@@ -14,8 +14,20 @@ import pytest
 from httpx import AsyncClient
 
 from app import auth as auth_mod
+from app import compute_backends as compute_backends_mod
 from app import orchestrator as orch
-from app.models import LocalRunner, Project, ProjectMember, Task, TaskStatus, _utcnow
+from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+from app.models import (
+    ComputeJob,
+    ComputeJobStatus,
+    LocalRunner,
+    Project,
+    ProjectMember,
+    Task,
+    TaskStatus,
+    _utcnow,
+)
+from app.routers.runner import _parse_multipart_form
 
 TEST_USER_ID = "test-user-123"
 
@@ -64,7 +76,13 @@ class TestRunnerAuth:
         assert h != t1
 
     @pytest.mark.asyncio
-    async def test_verify_runner_token_active_only(self, db_session):
+    async def test_verify_runner_token_resolves_non_deleted(self, db_session):
+        """FIX B3(a): any NON-deleted runner authenticates (incl. inactive).
+
+        An inactive runner (deactivated after a missed heartbeat — slept/network-
+        dropped host) MUST still authenticate so its heartbeat can re-arm it.
+        Only deleted/unknown tokens are rejected.
+        """
         project = await _make_project(db_session)
         runner, token = await _make_runner(db_session, project.id)
 
@@ -74,7 +92,14 @@ class TestRunnerAuth:
         # Wrong token resolves to None.
         assert await auth_mod.verify_runner_token("nope", db_session) is None
 
-        # Deleted/inactive runners never authenticate.
+        # An INACTIVE runner still authenticates (this is the lockout fix).
+        runner.status = "inactive"
+        db_session.add(runner)
+        await db_session.commit()
+        reactivatable = await auth_mod.verify_runner_token(token, db_session)
+        assert reactivatable is not None and reactivatable.id == runner.id
+
+        # A DELETED runner never authenticates.
         runner.status = "deleted"
         db_session.add(runner)
         await db_session.commit()
@@ -375,6 +400,198 @@ class TestRunnerEndpoints:
         assert runner.capabilities["has_gpu"] is True
         assert runner.capabilities["active_task_ids"] == ["x"]
 
+    @pytest.mark.asyncio
+    async def test_heartbeat_reactivates_inactive_runner(
+        self, client: AsyncClient, db_session
+    ):
+        """FIX B3(b): a successful heartbeat flips an inactive runner back to active.
+
+        After the stale-runner sweep deactivates a slept host, the runner's next
+        authenticated heartbeat is proof of liveness and must re-arm the row so
+        dispatch (which filters on recent last_seen_at) can target it again.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            status="inactive",
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+        )
+        assert runner.status == "inactive"
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        # Re-armed to active and last_seen_at refreshed.
+        assert runner.status == "active"
+        assert runner.last_seen_at > _utcnow() - timedelta(minutes=1)
+
+
+# ── Durable artifact upload endpoint (FIX M1, backend side) ───────────────────
+
+
+def _build_multipart(archive: bytes, file_count: int, total_bytes: int):
+    """Build a multipart/form-data body matching the runner client's wire shape."""
+    boundary = "----test-boundary-deadbeef"
+    crlf = b"\r\n"
+    body = bytearray()
+    for name, value in (("file_count", file_count), ("total_bytes", total_bytes)):
+        body += b"--" + boundary.encode() + crlf
+        body += f'Content-Disposition: form-data; name="{name}"'.encode() + crlf + crlf
+        body += str(value).encode() + crlf
+    body += b"--" + boundary.encode() + crlf
+    body += b'Content-Disposition: form-data; name="archive"; filename="artifacts.tar.gz"' + crlf
+    body += b"Content-Type: application/gzip" + crlf + crlf
+    body += archive + crlf
+    body += b"--" + boundary.encode() + b"--" + crlf
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
+class TestMultipartParser:
+    """Unit coverage for the dependency-free multipart parser used by the
+    artifact endpoint (avoids requiring python-multipart, which FastAPI File/Form
+    would otherwise pull in)."""
+
+    def test_parses_file_and_scalar_fields(self):
+        body, content_type = _build_multipart(b"\x1f\x8b\x08TARGZ", 3, 4096)
+        fields, files = _parse_multipart_form(body, content_type)
+        assert files["archive"] == b"\x1f\x8b\x08TARGZ"
+        assert fields["file_count"] == b"3"
+        assert fields["total_bytes"] == b"4096"
+
+    def test_binary_content_preserved_exactly(self):
+        raw = bytes(range(256)) * 4  # includes CRLF-looking byte sequences
+        body, content_type = _build_multipart(raw, 1, len(raw))
+        _fields, files = _parse_multipart_form(body, content_type)
+        assert files["archive"] == raw
+
+    def test_missing_boundary_returns_empty(self):
+        fields, files = _parse_multipart_form(b"whatever", "application/json")
+        assert fields == {} and files == {}
+
+
+class TestArtifactUploadEndpoint:
+    async def _make_runner_job(self, db_session, *, pinned_runner_id=None):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        pin = str(pinned_runner_id or runner.id)
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": pin},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+        return project, runner, token, job
+
+    @pytest.mark.asyncio
+    async def test_upload_stores_artifact_and_links_metadata(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        project, runner, token, job = await self._make_runner_job(db_session)
+
+        captured = {}
+
+        async def fake_store(session, j, archive_bytes, file_count, total_bytes):
+            captured["archive_len"] = len(archive_bytes)
+            captured["file_count"] = file_count
+            captured["total_bytes"] = total_bytes
+            return {
+                "kind": "runner_artifact",
+                "uri": "gs://bucket/compute-jobs/x/artifacts/bundle.tar.gz",
+                "file_count": file_count,
+                "total_bytes": total_bytes,
+                "stored": True,
+            }
+
+        monkeypatch.setattr(
+            compute_backends_mod, "store_runner_artifact", fake_store, raising=False
+        )
+
+        archive = b"\x1f\x8b\x08gzip-bytes"
+        body, content_type = _build_multipart(archive, 2, 1234)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert captured["archive_len"] == len(archive)
+        assert captured["file_count"] == 2
+        assert captured["total_bytes"] == 1234
+
+        await db_session.refresh(job)
+        stored = job.polling_metadata["runner_artifact"]
+        assert stored["stored"] is True
+        assert stored["uri"].startswith("gs://")
+
+    @pytest.mark.asyncio
+    async def test_upload_over_cap_returns_413(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        project, runner, token, job = await self._make_runner_job(db_session)
+
+        called = {"n": 0}
+
+        async def fake_store(*a, **k):
+            called["n"] += 1
+            return {}
+
+        monkeypatch.setattr(
+            compute_backends_mod, "store_runner_artifact", fake_store, raising=False
+        )
+
+        from app.routers import runner as runner_router
+
+        oversize = b"x" * (runner_router._MAX_RUNNER_ARTIFACT_BYTES + 1)
+        body, content_type = _build_multipart(oversize, 1, len(oversize))
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+            },
+        )
+        assert resp.status_code == 413
+        assert called["n"] == 0  # store never invoked on cap breach
+
+    @pytest.mark.asyncio
+    async def test_upload_wrong_runner_404(
+        self, client: AsyncClient, db_session, monkeypatch
+    ):
+        # Job pinned to a DIFFERENT runner id than the caller's token.
+        project, runner, token, job = await self._make_runner_job(
+            db_session, pinned_runner_id=uuid.uuid4()
+        )
+
+        async def fake_store(*a, **k):
+            raise AssertionError("store must not run for a non-owned job")
+
+        monkeypatch.setattr(
+            compute_backends_mod, "store_runner_artifact", fake_store, raising=False
+        )
+
+        body, content_type = _build_multipart(b"gz", 1, 2)
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/artifact",
+            content=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+            },
+        )
+        assert resp.status_code == 404
+
 
 # ── Orchestrator routing helpers ─────────────────────────────────────────────
 
@@ -654,6 +871,63 @@ class TestOrchestratorRunnerRouting:
         await db_session.refresh(alive)
         assert never_heartbeated.status == "inactive"
         assert alive.status == "active"
+
+    @pytest.mark.asyncio
+    async def test_deactivate_stale_runners_releases_unpulled_pins(self, db_session):
+        # A task pinned to a runner that goes stale before pulling it must be
+        # released back to QUEUED. The orphan reaper intentionally no longer reaps
+        # awaiting-pull runner pins, so deactivation is the only recovery path —
+        # without it the task would wedge forever.
+        project = await _make_project(db_session)
+        stale, _ = await _make_runner(
+            db_session, project.id, last_seen_at=_utcnow() - timedelta(minutes=10)
+        )
+        pinned = Task(
+            project_id=project.id,
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{stale.id}",
+            vm_provisioned_at=_utcnow(),
+            context={"runner_target_id": str(stale.id)},
+        )
+        db_session.add(pinned)
+        await db_session.commit()
+
+        await orch._deactivate_stale_runners(db_session)
+
+        await db_session.refresh(stale)
+        await db_session.refresh(pinned)
+        assert stale.status == "inactive"
+        assert pinned.status == TaskStatus.QUEUED
+        assert pinned.vm_instance_id is None
+        assert pinned.vm_provisioned_at is None
+        assert "runner_target_id" not in (pinned.context or {})
+
+    @pytest.mark.asyncio
+    async def test_deactivate_stale_runners_keeps_pulled_pins(self, db_session):
+        # A pin the runner already pulled (started_at set) is in-flight work, not
+        # an awaiting-pull pin — deactivation must NOT yank it back to QUEUED.
+        project = await _make_project(db_session)
+        stale, _ = await _make_runner(
+            db_session, project.id, last_seen_at=_utcnow() - timedelta(minutes=10)
+        )
+        running = Task(
+            project_id=project.id,
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{stale.id}",
+            vm_provisioned_at=_utcnow(),
+            started_at=_utcnow(),
+            context={"runner_target_id": str(stale.id)},
+        )
+        db_session.add(running)
+        await db_session.commit()
+
+        await orch._deactivate_stale_runners(db_session)
+
+        await db_session.refresh(running)
+        assert running.status == TaskStatus.PROVISIONING
+        assert running.vm_instance_id == f"runner:{stale.id}"
 
 
 # ── Strategic-spawning local-runner availability signal ──────────────────────

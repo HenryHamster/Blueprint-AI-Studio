@@ -2361,12 +2361,15 @@ ALSO write /tmp/research_progress_${taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — 
     \`spend_cap_usd\` (a positive USD cap — keep it conservative), and
     \`deadline_seconds\` (a positive wall-clock timeout). Optionally add \`success_criterion\`
     — a numeric goal of {"metric": "<name>", "operator": ">=|<=|>|<|==|!=", "threshold": <number>}
-    — to make the result machine-checkable. To make a declared metric available, the command must
-    write {metric: value} JSON to the \`$BLUEPRINT_RESULT_FILE\` path OR print a JSON object
-    containing it to stdout (e.g. \`echo "{\\"accuracy\\": 0.93}" > "$BLUEPRINT_RESULT_FILE"\`); the
-    criterion reads THAT value. A measured-but-missed goal is recorded as honest negative evidence
-    (the dependent still runs), but a declared metric the run never produces a numeric value for
-    fails loud (compute_unmeasured_criterion) — a job that ran cannot pass as a hypothesis that was
+    — to make the result machine-checkable. Metric capture is MANDATORY: the command MUST
+    write {metric: value} JSON to the file at \`$BLUEPRINT_RESULT_FILE\` as its final step OR print a
+    JSON object containing it as the LAST line of stdout — e.g.
+    \`... && python -c "import json,os; json.dump({'<metric>': <value>}, open(os.environ['BLUEPRINT_RESULT_FILE'],'w'))"\`
+    or \`echo "{\\"<metric>\\": <value>}" > "$BLUEPRINT_RESULT_FILE"\` (use your real declared-metric
+    key in place of \`<metric>\`); the criterion reads THAT value. A measured-but-missed goal is
+    recorded as honest negative evidence (the dependent still runs), but a declared metric the run
+    never produces a numeric value for is silently lost — the criterion is then evaluated UNMEASURED
+    and fails loud (compute_unmeasured_criterion) — a job that ran cannot pass as a hypothesis that was
     measured. Put the launch fields either flat on the finding or nested under a
     \`compute_experiment\` object. Above a configured spend threshold the launch holds for operator
     approval; below it, it runs autonomously.

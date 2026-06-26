@@ -920,6 +920,8 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
                             "require_durable_artifact",
                             "sweep_id",
                             "setup_step",
+                            "container_image",
+                            "container_registry_auth",
                             "declared_metric",
                             "arms",
                             "smoke_sample",

@@ -17105,6 +17105,43 @@ class TestComputeExperimentTaskLaunch:
         }
 
     @pytest.mark.asyncio
+    async def test_container_fields_persist_for_runner_experiments(
+        self, client: AsyncClient, db_session
+    ):
+        # Container-aware fields (image + registry auth + host setup_step) must
+        # survive request validation -> launch_contract -> stored task payload,
+        # or a CUDA/NGC experiment would silently run bare on the runner.
+        await self._project_with_repo(db_session)
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                container_image="nvcr.io/nvidia/tensorflow:25.01",
+                container_registry_auth={
+                    "server": "nvcr.io",
+                    "username": "$oauthtoken",
+                    "password": "nvapi-SECRET",
+                },
+                setup_step="echo host-prep",
+            ),
+        )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(data["id"]))
+            )
+        ).scalar_one()
+        payload = task.payloads[0]
+        assert payload["container_image"] == "nvcr.io/nvidia/tensorflow:25.01"
+        assert payload["container_registry_auth"] == {
+            "server": "nvcr.io",
+            "username": "$oauthtoken",
+            "password": "nvapi-SECRET",
+        }
+        assert payload["setup_step"] == "echo host-prep"
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("override", "expected_detail"),
         [

@@ -115,6 +115,55 @@ export function buildStagedDirectionsSection(staged: Array<Record<string, unknow
 }
 
 /**
+ * Render the backend-supplied `local_runner_status` block as a short prompt note
+ * so the strategist factors LIVE self-hosted GPU availability into whether to
+ * author GPU `compute_experiment` tasks. The backend ships this object only when
+ * the project has registered a self-hosted runner OR declares the enforce-local
+ * policy (require_local_runner). Shape:
+ * `{ever_registered, active_total, active_gpu, require_local_runner}`.
+ *
+ * When no GPU runner is live the strategist should AVOID authoring GPU
+ * experiments: with require_local_runner they are held then terminally fail;
+ * without it they fall back to billable cloud GPU. Returns '' when absent or
+ * malformed so the section is omitted on the common path. Defined here (not in
+ * strategic-sections.ts) so it does not have to be threaded through that module's
+ * exhaustive vi.mock in strategic.test.ts.
+ */
+export function buildLocalRunnerSection(status: unknown): string {
+  if (!status || typeof status !== 'object' || Array.isArray(status)) return '';
+  const s = status as Record<string, unknown>;
+  const activeTotal = typeof s.active_total === 'number' ? s.active_total : 0;
+  const activeGpu = typeof s.active_gpu === 'number' ? s.active_gpu : 0;
+  const everRegistered = s.ever_registered === true;
+  const requireLocal = s.require_local_runner === true;
+  // Backend already gates inclusion on (ever_registered || require_local_runner);
+  // re-check defensively so a stray payload never renders an empty/misleading note.
+  if (!everRegistered && !requireLocal) return '';
+
+  const lines: string[] = ['## Self-hosted compute (local runner availability)'];
+  lines.push(
+    `- Live runners: ${activeTotal} total, ${activeGpu} GPU-capable`
+    + (requireLocal
+      ? ' — this project ENFORCES local-only compute (require_local_runner=true), so a compute_experiment never bills cloud.'
+      : '.'),
+  );
+  if (activeGpu > 0) {
+    lines.push(
+      '- GPU hardware is ONLINE: a GPU `compute_experiment` will run on the operator\'s self-hosted runner. Authoring one is fine.',
+    );
+  } else if (requireLocal) {
+    lines.push(
+      '- GPU hardware is OFFLINE and this project is local-only: a GPU `compute_experiment` authored now is HELD (never billed to cloud) and terminally fails after the hold window. Do NOT author GPU experiments until a GPU runner is live — defer the hypothesis or take a non-GPU approach.',
+    );
+  } else {
+    lines.push(
+      '- GPU hardware is OFFLINE: a GPU `compute_experiment` authored now would FALL BACK to billable cloud GPU. Prefer to defer GPU experiments until the operator\'s runner is live, unless the cloud spend is justified.',
+    );
+  }
+  return lines.join('\n');
+}
+
+/**
  * Render the compact design-doc INDEX as a clean architecture overview — NOT a
  * raw JSON dump. The backend now ships the design doc as a navigation index
  * (`{ sections: [{ key, summary?, status?, modules?, presence_warning? }] }`,
@@ -612,6 +661,10 @@ prompts, schemas, tools, or orchestration.` : '';
       dirSummaryText,
       dirHealthSummary,
       stagedDirectionsSection,
+      // Live self-hosted local-runner availability note (M7) — built from the
+      // backend's `local_runner_status` payload field so the strategist avoids
+      // authoring GPU compute_experiments while the operator's hardware is offline.
+      localRunnerSection: buildLocalRunnerSection(payload.local_runner_status),
       userPausedSection: buildUserPausedSection(directionsSummary),
       rejectedProposalsSection: buildRejectedProposalsSection(Array.isArray(payload.rejected_proposals) ? payload.rejected_proposals as Array<Record<string, unknown>> : []),
       operatorOverridesSection: buildOperatorOverridesSection(Array.isArray(payload.operator_overrides) ? payload.operator_overrides as Array<Record<string, unknown>> : []),
@@ -852,7 +905,18 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 #   compute_experiment — run a command and measure a declared metric to resolve a
 #                       falsifiable hypothesis; requires command, spend_cap_usd,
 #                       deadline_seconds; optional success_criterion {metric,
-#                       operator (<|>|<=|>=), threshold}
+#                       operator (<|>|<=|>=), threshold}, accelerator (T4|L4|V100
+#                       — requests ONE GPU, no machine_type needed), container_image
+#                       (run command INSIDE a docker image — REQUIRED for CUDA/NGC
+#                       stacks the repo cannot pip-install natively, else it runs
+#                       BARE and dies ModuleNotFoundError), container_registry_auth
+#                       {server,username,password} (private/gated registries only),
+#                       setup_step (host-level prep run as bare bash -lc OUTSIDE the
+#                       container; container-dependent installs go in command, NOT
+#                       here). The command MUST write the declared metric as JSON to
+#                       $BLUEPRINT_RESULT_FILE (or print it as the last stdout line)
+#                       — a run that exits 0 without it loses the metric and the
+#                       criterion fails unmeasured (compute_unmeasured_criterion).
 # web_research and design are HIGH-ROI and chronically under-used: one durable
 # knowledge document de-risks every later task in the area and compounds across
 # cycles. Spawn them PROACTIVELY, not only reactively — signals that warrant one:
@@ -869,7 +933,12 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "Full investigation prompt...", "direction_id": "d-xxx"}'
 ./strategic spawn-task '{"type": "web_research", "title": "...", "prompt": "What external knowledge to gather...", "direction_id": "d-xxx"}'
 ./strategic spawn-task '{"type": "design", "title": "...", "prompt": "Design question grounded in the codebase...", "direction_id": "d-xxx"}'
-./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<falsifiable claim with a concrete threshold>", "command": "<command that writes the declared metric to $BLUEPRINT_RESULT_FILE>", "spend_cap_usd": 2.50, "deadline_seconds": 1800, "success_criterion": {"metric": "<metric_key>", "operator": ">=", "threshold": 0}, "direction_id": "d-xxx"}'
+./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<falsifiable claim with a concrete threshold>", "command": "<command that writes the declared metric as JSON to $BLUEPRINT_RESULT_FILE>", "spend_cap_usd": 2.50, "deadline_seconds": 1800, "success_criterion": {"metric": "<metric_key>", "operator": ">=", "threshold": 0}, "direction_id": "d-xxx"}'
+# GPU / containerized variant — accelerator requests one GPU; container_image runs
+# the command INSIDE a CUDA/NGC image (REQUIRED when the runtime is not pip-installable,
+# else the command runs bare and dies ModuleNotFoundError). Add container_registry_auth
+# only for a private registry; setup_step is host-level prep run OUTSIDE the container.
+./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<falsifiable GPU claim with a concrete threshold>", "command": "<command — installs+run go HERE, inside the image; must write the metric JSON to $BLUEPRINT_RESULT_FILE>", "accelerator": "T4", "container_image": "nvcr.io/nvidia/tensorflow:25.01", "spend_cap_usd": 5.00, "deadline_seconds": 3600, "success_criterion": {"metric": "<metric_key>", "operator": ">=", "threshold": 0}, "direction_id": "d-xxx"}'
 # Multi-arm variant: use "arms" + "declared_metric" instead of a single "command".
 # Each arm writes its declared_metric key to $BLUEPRINT_RESULT_FILE as usual; the
 # platform isolates each arm in its own result path and assembles the comparison

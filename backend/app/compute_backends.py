@@ -34,6 +34,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Protocol
 
+from google.cloud import storage as gcs_storage
+
 from app import compute
 from app import storage
 from app.models import ComputeJob, ComputeJobStatus
@@ -1424,7 +1426,9 @@ async def collect_terminal_artifact_reference(
     holds at least one object, else ``None``. The detection is backend-aware:
     the local backend inspects the on-disk artifact directory that survives the
     subprocess; the GCP backend lists the per-job object prefix the startup
-    script uploaded to before poweroff.
+    script uploaded to before poweroff; the runner-subprocess backend rehydrates
+    the ``runner_artifact`` stamp the receiving endpoint wrote from
+    :func:`store_runner_artifact`.
 
     Fail-soft by contract: an empty artifact directory, a missing location, or
     ANY detection error degrades to ``None`` (interpreted upstream as 'no
@@ -1436,6 +1440,8 @@ async def collect_terminal_artifact_reference(
             return _collect_local_artifact_reference(job)
         if job.backend == GCP_BACKEND_NAME:
             return await _collect_gcp_artifact_reference(job)
+        if job.backend == RUNNER_SUBPROCESS_BACKEND_NAME:
+            return _collect_runner_artifact_reference(job)
     except Exception:
         logger.warning(
             "Durable-artifact detection failed for compute job %s",
@@ -1481,6 +1487,129 @@ async def _collect_gcp_artifact_reference(
         file_count=file_count,
         total_size_bytes=total_size_bytes,
     )
+
+
+def _collect_runner_artifact_reference(
+    job: ComputeJob,
+) -> TerminalArtifactReference | None:
+    """Build a terminal-artifact reference for a runner-subprocess job.
+
+    Unlike the local/GCP branches, the runner has no in-process or VM-side
+    location for the orchestrator to inspect: the runner tars its artifact dir
+    and POSTs the bytes to the receiving endpoint, which calls
+    :func:`store_runner_artifact` and stamps the returned dict onto
+    ``polling_metadata["runner_artifact"]``. This branch simply rehydrates that
+    stamp into the shared :class:`TerminalArtifactReference` shape the other
+    branches return.
+
+    Mirrors the other branches' emptiness contract: a reference is produced ONLY
+    for a non-empty bundle (``file_count >= 1``); an absent stamp or an empty
+    bundle degrades to ``None`` ('no artifact'). ``uri`` is the durable
+    ``gs://`` location when the upload succeeded, or ``None`` in the degraded
+    no-store path (the durable file-count/byte metrics are still surfaced so the
+    job's terminal completion and metric-based criteria are unaffected, while a
+    ``require_durable_artifact`` gate correctly stays unmet without a durable
+    location).
+    """
+    meta = job.polling_metadata or {}
+    ref = meta.get("runner_artifact")
+    if not isinstance(ref, dict):
+        return None
+    try:
+        file_count = int(ref.get("file_count") or 0)
+        total_size_bytes = int(ref.get("total_bytes") or 0)
+    except (TypeError, ValueError):
+        return None
+    if file_count <= 0:
+        return None
+    uri = ref.get("uri")
+    return TerminalArtifactReference(
+        uri=uri if isinstance(uri, str) and uri.strip() else None,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        file_count=file_count,
+        total_size_bytes=total_size_bytes,
+    )
+
+
+async def store_runner_artifact(
+    session,
+    job: ComputeJob,
+    archive_bytes: bytes,
+    file_count: int,
+    total_bytes: int,
+) -> dict[str, Any]:
+    """Durably persist a runner-subprocess job's artifact tarball.
+
+    Mirrors the GCP backend's durable-artifact store exactly: the gzip tarball
+    the runner uploaded is written to the SAME per-job object the GCE startup
+    script uploads to before poweroff —
+    ``compute-jobs/<job_id>/artifacts/bundle.tar.gz`` in the shared artifact
+    bucket (:data:`storage.ARTIFACT_BUCKET_NAME`). Reusing
+    :func:`storage.compute_job_artifact_object_name` /
+    :func:`storage.compute_job_artifact_uri` means the bundle is retrievable
+    through the identical helpers the GCP path already uses
+    (``storage.download_compute_job_artifact_bundle``); no new store, bucket, or
+    path convention is introduced.
+
+    The orchestrator (Cloud Run) writes with its own ADC — the same credential
+    the GCP path already uses to list/download/IAM the bucket — so this works
+    from the request context that receives the runner upload (the VM-side signed
+    URL is unnecessary here).
+
+    ``session`` is accepted for caller-contract symmetry; this function does not
+    touch the DB. The caller stamps the returned dict onto
+    ``job.polling_metadata["runner_artifact"]``.
+
+    Returns a reference dict::
+
+        {"kind": "runner_artifact", "uri": <gs://...|None>,
+         "file_count": int, "total_bytes": int, "stored": bool}
+
+    Graceful degradation: when no durable object store is reachable (local dev
+    without GCS credentials, or any network/permission/decode error), the upload
+    is skipped best-effort and the dict carries ``uri=None, stored=False``. The
+    job still completes and its durable metrics are still stamped from
+    ``file_count``/``total_bytes``. NEVER raises — durable-artifact storage must
+    not block a runner job's terminal completion.
+    """
+    file_count = max(int(file_count or 0), 0)
+    total_bytes = max(int(total_bytes or 0), 0)
+    reference: dict[str, Any] = {
+        "kind": "runner_artifact",
+        "uri": None,
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "stored": False,
+    }
+    if not archive_bytes:
+        return reference
+
+    object_name = storage.compute_job_artifact_object_name(job.id)
+    bucket_name = storage.ARTIFACT_BUCKET_NAME
+    project_id = storage.GCP_PROJECT_ID
+
+    def _upload() -> None:
+        client = gcs_storage.Client(project=project_id)
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_name)
+        # upload_from_string streams the already-in-memory bytes once; it does
+        # not duplicate the buffer, so a large (within-cap) bundle stays bounded.
+        blob.upload_from_string(archive_bytes, content_type="application/gzip")
+
+    try:
+        await asyncio.to_thread(_upload)
+    except Exception:
+        logger.warning(
+            "Durable runner-artifact upload failed for compute job %s; "
+            "completing with no durable store (uri=None)",
+            getattr(job, "id", None),
+            exc_info=True,
+        )
+        return reference
+
+    reference["uri"] = storage.compute_job_artifact_uri(job.id)
+    reference["stored"] = True
+    return reference
 
 
 def _count_files_in_tree(path: str) -> int:

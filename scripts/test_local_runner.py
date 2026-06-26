@@ -87,16 +87,12 @@ class TestEnvVarValidation(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("BLUEPRINT_ORCHESTRATOR_URL", result.stderr)
 
-    def test_missing_agent_binary_exits_1(self):
-        result = self._run_script(
-            env_overrides={
-                "BLUEPRINT_RUNNER_TOKEN": "tok-abc",
-                "BLUEPRINT_ORCHESTRATOR_URL": "https://api.example.com",
-                "BLUEPRINT_AGENT_BINARY": "/nonexistent/agent/dist/index.js",
-            },
-        )
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("BLUEPRINT_AGENT_BINARY", result.stderr)
+    # NOTE: a missing agent binary is NO LONGER fatal at startup (FIX M5) — the
+    # runner resolves the agent lazily so a compute/GPU-only runner can boot
+    # without a built agent. The startup-exit-on-missing-binary behavior was
+    # removed; its unit-level replacement lives in TestAgentBinaryDetection
+    # (test_locate_* — non-fatal None) and the lazy per-task skip is covered by
+    # the main loop's _locate_agent_binary re-resolution.
 
 
 # ── Agent binary detection ─────────────────────────────────────────────────────
@@ -144,6 +140,29 @@ class TestAgentBinaryDetection(unittest.TestCase):
                 with self.assertRaises(SystemExit) as ctx:
                     local_runner._find_agent_binary()
         self.assertEqual(ctx.exception.code, 1)
+
+    # ── Lazy (non-fatal) locator — FIX M5: compute-only runners boot w/o agent ──
+
+    def test_locate_returns_none_for_missing_explicit(self):
+        """_locate_agent_binary returns None (does NOT exit) for a bad explicit path."""
+        with patch.dict(os.environ, {"BLUEPRINT_AGENT_BINARY": "/no/such/file.js"}):
+            self.assertIsNone(local_runner._locate_agent_binary())
+
+    def test_locate_returns_path_for_existing_explicit(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".js", delete=False) as f:
+            path = f.name
+        try:
+            with patch.dict(os.environ, {"BLUEPRINT_AGENT_BINARY": path}):
+                self.assertEqual(local_runner._locate_agent_binary(), path)
+        finally:
+            os.unlink(path)
+
+    def test_locate_returns_none_when_autodetect_misses(self):
+        """No explicit binary and nothing on disk → None, never SystemExit."""
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("os.path.isfile", return_value=False):
+                self.assertIsNone(local_runner._locate_agent_binary())
 
 
 # ── Startup summary ───────────────────────────────────────────────────────────
@@ -1115,6 +1134,181 @@ class TestDockerLogin(unittest.TestCase):
 
         self.assertIn("failed", reports)
         self.assertEqual(popen_calls, [], "docker run must not be called on login failure")
+
+
+# ── Registry-host derivation (FIX B4) ──────────────────────────────────────────
+
+class TestRegistryHostDerivation(unittest.TestCase):
+    def test_ngc_image_derives_nvcr_io(self):
+        self.assertEqual(
+            local_runner._derive_registry_host("nvcr.io/nvidia/tensorflow:25.01"),
+            "nvcr.io",
+        )
+
+    def test_host_port_segment_is_registry(self):
+        self.assertEqual(
+            local_runner._derive_registry_host("myregistry:5000/team/img"),
+            "myregistry:5000",
+        )
+
+    def test_dockerhub_user_repo_is_not_a_registry(self):
+        # First segment has no '.' or ':' → Docker Hub → no server arg.
+        self.assertEqual(local_runner._derive_registry_host("pytorch/pytorch:latest"), "")
+
+    def test_dockerhub_single_name_is_not_a_registry(self):
+        self.assertEqual(local_runner._derive_registry_host("ubuntu:22.04"), "")
+
+    def test_none_image_returns_empty(self):
+        self.assertEqual(local_runner._derive_registry_host(None), "")
+
+    def test_docker_login_derives_server_from_image_when_omitted(self):
+        """When auth has no 'server', the host is derived from container_image."""
+        captured = {}
+
+        def fake_run(cmd, *, input=None, capture_output=False, timeout=None):
+            captured["cmd"] = cmd
+            m = MagicMock()
+            m.returncode = 0
+            m.stderr = b""
+            return m
+
+        result = local_runner._docker_login(
+            {"username": "$oauthtoken", "password": "ngc-key"},  # no 'server'
+            container_image="nvcr.io/nvidia/tensorflow:25.01",
+            _subprocess_run=fake_run,
+        )
+        self.assertTrue(result)
+        # Derived host appended as the docker login server argument.
+        self.assertEqual(captured["cmd"][-1], "nvcr.io")
+
+    def test_docker_login_dockerhub_image_omits_server_arg(self):
+        """A Docker Hub image with no explicit server logs in with no server arg."""
+        captured = {}
+
+        def fake_run(cmd, *, input=None, capture_output=False, timeout=None):
+            captured["cmd"] = cmd
+            m = MagicMock()
+            m.returncode = 0
+            m.stderr = b""
+            return m
+
+        local_runner._docker_login(
+            {"username": "u", "password": "pw"},  # no 'server'
+            container_image="pytorch/pytorch:latest",
+            _subprocess_run=fake_run,
+        )
+        # No registry host appended — last token is the flag/value, not a host.
+        self.assertNotIn("pytorch/pytorch:latest", captured["cmd"])
+        self.assertEqual(captured["cmd"][-1], "u")  # ends with --username value
+
+    def test_explicit_server_takes_precedence_over_image(self):
+        captured = {}
+
+        def fake_run(cmd, *, input=None, capture_output=False, timeout=None):
+            captured["cmd"] = cmd
+            m = MagicMock()
+            m.returncode = 0
+            m.stderr = b""
+            return m
+
+        local_runner._docker_login(
+            {"server": "explicit.example.com", "password": "pw"},
+            container_image="nvcr.io/nvidia/tensorflow:25.01",
+            _subprocess_run=fake_run,
+        )
+        self.assertEqual(captured["cmd"][-1], "explicit.example.com")
+
+
+# ── Durable artifact upload (FIX M1, runner side) ──────────────────────────────
+
+class TestArtifactUpload(unittest.TestCase):
+    def _write(self, root, rel, data: bytes):
+        path = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path
+
+    def test_empty_dir_skips_upload(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as art:
+            with patch("urllib.request.urlopen") as mock_urlopen:
+                local_runner._upload_artifact("https://api.example.com", "tok", "job-1", art)
+            mock_urlopen.assert_not_called()
+
+    def test_missing_dir_skips_upload(self):
+        with patch("urllib.request.urlopen") as mock_urlopen:
+            local_runner._upload_artifact(
+                "https://api.example.com", "tok", "job-1", "/no/such/dir"
+            )
+        mock_urlopen.assert_not_called()
+
+    def test_over_cap_skips_upload(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as art:
+            self._write(art, "checkpoint.bin", b"x" * 4096)
+            with patch.object(local_runner, "_RUNNER_ARTIFACT_MAX_BYTES", 1024), \
+                 patch("urllib.request.urlopen") as mock_urlopen:
+                local_runner._upload_artifact(
+                    "https://api.example.com", "tok", "job-1", art
+                )
+            mock_urlopen.assert_not_called()
+
+    def test_successful_upload_posts_multipart_with_counts(self):
+        import tempfile
+        captured = {}
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["headers"] = dict(req.header_items())
+            captured["body"] = req.data
+            return _Resp()
+
+        with tempfile.TemporaryDirectory() as art:
+            self._write(art, "plots/loss.png", b"PNGDATA")
+            self._write(art, "ckpt.pt", b"WEIGHTS123")
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                local_runner._upload_artifact(
+                    "https://api.example.com", "tok", "job-xyz", art
+                )
+
+        self.assertIn("/api/runner/compute-job/job-xyz/artifact", captured["url"])
+        # Content-Type is multipart with a boundary; auth header carried through.
+        ct = captured["headers"].get("Content-type") or captured["headers"].get("Content-Type")
+        self.assertIn("multipart/form-data; boundary=", ct)
+        auth = captured["headers"].get("Authorization")
+        self.assertEqual(auth, "Bearer tok")
+        body = captured["body"]
+        # Form fields present with correct values (2 files, 17 total bytes).
+        self.assertIn(b'name="archive"; filename="artifacts.tar.gz"', body)
+        self.assertIn(b'name="file_count"', body)
+        self.assertIn(b"\r\n\r\n2\r\n", body)  # file_count == 2
+        self.assertIn(b'name="total_bytes"', body)
+        self.assertIn(b"\r\n\r\n17\r\n", body)  # 7 + 10 bytes
+
+    def test_upload_http_error_is_non_fatal(self):
+        import tempfile
+        import urllib.error
+
+        with tempfile.TemporaryDirectory() as art:
+            self._write(art, "f.txt", b"data")
+            with patch(
+                "urllib.request.urlopen",
+                side_effect=urllib.error.HTTPError("u", 500, "err", {}, None),
+            ):
+                # Must NOT raise.
+                local_runner._upload_artifact(
+                    "https://api.example.com", "tok", "job-1", art
+                )
 
 
 if __name__ == "__main__":

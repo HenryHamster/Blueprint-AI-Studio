@@ -16,12 +16,14 @@ Optional environment variables:
     BLUEPRINT_RUNNER_POLL_INTERVAL    Base poll interval in seconds (default: 2)
 """
 
+import io
 import json
 import os
 import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
@@ -40,13 +42,18 @@ def _require_env(name: str) -> str:
     return value
 
 
-def _find_agent_binary() -> str:
+def _locate_agent_binary() -> str | None:
+    """Locate the node agent entry point, or return None if it is unavailable.
+
+    Non-fatal counterpart to ``_find_agent_binary``.  The runner main loop uses
+    this to resolve the agent LAZILY — only when an AGENT task is actually
+    claimed — so a compute/GPU-only runner can boot and run compute jobs without
+    a built agent.  A missing binary is therefore not an error at startup; it is
+    only a problem the moment an agent task needs to run.
+    """
     explicit = os.environ.get("BLUEPRINT_AGENT_BINARY", "").strip()
     if explicit:
-        if not os.path.isfile(explicit):
-            print(f"ERROR: BLUEPRINT_AGENT_BINARY={explicit!r} does not exist.", file=sys.stderr)
-            sys.exit(1)
-        return explicit
+        return explicit if os.path.isfile(explicit) else None
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
@@ -57,6 +64,25 @@ def _find_agent_binary() -> str:
         normalized = os.path.normpath(path)
         if os.path.isfile(normalized):
             return normalized
+    return None
+
+
+def _find_agent_binary() -> str:
+    """Resolve the agent entry point or exit(1) (strict, hard-fail variant).
+
+    Retained for callers/tests that require a hard failure when the binary is
+    absent.  The runner main loop no longer calls this at startup — it resolves
+    lazily via ``_locate_agent_binary`` so a compute-only runner is not blocked
+    by a missing agent build.
+    """
+    located = _locate_agent_binary()
+    if located:
+        return located
+
+    explicit = os.environ.get("BLUEPRINT_AGENT_BINARY", "").strip()
+    if explicit:
+        print(f"ERROR: BLUEPRINT_AGENT_BINARY={explicit!r} does not exist.", file=sys.stderr)
+        sys.exit(1)
 
     print(
         "ERROR: could not find agent/dist/index.js. "
@@ -105,6 +131,9 @@ def _post(url: str, token: str, body: dict) -> tuple[int, dict | None]:
 _RUNNER_CONTAINER_OUT_DIR = "/tmp/blueprint_out"
 _RUNNER_MAX_COMMAND_LOG_BYTES = 32768
 _RUNNER_HEARTBEAT_INTERVAL = 30.0
+# v1 cap on durable artifact uploads. The runner skips (does not fail) any run
+# whose artifact dir exceeds this; the backend mirrors the cap and 413s.
+_RUNNER_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024  # 25 MiB
 
 
 # ── GPU detection ────────────────────────────────────────────────────────────
@@ -181,13 +210,45 @@ def _heartbeat_loop(orchestrator_url: str, token: str, active_tasks: dict, lock:
 
 # ── Compute-job execution ─────────────────────────────────────────────────────
 
-def _docker_login(auth: dict, *, _subprocess_run=None) -> bool:
+def _derive_registry_host(container_image: str | None) -> str:
+    """Derive the registry host from an image reference, or "" for Docker Hub.
+
+    Docker treats the first slash-delimited segment of a reference as a registry
+    host ONLY if it looks like one — i.e. it contains a ``.`` (domain) or a ``:``
+    (host:port).  Otherwise the reference targets Docker Hub and ``docker login``
+    must be invoked with no server argument.
+
+        nvcr.io/nvidia/tensorflow:25.01  -> "nvcr.io"
+        myregistry:5000/team/img         -> "myregistry:5000"
+        pytorch/pytorch:latest           -> ""   (Docker Hub)
+        ubuntu:22.04                     -> ""   (Docker Hub; the ':' is a tag)
+    """
+    if not container_image:
+        return ""
+    # A registry host only exists when there is a '/' separating it from the
+    # image path.  Without a '/', a bare ``name:tag`` (e.g. ``ubuntu:22.04``) is a
+    # Docker Hub image and the ':' is a TAG, not a host:port.
+    head, sep, _rest = container_image.partition("/")
+    if not sep:
+        return ""
+    if "." in head or ":" in head:
+        return head
+    return ""
+
+
+def _docker_login(auth: dict, container_image: str | None = None, *, _subprocess_run=None) -> bool:
     """Run `docker login` using the credentials in *auth*.
 
     Returns True on success, False on any failure (non-zero exit, missing
     required fields, subprocess error).  Auth must contain at least a
     ``password`` key; ``server`` and ``username`` are optional but should
     normally be present for private registries.
+
+    When ``server`` is absent/empty the registry host is DERIVED from
+    *container_image* (e.g. an NGC image ``nvcr.io/...`` logs into ``nvcr.io``).
+    Without this, an omitted server silently logs into Docker Hub and the NGC
+    pull then 401s.  A non-host-looking first segment (plain ``user/repo``) still
+    means Docker Hub, so we log in with no server argument as before.
 
     ``_subprocess_run`` is an optional override for the subprocess.run call,
     provided so tests can inject a fake without monkey-patching the global.
@@ -197,6 +258,8 @@ def _docker_login(auth: dict, *, _subprocess_run=None) -> bool:
         return True  # nothing to log in to
 
     server = auth.get("server") or ""
+    if not server:
+        server = _derive_registry_host(container_image)
     username = auth.get("username") or ""
     _run = _subprocess_run if _subprocess_run is not None else subprocess.run
 
@@ -269,6 +332,126 @@ def _report_compute_job(
     return False
 
 
+def _build_multipart_body(
+    *,
+    fields: dict,
+    file_field: str,
+    filename: str,
+    file_bytes: bytes,
+    file_content_type: str = "application/octet-stream",
+) -> tuple[bytes, str]:
+    """Build a multipart/form-data body. Returns (body_bytes, content_type).
+
+    Hand-rolled (urllib has no multipart helper) so the runner stays
+    dependency-free.  The boundary is randomized so it cannot collide with the
+    binary archive payload.
+    """
+    boundary = "----blueprintrunner" + os.urandom(16).hex()
+    bnd = boundary.encode("latin-1")
+    crlf = b"\r\n"
+    body = bytearray()
+    for name, value in fields.items():
+        body += b"--" + bnd + crlf
+        body += f'Content-Disposition: form-data; name="{name}"'.encode() + crlf + crlf
+        body += str(value).encode() + crlf
+    body += b"--" + bnd + crlf
+    body += (
+        f'Content-Disposition: form-data; name="{file_field}"; filename="{filename}"'.encode()
+        + crlf
+    )
+    body += f"Content-Type: {file_content_type}".encode() + crlf + crlf
+    body += file_bytes + crlf
+    body += b"--" + bnd + b"--" + crlf
+    return bytes(body), f"multipart/form-data; boundary={boundary}"
+
+
+def _upload_artifact(orchestrator_url: str, token: str, job_id: str, artifact_dir: str) -> None:
+    """Best-effort upload of a run's durable artifacts to the orchestrator.
+
+    Tarballs (gzip) the contents of *artifact_dir* and POSTs it to
+    ``/api/runner/compute-job/{job_id}/artifact`` as multipart/form-data (file
+    field ``archive`` + form fields ``file_count`` and ``total_bytes``).  Skips
+    silently when the dir is empty, and skips (without failing the job) when the
+    uncompressed total exceeds the 25 MiB v1 cap.
+
+    ALL failures are non-fatal: the metric report has already been sent by the
+    time this runs, so a failed upload must never fail the job.
+    """
+    try:
+        if not os.path.isdir(artifact_dir):
+            return
+
+        file_paths: list[str] = []
+        for root, _dirs, names in os.walk(artifact_dir):
+            for name in names:
+                path = os.path.join(root, name)
+                if os.path.isfile(path):
+                    file_paths.append(path)
+        if not file_paths:
+            return  # nothing produced — nothing to upload
+
+        file_count = len(file_paths)
+        total_bytes = 0
+        for path in file_paths:
+            try:
+                total_bytes += os.path.getsize(path)
+            except OSError:
+                pass
+
+        cap_mib = _RUNNER_ARTIFACT_MAX_BYTES // (1024 * 1024)
+        if total_bytes > _RUNNER_ARTIFACT_MAX_BYTES:
+            print(
+                f"[compute] artifact {total_bytes / (1024 * 1024):.1f} MiB exceeds "
+                f"{cap_mib} MiB v1 upload cap, skipping upload for job {job_id}",
+                flush=True,
+            )
+            return
+
+        # Build the gzip tarball in memory (paths relative to the artifact root).
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            tar.add(artifact_dir, arcname=".")
+        archive_bytes = buf.getvalue()
+
+        body, content_type = _build_multipart_body(
+            fields={"file_count": file_count, "total_bytes": total_bytes},
+            file_field="archive",
+            filename="artifacts.tar.gz",
+            file_bytes=archive_bytes,
+            file_content_type="application/gzip",
+        )
+        url = f"{orchestrator_url}/api/runner/compute-job/{job_id}/artifact"
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": content_type,
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                if resp.status in (200, 201, 204):
+                    print(
+                        f"[compute] uploaded {file_count} artifact file(s) "
+                        f"({total_bytes} bytes) for job {job_id}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[compute] artifact upload warning: HTTP {resp.status} for job {job_id}",
+                        flush=True,
+                    )
+        except urllib.error.HTTPError as exc:
+            print(f"[compute] artifact upload failed (HTTP {exc.code}) for job {job_id}", flush=True)
+        except Exception as exc:
+            print(f"[compute] artifact upload network error for job {job_id}: {exc}", flush=True)
+    except Exception as exc:  # noqa: BLE001 — upload is strictly best-effort
+        print(f"[compute] artifact upload unexpected error for job {job_id}: {exc}", flush=True)
+
+
 def _run_compute_job(
     job_body: dict,
     orchestrator_url: str,
@@ -290,6 +473,7 @@ def _run_compute_job(
     repo_token = job_body.get("repo_token") or None
 
     tmpdir = tempfile.mkdtemp(prefix="bp_compute_")
+    artifact_dir: str | None = None  # referenced in finally for durable-artifact upload
     try:
         result_file = os.path.join(tmpdir, "result.json")
         artifact_dir = os.path.join(tmpdir, "artifacts")
@@ -377,8 +561,10 @@ def _run_compute_job(
         # Build command args — containerized or bare
         if container_image:
             # Authenticate with the registry before pulling, if credentials provided.
+            # Pass container_image so the registry host can be derived when the
+            # auth payload omits an explicit server (e.g. NGC nvcr.io images).
             if container_registry_auth.get("password"):
-                if not _docker_login(container_registry_auth):
+                if not _docker_login(container_registry_auth, container_image=container_image):
                     _report_compute_job(orchestrator_url, token, job_id,
                                         exec_status="failed", exit_code=1)
                     return
@@ -546,6 +732,11 @@ def _run_compute_job(
         except Exception:
             pass
     finally:
+        # Upload durable artifacts (checkpoints/plots) BEFORE tearing down tmpdir.
+        # Runs for every terminal path (success, fail, deadline, cancel) so a run
+        # that produced output is never discarded.  Strictly best-effort.
+        if artifact_dir:
+            _upload_artifact(orchestrator_url, token, job_id, artifact_dir)
         with lock:
             active_jobs.discard(job_id)
         shutil.rmtree(tmpdir, ignore_errors=True)
@@ -579,13 +770,18 @@ def _compute_poll_loop(
             continue
 
         if status == 401:
+            # A 401 is NOT fatal: the token is still valid, but the runner row may
+            # have been deactivated after a missed heartbeat (slept/network-dropped
+            # laptop).  The background heartbeat re-arms the row (status->active),
+            # so we just back off and keep polling instead of exiting.
             print(
-                "ERROR: Runner token rejected (compute poll) — re-register via admin API: "
-                "POST /api/admin/projects/{project_id}/runners/register",
-                file=sys.stderr,
+                "[compute] poll 401 — runner token rejected; backing off and retrying "
+                "(row may be reactivating via heartbeat).",
+                flush=True,
             )
-            _shutdown_event.set()
-            break
+            poll_interval = min(poll_interval * 2, 30.0)
+            time.sleep(poll_interval)
+            continue
 
         if status == 204 or body is None:
             poll_interval = min(poll_interval * 2, 30.0)
@@ -625,7 +821,11 @@ def main() -> None:
     # Config
     token = _require_env("BLUEPRINT_RUNNER_TOKEN")
     orchestrator_url = _require_env("BLUEPRINT_ORCHESTRATOR_URL").rstrip("/")
-    agent_binary = _find_agent_binary()
+    # Resolve the agent binary LAZILY (compute/GPU-only runners must boot without
+    # a built agent).  This non-fatal probe is for the startup summary only; the
+    # poll loop re-resolves per agent task and fails THAT task (not the process)
+    # if the binary is still missing when an agent task arrives.
+    agent_binary = _locate_agent_binary()
 
     max_concurrent = int(os.environ.get("BLUEPRINT_RUNNER_MAX_CONCURRENT", "2"))
     max_concurrent_compute = int(
@@ -637,7 +837,10 @@ def main() -> None:
     token_prefix = token[:8] + "..." if len(token) >= 8 else token
     print("Blueprint local fleet runner starting", flush=True)
     print(f"  orchestrator : {orchestrator_url}", flush=True)
-    print(f"  agent binary : {agent_binary}", flush=True)
+    print(
+        f"  agent binary : {agent_binary or '(not built — compute-only mode; resolved lazily per agent task)'}",
+        flush=True,
+    )
     print(f"  max concurrent: {max_concurrent}", flush=True)
     print(f"  runner token : {token_prefix}", flush=True)
 
@@ -659,16 +862,21 @@ def main() -> None:
         print(f"ERROR: initial heartbeat failed: {exc}", file=sys.stderr)
         sys.exit(1)
     if status == 401:
+        # NOT fatal: the runner row may simply be inactive after a missed
+        # heartbeat (slept/network-dropped host).  Enter the loop anyway — the
+        # background heartbeat re-arms the row (status->active) and the poll
+        # loops retry with backoff.  (A truly revoked/deleted token will keep
+        # 401-ing harmlessly until the operator re-registers.)
         print(
-            "ERROR: runner token rejected (401). Re-register via admin API: "
-            "POST /api/admin/projects/{project_id}/runners/register",
-            file=sys.stderr,
+            "[runner] WARNING: initial heartbeat returned 401 — token may be stale or "
+            "the runner row inactive; entering poll loop and retrying (heartbeat re-arms it).",
+            flush=True,
         )
-        sys.exit(1)
-    if status not in (200, 204):
+    elif status not in (200, 204):
         print(f"ERROR: initial heartbeat returned HTTP {status}: {body}", file=sys.stderr)
         sys.exit(1)
-    print("[runner] Token validated. Entering poll loop.", flush=True)
+    else:
+        print("[runner] Token validated. Entering poll loop.", flush=True)
 
     # Shared state
     active_tasks: dict[str, subprocess.Popen] = {}
@@ -713,13 +921,17 @@ def main() -> None:
             continue
 
         if status == 401:
+            # NOT fatal (see compute poll loop): an inactive runner row 401s
+            # until the heartbeat re-arms it.  Back off and retry instead of
+            # exiting so a slept/network-dropped host self-heals on reconnect.
             print(
-                "ERROR: Runner token rejected — re-register via admin API: "
-                "POST /api/admin/projects/{project_id}/runners/register",
-                file=sys.stderr,
+                "[runner] poll 401 — runner token rejected; backing off and retrying "
+                "(row may be reactivating via heartbeat).",
+                flush=True,
             )
-            _shutdown_event.set()
-            break
+            poll_interval = min(poll_interval * 2, 30.0)
+            time.sleep(poll_interval)
+            continue
 
         if status == 204 or body is None:
             # No task available — backoff
@@ -745,6 +957,23 @@ def main() -> None:
             already_active = task_id in active_tasks
         if already_active:
             print(f"[runner] skipping duplicate dispatch for task {task_id}", flush=True)
+            time.sleep(poll_interval)
+            continue
+
+        # Lazily resolve the agent binary now that an AGENT task is actually here.
+        # A compute-only runner gets this far without a built agent; if the binary
+        # is missing we fail THIS task gracefully (log + skip) rather than killing
+        # the whole process — the compute poll loop keeps running.  Re-resolve each
+        # time so a binary built after startup is picked up; cache once found.
+        if not agent_binary:
+            agent_binary = _locate_agent_binary()
+        if not agent_binary:
+            print(
+                f"[runner] agent binary unavailable — cannot run agent task {task_id}; "
+                "skipping (build it with `cd agent && npm run build` or set "
+                "BLUEPRINT_AGENT_BINARY). Compute jobs are unaffected.",
+                flush=True,
+            )
             time.sleep(poll_interval)
             continue
 

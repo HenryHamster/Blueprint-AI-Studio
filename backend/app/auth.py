@@ -230,16 +230,25 @@ def create_runner_token(runner_id: uuid.UUID) -> str:
 async def verify_runner_token(
     token: str, session: AsyncSession
 ) -> "LocalRunner | None":
-    """Resolve an active LocalRunner by its bearer token, or None.
+    """Resolve a non-deleted LocalRunner by its bearer token, or None.
 
     Looks up the row whose ``token_hash`` matches SHA256(token) and whose
-    ``status`` is ``"active"`` (deleted/inactive runners never authenticate).
+    ``status`` is anything other than ``"deleted"``.  An ``inactive`` runner
+    (one the stale-runner sweep flipped off after a single missed heartbeat
+    window — e.g. a slept or network-dropped laptop) MUST still authenticate so
+    its heartbeat can re-arm it (set status back to ``"active"``); resolving only
+    ``"active"`` rows permanently locked such runners out.  Deleted runners and
+    unknown tokens never authenticate.
+
+    Dispatch safety is unaffected: pinning targets runners filtered on a recent
+    ``last_seen_at`` (orchestrator side), so authenticating an inactive runner
+    here does not make it eligible for work until it heartbeats again.
     """
     token_hash = hash_runner_token(token)
     result = await session.execute(
         select(LocalRunner).where(
             LocalRunner.token_hash == token_hash,
-            LocalRunner.status == "active",
+            LocalRunner.status != "deleted",
         )
     )
     return result.scalars().first()
@@ -251,7 +260,7 @@ async def get_current_runner(
 ) -> LocalRunner:
     """FastAPI dependency authenticating a pull-based fleet runner.
 
-    Raises 401 when the bearer token does not resolve to an active runner.
+    Raises 401 when the bearer token does not resolve to a non-deleted runner.
     """
     runner = await verify_runner_token(credentials.credentials, session)
     if runner is None:

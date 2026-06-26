@@ -26,7 +26,7 @@ import logging
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Response, status
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -39,6 +39,12 @@ from app.task_capabilities import agent_capability_slice
 
 _MAX_RUNNER_COMMAND_LOG_BYTES = 65536
 _MAX_RUNNER_RESULT_METRICS_KEYS = 256
+# v1 cap on durable artifact uploads (mirrors _RUNNER_ARTIFACT_MAX_BYTES on the
+# runner). The runner already gates on the uncompressed total; this caps the
+# actual uploaded tarball as a server-side defense.
+_MAX_RUNNER_ARTIFACT_BYTES = 25 * 1024 * 1024  # 25 MiB
+# Allowance for multipart framing/headers when early-rejecting on Content-Length.
+_MULTIPART_BODY_MARGIN = 1 * 1024 * 1024  # 1 MiB
 
 logger = logging.getLogger("blueprint")
 
@@ -131,6 +137,13 @@ async def heartbeat(
     per-task query.
     """
     runner.last_seen_at = _utcnow()
+    # Re-arm an inactive runner on every authenticated heartbeat. The stale-runner
+    # sweep flips active->inactive after a single missed 300s window (slept/network-
+    # dropped host); a successful heartbeat is proof of liveness, so flip it back to
+    # active here. This is the reactivation half of allowing inactive runners to
+    # authenticate (see auth.verify_runner_token). Never resurrects a deleted row:
+    # a deleted runner can no longer authenticate, so it never reaches this handler.
+    runner.status = "active"
     caps = dict(runner.capabilities or {})
     caps["active_task_ids"] = list(payload.active_task_ids)
     # Merge runner-reported hardware capabilities when present.
@@ -324,3 +337,142 @@ async def report_compute_job(
         await session.commit()
 
     return {"ok": True, "cancel_requested": cancel_requested}
+
+
+def _parse_multipart_form(body: bytes, content_type: str) -> tuple[dict, dict]:
+    """Parse a multipart/form-data body without requiring python-multipart.
+
+    Returns ``(fields, files)``: ``fields`` maps each non-file field name to its
+    raw bytes value; ``files`` maps each file field name to its raw bytes content.
+
+    The artifact upload is a small, fixed-shape body (one file part + two scalar
+    fields), so a minimal boundary splitter is sufficient — and it avoids adding
+    a python-multipart dependency, which FastAPI's ``File``/``Form`` would require
+    at route-registration time (a missing dep would crash app boot). Tolerant of
+    field ordering and absent parts. Assumes RFC-2046 CRLF delimiters (what httpx
+    and the runner client both emit).
+    """
+    fields: dict[str, bytes] = {}
+    files: dict[str, bytes] = {}
+
+    boundary = None
+    for piece in content_type.split(";"):
+        piece = piece.strip()
+        if piece.lower().startswith("boundary="):
+            boundary = piece[len("boundary="):].strip().strip('"')
+            break
+    if not boundary:
+        return fields, files
+
+    delimiter = b"--" + boundary.encode("latin-1")
+    for seg in body.split(delimiter):
+        if not seg or seg in (b"--\r\n", b"--", b"\r\n"):
+            continue
+        if seg.startswith(b"--"):  # trailing closing-boundary remnant
+            continue
+        if seg.startswith(b"\r\n"):
+            seg = seg[2:]
+        header_end = seg.find(b"\r\n\r\n")
+        if header_end == -1:
+            continue
+        header_block = seg[:header_end].decode("latin-1", "replace")
+        content = seg[header_end + 4:]
+        if content.endswith(b"\r\n"):
+            content = content[:-2]
+
+        name = None
+        filename = None
+        for hline in header_block.split("\r\n"):
+            if hline.lower().startswith("content-disposition:"):
+                for param in hline.split(";")[1:]:
+                    param = param.strip()
+                    if param.startswith("name="):
+                        name = param[len("name="):].strip().strip('"')
+                    elif param.startswith("filename="):
+                        filename = param[len("filename="):].strip().strip('"')
+        if name is None:
+            continue
+        if filename is not None:
+            files[name] = content
+        else:
+            fields[name] = content
+    return fields, files
+
+
+@router.post("/compute-job/{job_id}/artifact")
+async def upload_compute_job_artifact(
+    job_id: uuid.UUID,
+    request: Request,
+    runner: LocalRunner = Depends(get_current_runner),
+    session: AsyncSession = Depends(get_session),
+):
+    """Receive a runner's durable artifact tarball for a claimed compute job.
+
+    Body is multipart/form-data: file field ``archive`` (a .tar.gz) plus form
+    fields ``file_count`` and ``total_bytes``. Enforces the 25 MiB v1 cap (413 if
+    exceeded), stores the archive via ``compute_backends.store_runner_artifact``,
+    and links the returned descriptor into ``polling_metadata['runner_artifact']``
+    for the monitor/finalize path. Scoped to the pinned runner exactly like the
+    report endpoint, so runner A cannot upload to a job claimed by runner B.
+    """
+    # Early-reject obviously-oversized uploads before buffering the whole body.
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared = int(content_length)
+        except ValueError:
+            declared = None
+        if declared is not None and declared > _MAX_RUNNER_ARTIFACT_BYTES + _MULTIPART_BODY_MARGIN:
+            raise HTTPException(status_code=413, detail="artifact exceeds 25 MiB upload cap")
+
+    raw = await request.body()
+    fields, files = _parse_multipart_form(raw, request.headers.get("content-type", ""))
+
+    archive_bytes = files.get("archive")
+    if archive_bytes is None:
+        raise HTTPException(status_code=400, detail="missing 'archive' file field")
+    if len(archive_bytes) > _MAX_RUNNER_ARTIFACT_BYTES:
+        raise HTTPException(status_code=413, detail="artifact exceeds 25 MiB upload cap")
+
+    def _to_int(val: bytes | None) -> int:
+        try:
+            return int((val or b"0").decode("latin-1").strip())
+        except (ValueError, AttributeError):
+            return 0
+
+    file_count = _to_int(fields.get("file_count"))
+    total_bytes = _to_int(fields.get("total_bytes"))
+
+    # Same ownership scoping as the report endpoint: pinned runner only.
+    result = await session.execute(
+        select(ComputeJob)
+        .where(
+            ComputeJob.id == job_id,
+            ComputeJob.project_id == runner.project_id,
+            ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
+            ComputeJob.polling_metadata["runner_target_id"].as_string() == str(runner.id),
+        )
+        .with_for_update()
+    )
+    job = result.scalars().first()
+    if job is None:
+        raise HTTPException(status_code=404, detail="compute job not found")
+
+    # store_runner_artifact is implemented in parallel in app.compute_backends
+    # (pinned contract). Imported locally — same pattern as the repo-token import
+    # in /next-compute-job — so module import / app boot never depends on its
+    # presence at import time.
+    from app.compute_backends import store_runner_artifact
+
+    artifact_info = await store_runner_artifact(
+        session, job, archive_bytes, file_count, total_bytes
+    )
+
+    meta = dict(job.polling_metadata or {})
+    meta["runner_artifact"] = artifact_info
+    job.polling_metadata = meta
+    job.updated_at = _utcnow()
+    session.add(job)
+    await session.commit()
+
+    return {"ok": True, "runner_artifact": artifact_info}

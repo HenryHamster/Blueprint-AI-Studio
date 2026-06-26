@@ -526,7 +526,13 @@ def serialize_compute_job_response(job: object) -> Dict[str, Any]:
     return data
 
 
-_POLLING_METADATA_LAUNCH_SPEC_KEYS = frozenset({"env", "command", "cwd"})
+# Launch-spec keys removed from polling_metadata before operator-facing exposure.
+# ``container_registry_auth`` carries registry credentials (e.g. an NGC API key /
+# password) used to pull the experiment container for runner-subprocess jobs — it
+# must never reach the admin API alongside env/command/cwd internal launch material.
+_POLLING_METADATA_LAUNCH_SPEC_KEYS = frozenset(
+    {"env", "command", "cwd", "container_registry_auth"}
+)
 
 # Regex patterns for scrubbing secrets/credentials from RPC error messages.
 _URL_QUERY_RE = re.compile(r"\?[^\s'\"<>]*")
@@ -606,9 +612,10 @@ def _redact_dict_strings(obj: Any) -> Any:
 def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
     """Return a JSON-ready compute-job response with launch-spec fields redacted.
 
-    Strips ``env``, ``command``, and ``cwd`` from ``polling_metadata`` before
-    returning so operator-facing endpoints never expose internal launch material
-    that may contain secrets or internal paths.  Also sanitizes the promoted
+    Strips ``env``, ``command``, ``cwd``, and ``container_registry_auth`` from
+    ``polling_metadata`` before returning so operator-facing endpoints never
+    expose internal launch material that may contain secrets (e.g. a registry
+    password / NGC API key) or internal paths.  Also sanitizes the promoted
     ``compute_rpc_diagnostic`` to strip URL query strings and credential-bearing
     tokens from raw provider exception text, and promotes ``vm_phase``,
     and ``launch_contract`` for operator diagnostics.  The agent-facing endpoints

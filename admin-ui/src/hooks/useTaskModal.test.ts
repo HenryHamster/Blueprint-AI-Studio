@@ -1352,4 +1352,122 @@ describe('useTaskModal', () => {
     expect(body).not.toHaveProperty('cwd');
     expect(body).not.toHaveProperty('env');
   });
+
+  it('handleCreateTask sends container_image and container_registry_auth when set', async () => {
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskBranch('main');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+        containerImage: 'nvcr.io/nvidia/tensorflow:25.01',
+        containerRegistryServer: 'nvcr.io',
+        containerRegistryUsername: '$oauthtoken',
+        containerRegistryPassword: 'ngc-secret-key',
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
+    const body = mockCreateComputeExperiment.mock.calls[0][0];
+    expect(body.container_image).toBe('nvcr.io/nvidia/tensorflow:25.01');
+    expect(body.container_registry_auth).toEqual({
+      server: 'nvcr.io',
+      username: '$oauthtoken',
+      password: 'ngc-secret-key',
+    });
+  });
+
+  it('handleCreateTask sends container_image bare (no auth) when only the image is set', async () => {
+    const addToast = vi.fn();
+    const fetchTasksRef = { current: vi.fn() };
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, fetchTasksRef),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setNewTaskBranch('main');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+        containerImage: 'nvcr.io/nvidia/tensorflow:25.01',
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(mockCreateComputeExperiment).toHaveBeenCalledTimes(1);
+    const body = mockCreateComputeExperiment.mock.calls[0][0];
+    expect(body.container_image).toBe('nvcr.io/nvidia/tensorflow:25.01');
+    expect(body).not.toHaveProperty('container_registry_auth');
+  });
+
+  it('handleCreateTask rejects a registry password without server/username', async () => {
+    const addToast = vi.fn();
+    const { result } = renderHook(() =>
+      useTaskModal('create', addToast, { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.setNewTaskType('compute_experiment');
+      result.current.setNewTaskRepo('owner/repo');
+      result.current.setComputeExperiment(f => ({
+        ...f,
+        command: 'python train.py',
+        spendCapUsd: '5',
+        deadlineSeconds: '1800',
+        containerImage: 'nvcr.io/nvidia/tensorflow:25.01',
+        containerRegistryPassword: 'ngc-secret-key',
+      }));
+    });
+    await act(async () => {
+      await result.current.handleCreateTask({ preventDefault: vi.fn() } as unknown as React.FormEvent);
+    });
+    expect(addToast).toHaveBeenCalledWith(
+      'Registry credentials need a server and username when a password is set',
+      'error',
+    );
+    expect(mockCreateComputeExperiment).not.toHaveBeenCalled();
+  });
+
+  it('openDuplicateTaskModal prefills container image + registry server/username but never the password', () => {
+    const { result } = renderHook(() =>
+      useTaskModal('create', vi.fn(), { current: vi.fn() }),
+    );
+    act(() => {
+      result.current.openDuplicateTaskModal({
+        id: 'task-ce-container',
+        title: 'Containerized experiment',
+        description: 'rerun it',
+        task_type: 'compute_experiment',
+        payloads: [
+          {
+            github_repo: 'owner/repo',
+            base_branch: 'main',
+            command: 'python train.py',
+            spend_cap_usd: 5,
+            deadline_seconds: 1800,
+            container_image: 'nvcr.io/nvidia/tensorflow:25.01',
+            container_registry_auth: { server: 'nvcr.io', username: '$oauthtoken', password: 'should-not-leak' },
+          },
+        ] as unknown as Record<string, unknown>[],
+      } as unknown as Parameters<typeof result.current.openDuplicateTaskModal>[0]);
+    });
+    expect(result.current.computeExperiment.containerImage).toBe('nvcr.io/nvidia/tensorflow:25.01');
+    expect(result.current.computeExperiment.containerRegistryServer).toBe('nvcr.io');
+    expect(result.current.computeExperiment.containerRegistryUsername).toBe('$oauthtoken');
+    // Secret must never be prefilled from a stored payload.
+    expect(result.current.computeExperiment.containerRegistryPassword).toBe('');
+  });
 });

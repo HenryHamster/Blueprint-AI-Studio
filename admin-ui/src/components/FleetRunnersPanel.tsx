@@ -4,15 +4,27 @@ import { listFleetRunners, registerFleetRunner, revokeFleetRunner } from '../api
 import type { FleetRunner } from '../api';
 import { timeAgo, parseTimestamp } from '../utils/time';
 
-const LIVENESS_THRESHOLD_SEC = 120;
+// A runner is "live" (eligible for dispatch) only if it heartbeated within this
+// window. Mirrors the backend's `_RUNNER_LIVENESS_SECONDS` (orchestrator.py): a
+// runner past this cutoff is swept to status='inactive' and no longer dispatched
+// to, so the UI must not show "live" past it. Beyond the stale window it reads
+// fully offline.
+const LIVENESS_THRESHOLD_SEC = 300;
+const STALE_THRESHOLD_SEC = 600;
 
 function livenessLabel(lastSeenAt: string | null): { label: string; cls: string } {
   if (!lastSeenAt) return { label: 'never seen', cls: 'text-neutral-500' };
   const ageMs = Date.now() - parseTimestamp(lastSeenAt).getTime();
   const ageSec = ageMs / 1000;
   if (ageSec < LIVENESS_THRESHOLD_SEC) return { label: 'live', cls: 'text-emerald-400' };
-  if (ageSec < 600) return { label: 'stale', cls: 'text-amber-400' };
+  if (ageSec < STALE_THRESHOLD_SEC) return { label: 'stale', cls: 'text-amber-400' };
   return { label: 'offline', cls: 'text-neutral-500' };
+}
+
+/** Count of tasks the runner reported executing in its last heartbeat. */
+function activeTaskCount(caps: FleetRunner['capabilities']): number {
+  const ids = caps.active_task_ids;
+  return Array.isArray(ids) ? ids.length : 0;
 }
 
 function capsSummary(caps: FleetRunner['capabilities']): string {
@@ -195,6 +207,10 @@ export function FleetRunnersPanel({ projectId }: Props) {
         <div className="space-y-2">
           {runners.map(runner => {
             const { label: livLabel, cls: livCls } = livenessLabel(runner.last_seen_at);
+            // status is authoritative (set by the backend stale-runner sweep);
+            // distinct from the timestamp-derived live/stale label above.
+            const isActive = runner.status === 'active';
+            const activeCount = activeTaskCount(runner.capabilities);
             return (
               <div
                 key={runner.id}
@@ -214,6 +230,16 @@ export function FleetRunnersPanel({ projectId }: Props) {
                       <span className="text-xs text-neutral-500">{runner.version}</span>
                     )}
                     <span className={`text-xs font-medium ${livCls}`}>{livLabel}</span>
+                    {!isActive && (
+                      <span className="text-xs bg-neutral-700/40 border border-neutral-600/50 text-neutral-300 rounded px-1.5 py-0.5">
+                        {runner.status === 'inactive' ? 'offline (deactivated)' : runner.status}
+                      </span>
+                    )}
+                    {activeCount > 0 && (
+                      <span className="text-xs bg-blue-500/10 border border-blue-500/30 text-blue-400 rounded px-1.5 py-0.5">
+                        {activeCount} active
+                      </span>
+                    )}
                     {runner.capabilities.has_gpu && (
                       <span className="text-xs bg-purple-500/10 border border-purple-500/30 text-purple-400 rounded px-1.5 py-0.5">GPU</span>
                     )}

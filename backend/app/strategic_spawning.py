@@ -37,6 +37,7 @@ from app.models import (
     LocalRunner,
 )
 from app.deploy_identity import project_matches_deploy_identity
+from app.resource_envelope import resolve_project_require_local_runner
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.release_artifacts import (
     summarize_required_artifact_gap,
@@ -6074,8 +6075,19 @@ async def _spawn_strategic_review(
     # Live self-hosted local-runner availability, so the strategist avoids
     # authoring GPU compute_experiment tasks (which silently fall back to
     # billable cloud GPU) while the operator's hardware is offline. Included in
-    # the payload only when the project has ever registered a runner (below).
+    # the payload when the project has ever registered a runner OR declares the
+    # enforce-local policy (below).
     _local_runner_status = await _load_local_runner_status(session, project.id)
+    # Surface the enforce-local policy alongside availability so the strategist
+    # can reason about consequence: when require_local_runner is True a GPU
+    # experiment authored while no runner is live is HELD (never billable cloud
+    # fallback) and terminally fails after the hold window; when False it falls
+    # back to billable cloud GPU. Merged at the call site (not inside
+    # _load_local_runner_status) so that helper's return shape stays stable for
+    # its unit tests. Resolved from build_config.resource_envelope.
+    _local_runner_status["require_local_runner"] = resolve_project_require_local_runner(
+        project
+    )
     _active_direction_ids = [
         d.get("id")
         for d in (project.directions or [])
@@ -6113,13 +6125,18 @@ async def _spawn_strategic_review(
             **({"prune_candidates": _prune_candidates} if _prune_candidates else {}),
             **({"knowledge_index": _knowledge_index} if _knowledge_index else {}),
             **({"compute_experiment_sweeps": _compute_sweep_groups} if _compute_sweep_groups else {}),
-            # Live local-runner availability — surfaced ONLY when the operator
-            # has ever registered self-hosted hardware. Absent => agent authors
+            # Live local-runner availability — surfaced when the operator has
+            # ever registered self-hosted hardware OR the project declares the
+            # enforce-local policy (require_local_runner). Absent => agent authors
             # for cloud normally; present => agent can hold GPU experiments while
-            # active_gpu == 0 to avoid silent billable-cloud-GPU fallback.
+            # active_gpu == 0 to avoid silent billable-cloud-GPU fallback (or, when
+            # require_local_runner is set, an indefinite hold + terminal fail).
             **(
                 {"local_runner_status": _local_runner_status}
-                if _local_runner_status.get("ever_registered")
+                if (
+                    _local_runner_status.get("ever_registered")
+                    or _local_runner_status.get("require_local_runner")
+                )
                 else {}
             ),
             "running_update": project.running_update or "",

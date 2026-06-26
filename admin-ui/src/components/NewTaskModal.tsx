@@ -121,6 +121,7 @@ export function NewTaskModal({
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const [prNumberError, setPrNumberError] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [registryAuthOpen, setRegistryAuthOpen] = useState(false);
   const prNumberRef = useRef<HTMLInputElement>(null);
 
   const [ideaText, setIdeaText] = useState('');
@@ -509,6 +510,9 @@ export function NewTaskModal({
                   {submitAttempted && computeCommandInvalid && <p className="text-ui-sm text-red-500 mt-1">Command is required.</p>}
                 </div>
               )}
+              <p className="text-ui-sm text-neutral-500 mb-3">
+                The command must write the declared metric as JSON to <code className="text-neutral-400 font-mono">$BLUEPRINT_RESULT_FILE</code> — otherwise the result is lost.
+              </p>
               <div className="grid grid-cols-2 gap-3 mb-3">
                 <div>
                   <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Working Dir <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
@@ -563,6 +567,63 @@ export function NewTaskModal({
                     <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Machine Type <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
                     <div className="w-full bg-neutral-950 border border-neutral-800 text-neutral-600 rounded-lg px-3 py-2 text-base md:text-sm font-mono">
                       Default CPU
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="mb-3">
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Container Image <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                <input
+                  type="text"
+                  value={computeExperiment.containerImage}
+                  onChange={e => updateCompute('containerImage', e.target.value)}
+                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                  placeholder="nvcr.io/nvidia/tensorflow:25.01"
+                />
+                <p className="text-ui-sm text-neutral-600 mt-1">Container image to run the experiment in (required for CUDA/NGC stacks; without it the command runs bare).</p>
+                <button
+                  type="button"
+                  onClick={() => setRegistryAuthOpen(o => !o)}
+                  className="min-h-[44px] sm:min-h-0 mt-2 flex items-center gap-1 text-ui-sm font-medium text-neutral-500 hover:text-neutral-300 transition-colors"
+                >
+                  <ChevronDown className={`w-3 h-3 transition-transform ${registryAuthOpen ? 'rotate-180' : ''}`} />
+                  Registry credentials <span className="text-neutral-600 font-normal normal-case">(optional — private/gated registries)</span>
+                </button>
+                {registryAuthOpen && (
+                  <div className="mt-2 grid grid-cols-1 gap-2 rounded-md border border-neutral-800 bg-neutral-950/50 p-2.5">
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="block text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider mb-1">Server</label>
+                        <input
+                          type="text"
+                          value={computeExperiment.containerRegistryServer}
+                          onChange={e => updateCompute('containerRegistryServer', e.target.value)}
+                          className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                          placeholder="nvcr.io"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider mb-1">Username</label>
+                        <input
+                          type="text"
+                          value={computeExperiment.containerRegistryUsername}
+                          onChange={e => updateCompute('containerRegistryUsername', e.target.value)}
+                          className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                          placeholder="$oauthtoken"
+                        />
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider mb-1">Password / API key</label>
+                      <input
+                        type="password"
+                        autoComplete="new-password"
+                        value={computeExperiment.containerRegistryPassword}
+                        onChange={e => updateCompute('containerRegistryPassword', e.target.value)}
+                        className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                        placeholder="NGC API key (write-only — never echoed back)"
+                      />
+                      <p className="text-ui-sm text-neutral-600 mt-1">Set a password to enable <code className="font-mono">docker login</code>; server and username are then required.</p>
                     </div>
                   </div>
                 )}

@@ -506,13 +506,24 @@ def _runner_active_task_count(runner: LocalRunner) -> int:
         return 0
 
 
-def _runner_at_capacity(runner: LocalRunner) -> bool:
-    """True when the runner's active count has reached its declared max_concurrent."""
+def _runner_at_capacity(runner: LocalRunner, pins_this_cycle: int = 0) -> bool:
+    """True when the runner's EFFECTIVE load has reached its declared max_concurrent.
+
+    Effective load = heartbeat-reported active count (tasks the runner has already
+    pulled and reported) PLUS ``pins_this_cycle`` (tasks pinned to this runner
+    earlier in the SAME dispatch pass but not yet pulled/reported). The
+    heartbeat-reported ``active_task_ids`` lags pins by at least one heartbeat, so
+    without counting same-cycle pins a burst of N QUEUED tasks would all pin to a
+    single idle runner (it reads as load 0 on every iteration) and the surplus —
+    beyond what the runner can actually pull (max_concurrent) — would sit
+    PROVISIONING until falsely reaped. Counting the in-cycle pins caps NEW work
+    per cycle at the runner's real pull capacity.
+    """
     caps = runner.capabilities or {}
     max_concurrent = caps.get("max_concurrent")
     if max_concurrent is None:
         return False
-    return _runner_active_task_count(runner) >= max_concurrent
+    return _runner_active_task_count(runner) + pins_this_cycle >= max_concurrent
 
 
 async def _load_active_runners_cache(
@@ -549,6 +560,7 @@ async def _try_runner_dispatch(
     session: AsyncSession,
     task: Task,
     active_runners_cache: dict[uuid.UUID, list[LocalRunner]],
+    runner_pins_this_cycle: dict[uuid.UUID, int] | None = None,
 ) -> bool:
     """Pin a QUEUED task to an eligible registered runner, if one exists.
 
@@ -557,8 +569,19 @@ async def _try_runner_dispatch(
     warm-pool and GCP dispatch paths for this task. Returns False when no runner
     is eligible, leaving every existing dispatch path to run exactly as before.
 
+    ``runner_pins_this_cycle`` is a ``{runner_id: pins_so_far}`` counter the
+    caller resets ONCE per dispatch cycle (so it counts only pins made this
+    pass). It is consulted in the capacity check and incremented on a successful
+    pin so a burst of QUEUED tasks in one cycle never over-pins a single idle
+    runner beyond its max_concurrent pull capacity (the heartbeat-reported active
+    count lags pins by a heartbeat, so it alone reads 0 for every iteration).
+
     Driven entirely by runner registration — no LOCAL_MODE flag is consulted.
+    When omitted (single-call / test callers), it defaults to a fresh per-call
+    counter, so a lone dispatch behaves exactly as before.
     """
+    if runner_pins_this_cycle is None:
+        runner_pins_this_cycle = {}
     ctx = task.context or {}
     # Already pinned by a prior cycle — leave it for the runner to pull.
     if ctx.get("runner_target_id"):
@@ -569,7 +592,8 @@ async def _try_runner_dispatch(
     eligible = [
         r
         for r in candidates
-        if _runner_handles_task_type(r, task_type) and not _runner_at_capacity(r)
+        if _runner_handles_task_type(r, task_type)
+        and not _runner_at_capacity(r, runner_pins_this_cycle.get(r.id, 0))
     ]
     if not eligible:
         return False
@@ -587,8 +611,14 @@ async def _try_runner_dispatch(
             if not eligible:
                 return False
 
-    # Prefer the least-loaded runner (by heartbeat-reported active task count).
-    runner = min(eligible, key=_runner_active_task_count)
+    # Prefer the least-loaded runner by EFFECTIVE load (heartbeat-reported active
+    # count plus pins already made to it this cycle), so a multi-runner fleet
+    # spreads a same-cycle burst across runners instead of stacking one.
+    runner = min(
+        eligible,
+        key=lambda r: _runner_active_task_count(r)
+        + runner_pins_this_cycle.get(r.id, 0),
+    )
 
     new_ctx = dict(ctx)
     new_ctx["runner_target_id"] = str(runner.id)
@@ -612,6 +642,9 @@ async def _try_runner_dispatch(
         )
         await session.rollback()
         return False
+    # Only charge the in-cycle pin slot once the pin is durably committed — a
+    # rolled-back pin above must not consume the runner's per-cycle capacity.
+    runner_pins_this_cycle[runner.id] = runner_pins_this_cycle.get(runner.id, 0) + 1
     logger.info(
         "[RUNNERS] Pinned task %s (type=%s) to runner %s",
         task.id,
@@ -625,23 +658,65 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
     """Mark runners that missed the heartbeat window as inactive.
 
     Keeps the dispatch cache query clean and surfaces stale runners in the admin
-    listing. Stale PROVISIONING tasks pinned to a dead runner are recovered by
-    the existing orphaned-task sweep, so no new recovery code is needed here.
+    listing. Any task pinned to a now-inactive runner that the runner never
+    pulled (``started_at IS NULL``) is released back to QUEUED so the next
+    dispatch cycle can re-pin it to a live runner, hold it (enforce-local, with
+    the 6h safety-fail), or fall back to cloud. This recovery is required because
+    the orphaned-task reaper intentionally no longer reaps awaiting-pull runner
+    pins (they are not dead GCE VMs); without it a pin would wedge forever if its
+    runner went offline in the pin->pull window.
     """
     from sqlalchemy import or_, update as _sa_update
 
     cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    stale_ids = (
+        await session.execute(
+            select(LocalRunner.id).where(
+                LocalRunner.status == "active",
+                or_(
+                    LocalRunner.last_seen_at.is_(None),
+                    LocalRunner.last_seen_at < cutoff,
+                ),
+            )
+        )
+    ).scalars().all()
+    if not stale_ids:
+        return
+
     await session.execute(
         _sa_update(LocalRunner)
-        .where(
-            LocalRunner.status == "active",
-            or_(
-                LocalRunner.last_seen_at.is_(None),
-                LocalRunner.last_seen_at < cutoff,
-            ),
-        )
+        .where(LocalRunner.id.in_(stale_ids))
         .values(status="inactive")
     )
+
+    # Release unpulled pins on the now-inactive runners back to QUEUED. A pin the
+    # runner never claimed has started_at IS NULL and vm_instance_id "runner:{id}"
+    # (set together in _try_runner_dispatch); clearing the pin lets the dispatch
+    # loop re-decide next cycle.
+    stale_vm_ids = [f"runner:{rid}" for rid in stale_ids]
+    pinned = (
+        await session.execute(
+            select(Task).where(
+                Task.status == TaskStatus.PROVISIONING,
+                Task.started_at.is_(None),
+                Task.vm_instance_id.in_(stale_vm_ids),
+            )
+        )
+    ).scalars().all()
+    for task in pinned:
+        task.status = TaskStatus.QUEUED
+        task.vm_instance_id = None
+        task.vm_provisioned_at = None
+        new_ctx = dict(task.context or {})
+        new_ctx.pop("runner_target_id", None)
+        task.context = new_ctx
+        session.add(task)
+        logger.info(
+            "[RUNNERS] Released unpulled pin for task %s from a now-inactive "
+            "runner (back to QUEUED for re-dispatch)",
+            task.id,
+        )
+
     await session.commit()
 
 
@@ -3703,6 +3778,14 @@ async def orchestrator_worker():
                 # never issues a DB query. Empty dict when none are registered —
                 # the common case, in which all dispatch paths run unchanged.
                 _active_runners_cache = await _load_active_runners_cache(session)
+                # Per-cycle pin counter ({runner_id: pins_made_this_pass}).
+                # Declared inside the cycle body so it RESETS every dispatch pass
+                # — it must count only pins made in THIS cycle, since the runner's
+                # heartbeat-reported active count catches up between cycles.
+                # _try_runner_dispatch reads it (capacity check) and increments it
+                # on each committed pin so one idle runner is never over-pinned
+                # beyond its max_concurrent in a single burst.
+                _runner_pins_this_cycle: dict[uuid.UUID, int] = {}
 
                 for _qt_id, _task_type_for_gate in _queued_task_gate_info:
                     # Per-type failure gate: skip tasks whose type is currently failing
@@ -3783,7 +3866,10 @@ async def orchestrator_worker():
                         # existing dispatch path runs exactly as before. No
                         # LOCAL_MODE flag is involved.
                         if await _try_runner_dispatch(
-                            session, task, _active_runners_cache
+                            session,
+                            task,
+                            _active_runners_cache,
+                            _runner_pins_this_cycle,
                         ):
                             _cycle_dispatched += 1
                             continue

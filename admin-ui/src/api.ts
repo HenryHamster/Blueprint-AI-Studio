@@ -221,6 +221,17 @@ export interface ComputeExperimentLaunchRequest {
   require_live_release?: boolean;
   require_durable_artifact?: boolean;
   provisioning_model?: string;
+  // Optional container image the experiment runs inside (e.g. nvcr.io/nvidia/...).
+  // Required for CUDA/NGC stacks; absent ⇒ the command runs bare on the runner.
+  container_image?: string;
+  // Optional credentials for a private/gated registry. The self-hosted local
+  // runner performs `docker login --password-stdin` with these before pulling.
+  // The password is write-only — never returned from any GET.
+  container_registry_auth?: {
+    server?: string;
+    username?: string;
+    password?: string;
+  };
   model?: string;
   effort?: string;
 }
@@ -4049,6 +4060,8 @@ export interface FleetRunner {
     task_types?: string | string[];
     has_gpu?: boolean;
     max_concurrent?: number;
+    // Task ids the runner reported as currently executing in its last heartbeat.
+    active_task_ids?: string[];
     [key: string]: unknown;
   };
   last_seen_at: string | null;

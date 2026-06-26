@@ -46,6 +46,13 @@ export interface ComputeExperimentForm {
   requireLiveRelease: boolean;
   requireDurableArtifact: boolean;
   provisioningModel: 'STANDARD' | 'SPOT';
+  // Optional container image the experiment runs inside (e.g. nvcr.io/nvidia/...).
+  containerImage: string;
+  // Optional private-registry credentials. password is write-only — never
+  // prefilled from a stored payload (see openDuplicateTaskModal).
+  containerRegistryServer: string;
+  containerRegistryUsername: string;
+  containerRegistryPassword: string;
 }
 
 export const COMPUTE_ACCELERATOR_OPTIONS = [
@@ -81,6 +88,10 @@ export function defaultComputeExperimentForm(): ComputeExperimentForm {
     requireLiveRelease: false,
     requireDurableArtifact: false,
     provisioningModel: 'STANDARD',
+    containerImage: '',
+    containerRegistryServer: '',
+    containerRegistryUsername: '',
+    containerRegistryPassword: '',
   };
 }
 
@@ -448,6 +459,26 @@ export function useTaskModal(
     const hypothesis = computeExperiment.hypothesis.trim();
     const metric = computeExperiment.metric.trim();
     const cwd = computeExperiment.cwd.trim();
+    // Optional container image + private-registry credentials. The runner runs
+    // the command inside container_image (docker run) and, when a password is
+    // supplied, performs `docker login` first. Only send container_registry_auth
+    // when a password is present; password requires server + username.
+    const containerImage = computeExperiment.containerImage.trim();
+    const registryServer = computeExperiment.containerRegistryServer.trim();
+    const registryUsername = computeExperiment.containerRegistryUsername.trim();
+    const registryPassword = computeExperiment.containerRegistryPassword;
+    let containerRegistryAuth: { server: string; username: string; password: string } | undefined;
+    if (registryPassword) {
+      if (!registryServer || !registryUsername) {
+        addToast('Registry credentials need a server and username when a password is set', 'error');
+        return;
+      }
+      containerRegistryAuth = {
+        server: registryServer,
+        username: registryUsername,
+        password: registryPassword,
+      };
+    }
     // Parse KEY=VALUE lines into an env record; skip blank lines and comments.
     const envRecord: Record<string, string> = {};
     for (const line of computeExperiment.envVars.split('\n')) {
@@ -484,6 +515,8 @@ export function useTaskModal(
       ...(benchmark ? { benchmark } : {}),
       ...(hypothesis ? { hypothesis } : {}),
       ...(metric ? { metric } : {}),
+      ...(containerImage ? { container_image: containerImage } : {}),
+      ...(containerRegistryAuth ? { container_registry_auth: containerRegistryAuth } : {}),
       ...(successCriterion ? { success_criterion: successCriterion } : {}),
       ...(computeExperiment.requireLiveRelease ? { require_live_release: true } : {}),
       ...(computeExperiment.requireDurableArtifact
@@ -703,6 +736,17 @@ export function useTaskModal(
         requireLiveRelease: (payload.require_live_release as boolean) || false,
         requireDurableArtifact: (payload.require_durable_artifact as boolean) || false,
         provisioningModel: ((payload.provisioning_model as 'STANDARD' | 'SPOT') || 'STANDARD'),
+        containerImage: (payload.container_image as string) || '',
+        containerRegistryServer: (() => {
+          const auth = payload.container_registry_auth as { server?: string } | undefined;
+          return auth?.server || '';
+        })(),
+        containerRegistryUsername: (() => {
+          const auth = payload.container_registry_auth as { username?: string } | undefined;
+          return auth?.username || '';
+        })(),
+        // Never prefill the registry password — it is a write-only secret.
+        containerRegistryPassword: '',
       });
     } else {
       setComputeExperiment(defaultComputeExperimentForm());

@@ -1561,6 +1561,12 @@ class ComputeExperimentTaskPayload(BaseModel):
     require_live_release: bool = False
     require_durable_artifact: bool = False
     provisioning_model: str | None = None
+    # Container-aware runner fields (parity with the research/plan authoring path):
+    # required for CUDA/NGC stacks (e.g. nvcr.io images) or the command runs bare.
+    # The registry password is only ever persisted for runner-subprocess jobs.
+    container_image: str | None = None
+    container_registry_auth: dict[str, str] | None = None
+    setup_step: str | None = None
     idempotency_key: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
     )
@@ -2404,6 +2410,9 @@ async def create_compute_experiment_task(
         "hypothesis",
         "metric",
         "provisioning_model",
+        "container_image",
+        "container_registry_auth",
+        "setup_step",
     ):
         val = getattr(payload, opt_key)
         if val is not None:
@@ -2494,6 +2503,9 @@ async def create_compute_experiment_task(
                 "provisioning_model",
                 "arms",
                 "declared_metric",
+                "container_image",
+                "container_registry_auth",
+                "setup_step",
             )
             if launch_contract.get(k) is not None
         },

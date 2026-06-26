@@ -119,6 +119,39 @@ def _vm_tool_use_within_cutoff(
     return last_tool_use is not None and last_tool_use >= progress_cutoff
 
 
+def _is_runner_pinned_awaiting_pull(task) -> bool:
+    """True iff this task is a self-hosted-runner pin still awaiting its pull.
+
+    The orchestrator pins a QUEUED task to a registered local runner by setting
+    ``vm_instance_id = 'runner:{id}'`` and ``status = PROVISIONING`` with
+    ``vm_provisioned_at`` stamped (orchestrator.py ``_try_runner_dispatch``). Such
+    a task is NOT a dispatched-then-dead GCE VM: no VM was ever provisioned. It
+    sits PROVISIONING until the operator's runner polls
+    ``POST /api/runner/next-task`` — which sets ``started_at`` (runner.py) — so a
+    pin still awaiting that pull always has ``started_at IS NULL``.
+
+    The silent pre-claim VM-death reap keys on ``vm_provisioned_at < cutoff and
+    last_heartbeat is None``; left ungated it would reap a runner pin the moment
+    the (6-10 min) timer elapses, even though there is no VM to have died and the
+    operator's runner may simply be briefly offline (laptop asleep / rebooting)
+    and will pull the pin when it returns. Excluding it here lets the work wait
+    for the runner instead of churning requeue→repin→reap. (Genuinely-stuck
+    require-local work is separately bounded by the 6h hold sweep,
+    orchestrator.py ``_fail_stale_local_runner_holds``.)
+
+    Scoped narrowly: only the ``runner:`` vm-id prefix + ``started_at IS NULL``
+    match here, so cloud/GCE PROVISIONING tasks (numeric/instance-name vm ids, or
+    runner tasks the runner has already pulled and stamped ``started_at``) are
+    reaped exactly as before.
+    """
+    vm_id = getattr(task, "vm_instance_id", None)
+    return (
+        isinstance(vm_id, str)
+        and vm_id.startswith("runner:")
+        and getattr(task, "started_at", None) is None
+    )
+
+
 def _classify_orphan(
     task,
     now: datetime,
@@ -184,12 +217,21 @@ def _classify_orphan(
             task.vm_provisioned_at
             and task.vm_provisioned_at < _preclaim_stale_cutoff(task, now)
             and task.last_heartbeat is None
+            and not _is_runner_pinned_awaiting_pull(task)
         ):
             # Silent pre-claim death: VM was dispatched long enough ago
             # (scope-aware: small 6min, medium 8min, large 10min) and the
             # agent never claimed. Charge provision budget. vm_contact override:
             # if the agent has actually been calling in within hb_cutoff it is
             # NOT a silent death — suppress the reap.
+            #
+            # Runner-pin exclusion: a task pinned to a self-hosted runner
+            # (vm_instance_id='runner:{id}', started_at IS NULL) was never a GCE
+            # VM — it is waiting for the operator's runner to poll. The
+            # vm_provisioned_at timer must NOT reap it as a pre-claim death; that
+            # caused surplus runner-pinned compute_experiments to churn
+            # (requeue→repin→reap). It is bounded instead by the 6h local-runner
+            # hold sweep (orchestrator.py _fail_stale_local_runner_holds).
             return not _vm_contact_within_cutoff(task, hb_cutoff, vm_contact_lookup)
         return False
 
