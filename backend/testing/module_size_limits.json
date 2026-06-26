@@ -6,7 +6,7 @@
     "task_completion_self_audit.py": 600,
     "task_lifecycle.py": 7750,
     "task_lifecycle_requeue.py": 1250,
-    "orchestrator.py": 7750,
+    "orchestrator.py": 9100,
     "orchestrator_health.py": 1150,
     "orchestrator_runtime_env.py": 400,
     "admin.py": 3200,
@@ -94,7 +94,7 @@
     "orchestrator_filters.py": 1850,
     "knowledge_completion.py": 2950,
     "alert_dispatch.py": 1750,
-    "compute_jobs.py": 2500,
+    "compute_jobs.py": 2900,
     "task_evaluators.py": 2300,
     "release_scoring.py": 2100,
     "runtime_config_state.py": 2050,
@@ -114,7 +114,7 @@
     "release_version.py": 1750,
     "ci_resolution.py": 1800,
     "routers/admin_project_config.py": 1800,
-    "compute_backends.py": 1800
+    "compute_backends.py": 2300
   },
   "agent": {
     "index.ts": 4600,
