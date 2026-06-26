@@ -13,6 +13,7 @@ vi.mock('../api', () => ({
   fetchTaskTypeCatalog: vi.fn(async () => []),
   createComputeExperiment: vi.fn(async () => ({ id: 'compute-experiment-test' })),
   computeExperimentPreflight: vi.fn(async () => ({})),
+  draftComputeExperiment: vi.fn(async () => ({ draft_available: false })),
 }));
 
 const LAUNCHABLE_OPTIONS = [

@@ -23,6 +23,7 @@ vi.mock('../api', () => ({
   triggerQualify: vi.fn(),
   setVersionPhase: vi.fn(),
   setVersionGoal: vi.fn(),
+  setVersionTheme: vi.fn(async () => ({ theme: null })),
   patchAdminSettings: vi.fn(),
   setProjectPromotionEnabled: vi.fn(),
   clearDeployFailed: vi.fn(),

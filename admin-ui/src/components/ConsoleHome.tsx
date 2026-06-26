@@ -222,7 +222,7 @@ export function ConsoleHome({
         <button
           onClick={handleRunSelfAudit}
           disabled={auditLoading}
-          className="w-full flex items-center gap-2 px-3 py-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg hover:bg-neutral-800/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-left"
+          className="w-full flex items-center gap-2 min-h-11 px-3 py-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg hover:bg-neutral-800/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-left"
         >
           <Zap className="w-4 h-4 text-neutral-400 shrink-0" />
           <span className="text-xs font-medium text-neutral-300">

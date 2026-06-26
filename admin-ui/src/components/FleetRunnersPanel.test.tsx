@@ -73,11 +73,13 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.querySelector('.text-emerald-400')).not.toBeNull();
   });
 
-  test('livenessLabel shows "stale" for runner seen 3 minutes ago', async () => {
+  test('livenessLabel shows "stale" for runner seen 7 minutes ago', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([
       {
         ...SAMPLE_RUNNERS[0],
-        last_seen_at: new Date(Date.now() - 3 * 60 * 1000).toISOString(), // 3 min ago — stale
+        // Inside the stale window: past the 300s liveness cutoff (mirrors the
+        // backend dispatch threshold) but before the 600s offline cutoff.
+        last_seen_at: new Date(Date.now() - 7 * 60 * 1000).toISOString(), // 7 min ago — stale
       },
     ]);
     const el = await mount();
