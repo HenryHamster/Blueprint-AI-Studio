@@ -4964,3 +4964,66 @@ class EvergreenFillDecisionLog(SQLModel, table=True):
             "ts",
         ),
     )
+
+
+class LocalRunner(SQLModel, table=True):
+    """A pull-based fleet runner registered on operator hardware.
+
+    A runner enrolls via ``POST /api/admin/projects/{id}/runners/register`` (which
+    returns a one-time secret token), then polls ``POST /api/runner/next-task`` with
+    that token to receive tasks the orchestrator has pinned to it. The orchestrator
+    pins QUEUED tasks to an active registered runner BEFORE the warm-pool/GCP dispatch
+    paths, so operator hardware becomes a first-class fleet member with no LOCAL_MODE
+    flag. Only the SHA256 hash of the token is ever stored.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    # Deleted with the project so a runner can't outlive its owning project.
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+    # SHA256 hex digest of the runner's secret token (never the plaintext).
+    token_hash: str = Field(sa_column=Column(String(64), nullable=False, index=True))
+    hostname: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    version: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    # "active" | "inactive" | "deleted"
+    status: str = Field(
+        default="active",
+        sa_column=Column(String(16), nullable=False, server_default=text("'active'")),
+    )
+    # {"task_types": "all" | [str], "has_gpu": bool, "max_concurrent": int}
+    capabilities: Dict[str, Any] = Field(
+        default_factory=lambda: {
+            "task_types": "all",
+            "has_gpu": False,
+            "max_concurrent": 2,
+        },
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    last_seen_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        # Dispatch-cache hot path: per-project active-runner scans filtered on
+        # status + last_seen_at recency.
+        Index(
+            "ix_localrunner_project_status",
+            "project_id",
+            "status",
+        ),
+    )
