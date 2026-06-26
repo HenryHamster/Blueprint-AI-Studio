@@ -119,6 +119,27 @@ function normalizeArms(arms: unknown): ArmRecord[] | null {
   return records.length > 0 ? records : null;
 }
 
+type ArmVerdict = {
+  winnerName: string;
+  winnerValue: number;
+  runnerUpName: string;
+  runnerUpValue: number;
+  margin: number;
+};
+
+function armComparisonVerdict(arms: ArmRecord[], metricKey: string, direction: MetricDirection): ArmVerdict | null {
+  if (direction === 'unknown') return null;
+  const measured = arms
+    .map((arm) => ({ name: arm.name, value: typeof arm.metrics[metricKey] === 'number' ? arm.metrics[metricKey] as number : null }))
+    .filter((a): a is { name: string; value: number } => a.value !== null);
+  if (measured.length < 2) return null;
+  const sorted = [...measured].sort((a, b) => direction === 'higher_better' ? b.value - a.value : a.value - b.value);
+  const winner = sorted[0];
+  const runnerUp = sorted[1];
+  const margin = direction === 'higher_better' ? winner.value - runnerUp.value : runnerUp.value - winner.value;
+  return { winnerName: winner.name, winnerValue: winner.value, runnerUpName: runnerUp.name, runnerUpValue: runnerUp.value, margin };
+}
+
 function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
   let criterionMetric: string | null = null;
   const extraKeys = new Set<string>();
@@ -1101,6 +1122,29 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                             );
                           })}
                         </div>
+                        {(() => {
+                          const cv = job.criterion_verdict;
+                          if (!cv?.metric) return null;
+                          const dir: MetricDirection = cv.operator === '>=' || cv.operator === '>' ? 'higher_better' : 'lower_better';
+                          const verdict = armComparisonVerdict(arms, cv.metric, dir);
+                          if (!verdict) return null;
+                          return (
+                            <div
+                              className="mt-1.5 flex items-center gap-1.5 text-ui-sm font-mono flex-wrap"
+                              data-testid="arm-comparison-verdict"
+                            >
+                              <span className="text-neutral-500 shrink-0">Winner</span>
+                              <span className="font-semibold text-emerald-300">{verdict.winnerName}</span>
+                              <span className="text-neutral-400">{cv.metric}={verdict.winnerValue}</span>
+                              <span
+                                className="rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-ui-xs font-semibold text-emerald-300"
+                                data-testid="arm-comparison-margin"
+                              >
+                                +{verdict.margin.toFixed(2)} vs {verdict.runnerUpName}
+                              </span>
+                            </div>
+                          );
+                        })()}
                       </div>
                     )}
                   </>

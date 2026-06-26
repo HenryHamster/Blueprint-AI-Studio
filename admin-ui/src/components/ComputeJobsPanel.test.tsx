@@ -1886,4 +1886,88 @@ describe('ComputeJobsPanel render + kill', () => {
     await findByText('No compute jobs');
     expect(queryByTestId('compute-lifetime-summary')).toBeNull();
   });
+
+  test('arms breakdown renders winner verdict and positive margin for higher_better criterion metric', async () => {
+    const armsJob = makeJob({
+      id: 'job-verdict',
+      task_title: 'verdict experiment',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 2.0,
+      success_criterion: { metric: 'val_acc', operator: '>=', threshold: 0.9 },
+      criterion_verdict: { metric: 'val_acc', operator: '>=', threshold: 0.9, value: 0.95, met: true, measurable: true },
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-a': { val_acc: 0.90, lr: 0.01 },
+            'arm-b': { val_acc: 0.95, lr: 0.001 },
+          },
+        },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([armsJob]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const verdict = await findByTestId('arm-comparison-verdict');
+    expect(verdict.textContent).toContain('Winner');
+    expect(verdict.textContent).toContain('arm-b');
+    const marginChip = await findByTestId('arm-comparison-margin');
+    // arm-b (0.95) beats arm-a (0.90) by 0.05
+    expect(marginChip.textContent).toContain('+0.05');
+    expect(marginChip.textContent).toContain('arm-a');
+    expect(marginChip.classList.contains('text-emerald-300')).toBe(true);
+  });
+
+  test('arms breakdown renders no verdict when fewer than two arms have the criterion metric value', async () => {
+    const armsJob = makeJob({
+      id: 'job-no-verdict',
+      task_title: 'incomplete arms experiment',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.5,
+      success_criterion: { metric: 'val_acc', operator: '>=', threshold: 0.9 },
+      criterion_verdict: { metric: 'val_acc', operator: '>=', threshold: 0.9, value: 0.91, met: true, measurable: true },
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-a': { val_acc: 0.91 },
+            'arm-b': { exit_code: 1, error: 'OOM' },
+          },
+        },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([armsJob]));
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Arms breakdown renders but no verdict since only arm-a has val_acc
+    await findByTestId('arms-breakdown');
+    expect(queryByTestId('arm-comparison-verdict')).toBeNull();
+  });
+
+  test('arms breakdown verdict shows correct winner for lower_better (<=) criterion metric', async () => {
+    const armsJob = makeJob({
+      id: 'job-lower-better',
+      task_title: 'latency experiment',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.5,
+      success_criterion: { metric: 'latency_ms', operator: '<=', threshold: 100 },
+      criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 80, met: true, measurable: true },
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-fast': { latency_ms: 80 },
+            'arm-slow': { latency_ms: 120 },
+          },
+        },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([armsJob]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const verdict = await findByTestId('arm-comparison-verdict');
+    // arm-fast wins (lower latency is better)
+    expect(verdict.textContent).toContain('arm-fast');
+    const marginChip = await findByTestId('arm-comparison-margin');
+    // margin = 120 - 80 = 40
+    expect(marginChip.textContent).toContain('+40.00');
+    expect(marginChip.textContent).toContain('arm-slow');
+  });
 });
