@@ -113,6 +113,11 @@ GCP_BACKEND_NAME = "gcp"
 LOCAL_GPU_BACKEND_NAME = "local-gpu"
 RUNNER_SUBPROCESS_BACKEND_NAME = "runner-subprocess"
 
+
+def is_zero_cost_backend(name: str) -> bool:
+    """Return True for backends that run on operator/local hardware Blueprint does not pay for."""
+    return name in (LOCAL_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME)
+
 # Fixed in-container path where the job's state directory is mounted.
 # The command writes result.json and artifacts/ here; the host-side mount makes
 # them visible at the job's state dir path without any post-run copy step.

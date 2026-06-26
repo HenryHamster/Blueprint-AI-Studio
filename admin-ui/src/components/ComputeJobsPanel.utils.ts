@@ -111,6 +111,24 @@ export function computeJobProjectedSpend(
   return accrued + burnRatePerHr * (remainingSec / 3600);
 }
 
+/** Map a job backend string to a human-readable execution location label and
+ *  a zero-cost flag. Unknown backends fall back to the raw backend string. */
+export function computeJobExecutionLocation(backend: string): {
+  label: string;
+  isOperatorHardware: boolean;
+} {
+  switch (backend) {
+    case 'local-subprocess':
+      return { label: 'Operator hardware', isOperatorHardware: true };
+    case 'local-gpu':
+      return { label: 'Operator hardware · GPU', isOperatorHardware: true };
+    case 'gcp':
+      return { label: 'GCP cloud', isOperatorHardware: false };
+    default:
+      return { label: backend, isOperatorHardware: false };
+  }
+}
+
 /** Calculate the margin (distance from threshold to actual value).
  *  Positive margin means the result beat the threshold; negative means it missed.
  *  For >= / > operators: margin = value - threshold

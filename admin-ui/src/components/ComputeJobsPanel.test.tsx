@@ -8,6 +8,7 @@ import {
   computeJobRpcDiagnostic,
   computeJobRuntimeSec,
   computeJobMargin,
+  computeJobExecutionLocation,
   fmtCountdown,
   fmtDuration,
 } from './ComputeJobsPanel.utils';
@@ -181,6 +182,20 @@ describe('ComputeJobsPanel helpers', () => {
     }))).toBeNull();
     expect(computeJobMargin(makeJob({ criterion_verdict: null }))).toBeNull();
     expect(computeJobMargin(makeJob())).toBeNull();
+  });
+
+  test('computeJobExecutionLocation maps known local backends to operator-hardware', () => {
+    expect(computeJobExecutionLocation('local-subprocess')).toEqual({ label: 'Operator hardware', isOperatorHardware: true });
+    expect(computeJobExecutionLocation('local-gpu')).toEqual({ label: 'Operator hardware · GPU', isOperatorHardware: true });
+  });
+
+  test('computeJobExecutionLocation maps gcp to GCP cloud', () => {
+    expect(computeJobExecutionLocation('gcp')).toEqual({ label: 'GCP cloud', isOperatorHardware: false });
+  });
+
+  test('computeJobExecutionLocation falls back to raw string for unknown backends', () => {
+    expect(computeJobExecutionLocation('gcp_compute_engine')).toEqual({ label: 'gcp_compute_engine', isOperatorHardware: false });
+    expect(computeJobExecutionLocation('unknown-backend')).toEqual({ label: 'unknown-backend', isOperatorHardware: false });
   });
 });
 
@@ -1940,6 +1955,71 @@ describe('ComputeJobsPanel render + kill', () => {
     // Arms breakdown renders but no verdict since only arm-a has val_acc
     await findByTestId('arms-breakdown');
     expect(queryByTestId('arm-comparison-verdict')).toBeNull();
+  });
+
+  test('operator-hardware job (local-subprocess) shows friendly label and $0.00 not-billed cost', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({ backend: 'local-subprocess', spend_cap_usd: 4.0, accrued_cost_usd: 0 }),
+    ]));
+    const { findByText, findByTestId, queryByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    // Friendly label in subtitle
+    const subtitle = await findByText((t) => t.includes('Operator hardware'));
+    expect(subtitle.textContent).toContain('Operator hardware');
+    expect(subtitle.textContent).not.toContain('local-subprocess');
+    // Cost block shows $0.00 + not-billed label instead of budget bar
+    const costRow = await findByTestId('compute-operator-cost');
+    expect(costRow.textContent).toContain('$0.00');
+    expect(costRow.textContent).toContain('not billed at cloud rates');
+    // No budget bar readout
+    expect(queryByText(/Budget/)).toBeNull();
+  });
+
+  test('operator-hardware GPU job (local-gpu) shows GPU label and $0.00 not-billed cost', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({ backend: 'local-gpu', spend_cap_usd: 4.0, accrued_cost_usd: 0 }),
+    ]));
+    const { findByText, findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    const subtitle = await findByText((t) => t.includes('Operator hardware · GPU'));
+    expect(subtitle.textContent).toContain('Operator hardware · GPU');
+    const costRow = await findByTestId('compute-operator-cost');
+    expect(costRow.textContent).toContain('$0.00');
+    expect(costRow.textContent).toContain('not billed at cloud rates');
+  });
+
+  test('GCP job still shows budget bar with real cost amounts (non-regression)', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({ backend: 'gcp_compute_engine', accrued_cost_usd: 2.0, spend_cap_usd: 4.0 }),
+    ]));
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('$2.00 / $4.00');
+    // Standard budget bar rendered, not the operator cost row
+    expect(queryByTestId('compute-operator-cost')).toBeNull();
+  });
+
+  test('provisioning-death path is unaffected when backend is gcp (non-regression)', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        backend: 'gcp_compute_engine',
+        status: 'TIMED_OUT',
+        outcome: 'TIMED_OUT',
+        final_cost_usd: 0,
+        terminal_reason: 'compute job timed out while provisioning',
+        vm_phase: 'provisioning',
+        launch_contract: { requested_deadline_seconds: 600, provisioning_model: 'best_effort' },
+        compute_rpc_diagnostic: makeDiagnostic({
+          operation: 'launch',
+          error_type: 'QuotaExceeded',
+          error_message: 'quota exceeded',
+        }),
+      }),
+    ]));
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Provisioning cause block shows for gcp
+    await findByTestId('compute-provisioning-cause');
+    // No operator-cost row for a gcp backend
+    expect(queryByTestId('compute-operator-cost')).toBeNull();
   });
 
   test('arms breakdown verdict shows correct winner for lower_better (<=) criterion metric', async () => {

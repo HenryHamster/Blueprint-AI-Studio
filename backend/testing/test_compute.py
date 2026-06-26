@@ -3558,6 +3558,65 @@ async def test_local_subprocess_still_rejected_for_gpu(db_session, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_operator_local_backends_accrue_zero_cost(db_session, monkeypatch):
+    """local-subprocess and local-gpu backends persist cost_rate_per_second=0.0,
+    while gcp retains a positive billed rate.  _accrued_cost stays $0 for local runs."""
+    from app import compute_backends as cb
+    from app.compute_backends import _accrued_cost
+    from datetime import timezone
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task_local = await _make_compute_task(db_session)
+
+    # local-subprocess: rate must be exactly 0.0
+    job_local = await compute_jobs.create_compute_job(
+        db_session,
+        task_local,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="local-subprocess",
+    )
+    assert job_local.polling_metadata["cost_rate_per_second"] == 0.0
+
+    # _accrued_cost stays $0 even after simulated elapsed time
+    job_local.started_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    as_of = datetime(2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc)  # 1 hour later
+    assert _accrued_cost(job_local, as_of) == 0.0
+
+    # local-gpu: rate must also be 0.0
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: {"name": "Tesla T4", "memory_mib": 15360})
+    monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: {"name": "Tesla T4", "memory_mib": 15360})
+    task_gpu = await _make_compute_task(db_session)
+    job_gpu = await compute_jobs.create_compute_job(
+        db_session,
+        task_gpu,
+        command="python train.py",
+        machine_type="n1-standard-1",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="local-gpu",
+        accelerator="T4",
+    )
+    assert job_gpu.polling_metadata["cost_rate_per_second"] == 0.0
+
+    # gcp backend must retain a positive (billed) rate
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task_gcp = await _make_compute_task(db_session)
+    job_gcp = await compute_jobs.create_compute_job(
+        db_session,
+        task_gcp,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="gcp",
+    )
+    assert job_gcp.polling_metadata["cost_rate_per_second"] > 0.0
+
+
+@pytest.mark.asyncio
 async def test_process_compute_jobs_once_kills_on_spend_cap(db_session, monkeypatch):
     project = Project(name="Compute Job Budget Kill", user_id="test-user")
     db_session.add(project)

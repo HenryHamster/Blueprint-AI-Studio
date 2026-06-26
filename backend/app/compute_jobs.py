@@ -34,6 +34,7 @@ from app.compute_backends import (
     default_compute_backend_name,
     detect_local_gpu,
     get_compute_backend,
+    is_zero_cost_backend,
     run_preflight_smoke,
     validate_backend_name,
 )
@@ -408,14 +409,18 @@ async def create_compute_job(
         _utcnow() + timedelta(seconds=provisioning_budget_seconds),
         deadline_at,
     )
-    # Accelerator-aware rate: base machine + GPU surcharge (N1+T4/V100) or the
-    # bundled G2 rate (L4); falls through to the plain VM rate for CPU jobs.
-    rate = get_compute_rate_per_second(
-        machine_type=resolved_machine_type,
-        accelerator=persisted_accelerator,
-        count=accelerator_count,
-        spot=normalized_provisioning == "SPOT",
-    )
+    # Operator/local backends (local-subprocess, local-gpu) run on hardware Blueprint
+    # does not pay cloud rates for — persist $0 so accrual is genuinely zero.
+    # GCP retains the full accelerator-aware rate (base + GPU surcharge).
+    if is_zero_cost_backend(normalized_backend):
+        rate = 0.0
+    else:
+        rate = get_compute_rate_per_second(
+            machine_type=resolved_machine_type,
+            accelerator=persisted_accelerator,
+            count=accelerator_count,
+            spot=normalized_provisioning == "SPOT",
+        )
     # Park deadline: worst-case window (declared runtime + provisioning allowance)
     # plus grace. Stored in polling_metadata so the agent can read it from the
     # job response instead of recomputing from the declared deadline alone.

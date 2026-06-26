@@ -15,6 +15,7 @@ import {
   computeJobBurnRate,
   computeJobProjectedSpend,
   computeJobMargin,
+  computeJobExecutionLocation,
   fmtUsd,
   fmtCountdown,
   fmtDuration,
@@ -689,6 +690,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
           const cap = job.spend_cap_usd ?? 0;
           const spent = computeJobSpent(job);
           const pct = cap > 0 ? Math.min(1, spent / cap) : 0;
+          const { label: backendLabel, isOperatorHardware } = computeJobExecutionLocation(job.backend ?? '');
           return (
             <div
               key={job.id}
@@ -709,7 +711,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     </div>
                   )}
                   <div className="text-ui-sm text-neutral-500 font-mono mt-0.5 break-words">
-                    {job.backend}
+                    {backendLabel}
                     {job.machine_type ? ` · ${job.machine_type}` : ''}
                     {job.accelerator_type ? ` · ${job.accelerator_type} x${job.accelerator_count ?? 1}` : ''}
                     {job.launch_contract?.provisioning_model ? ` · ${job.launch_contract.provisioning_model}` : ''}
@@ -732,20 +734,27 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 </span>
               </div>
 
-              <div className="mb-1.5">
-                <div className="flex items-center justify-between text-ui-sm text-neutral-400 font-mono mb-1">
-                  <span>Budget</span>
-                  <span>
-                    {fmtUsd(spent)} / {fmtUsd(job.spend_cap_usd)}
-                  </span>
+              {isOperatorHardware ? (
+                <div className="mb-1.5 flex items-center justify-between text-ui-sm text-neutral-400 font-mono" data-testid="compute-operator-cost">
+                  <span>Cost</span>
+                  <span>$0.00 · not billed at cloud rates</span>
                 </div>
-                <div className="h-1.5 w-full rounded-full bg-neutral-800 overflow-hidden">
-                  <div
-                    className={`h-full ${budgetBarClass(pct)}`}
-                    style={{ width: `${Math.round(pct * 100)}%` }}
-                  />
+              ) : (
+                <div className="mb-1.5">
+                  <div className="flex items-center justify-between text-ui-sm text-neutral-400 font-mono mb-1">
+                    <span>Budget</span>
+                    <span>
+                      {fmtUsd(spent)} / {fmtUsd(job.spend_cap_usd)}
+                    </span>
+                  </div>
+                  <div className="h-1.5 w-full rounded-full bg-neutral-800 overflow-hidden">
+                    <div
+                      className={`h-full ${budgetBarClass(pct)}`}
+                      style={{ width: `${Math.round(pct * 100)}%` }}
+                    />
+                  </div>
                 </div>
-              </div>
+              )}
 
               {(() => {
                 if (!active) return null;
