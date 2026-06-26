@@ -2142,6 +2142,9 @@ export interface CurrentVersion {
   tasks_merged_has_more?: boolean;
   /** Acceptance-criteria bucket counts for all merged tasks in this version. */
   acceptance_aggregate?: Record<string, number> | null;
+  /** Delivery theme for this version (e.g. leanness, reliability, performance,
+   *  feature, mixed, none). Null when the thinker has not set one yet. */
+  theme?: string | null;
 }
 
 export interface RecentVersion {

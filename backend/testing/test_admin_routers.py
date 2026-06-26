@@ -8978,6 +8978,102 @@ class TestSetVersionTheme:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# admin_release_version.py — Version Lifecycle Theme Exposure
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestVersionLifecycleTheme:
+    """GET /version-lifecycle exposes theme on current_version."""
+
+    @pytest.mark.asyncio
+    async def test_theme_surfaced_in_version_lifecycle(
+        self, client: AsyncClient, db_session
+    ):
+        """current_version.theme reflects the theme set on the open ReleaseVersion."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+            theme="reliability",
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["theme"] == "reliability"
+
+    @pytest.mark.asyncio
+    async def test_theme_none_when_not_set(
+        self, client: AsyncClient, db_session
+    ):
+        """current_version.theme is None when no theme has been set."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["theme"] is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # admin_release_version.py — Cut/Abandon Version
 # ═══════════════════════════════════════════════════════════════════════════════
 

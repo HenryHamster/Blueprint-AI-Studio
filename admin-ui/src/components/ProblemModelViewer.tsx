@@ -400,6 +400,14 @@ export default function ProblemModelViewer({
         {currentVersion != null && (
           <section>
             <SectionHeader icon={<GitBranch size={14} />}>Version goal</SectionHeader>
+            {currentVersion.theme && (
+              <p className="text-ui-sm mb-1">
+                <span className="text-neutral-500">Theme: </span>
+                <span className="px-1.5 py-0.5 rounded bg-neutral-800/70 text-neutral-300 border border-neutral-700 font-medium">
+                  {currentVersion.theme}
+                </span>
+              </p>
+            )}
             {currentVersion.goal ? (
               <div className="flex flex-col gap-1">
                 <p className="text-sm text-neutral-200" title={currentVersion.goal}>
