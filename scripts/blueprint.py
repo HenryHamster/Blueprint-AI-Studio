@@ -3948,6 +3948,9 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     arms: list | None = None
     container_image: str | None = None
     container_registry_auth: dict | None = None
+    spec_env: dict[str, str] | None = None
+    spec_cwd: str | None = None
+    spec_repo_clone: dict | None = None
     if getattr(args, "local_spec", None):
         # --local <spec.json>: read spec file; validate_backend_name is bypassed
         # because we call subprocess.run directly (no DB-backed flow).
@@ -3975,6 +3978,15 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         raw_auth = spec.get("container_registry_auth")
         if isinstance(raw_auth, dict):
             container_registry_auth = raw_auth
+        raw_env = spec.get("env")
+        if isinstance(raw_env, dict):
+            spec_env = {str(k): str(v) for k, v in raw_env.items()}
+        raw_cwd = spec.get("cwd")
+        if isinstance(raw_cwd, str) and raw_cwd:
+            spec_cwd = raw_cwd
+        raw_repo_clone = spec.get("repo_clone")
+        if isinstance(raw_repo_clone, dict):
+            spec_repo_clone = raw_repo_clone
     else:
         command = args.run_command
         container_image = getattr(args, "container_image", None) or None
@@ -4058,6 +4070,15 @@ def _compute_run_local(args: argparse.Namespace) -> None:
                 docker_arm_cmd = ["docker", "run", "--rm"]
                 if gpu_info["detected"]:
                     docker_arm_cmd += ["--gpus", "all"]
+                if spec_repo_clone:
+                    _repo_root = os.path.abspath(".")
+                    docker_arm_cmd += ["-v", f"{_repo_root}:/workspace"]
+                    docker_arm_cmd += ["-e", "PYTHONPATH=/workspace"]
+                    docker_arm_cmd += ["-w", "/workspace"]
+                elif spec_cwd:
+                    docker_arm_cmd += ["-w", spec_cwd]
+                for _k, _v in (spec_env or {}).items():
+                    docker_arm_cmd += ["-e", f"{_k}={_v}"]
                 docker_arm_cmd += [
                     "-v", f"{tmpdir}:/tmp/blueprint_out",
                     "-e", f"BLUEPRINT_RESULT_FILE={container_result}",
@@ -4066,7 +4087,8 @@ def _compute_run_local(args: argparse.Namespace) -> None:
                 ]
                 arm_proc = subprocess.run(docker_arm_cmd)
             else:
-                arm_proc = subprocess.run(["bash", "-lc", arm_cmd], env=arm_env)
+                arm_env.update(spec_env or {})
+                arm_proc = subprocess.run(["bash", "-lc", arm_cmd], env=arm_env, cwd=spec_cwd or None)
             arm_exit_code = arm_proc.returncode
 
             if arm_exit_code != 0:
@@ -4137,6 +4159,15 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         docker_single_cmd = ["docker", "run", "--rm"]
         if gpu_info["detected"]:
             docker_single_cmd += ["--gpus", "all"]
+        if spec_repo_clone:
+            _repo_root = os.path.abspath(".")
+            docker_single_cmd += ["-v", f"{_repo_root}:/workspace"]
+            docker_single_cmd += ["-e", "PYTHONPATH=/workspace"]
+            docker_single_cmd += ["-w", "/workspace"]
+        elif spec_cwd:
+            docker_single_cmd += ["-w", spec_cwd]
+        for _k, _v in (spec_env or {}).items():
+            docker_single_cmd += ["-e", f"{_k}={_v}"]
         docker_single_cmd += [
             "-v", f"{tmpdir}:/tmp/blueprint_out",
             "-e", "BLUEPRINT_RESULT_FILE=/tmp/blueprint_out/result.json",
@@ -4146,7 +4177,8 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         proc = subprocess.run(docker_single_cmd)
         result_file = os.path.join(tmpdir, "result.json")
     else:
-        proc = subprocess.run(["bash", "-lc", command], env=env)
+        env.update(spec_env or {})
+        proc = subprocess.run(["bash", "-lc", command], env=env, cwd=spec_cwd or None)
     exit_code = proc.returncode
     status = "SUCCEEDED" if exit_code == 0 else "FAILED"
 

@@ -1706,6 +1706,44 @@ def test_local_wrapper_docker_login_included_when_registry_auth_has_password(mon
     assert "docker run" in wrapper
 
 
+def test_local_container_mounts_repo_and_passes_env(monkeypatch):
+    """When repo_clone + env are set, the local wrapper mounts the repo root into the
+    container as /workspace, sets PYTHONPATH=/workspace, sets the workdir to /workspace,
+    and passes the declared env as -e flags. Also verifies container_image_pull_failed
+    is emitted as a typed reason when docker pull fails.
+    """
+    monkeypatch.setattr(
+        compute_backends_module,
+        "_detect_local_gpu_cache",
+        None,  # no GPU
+    )
+    from pathlib import Path
+
+    external_id = "local-repo-env-parity-test"
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "python train.py",
+        external_id=external_id,
+        container_image="nvcr.io/nvidia/cuda:12.0-base",
+        repo_clone={"owner": "acme", "repo": "ml", "ref": "main"},
+        env={"MY_SEED": "42", "DATASET": "/data/train"},
+    )
+    # The local repo root (three levels above compute_backends.py) must be
+    # bind-mounted at /workspace inside the container.
+    expected_repo_root = str(Path(compute_backends_module.__file__).parent.parent.parent)
+    assert f"{expected_repo_root}:/workspace" in wrapper
+    # Working directory inside the container must be /workspace.
+    assert "-w" in wrapper
+    assert "/workspace" in wrapper
+    # PYTHONPATH must be set so in-container imports resolve.
+    assert "PYTHONPATH=/workspace" in wrapper
+    # Each declared env var must appear as a -e flag in the docker run invocation.
+    assert "MY_SEED=42" in wrapper
+    assert "DATASET=/data/train" in wrapper
+    # Pull failure must emit the typed terminal reason, not fall through silently.
+    assert "container_image_pull_failed" in wrapper
+    assert "REASON=container_image_pull_failed" in wrapper
+
+
 def test_gcp_startup_script_uploads_artifacts_to_per_job_prefix():
     job_id = uuid.uuid4()
     spec = ComputeLaunchSpec(

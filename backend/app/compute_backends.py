@@ -463,6 +463,9 @@ class LocalSubprocessComputeBackend:
                     setup_step=spec.setup_step,
                     container_image=spec.container_image,
                     container_registry_auth=spec.container_registry_auth,
+                    cwd=spec.cwd,
+                    env=spec.env,
+                    repo_clone=spec.repo_clone,
                 ),
             ],
             cwd=spec.cwd or None,
@@ -855,6 +858,7 @@ def _read_local_terminal_status_for_external_id(
             finished_at = parsed
         except ValueError:
             finished_at = _utcnow()
+    reason = data.get("REASON") or None
     metrics = _decode_result_metrics(data.get("METRICS"))
     command_log = _decode_command_log(data.get("COMMAND_LOG"))
     echoed_release_sha = _decode_release_echo_sha(data.get("RELEASE_ECHO"))
@@ -871,7 +875,7 @@ def _read_local_terminal_status_for_external_id(
     if exit_code is None:
         return ComputeStatusResult(
             status=ComputeJobStatus.FAILED,
-            message="local subprocess exited with unknown code",
+            message=reason or "local subprocess exited with unknown code",
             finished_at=finished_at,
             metrics=metrics,
             command_log=command_log,
@@ -879,7 +883,7 @@ def _read_local_terminal_status_for_external_id(
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
-        message=f"local subprocess exited with code {exit_code}",
+        message=reason or f"local subprocess exited with code {exit_code}",
         exit_code=exit_code,
         finished_at=finished_at,
         metrics=metrics,
@@ -934,6 +938,9 @@ def _build_local_wrapper_command(
     setup_step: str | None = None,
     container_image: str | None = None,
     container_registry_auth: dict | None = None,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    repo_clone: dict | None = None,
 ) -> str:
     state_dir = shlex.quote(_local_state_dir_for_external_id(external_id))
     pid_path = shlex.quote(_local_pid_path_for_external_id(external_id))
@@ -952,27 +959,67 @@ def _build_local_wrapper_command(
             "live_tail.b64",
         )
     )
+    # Block emitted before the python runner that handles docker login + pull.
+    # Separated from the run command so pull failure can write a typed terminal
+    # reason (container_image_pull_failed) instead of falling through as a
+    # generic command failure.
+    container_setup_block = ""
     if container_image:
         host_out_dir = _local_state_dir_for_external_id(external_id)
         gpus = detect_local_gpu() is not None
+        # When the contract includes a repo checkout, bind-mount the repo root
+        # (the running deployment's checkout) into the container as /workspace so
+        # in-container imports resolve the same way they do on the bare substrate.
+        _container_extra_mounts: list[tuple[str, str]] | None = None
+        _container_workdir: str | None = None
+        _container_extra_env: dict[str, str] | None = None
+        if repo_clone:
+            _repo_root = str(Path(__file__).parent.parent.parent)
+            _container_extra_mounts = [(_repo_root, "/workspace")]
+            _container_workdir = "/workspace"
+            _container_extra_env = {"PYTHONPATH": "/workspace"}
+            if env:
+                _container_extra_env.update(env)
+        else:
+            _container_extra_env = dict(env) if env else None
+            if cwd:
+                _container_workdir = cwd
         prefix = _build_container_run_prefix(
             container_image,
             host_out_dir=host_out_dir,
             gpus=gpus,
+            extra_env=_container_extra_env,
+            extra_mounts=_container_extra_mounts,
+            workdir=_container_workdir,
         )
-        docker_parts: list[str] = []
+        effective_command = f"{prefix} bash -lc {shlex.quote(command)}"
         auth = container_registry_auth or {}
         pwd = str(auth.get("password") or "")
+        login_line = ""
         if pwd:
             server_q = shlex.quote(str(auth.get("server") or ""))
             user_q = shlex.quote(str(auth.get("username") or ""))
-            docker_parts.append(
+            login_line = (
                 f"printf '%s' {shlex.quote(pwd)} | "
-                f"docker login {server_q} -u {user_q} --password-stdin >/dev/null 2>&1 &&"
+                f"docker login {server_q} -u {user_q} --password-stdin >/dev/null 2>&1\n"
             )
-        docker_parts.append(f"docker pull {shlex.quote(container_image)} &&")
-        docker_parts.append(f"{prefix} bash -lc {shlex.quote(command)}")
-        effective_command = " ".join(docker_parts)
+        image_q = shlex.quote(container_image)
+        container_setup_block = (
+            login_line
+            + f"if ! docker pull {image_q} >/dev/null 2>&1; then\n"
+            + "  FINISHED_AT=$(date -u +'%Y-%m-%dT%H:%M:%SZ')\n"
+            + f"  cat > {terminal_path} <<PULL_EOF\n"
+            + "STATUS=FAILED\n"
+            + "EXIT_CODE=1\n"
+            + "FINISHED_AT=$FINISHED_AT\n"
+            + "REASON=container_image_pull_failed\n"
+            + "METRICS=\n"
+            + "COMMAND_LOG=\n"
+            + "RELEASE_ECHO=\n"
+            + "PULL_EOF\n"
+            + "  exit 1\n"
+            + "fi"
+        )
     else:
         effective_command = command
     command_literal = shlex.quote(effective_command)
@@ -1011,6 +1058,7 @@ rm -f {command_log_path}
 export {RESULT_FILE_ENV}={result_path}
 export {ARTIFACT_DIR_ENV}={artifact_dir}
 {setup_step_block}
+{container_setup_block}
 EXIT_CODE=0
 if python3 - \
   {command_literal} \
