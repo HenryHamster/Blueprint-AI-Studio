@@ -10,14 +10,13 @@ import { taskStatusDotColor } from '../utils/taskStatus';
 const ACTIVE_STATUSES = ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'];
 const TERMINAL_STATUSES = ['COMPLETED', 'FAILED', 'CANCELLED'];
 
-type FilterType = 'All' | 'Active' | 'Blocked' | 'Failed' | 'Needs Review';
+type FilterType = 'All' | 'Active' | 'Blocked' | 'Failed';
 
 const FILTER_CHIPS: { label: FilterType }[] = [
   { label: 'All' },
   { label: 'Active' },
   { label: 'Blocked' },
   { label: 'Failed' },
-  { label: 'Needs Review' },
 ];
 
 function taskMatchesFilter(task: Task, filter: FilterType): boolean {
@@ -27,7 +26,6 @@ function taskMatchesFilter(task: Task, filter: FilterType): boolean {
   // kept as a fallback for payloads predating the status.
   if (filter === 'Blocked') return task.status === 'BLOCKED' || (task.status === 'QUEUED' && !!task.depends_on && task.depends_on.length > 0);
   if (filter === 'Failed') return task.status === 'FAILED';
-  if (filter === 'Needs Review') return task.requires_approval === true;
   return true;
 }
 
@@ -663,20 +661,35 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
   const [groupExpanded, setGroupExpanded] = useState<Record<string, boolean>>({});
   const [activeFilter, setActiveFilter] = useState<FilterType>('All');
 
+  // Hide synthetic orphan groups whose parent was archived and every child is
+  // now terminal — they have no actionable tasks and only add clutter.
+  const visibleForest = useMemo(() =>
+    forest.filter(root => {
+      if (!root.isSyntheticParent) return true;
+      const childIds = collectAllIds(root).filter(id => !id.startsWith('synthetic-'));
+      if (childIds.length === 0) return false;
+      return !childIds.every(id => {
+        const t = taskMap.get(id);
+        return t && TERMINAL_STATUSES.includes(t.status);
+      });
+    }),
+    [forest, taskMap],
+  );
+
   const defaultExpanded = useMemo(() =>
     Object.fromEntries(
-      forest.map(r => [
+      visibleForest.map(r => [
         r.task.id,
         countByStatuses(r, ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING', 'FAILED']) > 0,
       ])
     ),
-    [forest]
+    [visibleForest]
   );
 
   const getExpanded = (id: string) => id in groupExpanded ? groupExpanded[id] : (defaultExpanded[id] ?? true);
   const toggleGroup = (id: string) => setGroupExpanded(prev => ({ ...prev, [id]: !getExpanded(id) }));
-  const expandAll = () => setGroupExpanded(Object.fromEntries(forest.map(r => [r.task.id, true])));
-  const collapseAll = () => setGroupExpanded(Object.fromEntries(forest.map(r => [r.task.id, false])));
+  const expandAll = () => setGroupExpanded(Object.fromEntries(visibleForest.map(r => [r.task.id, true])));
+  const collapseAll = () => setGroupExpanded(Object.fromEntries(visibleForest.map(r => [r.task.id, false])));
 
   const activeTaskIds = useMemo(
     () => tasks.filter(t => ACTIVE_STATUSES.includes(t.status)).map(t => t.id),
@@ -686,7 +699,7 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
   const jumpToActive = () => {
     // Expand all root groups that contain active tasks
     const toExpand: Record<string, boolean> = {};
-    for (const root of forest) {
+    for (const root of visibleForest) {
       const hasActive = root.isSyntheticParent
         ? root.children.some(c => countByStatuses(c, ACTIVE_STATUSES) > 0)
         : countByStatuses(root, ACTIVE_STATUSES) > 0;
@@ -709,7 +722,7 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
   // tree is done from the operator's view and should be archivable too.
   const donePipelineIds = useMemo(() => {
     const ids: string[] = [];
-    for (const root of forest) {
+    for (const root of visibleForest) {
       const allIds = collectAllIds(root).filter(id => !id.startsWith('synthetic-'));
       if (allIds.length === 0) continue;
       const allTerminal = allIds.every(id => {
@@ -719,7 +732,7 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
       if (allTerminal) ids.push(...allIds);
     }
     return ids;
-  }, [forest, taskMap]);
+  }, [visibleForest, taskMap]);
 
   const btnClass = 'px-2 py-1 text-xs text-neutral-500 hover:text-neutral-300 bg-neutral-900 border border-neutral-800 rounded transition-colors';
   const chipBase = 'px-2.5 py-1 text-xs rounded-full border transition-colors font-medium';
@@ -752,7 +765,7 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
             </button>
           )}
         </div>
-        {forest.length > 1 && (
+        {visibleForest.length > 1 && (
           <div className="flex items-center gap-2">
             <button className={btnClass} onClick={expandAll}>Expand all</button>
             <button className={btnClass} onClick={collapseAll}>Collapse all</button>
@@ -775,7 +788,7 @@ export function PipelineView({ tasks, onViewLogs, onNavigateToParent, onClearWav
             )}
           </div>
         )}
-        {forest.map(root => (
+        {visibleForest.map(root => (
           <RootGroup
             key={root.task.id}
             root={root}

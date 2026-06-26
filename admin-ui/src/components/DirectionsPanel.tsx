@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { ToggleLeft, ToggleRight, X } from 'lucide-react';
+import { ChevronDown, Plus, ToggleLeft, ToggleRight, X } from 'lucide-react';
 import DesignDocViewer from './DesignDocViewer';
 import ProblemModelViewer from './ProblemModelViewer';
 import RunningUpdatePanel from './RunningUpdatePanel';
@@ -197,6 +197,9 @@ export function DirectionsPanel({ addToast, onViewFindings, onViewKnowledge, onN
   // Collapsible sections — expired collapsed by default, others expanded
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ expired: true });
 
+  // Add-direction form starts collapsed; operator expands via "+ New direction"
+  const [formExpanded, setFormExpanded] = useState(false);
+
   // Category filter
   const [categoryFilter, setCategoryFilter] = useState<DirectionCategoryFilter>('all');
 
@@ -339,7 +342,21 @@ export function DirectionsPanel({ addToast, onViewFindings, onViewKnowledge, onN
             )}
           </div>
           {selectedProjectId && (
-            <DirectionsAddForm form={form} addDirection={data.addDirection} stageTargetVersion={data.openVersionNumber} />
+            <>
+              <div className={`px-5 py-2 shrink-0 ${!formExpanded ? 'border-b border-neutral-800' : ''}`}>
+                <button
+                  onClick={() => setFormExpanded(v => !v)}
+                  className="flex items-center gap-1.5 text-xs text-neutral-400 hover:text-neutral-200 transition-colors min-h-[36px]"
+                >
+                  {formExpanded
+                    ? <><ChevronDown className="w-3.5 h-3.5" /><span>Cancel</span></>
+                    : <><Plus className="w-3.5 h-3.5" /><span>New direction</span></>}
+                </button>
+              </div>
+              {formExpanded && (
+                <DirectionsAddForm form={form} addDirection={() => { data.addDirection(); setFormExpanded(false); }} stageTargetVersion={data.openVersionNumber} />
+              )}
+            </>
           )}
           {data.error && (
             <div className="px-5 py-2 bg-red-950/50 border-b border-red-900/50 flex items-center justify-between shrink-0">
