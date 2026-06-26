@@ -9470,6 +9470,54 @@ class TestPortfolioOperations:
         )
         assert rec["portfolio_operations"] == []
 
+    def test_stage_direction_with_text_reclassified_to_create(self):
+        # A stage_direction verdict carrying text but NO direction_id is really a
+        # vote to STAGE A NEW direction, which the strategist executes as
+        # create_direction(staged=true) (the stage path cannot create). The stored
+        # op + fingerprint must match that create_direction move, otherwise the
+        # approved staged-create is hard-blocked as "no matching verdict".
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "portfolio_operations": [
+                    {
+                        "op": "stage_direction",
+                        "text": "Stand up a local-GPU runner lane",
+                        "verdict": "approved",
+                    }
+                ],
+            }
+        )
+        ops = rec["portfolio_operations"]
+        assert len(ops) == 1
+        assert ops[0]["op"] == "create_direction"
+        assert ops[0]["fingerprint"] == portfolio_operation_fingerprint(
+            "create_direction", text="Stand up a local-GPU runner lane"
+        )
+        assert ops[0]["fingerprint"].startswith("create_direction:text:")
+        assert ops[0]["verdict"] == "approved"
+
+    def test_stage_direction_with_direction_id_is_unchanged(self):
+        # Staging an EXISTING direction by id stays a real stage_direction op.
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "portfolio_operations": [
+                    {
+                        "op": "stage_direction",
+                        "direction_id": "d-1",
+                        "verdict": "approved",
+                    }
+                ],
+            }
+        )
+        ops = rec["portfolio_operations"]
+        assert len(ops) == 1
+        assert ops[0]["op"] == "stage_direction"
+        assert ops[0]["fingerprint"] == portfolio_operation_fingerprint(
+            "stage_direction", direction_id="d-1"
+        )
+
 
 class TestPortfolioOperationFingerprint:
     def test_id_keyed_ops_are_stable_and_canonical(self):
@@ -9556,6 +9604,26 @@ class TestChallengeRejectsPortfolioOp:
     def test_missing_record_does_not_block(self):
         assert challenge_rejects_portfolio_op(
             None, "retire_direction", direction_id="d-1"
+        ) == (False, "")
+
+    def test_approved_staged_create_is_not_blocked(self):
+        # Regression: a stage_direction verdict with text (no direction_id) is the
+        # approval to STAGE A NEW direction, which the strategist runs as
+        # create_direction(staged=true). The stored verdict is reclassified to
+        # create_direction so the gate matches the executed op rather than failing
+        # with "no matching portfolio_operations verdict" every cycle.
+        rec = self._rec(
+            [
+                {
+                    "op": "stage_direction",
+                    "text": "Stand up a local-GPU runner lane",
+                    "verdict": "approved",
+                }
+            ]
+        )
+        assert rec["portfolio_operations"][0]["op"] == "create_direction"
+        assert challenge_rejects_portfolio_op(
+            rec, "create_direction", text="Stand up a local-GPU runner lane"
         ) == (False, "")
 
 

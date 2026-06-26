@@ -689,6 +689,13 @@ def _sanitize_portfolio_operations(raw: object) -> list[dict]:
             continue
         did = str(entry.get("direction_id", "")).strip()
         txt = str(entry.get("text", "")).strip()
+        # A "stage_direction" verdict that carries text but no direction_id is really a
+        # vote to STAGE A NEW direction — which executes as create_direction(staged=true),
+        # since the stage path cannot create. Canonicalize so the stored verdict
+        # fingerprint matches the create_direction op the strategist actually runs;
+        # otherwise an APPROVED staged-create is hard-blocked as "no matching verdict".
+        if canon == "stage_direction" and txt and not did:
+            canon = "create_direction"
         fp = portfolio_operation_fingerprint(
             canon, direction_id=did or None, text=txt or None
         )

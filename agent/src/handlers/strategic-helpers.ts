@@ -505,12 +505,19 @@ function normalizePortfolioOperations(raw: unknown): ChallengePortfolioOperation
   for (const item of raw) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
     const o = item as Record<string, unknown>;
-    const canon = canonicalPortfolioOp(o.op);
+    let canon = canonicalPortfolioOp(o.op);
     if (!canon) continue;
     const verdict = _safeStr(o.verdict).trim().toLowerCase();
     if (!_VALID_PORTFOLIO_VERDICTS.has(verdict)) continue;
     const direction_id = _safeStr(o.direction_id).trim().slice(0, 64);
     const text = _safeStr(o.text).trim();
+    // A "stage_direction" verdict carrying text but no direction_id is really a
+    // vote to STAGE A NEW direction, which executes as create_direction(staged=true)
+    // since the stage path cannot create. Reclassify so this agent-side fingerprint
+    // matches the backend's stored create_direction op for the move.
+    if (canon === 'stage_direction' && text && !direction_id) {
+      canon = 'create_direction';
+    }
     const fingerprint = portfolioOperationFingerprint(canon, {
       directionId: direction_id || undefined,
       text: text || undefined,
@@ -636,7 +643,7 @@ Rules:
 - Add an evidence_progress entry for EVERY direction the thinker rated advancing or met (verdict "approved" only with concrete evidence, otherwise "rejected"). Directions the thinker called stalled need no entry — stalled is advisory and never gated. If the thinker rated none, emit an empty array.
 - Add a retirement_approvals entry for EVERY direction the thinker proposes to retire (verdict "approved" only when the reasoning names a real evidenced pattern, otherwise "rejected"). When in doubt, REJECT. If the thinker proposes no retirements, emit an empty array.
 - "retirement_critique_quality" and "portfolio_shape_risk" are REQUIRED keys even when there is little to say.
-- Add a portfolio_operations entry for EVERY concrete create/update/retire/stage/approve/reject the thinker proposed. For ops on an existing direction set "direction_id" (its id); for a create set "text" to the proposed direction text (omit/empty "direction_id"). Use "rejected" ONLY for destructive/fan-out-sensitive moves that are unsafe to commit; "warned"/"uncertain" for advisory subjective concerns; "approved" for clean moves.
+- Add a portfolio_operations entry for EVERY concrete create/update/retire/stage/approve/reject the thinker proposed. For ops on an existing direction set "direction_id" (its id); for a create set "text" to the proposed direction text (omit/empty "direction_id"). A NEW direction the thinker proposes to STAGE for the next version is op "create_direction" (set "text", no "direction_id") — it executes as a staged create; "stage_direction" is only for an EXISTING direction (set "direction_id"). Use "rejected" ONLY for destructive/fan-out-sensitive moves that are unsafe to commit; "warned"/"uncertain" for advisory subjective concerns; "approved" for clean moves.
 - Output the JSON object and nothing else.`;
 }
 
