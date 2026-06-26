@@ -1137,11 +1137,13 @@ async def _resolve_review_second_opinion(
             "Second-opinion panel review failed/unparseable — review escalated"
         )[:500]
         session.add(challenger)
+        _gates_on = _runtime_config.get("require_approval_gates", True)
         if original_task_id:
             try:
                 orig = await session.get(Task, uuid.UUID(original_task_id))
                 if orig:
-                    orig.requires_approval = True
+                    if _gates_on:
+                        orig.requires_approval = True
                     orig.latest_status_message = (
                         "Second-opinion review challenge unresolved — manual "
                         "review required"
