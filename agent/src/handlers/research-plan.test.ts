@@ -1919,6 +1919,21 @@ describe('buildVersionPhaseSection', () => {
     });
     expect(result).toContain('blocker=ci_red');
   });
+
+  it('instructs the agent to hold qualification only for legitimate blockers and keep work flowing (no stalling, no rushing)', () => {
+    // Prompt-level guidance (independent of any qualification record). The
+    // stabilize phase must not stall qualification on an illegitimate blocker —
+    // a straggler "waiting to land" from a paused/churn-stalled direction is a
+    // deferral, not a true must-ship hold — while never sitting idle. It also
+    // must NOT push to rush qualification to hit a cadence.
+    const result = buildVersionPhaseSection({ version_number: 1, phase: 'stabilize' });
+    expect(result).toContain('Hold qualification only for legitimate blockers');
+    expect(result).toContain('must-ship');
+    expect(result).toContain('churn-stalled direction');
+    expect(result).toContain('never let the phase sit idle');
+    // Explicitly does not advocate rushing.
+    expect(result).toContain('Do NOT rush to qualify');
+  });
 });
 
 describe('buildMemoCitationsSection', () => {
