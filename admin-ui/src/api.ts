@@ -3884,10 +3884,15 @@ export async function declareCapabilityVerdict(
 export async function dismissPendingConfirmation(
   projectId: string,
   pendingId: string,
+  note?: string,
 ): Promise<void> {
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/pending-confirm/${encodeURIComponent(pendingId)}/dismiss`,
-    { method: 'POST' },
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note: note ?? null }),
+    },
   );
   if (!res.ok) throw new Error(`Failed to dismiss pending confirmation: ${res.status}`);
 }

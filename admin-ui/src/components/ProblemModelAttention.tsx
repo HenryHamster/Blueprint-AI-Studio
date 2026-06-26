@@ -36,7 +36,7 @@ function PendingItemRow({
   onAccept,
 }: {
   pending: PendingConfirmation;
-  onDismiss: () => Promise<void>;
+  onDismiss: (note?: string) => Promise<void>;
   onAccept: (answer?: string) => Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(false);
@@ -97,7 +97,7 @@ function PendingItemRow({
           disabled={dismissing || accepting}
           onClick={async () => {
             setDismissing(true);
-            try { await onDismiss(); } finally { setDismissing(false); }
+            try { await onDismiss(answer.trim() || undefined); } finally { setDismissing(false); }
           }}
           className="shrink-0 inline-flex items-center gap-1 px-2 py-1 min-h-[44px] md:min-h-0 text-xs font-medium rounded border border-neutral-700 bg-neutral-800/50 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100 transition disabled:opacity-50"
           title="Mark as resolved without action"
@@ -112,26 +112,24 @@ function PendingItemRow({
           {pending.rationale && (
             <p className="text-xs text-neutral-400">{pending.rationale}</p>
           )}
-          {pending.type === 'major_decision' && (
-            <div className="flex gap-2 items-start pt-1">
-              <textarea
-                value={answer}
-                onChange={(e) => setAnswer(e.target.value)}
-                placeholder="Enter your answer…"
-                rows={2}
-                className="flex-1 text-xs bg-neutral-800 border border-neutral-700 rounded px-2 py-1.5 text-neutral-200 placeholder-neutral-600 resize-none focus:outline-none focus:border-emerald-700"
-              />
-              <button
-                type="button"
-                disabled={accepting || !answer.trim()}
-                onClick={() => handleAccept(answer.trim())}
-                className="shrink-0 inline-flex items-center gap-1 px-2 py-1.5 min-h-[44px] md:min-h-0 text-xs font-medium rounded border border-emerald-800 bg-emerald-950/50 text-emerald-400 hover:bg-emerald-900/40 hover:text-emerald-300 transition disabled:opacity-50"
-              >
-                <Check size={11} />
-                Answer
-              </button>
-            </div>
-          )}
+          <div className="flex gap-2 items-start pt-1">
+            <textarea
+              value={answer}
+              onChange={(e) => setAnswer(e.target.value)}
+              placeholder={pending.type === 'major_decision' ? 'Enter your answer…' : 'Add a note (optional)…'}
+              rows={2}
+              className="flex-1 text-xs bg-neutral-800 border border-neutral-700 rounded px-2 py-1.5 text-neutral-200 placeholder-neutral-600 resize-none focus:outline-none focus:border-emerald-700"
+            />
+            <button
+              type="button"
+              disabled={accepting || !answer.trim()}
+              onClick={() => handleAccept(answer.trim())}
+              className="shrink-0 inline-flex items-center gap-1 px-2 py-1.5 min-h-[44px] md:min-h-0 text-xs font-medium rounded border border-emerald-800 bg-emerald-950/50 text-emerald-400 hover:bg-emerald-900/40 hover:text-emerald-300 transition disabled:opacity-50"
+            >
+              <Check size={11} />
+              {acceptLabel}
+            </button>
+          </div>
           <p className="text-ui-sm font-mono text-neutral-700">{pending.id}</p>
         </div>
       )}
@@ -141,7 +139,7 @@ function PendingItemRow({
 
 interface PendingConfirmationListProps {
   pending: PendingConfirmation[];
-  onDismiss: (id: string) => Promise<void>;
+  onDismiss: (id: string, note?: string) => Promise<void>;
   onAccept: (id: string, answer?: string) => Promise<void>;
 }
 
@@ -163,7 +161,7 @@ export function PendingConfirmationList({ pending, onDismiss, onAccept }: Pendin
         <PendingItemRow
           key={p.id}
           pending={p}
-          onDismiss={() => onDismiss(p.id)}
+          onDismiss={(note) => onDismiss(p.id, note)}
           onAccept={(answer) => onAccept(p.id, answer)}
         />
       ))}

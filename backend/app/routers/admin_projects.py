@@ -772,12 +772,18 @@ async def edit_running_update(
     }
 
 
+class _DismissPendingBody(BaseModel):
+    note: str | None = None
+    """Optional operator note to record in the revision log alongside the dismissal."""
+
+
 @router.post("/projects/{project_id}/pending-confirm/{pending_id}/dismiss")
 @limiter.limit("30/minute")
 async def dismiss_pending_confirmation(
     request: Request,
     project_id: uuid.UUID,
     pending_id: str,
+    payload: _DismissPendingBody = _DismissPendingBody(),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -787,25 +793,37 @@ async def dismiss_pending_confirmation(
     (credentials needed, access needed, major decisions). Once the operator
     takes action they can dismiss the item here rather than waiting for the
     next autonomous strategic cycle to clear it.
+
+    An optional ``note`` in the request body is recorded in the revision log
+    so the strategist can see the operator's response on its next cycle.
     """
-    from app.problem_model import parse_problem_model
+    from app.problem_model import append_revision_log, parse_problem_model
     from app.time_utils import _utcnow
 
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
     current_model = parse_problem_model(project.problem_model)
-    before = len(current_model.pending_user_confirmation)
-    current_model.pending_user_confirmation = [
-        p for p in current_model.pending_user_confirmation if p.id != pending_id
-    ]
-    if len(current_model.pending_user_confirmation) == before:
+    matched = next(
+        (p for p in current_model.pending_user_confirmation if p.id == pending_id),
+        None,
+    )
+    if matched is None:
         raise HTTPException(
             status_code=404, detail=f"Pending confirmation '{pending_id}' not found"
         )
+    current_model.pending_user_confirmation = [
+        p for p in current_model.pending_user_confirmation if p.id != pending_id
+    ]
     current_model.revision += 1
     current_model.last_updated = _utcnow().isoformat()
     current_model.last_updated_by = "user"
+    if payload.note:
+        changes: dict = {
+            "dismissed_proposal": matched.proposal,
+            "dismissal_note": payload.note,
+        }
+        append_revision_log(current_model, f"operator dismissed {matched.type}", changes)
     project.problem_model = current_model.model_dump()
     flag_modified(project, "problem_model")
     session.add(project)
@@ -868,6 +886,13 @@ async def accept_pending_confirmation(
         current_model.pending_user_confirmation = [
             p for p in current_model.pending_user_confirmation if p.id != pending_id
         ]
+        if payload.answer:
+            changes: dict = {
+                "pending_accepted": {"id": pending_id, "type": matched.type},
+                "accepted_proposal": matched.proposal,
+                "operator_note": payload.answer,
+            }
+            append_revision_log(current_model, "operator accepted intent_change", changes)
     else:
         # For major_decision, credentials_needed, access_needed:
         # remove the item and record a revision log entry with any answer.

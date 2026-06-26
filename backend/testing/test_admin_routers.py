@@ -8014,6 +8014,93 @@ class TestDismissPendingConfirmation:
         )
         assert resp.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_dismiss_records_operator_note(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "revision": 5,
+            "last_updated": "2026-01-01T00:00:00",
+            "last_updated_by": "agent",
+            "intent": {"purpose": "", "current_focus": "", "user_purpose": ""},
+            "context": {},
+            "constraints": [],
+            "capabilities": [],
+            "gaps": [],
+            "archived_gaps": [],
+            "friction": [],
+            "pending_user_confirmation": [
+                {
+                    "id": "p-cred001",
+                    "type": "credentials_needed",
+                    "proposal": "Need AWS credentials for prod account.",
+                    "rationale": "Deploy pipeline is blocked.",
+                    "created_at": "2026-01-03T00:00:00",
+                },
+            ],
+            "revision_log": [],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-cred001/dismiss",
+            json={"note": "Credentials added to vault"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "dismissed"
+        assert data["pending_id"] == "p-cred001"
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["pending_user_confirmation"] == []
+        assert pm["revision"] == 6
+        assert pm["last_updated_by"] == "user"
+        assert len(pm["revision_log"]) == 1
+        last_log = pm["revision_log"][-1]
+        assert last_log["changes"]["dismissal_note"] == "Credentials added to vault"
+        assert last_log["changes"]["dismissed_proposal"] == "Need AWS credentials for prod account."
+
+    @pytest.mark.asyncio
+    async def test_dismiss_without_note_no_revision_log_entry(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "revision": 2,
+            "last_updated": "2026-01-01T00:00:00",
+            "last_updated_by": "agent",
+            "intent": {"purpose": "", "current_focus": "", "user_purpose": ""},
+            "context": {},
+            "constraints": [],
+            "capabilities": [],
+            "gaps": [],
+            "archived_gaps": [],
+            "friction": [],
+            "pending_user_confirmation": [
+                {
+                    "id": "p-access001",
+                    "type": "access_needed",
+                    "proposal": "Need read access to the S3 bucket.",
+                    "created_at": "2026-01-03T00:00:00",
+                },
+            ],
+            "revision_log": [],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-access001/dismiss"
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["pending_user_confirmation"] == []
+        assert pm["revision_log"] == []
+
 
 class TestAcceptPendingConfirmation:
     """POST /pending-confirm/{id}/accept applies type-specific action and clears the item."""
@@ -8101,6 +8188,75 @@ class TestAcceptPendingConfirmation:
         last_log = pm["revision_log"][-1]
         assert last_log["changes"]["decision_answer"] == "Yes, proceed with migration."
         assert last_log["changes"]["decision_question"] == "Should we migrate to Postgres 16?"
+
+    @pytest.mark.asyncio
+    async def test_accept_credentials_needed_records_answer(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            **self._BASE_PM,
+            "pending_user_confirmation": [
+                {
+                    "id": "p-cred002",
+                    "type": "credentials_needed",
+                    "proposal": "Need DB password for prod.",
+                    "created_at": "2026-01-04T00:00:00",
+                },
+            ],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-cred002/accept",
+            json={"answer": "Password added to secrets manager."},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "accepted"
+        assert data["type"] == "credentials_needed"
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["pending_user_confirmation"] == []
+        last_log = pm["revision_log"][-1]
+        assert last_log["changes"]["decision_answer"] == "Password added to secrets manager."
+        assert last_log["changes"]["decision_question"] == "Need DB password for prod."
+
+    @pytest.mark.asyncio
+    async def test_accept_intent_change_with_note_records_revision_log(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            **self._BASE_PM,
+            "pending_user_confirmation": [
+                {
+                    "id": "p-ic002",
+                    "type": "intent_change",
+                    "proposal": "Expand scope to include mobile.",
+                    "created_at": "2026-01-04T00:00:00",
+                },
+            ],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-ic002/accept",
+            json={"answer": "Agreed — prioritize Android first."},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["type"] == "intent_change"
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["pending_user_confirmation"] == []
+        assert pm["intent"]["purpose"] == "Expand scope to include mobile."
+        last_log = pm["revision_log"][-1]
+        assert last_log["changes"]["operator_note"] == "Agreed — prioritize Android first."
+        assert last_log["changes"]["accepted_proposal"] == "Expand scope to include mobile."
 
     @pytest.mark.asyncio
     async def test_accept_unknown_id_returns_404(

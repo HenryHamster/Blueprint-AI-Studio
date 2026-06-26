@@ -422,9 +422,9 @@ export default function ProblemModelViewer({
             </SectionHeader>
             <PendingConfirmationList
               pending={pending}
-              onDismiss={async (id) => {
+              onDismiss={async (id, note) => {
                 try {
-                  await dismissPendingConfirmation(projectId, id);
+                  await dismissPendingConfirmation(projectId, id, note);
                   onUpdated({
                     ...problemModel,
                     pending_user_confirmation: pending.filter((x) => x.id !== id),
