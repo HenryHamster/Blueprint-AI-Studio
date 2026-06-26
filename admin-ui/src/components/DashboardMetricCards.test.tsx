@@ -58,7 +58,7 @@ describe('FailedCard', () => {
       { failure_class: 'AGENT_TIMEOUT', label: 'Timeout', count: 2, tasks: [] },
       { failure_class: 'EXTERNAL_API', label: 'Ext', count: 1, tasks: [] },
     ];
-    render(<FailedCard value={11} groups={groups} spark={[]} loading={false} />);
+    render(<FailedCard value={11} groups={groups} spark={[]} loading={false} windowHours={24} />);
     expect(screen.getByText('Failed (24h)')).toBeInTheDocument();
     expect(screen.getByText('11')).toBeInTheDocument();
     expect(screen.getByText('5 code')).toBeInTheDocument();
@@ -72,6 +72,11 @@ describe('FailedCard', () => {
     const groups: FailureGroup[] = [{ failure_class: 'CODE_ERROR', label: 'Code', count: 5, tasks: [] }];
     render(<FailedCard value={0} groups={groups} spark={[]} loading={false} />);
     expect(screen.queryByText('5 code')).not.toBeInTheDocument();
+  });
+
+  it('label reflects the selected window (7d when windowHours=168)', () => {
+    render(<FailedCard value={3} spark={[]} loading={false} windowHours={168} />);
+    expect(screen.getByText('Failed (7d)')).toBeInTheDocument();
   });
 });
 
@@ -121,6 +126,11 @@ describe('CostCard', () => {
   it('renders -- when totalCost is null', () => {
     render(<CostCard totalCost={null} loading={false} />);
     expect(screen.getByText('--')).toBeInTheDocument();
+  });
+
+  it('label reflects the selected window (7d when windowHours=168)', () => {
+    render(<CostCard totalCost={5} loading={false} windowHours={168} />);
+    expect(screen.getByText('Cost (7d)')).toBeInTheDocument();
   });
 
   it('renders two decimals below $10', () => {

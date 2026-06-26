@@ -1136,6 +1136,51 @@ _COMPUTE_LOG_TEXT_CAP = 4000
 _COMPUTE_MAX_CITATIONS = 20
 
 
+def _enrich_per_arm_cost(
+    per_arm_verdicts: dict[str, dict[str, Any]],
+    arms: Any,
+    total_cost: float | None,
+) -> None:
+    """Add apportioned cost_usd to each per-arm verdict entry, in-place.
+
+    Apportions total_cost by elapsed_seconds fraction when available in the arms
+    block; falls back to an even split when durations are missing, and leaves
+    cost_usd None when total_cost is None.
+    """
+    if not per_arm_verdicts:
+        return
+    if total_cost is None:
+        for pav in per_arm_verdicts.values():
+            pav["cost_usd"] = None
+        return
+
+    elapsed: dict[str, float] = {}
+    arm_iter: list[tuple[str, Any]] = []
+    if isinstance(arms, dict):
+        arm_iter = list(arms.items())
+    elif isinstance(arms, list):
+        arm_iter = [
+            (a.get("name") or a.get("label") or a.get("arm") or f"arm_{i}", a)
+            for i, a in enumerate(arms)
+            if isinstance(a, dict)
+        ]
+    for arm_name, arm_data in arm_iter:
+        if isinstance(arm_data, dict):
+            e = arm_data.get("elapsed_seconds")
+            if isinstance(e, (int, float)) and e >= 0:
+                elapsed[str(arm_name)] = float(e)
+
+    total_elapsed = sum(elapsed.values())
+    n_arms = len(per_arm_verdicts)
+
+    for arm_name, pav in per_arm_verdicts.items():
+        if total_elapsed > 0 and arm_name in elapsed:
+            arm_cost = total_cost * elapsed[arm_name] / total_elapsed
+        else:
+            arm_cost = total_cost / n_arms if n_arms > 0 else None
+        pav["cost_usd"] = arm_cost
+
+
 def _evaluate_criterion_per_arm(
     criterion: dict[str, Any], arms: Any
 ) -> dict[str, dict[str, Any]] | None:
@@ -1439,6 +1484,7 @@ def _build_compute_experiment_document(
     # Per-arm criterion verdicts for deterministic querying and rendering
     per_arm_verdicts = _evaluate_criterion_per_arm(criterion, arms)
     if per_arm_verdicts:
+        _enrich_per_arm_cost(per_arm_verdicts, arms, cost)
         verdict_record["per_arm_verdicts"] = per_arm_verdicts
 
     return {

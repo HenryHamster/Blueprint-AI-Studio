@@ -2873,6 +2873,137 @@ async def test_compute_doc_renders_per_arm_criterion_verdict(
     assert verdict["criterion"]["met"] is True  # best arm meets criterion
 
 
+@pytest.mark.asyncio
+async def test_per_arm_verdicts_carry_apportioned_cost_usd(
+    db_session, _quiet_compute_io
+):
+    """per_arm_verdicts carry value, met, AND apportioned cost_usd based on elapsed_seconds.
+
+    When the arms block carries elapsed_seconds (written by the aggregator from
+    wall-clock timing), the backend apportions total experiment cost proportionally
+    so each per-arm verdict has a real cost_usd instead of None.
+    """
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "cost-apportionment test",
+            "success_criterion": {
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+            },
+        }
+    ]
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job, _artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    # Arms block carries elapsed_seconds for proportional cost split:
+    # baseline ran 60s, optimized ran 40s → total 100s
+    # total cost = $1.00 → baseline $0.60, optimized $0.40
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": {
+                "baseline": {"accuracy": 0.85, "exit_code": 0, "elapsed_seconds": 60.0},
+                "optimized": {"accuracy": 0.95, "exit_code": 0, "elapsed_seconds": 40.0},
+            },
+        },
+    }
+    job.accrued_cost_usd = 1.0
+    job.final_cost_usd = 1.0
+    db_session.add(job)
+    await db_session.commit()
+
+    # Cost of $1.00 in the logs drives apportionment
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.95, final_cost_usd=1.0)
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+
+    assert "per_arm_verdicts" in verdict
+    pav = verdict["per_arm_verdicts"]
+
+    # value and met populated
+    assert pav["baseline"]["value"] == pytest.approx(0.85)
+    assert pav["baseline"]["met"] is False
+    assert pav["optimized"]["value"] == pytest.approx(0.95)
+    assert pav["optimized"]["met"] is True
+
+    # cost_usd apportioned by elapsed_seconds: 60/(60+40)=0.6, 40/100=0.4
+    assert pav["baseline"]["cost_usd"] == pytest.approx(0.60, rel=1e-4)
+    assert pav["optimized"]["cost_usd"] == pytest.approx(0.40, rel=1e-4)
+
+
+@pytest.mark.asyncio
+async def test_per_arm_verdicts_even_split_when_no_durations(
+    db_session, _quiet_compute_io
+):
+    """per_arm_verdicts fall back to even cost split when elapsed_seconds is absent.
+
+    When the arms block has no elapsed_seconds (older aggregator or timing not
+    available), cost is split evenly across arms.
+    """
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "even-split fallback test",
+            "success_criterion": {
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+            },
+        }
+    ]
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job, _artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    # Arms block WITHOUT elapsed_seconds — triggers even-split fallback
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": {
+                "arm_a": {"accuracy": 0.92, "exit_code": 0},
+                "arm_b": {"accuracy": 0.88, "exit_code": 0},
+            },
+        },
+    }
+    job.accrued_cost_usd = 0.50
+    job.final_cost_usd = 0.50
+    db_session.add(job)
+    await db_session.commit()
+
+    # Cost of $0.50 in the logs drives even-split
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.92, final_cost_usd=0.50)
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+
+    assert "per_arm_verdicts" in verdict
+    pav = verdict["per_arm_verdicts"]
+
+    # Even split: 2 arms, total $0.50 → $0.25 each
+    assert pav["arm_a"]["cost_usd"] == pytest.approx(0.25, rel=1e-4)
+    assert pav["arm_b"]["cost_usd"] == pytest.approx(0.25, rel=1e-4)
+
+
 def _mock_anthropic_returning(citations: list[str]):
     """Build a mock anthropic.AsyncAnthropic class that returns a cited analysis."""
     fake_text = json.dumps(

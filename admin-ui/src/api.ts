@@ -3892,6 +3892,23 @@ export async function dismissPendingConfirmation(
   if (!res.ok) throw new Error(`Failed to dismiss pending confirmation: ${res.status}`);
 }
 
+export async function acceptPendingConfirmation(
+  projectId: string,
+  pendingId: string,
+  answer?: string,
+): Promise<{ status: string; type: string }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/pending-confirm/${encodeURIComponent(pendingId)}/accept`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answer: answer ?? null }),
+    },
+  );
+  if (!res.ok) throw new Error(`Failed to accept pending confirmation: ${res.status}`);
+  return res.json();
+}
+
 /** A pull-based fleet runner registered to a project. */
 export interface FleetRunner {
   id: string;

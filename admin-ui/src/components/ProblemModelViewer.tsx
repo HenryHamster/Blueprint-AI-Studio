@@ -4,7 +4,7 @@ import { timeAgo } from '../utils/time';
 import { MarkdownContent } from './MarkdownContent';
 import { ProblemModelEditor } from './ProblemModelEditor';
 import { PendingConfirmationList } from './ProblemModelAttention';
-import { dismissPendingConfirmation } from '../api';
+import { dismissPendingConfirmation, acceptPendingConfirmation } from '../api';
 import type { CurrentVersion } from '../api';
 import type {
   ProblemModel,
@@ -432,6 +432,27 @@ export default function ProblemModelViewer({
                   });
                 } catch {
                   addToast('Failed to dismiss — try again', 'error');
+                }
+              }}
+              onAccept={async (id, answer) => {
+                try {
+                  const result = await acceptPendingConfirmation(projectId, id, answer);
+                  const next: ProblemModel = {
+                    ...problemModel,
+                    pending_user_confirmation: pending.filter((x) => x.id !== id),
+                    revision: (problemModel.revision ?? 0) + 1,
+                  };
+                  // For intent_change, reflect the accepted proposal in local state.
+                  if (result.type === 'intent_change') {
+                    const accepted = pending.find((x) => x.id === id);
+                    if (accepted) {
+                      const cur = problemModel.intent ?? { purpose: '', current_focus: '' };
+                      next.intent = { ...cur, purpose: accepted.proposal };
+                    }
+                  }
+                  onUpdated(next);
+                } catch {
+                  addToast('Failed to accept — try again', 'error');
                 }
               }}
             />

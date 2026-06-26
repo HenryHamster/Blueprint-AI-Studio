@@ -61,15 +61,23 @@ const FAILURE_CLASS_SHORT: Record<string, string> = {
   SCOPE_OVERFLOW: 'scope',
 };
 
-export function FailedCard({ value, groups, spark, loading }: {
-  value: number; groups?: FailureGroup[]; spark: SparkPoint[]; loading: boolean;
+function windowLabel(windowHours: number): string {
+  if (windowHours >= 168) return '7d';
+  if (windowHours >= 48) return '48h';
+  if (windowHours >= 24) return '24h';
+  if (windowHours >= 12) return '12h';
+  return '6h';
+}
+
+export function FailedCard({ value, groups, spark, loading, windowHours = 24 }: {
+  value: number; groups?: FailureGroup[]; spark: SparkPoint[]; loading: boolean; windowHours?: number;
 }) {
   if (loading) return <Skeleton className="h-20" />;
   const fill = SPARK_COLORS['red'];
   const topGroups = (groups ?? []).slice(0, 3);
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
-      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Failed (24h)</p>
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Failed ({windowLabel(windowHours)})</p>
       <p className="text-2xl font-bold font-mono text-red-400">{value}</p>
       {spark.length >= 3 && (
         <div className="h-8 mt-1">
@@ -170,10 +178,11 @@ export function AcceptanceRateCard({ rate, loading }: {
   );
 }
 
-export function CostCard({ totalCost, trendHistory, loading }: {
+export function CostCard({ totalCost, trendHistory, loading, windowHours = 24 }: {
   totalCost?: number | null;
   trendHistory?: { period_cost_usd?: number | null }[];
   loading: boolean;
+  windowHours?: number;
 }) {
   const sparkPoints = useMemo(() => (trendHistory ?? []).map(p => ({ v: p.period_cost_usd ?? 0 })), [trendHistory]);
   if (loading) return <Skeleton className="h-20" />;
@@ -181,7 +190,7 @@ export function CostCard({ totalCost, trendHistory, loading }: {
   const display = totalCost == null ? '--' : totalCost < 10 ? `$${totalCost.toFixed(2)}` : `$${Math.round(totalCost)}`;
   return (
     <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-3 sm:p-4">
-      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Cost (24h)</p>
+      <p className="text-ui-sm text-neutral-500 uppercase tracking-wide mb-1">Cost ({windowLabel(windowHours)})</p>
       <p className="text-2xl font-bold font-mono text-blue-400">{display}</p>
       {sparkPoints.length >= 3 && (
         <div className="h-8 mt-1">

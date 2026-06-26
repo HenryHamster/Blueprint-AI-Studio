@@ -3493,6 +3493,64 @@ def test_knowledge_sweep_aggregate_doc_arms_block(monkeypatch, capsys):
     assert "NOT MET" in out
 
 
+def test_knowledge_sweep_aggregate_arms_real_criterion_cost(monkeypatch, capsys):
+    """Aggregate doc with per_arm_verdicts renders real MET/NOT MET and dollar costs.
+
+    This is the acceptance test for the per-arm criterion+cost fix: the sweep
+    table must show real verdict strings and dollar amounts — never '?' — when
+    the aggregate document carries a per_arm_verdicts block (populated by the
+    backend cost-apportionment path) and an arms block (raw aggregator output).
+    """
+    aggregate_doc = {
+        "id": "kdoc-agg-real",
+        "title": "Real sweep aggregate",
+        "source_kind": "compute_experiment",
+        "sweep_id": "swp-real01",
+        "arm_label": None,
+        "forward_quality_verdict": {
+            "arms": {
+                "baseline": {"accuracy": 0.85, "exit_code": 0, "elapsed_seconds": 60.0},
+                "optimized": {"accuracy": 0.93, "exit_code": 0, "elapsed_seconds": 40.0},
+            },
+            "per_arm_verdicts": {
+                "baseline": {"value": 0.85, "met": False, "cost_usd": 0.15},
+                "optimized": {"value": 0.93, "met": True, "cost_usd": 0.10},
+            },
+        },
+    }
+
+    def fake_api(method, path, body=None, timeout=30):
+        if "/knowledge-documents" in path and method == "GET":
+            return {"documents": [aggregate_doc], "total": 1}
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["knowledge", "sweep", "swp-real01"])
+    assert rc == 0
+    out = capsys.readouterr().out
+
+    # Both arm names appear
+    assert "baseline" in out
+    assert "optimized" in out
+
+    # Real criterion verdicts — no '?' for criterion
+    assert "MET" in out
+    assert "NOT MET" in out
+
+    # Real costs — dollar amounts appear, no '?' for cost
+    assert "$0.15" in out or "0.15" in out
+    assert "$0.10" in out or "0.10" in out
+
+    # No '?' in criterion or cost columns (every cell is resolved)
+    lines = [ln for ln in out.splitlines() if "baseline" in ln or "optimized" in ln]
+    for line in lines:
+        # Strip the arm name and metric columns, check criterion+cost are not '?'
+        parts = line.split()
+        assert "?" not in parts[2:], f"'?' found in criterion/cost column: {line!r}"
+
+
 def test_compute_kill_aborts_without_yes(mock_api, monkeypatch, capsys):
     """compute kill without --yes on non-interactive stdin aborts cleanly."""
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})

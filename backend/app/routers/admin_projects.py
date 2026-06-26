@@ -813,6 +813,83 @@ async def dismiss_pending_confirmation(
     return {"status": "dismissed", "pending_id": pending_id}
 
 
+class _AcceptPendingBody(BaseModel):
+    answer: str | None = None
+    """For major_decision: the operator's answer text to record."""
+
+
+@router.post("/projects/{project_id}/pending-confirm/{pending_id}/accept")
+@limiter.limit("30/minute")
+async def accept_pending_confirmation(
+    request: Request,
+    project_id: uuid.UUID,
+    pending_id: str,
+    payload: _AcceptPendingBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Accept a pending_user_confirmation item with a type-specific action.
+
+    - intent_change: applies the proposed text as the new intent.purpose and clears the item.
+    - major_decision: records the operator's answer in the revision log and clears the item.
+    - credentials_needed / access_needed: signals provided and clears the item.
+    """
+    from app.problem_model import (
+        apply_user_intent_patch,
+        append_revision_log,
+        parse_problem_model,
+    )
+    from app.time_utils import _utcnow
+
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    current_model = parse_problem_model(project.problem_model)
+
+    matched = next(
+        (p for p in current_model.pending_user_confirmation if p.id == pending_id),
+        None,
+    )
+    if matched is None:
+        raise HTTPException(
+            status_code=404, detail=f"Pending confirmation '{pending_id}' not found"
+        )
+
+    now = _utcnow().isoformat()
+
+    if matched.type == "intent_change":
+        # Apply the proposed text as the new operator-set intent.purpose.
+        current_model = apply_user_intent_patch(
+            project.problem_model,
+            {"intent": {"purpose": matched.proposal}},
+            now,
+        )
+        # Remove the pending item after applying the intent change.
+        current_model.pending_user_confirmation = [
+            p for p in current_model.pending_user_confirmation if p.id != pending_id
+        ]
+    else:
+        # For major_decision, credentials_needed, access_needed:
+        # remove the item and record a revision log entry with any answer.
+        current_model.pending_user_confirmation = [
+            p for p in current_model.pending_user_confirmation if p.id != pending_id
+        ]
+        current_model.revision += 1
+        current_model.last_updated = now
+        current_model.last_updated_by = "user"
+        changes: dict = {"pending_accepted": {"id": pending_id, "type": matched.type}}
+        if payload.answer:
+            changes["decision_answer"] = payload.answer
+            changes["decision_question"] = matched.proposal
+        append_revision_log(current_model, f"operator accepted {matched.type}", changes)
+
+    project.problem_model = current_model.model_dump()
+    flag_modified(project, "problem_model")
+    session.add(project)
+    await session.commit()
+    return {"status": "accepted", "pending_id": pending_id, "type": matched.type}
+
+
 @router.delete("/projects/{project_id}")
 @limiter.limit("10/minute")
 async def delete_project_admin(

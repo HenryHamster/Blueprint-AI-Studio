@@ -159,6 +159,8 @@ export function DirectionsList(props: DirectionsListProps) {
                         editCompletionCriteria={form.editCompletionCriteria}
                         editSuccessEvidence={form.editSuccessEvidence}
                         editRetirementCondition={form.editRetirementCondition}
+                        editCostBudget={form.editCostBudget}
+                        setEditCostBudget={form.setEditCostBudget}
                         setEditingId={form.setEditingId}
                         setEditText={form.setEditText}
                         setEditPriority={form.setEditPriority}

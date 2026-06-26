@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Lock, Shield, Target, HelpCircle, ChevronDown, ChevronRight, X } from 'lucide-react';
+import { Lock, Shield, Target, HelpCircle, ChevronDown, ChevronRight, X, Check } from 'lucide-react';
 import { timeAgo } from '../utils/time';
 import type { PendingConfirmation, PendingConfirmationType } from '../types';
 
@@ -33,13 +33,27 @@ const VISIBLE_CAP = 3;
 function PendingItemRow({
   pending,
   onDismiss,
+  onAccept,
 }: {
   pending: PendingConfirmation;
   onDismiss: () => Promise<void>;
+  onAccept: (answer?: string) => Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [dismissing, setDismissing] = useState(false);
+  const [accepting, setAccepting] = useState(false);
+  const [answer, setAnswer] = useState('');
   const label = TYPE_LABELS[pending.type] ?? pending.type;
+
+  const handleAccept = async (answerText?: string) => {
+    setAccepting(true);
+    try { await onAccept(answerText); } finally { setAccepting(false); }
+  };
+
+  const acceptLabel =
+    pending.type === 'intent_change' ? 'Accept intent' :
+    pending.type === 'major_decision' ? 'Answer' :
+    'Mark provided';
 
   return (
     <div className="border-l-2 border-amber-500/40 pl-3">
@@ -66,25 +80,57 @@ function PendingItemRow({
         >
           {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
         </button>
+        {pending.type !== 'major_decision' && (
+          <button
+            type="button"
+            disabled={accepting || dismissing}
+            onClick={() => handleAccept()}
+            className="shrink-0 inline-flex items-center gap-1 px-2 py-1 min-h-[44px] md:min-h-0 text-xs font-medium rounded border border-emerald-800 bg-emerald-950/50 text-emerald-400 hover:bg-emerald-900/40 hover:text-emerald-300 transition disabled:opacity-50"
+            title={acceptLabel}
+          >
+            <Check size={11} />
+            {acceptLabel}
+          </button>
+        )}
         <button
           type="button"
-          disabled={dismissing}
+          disabled={dismissing || accepting}
           onClick={async () => {
             setDismissing(true);
             try { await onDismiss(); } finally { setDismissing(false); }
           }}
           className="shrink-0 inline-flex items-center gap-1 px-2 py-1 min-h-[44px] md:min-h-0 text-xs font-medium rounded border border-neutral-700 bg-neutral-800/50 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100 transition disabled:opacity-50"
-          title="Mark as resolved"
+          title="Mark as resolved without action"
         >
           <X size={11} />
           Resolve
         </button>
       </div>
       {expanded && (
-        <div className="pb-2 pr-2 space-y-1">
+        <div className="pb-2 pr-2 space-y-2">
           <p className="text-sm text-neutral-200">{pending.proposal}</p>
           {pending.rationale && (
             <p className="text-xs text-neutral-400">{pending.rationale}</p>
+          )}
+          {pending.type === 'major_decision' && (
+            <div className="flex gap-2 items-start pt-1">
+              <textarea
+                value={answer}
+                onChange={(e) => setAnswer(e.target.value)}
+                placeholder="Enter your answer…"
+                rows={2}
+                className="flex-1 text-xs bg-neutral-800 border border-neutral-700 rounded px-2 py-1.5 text-neutral-200 placeholder-neutral-600 resize-none focus:outline-none focus:border-emerald-700"
+              />
+              <button
+                type="button"
+                disabled={accepting || !answer.trim()}
+                onClick={() => handleAccept(answer.trim())}
+                className="shrink-0 inline-flex items-center gap-1 px-2 py-1.5 min-h-[44px] md:min-h-0 text-xs font-medium rounded border border-emerald-800 bg-emerald-950/50 text-emerald-400 hover:bg-emerald-900/40 hover:text-emerald-300 transition disabled:opacity-50"
+              >
+                <Check size={11} />
+                Answer
+              </button>
+            </div>
           )}
           <p className="text-ui-sm font-mono text-neutral-700">{pending.id}</p>
         </div>
@@ -96,9 +142,10 @@ function PendingItemRow({
 interface PendingConfirmationListProps {
   pending: PendingConfirmation[];
   onDismiss: (id: string) => Promise<void>;
+  onAccept: (id: string, answer?: string) => Promise<void>;
 }
 
-export function PendingConfirmationList({ pending, onDismiss }: PendingConfirmationListProps) {
+export function PendingConfirmationList({ pending, onDismiss, onAccept }: PendingConfirmationListProps) {
   const [showAll, setShowAll] = useState(false);
 
   const sorted = [...pending].sort((a, b) => {
@@ -117,6 +164,7 @@ export function PendingConfirmationList({ pending, onDismiss }: PendingConfirmat
           key={p.id}
           pending={p}
           onDismiss={() => onDismiss(p.id)}
+          onAccept={(answer) => onAccept(p.id, answer)}
         />
       ))}
       {!showAll && overflow > 0 && (

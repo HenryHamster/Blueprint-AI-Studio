@@ -48,6 +48,9 @@ export function useDirectionForm() {
   // context when entering edit mode (see startEdit).
   const [editSuccessEvidence, setEditSuccessEvidence] = useState('');
   const [editRetirementCondition, setEditRetirementCondition] = useState('');
+  // Cost budget in USD — seeded from direction.cost_budget_usd (or empty string
+  // when unset); sent as a float or null on PATCH.
+  const [editCostBudget, setEditCostBudget] = useState('');
 
   function startEdit(d: Direction) {
     setEditingId(d.id);
@@ -60,6 +63,7 @@ export function useDirectionForm() {
     setEditCompletionCriteria(d.completion_criteria ?? '');
     setEditSuccessEvidence(d.context?.success_evidence ?? '');
     setEditRetirementCondition(d.context?.retirement_condition ?? '');
+    setEditCostBudget(d.cost_budget_usd != null ? String(d.cost_budget_usd) : '');
   }
 
   function resetAddKeyForEditedDraft() {
@@ -160,6 +164,7 @@ export function useDirectionForm() {
     editCompletionCriteria, setEditCompletionCriteria,
     editSuccessEvidence, setEditSuccessEvidence,
     editRetirementCondition, setEditRetirementCondition,
+    editCostBudget, setEditCostBudget,
     startEdit,
     resetAddForm,
     seedFromMessage,

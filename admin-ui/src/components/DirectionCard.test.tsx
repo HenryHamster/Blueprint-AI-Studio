@@ -702,6 +702,33 @@ describe('DirectionCard knowledge docs badge', () => {
   });
 });
 
+describe('DirectionCard cost budget editor', () => {
+  it('renders the cost budget input in edit mode when setEditCostBudget is provided', () => {
+    const d = makeDirection({ cost_budget_usd: 10.0 });
+    const setEditCostBudget = vi.fn();
+    const props = {
+      ...makeProps(d),
+      editingId: d.id,
+      editText: d.text,
+      editCostBudget: '10',
+      setEditCostBudget,
+    };
+    render(<DirectionCard {...props} />);
+    const input = screen.getByPlaceholderText('Budget $') as HTMLInputElement;
+    expect(input).toBeInTheDocument();
+    expect(input.value).toBe('10');
+    fireEvent.change(input, { target: { value: '25.50' } });
+    expect(setEditCostBudget).toHaveBeenCalledWith('25.50');
+  });
+
+  it('does not render the cost budget input when setEditCostBudget is absent', () => {
+    const d = makeDirection();
+    const props = { ...makeProps(d), editingId: d.id, editText: d.text };
+    render(<DirectionCard {...props} />);
+    expect(screen.queryByPlaceholderText('Budget $')).not.toBeInTheDocument();
+  });
+});
+
 describe('DirectionCard staged retarget control', () => {
   function stagedProps(overrides: Partial<Direction> = {}) {
     const d = makeDirection({ status: 'staged', staged_for_version: 5, ...overrides });

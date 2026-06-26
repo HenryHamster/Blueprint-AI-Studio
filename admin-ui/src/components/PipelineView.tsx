@@ -212,7 +212,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
 
       {/* Duration */}
       <span className="text-ui-sm text-neutral-500 font-mono shrink-0">
-        {task.status === 'QUEUED' ? 'Waiting' : duration}
+        {['QUEUED', 'PARKED', 'BLOCKED'].includes(task.status) ? 'Waiting' : duration}
       </span>
     </div>
   );

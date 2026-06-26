@@ -1342,6 +1342,41 @@ describe('ComputeJobsPanel render + kill', () => {
     );
   });
 
+  test('compute panel summary renders the outcome breakdown counts', async () => {
+    fetchComputeJobs.mockResolvedValue({
+      jobs: [
+        makeJob({ id: 'job-a', status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 }),
+        makeJob({ id: 'job-b', status: 'FAILED', outcome: 'FAILURE', final_cost_usd: 0.5 }),
+      ],
+      hasMore: false,
+      summary: {
+        total_jobs: 4,
+        active_jobs: 0,
+        terminal_jobs: 4,
+        total_spend_usd: 3.0,
+        outcome_breakdown: {
+          success: 2,
+          failure: 1,
+          cancelled: 1,
+        },
+        criterion_measured: 0,
+        criterion_met: 0,
+      },
+      limit: 50,
+      offset: 0,
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const summary = await findByTestId('compute-jobs-summary');
+    // Outcome breakdown section should be visible with header
+    expect(summary.textContent).toContain('Outcomes');
+    // All outcome counts should be displayed in the summary
+    expect(summary.textContent).toContain('success');
+    expect(summary.textContent).toContain('2');
+    expect(summary.textContent).toContain('failure');
+    expect(summary.textContent).toContain('1');
+    expect(summary.textContent).toContain('cancelled');
+  });
+
   test('command log with more than 30 lines shows Show all button; clicking expands', async () => {
     const longLog = Array.from({ length: 50 }, (_, i) => `line ${i}`).join('\n');
     fetchComputeJobs.mockResolvedValue(wrapJobs([

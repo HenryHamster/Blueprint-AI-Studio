@@ -24,7 +24,7 @@ import {
 
 const POLL_INTERVAL_MS = 10_000;
 
-const DIAGNOSTIC_KEYS = new Set(['exit_code', 'error', 'reason', 'stderr_excerpt', 'label', 'note', 'log']);
+const DIAGNOSTIC_KEYS = new Set(['exit_code', 'error', 'reason', 'stderr_excerpt', 'label', 'note', 'log', 'elapsed_seconds']);
 
 const WINDOW_OPTIONS: { label: string; minutes: number }[] = [
   { label: '6h', minutes: 360 },
@@ -879,30 +879,39 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
       )}
 
       {summary && summary.total_jobs > 0 && (
-        <div
-          className="mb-3 flex flex-wrap gap-x-4 gap-y-0.5 text-ui-sm font-mono text-neutral-400"
-          data-testid="compute-jobs-summary"
-        >
-          <span className="text-neutral-500 text-xs uppercase tracking-widest">Windowed</span>
-          <span>
-            <span className="text-neutral-500">total</span> {summary.total_jobs}
-          </span>
-          {summary.active_jobs > 0 && (
+        <div className="mb-3 flex flex-col gap-2" data-testid="compute-jobs-summary">
+          <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-ui-sm font-mono text-neutral-400">
+            <span className="text-neutral-500 text-xs uppercase tracking-widest">Windowed</span>
             <span>
-              <span className="text-neutral-500">active</span>{' '}
-              <span className="text-sky-300">{summary.active_jobs}</span>
+              <span className="text-neutral-500">total</span> {summary.total_jobs}
             </span>
-          )}
-          {summary.total_spend_usd > 0 && (
-            <span>
-              <span className="text-neutral-500">spend</span> {fmtUsd(summary.total_spend_usd)}
-            </span>
-          )}
-          {summary.criterion_measured > 0 && (
-            <span>
-              <span className="text-neutral-500">criterion</span>{' '}
-              {summary.criterion_met}/{summary.criterion_measured} met
-            </span>
+            {summary.active_jobs > 0 && (
+              <span>
+                <span className="text-neutral-500">active</span>{' '}
+                <span className="text-sky-300">{summary.active_jobs}</span>
+              </span>
+            )}
+            {summary.total_spend_usd > 0 && (
+              <span>
+                <span className="text-neutral-500">spend</span> {fmtUsd(summary.total_spend_usd)}
+              </span>
+            )}
+            {summary.criterion_measured > 0 && (
+              <span>
+                <span className="text-neutral-500">criterion</span>{' '}
+                {summary.criterion_met}/{summary.criterion_measured} met
+              </span>
+            )}
+          </div>
+          {Object.keys(summary.outcome_breakdown).length > 0 && (
+            <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-ui-sm font-mono text-neutral-400">
+              <span className="text-neutral-500 text-xs uppercase tracking-widest">Outcomes</span>
+              {Object.entries(summary.outcome_breakdown).map(([outcome, count]) => (
+                <span key={outcome}>
+                  <span className="text-neutral-500">{outcome}</span> {count}
+                </span>
+              ))}
+            </div>
           )}
         </div>
       )}
@@ -1428,97 +1437,138 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               {(() => {
                 if (active) return null;
                 const { experiment, benchmark, hypothesis } = job;
-                if (!experiment && !benchmark && !hypothesis) return null;
-                return (
-                  <div
-                    className="mt-1.5 flex flex-col gap-0.5 text-ui-sm font-mono"
-                    data-testid="compute-experiment-identity"
-                  >
-                    {(experiment || benchmark) && (
-                      <div className="flex items-start gap-1.5">
-                        <span className="text-neutral-500 shrink-0">{experiment ? 'Experiment' : 'Benchmark'}</span>
-                        <span className="text-neutral-300 break-words">{experiment ?? benchmark}</span>
-                      </div>
-                    )}
-                    {hypothesis && (
-                      <div className="flex items-start gap-1.5">
-                        <span className="text-neutral-500 shrink-0">Hypothesis</span>
-                        <span className="text-neutral-300 break-words">{hypothesis}</span>
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
-              {(() => {
-                if (active) return null;
                 const sc = job.success_criterion;
                 const verdict = job.criterion_verdict;
-                if (!sc) return null;
-                const expr = `${sc.metric} ${sc.operator} ${sc.threshold}`;
-                const margin = computeJobMargin(job);
-                let chip: React.ReactNode;
-                if (!verdict) {
-                  chip = (
-                    <span className="rounded border border-neutral-600/40 bg-neutral-800/60 px-1 py-0.5 text-neutral-400">
-                      not reported
-                    </span>
-                  );
-                } else if (verdict.met) {
-                  chip = (
-                    <span
-                      className="rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-emerald-300"
-                      data-testid="criterion-met"
-                    >
-                      met
-                    </span>
-                  );
-                } else {
-                  chip = (
-                    <span
-                      className="rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-red-300"
-                      data-testid="criterion-unmet"
-                    >
-                      {verdict.measurable ? 'unmet' : 'unmet (not measurable)'}
-                    </span>
-                  );
+                const hasIdentity = !!(experiment || benchmark || hypothesis);
+                if (!hasIdentity && !sc) return null;
+
+                // Derive top-level verdict state when hypothesis + criterion are both present.
+                type VerdictState = 'held' | 'refuted' | 'inconclusive';
+                let verdictState: VerdictState | null = null;
+                if (hypothesis && sc && verdict) {
+                  verdictState = !verdict.measurable ? 'inconclusive' : verdict.met ? 'held' : 'refuted';
                 }
+
+                const expr = sc ? `${sc.metric} ${sc.operator} ${sc.threshold}` : null;
+                const margin = computeJobMargin(job);
+
+                let chip: React.ReactNode;
+                if (sc) {
+                  if (!verdict) {
+                    chip = (
+                      <span className="rounded border border-neutral-600/40 bg-neutral-800/60 px-1 py-0.5 text-neutral-400">
+                        not reported
+                      </span>
+                    );
+                  } else if (verdict.met) {
+                    chip = (
+                      <span
+                        className="rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-emerald-300"
+                        data-testid="criterion-met"
+                      >
+                        met
+                      </span>
+                    );
+                  } else if (!verdict.measurable) {
+                    chip = (
+                      <span
+                        className="rounded border border-amber-500/40 bg-amber-500/15 px-1 py-0.5 text-amber-300"
+                        data-testid="criterion-inconclusive"
+                      >
+                        inconclusive
+                      </span>
+                    );
+                  } else {
+                    chip = (
+                      <span
+                        className="rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-red-300"
+                        data-testid="criterion-unmet"
+                      >
+                        unmet
+                      </span>
+                    );
+                  }
+                }
+
                 return (
                   <div
-                    className="mt-1.5 flex flex-col gap-1 text-ui-sm font-mono"
-                    data-testid="criterion-verdict-row"
+                    className="mt-1.5"
+                    data-testid={verdictState ? 'fused-experiment-verdict' : undefined}
                   >
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-neutral-500 shrink-0">Criterion</span>
-                      <span className="text-neutral-300 break-words">{expr}</span>
-                      {verdict && verdict.value !== null && verdict.value !== undefined && (
-                        <span className="text-neutral-500">
-                          (measured: {verdict.value})
-                        </span>
-                      )}
-                      {chip}
-                    </div>
-                    {verdict?.binding_status && (
-                      <div className="flex items-center gap-1.5 text-neutral-500">
-                        <span className="shrink-0">Binding status</span>
+                    {verdictState && (
+                      <div className="mb-1 flex items-center gap-1.5">
                         <span
-                          className="font-semibold text-neutral-300"
-                          data-testid="criterion-binding-status"
+                          className={`rounded border px-1.5 py-0.5 text-ui-xs font-bold ${
+                            verdictState === 'held'
+                              ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                              : verdictState === 'refuted'
+                                ? 'border-red-500/40 bg-red-500/15 text-red-300'
+                                : 'border-amber-500/40 bg-amber-500/15 text-amber-300'
+                          }`}
+                          data-testid="verdict-label"
                         >
-                          {verdict.binding_status}
+                          {verdictState === 'held' ? 'HELD' : verdictState === 'refuted' ? 'REFUTED' : 'INCONCLUSIVE'}
                         </span>
                       </div>
                     )}
-                    {margin !== null && (
-                      <div className="flex items-center gap-1.5 text-neutral-500">
-                        <span className="shrink-0">Margin</span>
-                        <span
-                          className={`font-semibold ${
-                            margin >= 0 ? 'text-emerald-300' : 'text-red-300'
-                          }`}
-                          data-testid="criterion-margin"
-                        >
-                          {margin >= 0 ? '+' : ''}{margin.toFixed(2)}
-                        </span>
+                    {hasIdentity && (
+                      <div
+                        className="flex flex-col gap-0.5 text-ui-sm font-mono"
+                        data-testid="compute-experiment-identity"
+                      >
+                        {(experiment || benchmark) && (
+                          <div className="flex items-start gap-1.5">
+                            <span className="text-neutral-500 shrink-0">{experiment ? 'Experiment' : 'Benchmark'}</span>
+                            <span className="text-neutral-300 break-words">{experiment ?? benchmark}</span>
+                          </div>
+                        )}
+                        {hypothesis && (
+                          <div className="flex items-start gap-1.5">
+                            <span className="text-neutral-500 shrink-0">Hypothesis</span>
+                            <span className="text-neutral-300 break-words">{hypothesis}</span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {sc && (
+                      <div
+                        className={`flex flex-col gap-1 text-ui-sm font-mono${hasIdentity ? ' mt-0.5' : ''}`}
+                        data-testid="criterion-verdict-row"
+                      >
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-neutral-500 shrink-0">Criterion</span>
+                          <span className="text-neutral-300 break-words">{expr}</span>
+                          {verdict && verdict.value !== null && verdict.value !== undefined && (
+                            <span className="text-neutral-500">
+                              (measured: {verdict.value})
+                            </span>
+                          )}
+                          {chip}
+                        </div>
+                        {verdict?.binding_status && (
+                          <div className="flex items-center gap-1.5 text-neutral-500">
+                            <span className="shrink-0">Binding status</span>
+                            <span
+                              className="font-semibold text-neutral-300"
+                              data-testid="criterion-binding-status"
+                            >
+                              {verdict.binding_status}
+                            </span>
+                          </div>
+                        )}
+                        {margin !== null && (
+                          <div className="flex items-center gap-1.5 text-neutral-500">
+                            <span className="shrink-0">Margin</span>
+                            <span
+                              className={`font-semibold ${
+                                margin >= 0 ? 'text-emerald-300' : 'text-red-300'
+                              }`}
+                              data-testid="criterion-margin"
+                            >
+                              {margin >= 0 ? '+' : ''}{margin.toFixed(2)}
+                            </span>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>

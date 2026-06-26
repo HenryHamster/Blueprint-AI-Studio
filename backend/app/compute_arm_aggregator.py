@@ -25,6 +25,14 @@ def _read_exit_code(path: str) -> int | None:
         return None
 
 
+def _read_elapsed_seconds(path: str) -> float | None:
+    try:
+        val = int(Path(path).read_text().strip())
+        return float(val) if val >= 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _read_stderr_excerpt(path: str) -> str | None:
     try:
         data = Path(path).read_bytes()
@@ -66,6 +74,7 @@ def aggregate(
     *,
     exit_codes: dict[str, str] | None = None,
     stderr_files: dict[str, str] | None = None,
+    durations: dict[str, str] | None = None,
 ) -> dict:
     """Read per-arm result files and write the combined arms block.
 
@@ -75,12 +84,19 @@ def aggregate(
     corresponding capture file.  When provided, each arm entry gains an
     exit_code field and, on failure, a stderr_excerpt and human-readable
     reason that distinguishes crash / timeout / unmeasured-criterion.
+
+    Optional durations maps arm name to the path of the elapsed-seconds file
+    written by the wrapper.  When provided, each arm entry gains an
+    elapsed_seconds field for both successful and failed arms so that the
+    backend can apportion total cost by wall-clock fraction.
     """
     arms_block: dict = {}
     for name, path in arms:
         ec_path = (exit_codes or {}).get(name)
         se_path = (stderr_files or {}).get(name)
+        dur_path = (durations or {}).get(name)
         exit_code = _read_exit_code(ec_path) if ec_path else None
+        elapsed = _read_elapsed_seconds(dur_path) if dur_path else None
 
         result_missing = False
         metric_missing = False
@@ -95,6 +111,8 @@ def aggregate(
                 entry: dict = {declared_metric: value}
                 if exit_code is not None:
                     entry["exit_code"] = exit_code
+                if elapsed is not None:
+                    entry["elapsed_seconds"] = elapsed
                 arms_block[name] = entry
                 continue
         except FileNotFoundError:
@@ -103,6 +121,8 @@ def aggregate(
             arms_block[name] = {"error": str(exc)}
             if exit_code is not None:
                 arms_block[name]["exit_code"] = exit_code
+            if elapsed is not None:
+                arms_block[name]["elapsed_seconds"] = elapsed
             continue
 
         reason = _failure_reason(
@@ -118,6 +138,8 @@ def aggregate(
             excerpt = _read_stderr_excerpt(se_path)
             if excerpt:
                 entry["stderr_excerpt"] = excerpt
+        if elapsed is not None:
+            entry["elapsed_seconds"] = elapsed
         arms_block[name] = entry
 
     result = {"arms": arms_block}
@@ -160,6 +182,13 @@ def main() -> None:
         default=None,
         help="Colon-separated arm name and stderr capture file path pairs.",
     )
+    parser.add_argument(
+        "--durations",
+        nargs="+",
+        metavar="NAME:PATH",
+        default=None,
+        help="Colon-separated arm name and elapsed-seconds file path pairs.",
+    )
     args = parser.parse_args()
 
     def _parse_specs(specs: list[str] | None) -> dict[str, str] | None:
@@ -182,6 +211,7 @@ def main() -> None:
         args.output,
         exit_codes=_parse_specs(args.exit_codes),
         stderr_files=_parse_specs(args.stderr),
+        durations=_parse_specs(args.durations),
     )
 
 

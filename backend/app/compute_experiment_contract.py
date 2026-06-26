@@ -166,27 +166,33 @@ def _validate_compute_launch_contract(
             arm_result_specs: list[str] = []
             arm_exit_specs: list[str] = []
             arm_stderr_specs: list[str] = []
+            arm_duration_specs: list[str] = []
             for arm in arms:
                 aname = arm["name"]
                 acmd = arm["command"].strip()
                 lines += [
                     f'mkdir -p "${{_BRF_BASE}}/{aname}"',
+                    '_BRF_T1=$(date +%s)',
                     f'(export BLUEPRINT_RESULT_FILE="${{_BRF_BASE}}/{aname}/result.json"; {acmd})'
                     f' 2>"${{_BRF_BASE}}/{aname}/stderr"',
                     f'echo $? > "${{_BRF_BASE}}/{aname}/exit_code"',
+                    f'echo $(($(date +%s) - _BRF_T1)) > "${{_BRF_BASE}}/{aname}/elapsed"',
                 ]
                 arm_result_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/result.json"')
                 arm_exit_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/exit_code"')
                 arm_stderr_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/stderr"')
+                arm_duration_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/elapsed"')
             arm_specs_arg = " ".join(arm_result_specs)
             exit_specs_arg = " ".join(arm_exit_specs)
             stderr_specs_arg = " ".join(arm_stderr_specs)
+            duration_specs_arg = " ".join(arm_duration_specs)
             lines += [
                 f"echo {_AGGREGATOR_B64} | base64 -d > /tmp/blueprint_arm_agg.py",
                 f'python3 /tmp/blueprint_arm_agg.py --arms {arm_specs_arg}'
                 f' --declared-metric "{declared_metric}" --output "${{_BRF_MAIN}}"'
                 f' --exit-codes {exit_specs_arg}'
-                f' --stderr {stderr_specs_arg}',
+                f' --stderr {stderr_specs_arg}'
+                f' --durations {duration_specs_arg}',
             ]
             script = "\n".join(lines)
             encoded = base64.b64encode(script.encode()).decode()

@@ -3483,25 +3483,29 @@ def _render_knowledge_sweep(data: dict) -> None:
                 "cost_usd": verdict.get("cost_usd"),
             })
         else:
-            # Aggregate document — parse arms block
+            # Aggregate document — per_arm_verdicts is authoritative for criterion/cost
+            per_arm_verdicts = verdict.get("per_arm_verdicts") or {}
             arms_block = verdict.get("arms") or {}
             if isinstance(arms_block, dict):
                 for name, arm_data in arms_block.items():
                     if isinstance(arm_data, dict):
+                        pav = per_arm_verdicts.get(name) if isinstance(per_arm_verdicts, dict) else {}
                         rows.append({
                             "arm": name,
                             "metric": _sweep_metric_value(arm_data),
-                            "criterion_met": arm_data.get("criterion_met"),
-                            "cost_usd": arm_data.get("cost_usd"),
+                            "criterion_met": pav.get("met") if pav else arm_data.get("criterion_met"),
+                            "cost_usd": pav.get("cost_usd") if pav else arm_data.get("cost_usd"),
                         })
             elif isinstance(arms_block, list):
                 for arm_data in arms_block:
                     if isinstance(arm_data, dict):
+                        arm_name = arm_data.get("arm") or arm_data.get("arm_label") or arm_data.get("name") or "?"
+                        pav = per_arm_verdicts.get(arm_name) if isinstance(per_arm_verdicts, dict) else {}
                         rows.append({
-                            "arm": arm_data.get("arm") or arm_data.get("arm_label") or "?",
+                            "arm": arm_name,
                             "metric": _sweep_metric_value(arm_data),
-                            "criterion_met": arm_data.get("criterion_met"),
-                            "cost_usd": arm_data.get("cost_usd"),
+                            "criterion_met": pav.get("met") if pav else arm_data.get("criterion_met"),
+                            "cost_usd": pav.get("cost_usd") if pav else arm_data.get("cost_usd"),
                         })
 
     if not rows:

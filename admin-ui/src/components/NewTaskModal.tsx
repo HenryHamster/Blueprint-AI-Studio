@@ -535,13 +535,19 @@ export function NewTaskModal({
                 </div>
               </div>
               {/* Preflight cost & policy panel */}
-              {isComputeExperiment && (preflightLoading || preflightResult || (preflightError && false)) && (
-                <div className={`mb-3 rounded-md px-3 py-2 text-ui-sm border ${isPreflightBlocking ? 'bg-red-950/40 border-red-800/60' : 'bg-neutral-900 border-neutral-800'}`}>
+              {isComputeExperiment && (preflightLoading || preflightResult || preflightError) && (
+                <div className={`mb-3 rounded-md px-3 py-2 text-ui-sm border ${preflightError || isPreflightBlocking ? 'bg-red-950/40 border-red-800/60' : 'bg-neutral-900 border-neutral-800'}`}>
                   {preflightLoading && (
                     <span className="flex items-center gap-1.5 text-neutral-500">
                       <Loader2 className="animate-spin" style={{ width: 11, height: 11 }} />
                       Checking rates…
                     </span>
+                  )}
+                  {!preflightLoading && preflightError && (
+                    <div className="text-red-400">
+                      <span className="font-semibold">Couldn't estimate cost — </span>
+                      {preflightError}
+                    </div>
                   )}
                   {!preflightLoading && preflightResult && (
                     <div className="space-y-1">

@@ -8015,6 +8015,109 @@ class TestDismissPendingConfirmation:
         assert resp.status_code == 404
 
 
+class TestAcceptPendingConfirmation:
+    """POST /pending-confirm/{id}/accept applies type-specific action and clears the item."""
+
+    _BASE_PM: dict = {
+        "revision": 2,
+        "last_updated": "2026-01-01T00:00:00",
+        "last_updated_by": "agent",
+        "intent": {"purpose": "Old purpose", "current_focus": "focus", "user_purpose": "Old purpose"},
+        "context": {},
+        "constraints": [],
+        "capabilities": [],
+        "gaps": [],
+        "archived_gaps": [],
+        "friction": [],
+        "revision_log": [],
+    }
+
+    @pytest.mark.asyncio
+    async def test_accept_intent_change_updates_purpose(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            **self._BASE_PM,
+            "pending_user_confirmation": [
+                {
+                    "id": "p-ic001",
+                    "type": "intent_change",
+                    "proposal": "New project purpose text",
+                    "rationale": "Direction shifted.",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            ],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-ic001/accept",
+            json={"answer": None},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "accepted"
+        assert data["type"] == "intent_change"
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["pending_user_confirmation"] == []
+        assert pm["intent"]["purpose"] == "New project purpose text"
+        assert pm["revision"] == 3
+        assert pm["last_updated_by"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_accept_major_decision_records_answer(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            **self._BASE_PM,
+            "pending_user_confirmation": [
+                {
+                    "id": "p-md001",
+                    "type": "major_decision",
+                    "proposal": "Should we migrate to Postgres 16?",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            ],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-md001/accept",
+            json={"answer": "Yes, proceed with migration."},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "accepted"
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["pending_user_confirmation"] == []
+        # Answer is recorded in the revision log
+        last_log = pm["revision_log"][-1]
+        assert last_log["changes"]["decision_answer"] == "Yes, proceed with migration."
+        assert last_log["changes"]["decision_question"] == "Should we migrate to Postgres 16?"
+
+    @pytest.mark.asyncio
+    async def test_accept_unknown_id_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {**self._BASE_PM, "pending_user_confirmation": []}
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-notexist/accept",
+            json={"answer": None},
+        )
+        assert resp.status_code == 404
+
+
 class TestBuildDeployStatePayload:
     """Regression: WS broadcasts use websocket.send_json which lacks FastAPI's
     JSON encoder, so any datetime in the payload raised

@@ -223,9 +223,10 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
   async function updateDirection(id: string) {
     setError(null);
     try {
+      const costBudget = form.editCostBudget.trim() !== '' ? parseFloat(form.editCostBudget) : null;
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
         method: 'PATCH',
-        body: JSON.stringify({ text: form.editText, priority: form.editPriority, status: form.editStatus, paths: form.editPathTags, category: form.editCategory ?? null, completion_criteria: form.editCompletionCriteria.trim() || null, success_evidence: form.editSuccessEvidence.trim() || null, retirement_condition: form.editRetirementCondition.trim() || null }),
+        body: JSON.stringify({ text: form.editText, priority: form.editPriority, status: form.editStatus, paths: form.editPathTags, category: form.editCategory ?? null, completion_criteria: form.editCompletionCriteria.trim() || null, success_evidence: form.editSuccessEvidence.trim() || null, retirement_condition: form.editRetirementCondition.trim() || null, cost_budget_usd: (costBudget != null && !Number.isNaN(costBudget)) ? costBudget : null }),
       });
       if (!res.ok) throw new Error('Failed to update direction');
       form.setEditingId(null);

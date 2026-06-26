@@ -256,4 +256,28 @@ describe('PipelineView group summary counts parked tasks separately', () => {
     const parkedBadges = Array.from(document.querySelectorAll('[title*="parked"]')).filter(el => el.textContent?.includes('1'));
     expect(parkedBadges.length).toBeGreaterThan(0);
   });
+
+  it('shows "Waiting" for PARKED and BLOCKED tasks instead of live-ticking timer', async () => {
+    const user = userEvent.setup();
+    const createdAt = '2026-05-01T10:00:00Z';
+    const tasks = [
+      makeTask({ id: 'parked-task', title: 'Parked Task', status: 'PARKED', created_at: createdAt }),
+      makeTask({ id: 'blocked-task', title: 'Blocked Task', status: 'BLOCKED', created_at: createdAt }),
+      makeTask({ id: 'in-progress', title: 'In Progress', status: 'IN_PROGRESS', created_at: createdAt }),
+      makeTask({ id: 'sibling', title: 'Sibling', status: 'QUEUED' }),
+    ];
+    render(<PipelineView tasks={tasks} onViewLogs={vi.fn()} />);
+    await user.click(screen.getByRole('button', { name: 'Expand all' }));
+
+    // PARKED and BLOCKED tasks should show "Waiting"
+    const parkedNode = nodeFor('parked-task');
+    expect(parkedNode.textContent).toContain('Waiting');
+
+    const blockedNode = nodeFor('blocked-task');
+    expect(blockedNode.textContent).toContain('Waiting');
+
+    // IN_PROGRESS should show elapsed time (contains a colon from time format), not "Waiting"
+    const progressNode = nodeFor('in-progress');
+    expect(progressNode.textContent).not.toContain('Waiting');
+  });
 });
