@@ -286,6 +286,21 @@ def reset_github_module_caches():
 
 
 @pytest.fixture(autouse=True)
+def reset_detect_local_gpu_cache():
+    """Reset the module-level detect_local_gpu cache before and after every test.
+
+    detect_local_gpu() caches its result in a process-lifetime global.  Without
+    this fixture a value populated (or monkeypatched) by one test leaks into the
+    next, causing order-dependent failures in parallel or xdist runs.
+    """
+    from app import compute_backends as cb
+
+    cb._detect_local_gpu_cache = cb._DETECT_LOCAL_GPU_UNSET
+    yield
+    cb._detect_local_gpu_cache = cb._DETECT_LOCAL_GPU_UNSET
+
+
+@pytest.fixture(autouse=True)
 def reset_rate_limiter():
     """
     Reset the slowapi in-memory rate-limit counters before every test so that

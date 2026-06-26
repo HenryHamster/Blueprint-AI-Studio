@@ -3440,19 +3440,15 @@ def test_detect_local_gpu_absent(monkeypatch):
     """detect_local_gpu returns None when nvidia-smi is not on the PATH."""
     from app import compute_backends as cb
 
-    monkeypatch.setattr(cb, "_detect_local_gpu_cache", cb._DETECT_LOCAL_GPU_UNSET)
     monkeypatch.setattr(cb.shutil, "which", lambda _name: None)
     result = cb.detect_local_gpu()
     assert result is None
-    # Reset cache so later tests are unaffected.
-    monkeypatch.setattr(cb, "_detect_local_gpu_cache", cb._DETECT_LOCAL_GPU_UNSET)
 
 
 def test_detect_local_gpu_present(monkeypatch):
     """detect_local_gpu returns parsed name + memory when nvidia-smi succeeds."""
     from app import compute_backends as cb
 
-    monkeypatch.setattr(cb, "_detect_local_gpu_cache", cb._DETECT_LOCAL_GPU_UNSET)
     monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/nvidia-smi")
 
     class _FakeResult:
@@ -3462,14 +3458,12 @@ def test_detect_local_gpu_present(monkeypatch):
     monkeypatch.setattr(cb.subprocess, "run", lambda *_a, **_kw: _FakeResult())
     result = cb.detect_local_gpu()
     assert result == {"name": "Tesla T4", "memory_mib": 15360}
-    monkeypatch.setattr(cb, "_detect_local_gpu_cache", cb._DETECT_LOCAL_GPU_UNSET)
 
 
 def test_detect_local_gpu_subprocess_error(monkeypatch):
     """detect_local_gpu returns None and does not raise when nvidia-smi errors."""
     from app import compute_backends as cb
 
-    monkeypatch.setattr(cb, "_detect_local_gpu_cache", cb._DETECT_LOCAL_GPU_UNSET)
     monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/nvidia-smi")
 
     def _raise(*_a, **_kw):
@@ -3478,7 +3472,6 @@ def test_detect_local_gpu_subprocess_error(monkeypatch):
     monkeypatch.setattr(cb.subprocess, "run", _raise)
     result = cb.detect_local_gpu()
     assert result is None
-    monkeypatch.setattr(cb, "_detect_local_gpu_cache", cb._DETECT_LOCAL_GPU_UNSET)
 
 
 def test_validate_backend_name_local_gpu_no_gpu(monkeypatch):

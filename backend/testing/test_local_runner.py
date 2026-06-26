@@ -19,6 +19,7 @@ from app import orchestrator as orch
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
 from app.models import (
     ComputeJob,
+    ComputeJobOutcome,
     ComputeJobStatus,
     LocalRunner,
     Project,
@@ -1048,3 +1049,74 @@ class TestLocalRunnerStatusForStrategist:
         assert status["ever_registered"] is True
         assert status["active_total"] == 2
         assert status["active_gpu"] == 1
+
+
+class TestRegistryPasswordErasedOnTerminalFinalization:
+    @pytest.mark.asyncio
+    async def test_password_erased_from_polling_metadata_on_finalization(
+        self, db_session
+    ):
+        from app.compute_jobs import _finalize_terminal_job
+
+        project = await _make_project(db_session)
+        now = _utcnow()
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={
+                "container_registry_auth": {
+                    "server": "registry.example.com",
+                    "username": "myuser",
+                    "password": "s3cr3t",
+                },
+                "runner_target_id": "some-runner-id",
+            },
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+
+        _finalize_terminal_job(
+            job,
+            status=ComputeJobStatus.SUCCEEDED,
+            outcome=ComputeJobOutcome.SUCCESS,
+            terminal_reason="job completed",
+            now=now,
+        )
+
+        auth = job.polling_metadata.get("container_registry_auth", {})
+        assert "password" not in auth, (
+            "registry password must be erased from polling_metadata at terminal state"
+        )
+        assert auth.get("server") == "registry.example.com"
+        assert auth.get("username") == "myuser"
+
+    @pytest.mark.asyncio
+    async def test_finalization_without_registry_auth_leaves_metadata_intact(
+        self, db_session
+    ):
+        from app.compute_jobs import _finalize_terminal_job
+
+        project = await _make_project(db_session)
+        now = _utcnow()
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": "some-runner-id"},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+
+        _finalize_terminal_job(
+            job,
+            status=ComputeJobStatus.FAILED,
+            outcome=ComputeJobOutcome.FAILURE,
+            terminal_reason="job failed",
+            now=now,
+        )
+
+        assert "container_registry_auth" not in (job.polling_metadata or {})
+        assert job.polling_metadata.get("runner_target_id") == "some-runner-id"

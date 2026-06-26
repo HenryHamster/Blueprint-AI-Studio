@@ -2358,6 +2358,15 @@ def _finalize_terminal_job(
         # The immediate delete retries failed; the orphan sweep is the safety net.
         extra["terminate_failed"] = True
     _set_meta(job, status_message=terminal_reason, **extra)
+    # Erase the registry password the moment the job reaches a terminal state.
+    # The runner only needed it once (at docker-login time); keeping it in the
+    # DB row beyond that is an unnecessary plaintext secret at rest.
+    meta = dict(job.polling_metadata or {})
+    if isinstance(meta.get("container_registry_auth"), dict):
+        auth = dict(meta["container_registry_auth"])
+        auth.pop("password", None)
+        meta["container_registry_auth"] = auth
+        job.polling_metadata = meta
 
 
 def _is_durable_artifact_uri(reference: str) -> bool:
