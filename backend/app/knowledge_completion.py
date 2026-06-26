@@ -1136,6 +1136,60 @@ _COMPUTE_LOG_TEXT_CAP = 4000
 _COMPUTE_MAX_CITATIONS = 20
 
 
+def _evaluate_criterion_per_arm(
+    criterion: dict[str, Any], arms: Any
+) -> dict[str, dict[str, Any]] | None:
+    """Evaluate criterion against each arm and return per-arm verdicts.
+
+    Returns a dict mapping arm name → {"value": metric_value, "met": bool}, or
+    None if no criterion/arms or evaluation is not possible. Mirrors the per-arm
+    metric extraction logic in task_evaluators._find_metric_in_arms.
+    """
+    if not isinstance(criterion, dict) or arms is None:
+        return None
+
+    metric = criterion.get("metric")
+    op = criterion.get("operator")
+    threshold = criterion.get("threshold")
+    if not metric or not op or threshold is None:
+        return None
+
+    # Import the criterion_met helper from task_evaluators
+    from app.task_evaluators import criterion_met as _criterion_met, _coerce_number
+
+    per_arm: dict[str, dict[str, Any]] = {}
+    arm_items: list[tuple[str, Any]] = []
+
+    # Handle both dict and list arm shapes
+    if isinstance(arms, dict):
+        arm_items = list(arms.items())
+    elif isinstance(arms, list):
+        arm_items = [
+            (a.get("name") or a.get("label") or a.get("arm") or f"arm_{i}", a)
+            for i, a in enumerate(arms)
+            if isinstance(a, dict)
+        ]
+
+    for arm_name, arm_data in arm_items:
+        if not isinstance(arm_data, dict):
+            continue
+
+        # Extract metric value from arm, trying exact match then case-insensitive
+        raw_value = arm_data.get(metric)
+        if raw_value is None:
+            # Try case-insensitive lookup
+            for key in arm_data:
+                if key.lower() == metric.lower():
+                    raw_value = arm_data[key]
+                    break
+
+        value = _coerce_number(raw_value)
+        met = _criterion_met(raw_value, op, threshold)
+        per_arm[str(arm_name)] = {"value": value, "met": met}
+
+    return per_arm if per_arm else None
+
+
 def _build_compute_experiment_document(
     task: Task,
     *,
@@ -1338,6 +1392,20 @@ def _build_compute_experiment_document(
             body_lines.append("")
             body_lines.append("### Failed arms")
             body_lines.extend(failed_lines)
+
+        # Append per-arm criterion verdicts when a criterion is declared
+        per_arm_verdicts = _evaluate_criterion_per_arm(criterion, arms)
+        if per_arm_verdicts:
+            body_lines.append("")
+            body_lines.append("### Per-arm criterion evaluation")
+            for arm_name, verdict in per_arm_verdicts.items():
+                value = verdict.get("value")
+                met = verdict.get("met")
+                status = "✓ MET" if met else "✗ NOT MET"
+                if value is not None:
+                    body_lines.append(f"- **{arm_name}:** {status} ({criterion.get('metric')}={value})")
+                else:
+                    body_lines.append(f"- **{arm_name}:** {status} ({criterion.get('metric')}=unmeasured)")
     body = "\n".join(body_lines)
 
     raw_tags = payload.get("tags")
@@ -1368,6 +1436,10 @@ def _build_compute_experiment_document(
         verdict_record["result_metrics"] = result_metrics
     if arms is not None:
         verdict_record["arms"] = arms
+    # Per-arm criterion verdicts for deterministic querying and rendering
+    per_arm_verdicts = _evaluate_criterion_per_arm(criterion, arms)
+    if per_arm_verdicts:
+        verdict_record["per_arm_verdicts"] = per_arm_verdicts
 
     return {
         "title": title,

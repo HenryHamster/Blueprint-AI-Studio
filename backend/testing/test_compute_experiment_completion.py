@@ -2782,6 +2782,97 @@ async def test_arms_only_result_persists_direction_linked_knowledge(
     assert verdict["analysis_mode"] == "deterministic"
 
 
+@pytest.mark.asyncio
+async def test_compute_doc_renders_per_arm_criterion_verdict(
+    db_session, _quiet_compute_io
+):
+    """Per-arm criterion verdicts render deterministically in the knowledge document.
+
+    When a criterion is declared and the experiment reports multi-arm results,
+    the document should show which arms met the criterion and which did not,
+    without requiring JSON parsing. The per-arm verdicts are both rendered in
+    the human-readable body AND stored in forward_quality_verdict for querying.
+    """
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "A/B performance test",
+            "benchmark": "bench-suite-v2",
+            "tags": ["perf"],
+            "success_criterion": {
+                "metric": "latency_ms",
+                "operator": "<=",
+                "threshold": 100,
+            },
+        }
+    ]
+    task.context = {"direction_id": "d-perf-test"}
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job, _artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    # Multi-arm result: each arm reports the metric
+    # - baseline: 105ms (FAILS criterion: 105 > 100)
+    # - optimized: 95ms (MEETS criterion: 95 <= 100)
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": [
+                {"name": "baseline", "latency_ms": 105},
+                {"name": "optimized", "latency_ms": 95},
+            ],
+        },
+    }
+    db_session.add(job)
+    await db_session.commit()
+
+    # The result_artifact needs to include at least one metric value (the best arm)
+    # so the criterion evaluation succeeds. The completion handler will look in
+    # result_metrics (from polling_metadata) for the arms; the COMPUTE_RESULT logs
+    # carry the flattened top-level metric.
+    logs = _result_artifact(job_id=str(job.id), latency_ms=95)
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    doc = docs[0]
+
+    verdict = doc.forward_quality_verdict
+
+    # (1) Per-arm verdicts are stored in the verdict_record for querying
+    assert "per_arm_verdicts" in verdict
+    per_arm = verdict["per_arm_verdicts"]
+    assert "baseline" in per_arm
+    assert "optimized" in per_arm
+
+    # baseline: 105 does NOT meet criterion (105 > 100)
+    assert per_arm["baseline"]["value"] == 105
+    assert per_arm["baseline"]["met"] is False
+
+    # optimized: 95 DOES meet criterion (95 <= 100)
+    assert per_arm["optimized"]["value"] == 95
+    assert per_arm["optimized"]["met"] is True
+
+    # (2) Per-arm verdicts render in the human-readable body
+    assert "Per-arm criterion evaluation" in doc.body
+    assert "**baseline:**" in doc.body
+    assert "**optimized:**" in doc.body
+    assert "✓ MET" in doc.body  # optimized meets criterion
+    assert "✗ NOT MET" in doc.body  # baseline does not meet criterion
+    assert "latency_ms=105" in doc.body  # baseline value shown
+    assert "latency_ms=95" in doc.body  # optimized value shown
+
+    # (3) The best arm's value is captured at the top level (unchanged from before)
+    assert verdict["criterion"]["value"] == 95  # best arm value
+    assert verdict["criterion"]["met"] is True  # best arm meets criterion
+
+
 def _mock_anthropic_returning(citations: list[str]):
     """Build a mock anthropic.AsyncAnthropic class that returns a cited analysis."""
     fake_text = json.dumps(
@@ -5920,3 +6011,96 @@ async def test_completed_arm_knowledge_retrievable_by_sweep_and_surfaced_to_stra
     assert len(group_entries) == 2
     group_labels = {e["arm_label"] for e in group_entries}
     assert group_labels == {"baseline", "optimized"}
+
+
+# ── Multi-arm criterion evaluation from arms block ────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_multi_arm_criterion_evaluated_from_arms_block(
+    db_session, _quiet_compute_io
+):
+    """A multi-arm result (dict-arms form) with accuracy >= 0.9: the evaluator
+    picks the max arm (0.93), reports measurable=True, met=True, and the task
+    COMPLETES without compute_unmeasured_criterion."""
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
+
+    multi_arm_result = _result_artifact(
+        **{"arms": {"A": {"accuracy": 0.93}, "B": {"accuracy": 0.88}}}
+    )
+    await _handle_compute_experiment_completion(task, multi_arm_result, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.context.get("failure_category") != "compute_unmeasured_criterion"
+    ctx_criterion = task.context["compute_success_criterion"]
+    assert ctx_criterion["measurable"] is True
+    assert ctx_criterion["met"] is True
+    assert ctx_criterion["value"] == pytest.approx(0.93)
+    assert ctx_criterion.get("best_arm") == "A"
+
+
+@pytest.mark.asyncio
+async def test_multi_arm_criterion_unmet_completes_as_evidence(
+    db_session, _quiet_compute_io
+):
+    """A multi-arm result where no arm meets the threshold: measurable=True,
+    met=False, task COMPLETES as honest evidence (no loud failure)."""
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
+
+    multi_arm_result = _result_artifact(
+        **{"arms": {"A": {"accuracy": 0.85}, "B": {"accuracy": 0.82}}}
+    )
+    await _handle_compute_experiment_completion(task, multi_arm_result, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.context.get("failure_category") != "compute_unmeasured_criterion"
+    ctx_criterion = task.context["compute_success_criterion"]
+    assert ctx_criterion["measurable"] is True
+    assert ctx_criterion["met"] is False
+    assert ctx_criterion["value"] == pytest.approx(0.85)
+
+
+@pytest.mark.asyncio
+async def test_multi_arm_criterion_list_arms_form_evaluates_correctly(
+    db_session, _quiet_compute_io
+):
+    """A list-arms form result (arms as a list of dicts with 'name' field) is
+    evaluated correctly — the evaluator finds the metric and compares it."""
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
+
+    list_arms_result = _result_artifact(
+        **{"arms": [{"name": "baseline", "accuracy": 0.93}]}
+    )
+    await _handle_compute_experiment_completion(task, list_arms_result, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    ctx_criterion = task.context["compute_success_criterion"]
+    assert ctx_criterion["measurable"] is True
+    assert ctx_criterion["met"] is True
+    assert ctx_criterion["value"] == pytest.approx(0.93)
+
+
+@pytest.mark.asyncio
+async def test_multi_arm_metric_absent_from_all_arms_still_fires_unmeasured(
+    db_session, _quiet_compute_io
+):
+    """When all arms lack the declared metric, compute_unmeasured_criterion still
+    fires — the new arms fallback must NOT bypass the guard."""
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
+
+    # Arms present but metric key absent from all of them.
+    no_metric_result = _result_artifact(
+        **{"arms": {"A": {"loss": 0.4}, "B": {"loss": 0.3}}}
+    )
+    await _handle_compute_experiment_completion(task, no_metric_result, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.context["failure_category"] == "compute_unmeasured_criterion"
+    ctx_criterion = task.context["compute_success_criterion"]
+    assert ctx_criterion["measurable"] is False
+    assert ctx_criterion["met"] is False
+    assert ctx_criterion["value"] is None

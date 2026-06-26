@@ -912,6 +912,65 @@ def _find_metric_case_insensitive(obj: dict, metric: str) -> object:
     return matches[0][1]
 
 
+def _find_metric_in_arms(
+    obj: dict, metric: str, op: str
+) -> tuple[object, str | None]:
+    """Scan the ``arms`` block of a multi-arm COMPUTE_RESULT for ``metric``.
+
+    Returns ``(raw_value, arm_name)`` where ``raw_value`` is the best-arm
+    numeric value for the declared ``op`` (max for >= / >; min for <= / <;
+    any for == / !=), or ``(None, None)`` when no arm carries a numeric value.
+
+    Handles two arm shapes:
+    * dict:  ``{"arms": {arm_name: {metric: value, ...}}}``
+    * list:  ``{"arms": [{"name": arm_name, metric: value, ...}]}``
+
+    Non-dict arm entries are skipped gracefully.
+    """
+    arms_raw = obj.get("arms")
+    if arms_raw is None:
+        return None, None
+
+    def _get_arm_value(arm_dict: dict) -> object:
+        v = arm_dict.get(metric)
+        if v is None:
+            v = _find_metric_case_insensitive(arm_dict, metric)
+        return v
+
+    arm_pairs: list[tuple[str, object]] = []
+    if isinstance(arms_raw, dict):
+        for arm_name, arm_data in arms_raw.items():
+            if not isinstance(arm_data, dict):
+                continue
+            v = _get_arm_value(arm_data)
+            n = _coerce_number(v)
+            if n is not None:
+                arm_pairs.append((str(arm_name), n))
+    elif isinstance(arms_raw, list):
+        for item in arms_raw:
+            if not isinstance(item, dict):
+                continue
+            arm_name = str(item.get("name") or "")
+            v = _get_arm_value(item)
+            n = _coerce_number(v)
+            if n is not None:
+                arm_pairs.append((arm_name, n))
+
+    if not arm_pairs:
+        return None, None
+
+    # Select the best-arm value: for >= / > maximize; for <= / < minimize;
+    # for == / != take the first arm that has the metric.
+    if op in (">=", ">"):
+        best = max(arm_pairs, key=lambda t: t[1])
+    elif op in ("<=", "<"):
+        best = min(arm_pairs, key=lambda t: t[1])
+    else:
+        best = arm_pairs[0]
+
+    return best[1], best[0]
+
+
 def evaluate_compute_success_criterion(
     task: Task,
     artifact_text: str | None,
@@ -944,6 +1003,7 @@ def evaluate_compute_success_criterion(
         return None
     metric, op, threshold = criterion
     binding_status: str | None = None
+    best_arm: str | None = None
     per_arm_values: dict | None = None
     if metric in _RELEASE_ECHO_METRICS:
         binding_status = derive_release_binding_status(echo_sha, expected_sha)
@@ -951,19 +1011,29 @@ def evaluate_compute_success_criterion(
         raw_value: object = value
     else:
         obj = _parse_artifact_json(artifact_text) or {}
-        arms_block = obj.get("arms") if isinstance(obj.get("arms"), dict) else None
-        if arms_block:
-            # Multi-arm result: arms[name][metric] — aggregate using best-arm semantics.
+        arms_raw = obj.get("arms")
+        if isinstance(arms_raw, (dict, list)):
+            # Multi-arm result — aggregate using best-arm semantics.
             # "Best arm" = the arm value most favorable for the declared operator so
             # that met=True whenever at least one arm met the criterion.
             per_arm_values = {}
-            for arm_name, arm_data in arms_block.items():
-                if not isinstance(arm_data, dict):
-                    continue
-                arm_val = arm_data.get(metric)
-                if arm_val is None:
-                    arm_val = _find_metric_case_insensitive(arm_data, metric)
-                per_arm_values[arm_name] = _coerce_number(arm_val)
+            if isinstance(arms_raw, dict):
+                for arm_name, arm_data in arms_raw.items():
+                    if not isinstance(arm_data, dict):
+                        continue
+                    arm_val = arm_data.get(metric)
+                    if arm_val is None:
+                        arm_val = _find_metric_case_insensitive(arm_data, metric)
+                    per_arm_values[str(arm_name)] = _coerce_number(arm_val)
+            else:
+                for item in arms_raw:
+                    if not isinstance(item, dict):
+                        continue
+                    arm_name = str(item.get("name") or item.get("label") or item.get("arm") or "")
+                    arm_val = item.get(metric)
+                    if arm_val is None:
+                        arm_val = _find_metric_case_insensitive(item, metric)
+                    per_arm_values[arm_name] = _coerce_number(arm_val)
             measurable_vals = [v for v in per_arm_values.values() if v is not None]
             if measurable_vals:
                 if op in (">=", ">"):
@@ -975,6 +1045,10 @@ def evaluate_compute_success_criterion(
                         (v for v in measurable_vals if criterion_met(v, op, threshold)),
                         measurable_vals[0],
                     )
+                best_arm = next(
+                    (name for name, val in per_arm_values.items() if val == raw_value),
+                    None,
+                )
             else:
                 raw_value = None
         else:
@@ -993,6 +1067,8 @@ def evaluate_compute_success_criterion(
         "met": met,
         "measurable": value is not None,
     }
+    if best_arm is not None:
+        result["best_arm"] = best_arm
     if binding_status is not None:
         result["binding_status"] = binding_status
     if per_arm_values is not None:
