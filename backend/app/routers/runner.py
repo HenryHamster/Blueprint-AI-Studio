@@ -321,13 +321,15 @@ async def report_compute_job(
         if payload.command_log is not None:
             if isinstance(payload.command_log, dict):
                 log_text = payload.command_log.get("text", "")
-                if isinstance(log_text, str) and len(log_text.encode("utf-8")) > _MAX_RUNNER_COMMAND_LOG_BYTES:
+                if not isinstance(log_text, str):
+                    log_text = ""
+                if len(log_text.encode("utf-8")) > _MAX_RUNNER_COMMAND_LOG_BYTES:
                     log_text = log_text.encode("utf-8")[:_MAX_RUNNER_COMMAND_LOG_BYTES].decode("utf-8", "replace")
-                    meta["runner_command_log"] = {**payload.command_log, "text": log_text, "truncated": True}
+                    meta["runner_command_log"] = {"text": log_text, "truncated": True}
                 else:
-                    meta["runner_command_log"] = payload.command_log
+                    meta["runner_command_log"] = {"text": log_text, "truncated": False}
             elif isinstance(payload.command_log, str):
-                meta["runner_command_log"] = {"text": payload.command_log}
+                meta["runner_command_log"] = {"text": payload.command_log, "truncated": False}
         if payload.exec_status in ("succeeded", "failed"):
             meta["runner_finished_at"] = now.isoformat()
         job.polling_metadata = meta

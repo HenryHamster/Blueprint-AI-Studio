@@ -8210,6 +8210,40 @@ class TestDismissPendingConfirmation:
         assert pm["pending_user_confirmation"] == []
         assert pm["revision_log"] == []
 
+    @pytest.mark.asyncio
+    async def test_dismiss_note_over_5000_chars_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """note field longer than 5000 characters must be rejected with 422."""
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "revision": 1,
+            "intent": {"purpose": "", "current_focus": "", "user_purpose": ""},
+            "context": {},
+            "constraints": [],
+            "capabilities": [],
+            "gaps": [],
+            "archived_gaps": [],
+            "friction": [],
+            "pending_user_confirmation": [
+                {
+                    "id": "p-abc12345",
+                    "type": "major_decision",
+                    "proposal": "Should we migrate?",
+                    "created_at": "2026-01-01T00:00:00",
+                }
+            ],
+            "revision_log": [],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-abc12345/dismiss",
+            json={"note": "x" * 5001},
+        )
+        assert resp.status_code == 422
+
 
 class TestAcceptPendingConfirmation:
     """POST /pending-confirm/{id}/accept applies type-specific action and clears the item."""
@@ -8381,6 +8415,40 @@ class TestAcceptPendingConfirmation:
             json={"answer": None},
         )
         assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_accept_answer_over_5000_chars_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """answer field longer than 5000 characters must be rejected with 422."""
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "revision": 1,
+            "intent": {"purpose": "", "current_focus": "", "user_purpose": ""},
+            "context": {},
+            "constraints": [],
+            "capabilities": [],
+            "gaps": [],
+            "archived_gaps": [],
+            "friction": [],
+            "pending_user_confirmation": [
+                {
+                    "id": "p-dec001",
+                    "type": "major_decision",
+                    "proposal": "Go with option A?",
+                    "created_at": "2026-01-01T00:00:00",
+                }
+            ],
+            "revision_log": [],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-dec001/accept",
+            json={"answer": "y" * 5001},
+        )
+        assert resp.status_code == 422
 
 
 class TestBuildDeployStatePayload:

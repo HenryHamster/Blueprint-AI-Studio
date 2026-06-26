@@ -283,61 +283,71 @@ def _base_contract(**extra):
     }
 
 
-def test_validate_contract_accepts_without_author_smoke_sample():
-    # Author-attested smoke is now ADVISORY only; the platform-executed
-    # pre-flight smoke (capability platform-preflight-smoke) is the binding gate.
-    # A contract with no smoke_sample must be ACCEPTED so the platform can gate it.
-    ok, reason = _validate_compute_launch_contract(_base_contract())
-    assert ok is True
-    assert reason == ""
+class TestValidateContractSmokeAdvisory:
+    """Author smoke_sample failures are ADVISORY, not blocking — v20 design decision.
 
+    ``_validate_compute_launch_contract`` deliberately demotes every author-attested
+    smoke failure from a hard rejection to a logged warning.  The binding gate is the
+    platform-executed pre-flight smoke (capability ``platform-preflight-smoke``) which
+    runs the actual command on the real compute substrate before any VM is billed.
+    Author smoke runs cheaply on the orchestrator host and cannot account for GPU
+    hardware, private container registries, or custom base images — so a failed or
+    absent author smoke must NEVER block launch.
 
-def test_validate_contract_advisory_non_dict_smoke_sample():
-    # A non-dict smoke_sample is advisory — contract is still accepted.
-    ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample="yes"))
-    assert ok is True
-    assert reason == ""
+    These tests pin that intentional demotion.  If any test in this class starts
+    asserting ``ok is False``, that is a regression: the platform smoke gate is the
+    correct enforcement point, not the author contract validator.
+    """
 
+    def test_accepts_without_author_smoke_sample(self):
+        # No smoke_sample at all: platform smoke will gate at launch.
+        ok, reason = _validate_compute_launch_contract(_base_contract())
+        assert ok is True
+        assert reason == ""
 
-def test_validate_contract_advisory_failed_smoke_startup():
-    # A startup failure in the author smoke_sample is now advisory — accepted.
-    smoke = {
-        "exit_code": 1,
-        "startup_ok": False,
-        "metric_captured": False,
-        "error_excerpt": "ModuleNotFoundError: No module named 'backend'",
-    }
-    ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample=smoke))
-    assert ok is True
-    assert reason == ""
+    def test_advisory_non_dict_smoke_sample(self):
+        # A malformed (non-dict) smoke_sample is advisory — contract still accepted.
+        ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample="yes"))
+        assert ok is True
+        assert reason == ""
 
+    def test_advisory_failed_smoke_startup(self):
+        # Startup failure in author smoke_sample is advisory — accepted.
+        smoke = {
+            "exit_code": 1,
+            "startup_ok": False,
+            "metric_captured": False,
+            "error_excerpt": "ModuleNotFoundError: No module named 'backend'",
+        }
+        ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample=smoke))
+        assert ok is True
+        assert reason == ""
 
-def test_validate_contract_advisory_unsmokable():
-    # An unsmokable author attestation is now advisory — accepted.
-    smoke = {
-        "unsmokable": True,
-        "unsmokable_reason": "requires T4 GPU not available on this VM",
-    }
-    ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample=smoke))
-    assert ok is True
-    assert reason == ""
+    def test_advisory_unsmokable(self):
+        # Unsmokable author attestation (e.g. GPU-only) is advisory — accepted.
+        smoke = {
+            "unsmokable": True,
+            "unsmokable_reason": "requires T4 GPU not available on this VM",
+        }
+        ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample=smoke))
+        assert ok is True
+        assert reason == ""
 
-
-def test_validate_contract_advisory_metric_not_captured_when_criterion_declared():
-    # An author smoke that did not capture the declared metric is now advisory.
-    smoke = {
-        "exit_code": 0,
-        "startup_ok": True,
-        "metric_captured": False,
-        "timed_out": False,
-    }
-    contract = _base_contract(
-        smoke_sample=smoke,
-        success_criterion={"metric": "accuracy", "operator": ">=", "threshold": 0.9},
-    )
-    ok, reason = _validate_compute_launch_contract(contract)
-    assert ok is True
-    assert reason == ""
+    def test_advisory_metric_not_captured_when_criterion_declared(self):
+        # Author smoke that did not capture the declared metric is advisory.
+        smoke = {
+            "exit_code": 0,
+            "startup_ok": True,
+            "metric_captured": False,
+            "timed_out": False,
+        }
+        contract = _base_contract(
+            smoke_sample=smoke,
+            success_criterion={"metric": "accuracy", "operator": ">=", "threshold": 0.9},
+        )
+        ok, reason = _validate_compute_launch_contract(contract)
+        assert ok is True
+        assert reason == ""
 
 
 def test_validate_contract_accepts_valid_smoke_no_criterion():

@@ -8,7 +8,7 @@ self-improvement flags.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, delete
 from sqlalchemy import update
@@ -791,7 +791,7 @@ async def edit_running_update(
 
 
 class _DismissPendingBody(BaseModel):
-    note: str | None = None
+    note: str | None = Field(None, max_length=5000)
     """Optional operator note to record in the revision log alongside the dismissal."""
 
 
@@ -850,7 +850,7 @@ async def dismiss_pending_confirmation(
 
 
 class _AcceptPendingBody(BaseModel):
-    answer: str | None = None
+    answer: str | None = Field(None, max_length=5000)
     """For major_decision: the operator's answer text to record."""
 
 

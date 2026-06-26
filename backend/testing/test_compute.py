@@ -12748,6 +12748,80 @@ async def test_compute_job_report_stamps_status_so_monitor_finalizes(
 
 
 @pytest.mark.asyncio
+async def test_compute_job_report_command_log_extra_keys_filtered(
+    client, db_session, monkeypatch
+):
+    """POST /api/runner/compute-job/{id}/report with command_log containing extra
+    keys stores only {text, truncated} in polling_metadata (key 14c62b47c166af12)."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Extra Keys Filter", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all"},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={"command": "python run.py", "env": {}, "runtime_deadline_seconds": 300, "runner_target_id": str(runner.id)},
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        json={
+            "exec_status": "succeeded",
+            "exit_code": 0,
+            "command_log": {
+                "text": "Done",
+                "truncated": False,
+                "extra_key": "should_be_dropped",
+                "another_key": 123,
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    stored_log = meta.get("runner_command_log")
+    assert stored_log == {"text": "Done", "truncated": False}
+    # Extra keys must not be persisted
+    assert "extra_key" not in stored_log
+    assert "another_key" not in stored_log
+
+
+@pytest.mark.asyncio
 async def test_compute_job_report_idempotent_on_terminal_job(
     client, db_session, monkeypatch
 ):
