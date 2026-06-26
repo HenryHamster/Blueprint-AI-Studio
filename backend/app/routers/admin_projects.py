@@ -485,6 +485,24 @@ async def update_project(
         doc = dict(payload.design_doc)
         # Remove the divergent top-level "revision" key; canonical counter is _meta.revision
         doc.pop("revision", None)
+        # Preserve system/operator-owned underscore-prefixed keys that the
+        # design-doc editor never surfaces.  The agent list/get endpoint filters
+        # out ``_``-prefixed keys (admin_agent_ops.update_design_doc) and blocks
+        # writing them, so a UI round-trip carries only the public keys — a
+        # wholesale replace from the editor would otherwise silently DROP durable
+        # config such as ``_auto_remediation`` / ``_issue_implementation`` /
+        # ``_auto_review`` / ``_file_to_system`` (this is exactly how an operator's
+        # enabled auto-remediation setting disappears after a later doc edit).
+        # An incoming payload that DOES include a given underscore key still wins
+        # (explicit operator intent).  ``_meta`` is rebuilt below, so skip it here.
+        for _sys_key, _sys_val in (project.design_doc or {}).items():
+            if (
+                isinstance(_sys_key, str)
+                and _sys_key.startswith("_")
+                and _sys_key != "_meta"
+                and _sys_key not in doc
+            ):
+                doc[_sys_key] = _sys_val
         meta = dict(stored_meta)
         meta["revision"] = stored_rev + 1
         meta["last_updated"] = _utcnow().isoformat()

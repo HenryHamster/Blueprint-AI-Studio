@@ -6478,6 +6478,62 @@ async def test_managed_check_wait_timeout_backstop_still_applies(db_session):
     assert "promotion_pending" not in version.last_qualification
 
 
+@pytest.mark.asyncio
+async def test_managed_check_wait_timeout_closes_orphaned_pr(db_session, mocker):
+    """When the pure-DB promotion_pending_timeout backstop force-fails a
+    managed_check_wait record, it best-effort closes the still-open promotion PR
+    and deletes its release branch — so the promotion_failed re-driver opens a
+    FRESH promotion PR instead of racing the orphan (which wasted a full audit +
+    merge-grade). Cleanup runs after the lock is released and is fail-open."""
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="release"
+    )
+    stranded_enabled = (
+        _utcnow() - timedelta(seconds=_promotion_pending_timeout_seconds() + 3600)
+    ).isoformat()
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "promotion_pending": {
+            "pr_number": 77,
+            "pr_url": "https://github.com/acme/widget/pull/77",
+            "auto_merge_enabled": False,
+            "migration_carrying": True,
+            "managed_check_wait": True,
+            "why_not_native_automerge": "migration_carrying",
+            "enabled_at": stranded_enabled,
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.release_reconciliation._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    cleanup_mock = mocker.patch(
+        "app.release_reconciliation._cleanup_managed_check_wait_failure_artifacts",
+        new=AsyncMock(),
+    )
+
+    timed_out = await _reconcile_if_promotion_pending_timed_out(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert timed_out is True
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "promotion_pending_timeout"
+    assert "promotion_pending" not in version.last_qualification
+    # The orphaned managed promotion PR was best-effort closed.
+    cleanup_mock.assert_awaited_once()
+    _args, _kwargs = cleanup_mock.await_args
+    assert _args[3] == f"release-v{version.version_number}"  # release branch
+    assert _args[5] == 77  # pr_number
+
+
 # ===========================================================================
 # managed_check_wait: 405 retriable vs terminal classification
 # ===========================================================================
@@ -6924,6 +6980,7 @@ async def test_harvest_infra_flake_requalifies_and_skips_spawn(db_session, mocke
         ci_source_sha="dead" * 10,
         integration_branch="automain",
         auto_remediation_config=auto_remediation_config,
+        selfheal_enabled=True,
     )
 
     rq_mock.assert_awaited_once()
@@ -6982,6 +7039,7 @@ async def test_harvest_setup_phase_flake_requalifies_and_skips_spawn(db_session,
         ci_source_sha="cafe" * 10,
         integration_branch="automain",
         auto_remediation_config={"enabled": True},
+        selfheal_enabled=True,
     )
 
     rq_mock.assert_awaited_once()
@@ -7033,9 +7091,134 @@ async def test_harvest_real_failure_spawns_fix(db_session, mocker):
         ci_source_sha="beef" * 10,
         integration_branch="automain",
         auto_remediation_config={"enabled": True},
+        selfheal_enabled=True,
     )
 
     rerun_mock.assert_not_awaited()
+    handle_mock.assert_awaited_once()
+
+
+# ===========================================================================
+# Promotion-CI self-heal gate: decoupled from design_doc._auto_remediation,
+# governed by durable operator-owned build_config (default ON, project-agnostic)
+# ===========================================================================
+
+
+def test_promotion_ci_selfheal_enabled_resolver():
+    """The release-pipeline self-heal gate resolves from durable, operator-owned
+    build_config (NOT the strategist-clobbered design_doc._auto_remediation) and
+    defaults ON for any project — no self-repo / repo-name special-casing."""
+    from app.release_reconciliation import promotion_ci_selfheal_enabled
+
+    # No build_config at all -> default ON.
+    p = Project(name="p", user_id="u", github_owner="o", github_repo="r")
+    assert promotion_ci_selfheal_enabled(p) is True
+
+    # Explicit operator opt-out in build_config wins.
+    p.build_config = {"promotion_ci_selfheal_enabled": False}
+    assert promotion_ci_selfheal_enabled(p) is False
+
+    # Explicit operator opt-in.
+    p.build_config = {"promotion_ci_selfheal_enabled": True}
+    assert promotion_ci_selfheal_enabled(p) is True
+
+    # A non-bool value is ignored -> default ON (robust to malformed config).
+    p.build_config = {"promotion_ci_selfheal_enabled": "yes"}
+    assert promotion_ci_selfheal_enabled(p) is True
+
+    # design_doc._auto_remediation.enabled does NOT gate this anymore: even a
+    # FALSE/absent _auto_remediation leaves the release self-heal ON by default.
+    p.build_config = None
+    p.design_doc = {"_auto_remediation": {"enabled": False}}
+    assert promotion_ci_selfheal_enabled(p) is True
+
+
+@pytest.mark.asyncio
+async def test_harvest_skips_when_selfheal_disabled(db_session, mocker):
+    """selfheal_enabled=False makes the harvest a no-op: no infra-flake re-qualify
+    and no fix-task spawn, and it returns BEFORE any GitHub I/O — regardless of
+    auto_remediation_config."""
+    from app.release_reconciliation import _harvest_promotion_ci_failures
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="main"
+    )
+    rq_mock = mocker.patch(
+        "app.release_qualifier.run_qualification", new=AsyncMock()
+    )
+    handle_mock = mocker.patch(
+        "app.auto_remediation._handle_main_branch_ci_failure", new=AsyncMock()
+    )
+    token_mock = mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+
+    await _harvest_promotion_ci_failures(
+        project_id=_project.id,
+        version_id=version.id,
+        version_number=version.version_number,
+        owner="acme",
+        repo="widget",
+        ci_source_sha="dead" * 10,
+        integration_branch="automain",
+        # Even an *enabled* generic auto_remediation config must not re-enable a
+        # self-heal the operator turned OFF at the release level.
+        auto_remediation_config={"enabled": True},
+        selfheal_enabled=False,
+    )
+    rq_mock.assert_not_awaited()
+    handle_mock.assert_not_awaited()
+    token_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_harvest_self_heals_with_empty_auto_remediation_config(
+    db_session, mocker
+):
+    """The promotion-CI self-heal is decoupled from design_doc._auto_remediation:
+    with selfheal_enabled=True it spawns the fix even when auto_remediation_config
+    is EMPTY (the absent-config case that left Blueprint's own promotions
+    un-harvested before this change). The empty config still drives the spawn
+    mechanics via built-in defaults."""
+    from app.release_reconciliation import _harvest_promotion_ci_failures
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="main"
+    )
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "completed",
+                "conclusion": "failure",
+                "details": [{"name": "pytest", "conclusion": "failure"}],
+                "failed_logs": "FAILED testing/test_foo.py::test_bar\nAssertionError",
+                "setup_phase_failure": False,
+                "failed_run_ids": [],
+            }
+        ),
+    )
+    handle_mock = mocker.patch(
+        "app.auto_remediation._handle_main_branch_ci_failure", new=AsyncMock()
+    )
+
+    await _harvest_promotion_ci_failures(
+        project_id=_project.id,
+        version_id=version.id,
+        version_number=version.version_number,
+        owner="acme",
+        repo="widget",
+        ci_source_sha="beef" * 10,
+        integration_branch="automain",
+        # Absent / never-customized generic config (Blueprint's own case).
+        auto_remediation_config={},
+        selfheal_enabled=True,
+    )
     handle_mock.assert_awaited_once()
 
 

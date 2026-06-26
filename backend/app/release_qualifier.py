@@ -1262,12 +1262,33 @@ async def run_qualification(
     #    in-flight check, the spawns, and the last_qualification write.  The
     #    second caller blocks here until the first commits, then sees the
     #    pending record and short-circuits at the in-flight guard below.
+    #
+    #    ``populate_existing=True`` (+ an explicit ``expire`` for callers that
+    #    pre-loaded the row) is the correctness linchpin: when ``version`` was
+    #    already cached in this session's identity map — notably the strategic
+    #    ``qualify_request`` path, which loads the open version via
+    #    ``current_open_version(session, ...)`` and may then hold a copy that
+    #    PRE-DATES a ``promote()`` committed in another session — a bare
+    #    ``with_for_update()`` SELECT acquires the DB lock but returns that SAME
+    #    cached instance WITHOUT refreshing its attributes, so the under-lock
+    #    guards below (phase / in-flight / promotion-in-flight / cached-verdict)
+    #    would read STALE ``last_qualification``.  That is how a re-qualify slips
+    #    past the promotion-in-flight guard while a promotion PR is genuinely open
+    #    in ``promotion_check_wait`` and spawns a redundant audit + merge-grade.
+    #    Forcing the loaded row to overwrite the cached attributes makes the
+    #    under-lock guards authoritative regardless of caller staleness (mirrors
+    #    the ``populate_existing`` pattern the managed-check-wait reconciler
+    #    helpers already use).  ``populate_existing`` overwrites the attributes of
+    #    an instance already present in the identity map, so it is sufficient on
+    #    its own — ``version`` is not mutated before this point, so no dirty write
+    #    is lost.
     locked_version = (
         (
             await session.execute(
                 select(release_version.ReleaseVersion)
                 .where(release_version.ReleaseVersion.id == version.id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()

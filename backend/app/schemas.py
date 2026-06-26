@@ -939,6 +939,21 @@ class BuildConfig(BaseModel):
     # validation on every write path (onboard, PATCH, re-detect, auto-refresh)
     # — the merge gate reads it via ``ci_resolution.requires_ci_checks``.
     requires_ci_checks: bool = True
+    # Whether the engine self-heals its OWN release-promotion CI failures. When a
+    # promotion PR's full CI matrix goes red, the reconciler harvests the failing
+    # tests into a fix task on the integration branch (or re-qualifies on an infra
+    # flake) so the next qualification does not re-promote the same red code — a
+    # release-pipeline concern, DISTINCT from the generic protected-branch
+    # auto-remediation gate (``design_doc._auto_remediation.enabled``, which the
+    # strategist rewrites each cycle). It lives here in operator-owned
+    # ``build_config`` precisely so the strategist cannot clobber it, and survives
+    # validation on every write path (onboard, PATCH, re-detect). Default ON for
+    # every project and project-agnostic by design — the harvest only ever runs
+    # when a promotion PR's CI fails, so a blanket default is self-limiting and
+    # needs no repo-identity / self-repo special-casing. Resolved via
+    # ``release_reconciliation.promotion_ci_selfheal_enabled`` and overridable per
+    # project (set False to opt out).
+    promotion_ci_selfheal_enabled: bool = True
     # Deterministic empty/near-empty repo signal, computed at onboarding from
     # the already-fetched root + first-level subdirectory listings during
     # build-config detection (see ``admin_onboard._classify_repo_emptiness``).

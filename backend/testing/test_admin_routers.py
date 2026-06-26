@@ -1116,6 +1116,61 @@ class TestUpdateProject:
         assert "revision" not in doc
 
     @pytest.mark.asyncio
+    async def test_design_doc_edit_preserves_underscore_system_keys(
+        self, client: AsyncClient, db_session
+    ):
+        """A wholesale design_doc edit from the doc editor (which surfaces only
+        public keys) must NOT drop system/operator-owned underscore-prefixed keys
+        such as _auto_remediation — this is exactly how an operator's enabled
+        auto-remediation config silently disappeared after a later doc edit. An
+        underscore key that IS in the payload still wins (explicit intent)."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.design_doc = {
+            "key": "old",
+            "_auto_remediation": {"enabled": True, "max_per_hour": 2},
+            "_issue_implementation": {"enabled": True},
+            "_meta": {"revision": 4},
+        }
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+
+        # The editor round-trips ONLY the public key.
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"design_doc": {"key": "new"}, "design_doc_base_revision": 4},
+        )
+        assert resp.status_code == 200
+
+        await db_session.refresh(project)
+        doc = project.design_doc or {}
+        assert doc.get("key") == "new"
+        # System/operator-owned underscore keys survived the wholesale replace.
+        assert doc.get("_auto_remediation") == {"enabled": True, "max_per_hour": 2}
+        assert doc.get("_issue_implementation") == {"enabled": True}
+        assert doc.get("_meta", {}).get("revision") == 5
+
+        # An explicit underscore key in a later payload overrides the stored one.
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "design_doc": {
+                    "key": "new",
+                    "_auto_remediation": {"enabled": False},
+                },
+                "design_doc_base_revision": 5,
+            },
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        doc = project.design_doc or {}
+        assert doc.get("_auto_remediation") == {"enabled": False}
+        # The untouched underscore key is still preserved.
+        assert doc.get("_issue_implementation") == {"enabled": True}
+
+    @pytest.mark.asyncio
     async def test_design_doc_no_base_revision_always_succeeds(
         self, client: AsyncClient, db_session
     ):

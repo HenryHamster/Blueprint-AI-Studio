@@ -6464,6 +6464,115 @@ async def test_run_qualification_managed_check_wait_is_noop(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_refreshes_stale_check_wait_under_lock(
+    db_session, mocker
+):
+    """Regression (re-qual serialization): a re-qualify must no-op even when the
+    caller passes a STALE in-memory version whose last_qualification predates the
+    promote() that set managed_check_wait in another session.
+
+    This reproduces the redundant-audit incident: the strategic qualify_request
+    path loads the open version via current_open_version() and may hold a copy
+    cached BEFORE promote() committed the managed check_wait.  Without
+    populate_existing on the under-lock FOR UPDATE re-select, that SELECT acquires
+    the row lock but returns the SAME stale identity-map instance, so the
+    promotion-in-flight guard reads non-blocking state and spawns a fresh audit +
+    merge-grade while the promotion PR is genuinely open.  With the fix the
+    re-select overwrites the cached attributes, so the guard sees the committed
+    check_wait and no-ops."""
+    from sqlalchemy import update as _sa_update
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-done",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-stale",
+        status=TaskStatus.COMPLETED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    # The caller's in-memory version: a NON-blocking 'pending' (audit done, no
+    # promotion_pending) — on its own this would spawn a fresh qualification
+    # (cf. test_run_qualification_pending_but_children_terminal_runs_fresh).
+    stale_state = {
+        "status": "pending",
+        "candidate_sha": "feed" * 10,
+        "ci_green": True,
+        "started_at": "2026-05-20T00:00:00",
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "smoketest_enabled": False,
+    }
+    version.last_qualification = stale_state
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    attempts_before = version.qualification_attempts
+
+    # Simulate another session committing the managed check_wait AFTER this
+    # session cached `version`: write it straight to the row with
+    # synchronize_session=False so the in-memory instance stays stale.
+    db_managed_state = {
+        **stale_state,
+        "promotion_pending": {
+            "pr_number": 909,
+            "pr_url": "https://github.com/o/r/pull/909",
+            "auto_merge_enabled": False,
+            "migration_carrying": True,
+            "managed_check_wait": True,
+        },
+    }
+    await db_session.execute(
+        _sa_update(rv.ReleaseVersion)
+        .where(rv.ReleaseVersion.id == version.id)
+        .values(last_qualification=db_managed_state)
+        .execution_options(synchronize_session=False)
+    )
+    # The in-memory copy is still the stale, non-blocking state.
+    assert "promotion_pending" not in version.last_qualification
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="cafe" * 10),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # The under-lock re-select refreshed the stale instance, so the
+    # promotion-in-flight guard caught the managed check_wait — no fresh spawn.
+    assert result["status"] == "promotion_check_wait"
+    assert result["promotion_pr_number"] == 909
+
+    await db_session.refresh(version)
+    assert version.last_qualification["promotion_pending"]["pr_number"] == 909
+    assert version.qualification_attempts == attempts_before
+
+    # Still exactly the one original audit child — no fresh audit/smoketest pair.
+    from sqlmodel import select as _select
+
+    tasks = (
+        (await db_session.execute(_select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 1
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_pending_but_children_terminal_runs_fresh(
     db_session, mocker
 ):
