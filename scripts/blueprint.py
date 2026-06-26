@@ -742,6 +742,19 @@ def _render_task_detail(t: dict) -> None:
     msg = t.get("latest_status_message")
     if msg:
         print(f"  Message:  {msg[:200]}")
+    ctx = t.get("context") or {}
+    fc = ctx.get("failure_category") or ctx.get("failure_class")
+    if fc and t.get("status") in ("FAILED", "CANCELLED"):
+        print(f"  FailClass: {fc}")
+    diag = ctx.get("compute_terminal_diagnostics")
+    if diag:
+        reason = diag.get("terminal_reason", "")
+        phase = diag.get("vm_phase", "")
+        phase_label = f" [{phase}]" if phase else ""
+        print(f"  ComputeDiag:{phase_label} {reason}"[:200])
+        cause = diag.get("provisioning_cause")
+        if cause:
+            print(f"    ProvCause: {cause}"[:200])
     desc = t.get("description")
     if desc:
         print(f"\n  Description:\n    {desc[:500]}")

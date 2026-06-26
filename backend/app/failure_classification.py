@@ -284,6 +284,40 @@ APPROVED_CAP_PR_CLOSED = "APPROVED_CAP_PR_CLOSED"
 # (which stay clean terminal outcomes).
 COMPUTE_UNMEASURED_CRITERION = "compute_unmeasured_criterion"
 
+
+def classify_compute_terminal_reason(
+    terminal_reason: "str | None",
+    vm_phase: "str | None",
+) -> str:
+    """Map a ComputeJob terminal_reason + vm_phase to a canonical failure class.
+
+    Pure function — no I/O, no Task object required. Used by
+    task_completion._handle_compute_experiment_completion to classify pre-metric
+    failures so they don't all collapse to CODE_ERROR.
+
+    Mapping rules (first match wins):
+    - vm_phase == "provisioning" → PROVISION_FAILURE (VM never started)
+    - reason contains "provisioning" → PROVISION_FAILURE (launch/RPC failure)
+    - reason contains "runtime deadline" or "spend cap" → AGENT_TIMEOUT
+      (intentional platform kills; these should normally PASS the gate, but if
+      they somehow reach a failure branch the class must be AGENT_TIMEOUT, not
+      CODE_ERROR)
+    - reason contains "cancelled" or "operator" → ADMIN_CANCEL
+    - default → CODE_ERROR (genuine command/work defect)
+    """
+    if vm_phase == "provisioning":
+        return PROVISION_FAILURE
+    if terminal_reason:
+        lower = terminal_reason.lower()
+        if "provisioning" in lower:
+            return PROVISION_FAILURE
+        if "runtime deadline" in lower or "spend cap" in lower:
+            return AGENT_TIMEOUT
+        if "cancelled" in lower or "operator" in lower:
+            return ADMIN_CANCEL
+    return CODE_ERROR
+
+
 # Administrative cancellation — orchestrator or operator terminated the task before
 # it ran meaningful work: cascade cancels ("Cancelled: dependency task failed"),
 # parent-dependency cancels ("Cancelled: parent evaluation timeout"), or system

@@ -2124,6 +2124,140 @@ async def test_lifecycle_success_completes_through_task(
     assert task.plan_output["compute_result"]["final_cost_usd"] == pytest.approx(0.03)
 
 
+# ── Terminal-reason threading: failure_category classification ───────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_completion_provisioning_failure_routes_to_provision_failure(
+    db_session, monkeypatch, _quiet_compute_io
+):
+    """A compute job that died in the provisioning phase (VM never started)
+    must classify the owning task as PROVISION_FAILURE — an INFRA class that
+    does not burn the retry budget or penalise direction health.
+
+    Acceptance gate: test_compute_completion_provisioning_failure_routes_to_provision_failure
+    """
+    from app.failure_classification import PROVISION_FAILURE
+
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    # Create a job that never got to STARTING (started_at=None → vm_phase="provisioning")
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    # Manually terminal-ise the job row as a provisioning failure.
+    job.status = ComputeJobStatus.FAILED
+    job.terminal_reason = "compute job timed out while provisioning"
+    # started_at stays None → _extract_job_terminal_diagnostics → vm_phase="provisioning"
+    db_session.add(job)
+    await db_session.commit()
+
+    # Emit a COMPUTE_RESULT that carries no outcome/cost (pre-metric failure path).
+    logs = json.dumps({"job_id": str(job.id), "status": "FAILED"})
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    ctx = task.context or {}
+    assert ctx.get("failure_category") == PROVISION_FAILURE, (
+        f"Expected PROVISION_FAILURE but got {ctx.get('failure_category')!r}; "
+        f"context: {ctx}"
+    )
+    diag = ctx.get("compute_terminal_diagnostics")
+    assert diag is not None, "compute_terminal_diagnostics must be stamped on context"
+    assert diag["vm_phase"] == "provisioning"
+    assert "provisioning" in (diag.get("terminal_reason") or "").lower()
+    # The status message should surface the reason to the operator.
+    assert task.latest_status_message is not None
+    assert "provisioning" in (task.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_compute_completion_runtime_deadline_routes_to_agent_timeout(
+    db_session, monkeypatch, _quiet_compute_io
+):
+    """A compute job killed for exceeding the runtime deadline — which ran long
+    enough to start (started_at set) but had no artifact — classifies as
+    AGENT_TIMEOUT on the owning task."""
+    from app.failure_classification import AGENT_TIMEOUT
+
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 999",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.FAILED
+    job.started_at = datetime.utcnow() - timedelta(seconds=300)
+    job.terminal_reason = "compute job exceeded runtime deadline"
+    db_session.add(job)
+    await db_session.commit()
+
+    logs = json.dumps({"job_id": str(job.id), "status": "FAILED"})
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    ctx = task.context or {}
+    assert ctx.get("failure_category") == AGENT_TIMEOUT, (
+        f"Expected AGENT_TIMEOUT but got {ctx.get('failure_category')!r}"
+    )
+    diag = ctx.get("compute_terminal_diagnostics")
+    assert diag is not None
+    assert diag["vm_phase"] == "runtime"
+
+
+@pytest.mark.asyncio
+async def test_compute_completion_intentional_kills_still_complete(
+    db_session, monkeypatch, _quiet_compute_io
+):
+    """Intentional spend-cap and deadline kills carry an outcome + cost and pass
+    the gate — they must still surface as COMPLETED, not FAILED."""
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 10",
+        machine_type="e2-standard-2",
+        spend_cap_usd=0.02,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SPEND_CAP_EXCEEDED
+    job.started_at = datetime.utcnow() - timedelta(seconds=60)
+    job.final_cost_usd = 0.05
+    job.terminal_reason = "spend cap exceeded"
+    db_session.add(job)
+    await db_session.commit()
+
+    logs = _result_from_terminal_job(job)
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    # Intentional kills COMPLETE — never FAILED.
+    assert task.status == TaskStatus.COMPLETED
+    assert task.plan_output["compute_result"]["outcome"] == "SPEND_CAP_EXCEEDED"
+
+
 # ── Cited LLM analysis over durable artifacts as acceptance evidence ──────────
 
 
