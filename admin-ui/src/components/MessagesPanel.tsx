@@ -21,6 +21,8 @@ import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { StrategicChallengeChip } from './StrategicChallengeChip';
+import { useDirectionForm } from '../hooks/useDirectionForm';
+import { DirectionsAddForm } from './DirectionsAddForm';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -223,6 +225,11 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // direction; cleared only after the message is resolved/created so a failed
   // attempt keeps its key for the retry.
   const directionIdempotencyKeysRef = useRef<Map<string, string>>(new Map());
+
+  // Form instance for the convert-to-direction modal
+  const convertForm = useDirectionForm();
+  const [pendingConvertMsg, setPendingConvertMsg] = useState<ProjectMessage | null>(null);
+  const [convertSubmitting, setConvertSubmitting] = useState(false);
 
   // Per-message action state
   const [resolvingId, setResolvingId] = useState<string | null>(null);
@@ -994,6 +1001,59 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }
   }
 
+  function handleOpenConvertModal(msg: ProjectMessage) {
+    convertForm.seedFromMessage(msg.content);
+    setPendingConvertMsg(msg);
+  }
+
+  async function handleSubmitConvertForm() {
+    if (!selectedProjectId || !pendingConvertMsg || !convertForm.newText.trim()) return;
+    setConvertSubmitting(true);
+    const msg = pendingConvertMsg;
+    try {
+      let idemKey = directionIdempotencyKeysRef.current.get(msg.id);
+      if (!idemKey) {
+        idemKey = generateIdempotencyKey();
+        directionIdempotencyKeysRef.current.set(msg.id, idemKey);
+      }
+      convertForm.addIdempotencyKeyRef.current = idemKey;
+      const body: Record<string, unknown> = {
+        text: convertForm.newText.trim(),
+        priority: convertForm.newPriority,
+        paths: convertForm.newPathTags,
+        idempotency_key: idemKey,
+      };
+      if (convertForm.newCategory) body.category = convertForm.newCategory;
+      body.completion_criteria = convertForm.newCompletionCriteria.trim() || null;
+      body.success_evidence = convertForm.newSuccessEvidence.trim() || null;
+      body.retirement_condition = convertForm.newRetirementCondition.trim() || null;
+      const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/directions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const directionId: string = data.direction?.id ?? '';
+      const resolveRes = await apiFetch(`${API_BASE_URL}/api/admin/messages/${msg.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ resolution: `Direction created: ${directionId}` }),
+      });
+      if (!resolveRes.ok) throw new Error(`HTTP ${resolveRes.status}`);
+      directionIdempotencyKeysRef.current.delete(msg.id);
+      setPendingConvertMsg(null);
+      convertForm.resetAddForm();
+      addToast('Direction created', 'success');
+      await fetchMessages();
+    } catch {
+      convertForm.markAddAttemptFailed();
+      addToast('Failed to create direction', 'error');
+    } finally {
+      setConvertSubmitting(false);
+    }
+  }
+
   async function handleCreateInvestigation(msg: ProjectMessage): Promise<boolean> {
     if (!selectedProjectId || !githubRepo) return false;
     setInvestigatingIds(prev => new Set(prev).add(msg.id));
@@ -1102,7 +1162,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     selectedIds,
     onOpenTask,
     onToggleSelect: toggleSelect,
-    onCreateDirection: (msg: ProjectMessage) => { void handleCreateDirection(msg); },
+    onCreateDirection: (msg: ProjectMessage) => { handleOpenConvertModal(msg); },
     onCreateInvestigation: (msg: ProjectMessage) => { void handleCreateInvestigation(msg); },
     onResolve: handleResolve,
     onDelete: (msgId: string) => { void handleDelete(msgId); },
@@ -1342,6 +1402,49 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           batchCreating={batchCreating}
           onCreateDirections={handleBatchCreateDirections}
         />
+      )}
+
+      {/* Convert-to-direction modal */}
+      {pendingConvertMsg && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" role="dialog" aria-modal="true" aria-label="Create direction from message">
+          <div className="bg-neutral-950 border border-neutral-800 rounded-lg shadow-xl w-full max-w-lg mx-4 flex flex-col max-h-[90vh]">
+            <div className="px-5 py-3 border-b border-neutral-800 flex items-center justify-between shrink-0">
+              <span className="text-sm font-medium text-neutral-200">Create direction from message</span>
+              <button
+                type="button"
+                onClick={() => { setPendingConvertMsg(null); convertForm.resetAddForm(); }}
+                className="text-neutral-500 hover:text-neutral-300 transition-colors p-1 min-h-[44px] min-w-[44px] flex items-center justify-center md:min-h-auto md:min-w-auto"
+                aria-label="Close"
+              >
+                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
+              </button>
+            </div>
+            <div className="overflow-y-auto flex-1 min-h-0">
+              <DirectionsAddForm
+                form={convertForm}
+                addDirection={handleSubmitConvertForm}
+                stageTargetVersion={null}
+              />
+            </div>
+            <div className="px-5 py-3 border-t border-neutral-800 flex justify-end gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => { setPendingConvertMsg(null); convertForm.resetAddForm(); }}
+                className="text-xs text-neutral-400 hover:text-neutral-200 px-3 py-1.5 rounded border border-neutral-700 bg-neutral-900 hover:bg-neutral-800 transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleSubmitConvertForm}
+                disabled={convertSubmitting || !convertForm.newText.trim()}
+                className="text-xs text-neutral-200 px-3 py-1.5 rounded border border-neutral-600 bg-neutral-800 hover:bg-neutral-700 disabled:opacity-40 transition-colors"
+              >
+                {convertSubmitting ? 'Creating…' : 'Create direction'}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {/* Compose area — bottom, chat-style */}

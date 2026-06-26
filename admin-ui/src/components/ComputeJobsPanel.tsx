@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid } from 'lucide-react';
-import { analyzeComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type KnowledgeDocument } from '../api';
+import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen } from 'lucide-react';
+import { analyzeComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
@@ -391,15 +391,99 @@ function budgetBarClass(pct: number): string {
   return 'bg-sky-500';
 }
 
+function HeldExperimentsSection({
+  experiments,
+  onApprove,
+  onDismiss,
+}: {
+  experiments: HeldComputeExperiment[];
+  onApprove?: (taskId: string) => Promise<void>;
+  onDismiss?: (taskId: string) => Promise<void>;
+}) {
+  const [actionId, setActionId] = useState<string | null>(null);
+
+  if (!experiments || experiments.length === 0) return null;
+
+  const handleApprove = async (id: string) => {
+    if (!onApprove) return;
+    setActionId(id);
+    try { await onApprove(id); } finally { setActionId(null); }
+  };
+
+  const handleDismiss = async (id: string) => {
+    if (!onDismiss) return;
+    setActionId(id);
+    try { await onDismiss(id); } finally { setActionId(null); }
+  };
+
+  return (
+    <div className="mb-3" data-testid="held-experiments-section">
+      <div className="text-ui-sm font-semibold text-amber-300 uppercase tracking-widest mb-1.5 flex items-center gap-1.5">
+        <AlertTriangle className="w-3 h-3 shrink-0" />
+        Held for approval
+      </div>
+      <div className="flex flex-col gap-1.5">
+        {experiments.map((exp) => {
+          const spendCap = (exp.payloads?.[0] as Record<string, unknown> | undefined)?.spend_cap_usd;
+          const capLabel = spendCap != null ? ` · $${Number(spendCap).toFixed(2)}` : '';
+          const busy = actionId === exp.id;
+          return (
+            <div
+              key={exp.id}
+              className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 flex items-center justify-between gap-3"
+              data-testid="held-experiment-row"
+            >
+              <div className="min-w-0">
+                <div className="text-xs font-semibold text-amber-200 break-words">{exp.title}{capLabel}</div>
+                <div className="text-ui-sm text-amber-300/70 font-mono">spend cap requires operator approval</div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                {onApprove && (
+                  <button
+                    type="button"
+                    onClick={() => void handleApprove(exp.id)}
+                    disabled={busy}
+                    className="min-h-[44px] flex items-center gap-1.5 rounded bg-emerald-500/20 px-3 text-ui-md font-semibold text-emerald-200 hover:bg-emerald-500/30 transition-colors disabled:opacity-50"
+                    data-testid="held-experiment-approve"
+                  >
+                    <CheckCircle className="w-3 h-3" />
+                    {busy ? 'Approving…' : 'Approve'}
+                  </button>
+                )}
+                {onDismiss && (
+                  <button
+                    type="button"
+                    onClick={() => void handleDismiss(exp.id)}
+                    disabled={busy}
+                    className="min-h-[44px] flex items-center gap-1.5 rounded bg-red-500/20 px-3 text-ui-md font-semibold text-red-200 hover:bg-red-500/30 transition-colors disabled:opacity-50"
+                    data-testid="held-experiment-dismiss"
+                  >
+                    <XCircle className="w-3 h-3" />
+                    {busy ? 'Dismissing…' : 'Dismiss'}
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 interface ComputeJobsPanelProps {
   projectId: string | null;
   onNavigateToTask?: (taskId: string) => void;
   onLaunchCompute?: () => void;
   onDuplicateTask?: (taskId: string) => Promise<void>;
+  onApproveExperiment?: (taskId: string) => Promise<void>;
+  onDismissExperiment?: (taskId: string) => Promise<void>;
+  onNavigateToKnowledge?: (documentId: string) => void;
 }
 
-export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onDuplicateTask }: ComputeJobsPanelProps) {
+export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onDuplicateTask, onApproveExperiment, onDismissExperiment, onNavigateToKnowledge }: ComputeJobsPanelProps) {
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
+  const [heldExperiments, setHeldExperiments] = useState<HeldComputeExperiment[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [summary, setSummary] = useState<ComputeJobsSummary | null>(null);
   const [lifetimeSummary, setLifetimeSummary] = useState<ComputeJobsSummary | null>(null);
@@ -462,6 +546,22 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     enabled: !!projectId,
     deps: [projectId, finishedWindowMinutes, allTerminal],
   });
+
+  // Poll held (requires_approval) compute experiments every 30s so operators
+  // see them here without visiting the Board.
+  usePoller(
+    async (signal) => {
+      if (!projectId) return;
+      try {
+        const held = await fetchHeldComputeExperiments(projectId, signal);
+        setHeldExperiments(Array.isArray(held) ? held : []);
+      } catch (e) {
+        if (e instanceof Error && e.name === 'AbortError') return;
+        // Non-fatal: held section is supplementary; don't surface as panel error
+      }
+    },
+    { intervalMs: 30_000, enabled: !!projectId, deps: [projectId] },
+  );
 
   // Fetch lifetime aggregate summary once per project (unbounded lifetime totals).
   useEffect(() => {
@@ -573,33 +673,49 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
   return (
     <div className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/60 p-4" data-viewport-allow-truncation>
-      <div className="flex items-center justify-between gap-2 mb-3">
+      <div className="flex items-center justify-between gap-2 mb-1">
         <div className="flex items-center gap-2 text-ui-md font-bold text-neutral-400 uppercase tracking-widest">
           <Cpu className="w-3.5 h-3.5 shrink-0" />
           Compute jobs
         </div>
-        <div className="flex items-center gap-0.5" data-testid="compute-window-selector">
-          {WINDOW_OPTIONS.map(({ label, minutes }) => (
+        <div className="flex items-center gap-2">
+          {onLaunchCompute && (
             <button
-              key={minutes}
               type="button"
-              onClick={() => { setAllTerminal(false); setFinishedWindowMinutes(minutes); setHasMore(false); }}
-              className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${!allTerminal && finishedWindowMinutes === minutes ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
-              data-testid={`compute-window-${label}`}
+              onClick={onLaunchCompute}
+              className="shrink-0 min-h-[36px] rounded bg-sky-500/20 px-3 text-ui-sm font-semibold text-sky-200 transition-colors hover:bg-sky-500/30"
             >
-              {label}
+              Launch experiment
             </button>
-          ))}
-          <button
-            type="button"
-            onClick={() => { setAllTerminal(true); setHasMore(false); }}
-            className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${allTerminal ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
-            data-testid="compute-window-all"
-          >
-            All
-          </button>
+          )}
+          <div className="flex items-center gap-0.5" data-testid="compute-window-selector">
+            {WINDOW_OPTIONS.map(({ label, minutes }) => (
+              <button
+                key={minutes}
+                type="button"
+                onClick={() => { setAllTerminal(false); setFinishedWindowMinutes(minutes); setHasMore(false); }}
+                className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${!allTerminal && finishedWindowMinutes === minutes ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+                data-testid={`compute-window-${label}`}
+              >
+                {label}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => { setAllTerminal(true); setHasMore(false); }}
+              className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${allTerminal ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+              data-testid="compute-window-all"
+            >
+              All
+            </button>
+          </div>
         </div>
       </div>
+      {!allTerminal && (
+        <div className="mb-2 text-ui-xs text-neutral-500" data-testid="compute-window-indicator">
+          Showing jobs from the last {WINDOW_OPTIONS.find(o => o.minutes === finishedWindowMinutes)?.label || '6h'}
+        </div>
+      )}
 
       {lifetimeSummary && lifetimeSummary.total_jobs > 0 && (
         <div
@@ -662,25 +778,18 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
       {showEmptyState && (
         <div className="rounded-lg border border-neutral-800/80 bg-neutral-900/40 px-3 py-2">
-          <div className="flex items-center justify-between gap-3">
-            <div className="min-w-0">
-              <div className="text-xs font-semibold text-neutral-200">No compute jobs</div>
-              <div className="mt-0.5 text-ui-sm text-neutral-500">
-                Launch a structured experiment for this project.
-              </div>
-            </div>
-            {onLaunchCompute && (
-              <button
-                type="button"
-                onClick={onLaunchCompute}
-                className="shrink-0 min-h-[36px] rounded bg-sky-500/20 px-3 text-ui-md font-semibold text-sky-200 transition-colors hover:bg-sky-500/30"
-              >
-                Launch compute experiment
-              </button>
-            )}
+          <div className="text-xs font-semibold text-neutral-200">No compute jobs</div>
+          <div className="mt-0.5 text-ui-sm text-neutral-500">
+            Launch a structured experiment for this project.
           </div>
         </div>
       )}
+
+      <HeldExperimentsSection
+        experiments={heldExperiments}
+        onApprove={onApproveExperiment}
+        onDismiss={onDismissExperiment}
+      />
 
       <ExperimentSweepSummary jobs={jobs} />
 
@@ -938,14 +1047,28 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     <div className="flex items-start gap-1.5">
                       <FileText className="w-3 h-3 shrink-0 mt-0.5 text-sky-300" />
                       <div className="min-w-0 flex-1">
-                        <button
-                          type="button"
-                          onClick={() => toggleDocExpanded(docKey)}
-                          className="font-semibold text-sky-200 break-words text-left w-full hover:text-sky-100"
-                          data-testid="compute-knowledge-doc-toggle"
-                        >
-                          {doc.title}
-                        </button>
+                        <div className="flex items-center justify-between gap-2">
+                          <button
+                            type="button"
+                            onClick={() => toggleDocExpanded(docKey)}
+                            className="font-semibold text-sky-200 break-words text-left flex-1 hover:text-sky-100"
+                            data-testid="compute-knowledge-doc-toggle"
+                          >
+                            {doc.title}
+                          </button>
+                          {onNavigateToKnowledge && (
+                            <button
+                              type="button"
+                              onClick={() => onNavigateToKnowledge(doc.id)}
+                              className="min-h-[44px] shrink-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-ui-xs font-semibold text-sky-400 hover:text-sky-200 hover:bg-sky-500/15 transition-colors"
+                              title="View in Knowledge Library"
+                              data-testid="compute-knowledge-doc-library-link"
+                            >
+                              <BookOpen className="w-3 h-3" />
+                              Library
+                            </button>
+                          )}
+                        </div>
                         {!expanded && doc.summary && (
                           <div className="mt-0.5 text-sky-300/80 break-words whitespace-pre-wrap line-clamp-3">{doc.summary}</div>
                         )}

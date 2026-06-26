@@ -20,6 +20,7 @@ const analyzeComputeJob = vi.fn();
 const fetchKnowledgeDocument = vi.fn();
 const resolveArtifactDownloadUrl = vi.fn();
 const fetchComputeJobsAggregateSummary = vi.fn();
+const fetchHeldComputeExperiments = vi.fn();
 
 vi.mock('../api', () => ({
   fetchComputeJobs: (...args: unknown[]) => fetchComputeJobs(...args),
@@ -32,6 +33,7 @@ vi.mock('../api', () => ({
   fetchKnowledgeDocument: (...args: unknown[]) => fetchKnowledgeDocument(...args),
   resolveArtifactDownloadUrl: (...args: unknown[]) => resolveArtifactDownloadUrl(...args),
   fetchComputeJobsAggregateSummary: (...args: unknown[]) => fetchComputeJobsAggregateSummary(...args),
+  fetchHeldComputeExperiments: (...args: unknown[]) => fetchHeldComputeExperiments(...args),
 }));
 
 function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
@@ -207,6 +209,7 @@ describe('ComputeJobsPanel render + kill', () => {
     fetchKnowledgeDocument.mockReset();
     resolveArtifactDownloadUrl.mockReset();
     fetchComputeJobsAggregateSummary.mockReset();
+    fetchHeldComputeExperiments.mockReset();
     vi.restoreAllMocks();
   });
 
@@ -576,14 +579,14 @@ describe('ComputeJobsPanel render + kill', () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([]));
     const { findByText, queryByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('No compute jobs');
-    expect(queryByRole('button', { name: 'Launch compute experiment' })).toBeNull();
+    expect(queryByRole('button', { name: 'Launch experiment' })).toBeNull();
   });
 
   test('renders a launch action in the empty compute workbench when provided', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([]));
     const { findByText, findByRole } = render(<ComputeJobsPanel projectId="proj-1" onLaunchCompute={vi.fn()} />);
     await findByText('No compute jobs');
-    expect(await findByRole('button', { name: 'Launch compute experiment' })).toBeTruthy();
+    expect(await findByRole('button', { name: 'Launch experiment' })).toBeTruthy();
   });
 
   test('terminal job with command_log renders log text and truncated badge when truncated', async () => {
@@ -756,7 +759,7 @@ describe('ComputeJobsPanel render + kill', () => {
     const onLaunchCompute = vi.fn();
     fetchComputeJobs.mockResolvedValue(wrapJobs([]));
     const { findByRole } = render(<ComputeJobsPanel projectId="proj-1" onLaunchCompute={onLaunchCompute} />);
-    const launchButton = await findByRole('button', { name: 'Launch compute experiment' });
+    const launchButton = await findByRole('button', { name: 'Launch experiment' });
     await act(async () => { launchButton.click(); });
     expect(onLaunchCompute).toHaveBeenCalledTimes(1);
   });
@@ -1900,6 +1903,128 @@ describe('ComputeJobsPanel render + kill', () => {
     const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('No compute jobs');
     expect(queryByTestId('compute-lifetime-summary')).toBeNull();
+  });
+
+  test('renders held experiments section when tasks with requires_approval exist', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    fetchHeldComputeExperiments.mockResolvedValue([
+      {
+        id: 'task-held-1',
+        title: 'sweep: test convergence',
+        status: 'QUEUED',
+        requires_approval: true,
+        payloads: [{ type: 'compute_experiment', spend_cap_usd: 12.5 }],
+        created_at: new Date().toISOString(),
+      },
+    ]);
+    const { findByTestId, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('held-experiments-section');
+    expect(await findByText(/sweep: test convergence/)).toBeTruthy();
+    expect(await findByText(/\$12\.50/)).toBeTruthy();
+  });
+
+  test('approve button calls onApproveExperiment with task id', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    fetchHeldComputeExperiments.mockResolvedValue([
+      {
+        id: 'task-held-2',
+        title: 'held experiment',
+        status: 'QUEUED',
+        requires_approval: true,
+        payloads: [{ type: 'compute_experiment', spend_cap_usd: 5.0 }],
+        created_at: new Date().toISOString(),
+      },
+    ]);
+    const onApprove = vi.fn().mockResolvedValue(undefined);
+    const { findByTestId } = render(
+      <ComputeJobsPanel projectId="proj-1" onApproveExperiment={onApprove} />,
+    );
+    const btn = await findByTestId('held-experiment-approve');
+    btn.click();
+    await waitFor(() => expect(onApprove).toHaveBeenCalledWith('task-held-2'));
+  });
+
+  test('dismiss button calls onDismissExperiment with task id', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    fetchHeldComputeExperiments.mockResolvedValue([
+      {
+        id: 'task-held-3',
+        title: 'held experiment',
+        status: 'QUEUED',
+        requires_approval: true,
+        payloads: [{ type: 'compute_experiment', spend_cap_usd: 5.0 }],
+        created_at: new Date().toISOString(),
+      },
+    ]);
+    const onDismiss = vi.fn().mockResolvedValue(undefined);
+    const { findByTestId } = render(
+      <ComputeJobsPanel projectId="proj-1" onDismissExperiment={onDismiss} />,
+    );
+    const btn = await findByTestId('held-experiment-dismiss');
+    btn.click();
+    await waitFor(() => expect(onDismiss).toHaveBeenCalledWith('task-held-3'));
+  });
+
+  test('held experiments section is absent when no held tasks exist', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    fetchHeldComputeExperiments.mockResolvedValue([]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('No compute jobs');
+    expect(queryByTestId('held-experiments-section')).toBeNull();
+  });
+
+  test('renders View in Library button when knowledge doc present and onNavigateToKnowledge is provided, calls it with doc id', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      knowledge_document_id: 'doc-lib-1',
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    fetchKnowledgeDocument.mockResolvedValue({
+      id: 'doc-lib-1',
+      title: 'Experiment: accuracy result',
+      summary: 'Achieved 91% accuracy.',
+      tags: [],
+      source_citations: [],
+      source_task_id: 'task-1',
+      created_at: null,
+      updated_at: null,
+      forward_quality_verdict: null,
+    });
+    const onNavigateToKnowledge = vi.fn();
+    const { findByTestId } = render(
+      <ComputeJobsPanel projectId="proj-1" onNavigateToKnowledge={onNavigateToKnowledge} />,
+    );
+    const libraryBtn = await findByTestId('compute-knowledge-doc-library-link');
+    expect(libraryBtn).toBeTruthy();
+    await act(async () => { libraryBtn.click(); });
+    expect(onNavigateToKnowledge).toHaveBeenCalledWith('doc-lib-1');
+  });
+
+  test('does not render View in Library button when onNavigateToKnowledge is not provided', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      knowledge_document_id: 'doc-lib-2',
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    fetchKnowledgeDocument.mockResolvedValue({
+      id: 'doc-lib-2',
+      title: 'Experiment: no library link',
+      summary: 'Some result.',
+      tags: [],
+      source_citations: [],
+      source_task_id: 'task-1',
+      created_at: null,
+      updated_at: null,
+      forward_quality_verdict: null,
+    });
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Verify the doc card renders (so we know the test setup is correct)
+    await findByTestId('compute-knowledge-doc-link');
+    expect(queryByTestId('compute-knowledge-doc-library-link')).toBeNull();
   });
 
   test('arms breakdown renders winner verdict and positive margin for higher_better criterion metric', async () => {

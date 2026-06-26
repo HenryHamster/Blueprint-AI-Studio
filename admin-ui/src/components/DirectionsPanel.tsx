@@ -207,6 +207,13 @@ export function DirectionsPanel({ addToast, onViewFindings, onViewKnowledge, onN
   const data = useDirectionsData({ selectedProjectId, addToast, fetchDirectionsRef });
   const { form, config } = data;
 
+  function handleSpawnDirection(gapId: string, gapName: string) {
+    form.setNewText(gapName);
+    form.setNewLinkedGapId(gapId);
+    setActiveTab('directions');
+    setFormExpanded(true);
+  }
+
   function toggleSection(key: string) {
     setCollapsed(prev => ({ ...prev, [key]: !prev[key] }));
   }
@@ -354,7 +361,7 @@ export function DirectionsPanel({ addToast, onViewFindings, onViewKnowledge, onN
                 </button>
               </div>
               {formExpanded && (
-                <DirectionsAddForm form={form} addDirection={() => { data.addDirection(); setFormExpanded(false); }} stageTargetVersion={data.openVersionNumber} />
+                <DirectionsAddForm form={form} addDirection={() => { data.addDirection(); setFormExpanded(false); }} stageTargetVersion={data.openVersionNumber} linkedGapId={form.newLinkedGapId} />
               )}
             </>
           )}
@@ -425,6 +432,11 @@ export function DirectionsPanel({ addToast, onViewFindings, onViewKnowledge, onN
                 currentVersion={data.currentVersion}
                 addToast={addToast}
                 onUpdated={data.setProblemModel}
+                onSpawnDirection={handleSpawnDirection}
+                onLinkDirection={data.linkDirectionToGap}
+                directions={data.directions
+                  .filter(d => d.status === 'active')
+                  .map(d => ({ id: d.id, text: d.text }))}
               />
             </div>
           )}

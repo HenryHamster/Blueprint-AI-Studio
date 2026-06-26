@@ -20,6 +20,9 @@ export function useDirectionForm() {
   // passes through a research-eligible active state. Gated in the UI to an
   // open release version, mirroring the edit-form 'staged' status option.
   const [newStaged, setNewStagedState] = useState(false);
+  // Problem model gap this direction is being created to address. Set when
+  // the operator clicks "Spawn direction" on a gap card; cleared on reset.
+  const [newLinkedGapId, setNewLinkedGapIdState] = useState<string | null>(null);
 
   // Client idempotency identity for the add path. Minted lazily on first submit
   // and reused across double-clicks / failed retries / lost-response replays so
@@ -105,6 +108,11 @@ export function useDirectionForm() {
     setNewStagedState(value);
   }
 
+  function setNewLinkedGapId(value: string | null) {
+    resetAddKeyForEditedDraft();
+    setNewLinkedGapIdState(value);
+  }
+
   function markAddAttemptFailed() {
     rotateAddIdempotencyKeyOnDraftChangeRef.current = true;
   }
@@ -119,8 +127,14 @@ export function useDirectionForm() {
     setNewSuccessEvidenceState('');
     setNewRetirementConditionState('');
     setNewStagedState(false);
+    setNewLinkedGapIdState(null);
     addIdempotencyKeyRef.current = null;
     rotateAddIdempotencyKeyOnDraftChangeRef.current = false;
+  }
+
+  function seedFromMessage(text: string) {
+    resetAddForm();
+    setNewTextState(text.slice(0, 2000));
   }
 
   return {
@@ -133,6 +147,7 @@ export function useDirectionForm() {
     newSuccessEvidence, setNewSuccessEvidence,
     newRetirementCondition, setNewRetirementCondition,
     newStaged, setNewStaged,
+    newLinkedGapId, setNewLinkedGapId,
     addIdempotencyKeyRef,
     markAddAttemptFailed,
     editingId, setEditingId,
@@ -147,5 +162,6 @@ export function useDirectionForm() {
     editRetirementCondition, setEditRetirementCondition,
     startEdit,
     resetAddForm,
+    seedFromMessage,
   };
 }

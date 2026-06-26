@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Pencil, ChevronDown, ChevronRight, AlertCircle, Target, Box, CheckCircle2, Circle, Clock, Flag, GitBranch } from 'lucide-react';
+import { Pencil, ChevronDown, ChevronRight, AlertCircle, Target, Box, CheckCircle2, Circle, Clock, Flag, GitBranch, Plus } from 'lucide-react';
 import { timeAgo } from '../utils/time';
 import { MarkdownContent } from './MarkdownContent';
 import { ProblemModelEditor } from './ProblemModelEditor';
@@ -24,6 +24,10 @@ interface ProblemModelViewerProps {
   currentVersion?: CurrentVersion | null;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onUpdated: (patched: ProblemModel) => void;
+  // Callbacks wired from DirectionsPanel to make gap cards actionable.
+  onSpawnDirection?: (gapId: string, gapName: string) => void;
+  onLinkDirection?: (directionId: string, gapId: string) => void;
+  directions?: Array<{ id: string; text: string }>;
 }
 
 const capabilityBarColors: Record<string, string> = {
@@ -147,9 +151,52 @@ function CapabilityBar({ capability }: { capability: Capability }) {
   );
 }
 
-function GapCard({ gap }: { gap: Gap }) {
+function GapLinkSelect({
+  gapId,
+  directions,
+  onLink,
+}: {
+  gapId: string;
+  directions: Array<{ id: string; text: string }>;
+  onLink: (directionId: string, gapId: string) => void;
+}) {
+  const [value, setValue] = useState('');
+  return (
+    <select
+      value={value}
+      onChange={e => {
+        const id = e.target.value;
+        if (id) {
+          onLink(id, gapId);
+          setValue('');
+        }
+      }}
+      className="text-xs bg-neutral-900 border border-neutral-700 text-neutral-400 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-neutral-600"
+    >
+      <option value="">Link direction…</option>
+      {directions.map(d => (
+        <option key={d.id} value={d.id}>
+          {d.text.length > 50 ? `${d.text.slice(0, 50)}…` : d.text}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function GapCard({
+  gap,
+  onSpawnDirection,
+  onLinkDirection,
+  directions,
+}: {
+  gap: Gap;
+  onSpawnDirection?: (gapId: string, gapName: string) => void;
+  onLinkDirection?: (directionId: string, gapId: string) => void;
+  directions?: Array<{ id: string; text: string }>;
+}) {
   const activeMoves = gap.active_moves ?? [];
   const pastMoves = gap.past_moves ?? [];
+  const hasActions = onSpawnDirection || (onLinkDirection && directions && directions.length > 0);
   return (
     <div className="border border-neutral-800 rounded-md p-3 bg-neutral-900/40">
       <div className="flex items-start justify-between gap-2 mb-1">
@@ -185,6 +232,23 @@ function GapCard({ gap }: { gap: Gap }) {
           )}
           {pastMoves.length > 0 && (
             <span><span className="text-neutral-400">Past:</span> {pastMoves.length}</span>
+          )}
+        </div>
+      )}
+      {hasActions && (
+        <div className="mt-2 pt-2 border-t border-neutral-800/60 flex items-center gap-2 flex-wrap">
+          {onSpawnDirection && (
+            <button
+              type="button"
+              onClick={() => onSpawnDirection(gap.id, gap.name)}
+              className="inline-flex items-center gap-1 px-2 py-1 min-h-[44px] md:min-h-auto text-xs rounded border border-neutral-700 bg-neutral-800/50 text-neutral-300 hover:bg-neutral-800 hover:text-neutral-100 transition"
+            >
+              <Plus size={10} />
+              Spawn direction
+            </button>
+          )}
+          {onLinkDirection && directions && directions.length > 0 && (
+            <GapLinkSelect gapId={gap.id} directions={directions} onLink={onLinkDirection} />
           )}
         </div>
       )}
@@ -273,6 +337,9 @@ export default function ProblemModelViewer({
   currentVersion,
   addToast,
   onUpdated,
+  onSpawnDirection,
+  onLinkDirection,
+  directions,
 }: ProblemModelViewerProps) {
   const [showEditor, setShowEditor] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
@@ -499,7 +566,15 @@ export default function ProblemModelViewer({
           <section>
             <SectionHeader icon={<Circle size={14} />} count={sortedGaps.length}>Active gaps</SectionHeader>
             <div className="space-y-2">
-              {sortedGaps.map((g, i) => <GapCard key={g.id ?? `gap-${i}`} gap={g} />)}
+              {sortedGaps.map((g, i) => (
+                <GapCard
+                  key={g.id ?? `gap-${i}`}
+                  gap={g}
+                  onSpawnDirection={onSpawnDirection}
+                  onLinkDirection={onLinkDirection}
+                  directions={directions}
+                />
+              ))}
             </div>
           </section>
         )}

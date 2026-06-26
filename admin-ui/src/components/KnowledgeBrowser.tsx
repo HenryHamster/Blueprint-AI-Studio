@@ -19,6 +19,7 @@ interface KnowledgeBrowserProps {
   onNavigateToTask?: (taskId: string) => void;
   onLaunchWebResearchTask?: (topic?: string) => void;
   initialDirectionId?: string;
+  initialDocumentId?: string;
 }
 
 function relativeDate(dateStr: string | null): string {
@@ -402,7 +403,7 @@ function CopyableId({ id }: { id: string }) {
 
 const PAGE_SIZE = 50;
 
-export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask, onLaunchWebResearchTask, initialDirectionId }: KnowledgeBrowserProps) {
+export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask, onLaunchWebResearchTask, initialDirectionId, initialDocumentId }: KnowledgeBrowserProps) {
   const [query, setQuery] = useState({
     search: '',
     topicFilter: null as string | null,
@@ -470,6 +471,17 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
       .then(full => setSelected(full))
       .catch(() => {/* keep summary view */});
   }, [selectedProjectId]);
+
+  // When a specific document id is provided (e.g. from the compute jobs panel),
+  // open it directly in the detail view once the panel mounts or the project changes.
+  useEffect(() => {
+    if (!initialDocumentId || !selectedProjectId) return;
+    let cancelled = false;
+    fetchKnowledgeDocument(selectedProjectId, initialDocumentId)
+      .then(full => { if (!cancelled) setSelected(full); })
+      .catch(() => {/* non-fatal: browser can navigate back */});
+    return () => { cancelled = true; };
+  }, [initialDocumentId, selectedProjectId]);
 
   const launchWebResearch = useCallback((topic?: string) => {
     onLaunchWebResearchTask?.(topic);

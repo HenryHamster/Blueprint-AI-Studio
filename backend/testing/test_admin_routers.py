@@ -20241,6 +20241,34 @@ class TestApprovalNeededFilter:
         assert no_id in false_ids
         assert needs_id not in false_ids
 
+    @pytest.mark.asyncio
+    async def test_patch_requires_approval_false_sets_spend_approval_cleared_at(
+        self, client: AsyncClient, db_session
+    ):
+        """PATCH {requires_approval: false} on a held compute_experiment task must
+        set spend_approval_cleared_at so check_compute_spend_approval unblocks."""
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "compute_experiment", "spend_cap_usd": 20.0}],
+            requires_approval=True,
+            spend_approval_cleared_at=None,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.patch(
+            f"/api/admin/tasks/{task.id}",
+            json={"requires_approval": False},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(task)
+        assert task.requires_approval is False
+        assert task.spend_approval_cleared_at is not None
+
 
 class TestPoolAccountMutationsRequireAdmin:
     """Mutation endpoints on /max-plan-accounts must reject non-admin callers."""

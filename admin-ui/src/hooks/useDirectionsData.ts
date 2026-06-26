@@ -196,6 +196,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       // single create call (404s if none is open), so the direction never passes
       // through a research-eligible active state (no create-then-edit race).
       if (form.newStaged && openVersionNumber != null) body.staged = true;
+      if (form.newLinkedGapId) body.gap_id = form.newLinkedGapId;
       // Reuse one client idempotency identity across double-clicks / failed
       // retries / lost-response replays so the backend collapses them into a
       // single direction. The key is minted lazily here and held until the add
@@ -470,6 +471,22 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     }
   }
 
+  async function linkDirectionToGap(directionId: string, gapId: string) {
+    if (!selectedProjectId) return;
+    setError(null);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${directionId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ gap_id: gapId }),
+      });
+      if (!res.ok) throw new Error('Failed to link direction to gap');
+      addToast('Direction linked to gap', 'success');
+      fetchDirections();
+    } catch {
+      setError('Failed to link direction to gap. Please try again.');
+    }
+  }
+
   async function triggerResearch(id: string, bypass = false) {
     setResearchingIds(prev => ({ ...prev, [id]: true }));
     setForceConfirmId(null);
@@ -535,5 +552,6 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     toggleAutonomous,
     reorderDirections,
     triggerResearch,
+    linkDirectionToGap,
   };
 }

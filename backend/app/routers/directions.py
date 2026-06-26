@@ -142,6 +142,11 @@ class _DirectionPayload(BaseModel):
             "convention."
         ),
     )
+    gap_id: Optional[str] = Field(
+        default=None,
+        max_length=100,
+        description="Problem model gap ID this direction is created to address.",
+    )
 
 
 @router.get("/projects/{project_id}/directions")
@@ -393,6 +398,8 @@ async def add_direction(
         context["retirement_condition"] = payload.retirement_condition
     if context:
         direction["context"] = context
+    if payload.gap_id:
+        direction["gap_id"] = payload.gap_id
 
     existing_direction: list = []  # Will be populated if we find a duplicate
 
@@ -799,6 +806,17 @@ async def update_direction(
             status_code=400,
             detail="system_id must be a string of at most 100 characters",
         )
+    if (
+        "gap_id" in payload
+        and payload["gap_id"] is not None
+        and (
+            not isinstance(payload["gap_id"], str) or len(payload["gap_id"]) > 100
+        )
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="gap_id must be a string of at most 100 characters",
+        )
 
     # Resolve and validate the staging TARGET version. Triggered both when a
     # direction transitions to ``staged`` AND when an already-staged direction is
@@ -1001,6 +1019,11 @@ async def update_direction(
                         d.pop("system_id", None)
                     else:
                         d["system_id"] = payload["system_id"][:100]
+                if "gap_id" in payload:
+                    if payload["gap_id"] is None:
+                        d.pop("gap_id", None)
+                    else:
+                        d["gap_id"] = payload["gap_id"]
 
                 # Reset outcome-detection state when any contract field actually changed.
                 _new_ctx = d.get("context") or {}

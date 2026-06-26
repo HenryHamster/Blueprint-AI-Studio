@@ -3048,6 +3048,32 @@ export interface ComputeJobsListResponse {
   offset: number;
 }
 
+export interface HeldComputeExperiment {
+  id: string;
+  title: string;
+  status: string;
+  requires_approval: boolean;
+  payloads?: Record<string, unknown>[];
+  created_at: string;
+}
+
+export async function fetchHeldComputeExperiments(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<HeldComputeExperiment[]> {
+  const query = new URLSearchParams({
+    task_type: 'compute_experiment',
+    approval_needed: 'true',
+    archived: 'false',
+    project_id: projectId,
+    limit: '20',
+  });
+  const res = await apiFetch(`/api/admin/tasks?${query.toString()}`, undefined, 2, 20000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch held compute experiments: ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data) ? data : (data.tasks ?? []);
+}
+
 export async function fetchComputeJobs(
   projectId: string,
   signal?: AbortSignal,
@@ -3832,4 +3858,59 @@ export async function dismissPendingConfirmation(
     { method: 'POST' },
   );
   if (!res.ok) throw new Error(`Failed to dismiss pending confirmation: ${res.status}`);
+}
+
+/** A pull-based fleet runner registered to a project. */
+export interface FleetRunner {
+  id: string;
+  hostname: string | null;
+  version: string | null;
+  status: string;
+  capabilities: {
+    task_types?: string | string[];
+    has_gpu?: boolean;
+    max_concurrent?: number;
+    [key: string]: unknown;
+  };
+  last_seen_at: string | null;
+  created_at: string | null;
+}
+
+/** Register a new fleet runner for a project. Returns the one-time token. */
+export async function registerFleetRunner(
+  projectId: string,
+  opts: { hostname?: string; version?: string; capabilities?: Record<string, unknown> } = {},
+): Promise<{ runner_id: string; token: string }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/register`,
+    { method: 'POST', body: JSON.stringify(opts) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to register runner: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to register runner: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** List active (non-deleted) runners for a project. */
+export async function listFleetRunners(projectId: string): Promise<FleetRunner[]> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners`,
+  );
+  if (!res.ok) throw new Error(`Failed to list runners: ${res.status}`);
+  return res.json();
+}
+
+/** Revoke a runner by ID (marks it deleted). */
+export async function revokeFleetRunner(projectId: string, runnerId: string): Promise<void> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}`,
+    { method: 'DELETE' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to revoke runner: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to revoke runner: ${res.status}`);
+  }
 }

@@ -384,6 +384,11 @@ async def _apply_approval_mutation(
         logger.info(
             f"[ADMIN] Task {task.id} manually approved (was blocked: {task.latest_status_message or 'unknown reason'})"
         )
+        # Allow compute_experiment launch to proceed: check_compute_spend_approval
+        # gates on spend_approval_cleared_at being non-None. Set it here so that
+        # clearing requires_approval via PATCH actually unblocks job launch.
+        if task.spend_approval_cleared_at is None:
+            task.spend_approval_cleared_at = _utcnow()
 
     if not (
         was_blocked

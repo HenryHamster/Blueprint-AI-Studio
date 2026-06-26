@@ -292,6 +292,7 @@ export default function App() {
   const [dismissedZoneAlertIds, setDismissedZoneAlertIds] = useState<Set<string>>(new Set());
   const [researchBrowserDirectionId, setResearchBrowserDirectionId] = useState<string | null>(null);
   const [knowledgeBrowserDirectionId, setKnowledgeBrowserDirectionId] = useState<string | null>(null);
+  const [knowledgeBrowserInitialDocId, setKnowledgeBrowserInitialDocId] = useState<string | null>(null);
   const [researchFeed, setResearchFeed] = useState<Task[]>([]);
 
   // Fetch project tasks when the Findings Journal opens so findings and implementation child
@@ -912,6 +913,9 @@ export default function App() {
                 fetchTask(taskId).then(s.openDuplicateTaskModal).catch(() => { s.addToast('Could not load task — it may have been deleted', 'error'); });
               }
             }}
+            onApproveExperiment={s.handleApprove}
+            onDismissExperiment={s.handleDismiss}
+            onNavigateToKnowledge={(docId) => { setKnowledgeBrowserInitialDocId(docId); s.setShowKnowledgeBrowser(true); }}
           />
         </ErrorBoundary>
       ) : activeTab === 'home' ? (
@@ -1245,9 +1249,10 @@ export default function App() {
       {s.showKnowledgeBrowser && (
         <KnowledgeBrowser
           selectedProjectId={s.selectedProjectId}
-          onClose={() => { s.setShowKnowledgeBrowser(false); setKnowledgeBrowserDirectionId(null); }}
+          onClose={() => { s.setShowKnowledgeBrowser(false); setKnowledgeBrowserDirectionId(null); setKnowledgeBrowserInitialDocId(null); }}
           onLaunchWebResearchTask={s.openWebResearchTaskModal}
           initialDirectionId={knowledgeBrowserDirectionId ?? undefined}
+          initialDocumentId={knowledgeBrowserInitialDocId ?? undefined}
           onNavigateToTask={(taskId) => {
             s.setShowKnowledgeBrowser(false);
             const target = s.tasks.find(t => t.id === taskId);
@@ -1404,6 +1409,7 @@ export default function App() {
           onClose={() => s.setShowFleetDetail(false)}
           onViewTask={handleViewTask}
           projects={s.projects}
+          selectedProjectId={s.selectedProjectId}
         />
       )}
 

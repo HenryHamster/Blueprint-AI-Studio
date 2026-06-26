@@ -547,6 +547,68 @@ describe('ProblemModelViewer — viewport regression', () => {
     expect(host.textContent).toContain('Focus has since changed to something different');
   });
 
+  test('gap card shows spawn direction button when onSpawnDirection prop is provided', async () => {
+    const onSpawnDirection = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProblemModelViewer
+          problemModel={makeProblemModel()}
+          onSpawnDirection={onSpawnDirection}
+          {...defaultProps}
+        />
+      );
+    });
+    expect(host.textContent).toContain('Spawn direction');
+    const spawnBtn = Array.from(host.querySelectorAll('button')).find(b => b.textContent?.includes('Spawn direction'));
+    expect(spawnBtn).not.toBeNull();
+  });
+
+  test('gap card does not show spawn direction button when onSpawnDirection is not provided', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProblemModelViewer
+          problemModel={makeProblemModel()}
+          {...defaultProps}
+        />
+      );
+    });
+    expect(host.textContent).not.toContain('Spawn direction');
+  });
+
+  test('gap card shows link direction dropdown when onLinkDirection and directions are provided', async () => {
+    const onLinkDirection = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProblemModelViewer
+          problemModel={makeProblemModel()}
+          onLinkDirection={onLinkDirection}
+          directions={[{ id: 'd-abc12345', text: 'Fix the contract violation detection flow' }]}
+          {...defaultProps}
+        />
+      );
+    });
+    expect(host.textContent).toContain('Link direction');
+    expect(host.textContent).toContain('Fix the contract violation detection flow');
+  });
+
   test('version goal section absent when currentVersion is not provided', async () => {
     host = document.createElement('div');
     host.style.padding = '12px';
