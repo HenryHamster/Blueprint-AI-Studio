@@ -1318,6 +1318,294 @@ async def test_unmeasured_criterion_deadline_kill_stays_clean(
 
 
 @pytest.mark.asyncio
+async def test_multiarm_measured_criterion_is_measurable_and_not_failed_loud(
+    db_session, _quiet_compute_io
+):
+    """A multi-arm experiment whose arms all report the declared metric must be
+    evaluated as measurable=True using best-arm semantics — it must NOT trip the
+    loud ``compute_unmeasured_criterion`` failure just because no flat metric key
+    is present at the top level.
+
+    Drives the production code path: build_compute_result_logs flattens numeric
+    result_metrics AND preserves the 'arms' block so evaluate_compute_success_criterion
+    can apply best-arm semantics (>= → max across arms)."""
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.50
+    job.final_cost_usd = 0.50
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    # Multi-arm result: arms each report accuracy; no top-level 'accuracy' key.
+    # build_compute_result_logs must surface the arms block so the evaluator can
+    # use best-arm semantics.
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": {
+                "arm_a": {"accuracy": 0.93, "exit_code": 0},
+                "arm_b": {"accuracy": 0.85, "exit_code": 0},
+            },
+        },
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    # Production path: build_compute_result_logs → _handle_compute_experiment_completion
+    logs = compute_jobs.build_compute_result_logs(job)
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    # Must NOT fail loud — arms measured the criterion.
+    assert task.status == TaskStatus.COMPLETED
+    assert task.context.get("failure_category") != "compute_unmeasured_criterion"
+    # Criterion is measurable (best-arm value = max across arms for >=).
+    ctx_criterion = task.context["compute_success_criterion"]
+    assert ctx_criterion["measurable"] is True
+    assert ctx_criterion["met"] is True
+    assert ctx_criterion["value"] == pytest.approx(0.93)
+    # plan_output also records the criterion durably.
+    criterion = task.plan_output["compute_result"]["criterion"]
+    assert criterion["measurable"] is True
+    assert criterion["met"] is True
+    assert criterion["value"] == pytest.approx(0.93)
+    # per_arm breakdown available for consumers.
+    assert criterion["per_arm"]["arm_a"] == pytest.approx(0.93)
+    assert criterion["per_arm"]["arm_b"] == pytest.approx(0.85)
+
+
+@pytest.mark.asyncio
+async def test_multiarm_criterion_min_operator(
+    db_session, _quiet_compute_io
+):
+    """Multi-arm with a <= criterion uses min-arm semantics (lowest value wins)."""
+    task = await _make_compute_task_with_criterion(db_session, "latency_ms", "<=", 200)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python bench.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.20
+    job.final_cost_usd = 0.20
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": {
+                "fast": {"latency_ms": 150},
+                "slow": {"latency_ms": 300},
+            },
+        },
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs = compute_jobs.build_compute_result_logs(job)
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    criterion = task.plan_output["compute_result"]["criterion"]
+    # min across arms: 150 <= 200 → met
+    assert criterion["measurable"] is True
+    assert criterion["value"] == pytest.approx(150)
+    assert criterion["met"] is True
+    assert criterion["per_arm"]["fast"] == pytest.approx(150)
+    assert criterion["per_arm"]["slow"] == pytest.approx(300)
+
+
+@pytest.mark.asyncio
+async def test_multiarm_criterion_equality_operator(
+    db_session, _quiet_compute_io
+):
+    """Multi-arm with an == criterion prefers the first arm that satisfies it."""
+    task = await _make_compute_task_with_criterion(db_session, "status_code", "==", 0)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python run.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.10
+    job.final_cost_usd = 0.10
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": {
+                "failing_arm": {"status_code": 1},
+                "passing_arm": {"status_code": 0},
+            },
+        },
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs = compute_jobs.build_compute_result_logs(job)
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    criterion = task.plan_output["compute_result"]["criterion"]
+    # equality fallthrough: prefers the arm that satisfies == 0
+    assert criterion["measurable"] is True
+    assert criterion["value"] == pytest.approx(0)
+    assert criterion["met"] is True
+
+
+@pytest.mark.asyncio
+async def test_multiarm_criterion_partial_measurability(
+    db_session, _quiet_compute_io
+):
+    """One arm reports the metric; the other does not. The measurable arm's value
+    is used for best-arm evaluation; per_arm carries None for the missing arm."""
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.30
+    job.final_cost_usd = 0.30
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": {
+                "arm_with_metric": {"accuracy": 0.95},
+                "arm_without_metric": {"loss": 0.05},  # no 'accuracy' key
+            },
+        },
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs = compute_jobs.build_compute_result_logs(job)
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    criterion = task.plan_output["compute_result"]["criterion"]
+    # Partially measurable: best-arm value from the arm that reported it
+    assert criterion["measurable"] is True
+    assert criterion["value"] == pytest.approx(0.95)
+    assert criterion["met"] is True
+    assert criterion["per_arm"]["arm_with_metric"] == pytest.approx(0.95)
+    assert criterion["per_arm"]["arm_without_metric"] is None
+
+
+@pytest.mark.asyncio
+async def test_multiarm_criterion_all_arms_missing_metric(
+    db_session, _quiet_compute_io
+):
+    """When no arm reports the declared metric the criterion is unmeasurable
+    (fail-closed) and must NOT trip the loud compute_unmeasured_criterion failure."""
+    task = await _make_compute_task_with_criterion(db_session, "accuracy", ">=", 0.9)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.30
+    job.final_cost_usd = 0.30
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": {
+                "arm_a": {"loss": 0.1},
+                "arm_b": {"loss": 0.2},
+            },
+        },
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs = compute_jobs.build_compute_result_logs(job)
+    task.status = TaskStatus.COMPLETED
+    db_session.add(task)
+    await db_session.commit()
+
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    criterion = task.plan_output["compute_result"]["criterion"]
+    # All arms missing the metric → fail-closed
+    assert criterion["measurable"] is False
+    assert criterion["met"] is False
+    assert criterion["value"] is None
+
+
+@pytest.mark.asyncio
 async def test_artifact_produced_criterion_unaffected_by_unmeasured_failure(
     db_session, _quiet_compute_io
 ):

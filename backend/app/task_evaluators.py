@@ -944,15 +944,43 @@ def evaluate_compute_success_criterion(
         return None
     metric, op, threshold = criterion
     binding_status: str | None = None
+    per_arm_values: dict | None = None
     if metric in _RELEASE_ECHO_METRICS:
         binding_status = derive_release_binding_status(echo_sha, expected_sha)
         value: float | None = _release_echo_numeric(binding_status, metric)
         raw_value: object = value
     else:
         obj = _parse_artifact_json(artifact_text) or {}
-        raw_value = obj.get(metric)
-        if raw_value is None:
-            raw_value = _find_metric_case_insensitive(obj, metric)
+        arms_block = obj.get("arms") if isinstance(obj.get("arms"), dict) else None
+        if arms_block:
+            # Multi-arm result: arms[name][metric] — aggregate using best-arm semantics.
+            # "Best arm" = the arm value most favorable for the declared operator so
+            # that met=True whenever at least one arm met the criterion.
+            per_arm_values = {}
+            for arm_name, arm_data in arms_block.items():
+                if not isinstance(arm_data, dict):
+                    continue
+                arm_val = arm_data.get(metric)
+                if arm_val is None:
+                    arm_val = _find_metric_case_insensitive(arm_data, metric)
+                per_arm_values[arm_name] = _coerce_number(arm_val)
+            measurable_vals = [v for v in per_arm_values.values() if v is not None]
+            if measurable_vals:
+                if op in (">=", ">"):
+                    raw_value = max(measurable_vals)
+                elif op in ("<=", "<"):
+                    raw_value = min(measurable_vals)
+                else:
+                    raw_value = next(
+                        (v for v in measurable_vals if criterion_met(v, op, threshold)),
+                        measurable_vals[0],
+                    )
+            else:
+                raw_value = None
+        else:
+            raw_value = obj.get(metric)
+            if raw_value is None:
+                raw_value = _find_metric_case_insensitive(obj, metric)
         value = _coerce_number(raw_value)
     # Shared fail-closed core: a metric absent/non-numeric in the result is never
     # "met" (and ``criterion_met`` enforces that identically for the code gate).
@@ -967,6 +995,8 @@ def evaluate_compute_success_criterion(
     }
     if binding_status is not None:
         result["binding_status"] = binding_status
+    if per_arm_values is not None:
+        result["per_arm"] = per_arm_values
     return result
 
 

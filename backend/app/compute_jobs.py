@@ -2442,6 +2442,12 @@ def build_compute_result_logs(job: ComputeJob) -> str:
             num = _coerce_metric_number(value)
             if num is not None:
                 result[name] = num
+        # Preserve the arms block intact so the success-criterion evaluator can
+        # read per-arm metrics using best-arm semantics. The numeric loop above
+        # drops non-numeric values; the arms block (a nested dict) must survive
+        # as-is for multi-arm experiments.
+        if isinstance(reported.get("arms"), dict) and "arms" not in result:
+            result["arms"] = reported["arms"]
     # Embed the bounded command log text so downstream analysis (knowledge doc,
     # LLM analysis prompt) can find results that live in stdout/stderr rather
     # than in $BLUEPRINT_RESULT_FILE. Capped at _COMMAND_LOG_EMBED_CHARS so a
