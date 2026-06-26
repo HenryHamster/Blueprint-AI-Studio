@@ -3061,3 +3061,79 @@ async def test_preflight_smoke_no_container_image_is_unchanged(monkeypatch):
     assert cmd == "echo hello"  # no docker wrapping
     assert result.ran_containerized is False
     assert result.degraded_no_docker is False
+
+
+@pytest.mark.asyncio
+async def test_degraded_smoke_does_not_reject_container_job(
+    db_session, monkeypatch, _quiet_compute_io
+):
+    """When Docker is absent on the orchestrator (degraded_no_docker=True), a
+    bare-host smoke failure must NOT gate a container_image job.  The command may
+    legitimately depend on in-container libs not present on the host; the real VM
+    will have Docker, so the job must proceed to full provisioning."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.compute_backends import PreflightSmokeResult
+    from app.database import resolve_async_engine
+
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "command": "python3 train.py",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+        },
+    )
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        container_image="ghcr.io/acme/trainer:latest",
+    )
+
+    # Simulate Docker-absent orchestrator: bare-host run of a container-only command
+    # fails (the in-container dep is missing on host), but degraded_no_docker=True.
+    monkeypatch.setattr(
+        compute_jobs,
+        "run_preflight_smoke",
+        AsyncMock(
+            return_value=PreflightSmokeResult(
+                startup_ok=False,
+                exit_code=1,
+                metric_captured=False,
+                declared_metric_value=None,
+                error_excerpt="ModuleNotFoundError: No module named 'acme_trainer'",
+                degraded_no_docker=True,
+            )
+        ),
+    )
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    from app.compute_jobs import _run_and_apply_preflight_smoke
+
+    await _run_and_apply_preflight_smoke(session_factory, job, task)
+    await db_session.refresh(job)
+
+    # Degraded smoke must NOT reject the job — it should be marked as smoke-done
+    # (pass) so the next monitor tick proceeds to full VM provisioning.
+    assert job.status != ComputeJobStatus.FAILED, (
+        "container job must not be rejected by a degraded (Docker-less) smoke failure"
+    )
+    assert job.outcome != ComputeJobOutcome.SMOKE_FAILED
+    meta = job.polling_metadata or {}
+    assert meta.get("preflight_smoke_done") is True
+    assert meta.get("preflight_smoke_status") == "passed"
+    assert meta.get("preflight_smoke_degraded_no_docker") is True

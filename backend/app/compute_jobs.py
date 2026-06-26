@@ -1294,6 +1294,14 @@ async def _run_and_apply_preflight_smoke(
     smoke_passed = smoke.startup_ok and (
         smoke.exit_code is None or declared_metric_for_smoke is None or smoke.metric_captured
     )
+    # When a container_image was declared but Docker was unavailable on the
+    # orchestrator host, the smoke ran bare bash — not a faithful test of the
+    # containerized command.  A bare-run failure MUST NOT gate the job: the
+    # command may legitimately depend on in-container libs not present on the
+    # host.  Treat the degraded smoke as a non-binding pass so the job
+    # proceeds to the real VM where the container will be available.
+    if smoke.degraded_no_docker and not smoke_passed:
+        smoke_passed = True
 
     async with session_factory() as session:
         live = await _lock_compute_job(session, job.id)
