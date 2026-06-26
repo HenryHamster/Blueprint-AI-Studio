@@ -26,6 +26,7 @@ from sqlmodel import select
 from app.compute_backends import (
     GCP_BACKEND_NAME,
     LOCAL_GPU_BACKEND_NAME,
+    RUNNER_SUBPROCESS_BACKEND_NAME,
     ComputeLaunchSpec,
     ComputeStatusResult,
     PreflightSmokeResult,
@@ -304,12 +305,14 @@ async def create_compute_job(
     validate_backend_name(normalized_backend)
     # A GPU can never be provisioned by the CPU-only local-subprocess backend —
     # reject loudly at create time rather than silently running the command CPU-only.
+    # runner-subprocess is allowed: GPU is on the operator's own hardware.
     if accel_spec is not None and normalized_backend not in (
         LOCAL_GPU_BACKEND_NAME,
         GCP_BACKEND_NAME,
+        RUNNER_SUBPROCESS_BACKEND_NAME,
     ):
         raise ValueError(
-            f"GPU compute jobs require the local-gpu or gcp backend (got {normalized_backend!r})"
+            f"GPU compute jobs require the local-gpu, gcp, or runner-subprocess backend (got {normalized_backend!r})"
         )
     normalized_provisioning = normalize_provisioning_model(provisioning_model)
     capped_spend = clamp_spend_cap_usd(spend_cap_usd)
@@ -323,6 +326,13 @@ async def create_compute_job(
         raise ValueError("task not found")
     if locked_task.status in _TASK_TERMINAL_STATUSES:
         raise ValueError("cannot launch a compute job for a terminal task")
+    # Runner-pinned tasks route to the runner-subprocess backend so execution
+    # happens on operator hardware via the pull protocol. Override unconditionally
+    # (the runner's GPU capability gate in _try_runner_dispatch already validated
+    # that the runner can handle any GPU accelerator declared in the payload).
+    runner_target_id: str | None = (locked_task.context or {}).get("runner_target_id") or None
+    if runner_target_id is not None:
+        normalized_backend = RUNNER_SUBPROCESS_BACKEND_NAME
     await _assert_compute_spend_not_gated(session, locked_task, capped_spend)
     live_proof_requirement = _resolve_live_proof_requirement(
         locked_task,
@@ -449,6 +459,8 @@ async def create_compute_job(
                 polling_metadata["container_registry_auth"] = registry_meta
     if live_release_evidence is not None:
         polling_metadata[_LIVE_PROOF_METADATA_KEY] = live_release_evidence
+    if runner_target_id is not None:
+        polling_metadata["runner_target_id"] = runner_target_id
     job = ComputeJob(
         task_id=locked_task.id,
         project_id=locked_task.project_id,
@@ -1385,9 +1397,12 @@ async def _process_single_compute_job(
     if job.status in _COMPUTE_JOB_PRELAUNCH_STATUSES:
         # Pre-flight smoke: run ONCE on QUEUED jobs before reserving the full launch.
         # Idempotent: the flag in polling_metadata guards against re-running on restart.
+        # Skip for runner-subprocess: the command must run on operator hardware
+        # (may need local GPU/CUDA/data) — a leader-local smoke is wrong and would
+        # always validate a different substrate than the real execution environment.
         if job.status == ComputeJobStatus.QUEUED and not (
             job.polling_metadata or {}
-        ).get("preflight_smoke_done"):
+        ).get("preflight_smoke_done") and job.backend != RUNNER_SUBPROCESS_BACKEND_NAME:
             await _run_and_apply_preflight_smoke(session_factory, job, task)
             return  # next tick picks up STARTING (pass) or FAILED/SMOKE_FAILED (fail)
 
@@ -1563,12 +1578,25 @@ async def _process_single_compute_job(
                 + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
             )
             return
-        await _apply_launch_result(
-            session_factory,
-            job.id,
-            result,
-            now=now,
-        )
+        # For runner-subprocess, the STARTING→RUNNING transition is performed by
+        # the runner when it claims the job via /api/runner/next-compute-job.
+        # Calling _apply_launch_result here would move the job to RUNNING before
+        # the runner has a chance to claim it, making /next-compute-job miss it.
+        if job.backend != RUNNER_SUBPROCESS_BACKEND_NAME:
+            await _apply_launch_result(
+                session_factory,
+                job.id,
+                result,
+                now=now,
+            )
+        elif result.metadata:
+            # Persist launch metadata (e.g. repo_clone) without transitioning
+            # to RUNNING — the runner does that when it claims the job.
+            async with session_factory() as session:
+                live = await _lock_compute_job(session, job.id)
+                if live is not None and live.status in _COMPUTE_JOB_PRELAUNCH_STATUSES:
+                    _set_meta(live, **result.metadata)
+                    await session.commit()
         return
 
     # ── Running: poll STATUS first, then cost. A job that finished just before

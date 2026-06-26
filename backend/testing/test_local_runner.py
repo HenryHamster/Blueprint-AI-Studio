@@ -435,7 +435,39 @@ class TestOrchestratorRunnerRouting:
         assert task.status == TaskStatus.QUEUED
 
     @pytest.mark.asyncio
-    async def test_try_runner_dispatch_skips_compute_experiment(self, db_session):
+    async def test_try_runner_dispatch_gpu_experiment_blocked_by_cpu_runner(
+        self, db_session
+    ):
+        """A GPU compute_experiment must not be pinned to a non-GPU runner."""
+        project = await _make_project(db_session)
+        # Runner has no GPU.
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "compute_experiment", "accelerator": "T4"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert (
+            await orch._try_runner_dispatch(
+                db_session, task, {project.id: [runner]}
+            )
+            is False
+        )
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+
+    @pytest.mark.asyncio
+    async def test_try_runner_dispatch_cpu_compute_experiment_routes_to_runner(
+        self, db_session
+    ):
+        """A CPU compute_experiment (no accelerator) is routed normally."""
         project = await _make_project(db_session)
         runner, _ = await _make_runner(db_session, project.id)
         task = Task(
@@ -450,10 +482,10 @@ class TestOrchestratorRunnerRouting:
             await orch._try_runner_dispatch(
                 db_session, task, {project.id: [runner]}
             )
-            is False
+            is True
         )
         await db_session.refresh(task)
-        assert task.status == TaskStatus.QUEUED
+        assert task.status == TaskStatus.PROVISIONING
 
     @pytest.mark.asyncio
     async def test_try_runner_dispatch_respects_capability_task_types(

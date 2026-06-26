@@ -556,10 +556,6 @@ async def _try_runner_dispatch(
     if ctx.get("runner_target_id"):
         return False
     task_type = (task.first_payload or {}).get("type", "")
-    # Compute experiments use the GCP compute substrate; local GPU execution is
-    # out of scope for this PR.
-    if task_type == "compute_experiment":
-        return False
 
     candidates = active_runners_cache.get(task.project_id) or []
     eligible = [
@@ -569,6 +565,19 @@ async def _try_runner_dispatch(
     ]
     if not eligible:
         return False
+
+    # Compute experiments that declare a GPU accelerator may only be pinned to
+    # runners advertising has_gpu=True — a CPU runner cannot provide a GPU.
+    # Non-GPU compute experiments fall through to the normal eligibility check.
+    if task_type == "compute_experiment":
+        payload = task.first_payload or {}
+        accelerator = payload.get("accelerator") or (
+            payload.get("compute_experiment") or {}
+        ).get("accelerator")
+        if accelerator:
+            eligible = [r for r in eligible if (r.capabilities or {}).get("has_gpu")]
+            if not eligible:
+                return False
 
     # Prefer the least-loaded runner (by heartbeat-reported active task count).
     runner = min(eligible, key=_runner_active_task_count)

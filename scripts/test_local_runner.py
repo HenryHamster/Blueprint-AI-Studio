@@ -397,6 +397,463 @@ class TestGracefulShutdown(unittest.TestCase):
         proc.terminate.assert_called_once()
 
 
+# ── Compute job report helper ─────────────────────────────────────────────────
+
+class TestComputeJobReport(unittest.TestCase):
+    def test_sends_correct_fields_and_returns_cancel_flag(self):
+        """_report_compute_job POSTs exec_status/exit_code and returns cancel_requested."""
+        captured = {}
+
+        def fake_post(url, token, body):
+            captured["url"] = url
+            captured["body"] = body
+            return 200, {"ok": True, "cancel_requested": True}
+
+        with patch.object(local_runner, "_post", fake_post):
+            result = local_runner._report_compute_job(
+                "https://api.example.com", "tok", "job-123",
+                exec_status="succeeded", exit_code=0,
+                result_metrics={"loss": 0.5},
+            )
+
+        self.assertTrue(result)
+        self.assertIn("/api/runner/compute-job/job-123/report", captured["url"])
+        self.assertEqual(captured["body"]["exec_status"], "succeeded")
+        self.assertEqual(captured["body"]["exit_code"], 0)
+        self.assertEqual(captured["body"]["result_metrics"], {"loss": 0.5})
+
+    def test_cancel_not_requested_returns_false(self):
+        def fake_post(url, token, body):
+            return 200, {"ok": True, "cancel_requested": False}
+
+        with patch.object(local_runner, "_post", fake_post):
+            result = local_runner._report_compute_job(
+                "https://api.example.com", "tok", "job-abc",
+                exec_status="running",
+            )
+
+        self.assertFalse(result)
+
+    def test_404_returns_true(self):
+        """A 404 response means the job is gone — treat as cancel_requested."""
+        def fake_post(url, token, body):
+            return 404, None
+
+        with patch.object(local_runner, "_post", fake_post):
+            result = local_runner._report_compute_job(
+                "https://api.example.com", "tok", "job-gone",
+                exec_status="running",
+            )
+
+        self.assertTrue(result)
+
+    def test_network_error_returns_false(self):
+        def fake_post(url, token, body):
+            raise RuntimeError("network error")
+
+        with patch.object(local_runner, "_post", fake_post):
+            result = local_runner._report_compute_job(
+                "https://api.example.com", "tok", "job-err",
+                exec_status="running",
+            )
+
+        self.assertFalse(result)
+
+
+# ── Compute job worker ────────────────────────────────────────────────────────
+
+class TestRunComputeJob(unittest.TestCase):
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def _make_job(self, **kwargs):
+        base = {
+            "job_id": "test-job-001",
+            "command": "echo hello",
+            "env": {},
+            "cwd": None,
+            "setup_step": None,
+            "container_image": None,
+            "container_registry_auth": {},
+            "runtime_deadline_seconds": None,
+            "cancel_requested": False,
+        }
+        base.update(kwargs)
+        return base
+
+    def test_successful_command_reports_succeeded_with_metrics(self):
+        """A command that exits 0 and writes result.json → succeeded report with metrics."""
+        reports = []
+
+        def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
+                        result_metrics=None, command_log=None):
+            reports.append({
+                "exec_status": exec_status,
+                "exit_code": exit_code,
+                "result_metrics": result_metrics,
+            })
+            return False
+
+        # Command writes result.json and exits 0
+        job = self._make_job(
+            command="python3 -c \""
+                    "import json,os; "
+                    "open(os.environ['BLUEPRINT_RESULT_FILE'],'w').write(json.dumps({'acc':0.9}))"
+                    "\"",
+        )
+        active_jobs: set = {"test-job-001"}
+        lock = threading.Lock()
+
+        with patch.object(local_runner, "_report_compute_job", fake_report):
+            local_runner._run_compute_job(job, "https://api.example.com", "tok",
+                                          active_jobs, lock)
+
+        terminal = [r for r in reports if r["exec_status"] in ("succeeded", "failed")]
+        self.assertTrue(terminal, "Expected a terminal report")
+        self.assertEqual(terminal[-1]["exec_status"], "succeeded")
+        self.assertEqual(terminal[-1]["exit_code"], 0)
+        self.assertEqual(terminal[-1]["result_metrics"], {"acc": 0.9})
+        # job_id removed from active_jobs after completion
+        self.assertNotIn("test-job-001", active_jobs)
+
+    def test_failed_command_reports_failed(self):
+        """A command that exits non-zero → failed report."""
+        reports = []
+
+        def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
+                        result_metrics=None, command_log=None):
+            reports.append({"exec_status": exec_status, "exit_code": exit_code})
+            return False
+
+        job = self._make_job(command="exit 42")
+        active_jobs: set = {"test-job-001"}
+        lock = threading.Lock()
+
+        with patch.object(local_runner, "_report_compute_job", fake_report):
+            local_runner._run_compute_job(job, "https://api.example.com", "tok",
+                                          active_jobs, lock)
+
+        terminal = [r for r in reports if r["exec_status"] in ("succeeded", "failed")]
+        self.assertTrue(terminal)
+        self.assertEqual(terminal[-1]["exec_status"], "failed")
+        self.assertNotEqual(terminal[-1]["exit_code"], 0)
+
+    def test_setup_step_nonzero_fails_immediately(self):
+        """A non-zero setup_step exit reports failed without running main command."""
+        reports = []
+        commands_run = []
+
+        real_run = subprocess.run
+
+        def fake_run(args, **kwargs):
+            commands_run.append(args[2] if len(args) > 2 else args)
+            if "setup" in str(args):
+                mock = MagicMock()
+                mock.returncode = 2
+                return mock
+            return real_run(args, **kwargs)
+
+        def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
+                        result_metrics=None, command_log=None):
+            reports.append({"exec_status": exec_status, "exit_code": exit_code})
+            return False
+
+        job = self._make_job(
+            command="echo main",
+            setup_step="exit 2",  # will fail
+        )
+        active_jobs: set = {"test-job-001"}
+        lock = threading.Lock()
+
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch("subprocess.run", side_effect=fake_run):
+            local_runner._run_compute_job(job, "https://api.example.com", "tok",
+                                          active_jobs, lock)
+
+        # Should report failed with setup exit code
+        self.assertTrue(reports)
+        # Only the setup should have triggered a report
+        self.assertEqual(reports[-1]["exec_status"], "failed")
+        self.assertEqual(reports[-1]["exit_code"], 2)
+        # Main command (echo main) should NOT have been reached via Popen
+        # (only subprocess.run calls for setup_step, no Popen for main)
+
+    def test_container_image_uses_docker_run(self):
+        """When container_image is set, docker run args include volume mount and env vars."""
+        popen_calls = []
+
+        class FakeProc:
+            pid = 9999
+            stdout = MagicMock()
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                pass
+
+            def kill(self):
+                pass
+
+        fake_proc = FakeProc()
+        fake_proc.stdout.read.return_value = b""
+
+        def fake_popen(args, **kwargs):
+            popen_calls.append(list(args))
+            return fake_proc
+
+        reports = []
+
+        def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
+                        result_metrics=None, command_log=None):
+            reports.append(exec_status)
+            return False
+
+        job = self._make_job(
+            command="python3 train.py",
+            container_image="nvcr.io/nvidia/pytorch:latest",
+        )
+        active_jobs: set = {"test-job-001"}
+        lock = threading.Lock()
+
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch("subprocess.Popen", side_effect=fake_popen), \
+             patch.object(local_runner, "_detect_runner_gpu", return_value=False):
+            local_runner._run_compute_job(job, "https://api.example.com", "tok",
+                                          active_jobs, lock)
+
+        self.assertTrue(popen_calls, "Expected Popen to be called for main command")
+        docker_args = popen_calls[0]
+        self.assertEqual(docker_args[0], "docker")
+        self.assertEqual(docker_args[1], "run")
+        self.assertIn("--rm", docker_args)
+        # Volume mount includes the container out dir
+        v_idx = docker_args.index("-v")
+        self.assertIn(local_runner._RUNNER_CONTAINER_OUT_DIR, docker_args[v_idx + 1])
+        # Image appears before the command
+        self.assertIn("nvcr.io/nvidia/pytorch:latest", docker_args)
+        # --gpus all NOT present when GPU not detected
+        self.assertNotIn("--gpus", docker_args)
+
+    def test_container_image_with_gpu_adds_gpus_flag(self):
+        """When GPU is detected, docker run includes --gpus all."""
+        popen_calls = []
+
+        class FakeProc:
+            pid = 1
+            stdout = MagicMock()
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                pass
+
+        fake_proc = FakeProc()
+        fake_proc.stdout.read.return_value = b""
+
+        def fake_popen(args, **kwargs):
+            popen_calls.append(list(args))
+            return fake_proc
+
+        def fake_report(*a, **kw):
+            return False
+
+        job = self._make_job(
+            command="python3 train.py",
+            container_image="pytorch/pytorch:latest",
+        )
+        active_jobs: set = {"test-job-001"}
+        lock = threading.Lock()
+
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch("subprocess.Popen", side_effect=fake_popen), \
+             patch.object(local_runner, "_detect_runner_gpu", return_value=True):
+            local_runner._run_compute_job(job, "https://api.example.com", "tok",
+                                          active_jobs, lock)
+
+        docker_args = popen_calls[0]
+        self.assertIn("--gpus", docker_args)
+        gpus_idx = docker_args.index("--gpus")
+        self.assertEqual(docker_args[gpus_idx + 1], "all")
+
+    def test_cancel_requested_on_claim_skips_execution(self):
+        """When cancel_requested is True on the job body, no subprocess is started."""
+        reports = []
+
+        def fake_report(orch_url, token, job_id, *, exec_status, **kwargs):
+            reports.append(exec_status)
+            return False
+
+        job = self._make_job(cancel_requested=True)
+        active_jobs: set = {"test-job-001"}
+        lock = threading.Lock()
+
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch("subprocess.Popen") as mock_popen:
+            local_runner._run_compute_job(job, "https://api.example.com", "tok",
+                                          active_jobs, lock)
+
+        mock_popen.assert_not_called()
+        self.assertIn("failed", reports)
+
+    def test_cancel_from_heartbeat_terminates_process(self):
+        """When a heartbeat response returns cancel_requested, the subprocess is terminated."""
+        report_statuses = []
+        proc_terminated = []
+
+        class FakeProc:
+            pid = 5555
+            stdout = MagicMock()
+
+            def wait(self, timeout=None):
+                # First call: TimeoutExpired (so the loop continues to heartbeat)
+                # Subsequent calls: return 0
+                if not proc_terminated:
+                    raise subprocess.TimeoutExpired(cmd="bash", timeout=30)
+                return 1
+
+            def terminate(self):
+                proc_terminated.append(True)
+
+            def kill(self):
+                pass
+
+        fake_proc = FakeProc()
+        fake_proc.stdout.read.return_value = b""
+
+        report_call_count = [0]
+
+        def fake_report(orch_url, token, job_id, *, exec_status, **kwargs):
+            report_call_count[0] += 1
+            report_statuses.append(exec_status)
+            # First call (initial running report): no cancel
+            # Second call (heartbeat): signal cancel
+            return report_call_count[0] >= 2
+
+        job = self._make_job()
+        active_jobs: set = {"test-job-001"}
+        lock = threading.Lock()
+
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch("subprocess.Popen", return_value=fake_proc):
+            local_runner._run_compute_job(job, "https://api.example.com", "tok",
+                                          active_jobs, lock)
+
+        self.assertTrue(proc_terminated, "Expected proc.terminate() to be called")
+        self.assertIn("failed", report_statuses)
+
+
+# ── Compute poll loop ─────────────────────────────────────────────────────────
+
+class TestComputePollLoop(unittest.TestCase):
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_204_triggers_backoff_and_no_worker(self):
+        """A 204 from next-compute-job causes backoff; no worker thread is spawned."""
+        sleep_calls = []
+        iterations = [0]
+
+        def fake_post(url, token, body):
+            return 204, None
+
+        def fake_sleep(secs):
+            sleep_calls.append(secs)
+            iterations[0] += 1
+            if iterations[0] >= 3:
+                local_runner._shutdown_event.set()
+
+        active_jobs: set = set()
+        lock = threading.Lock()
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch("time.sleep", fake_sleep), \
+             patch("threading.Thread") as mock_thread:
+            local_runner._compute_poll_loop(
+                "https://api.example.com", "tok", active_jobs, lock, max_concurrent=2
+            )
+
+        # Backoff doubles: 2→4
+        self.assertGreater(sleep_calls[1], sleep_calls[0])
+        # No worker thread spawned for 204 responses
+        mock_thread.assert_not_called()
+
+    def test_at_capacity_does_not_poll(self):
+        """When active_jobs is full, the loop sleeps without calling next-compute-job."""
+        post_calls = []
+        sleep_iterations = [0]
+
+        def fake_post(url, token, body):
+            post_calls.append(url)
+            return 204, None
+
+        def fake_sleep(secs):
+            sleep_iterations[0] += 1
+            if sleep_iterations[0] >= 2:
+                local_runner._shutdown_event.set()
+
+        active_jobs: set = {"job-a", "job-b"}  # already at max=2
+        lock = threading.Lock()
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch("time.sleep", fake_sleep):
+            local_runner._compute_poll_loop(
+                "https://api.example.com", "tok", active_jobs, lock, max_concurrent=2
+            )
+
+        self.assertEqual(post_calls, [], "next-compute-job must NOT be called when at capacity")
+
+    def test_200_response_spawns_worker_thread(self):
+        """A 200 response with a job body causes a worker thread to be started."""
+        call_count = [0]
+        threads_started = []
+
+        def fake_post(url, token, body):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return 200, {
+                    "job_id": "job-xyz",
+                    "command": "echo hi",
+                    "env": {},
+                    "cwd": None,
+                    "setup_step": None,
+                    "container_image": None,
+                    "container_registry_auth": {},
+                    "runtime_deadline_seconds": None,
+                    "cancel_requested": False,
+                }
+            # After spawning, return 204 and then shut down
+            local_runner._shutdown_event.set()
+            return 204, None
+
+        class FakeThread:
+            def __init__(self, target=None, args=(), daemon=False):
+                threads_started.append({"target": target, "args": args})
+
+            def start(self):
+                pass
+
+        active_jobs: set = set()
+        lock = threading.Lock()
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch("time.sleep", lambda s: None), \
+             patch("threading.Thread", FakeThread):
+            local_runner._compute_poll_loop(
+                "https://api.example.com", "tok", active_jobs, lock, max_concurrent=2
+            )
+
+        self.assertTrue(threads_started, "Expected a worker thread to be started")
+        self.assertEqual(threads_started[0]["args"][0]["job_id"], "job-xyz")
+
+
 # ── GPU detection ─────────────────────────────────────────────────────────────
 
 class TestGpuDetection(unittest.TestCase):

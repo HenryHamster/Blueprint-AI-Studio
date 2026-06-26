@@ -12059,3 +12059,610 @@ async def test_create_compute_job_registry_auth_no_password_persists_server_user
 
     persisted_auth = (job.polling_metadata or {}).get("container_registry_auth")
     assert persisted_auth == {"server": "nvcr.io", "username": "$oauthtoken"}
+
+
+# ── Runner-subprocess backend tests ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_runner_target_id_overrides_backend(
+    db_session, monkeypatch
+):
+    """create_compute_job must route to runner-subprocess when the locked task
+    carries runner_target_id in context, and persist runner_target_id in
+    polling_metadata alongside the normal exec fields."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Runner Routing", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+    meta = job.polling_metadata or {}
+    assert meta.get("runner_target_id") == str(runner.id)
+    # Core exec fields must be present so the runner can execute the arm.
+    assert meta.get("command") == "python train.py"
+    assert "env" in meta
+    assert "runtime_deadline_seconds" in meta
+
+
+@pytest.mark.asyncio
+async def test_next_compute_job_claims_starting_job_and_prevents_double_claim(
+    client, db_session, monkeypatch
+):
+    """POST /api/runner/next-compute-job atomically transitions STARTING→RUNNING
+    and a second sequential poll returns 204 (no double-claim)."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Next CJ Claim", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.STARTING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={
+            "command": "python train.py",
+            "env": {},
+            "cwd": None,
+            "runner_target_id": str(runner.id),
+            "runtime_deadline_seconds": 300,
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    # First poll: should claim the job.
+    resp1 = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp1.status_code == 200, resp1.text
+    body = resp1.json()
+    assert body["job_id"] == str(job.id)
+    assert body["command"] == "python train.py"
+    assert body["runtime_deadline_seconds"] == 300
+
+    # Job must now be RUNNING.
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+    assert job.last_heartbeat_at is not None
+    assert (job.polling_metadata or {}).get("runner_claimed_at") is not None
+
+    # Second poll: no unclaimed STARTING job remains → 204.
+    resp2 = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp2.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_next_compute_job_delivers_repo_clone_from_launch(
+    client, db_session, monkeypatch
+):
+    """repo_clone persisted by RunnerSubprocessBackend.launch() must be present in
+    /api/runner/next-compute-job response.
+
+    RunnerSubprocessBackend.launch() returns repo_clone in result.metadata.
+    _apply_launch_result is skipped for runner-subprocess (to avoid premature
+    STARTING→RUNNING transition), so the monitor must explicitly persist
+    result.metadata.  This test drives that path end-to-end: monitor tick →
+    claim endpoint, asserting non-null repo_clone reaches the runner.
+    """
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Repo Clone Delivery", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Patch _attach_repo_clone so it injects a repo_clone without needing GitHub.
+    _FAKE_REPO_CLONE = {"owner": "acme", "repo": "ml", "ref": "main"}
+
+    async def _fake_attach_repo_clone(session_factory, job, spec):
+        import dataclasses
+        return dataclasses.replace(spec, repo_clone=_FAKE_REPO_CLONE)
+
+    monkeypatch.setattr(compute_jobs, "_attach_repo_clone", _fake_attach_repo_clone)
+
+    # Patch _get_project_github_token so next_compute_job can mint a fake token.
+    # It is imported lazily inside the endpoint, so patch at the source module.
+    async def _fake_get_token(project, session):
+        return "gh-test-token"
+
+    import app.branch_cleanup as branch_cleanup_mod
+    monkeypatch.setattr(branch_cleanup_mod, "_get_project_github_token", _fake_get_token)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    # Run the monitor tick: it calls launch() and should persist repo_clone.
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+
+    # repo_clone must be persisted into polling_metadata by the new elif branch.
+    meta = job.polling_metadata or {}
+    assert meta.get("repo_clone") == _FAKE_REPO_CLONE, (
+        f"Expected repo_clone in polling_metadata after monitor launch tick; got: {meta}"
+    )
+
+    # Claim the job and assert the endpoint delivers repo_clone + repo_token.
+    resp = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["job_id"] == str(job.id)
+    assert body["repo_clone"] == _FAKE_REPO_CLONE
+    assert body["repo_token"] == "gh-test-token"
+
+
+@pytest.mark.asyncio
+async def test_next_compute_job_scoped_to_pinned_runner(client, db_session, monkeypatch):
+    """Within ONE project, a job pinned (polling_metadata['runner_target_id']) to
+    runner A must NOT be claimable by a different runner B — even a second poll by
+    B returns 204 while A claims it. This is the server-side enforcement of the
+    GPU capability gate: a non-GPU runner must not steal a GPU experiment that
+    _try_runner_dispatch pinned to a has_gpu runner."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Pinned Runner Scope", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Runner A: has GPU, the intended target.
+    token_a = auth_mod.create_runner_token(uuid.uuid4())
+    runner_a = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token_a),
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    # Runner B: no GPU, same project — must not be able to claim A's job.
+    token_b = auth_mod.create_runner_token(uuid.uuid4())
+    runner_b = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token_b),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add_all([runner_a, runner_b])
+    await db_session.commit()
+    await db_session.refresh(runner_a)
+    await db_session.refresh(runner_b)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"runner_target_id": str(runner_a.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.STARTING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={
+            "command": "python train.py",
+            "env": {},
+            "runner_target_id": str(runner_a.id),
+            "runtime_deadline_seconds": 300,
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    # Runner B (wrong pin) must NOT claim the job.
+    resp_b = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token_b}"},
+    )
+    assert resp_b.status_code == 204, resp_b.text
+
+    # Job must still be STARTING (untouched by B's poll).
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.STARTING
+
+    # Runner A (correct pin) claims it.
+    resp_a = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert resp_a.status_code == 200, resp_a.text
+    assert resp_a.json()["job_id"] == str(job.id)
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_next_compute_job_project_scoped(client, db_session, monkeypatch):
+    """A runner must not claim a job belonging to a different project."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    proj_a = Project(name="Proj A", user_id="u")
+    proj_b = Project(name="Proj B", user_id="u")
+    db_session.add_all([proj_a, proj_b])
+    await db_session.commit()
+    await db_session.refresh(proj_a)
+    await db_session.refresh(proj_b)
+
+    token_b = auth_mod.create_runner_token(uuid.uuid4())
+    runner_b = LocalRunner(
+        project_id=proj_b.id,
+        token_hash=auth_mod.hash_runner_token(token_b),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner_b)
+    await db_session.commit()
+    await db_session.refresh(runner_b)
+
+    # Job belongs to proj_a — runner_b should NOT see it.
+    task_a = Task(
+        project_id=proj_a.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    job_a = ComputeJob(
+        project_id=proj_a.id,
+        task_id=task_a.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.STARTING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={"command": "echo", "env": {}, "runtime_deadline_seconds": 60},
+    )
+    db_session.add(job_a)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token_b}"},
+    )
+    assert resp.status_code == 204  # proj_b runner cannot see proj_a job
+
+
+@pytest.mark.asyncio
+async def test_compute_job_report_stamps_status_so_monitor_finalizes(
+    client, db_session, monkeypatch
+):
+    """POST /api/runner/compute-job/{id}/report stamps runner_exec_status so
+    RunnerSubprocessBackend.poll_status() returns SUCCEEDED/FAILED,
+    which the monitor uses to finalize the job."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME, RunnerSubprocessBackend
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Report Terminal", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={"command": "python train.py", "env": {}, "runtime_deadline_seconds": 300, "runner_target_id": str(runner.id)},
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        json={
+            "exec_status": "succeeded",
+            "exit_code": 0,
+            "result_metrics": {"accuracy": 0.99, "loss": 0.01},
+            "command_log": {"text": "Training complete", "truncated": False},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["cancel_requested"] is False
+
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    assert meta.get("runner_exec_status") == "succeeded"
+    assert meta.get("runner_exit_code") == 0
+    assert meta.get("runner_result_metrics") == {"accuracy": 0.99, "loss": 0.01}
+    assert meta.get("runner_command_log") == {"text": "Training complete", "truncated": False}
+    assert meta.get("runner_finished_at") is not None
+
+    # poll_status must now return SUCCEEDED so the monitor can finalize.
+    backend = RunnerSubprocessBackend()
+    status_result = await backend.poll_status(job)
+    assert status_result.status == ComputeJobStatus.SUCCEEDED
+    assert status_result.exit_code == 0
+    assert status_result.metrics == {"accuracy": 0.99, "loss": 0.01}
+
+
+@pytest.mark.asyncio
+async def test_compute_job_report_idempotent_on_terminal_job(
+    client, db_session, monkeypatch
+):
+    """Reporting on an already-terminal job must return ok=True and cancel_requested=True
+    without updating the job (idempotent)."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Idempotent Report", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    job = ComputeJob(
+        project_id=project.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.CANCELLED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={"command": "echo", "env": {}, "runner_target_id": str(runner.id)},
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        json={"exec_status": "running"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["cancel_requested"] is True  # terminal job signals cancel to runner
+
+
+@pytest.mark.asyncio
+async def test_try_runner_dispatch_gpu_experiment_requires_has_gpu_runner(db_session):
+    """_try_runner_dispatch must pin a GPU compute_experiment only to a runner
+    advertising has_gpu=True; a non-GPU runner must be refused."""
+    from app import auth as auth_mod
+    from app import orchestrator as orch
+    from app.models import LocalRunner
+
+    project = Project(name="GPU Gate", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    def _make_runner(has_gpu, name="runner"):
+        t = auth_mod.create_runner_token(uuid.uuid4())
+        r = LocalRunner(
+            project_id=project.id,
+            token_hash=auth_mod.hash_runner_token(t),
+            capabilities={"task_types": "all", "has_gpu": has_gpu},
+        )
+        return r
+
+    cpu_runner = _make_runner(has_gpu=False)
+    gpu_runner = _make_runner(has_gpu=True)
+    db_session.add_all([cpu_runner, gpu_runner])
+    await db_session.commit()
+    await db_session.refresh(cpu_runner)
+    await db_session.refresh(gpu_runner)
+
+    gpu_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "compute_experiment", "accelerator": "T4"}],
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(gpu_task)
+    await db_session.commit()
+    await db_session.refresh(gpu_task)
+
+    # CPU-only runner cache → GPU experiment must NOT be pinned.
+    pinned = await orch._try_runner_dispatch(
+        db_session, gpu_task, {project.id: [cpu_runner]}
+    )
+    assert pinned is False
+    await db_session.refresh(gpu_task)
+    assert gpu_task.status == TaskStatus.QUEUED
+
+    # GPU-capable runner cache → GPU experiment MUST be pinned to it.
+    pinned = await orch._try_runner_dispatch(
+        db_session, gpu_task, {project.id: [cpu_runner, gpu_runner]}
+    )
+    assert pinned is True
+    await db_session.refresh(gpu_task)
+    assert gpu_task.status == TaskStatus.PROVISIONING
+    assert gpu_task.vm_instance_id == f"runner:{gpu_runner.id}"
+
+
+@pytest.mark.asyncio
+async def test_try_runner_dispatch_cpu_experiment_routes_to_any_runner(db_session):
+    """A CPU compute_experiment (no accelerator) can be pinned to any eligible runner."""
+    from app import auth as auth_mod
+    from app import orchestrator as orch
+    from app.models import LocalRunner
+
+    project = Project(name="CPU Exp Route", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    cpu_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "compute_experiment"}],  # no accelerator
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(cpu_task)
+    await db_session.commit()
+    await db_session.refresh(cpu_task)
+
+    pinned = await orch._try_runner_dispatch(
+        db_session, cpu_task, {project.id: [runner]}
+    )
+    assert pinned is True
+    await db_session.refresh(cpu_task)
+    assert cpu_task.status == TaskStatus.PROVISIONING

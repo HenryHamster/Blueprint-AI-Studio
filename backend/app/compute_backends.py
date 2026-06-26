@@ -111,6 +111,7 @@ _MAX_COMMAND_LOG_DECODED_BYTES = 65536
 LOCAL_BACKEND_NAME = "local-subprocess"
 GCP_BACKEND_NAME = "gcp"
 LOCAL_GPU_BACKEND_NAME = "local-gpu"
+RUNNER_SUBPROCESS_BACKEND_NAME = "runner-subprocess"
 
 # Fixed in-container path where the job's state directory is mounted.
 # The command writes result.json and artifacts/ here; the host-side mount makes
@@ -810,9 +811,97 @@ class LocalGPUComputeBackend:
         return await self._delegate.terminate(job, reason=reason)
 
 
+class RunnerSubprocessBackend:
+    """Passthrough backend for compute jobs running on operator hardware.
+
+    ``launch()`` is a no-op: the job enters STARTING and waits for a runner
+    to claim it via ``POST /api/runner/next-compute-job``.  ``poll_status()``
+    reads runner-reported execution state from ``polling_metadata``, stamped
+    by ``POST /api/runner/compute-job/{id}/report``.  ``poll_cost()`` returns
+    zero (operator hardware has no cloud billing).  ``terminate()`` returns
+    True; the job is finalized by ``_apply_task_terminal_cancellation`` and the
+    runner observes the terminal state on its next report.
+    """
+
+    name = RUNNER_SUBPROCESS_BACKEND_NAME
+
+    def external_id_for(self, job: ComputeJob) -> str:
+        return f"runner-{job.id}"
+
+    async def launch(self, spec: ComputeLaunchSpec) -> ComputeLaunchResult:
+        metadata: dict = {}
+        if spec.repo_clone:
+            # Persist owner/repo/ref so /next-compute-job can return it to the
+            # runner for git clone.  The token is NOT stored here — it is minted
+            # fresh at claim time to avoid persisting a short-lived secret.
+            metadata["repo_clone"] = spec.repo_clone
+        return ComputeLaunchResult(
+            external_id=spec.external_id or f"runner-{spec.job_id}",
+            started_at=_utcnow(),
+            cost_rate_per_second=0.0,
+            message="runner-subprocess: awaiting runner claim",
+            metadata=metadata,
+        )
+
+    async def poll_status(self, job: ComputeJob) -> ComputeStatusResult:
+        meta = job.polling_metadata or {}
+        runner_exec_status = meta.get("runner_exec_status")
+        if runner_exec_status is None:
+            # Runner has not yet reported — still waiting for claim/first report.
+            return ComputeStatusResult(status=ComputeJobStatus.STARTING)
+        if runner_exec_status == "running":
+            return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+        if runner_exec_status in ("succeeded", "failed"):
+            raw_code = meta.get("runner_exit_code")
+            exit_code = (
+                raw_code
+                if isinstance(raw_code, int) and not isinstance(raw_code, bool)
+                else None
+            )
+            raw_metrics = meta.get("runner_result_metrics")
+            metrics = raw_metrics if isinstance(raw_metrics, dict) else None
+            raw_log = meta.get("runner_command_log")
+            command_log = raw_log if isinstance(raw_log, dict) else None
+            raw_ts = meta.get("runner_finished_at")
+            finished_at = None
+            if isinstance(raw_ts, str):
+                try:
+                    from datetime import datetime as _dt
+                    finished_at = _dt.fromisoformat(
+                        raw_ts.replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                except (ValueError, AttributeError):
+                    pass
+            cjs = (
+                ComputeJobStatus.SUCCEEDED
+                if runner_exec_status == "succeeded"
+                else ComputeJobStatus.FAILED
+            )
+            return ComputeStatusResult(
+                status=cjs,
+                exit_code=exit_code if exit_code is not None else (0 if cjs == ComputeJobStatus.SUCCEEDED else None),
+                finished_at=finished_at or _utcnow(),
+                metrics=metrics,
+                command_log=command_log,
+            )
+        # Unknown status string — treat as still running.
+        return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+
+    async def poll_cost(
+        self, job: ComputeJob, *, as_of: datetime
+    ) -> ComputeCostResult:
+        return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+    async def terminate(self, job: ComputeJob, *, reason: str) -> bool:
+        # The runner observes the cancel signal when it gets back cancel_requested=True
+        # from the /report endpoint (job is CANCELLED after _apply_task_terminal_cancellation).
+        return True
+
+
 _LOCAL_BACKEND = LocalSubprocessComputeBackend()
 _GCP_BACKEND = GcpComputeBackend()
 _LOCAL_GPU_BACKEND = LocalGPUComputeBackend()
+_RUNNER_SUBPROCESS_BACKEND = RunnerSubprocessBackend()
 
 
 def get_compute_backend(name: str) -> ComputeBackend:
@@ -822,6 +911,8 @@ def get_compute_backend(name: str) -> ComputeBackend:
         return _GCP_BACKEND
     if name == _LOCAL_GPU_BACKEND.name:
         return _LOCAL_GPU_BACKEND
+    if name == _RUNNER_SUBPROCESS_BACKEND.name:
+        return _RUNNER_SUBPROCESS_BACKEND
     raise ValueError(f"unknown compute backend: {name}")
 
 
@@ -847,6 +938,8 @@ def validate_backend_name(name: str) -> str:
             raise ValueError(
                 "local-gpu backend is unavailable: no local GPU detected"
             )
+    # runner-subprocess is available in both LOCAL_MODE and cloud mode — its
+    # availability depends on runner registration, not the leader's deploy mode.
     return name
 
 
