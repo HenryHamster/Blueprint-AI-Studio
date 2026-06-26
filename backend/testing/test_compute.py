@@ -12725,3 +12725,80 @@ async def test_try_runner_dispatch_cpu_experiment_routes_to_any_runner(db_sessio
     assert pinned is True
     await db_session.refresh(cpu_task)
     assert cpu_task.status == TaskStatus.PROVISIONING
+
+
+@pytest.mark.asyncio
+async def test_dead_runner_pin_cleared_on_requeue_falls_over_to_gcp(
+    db_session, monkeypatch
+):
+    """Regression: stale-PROVISIONING requeue must clear runner_target_id so the
+    mandatory cloud fallback engages instead of re-routing to the dead runner.
+
+    When clear_task_llm_runtime_context is applied during recovery (orchestrator.py
+    stale-PROVISIONING sweep) the runner_target_id key must be absent from the
+    resulting context, and a subsequent create_compute_job call must route to a
+    non-runner-subprocess backend (GCP / local) rather than back to the dead runner.
+    """
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.max_plan_pool import clear_task_llm_runtime_context
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Fallback Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    # Simulate task that was pinned to the runner (PROVISIONING), then recovered
+    # back to QUEUED by the stale-PROVISIONING sweep — context still has the pin.
+    pinned_ctx = {
+        "runner_target_id": str(runner.id),
+        "provision_failures": 1,
+    }
+    recovered_ctx = clear_task_llm_runtime_context(pinned_ctx)
+
+    # Core assertion: runner_target_id must be stripped so GCP dispatch is chosen.
+    assert "runner_target_id" not in recovered_ctx, (
+        "clear_task_llm_runtime_context must remove runner_target_id so a dead "
+        "runner is not re-pinned on requeue"
+    )
+    # Non-runtime keys (provision_failures) must be preserved.
+    assert recovered_ctx.get("provision_failures") == 1
+
+    # Integration: create_compute_job with the cleared context must NOT route to
+    # the runner-subprocess backend.
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context=recovered_ctx,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    assert job.backend != RUNNER_SUBPROCESS_BACKEND_NAME, (
+        f"After runner_target_id is cleared, create_compute_job must not route "
+        f"to {RUNNER_SUBPROCESS_BACKEND_NAME} (got {job.backend!r})"
+    )

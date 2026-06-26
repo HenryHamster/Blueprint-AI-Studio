@@ -707,6 +707,23 @@ def test_clear_task_llm_runtime_context_strips_all_runtime_keys():
     assert "max_plan_account_id" not in cleared
 
 
+def test_clear_task_llm_runtime_context_strips_runner_target_id():
+    """runner_target_id must be cleared on requeue so a dead runner is not
+    re-pinned forever — the next dispatch cycle falls over to GCP instead."""
+    cleared = clear_task_llm_runtime_context(
+        {
+            "runner_target_id": "some-runner-uuid",
+            "provision_failures": 1,
+            "scope": "small",
+        }
+    )
+
+    assert "runner_target_id" not in cleared
+    # Non-runtime keys are preserved.
+    assert cleared.get("provision_failures") == 1
+    assert cleared.get("scope") == "small"
+
+
 def test_sync_task_payload_runtime_fields_overwrites_stale_values():
     task = SimpleNamespace(
         payloads=[
