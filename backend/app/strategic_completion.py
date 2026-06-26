@@ -4907,11 +4907,12 @@ async def _handle_strategic_completion(
                 rejected_text = (target.get("text") or "")[:200].strip()
                 remaining = [d for d in directions if d.get("id") != dir_id]
                 if rejected_text:
+                    now_iso = _utcnow().isoformat()
                     tombstone = {
                         "id": target["id"],
                         "text": rejected_text,
                         "status": "rejected",
-                        "rejected_at": _utcnow().isoformat(),
+                        "rejected_at": now_iso,
                         "rejected_by": "strategic",
                         **({"rejection_rationale": rationale} if rationale else {}),
                     }
@@ -4922,6 +4923,14 @@ async def _handle_strategic_completion(
                     rejected.append(tombstone)
                     rejected = rejected[-20:]
                     remaining = non_rejected + rejected
+                    # Persist to vision["rejected_proposals"] so the starvation
+                    # fallback dedup survives direction-list pruning.
+                    _vision = dict(project.vision or {})
+                    _rp = list(_vision.get("rejected_proposals") or [])
+                    _rp.append({"text": rejected_text, "rejected_at": now_iso})
+                    _vision["rejected_proposals"] = _rp[-30:]
+                    project.vision = _vision
+                    flag_modified(project, "vision")
                 cancelled_result = await session.execute(
                     select(Task).where(
                         Task.project_id == project.id,

@@ -1944,6 +1944,63 @@ class TestCheckDirectionStarvation:
         assert project.vision.get("_direction_starvation_count") == 5
         alert_mock.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_starvation_fallback_dedups_against_persisted_rejected_memory(
+        self, strat_fail_db, mocker
+    ):
+        """Starvation fallback deduplicates against vision['rejected_proposals'].
+
+        The directions list contains no active product directions (triggering
+        NO_PRODUCT_DIRECTIONS gap).  The fallback text is "Deliver user-visible
+        product improvements".  We pre-seed vision['rejected_proposals'] with a
+        recent entry whose text overlaps enough (>=4 shared non-stopword tokens)
+        to trigger the duplicate guard — simulating the scenario where the
+        matching direction was pruned from the directions list but its rejection
+        was persisted in vision memory.  The fallback must NOT create a new
+        direction; instead it resets the counter and fires an alert.
+        """
+        alert_mock = mocker.patch(
+            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
+        )
+        from datetime import timezone
+
+        recent_ts = (
+            __import__("datetime").datetime.now(timezone.utc).isoformat()
+        )
+        project = Project(
+            name="P",
+            user_id="u1",
+            vision={
+                "_direction_starvation_count": 4,
+                "rejected_proposals": [
+                    {
+                        # >=4 shared non-stopword tokens with fallback text
+                        # "Deliver user-visible product improvements"
+                        "text": "Deliver user-visible product improvements for users",
+                        "rejected_at": recent_ts,
+                    }
+                ],
+            },
+            directions=[
+                _active_dir(id="1", category="structural"),
+                _active_dir(id="2", category="structural"),
+                _active_dir(id="3", category="structural"),
+            ],
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db
+        )
+
+        # No new direction created — dedup matched persisted rejected memory
+        assert len(project.directions) == 3
+        # Counter reset (dedup path resets and alerts instead of creating)
+        assert project.vision.get("_direction_starvation_count") == 0
+        # Alert fired to prompt manual intervention
+        alert_mock.assert_called_once()
+
 
 # ── Rationale persistence & retrieval ────────────────────────────────────────
 
