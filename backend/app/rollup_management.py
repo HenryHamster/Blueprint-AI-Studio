@@ -423,6 +423,67 @@ def _propagate_landed_to_rollup_children(
             session.add(child)
 
 
+async def _propagate_landed_to_staging_merged_descendants(
+    parent_task_id, session: AsyncSession
+) -> None:
+    """Recursively stamp landed_on_integration on all staging-merged descendants.
+
+    ``_propagate_landed_to_rollup_children`` only touches the direct children
+    present in ``completed_children``.  When a lineage contains nested
+    research/rollup sub-tasks, code tasks at deeper levels (grandchildren of
+    the top-level rollup, etc.) were merged to an intermediate staging branch
+    — not directly to integration — and would otherwise be left with
+    ``landed_on_integration=False`` even though their code reached the
+    integration trunk via the ancestor rollup merge.
+
+    This function walks the full subtree rooted at *parent_task_id* via BFS
+    and stamps ``landed_on_integration=True`` on every descendant that carries
+    ``has_merge_unblock_signal=True`` (pr_merged=True) but not yet
+    ``has_landed_signal``, skipping force-dropped children exactly as the sync
+    helper does.  Idempotent: descendants that already carry the landed signal
+    are skipped.
+    """
+    from app.landed_signal import (
+        NON_MERGE_UNBLOCK_REASON_KEY,
+        has_landed_signal,
+        has_merge_unblock_signal,
+        mark_landed_on_integration,
+    )
+
+    visited: set = {parent_task_id}
+    queue: list = [parent_task_id]
+
+    while queue:
+        rows = (
+            (
+                await session.execute(
+                    select(Task).where(Task.parent_task_id.in_(queue))
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        next_queue: list = []
+        for row in rows:
+            if row.id in visited:
+                continue
+            visited.add(row.id)
+
+            ctx = row.context or {}
+            if (
+                ctx.get(NON_MERGE_UNBLOCK_REASON_KEY) not in _FORCE_DROP_REASONS
+                and has_merge_unblock_signal(row)
+                and not has_landed_signal(row)
+            ):
+                mark_landed_on_integration(row)
+                session.add(row)
+
+            next_queue.append(row.id)
+
+        queue = next_queue
+
+
 async def _hold_rollup_for_branch_safety(
     parent: Task,
     project: Project | None,
@@ -2356,6 +2417,9 @@ async def _check_and_trigger_rollup(
                                 _propagate_landed_to_rollup_children(
                                     completed_children, session
                                 )
+                                await _propagate_landed_to_staging_merged_descendants(
+                                    parent.id, session
+                                )
                             if _terminal_rollup_merge:
                                 parent.latest_status_message = (
                                     f"Rollup PR #{existing_pr} already merged"
@@ -2762,6 +2826,9 @@ async def _check_and_trigger_rollup(
                         )
                         _propagate_landed_to_rollup_children(
                             completed_children, session
+                        )
+                        await _propagate_landed_to_staging_merged_descendants(
+                            parent.id, session
                         )
                     session.add(parent)
                     await session.commit()
@@ -3186,6 +3253,9 @@ async def _check_and_trigger_rollup(
                             )
                             _propagate_landed_to_rollup_children(
                                 completed_children, session
+                            )
+                            await _propagate_landed_to_staging_merged_descendants(
+                                parent.id, session
                             )
                         if _terminal_rollup_merge:
                             parent.latest_status_message = (
@@ -3667,6 +3737,9 @@ async def _check_and_trigger_rollup(
                                         _propagate_landed_to_rollup_children(
                                             completed_children, session
                                         )
+                                        await _propagate_landed_to_staging_merged_descendants(
+                                            parent.id, session
+                                        )
                                     if _rp_terminal:
                                         parent.latest_status_message = (
                                             f"All {completed_count} subtasks merged, "
@@ -3936,6 +4009,9 @@ async def _check_and_trigger_rollup(
                                             )
                                             _propagate_landed_to_rollup_children(
                                                 completed_children, session
+                                            )
+                                            await _propagate_landed_to_staging_merged_descendants(
+                                                parent.id, session
                                             )
                                         if _esc_terminal:
                                             parent.latest_status_message = (
