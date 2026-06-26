@@ -640,3 +640,17 @@ class TestOrchestratorRunnerRouting:
         await db_session.refresh(stale)
         assert fresh.status == "active"
         assert stale.status == "inactive"
+
+    @pytest.mark.asyncio
+    async def test_deactivate_stale_runners_null_last_seen_at(self, db_session):
+        project = await _make_project(db_session)
+        never_heartbeated, _ = await _make_runner(
+            db_session, project.id, last_seen_at=None
+        )
+        alive, _ = await _make_runner(db_session, project.id, last_seen_at=_utcnow())
+
+        await orch._deactivate_stale_runners(db_session)
+        await db_session.refresh(never_heartbeated)
+        await db_session.refresh(alive)
+        assert never_heartbeated.status == "inactive"
+        assert alive.status == "active"

@@ -616,14 +616,17 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
     listing. Stale PROVISIONING tasks pinned to a dead runner are recovered by
     the existing orphaned-task sweep, so no new recovery code is needed here.
     """
-    from sqlalchemy import update as _sa_update
+    from sqlalchemy import or_, update as _sa_update
 
     cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
     await session.execute(
         _sa_update(LocalRunner)
         .where(
             LocalRunner.status == "active",
-            LocalRunner.last_seen_at < cutoff,
+            or_(
+                LocalRunner.last_seen_at.is_(None),
+                LocalRunner.last_seen_at < cutoff,
+            ),
         )
         .values(status="inactive")
     )
