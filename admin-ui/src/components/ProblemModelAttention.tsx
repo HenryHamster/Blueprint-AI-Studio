@@ -89,7 +89,9 @@ function PendingItemRow({
             title={acceptLabel}
           >
             <Check size={11} />
-            {acceptLabel}
+            {/* Label collapses to the icon on narrow viewports so the action
+                row fits 375px; the title tooltip keeps it discoverable. */}
+            <span className="hidden sm:inline">{acceptLabel}</span>
           </button>
         )}
         <button
@@ -103,7 +105,7 @@ function PendingItemRow({
           title="Mark as resolved without action"
         >
           <X size={11} />
-          Resolve
+          <span className="hidden sm:inline">Resolve</span>
         </button>
       </div>
       {expanded && (

@@ -2224,6 +2224,10 @@ describe('MessagesPanel saved views', () => {
       Object.getOwnPropertyDescriptor(proto, 'value')?.set?.call(searchInput, 'urgent');
       searchInput.dispatchEvent(new Event('input', { bubbles: true }));
     });
+    // The search box debounces onSearchChange by 300ms (MessagesPanelHeader),
+    // so wait for it to propagate to the panel's searchQuery before saving —
+    // otherwise the view is captured with the still-empty pre-debounce query.
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 350)); });
     // Open save dialog
     const openBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Save current filters'));
     await act(async () => { (openBtn as HTMLButtonElement).click(); });

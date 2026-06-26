@@ -28,6 +28,24 @@ from app.database import (
 )
 
 
+def _make_test_client(app) -> TestClient:
+    """Construct a starlette/fastapi TestClient with the httpx ``app=`` shortcut
+    deprecation suppressed.
+
+    starlette 0.27's TestClient builds its httpx client via the ``app=`` shortcut
+    that httpx 0.27+ deprecates (and 0.28 removed). That call is internal to
+    starlette and unavoidable while fastapi is pinned to 0.104 — there is no test
+    code to migrate. Suppress only that one DeprecationWarning at construction so
+    the strict global ``filterwarnings = error`` doesn't fail on a
+    framework-internal call; the test's own behavior assertions are unchanged.
+    """
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        return TestClient(app)
+
+
 def _named_exc(name: str, message: str = "") -> Exception:
     """Build an exception whose ``type(...).__name__`` is ``name`` — lets the
     tests mimic asyncpg's TimeoutError / QueryCanceledError / InternalClientError
@@ -363,7 +381,7 @@ def test_metrics_endpoint_unauthenticated_when_token_unset(monkeypatch):
     monkeypatch.setattr(main_module, "_METRICS_TOKEN", "")
 
     from app.main import app
-    client = TestClient(app)
+    client = _make_test_client(app)
 
     # Without token, should return 200
     response = client.get("/metrics")
@@ -379,7 +397,7 @@ def test_metrics_endpoint_requires_token_when_set(monkeypatch):
     monkeypatch.setattr(main_module, "_METRICS_TOKEN", test_token)
 
     from app.main import app
-    client = TestClient(app)
+    client = _make_test_client(app)
 
     # Without token, should return 403
     response = client.get("/metrics")
@@ -400,7 +418,7 @@ def test_metrics_endpoint_accepts_correct_token(monkeypatch):
     monkeypatch.setattr(main_module, "_METRICS_TOKEN", test_token)
 
     from app.main import app
-    client = TestClient(app)
+    client = _make_test_client(app)
 
     # With correct token, should return 200
     response = client.get(f"/metrics?token={test_token}")

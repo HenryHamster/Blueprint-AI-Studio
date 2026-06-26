@@ -353,7 +353,7 @@ export function DirectionsPanel({ addToast, onViewFindings, onViewKnowledge, onN
               <div className={`px-5 py-2 shrink-0 ${!formExpanded ? 'border-b border-neutral-800' : ''}`}>
                 <button
                   onClick={() => setFormExpanded(v => !v)}
-                  className="flex items-center gap-1.5 text-xs text-neutral-400 hover:text-neutral-200 transition-colors min-h-[36px]"
+                  className="flex items-center gap-1.5 text-xs text-neutral-400 hover:text-neutral-200 transition-colors min-h-[44px] md:min-h-[36px]"
                 >
                   {formExpanded
                     ? <><ChevronDown className="w-3.5 h-3.5" /><span>Cancel</span></>

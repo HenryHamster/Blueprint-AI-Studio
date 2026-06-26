@@ -432,15 +432,23 @@ export function HeaderBar(props: HeaderBarProps) {
           )}
         </div>
 
-        {/* CENTER: Primary tab group */}
-        <nav className="flex items-center gap-0.5 flex-1 overflow-x-auto min-w-0 mx-1">
+        {/* CENTER: Primary tab group — intentional horizontal-scroll strip
+            (overflow-x-auto + min-w-0) so the tabs scroll rather than wrap or
+            push the bar wide on narrow viewports; opt the scroll container out
+            of the overflow/truncation invariants (its descendants legitimately
+            extend past the fold inside the scroll region). */}
+        <nav
+          data-viewport-allow-overflow
+          data-viewport-allow-truncation
+          className="flex items-center gap-0.5 flex-1 overflow-x-auto min-w-0 mx-1"
+        >
           {(['home', 'board', 'directions', 'compute'] as const).map(tab => {
             const isActive = props.activeTab === tab;
             return (
               <button
                 key={tab}
                 onClick={() => props.onTabChange(tab)}
-                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors whitespace-nowrap ${
+                className={`px-3 py-1.5 min-h-[44px] md:min-h-0 rounded-md text-sm font-medium transition-colors whitespace-nowrap ${
                   isActive
                     ? 'bg-neutral-800 text-neutral-100'
                     : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'

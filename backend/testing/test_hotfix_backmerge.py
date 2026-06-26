@@ -44,6 +44,17 @@ from app.time_utils import _utcnow
 
 pytestmark = pytest.mark.asyncio
 
+# Derive the tracked orchestrator.py cap from the canonical limits file rather
+# than hardcoding it. The cap is legitimately bumped as the module grows (it
+# rose from 7750 to 9100), and a stale hardcoded value silently turns the
+# "over cap" fixtures below into UNDER-cap no-ops (no violation → no alert),
+# which is exactly the failure class that slipped past automain and only
+# surfaced on the full promotion matrix. Reading the live cap keeps these
+# tests honest across future bumps.
+_ORCH_CAP: int = (hb._load_size_limits().get("backend") or {}).get(
+    "orchestrator.py"
+) or 0
+
 
 # ===========================================================================
 # Fixtures / helpers
@@ -3218,15 +3229,17 @@ async def test_module_size_check_emits_warning_alert_on_violation(db_session, mo
         merge_return={"merged": True},
     )
 
-    # PR touches orchestrator.py (tracked under backend, cap 7750 lines).
+    # PR touches orchestrator.py (tracked under backend).
     mocker.patch(
         "app.github.get_pr_files",
         new=AsyncMock(return_value=[_make_pr_file("backend/app/orchestrator.py")]),
     )
-    # The file at the LTS branch head is 8000 lines — over cap.
+    # The file at the LTS branch head is over cap by 200 lines.
+    over = _ORCH_CAP + 200
+    bucket = (over // 100) * 100
     mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(return_value=_make_file_content(8000)),
+        new=AsyncMock(return_value=_make_file_content(over)),
     )
 
     result = await hb.open_backmerge_pr(
@@ -3241,8 +3254,8 @@ async def test_module_size_check_emits_warning_alert_on_violation(db_session, mo
     a = alerts[0]
     assert a.severity == AlertSeverity.WARNING
     assert "orchestrator.py" in a.title
-    assert "~8000 lines" in a.title  # bucket for 8000 = (8000 // 100) * 100 = 8000
-    assert "cap 7750" in a.title
+    assert f"~{bucket} lines" in a.title  # bucket = (count // 100) * 100
+    assert f"cap {_ORCH_CAP}" in a.title
 
 
 async def test_module_size_check_does_not_block_merge(db_session, mocker):
@@ -3260,7 +3273,7 @@ async def test_module_size_check_does_not_block_merge(db_session, mocker):
     )
     mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(return_value=_make_file_content(9000)),
+        new=AsyncMock(return_value=_make_file_content(_ORCH_CAP + 500)),
     )
 
     result = await hb.open_backmerge_pr(db_session, project.id)
@@ -3282,20 +3295,23 @@ async def test_module_size_check_dedupes_same_bucket(db_session, mocker):
         "app.github.get_pr_files",
         new=AsyncMock(return_value=[_make_pr_file("backend/app/orchestrator.py")]),
     )
-    # First call: 8010 lines → bucket 8000.
+    # First whole 100-line bucket strictly above cap (robust even when the cap
+    # itself is not a multiple of 100).
+    bucket = ((_ORCH_CAP + 100) // 100) * 100
+    # First call: bucket+10 lines → bucket.
     mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(return_value=_make_file_content(8010)),
+        new=AsyncMock(return_value=_make_file_content(bucket + 10)),
     )
 
     await hb.open_backmerge_pr(db_session, project.id)
     await db_session.commit()
     assert len(await _alerts_for(db_session, project.id)) == 1
 
-    # Second call: 8050 lines — still in the same bucket 8000.
+    # Second call: bucket+50 lines — still in the same bucket.
     mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(return_value=_make_file_content(8050)),
+        new=AsyncMock(return_value=_make_file_content(bucket + 50)),
     )
     await hb.open_backmerge_pr(db_session, project.id)
     await db_session.commit()
@@ -3319,19 +3335,22 @@ async def test_module_size_check_refires_on_larger_bucket(db_session, mocker):
         new=AsyncMock(return_value=[_make_pr_file("backend/app/orchestrator.py")]),
     )
 
-    # First cycle: 8010 lines → bucket 8000 → alert A.
+    # First whole 100-line bucket strictly above cap, and the next one up.
+    bucket_a = ((_ORCH_CAP + 100) // 100) * 100
+    bucket_b = bucket_a + 100
+    # First cycle: bucket_a+10 lines → bucket_a → alert A.
     mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(return_value=_make_file_content(8010)),
+        new=AsyncMock(return_value=_make_file_content(bucket_a + 10)),
     )
     await hb.open_backmerge_pr(db_session, project.id)
     await db_session.commit()
     assert len(await _alerts_for(db_session, project.id)) == 1
 
-    # Second cycle: 8120 lines → bucket 8100 → title differs → new alert B.
+    # Second cycle: bucket_b+10 lines → next bucket → title differs → new alert B.
     mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(return_value=_make_file_content(8120)),
+        new=AsyncMock(return_value=_make_file_content(bucket_b + 10)),
     )
     await hb.open_backmerge_pr(db_session, project.id)
     await db_session.commit()
@@ -3339,8 +3358,8 @@ async def test_module_size_check_refires_on_larger_bucket(db_session, mocker):
     alerts = await _alerts_for(db_session, project.id)
     assert len(alerts) == 2
     titles = {a.title for a in alerts}
-    assert any("~8000 lines" in t for t in titles)
-    assert any("~8100 lines" in t for t in titles)
+    assert any(f"~{bucket_a} lines" in t for t in titles)
+    assert any(f"~{bucket_b} lines" in t for t in titles)
 
 
 async def test_module_size_check_exception_does_not_block_merge(db_session, mocker):

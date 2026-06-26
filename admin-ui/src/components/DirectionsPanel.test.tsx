@@ -9,6 +9,12 @@ vi.mock('../api', () => ({
   // DirectionsPanel calls apiFetch, not fetch directly — route through
   // the global fetch stub so the test's mockFetch() responses still apply.
   apiFetch: (path: string, init?: RequestInit) => (globalThis.fetch as typeof fetch)(path, init),
+  // useDirectionsData also imports fetchVersionLifecycle and (since the #11917
+  // perf reorder) calls it at the TOP of fetchDirections, before the directions
+  // apiFetch calls. The mock factory fully replaces '../api', so this export must
+  // be present or it resolves to undefined and the call throws synchronously —
+  // which the try/catch swallows, silently skipping every later apiFetch.
+  fetchVersionLifecycle: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock('./DirectionCard', () => ({

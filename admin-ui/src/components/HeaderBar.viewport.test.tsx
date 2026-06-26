@@ -17,13 +17,10 @@ vi.mock('../firebase', () => ({
   signOut: vi.fn(),
 }));
 
-// AutonomousStatus, MetricsBar, and SettingsDropdown are complex sub-trees;
+// AutonomousStatus and SettingsDropdown are complex sub-trees;
 // stub them to keep the test focused on HeaderBar's own mobile layout.
 vi.mock('./AutonomousStatus', () => ({
   AutonomousStatus: () => <div data-testid="autonomous-status" />,
-}));
-vi.mock('./MetricsBar', () => ({
-  MetricsBar: () => <div data-testid="metrics-bar" />,
 }));
 vi.mock('./SettingsDropdown', () => ({
   SettingsDropdown: () => <div data-testid="settings-dropdown" />,

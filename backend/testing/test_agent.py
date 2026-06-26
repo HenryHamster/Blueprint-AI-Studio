@@ -8871,8 +8871,17 @@ def test_agent_ws_invalid_token_closes_with_1008(mocker, caplog):
 
     task_id = uuid.uuid4()
     caplog.set_level(logging.INFO)
+    # starlette's TestClient builds its httpx client via the deprecated `app=`
+    # shortcut (internal to starlette 0.27, pinned by fastapi 0.104); suppress
+    # only that DeprecationWarning at construction so the strict global
+    # filterwarnings=error doesn't fail on a framework-internal call.
+    import warnings as _warnings
+
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("ignore", DeprecationWarning)
+        _tc = TestClient(main_module.app)
     with (
-        TestClient(main_module.app) as tc,
+        _tc as tc,
         pytest.raises(WebSocketDisconnect) as exc_info,
         tc.websocket_connect(f"/api/agent/ws/{task_id}") as ws,
     ):

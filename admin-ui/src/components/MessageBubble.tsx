@@ -29,6 +29,9 @@ function CopyableMessageRef({ msgId }: { msgId: string }) {
     <button
       onClick={copy}
       title="Copy message ref"
+      // Compact secondary affordance in the dense message-metadata header row;
+      // a 44px touch target would inflate every message's header on mobile.
+      data-viewport-allow-small-target
       className="inline-flex items-center gap-1 font-mono text-ui-sm text-neutral-600 hover:text-neutral-400 transition-colors"
     >
       {copied ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}

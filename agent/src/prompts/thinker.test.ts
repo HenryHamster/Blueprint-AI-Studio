@@ -105,7 +105,11 @@ describe('buildThinkerPrompt', () => {
   it('includes sweep synthesis guidance for reading back completed experiments', () => {
     const prompt = buildThinkerPrompt(base);
     expect(prompt).toContain('Sweep synthesis');
-    expect(prompt).toContain('compute_experiment_sweeps');
+    // The guidance references the rendered "Completed experiment sweeps" section
+    // (built from the strategic payload's compute_experiment_sweeps field). The
+    // snake_case field name itself is internal plumbing and is deliberately not
+    // surfaced in the operator-facing prompt body.
+    expect(prompt).toContain('Completed experiment sweeps');
     expect(prompt).toContain('MET or NOT MET');
   });
 

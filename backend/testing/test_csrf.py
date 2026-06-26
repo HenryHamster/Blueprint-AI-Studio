@@ -39,9 +39,11 @@ class TestCSRFSafeMethods:
         """A csrf_token cookie that is already present should not be reset."""
         existing = "already-set-csrf-token"
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies={CSRF_COOKIE_NAME: existing},
         ) as client:
-            resp = await client.get("/", cookies={CSRF_COOKIE_NAME: existing})
+            resp = await client.get("/")
         assert CSRF_COOKIE_NAME not in resp.cookies
 
     @pytest.mark.asyncio
@@ -139,11 +141,12 @@ class TestCSRFTokenValidation:
     @pytest.mark.asyncio
     async def test_post_with_cookie_but_no_header_returns_403(self):
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies={CSRF_COOKIE_NAME: "my-csrf-token"},
         ) as client:
             resp = await client.post(
                 "/nonexistent-endpoint",
-                cookies={CSRF_COOKIE_NAME: "my-csrf-token"},
                 json={},
             )
         assert resp.status_code == 403
@@ -165,11 +168,12 @@ class TestCSRFTokenValidation:
     @pytest.mark.asyncio
     async def test_post_with_mismatched_token_returns_403(self):
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies={CSRF_COOKIE_NAME: "real-token"},
         ) as client:
             resp = await client.post(
                 "/nonexistent-endpoint",
-                cookies={CSRF_COOKIE_NAME: "real-token"},
                 headers={CSRF_HEADER_NAME: "wrong-token"},
                 json={},
             )
@@ -181,11 +185,12 @@ class TestCSRFTokenValidation:
         """Matching cookie + header bypasses CSRF; routing takes over (404 not 403)."""
         token = "valid-csrf-token-value"
         async with AsyncClient(
-            transport=ASGITransport(app=app), base_url="http://test"
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            cookies={CSRF_COOKIE_NAME: token},
         ) as client:
             resp = await client.post(
                 "/nonexistent-endpoint",
-                cookies={CSRF_COOKIE_NAME: token},
                 headers={CSRF_HEADER_NAME: token},
                 json={},
             )

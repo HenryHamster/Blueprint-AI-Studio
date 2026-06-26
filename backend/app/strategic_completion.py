@@ -4246,6 +4246,11 @@ async def _handle_strategic_completion(
     retired_ids_fb: list = []
     created_rationales_fb: Dict[str, str] = {}
     _pending_retire_memory: list = []
+    # Rejected-proposal tombstones to persist into vision["rejected_proposals"]
+    # after the op loop, via with_vision_locked() — same deferred-batch +
+    # canonical-helper pattern as _pending_retire_memory (keeps the direct
+    # project.vision assignment out of this file's ratchet count).
+    _pending_rejected_proposals: list = []
     retired_rationales_fb: Dict[str, str] = {}
     if direction_ops and isinstance(direction_ops, list):
         if len(direction_ops) > MAX_DIRECTION_OPS:
@@ -4934,13 +4939,13 @@ async def _handle_strategic_completion(
                     rejected = rejected[-20:]
                     remaining = non_rejected + rejected
                     # Persist to vision["rejected_proposals"] so the starvation
-                    # fallback dedup survives direction-list pruning.
-                    _vision = dict(project.vision or {})
-                    _rp = list(_vision.get("rejected_proposals") or [])
-                    _rp.append({"text": rejected_text, "rejected_at": now_iso})
-                    _vision["rejected_proposals"] = _rp[-30:]
-                    project.vision = _vision
-                    flag_modified(project, "vision")
+                    # fallback dedup survives direction-list pruning. Defer the
+                    # actual write to a single with_vision_locked() pass after the
+                    # loop (mirrors _pending_retire_memory) so the read-modify-write
+                    # is serialized under the project row lock.
+                    _pending_rejected_proposals.append(
+                        {"text": rejected_text, "rejected_at": now_iso}
+                    )
                 cancelled_result = await session.execute(
                     select(Task).where(
                         Task.project_id == project.id,
@@ -5008,6 +5013,20 @@ async def _handle_strategic_completion(
                     record_retired_direction_memory(vision, _rd, reason="strategic_retire")
 
             await with_vision_locked(session, task.project_id, _apply_retire_memory)
+
+        if _pending_rejected_proposals:
+            from app.task_locking import with_vision_locked
+
+            _rejected_batch = list(_pending_rejected_proposals)
+
+            def _apply_rejected_proposals(vision: dict) -> None:
+                _rp = list(vision.get("rejected_proposals") or [])
+                _rp.extend(_rejected_batch)
+                vision["rejected_proposals"] = _rp[-30:]
+
+            await with_vision_locked(
+                session, task.project_id, _apply_rejected_proposals
+            )
 
     # Apply version_phase_decision + qualify_request from the parsed output
     # (fallback / log-parse path). In practice the agent emits both fields
