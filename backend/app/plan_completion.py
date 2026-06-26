@@ -542,7 +542,22 @@ async def _handle_plan_completion(task: Task, logs: str, session: AsyncSession):
     parent_hotfix = bool(task.first_payload.get("hotfix"))
     short_id = str(task.id).replace("-", "")[:8]
     plan_branch_prefix = getattr(project, "plan_branch_prefix", "plan/")
-    plan_branch = f"{plan_branch_prefix}{short_id}"
+    # When this task is a requeue-clone that already opened a rollup PR, carry
+    # the original staging branch forward instead of deriving a new plan/<id>
+    # branch from the clone's task ID.  Reusing the branch keeps the merge
+    # guard invariant (reviewed-branch == PR-head) intact: the PR head still
+    # points at the original branch, so the merge guard won't abort with a
+    # branch-mismatch error on every subsequent iteration.
+    # Guard: only reuse when BOTH plan_branch AND rollup_pr_number are present
+    # — rollup_pr_number confirms a PR was actually opened (not just a
+    # branch-setup step that failed before the PR was created).
+    _ctx = task.context or {}
+    _inherited_plan_branch = _ctx.get("plan_branch")
+    _has_rollup_pr = bool(_ctx.get("rollup_pr_number"))
+    if _inherited_plan_branch and _has_rollup_pr:
+        plan_branch = _inherited_plan_branch
+    else:
+        plan_branch = f"{plan_branch_prefix}{short_id}"
 
     # Round 4 W1 (audit C2): _ensure_branch now returns Task | None.
     # On success, returns the freshly-locked Task (caller mutates under

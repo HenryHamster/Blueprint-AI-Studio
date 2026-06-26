@@ -536,3 +536,115 @@ async def test_is_backmerge_resolver_helper(db_session):
     assert _is_backmerge_resolver(no_flag) is False
     assert _is_backmerge_resolver(no_key) is False
     assert _is_backmerge_resolver(none_ctx) is False
+
+
+# ── after_approve=True: dirty rollups are preservable ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_rollup_dirty_preservable_after_approve(db_session, mocker):
+    """SECONDARY FIX: a conflicted (dirty) rollup PR is preservable when called
+    with after_approve=True — the conflict is mechanical, not a rejection, and a
+    human can resolve it for hand-merge."""
+    _mock_preservable_pr(mocker, changed_files=4, mergeable_state="dirty")
+    from app.review_loop_convergence import _pr_is_preservable_on_cap
+
+    project = await _make_db_project(db_session)
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"_is_rollup_review": True, "rollup_pr_number": 800},
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    # Without after_approve: dirty rollup is NOT preservable (current behavior).
+    assert await _pr_is_preservable_on_cap(orig, 800, db_session) is False
+    # With after_approve=True: dirty rollup IS preservable (secondary fix).
+    assert await _pr_is_preservable_on_cap(orig, 800, db_session, after_approve=True) is True
+
+
+@pytest.mark.asyncio
+async def test_rollup_unknown_state_not_preservable_even_after_approve(db_session, mocker):
+    """GUARDRAIL: a rollup with 'unknown' mergeable_state is NOT preservable
+    even with after_approve=True — unknown state means GitHub hasn't computed it
+    yet, and we don't know if the PR is conflicted or not."""
+    _mock_preservable_pr(mocker, changed_files=4, mergeable_state="unknown")
+    from app.review_loop_convergence import _pr_is_preservable_on_cap
+
+    project = await _make_db_project(db_session)
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={"_is_rollup_review": True, "rollup_pr_number": 800},
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    assert await _pr_is_preservable_on_cap(orig, 800, db_session, after_approve=True) is False
+
+
+@pytest.mark.asyncio
+async def test_approved_dirty_rollup_routed_to_preserve_not_close(db_session, mocker):
+    """End-to-end: an APPROVED rollup PR that is conflicted (dirty) at cap
+    exhaustion is PRESERVED (PR left open, requires_approval=True) rather than
+    auto-closed. This is the secondary-fix safety net for the requeue-clone
+    branch-desync incident."""
+    close_mock = _mock_preservable_pr(mocker, changed_files=5, mergeable_state="dirty")
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.routers.agent_status.record_task_result")
+    mocker.patch("app.shared_state.record_direction_result")
+    mocker.patch(
+        "app.task_completion._record_remediation_if_terminal", new_callable=AsyncMock
+    )
+
+    from app.review_loop_convergence import _handle_cap_exhaustion
+
+    project = await _make_db_project(db_session)
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "rollup work", "base_branch": "main"}],
+        context={
+            "_is_rollup_review": True,
+            "rollup_pr_number": 102,
+            # Approved — no outstanding changes requested.
+            "review_loop": {
+                "pr_number": 102,
+                "review_approved": True,
+                "review_history": [{"verdict": "APPROVE", "issues": []}],
+            },
+        },
+    )
+    db_session.add(orig)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix", "pr_number": 102, "original_task_id": str(orig.id)}],
+        context={"review_loop": {"pr_number": 102, "review_approved": True}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(orig)
+    await db_session.refresh(source_task)
+
+    await _handle_cap_exhaustion(
+        source_task,
+        str(orig.id),
+        102,
+        16,
+        db_session,
+        scope="global",
+    )
+
+    await db_session.refresh(orig)
+    # PR must NOT have been closed — the work is preserved for hand-merge.
+    close_mock.assert_not_called()
+    # Task flagged for operator hand-merge.
+    assert orig.requires_approval is True

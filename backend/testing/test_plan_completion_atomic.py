@@ -2411,3 +2411,107 @@ async def test_plan_subtask_cross_tree_none_base_branch_is_noop(
         "child must keep its own plan branch when foundation has no base_branch, "
         f"got {child_base!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_requeue_clone_reuses_existing_plan_branch(
+    db_session, mocker, _quiet_mocks
+):
+    """A requeue-clone that already has a rollup PR open reuses the original
+    staging branch so the merge guard sees reviewed-branch == PR-head.
+
+    Scenario (real incident): plan task A has plan_branch='plan/aabbccdd' and
+    rollup_pr_number=102. Its parent is requeued, A is cancelled, and the clone
+    B inherits A's context (plan_branch='plan/aabbccdd', rollup_pr_number=102).
+    When B runs plan_completion, it MUST use 'plan/aabbccdd', not derive a new
+    'plan/<B-id>' — otherwise the merge guard aborts with "reviewed branch
+    plan/<B-id> does not match PR head plan/aabbccdd".
+    """
+    plan_logs = json.dumps(
+        {"subtasks": [{"title": "Step X", "prompt": "do step X", "scope": "small"}]}
+    )
+
+    project = make_project(name="RequeueBranchReuseTest")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Clone task inherits plan_branch + rollup_pr_number from the cancelled original.
+    original_plan_branch = "plan/aabbccdd"
+    clone_task = make_task(
+        project_id=project.id,
+        title="Plan: requeue clone",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "plan", "prompt": "do step X", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        context={
+            "plan_branch": original_plan_branch,
+            "rollup_pr_number": 102,
+            "_attempt_number": 2,
+        },
+    )
+    db_session.add(clone_task)
+    await db_session.commit()
+    await db_session.refresh(clone_task)
+
+    ensure_branch_mock = mocker.patch(
+        "app.task_completion._ensure_branch",
+        new_callable=AsyncMock,
+        return_value=clone_task,
+    )
+
+    await _handle_plan_completion(clone_task, plan_logs, db_session)
+
+    # _ensure_branch must have been called with the ORIGINAL branch, not the
+    # clone's derived 'plan/<clone-id-prefix>' branch.
+    assert ensure_branch_mock.called, "_ensure_branch should have been called"
+    called_branch = ensure_branch_mock.call_args[0][1]
+    assert called_branch == original_plan_branch, (
+        f"Expected _ensure_branch called with '{original_plan_branch}', "
+        f"got '{called_branch}'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fresh_plan_task_derives_branch_from_task_id(
+    db_session, mocker, _quiet_mocks
+):
+    """A plan task without a rollup_pr_number still derives its branch from the
+    task ID — the reuse guard must not activate for fresh (non-retry) tasks."""
+    plan_logs = json.dumps(
+        {"subtasks": [{"title": "Step Y", "prompt": "do step Y", "scope": "small"}]}
+    )
+
+    project = make_project(name="FreshBranchTest")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fresh_task = make_task(
+        project_id=project.id,
+        title="Plan: fresh task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "plan", "prompt": "do step Y", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+        # No plan_branch, no rollup_pr_number — fresh first attempt
+    )
+    db_session.add(fresh_task)
+    await db_session.commit()
+    await db_session.refresh(fresh_task)
+
+    ensure_branch_mock = mocker.patch(
+        "app.task_completion._ensure_branch",
+        new_callable=AsyncMock,
+        return_value=fresh_task,
+    )
+
+    await _handle_plan_completion(fresh_task, plan_logs, db_session)
+
+    assert ensure_branch_mock.called
+    called_branch = ensure_branch_mock.call_args[0][1]
+    short_id = str(fresh_task.id).replace("-", "")[:8]
+    expected_branch = f"plan/{short_id}"
+    assert called_branch == expected_branch, (
+        f"Fresh task must derive branch from task ID — expected '{expected_branch}', "
+        f"got '{called_branch}'"
+    )
