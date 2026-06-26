@@ -9859,6 +9859,63 @@ def test_gcp_startup_script_docker_login_only_with_registry_auth():
             assert secret not in line, f"password leaked to serial echo: {line!r}"
 
 
+def test_gcp_startup_script_passes_env_into_container():
+    """When container_image is set without repo_clone, spec.env and spec.cwd are
+    forwarded as docker -e flags and -w flag rather than being left only in the outer
+    VM shell — matching the local-subprocess backend's else-branch behaviour."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python eval.py",
+        machine_type="e2-standard-4",
+        spend_cap_usd=2.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        container_image="python:3.12-slim",
+        env={"MY_KEY": "my_val", "ANOTHER": "42"},
+        cwd="/workdir",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # env vars must appear as -e flags inside the docker run invocation
+    assert "-e MY_KEY=my_val" in script
+    assert "-e ANOTHER=42" in script
+    # cwd must appear as -w flag
+    assert "-w /workdir" in script
+    # docker run still wraps the command
+    assert "docker run" in script
+    assert "python eval.py" in script
+
+
+def test_gcp_startup_script_passes_env_into_container_with_repo_clone():
+    """When container_image + repo_clone + spec.env are all set, user env vars are
+    included as -e flags alongside the auto-injected PYTHONPATH=/workspace in the
+    docker run invocation (repo_clone branch of _build_gcp_startup_script)."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python eval.py",
+        machine_type="e2-standard-4",
+        spend_cap_usd=2.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        container_image="python:3.12-slim",
+        repo_clone={"owner": "octo", "repo": "demo", "ref": "main"},
+        repo_token="tok",
+        env={"MY_KEY": "my_val", "ANOTHER": "42"},
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # user env vars must appear as -e flags
+    assert "-e MY_KEY=my_val" in script
+    assert "-e ANOTHER=42" in script
+    # PYTHONPATH=/workspace is auto-injected alongside user env vars
+    assert "-e PYTHONPATH=/workspace" in script
+    # docker run still wraps the command
+    assert "docker run" in script
+    assert "python eval.py" in script
+
+
 def test_gcp_startup_script_no_docker_without_image():
     """Absent container_image, the generated script is byte-for-byte unchanged from
     the bare-shell path — no docker token appears anywhere."""

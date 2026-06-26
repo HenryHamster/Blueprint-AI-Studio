@@ -1508,6 +1508,11 @@ def _build_gcp_startup_script(
             _container_extra_mounts = [("/tmp/blueprint_repo", "/workspace")]
             _container_workdir = "/workspace"
             _container_extra_env = {"PYTHONPATH": "/workspace"}
+            if spec.env:
+                _container_extra_env.update(spec.env)
+        else:
+            _container_extra_env = dict(spec.env) if spec.env else None
+            _container_workdir = spec.cwd or None
         container_run_prefix = _build_container_run_prefix(
             spec.container_image,
             host_out_dir=_GCP_ARTIFACT_DIR_PATH,
