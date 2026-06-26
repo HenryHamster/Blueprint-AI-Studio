@@ -5712,21 +5712,48 @@ async def _process_post_commit(
                 # research cycle. Instead raise PostCommitFinalCommitFailed — which
                 # preserves the post_commit_pending marker so the sweep retries just
                 # the spawn from stored plan_output without re-running the agent.
+                #
+                # This recovery is NOT gated on the error being keyword-transient.
+                # The previous version only preserved the marker for errors whose
+                # string matched a transient keyword (timeout/connection/…), so a
+                # mid-spawn failure that did NOT match (a lock contention surfaced
+                # as a bare LockNotAvailableError, a SerializationFailure, an
+                # autoflush IntegrityError, …) fell through to the FAILED branch
+                # below and STRANDED its committed findings: the task showed
+                # terminal FAILED / "no actionable findings" with 0 children while
+                # plan_output held real, undispatched work — the irrecoverable
+                # ~28%-of-zero-child class (cause B). Resuming the spawn is always
+                # safe regardless of the original error: the resume path
+                # (_handle_research_completion, _research_spawn_pending branch)
+                # never re-runs the agent — it replays the spawn from the durable
+                # plan_output — and the duplicate-spawn guard makes a re-run that
+                # actually did land children a no-op. So whenever findings are
+                # durable and the spawn was in flight, prefer sweep-retry over a
+                # terminal FAILED that buries the work.
+                _spawn_pending = bool((task.context or {}).get("_research_spawn_pending"))
+                _has_durable_findings = bool(
+                    isinstance(task.plan_output, list) and task.plan_output
+                )
                 if (
-                    is_transient
-                    and task_type == "research"
-                    and bool((task.context or {}).get("_research_spawn_pending"))
+                    task_type == "research"
+                    and _spawn_pending
+                    and _has_durable_findings
                 ):
                     logger.warning(
-                        "[HANDLER] Research task %s: transient error mid-spawn; "
-                        "preserving post_commit_pending for sweep to retry spawn "
-                        "from stored findings (handler_exc=%r)",
+                        "[HANDLER] Research task %s: error mid-spawn with %d durable "
+                        "finding(s) in plan_output (transient=%s); preserving "
+                        "post_commit_pending for sweep to retry spawn from stored "
+                        "findings rather than stranding them on a terminal FAILED "
+                        "(handler_exc=%r)",
                         task_id,
+                        len(task.plan_output),
+                        is_transient,
                         handler_exc,
                     )
                     raise PostCommitFinalCommitFailed(
-                        f"research mid-spawn transient error for {task_id}; "
-                        f"sweep retries spawn: {handler_exc!r}"
+                        f"research mid-spawn error for {task_id}; "
+                        f"sweep retries spawn from {len(task.plan_output)} stored "
+                        f"finding(s): {handler_exc!r}"
                     ) from handler_exc
                 if is_transient and task.attempt_count < _runtime_config["max_retries"]:
                     task.status = TaskStatus.QUEUED

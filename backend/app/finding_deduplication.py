@@ -95,13 +95,21 @@ _COMPUTE_EXPERIMENT_FINDING_TYPES = frozenset(
 # Requiring concrete file-region overlap as a NECESSARY precondition neutralizes
 # that failure mode while keeping the agent's title/claims as corroborators.
 #
-# region (necessary):     |related_files ∩| >= REGION_MIN_SHARED  OR  jaccard >= REGION_MIN_JACCARD
-# corroboration (any of): title word-overlap >= CORROBORATE_WORDS_SAME / _CROSS,
-#                         OR >=1 shared claim, OR file jaccard >= STRONG_REGION_JACCARD
+# region (necessary):  |related_files ∩| >= REGION_MIN_SHARED  OR  jaccard >= REGION_MIN_JACCARD
+# corroboration:
+#   same-direction (any of): title word-overlap >= CORROBORATE_WORDS_SAME,
+#                            OR >=1 shared claim, OR file jaccard >= STRONG_REGION_JACCARD
+#   cross-direction (any of): >=1 shared claim, OR file jaccard >= STRONG_REGION_JACCARD
+#                            — the bare title-word arm is DROPPED for independent
+#                            directions, which share hot files without sharing intent.
 REGION_MIN_SHARED = 2
 REGION_MIN_JACCARD = 0.5
 STRONG_REGION_JACCARD = 0.7
 CORROBORATE_WORDS_SAME = 3
+# Retained for reference / legacy direction-aware title-overlap callers
+# (e.g. ``is_duplicate``). The region-identity matcher no longer uses a
+# cross-direction title-word threshold — cross-direction findings require a
+# strong corroborator instead — but the constant documents the prior policy.
 CORROBORATE_WORDS_CROSS = 5
 
 
@@ -1083,16 +1091,25 @@ def _find_overlap_match(
        :data:`REGION_MIN_SHARED` files OR Jaccard >= :data:`REGION_MIN_JACCARD`.
        A finding/candidate with no declared files cannot establish a region and
        is never matched here (it falls back to exact-hash dedup).
-    2. CORROBORATION (sufficient, given region): title word-overlap meets the
-       direction-aware word threshold, OR they share at least one claim, OR the
-       file sets are near-identical (Jaccard >= :data:`STRONG_REGION_JACCARD`).
+    2. CORROBORATION (sufficient, given region), direction-aware:
+       * SAME-direction (or either direction unknown): title word-overlap >=
+         :data:`CORROBORATE_WORDS_SAME`, OR >=1 shared claim, OR file sets
+         near-identical (Jaccard >= :data:`STRONG_REGION_JACCARD`).
+       * CROSS-direction (both directions known and different): a STRONG
+         corroborator only — >=1 shared claim OR Jaccard >=
+         :data:`STRONG_REGION_JACCARD`. The bare title-word arm is dropped,
+         because independent strategic tracks routinely touch the same hot file
+         (e.g. ``orchestrator.py``) while pursuing distinct work; word overlap
+         there was silently dropping genuinely-distinct cross-direction findings
+         (the live "1 word-overlap + 1 type-filtered → 0 tasks" signature behind
+         ~28% of research tasks spawning zero children).
 
     This replaces the prior title-string-only match (word / technical-token /
     bigram overlap), whose single-token false positives silently dropped
-    distinct work. Title overlap survives only as a corroborator *gated behind*
-    concrete file-region overlap, so a shared generic token alone can no longer
-    suppress a finding. Returns ``None`` when nothing matches, so callers can
-    build a reason string from the matched title.
+    distinct work. Title overlap survives only as a SAME-direction corroborator
+    *gated behind* concrete file-region overlap, so a shared generic token alone
+    can no longer suppress a finding. Returns ``None`` when nothing matches, so
+    callers can build a reason string from the matched title.
     """
     finding_files = _norm_related_files(finding.get("related_files"))
     if not finding_files:
@@ -1113,20 +1130,43 @@ def _find_overlap_match(
         region = len(shared) >= REGION_MIN_SHARED or file_jaccard >= REGION_MIN_JACCARD
         if not region:
             continue
-        same_direction = (
-            not finding_dir_id
-            or not candidate.direction_id
-            or finding_dir_id == candidate.direction_id
+        # Direction identity is "known to differ" only when BOTH sides declare a
+        # direction and they disagree. A missing direction on either side is
+        # treated as same-direction (the safe, looser default) because we cannot
+        # prove independence.
+        cross_direction = bool(
+            finding_dir_id
+            and candidate.direction_id
+            and finding_dir_id != candidate.direction_id
         )
-        word_threshold = (
-            CORROBORATE_WORDS_SAME if same_direction else CORROBORATE_WORDS_CROSS
-        )
-        title_words = set(candidate.title.lower().split()) - _STOPWORDS
-        corroborated = (
-            len(finding_words & title_words) >= word_threshold
-            or bool(finding_claims & candidate.claims)
+        # Strong corroborators (shared claim, near-identical file set) assert
+        # semantic identity directly and apply regardless of direction.
+        strong_corroborated = (
+            bool(finding_claims & candidate.claims)
             or file_jaccard >= STRONG_REGION_JACCARD
         )
+        if cross_direction:
+            # Independent strategic tracks routinely touch the same hot file
+            # (e.g. orchestrator.py) while pursuing genuinely distinct work, so
+            # a region overlap there is expected, not duplicative. Title-word
+            # overlap is too weak to distinguish "same fix, two directions found
+            # it" from "two different fixes in the same file" — it was eating
+            # real cross-direction findings (~28% of research tasks spawned 0
+            # children, the recurring "1 word-overlap + 1 type-filtered → 0
+            # tasks" signature). For cross-direction candidates we therefore
+            # DROP the bare title-word arm entirely and require a strong
+            # corroborator (shared claim or near-identical files).
+            corroborated = strong_corroborated
+        else:
+            # Same-direction (or unknown-direction) candidates keep the looser
+            # title-word corroborator: within one direction the agent is the
+            # same author iterating on the same intent, so word overlap on top
+            # of a shared region is a reliable duplicate signal.
+            title_words = set(candidate.title.lower().split()) - _STOPWORDS
+            corroborated = (
+                strong_corroborated
+                or len(finding_words & title_words) >= CORROBORATE_WORDS_SAME
+            )
         if corroborated:
             return candidate.title
     return None
