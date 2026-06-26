@@ -284,6 +284,11 @@ APPROVED_CAP_PR_CLOSED = "APPROVED_CAP_PR_CLOSED"
 # (which stay clean terminal outcomes).
 COMPUTE_UNMEASURED_CRITERION = "compute_unmeasured_criterion"
 
+# Command died on the local DB-less pre-flight smoke before any full VM was
+# provisioned. A genuine work defect (the command must be fixed to run on the
+# substrate), so it routes to CODE_ERROR and burns the retry budget.
+COMPUTE_PREFLIGHT_SMOKE_FAILED = "compute_preflight_smoke_failed"
+
 
 def classify_compute_terminal_reason(
     terminal_reason: "str | None",
@@ -316,7 +321,6 @@ def classify_compute_terminal_reason(
         if "cancelled" in lower or "operator" in lower:
             return ADMIN_CANCEL
     return CODE_ERROR
-
 
 # Administrative cancellation — orchestrator or operator terminated the task before
 # it ran meaningful work: cascade cancels ("Cancelled: dependency task failed"),
@@ -915,6 +919,7 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # distinct failure_category literal stays visible on task.context for the
     # spawning agent and operator panels.
     "compute_unmeasured_criterion": CODE_ERROR,
+    "compute_preflight_smoke_failed": CODE_ERROR,
     # ``panel_review_lens_failed`` — the panel_review task posted a failure because
     # a lens subprocess exited non-zero. Normally an infra-level failure (→
     # PROVISION_FAILURE) but requires a dead-auth text check first: when a Codex

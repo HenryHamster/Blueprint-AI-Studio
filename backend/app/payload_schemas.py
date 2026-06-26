@@ -800,6 +800,13 @@ class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     # suppresses the per-arm disposition follow-on and instead fires ONE aggregate
     # follow-on when every sibling arm reaches a terminal state.
     sweep_id: str | None = None
+    # Optional setup step the platform runs BEFORE the main command on the compute
+    # VM. When present, the startup script executes this as `bash -lc <setup_step>`
+    # immediately after the repo clone and before the main command. If the setup
+    # step exits non-zero the job fails with reason `setup_step_failed` — no VM
+    # budget is consumed by the main command. Use to install dependencies that are
+    # absent from the base VM image (e.g. `pip install -r requirements.txt`).
+    setup_step: str | None = None
     # NOTE: the legacy ``act_on_verdict`` opt-in (axis B) was retired — disposition
     # is now decided at completion (always-dispose), not by an authoring-time flag.
     # ``extra='allow'`` keeps any legacy payload still carrying the key valid.

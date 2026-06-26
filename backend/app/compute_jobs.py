@@ -28,10 +28,12 @@ from app.compute_backends import (
     LOCAL_GPU_BACKEND_NAME,
     ComputeLaunchSpec,
     ComputeStatusResult,
+    PreflightSmokeResult,
     collect_terminal_artifact_reference,
     default_compute_backend_name,
     detect_local_gpu,
     get_compute_backend,
+    run_preflight_smoke,
     validate_backend_name,
 )
 from app.resource_envelope import (
@@ -166,6 +168,7 @@ _COMPUTE_OUTCOME_DISPOSITION: dict[ComputeJobOutcome, tuple[bool, str | None]] =
     ComputeJobOutcome.TIMED_OUT: (True, "deadline"),
     ComputeJobOutcome.SPEND_CAP_EXCEEDED: (True, "budget"),
     ComputeJobOutcome.FAILURE: (False, None),
+    ComputeJobOutcome.SMOKE_FAILED: (False, None),
 }
 
 
@@ -265,6 +268,7 @@ async def create_compute_job(
     accelerator_count: int = 1,
     live_proof: Any | None = None,
     live_proof_marker: Any | None = None,
+    setup_step: str | None = None,
 ) -> ComputeJob:
     if not command.strip():
         raise ValueError("command must be non-empty")
@@ -416,6 +420,8 @@ async def create_compute_job(
         "status_message": "queued for compute-job launch",
         "park_deadline_seconds": park_deadline_seconds,
     }
+    if setup_step is not None:
+        polling_metadata["setup_step"] = setup_step
     if live_release_evidence is not None:
         polling_metadata[_LIVE_PROOF_METADATA_KEY] = live_release_evidence
     job = ComputeJob(
@@ -1172,6 +1178,117 @@ async def compute_job_monitor_service(session_factory=AsyncSessionLocal) -> None
         await asyncio.sleep(COMPUTE_JOB_MONITOR_INTERVAL_SECONDS)
 
 
+def _smoke_fail_reason(smoke: PreflightSmokeResult, declared_metric: str | None) -> str:
+    if not smoke.startup_ok:
+        excerpt = (smoke.error_excerpt or "")[:300]
+        return (
+            f"compute_preflight_smoke_failed: command exited {smoke.exit_code} on "
+            f"DB-less substrate before full VM provisioned; stderr: {excerpt}"
+        )[:500]
+    # startup_ok but metric missing
+    return (
+        f"compute_preflight_smoke_failed: command ran but declared metric "
+        f"{declared_metric!r} not found in result file (no full VM provisioned)"
+    )[:500]
+
+
+async def _run_and_apply_preflight_smoke(
+    session_factory,
+    job: ComputeJob,
+    task: Task | None,
+) -> None:
+    """Run a pre-flight smoke on the job's command and persist the result.
+
+    On PASS: stamps ``preflight_smoke_done=True`` so the next monitor tick
+    proceeds to the normal provisioning path.
+    On FAIL: finalizes the job as FAILED/SMOKE_FAILED and fires the task wake.
+    """
+    meta = job.polling_metadata or {}
+    command = str(meta.get("command") or "")
+    env = {str(k): str(v) for k, v in (meta.get("env") or {}).items()}
+    cwd = meta.get("cwd") or None
+    setup_step = meta.get("setup_step") or None
+
+    payload = task.first_payload if task is not None else {}
+    criterion = (payload or {}).get("success_criterion") or {}
+    declared_metric: str | None = (
+        (payload or {}).get("declared_metric")
+        or (criterion.get("metric") if isinstance(criterion, dict) else None)
+        or None
+    )
+    # Arms-synthesized contracts write {"arms": {name: {metric: value}}} to the
+    # result file, not a flat top-level key.  The original task spec requires
+    # arms jobs to check startup_ok only; skip the metric assertion for them.
+    is_arms = bool((payload or {}).get("arms"))
+    declared_metric_for_smoke = None if is_arms else declared_metric
+
+    smoke = await run_preflight_smoke(
+        command,
+        declared_metric=declared_metric_for_smoke,
+        env=env,
+        cwd=cwd,
+        setup_step=setup_step,
+    )
+
+    now = _utcnow()
+    # A timeout (exit_code is None) means the command is still alive = startup OK.
+    # Only enforce the metric check when the command EXITED CLEANLY (exit_code == 0).
+    # Rejecting on timeout would false-reject GPU training commands that declare a
+    # metric but cannot finish within the short smoke window.
+    smoke_passed = smoke.startup_ok and (
+        smoke.exit_code is None or declared_metric_for_smoke is None or smoke.metric_captured
+    )
+
+    async with session_factory() as session:
+        live = await _lock_compute_job(session, job.id)
+        if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+            return
+        if smoke_passed:
+            _set_meta(live, preflight_smoke_done=True, preflight_smoke_status="passed")
+            live.updated_at = now
+            session.add(live)
+            await session.commit()
+            return
+        # Smoke failed: finalize immediately — no full VM will be provisioned.
+        reason = _smoke_fail_reason(smoke, declared_metric)
+        diagnostic: dict[str, Any] = {
+            "startup_ok": smoke.startup_ok,
+            "exit_code": smoke.exit_code,
+            "metric_captured": smoke.metric_captured,
+            "error_excerpt": (smoke.error_excerpt or "")[:500],
+        }
+        if declared_metric:
+            diagnostic["declared_metric"] = declared_metric
+        _set_meta(
+            live,
+            preflight_smoke_done=True,
+            preflight_smoke_status="failed",
+            preflight_smoke_diagnostic=diagnostic,
+        )
+        _finalize_terminal_job(
+            live,
+            status=ComputeJobStatus.FAILED,
+            outcome=ComputeJobOutcome.SMOKE_FAILED,
+            terminal_reason=reason,
+            now=now,
+        )
+        await _link_terminal_artifact(session, live)
+        if live.task_id is not None:
+            from app.task_lifecycle import fire_task_wakes  # noqa: PLC0415
+
+            await fire_task_wakes(
+                session,
+                wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+                wake_source_ref=str(live.id),
+            )
+        await session.commit()
+    logger.info(
+        "[COMPUTE_JOB] pre-flight smoke FAILED for job=%s: %s",
+        job.id,
+        reason,
+    )
+
+
 async def _process_single_compute_job(
     job: ComputeJob, *, session_factory=AsyncSessionLocal
 ) -> None:
@@ -1219,6 +1336,14 @@ async def _process_single_compute_job(
         return
 
     if job.status in _COMPUTE_JOB_PRELAUNCH_STATUSES:
+        # Pre-flight smoke: run ONCE on QUEUED jobs before reserving the full launch.
+        # Idempotent: the flag in polling_metadata guards against re-running on restart.
+        if job.status == ComputeJobStatus.QUEUED and not (
+            job.polling_metadata or {}
+        ).get("preflight_smoke_done"):
+            await _run_and_apply_preflight_smoke(session_factory, job, task)
+            return  # next tick picks up STARTING (pass) or FAILED/SMOKE_FAILED (fail)
+
         reserved = await _reserve_compute_job_launch(
             session_factory, job.id, backend, now
         )
@@ -1845,6 +1970,7 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         provisioning_model=str(meta.get("provisioning_model") or "STANDARD"),
         accelerator=job.accelerator_type,
         accelerator_count=int(job.accelerator_count or 1),
+        setup_step=meta.get("setup_step") or None,
     )
 
 

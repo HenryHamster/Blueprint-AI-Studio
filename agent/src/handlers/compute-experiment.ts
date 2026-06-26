@@ -75,7 +75,7 @@ type JobResponse = Record<string, unknown>;
 
 function unwrapJobData(res: unknown): JobResponse | null {
   if (res && typeof res === 'object' && 'data' in res) {
-    const data = (res as { data: unknown }).data;
+    const data = res.data;
     if (data && typeof data === 'object') return data as JobResponse;
   }
   return null;
@@ -156,6 +156,13 @@ function buildLaunchBody(payload: Record<string, unknown>): Record<string, unkno
   const liveReleaseProofMarker = strVal(payload.live_release_proof_marker);
   if (liveReleaseProofMarker) body.live_proof_marker = liveReleaseProofMarker;
   if (payload.requires_live_release !== undefined) body.live_proof = payload.requires_live_release;
+  const setupStep = strVal(payload.setup_step);
+  if (setupStep) body.setup_step = setupStep;
+  // Forward declared_metric so the platform-executed pre-flight smoke knows
+  // which metric to verify is captured. Only forwarded when present — CPU/GPU
+  // jobs without a declared metric are byte-for-byte unchanged.
+  const declaredMetric = strVal(payload.declared_metric);
+  if (declaredMetric) body.declared_metric = declaredMetric;
   return body;
 }
 

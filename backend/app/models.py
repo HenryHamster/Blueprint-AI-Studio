@@ -228,6 +228,7 @@ class ComputeJobOutcome(str, Enum):
     CANCELLED = "CANCELLED"
     TIMED_OUT = "TIMED_OUT"
     SPEND_CAP_EXCEEDED = "SPEND_CAP_EXCEEDED"
+    SMOKE_FAILED = "SMOKE_FAILED"
 
 
 class ArtifactType(str, Enum):

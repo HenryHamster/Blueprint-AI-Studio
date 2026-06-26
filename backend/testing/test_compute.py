@@ -1804,6 +1804,11 @@ async def test_process_compute_jobs_once_persists_result_metrics(
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
+    # Skip the pre-flight smoke gate — this test exercises post-smoke lifecycle.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     class FakeBackend:
         def external_id_for(self, persisted_job):
@@ -1880,6 +1885,11 @@ async def test_process_compute_jobs_once_launches_and_records_terminal_success(
         deadline_seconds=300,
     )
     assert job.status == ComputeJobStatus.QUEUED
+    # Skip the pre-flight smoke gate — this test exercises post-smoke lifecycle.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     started_at = datetime.utcnow() - timedelta(seconds=30)
 
@@ -1959,6 +1969,11 @@ async def test_process_compute_jobs_once_records_launch_failure_then_clears_on_s
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
+    # Skip the pre-flight smoke gate — this test exercises launch-retry lifecycle.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     class FakeBackend:
         def __init__(self):
@@ -2024,6 +2039,11 @@ async def test_compute_runtime_deadline_starts_after_launch(db_session, monkeypa
         spend_cap_usd=1.0,
         deadline_seconds=60,
     )
+    # Skip the pre-flight smoke gate — this test exercises runtime-deadline lifecycle.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     terminate_reasons: list[str] = []
 
@@ -2117,7 +2137,9 @@ async def test_process_compute_jobs_once_times_out_provisioning_before_launch(
     )
     # Expire both the wall_clock_deadline AND the provisioning_deadline_at
     # sub-deadline so the monitor detects the provisioning timeout immediately.
+    # Also skip the pre-flight smoke gate — this test exercises provisioning timeout.
     meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
     meta["provisioning_deadline_at"] = (
         datetime.utcnow() + timedelta(milliseconds=200)
     ).isoformat()
@@ -2208,7 +2230,9 @@ async def test_provisioning_subdeadline_fails_fast(db_session, monkeypatch):
     )
 
     # Push the sub-deadline into the past to simulate a stalled provisioning VM.
+    # Also skip the pre-flight smoke gate — this test exercises provisioning timeout.
     meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
     meta["provisioning_deadline_at"] = (
         datetime.utcnow() - timedelta(seconds=1)
     ).isoformat()
@@ -2634,6 +2658,12 @@ async def test_compute_job_captures_bounded_log_artifact(db_session, monkeypatch
         backend_name=compute_backends_module.LOCAL_BACKEND_NAME,
     )
     assert job.status == ComputeJobStatus.QUEUED
+    # Skip smoke gate — command writes to $BLUEPRINT_ARTIFACT_DIR which is unset
+    # in the smoke environment; bypass to test full local backend lifecycle.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
@@ -2730,6 +2760,11 @@ async def test_compute_job_truncates_bounded_log_without_blocking_completion(
         deadline_seconds=300,
         backend_name=compute_backends_module.LOCAL_BACKEND_NAME,
     )
+    # Skip smoke gate — command uses $BLUEPRINT_ARTIFACT_DIR (unset in smoke env).
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
@@ -5053,6 +5088,11 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
+    # Skip smoke gate — this test exercises the park/wake lifecycle post-smoke.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     # The task parks on the launched job instead of poll-pinning its VM.
     await park_task(
@@ -5206,6 +5246,11 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
+    # Skip smoke gate — this test exercises the terminal-before-park lifecycle.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     started_at = datetime.utcnow() - timedelta(seconds=30)
 
@@ -7250,6 +7295,10 @@ async def test_compute_park_wake_is_race_safe_under_lock_contention(
             spend_cap_usd=1.0,
             deadline_seconds=300,
         )
+        # Skip smoke gate — these tests exercise wake/park race conditions.
+        meta = dict(job.polling_metadata or {})
+        meta["preflight_smoke_done"] = True
+        job.polling_metadata = meta
         await db_session.commit()
         return task, job
 
@@ -7477,6 +7526,10 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
+    # Skip smoke gate so the monitor reaches backend.launch() on the first tick.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
     await db_session.commit()
 
     launch_entered = asyncio.Event()
@@ -7562,6 +7615,10 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
+    # Skip smoke gate — this test exercises terminal-before-park wake handoff.
+    meta2 = dict(job2.polling_metadata or {})
+    meta2["preflight_smoke_done"] = True
+    job2.polling_metadata = meta2
     await db_session.commit()
 
     class _TerminalBackend:
@@ -9563,6 +9620,70 @@ def test_gcp_startup_script_writes_boot_beacon_before_command():
     beacon_idx = script.index("vm_terminated_before_completion")
     command_idx = script.index("python3 /tmp/blueprint_command_runner.py")
     assert trap_idx < beacon_idx < command_idx
+
+
+def test_gcp_startup_script_includes_setup_step_block():
+    """A spec with setup_step includes a bail-out block with setup_step_failed reason."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python3 eval.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        setup_step="pip install -r requirements.txt",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # The setup step command appears in the script.
+    assert "pip install -r requirements.txt" in script
+    # A typed failure reason is emitted so downstream can attribute the failure.
+    assert "setup_step_failed" in script
+    assert f"{compute_backends_module._SERIAL_REASON_PREFIX}setup_step_failed" in script
+    assert f"{compute_backends_module._SERIAL_STATUS_PREFIX}FAILED" in script
+    # The setup step runs AFTER the boot beacon and BEFORE the main command runner.
+    beacon_idx = script.index("vm_terminated_before_completion")
+    setup_idx = script.index("pip install -r requirements.txt")
+    command_idx = script.index("python3 /tmp/blueprint_command_runner.py")
+    assert beacon_idx < setup_idx < command_idx
+    # The setup step output is redirected to the artifact dir for diagnosis.
+    assert "setup_step.log" in script
+
+
+def test_gcp_startup_script_no_setup_step_unchanged():
+    """No setup_step on the spec ⇒ no setup_step_failed marker in the script."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "setup_step_failed" not in script
+    assert "setup_step.log" not in script
+
+
+def test_local_wrapper_includes_setup_step():
+    """_build_local_wrapper_command with setup_step runs it before the main command."""
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "python3 eval.py",
+        external_id="local-testsetup",
+        setup_step="pip install torch",
+    )
+    # The setup step command is in the wrapper.
+    assert "pip install torch" in wrapper
+    # The setup step runs before the main command (python3 - <<'PY' block).
+    setup_idx = wrapper.index("pip install torch")
+    cmd_idx = wrapper.index("python3 -")
+    assert setup_idx < cmd_idx
+    # On failure the wrapper writes the terminal file and exits early.
+    assert "SETUP_EXIT" in wrapper
+    assert "setup_step.log" in wrapper
 
 
 async def test_attach_repo_clone_sets_repo_and_token(db_session, monkeypatch):

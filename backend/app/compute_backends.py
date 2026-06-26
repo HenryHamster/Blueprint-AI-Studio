@@ -184,6 +184,11 @@ class ComputeLaunchSpec:
     # is never persisted on the job row. Absent ⇒ no checkout (legacy behavior).
     repo_clone: dict[str, str] | None = None
     repo_token: str | None = None
+    # Optional setup step executed as `bash -lc <setup_step>` AFTER the repo clone
+    # and BEFORE the main command. A non-zero exit fails the job immediately with
+    # reason `setup_step_failed`; the setup output is captured to setup_step.log in
+    # the artifact dir for diagnosis. Absent ⇒ no setup step (legacy behavior).
+    setup_step: str | None = None
 
 
 @dataclass(slots=True)
@@ -194,6 +199,121 @@ class ComputeLaunchResult:
     message: str | None = None
     # Extra fields merged into the job's polling_metadata (e.g. GCP zone, pid).
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight smoke
+# ---------------------------------------------------------------------------
+
+PREFLIGHT_SMOKE_TIMEOUT_SECONDS = int(
+    os.getenv("COMPUTE_PREFLIGHT_SMOKE_TIMEOUT_SECONDS", "30")
+)
+_PREFLIGHT_STDERR_MAX_BYTES = 2000
+
+
+@dataclass(slots=True)
+class PreflightSmokeResult:
+    startup_ok: bool
+    exit_code: int | None  # None = timed out (still running = startup OK)
+    metric_captured: bool
+    declared_metric_value: float | None
+    error_excerpt: str
+
+
+async def run_preflight_smoke(
+    command: str,
+    *,
+    declared_metric: str | None = None,
+    timeout_seconds: int = PREFLIGHT_SMOKE_TIMEOUT_SECONDS,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+    setup_step: str | None = None,
+) -> PreflightSmokeResult:
+    """Run a cheap local pre-flight smoke to catch commands that die on a DB-less substrate.
+
+    Runs `command` (and optionally `setup_step`) locally with no DB credentials
+    injected.  A non-zero exit before the timeout is a FAIL; a zero exit or a
+    timeout (command still alive) is a PASS (plus optional metric check).
+    """
+    run_env: dict[str, str] = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
+    # Mirror the GCP startup script: put the repo root on PYTHONPATH so commands
+    # that import project packages work the same way they do on the compute VM.
+    # Path(__file__) is backend/app/compute_backends.py; three levels up is the
+    # repo root (the equivalent of /tmp/blueprint_repo on the GCP VM).
+    _repo_root = str(Path(__file__).parent.parent.parent)
+    _existing_pp = os.environ.get("PYTHONPATH", "")
+    run_env["PYTHONPATH"] = f"{_repo_root}:{_existing_pp}" if _existing_pp else _repo_root
+    run_env.update(env or {})
+
+    tmpdir = tempfile.mkdtemp(prefix="bp_smoke_")
+    try:
+        result_path = os.path.join(tmpdir, "result.json")
+        run_env[RESULT_FILE_ENV] = result_path
+
+        async def _run_bash(cmd: str, t: int) -> tuple[int | None, str]:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "bash", "-lc", cmd,
+                    env=run_env,
+                    cwd=cwd or None,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    _, raw_err = await asyncio.wait_for(proc.communicate(), timeout=t)
+                    excerpt = raw_err[-_PREFLIGHT_STDERR_MAX_BYTES:].decode("utf-8", "replace")
+                    return proc.returncode, excerpt
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except ProcessLookupError:
+                        pass
+                    return None, ""
+            except Exception as exc:  # pragma: no cover
+                return -1, str(exc)[:_PREFLIGHT_STDERR_MAX_BYTES]
+
+        # Run setup_step first if present; a non-zero (non-timeout) exit is a FAIL.
+        if setup_step:
+            setup_t = max(10, timeout_seconds // 3)
+            setup_exit, setup_err = await _run_bash(setup_step, setup_t)
+            if setup_exit is not None and setup_exit != 0:
+                return PreflightSmokeResult(
+                    startup_ok=False,
+                    exit_code=setup_exit,
+                    metric_captured=False,
+                    declared_metric_value=None,
+                    error_excerpt=f"setup_step failed (exit {setup_exit}): {setup_err}",
+                )
+
+        exit_code, stderr_text = await _run_bash(command, timeout_seconds)
+        # Timed out (still running) counts as startup OK.
+        startup_ok = exit_code is None or exit_code == 0
+
+        # Check declared metric in result file when the command exited cleanly.
+        metric_captured = declared_metric is None  # no metric required = always captured
+        declared_metric_value: float | None = None
+        if declared_metric and os.path.exists(result_path):
+            try:
+                parsed = json.loads(Path(result_path).read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    val = parsed.get(declared_metric)
+                    if isinstance(val, (int, float)) and not isinstance(val, bool):
+                        metric_captured = True
+                        declared_metric_value = float(val)
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+
+        return PreflightSmokeResult(
+            startup_ok=startup_ok,
+            exit_code=exit_code,
+            metric_captured=metric_captured,
+            declared_metric_value=declared_metric_value,
+            error_excerpt=stderr_text,
+        )
+    finally:
+        import shutil  # noqa: PLC0415
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @dataclass(slots=True)
@@ -327,6 +447,7 @@ class LocalSubprocessComputeBackend:
                 _build_local_wrapper_command(
                     spec.command,
                     external_id=external_id,
+                    setup_step=spec.setup_step,
                 ),
             ],
             cwd=spec.cwd or None,
@@ -752,7 +873,9 @@ def _read_local_terminal_status_for_external_id(
     )
 
 
-def _build_local_wrapper_command(command: str, *, external_id: str) -> str:
+def _build_local_wrapper_command(
+    command: str, *, external_id: str, setup_step: str | None = None
+) -> str:
     state_dir = shlex.quote(_local_state_dir_for_external_id(external_id))
     pid_path = shlex.quote(_local_pid_path_for_external_id(external_id))
     terminal_path = shlex.quote(_local_terminal_path_for_external_id(external_id))
@@ -771,6 +894,30 @@ def _build_local_wrapper_command(command: str, *, external_id: str) -> str:
         )
     )
     command_literal = shlex.quote(command)
+    # Optional setup step: run before the main command; on failure write the
+    # terminal file and exit so the main command never starts.
+    setup_step_block = ""
+    if setup_step:
+        setup_step_log = shlex.quote(
+            os.path.join(
+                _local_artifact_dir_for_external_id(external_id),
+                "setup_step.log",
+            )
+        )
+        setup_step_q = shlex.quote(setup_step)
+        setup_step_block = f"""bash -lc {setup_step_q} >> {setup_step_log} 2>&1; SETUP_EXIT=$?
+if [ "$SETUP_EXIT" -ne 0 ]; then
+  FINISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  cat > {terminal_path} <<SETUP_EOF
+STATUS=FAILED
+EXIT_CODE=$SETUP_EXIT
+FINISHED_AT=$FINISHED_AT
+METRICS=
+COMMAND_LOG=
+RELEASE_ECHO=
+SETUP_EOF
+  exit "$SETUP_EXIT"
+fi"""
     # The artifact dir is created but NOT removed: its contents are the durable
     # output channel and must survive the subprocess (and an idempotent relaunch).
     return f"""mkdir -p {state_dir}
@@ -781,6 +928,7 @@ rm -f {result_path}
 rm -f {command_log_path}
 export {RESULT_FILE_ENV}={result_path}
 export {ARTIFACT_DIR_ENV}={artifact_dir}
+{setup_step_block}
 EXIT_CODE=0
 if python3 - \
   {command_literal} \
@@ -1211,6 +1359,28 @@ def _build_gcp_startup_script(
     # terminal marker" FAILURE that uploaded nothing. Every later phase
     # (clone-fail / runtime-TTL / completion) OVERWRITES this record with the true
     # outcome, so it only survives a death that writes nothing else.
+    # Optional setup step: run AFTER the repo clone, BEFORE cwd + main command.
+    # On failure, emit a typed serial reason and poweroff — no main command runs.
+    # Setup stdout+stderr are captured to setup_step.log in the artifact dir so
+    # they land in the durable GCS bundle for post-hoc diagnosis.
+    setup_step_block = ""
+    if spec.setup_step:
+        _setup_log_q = shlex.quote(os.path.join(_GCP_ARTIFACT_DIR_PATH, "setup_step.log"))
+        _setup_step_q = shlex.quote(spec.setup_step)
+        setup_step_block = (
+            f"if ! bash -lc {_setup_step_q} >{_setup_log_q} 2>&1; then\n"
+            f'  echo "{_SERIAL_REASON_PREFIX}setup_step_failed"\n'
+            f'  echo "{_SERIAL_STATUS_PREFIX}FAILED"\n'
+            f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
+            f"  python3 /tmp/blueprint_terminal_record.py "
+            f"{artifact_dir} FAILED 1 setup_step_failed "
+            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            f"  upload_artifacts\n"
+            f'  kill "$TTL_PID" 2>/dev/null || true\n'
+            f"  poweroff || shutdown -h now || true\n"
+            f"  exit 1\n"
+            f"fi"
+        )
     command = shlex.quote(spec.command)
     artifact_bundle = shlex.quote(_GCP_ARTIFACT_BUNDLE_PATH)
     artifact_upload_url = shlex.quote(artifact_upload_url)
@@ -1301,6 +1471,7 @@ python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} FAILED 1 vm_terminated_before_completion {result_file} {command_log_path} \
   >/dev/null 2>&1 || true
 {repo_setup_block}
+{setup_step_block}
 {cwd_line}
 EXIT_CODE=0
 if python3 /tmp/blueprint_command_runner.py \

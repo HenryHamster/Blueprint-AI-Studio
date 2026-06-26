@@ -7,9 +7,12 @@ same compute_experiment payload shape without importing each other.
 from __future__ import annotations
 
 import base64
+import logging
 import re
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Safe identifier charset for arm names: no shell metacharacters, no colons
 # (colon is the delimiter in the NAME:PATH aggregator spec), no slashes/dots
@@ -79,6 +82,7 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "arms",
         "declared_metric",
         "sweep_id",
+        "setup_step",
     ):
         val = _pick(opt_key)
         if val is not None:
@@ -93,10 +97,14 @@ def _validate_compute_launch_contract(
 ) -> tuple[bool, str]:
     """Return ``(ok, reason)`` for a proposed compute_experiment launch contract.
 
-    ``require_smoke=True`` (the default for author-generated contracts) requires a
-    ``smoke_sample`` proving the command starts and, when a ``success_criterion``
-    is declared, emits a numeric metric.  Operator-triggered launches may pass
-    ``require_smoke=False`` to skip that check.
+    ``require_smoke=True`` (the legacy default for author-generated contracts)
+    previously hard-rejected contracts whose ``smoke_sample`` was missing or
+    reported failure.  This check is now ADVISORY ONLY: the platform executes a
+    real pre-flight smoke (capability ``platform-preflight-smoke``) on the same
+    substrate class before any full VM is billed, which is the binding gate.
+    A missing or self-reported-failing author smoke_sample is logged as a warning
+    but no longer blocks the contract.  Operator-triggered launches may pass
+    ``require_smoke=False`` to silence even the advisory log.
     """
     arms = contract.get("arms")
     command = contract.get("command")
@@ -208,31 +216,36 @@ def _validate_compute_launch_contract(
         return False, f"deadline_seconds must be positive (got {deadline})"
 
     if require_smoke:
+        # Author-attested smoke is now ADVISORY ONLY.  The platform-executed
+        # pre-flight smoke (capability `platform-preflight-smoke`) runs the
+        # command on the real substrate before provisioning the full VM and is
+        # the binding gate.  A missing or self-reported-failing author
+        # smoke_sample is logged here for observability but does NOT reject the
+        # contract.
         smoke = contract.get("smoke_sample")
         if not smoke or not isinstance(smoke, dict):
-            return (
-                False,
-                "missing smoke_sample: author must smoke-test the command before "
-                "dispatch — run a short variant, capture startup_ok + metric_captured, "
-                "add smoke_sample to the finding",
+            logger.warning(
+                "compute_experiment contract has no author smoke_sample — "
+                "platform-preflight-smoke will gate at launch"
             )
-        if smoke.get("unsmokable"):
+        elif smoke.get("unsmokable"):
             reason = str(smoke.get("unsmokable_reason") or "cannot be smoked cheaply")
-            return (
-                False,
-                f"un-smokable command requires explicit operator review: {reason}",
+            logger.warning(
+                "compute_experiment author smoke_sample marked un-smokable: %s — "
+                "platform-preflight-smoke will gate at launch",
+                reason,
             )
-        if not smoke.get("startup_ok"):
+        elif not smoke.get("startup_ok"):
             error_excerpt = str(smoke.get("error_excerpt") or "unknown error")[:200]
-            return (
-                False,
-                f"smoke failed — command did not start cleanly: {error_excerpt}",
+            logger.warning(
+                "compute_experiment author smoke_sample reports startup failure: %s — "
+                "platform-preflight-smoke will gate at launch",
+                error_excerpt,
             )
-        if contract.get("success_criterion") and not smoke.get("metric_captured"):
-            return (
-                False,
-                "smoke did not capture declared metric — verify command writes "
-                "{metric: value} to $BLUEPRINT_RESULT_FILE",
+        elif contract.get("success_criterion") and not smoke.get("metric_captured"):
+            logger.warning(
+                "compute_experiment author smoke_sample did not capture declared metric — "
+                "platform-preflight-smoke will gate at launch"
             )
 
     return True, ""

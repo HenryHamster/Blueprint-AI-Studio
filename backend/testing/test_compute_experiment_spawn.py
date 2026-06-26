@@ -190,6 +190,27 @@ def test_author_contract_omits_absent_sweep_id():
     assert "sweep_id" not in contract
 
 
+def test_author_contract_forwards_setup_step():
+    # setup_step is forwarded when present (flat) so the platform can run it
+    # on the same substrate BEFORE the main command.
+    finding = {
+        "command": "python eval.py",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 300,
+        "setup_step": "pip install -r requirements.txt",
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["setup_step"] == "pip install -r requirements.txt"
+
+
+def test_author_contract_omits_absent_setup_step():
+    # When setup_step is absent, it must not appear in the contract — callers
+    # that check for its presence rely on absence meaning "no setup needed".
+    finding = {"command": "python run.py", "spend_cap_usd": 1.0, "deadline_seconds": 60}
+    contract = _author_compute_launch_contract(finding)
+    assert "setup_step" not in contract
+
+
 # --- contract validation --------------------------------------------------
 
 
@@ -262,19 +283,24 @@ def _base_contract(**extra):
     }
 
 
-def test_validate_contract_rejects_missing_smoke_sample():
+def test_validate_contract_accepts_without_author_smoke_sample():
+    # Author-attested smoke is now ADVISORY only; the platform-executed
+    # pre-flight smoke (capability platform-preflight-smoke) is the binding gate.
+    # A contract with no smoke_sample must be ACCEPTED so the platform can gate it.
     ok, reason = _validate_compute_launch_contract(_base_contract())
-    assert ok is False
-    assert "smoke_sample" in reason
+    assert ok is True
+    assert reason == ""
 
 
-def test_validate_contract_rejects_non_dict_smoke_sample():
+def test_validate_contract_advisory_non_dict_smoke_sample():
+    # A non-dict smoke_sample is advisory — contract is still accepted.
     ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample="yes"))
-    assert ok is False
-    assert "smoke_sample" in reason
+    assert ok is True
+    assert reason == ""
 
 
-def test_validate_contract_rejects_failed_smoke_startup():
+def test_validate_contract_advisory_failed_smoke_startup():
+    # A startup failure in the author smoke_sample is now advisory — accepted.
     smoke = {
         "exit_code": 1,
         "startup_ok": False,
@@ -282,23 +308,23 @@ def test_validate_contract_rejects_failed_smoke_startup():
         "error_excerpt": "ModuleNotFoundError: No module named 'backend'",
     }
     ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample=smoke))
-    assert ok is False
-    assert "smoke failed" in reason
-    assert "ModuleNotFoundError" in reason
+    assert ok is True
+    assert reason == ""
 
 
-def test_validate_contract_rejects_unsmokable():
+def test_validate_contract_advisory_unsmokable():
+    # An unsmokable author attestation is now advisory — accepted.
     smoke = {
         "unsmokable": True,
         "unsmokable_reason": "requires T4 GPU not available on this VM",
     }
     ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample=smoke))
-    assert ok is False
-    assert "un-smokable" in reason
-    assert "T4 GPU" in reason
+    assert ok is True
+    assert reason == ""
 
 
-def test_validate_contract_rejects_metric_not_captured_when_criterion_declared():
+def test_validate_contract_advisory_metric_not_captured_when_criterion_declared():
+    # An author smoke that did not capture the declared metric is now advisory.
     smoke = {
         "exit_code": 0,
         "startup_ok": True,
@@ -310,8 +336,8 @@ def test_validate_contract_rejects_metric_not_captured_when_criterion_declared()
         success_criterion={"metric": "accuracy", "operator": ">=", "threshold": 0.9},
     )
     ok, reason = _validate_compute_launch_contract(contract)
-    assert ok is False
-    assert "metric" in reason
+    assert ok is True
+    assert reason == ""
 
 
 def test_validate_contract_accepts_valid_smoke_no_criterion():
@@ -2442,3 +2468,308 @@ async def test_strategist_spawn_compute_experiment_arms_e2e(
     assert payload.get("declared_metric") == "val_loss"
     # A synthesized top-level command must also be present for the compute job.
     assert isinstance(payload.get("command"), str) and payload["command"]
+
+
+# --- pre-flight smoke gate ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_rejects_failing_command_before_full_provision(
+    db_session, monkeypatch, _quiet_compute_io
+):
+    """Pre-flight smoke gate: a command that dies on the DB-less substrate is
+    rejected before any full VM is provisioned.  backend.launch() must never be
+    called; the job must end up FAILED/SMOKE_FAILED."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.compute_backends import PreflightSmokeResult
+    from app.database import resolve_async_engine
+
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "command": "python3 -c 'import no_such_module'",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+        },
+    )
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 -c 'import no_such_module'",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    # Mock smoke to fail deterministically (no real subprocess needed).
+    monkeypatch.setattr(
+        compute_jobs,
+        "run_preflight_smoke",
+        AsyncMock(
+            return_value=PreflightSmokeResult(
+                startup_ok=False,
+                exit_code=1,
+                metric_captured=False,
+                declared_metric_value=None,
+                error_excerpt="ModuleNotFoundError: No module named 'no_such_module'",
+            )
+        ),
+    )
+
+    launch_called = []
+
+    class FakeBackend:
+        async def launch(self, spec):
+            launch_called.append(spec)
+            raise AssertionError("launch must not be called for smoke-failed jobs")
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            from app.compute_backends import ComputeCostResult
+
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            from app.compute_backends import ComputeStatusResult
+
+            return ComputeStatusResult(status=ComputeJobStatus.QUEUED)
+
+        async def terminate(self, persisted_job, *, reason):
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+
+    assert not launch_called, "backend.launch() must never be called for smoke-failed jobs"
+    assert job.status == ComputeJobStatus.FAILED
+    assert job.outcome == ComputeJobOutcome.SMOKE_FAILED
+    assert job.final_cost_usd == 0.0
+    assert "compute_preflight_smoke_failed" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_passing_command_proceeds_to_full_launch(
+    db_session, monkeypatch, _quiet_compute_io
+):
+    """Pre-flight smoke gate: a command that passes the smoke is allowed to
+    proceed to the normal full-VM provisioning path."""
+    from datetime import datetime
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.compute_backends import (
+        ComputeCostResult,
+        ComputeLaunchResult,
+        ComputeStatusResult,
+        PreflightSmokeResult,
+    )
+    from app.database import resolve_async_engine
+
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "command": "echo hello",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+        },
+    )
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hello",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    monkeypatch.setattr(
+        compute_jobs,
+        "run_preflight_smoke",
+        AsyncMock(
+            return_value=PreflightSmokeResult(
+                startup_ok=True,
+                exit_code=0,
+                metric_captured=True,
+                declared_metric_value=None,
+                error_excerpt="",
+            )
+        ),
+    )
+
+    launch_called = []
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "fake-vm-smoke-pass"
+
+        async def launch(self, spec):
+            launch_called.append(spec.job_id)
+            return ComputeLaunchResult(
+                external_id="fake-vm-smoke-pass",
+                started_at=datetime.utcnow(),
+                cost_rate_per_second=0.001,
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+
+        async def terminate(self, persisted_job, *, reason):
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    # Tick 1: smoke runs and passes; job NOT yet launched (waits for next tick).
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+    assert not launch_called, "launch must not be called on the smoke tick"
+    assert (job.polling_metadata or {}).get("preflight_smoke_done") is True
+    assert (job.polling_metadata or {}).get("preflight_smoke_status") == "passed"
+
+    # Tick 2: smoke already done; job proceeds to full provisioning.
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+    assert launch_called, "backend.launch() must be called after smoke passes"
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_failed_task_completion_route(
+    db_session, _quiet_compute_io
+):
+    """When a task's compute job has SMOKE_FAILED outcome, the completion handler
+    marks the task FAILED (not COMPLETED) and stamps compute_preflight_smoke_failed
+    as the failure_category — the gate must not treat SMOKE_FAILED as a measured
+    terminal result."""
+    from app.compute_jobs import build_compute_result_logs
+    from app.failure_classification import COMPUTE_PREFLIGHT_SMOKE_FAILED
+
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "command": "python3 -c 'import no_such_module'",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+        },
+    )
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 -c 'import no_such_module'",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    # Simulate a SMOKE_FAILED terminal state (as set by the monitor).
+    job.status = ComputeJobStatus.FAILED
+    job.outcome = ComputeJobOutcome.SMOKE_FAILED
+    job.final_cost_usd = 0.0
+    job.accrued_cost_usd = 0.0
+    job.terminal_reason = "compute_preflight_smoke_failed: exit 1"
+    db_session.add(job)
+    await db_session.commit()
+
+    logs = build_compute_result_logs(job)
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert (task.context or {}).get("failure_category") == COMPUTE_PREFLIGHT_SMOKE_FAILED
+
+
+# --- run_preflight_smoke unit tests (real executor, no mock) ------------------
+
+
+@pytest.mark.asyncio
+async def test_run_preflight_smoke_failing_command():
+    """run_preflight_smoke: a command that exits non-zero sets startup_ok=False."""
+    from app.compute_backends import run_preflight_smoke
+
+    result = await run_preflight_smoke("exit 42", timeout_seconds=10)
+    assert result.startup_ok is False
+    assert result.exit_code == 42
+    assert result.metric_captured is True  # no declared_metric -> always "captured"
+
+
+@pytest.mark.asyncio
+async def test_run_preflight_smoke_long_running_command_is_pass():
+    """run_preflight_smoke: a command that is still running at timeout is a PASS.
+
+    A GPU training command will never finish within the short smoke window; the
+    timeout (exit_code=None) must be treated as startup_ok=True, not a FAIL.
+    """
+    from app.compute_backends import run_preflight_smoke
+
+    # 'sleep 60' runs far beyond the 2 s timeout — should be treated as alive/passing.
+    result = await run_preflight_smoke("sleep 60", timeout_seconds=2)
+    assert result.startup_ok is True
+    assert result.exit_code is None  # timed out = still running
+    assert result.metric_captured is True  # no declared_metric -> always "captured"
+
+
+@pytest.mark.asyncio
+async def test_run_preflight_smoke_clean_exit_with_metric():
+    """run_preflight_smoke: clean exit with a valid result file captures the metric."""
+    from app.compute_backends import run_preflight_smoke
+
+    # Command writes the metric directly to the result file env var path.
+    cmd = "python3 -c \"import json,os; json.dump({'val_loss': 0.42}, open(os.environ['BLUEPRINT_RESULT_FILE'], 'w'))\""
+    result = await run_preflight_smoke(cmd, declared_metric="val_loss", timeout_seconds=10)
+    assert result.startup_ok is True
+    assert result.exit_code == 0
+    assert result.metric_captured is True
+    assert abs((result.declared_metric_value or 0) - 0.42) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_run_preflight_smoke_timeout_does_not_fail_on_declared_metric():
+    """run_preflight_smoke: a timeout with a declared metric must still be a PASS.
+
+    This covers the CRITICAL false-rejection: a GPU training command declares a
+    metric (e.g. val_loss) but cannot write the result file within the short smoke
+    window.  The timeout (exit_code=None) must not be counted as metric_captured=False.
+    The _run_and_apply_preflight_smoke caller gates the metric check on exit_code==0.
+    """
+    from app.compute_backends import run_preflight_smoke
+
+    # Command sleeps far past timeout so it never writes the result file.
+    result = await run_preflight_smoke(
+        "sleep 60", declared_metric="val_loss", timeout_seconds=2
+    )
+    assert result.startup_ok is True
+    assert result.exit_code is None
+    # metric_captured will be False (file not written), but the CALLER (compute_jobs)
+    # must not penalize this — it only checks metric when exit_code == 0.
+    assert result.metric_captured is False

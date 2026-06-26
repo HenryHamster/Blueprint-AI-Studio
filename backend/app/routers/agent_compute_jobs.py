@@ -54,6 +54,10 @@ class LaunchComputeJobRequest(BaseModel):
     # artifacts to be serving_confirmed before any job is created or reused.
     live_proof: bool | str | Dict[str, Any] | None = None
     live_proof_marker: str | None = Field(default=None, max_length=128)
+    # Optional setup step executed as `bash -lc <setup_step>` AFTER the repo
+    # clone and BEFORE the main command. On failure the job fails immediately
+    # with reason `setup_step_failed`; no main-command budget is consumed.
+    setup_step: str | None = Field(default=None, max_length=10000)
 
 
 @router.post("/compute-jobs")
@@ -121,6 +125,7 @@ async def launch_compute_job(
             accelerator=req.accelerator,
             live_proof=req.live_proof,
             live_proof_marker=req.live_proof_marker,
+            setup_step=req.setup_step,
         )
     except ComputeLaunchPreconditionFailed as exc:
         raise HTTPException(status_code=412, detail=exc.detail) from exc

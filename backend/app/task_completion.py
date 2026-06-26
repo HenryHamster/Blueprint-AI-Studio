@@ -3268,6 +3268,36 @@ async def _handle_compute_experiment_completion(
         task.context = crit_context
         flag_modified(task, "context")
 
+    # Fast-path: SMOKE_FAILED must never reach the gate as a "measured" result.
+    # _extract_compute_measurement returns ("SMOKE_FAILED", 0.0) for a zero-cost
+    # smoke-failed job — which would incorrectly pass the gate.  Intercept here
+    # and route to the failure path before the gate logic runs.
+    _early_meas = _extract_compute_measurement(logs)
+    if _early_meas is not None and _early_meas[0] == "SMOKE_FAILED":
+        from app.failure_classification import (  # noqa: PLC0415
+            COMPUTE_PREFLIGHT_SMOKE_FAILED,
+            persist_failure_category,
+        )
+
+        _smoke_reason = (
+            "compute_preflight_smoke_failed: command failed pre-flight smoke "
+            "on the DB-less substrate — no full VM was provisioned"
+        )
+        record_failed_gate(
+            task,
+            EvaluationVerdict(False, _smoke_reason, "compute-preflight-smoke"),
+        )
+        persist_failure_category(task, COMPUTE_PREFLIGHT_SMOKE_FAILED)
+        logger.info(
+            "[COMPUTE] Task %s FAILED at pre-flight smoke (no full VM provisioned)",
+            task.id,
+        )
+        await _spawn_act_on_verdict_followon(session, task, {}, logs, failure_mode=True)
+        await _finalize_compute_experiment(
+            session, task, TaskStatus.FAILED, logs, criterion, owns_commit=owns_commit
+        )
+        return
+
     acceptance_evidence = read_acceptance_evidence(task.first_payload)
     requires_durable_artifact = bool(
         (task.first_payload or {}).get("require_durable_artifact")

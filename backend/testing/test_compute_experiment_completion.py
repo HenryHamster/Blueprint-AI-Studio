@@ -2108,7 +2108,8 @@ async def test_lifecycle_success_completes_through_task(
         expire_on_commit=False,
         class_=AsyncSession,
     )
-    # Two passes: STARTING→launch, then RUNNING→poll-to-terminal.
+    # Three passes: pre-flight smoke, STARTING→launch, RUNNING→poll-to-terminal.
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
     await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
     await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
     await db_session.refresh(job)
