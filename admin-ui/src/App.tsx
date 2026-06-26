@@ -508,9 +508,6 @@ export default function App() {
   const activeTab: PrimaryTab = s.activeTab;
   const handleTabChange = (tab: PrimaryTab) => {
     s.setActiveTab(tab);
-    if (tab === 'board' && s.viewMode === 'home') {
-      s.setViewMode('kanban');
-    }
   };
 
   if (s.authLoading) {
@@ -601,8 +598,6 @@ export default function App() {
         onUpdateNotifyOnHighSignalMessage={s.setNotifyOnHighSignalMessage}
         onSetViewMode={(mode) => {
           s.setViewMode(mode);
-          if (mode === 'home') s.setActiveTab('home');
-          else s.setActiveTab('board');
         }}
         showResearchBrowser={s.showResearchBrowser}
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
@@ -932,21 +927,23 @@ export default function App() {
         </ErrorBoundary>
       ) : (
         <>
-          {/* Board view mode sub-tabs + Research/Knowledge toolbar buttons */}
+          {/* Board toolbar: segmented Kanban|Pipeline toggle + Research/Knowledge buttons */}
           <div className="flex items-center gap-1 shrink-0 mb-1">
-            {(['kanban', 'pipeline'] as const).map(mode => (
-              <button
-                key={mode}
-                onClick={() => s.setViewMode(mode)}
-                className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
-                  s.viewMode === mode
-                    ? 'bg-neutral-800 text-neutral-100'
-                    : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
-                }`}
-              >
-                {mode.charAt(0).toUpperCase() + mode.slice(1)}
-              </button>
-            ))}
+            <div className="flex bg-neutral-900 border border-neutral-800 rounded-md p-0.5 shrink-0" role="group" aria-label="Board view">
+              {(['kanban', 'pipeline'] as const).map(mode => (
+                <button
+                  key={mode}
+                  onClick={() => s.setViewMode(mode)}
+                  className={`px-3 py-0.5 rounded text-xs font-medium transition-colors ${
+                    s.viewMode === mode
+                      ? 'bg-neutral-700 text-neutral-100 shadow-sm'
+                      : 'text-neutral-500 hover:text-neutral-300'
+                  }`}
+                >
+                  {mode.charAt(0).toUpperCase() + mode.slice(1)}
+                </button>
+              ))}
+            </div>
             <div className="flex-1" />
             {/* eslint-disable-next-line viewport/min-touch-target */}
             <button
