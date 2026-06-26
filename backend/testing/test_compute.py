@@ -12120,6 +12120,66 @@ async def test_create_compute_job_registry_auth_no_password_persists_server_user
     assert persisted_auth == {"server": "nvcr.io", "username": "$oauthtoken"}
 
 
+@pytest.mark.asyncio
+async def test_create_compute_job_registry_auth_password_accepted_for_runner_subprocess(
+    db_session, monkeypatch
+):
+    """create_compute_job must persist server+username+password when the backend
+    is runner-subprocess — the runner needs the credential to docker login."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Runner Auth Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        container_registry_auth={
+            "server": "nvcr.io",
+            "username": "$oauthtoken",
+            "password": "s3cr3t-ngc-api-key",
+        },
+    )
+
+    assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+    persisted_auth = (job.polling_metadata or {}).get("container_registry_auth")
+    assert persisted_auth is not None
+    assert persisted_auth["server"] == "nvcr.io"
+    assert persisted_auth["username"] == "$oauthtoken"
+    assert persisted_auth["password"] == "s3cr3t-ngc-api-key"
+
+
 # ── Runner-subprocess backend tests ──────────────────────────────────────────
 
 

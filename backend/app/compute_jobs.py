@@ -444,24 +444,38 @@ async def create_compute_job(
         polling_metadata["container_image"] = container_image
         if container_registry_auth and isinstance(container_registry_auth, dict):
             if container_registry_auth.get("password"):
-                raise ValueError(
-                    "container_registry_auth.password cannot be delivered to the "
-                    "compute backend in the orchestrated path — the password is "
-                    "never persisted, and there is no re-attachment channel at "
-                    "launch time (unlike repo tokens, which are freshly minted). "
-                    "Use a container image in a public registry or one accessible "
-                    "via the VM's service-account identity (e.g. Artifact Registry "
-                    "with Workload Identity). Omit the password field or use a "
-                    "public image to proceed."
-                )
-            # Persist only server + username — password is never written to the row.
-            registry_meta: dict[str, str] = {}
-            if container_registry_auth.get("server"):
-                registry_meta["server"] = str(container_registry_auth["server"])
-            if container_registry_auth.get("username"):
-                registry_meta["username"] = str(container_registry_auth["username"])
-            if registry_meta:
+                if normalized_backend != RUNNER_SUBPROCESS_BACKEND_NAME:
+                    raise ValueError(
+                        "container_registry_auth.password cannot be delivered to the "
+                        "compute backend in the orchestrated path — the password is "
+                        "never persisted, and there is no re-attachment channel at "
+                        "launch time (unlike repo tokens, which are freshly minted). "
+                        "Use a container image in a public registry or one accessible "
+                        "via the VM's service-account identity (e.g. Artifact Registry "
+                        "with Workload Identity). Omit the password field or use a "
+                        "public image to proceed."
+                    )
+                # Runner-subprocess backend: persist full auth (server + username +
+                # password) so the runner can docker login before pulling the image.
+                # The password lives only in this row's JSONB and is scoped to the
+                # runner-subprocess pull path — never sent to GCP or logged.
+                registry_meta: dict[str, str] = {}
+                if container_registry_auth.get("server"):
+                    registry_meta["server"] = str(container_registry_auth["server"])
+                if container_registry_auth.get("username"):
+                    registry_meta["username"] = str(container_registry_auth["username"])
+                registry_meta["password"] = str(container_registry_auth["password"])
                 polling_metadata["container_registry_auth"] = registry_meta
+            else:
+                # No password: persist only server + username — password is never
+                # written to the row for non-runner backends.
+                registry_meta = {}
+                if container_registry_auth.get("server"):
+                    registry_meta["server"] = str(container_registry_auth["server"])
+                if container_registry_auth.get("username"):
+                    registry_meta["username"] = str(container_registry_auth["username"])
+                if registry_meta:
+                    polling_metadata["container_registry_auth"] = registry_meta
     if live_release_evidence is not None:
         polling_metadata[_LIVE_PROOF_METADATA_KEY] = live_release_evidence
     if runner_target_id is not None:

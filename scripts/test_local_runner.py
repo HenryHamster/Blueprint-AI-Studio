@@ -936,5 +936,186 @@ class TestGpuDetection(unittest.TestCase):
         self.assertEqual(posted_bodies[0]["gpu_names"], ["Tesla T4"])
 
 
+# ── Docker login helper ───────────────────────────────────────────────────────
+
+class TestDockerLogin(unittest.TestCase):
+    def test_docker_login_called_when_auth_has_password(self):
+        """_docker_login calls subprocess.run with docker login args when password present."""
+        captured = {}
+
+        def fake_run(cmd, *, input=None, capture_output=False, timeout=None):
+            captured["cmd"] = cmd
+            captured["input"] = input
+            m = MagicMock()
+            m.returncode = 0
+            m.stderr = b""
+            return m
+
+        result = local_runner._docker_login(
+            {"server": "nvcr.io", "username": "$oauthtoken", "password": "mykey"},
+            _subprocess_run=fake_run,
+        )
+        self.assertTrue(result)
+        self.assertIn("docker", captured["cmd"])
+        self.assertIn("login", captured["cmd"])
+        self.assertIn("--password-stdin", captured["cmd"])
+        self.assertIn("nvcr.io", captured["cmd"])
+        self.assertIn("--username", captured["cmd"])
+        self.assertEqual(captured["input"], b"mykey")
+
+    def test_docker_login_skipped_when_no_password(self):
+        """_docker_login returns True immediately when no password is present."""
+        called = []
+
+        def fake_run(*args, **kwargs):
+            called.append(True)
+            m = MagicMock()
+            m.returncode = 0
+            m.stderr = b""
+            return m
+
+        result = local_runner._docker_login(
+            {"server": "nvcr.io", "username": "user"},
+            _subprocess_run=fake_run,
+        )
+        self.assertTrue(result)
+        self.assertEqual(called, [], "subprocess.run must NOT be called when no password")
+
+    def test_docker_login_failure_returns_false(self):
+        """_docker_login returns False when docker login exits non-zero."""
+        def fake_run(*args, **kwargs):
+            m = MagicMock()
+            m.returncode = 1
+            m.stderr = b"unauthorized: incorrect credentials"
+            return m
+
+        result = local_runner._docker_login(
+            {"server": "nvcr.io", "username": "u", "password": "bad"},
+            _subprocess_run=fake_run,
+        )
+        self.assertFalse(result)
+
+    def test_docker_login_timeout_returns_false(self):
+        """_docker_login returns False when subprocess times out."""
+        def fake_run(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="docker", timeout=60)
+
+        result = local_runner._docker_login(
+            {"server": "nvcr.io", "username": "u", "password": "pw"},
+            _subprocess_run=fake_run,
+        )
+        self.assertFalse(result)
+
+    def test_container_image_with_registry_auth_calls_login_before_run(self):
+        """_run_compute_job calls docker login before docker run when password present."""
+        subprocess_calls = []
+
+        class FakeProc:
+            pid = 7777
+            stdout = MagicMock()
+
+            def wait(self, timeout=None):
+                return 0
+
+            def terminate(self):
+                pass
+
+        fake_proc = FakeProc()
+        fake_proc.stdout.read.return_value = b""
+
+        def fake_popen(args, **kwargs):
+            subprocess_calls.append(("popen", list(args)))
+            return fake_proc
+
+        login_calls = []
+
+        def fake_docker_login(auth, **kwargs):
+            login_calls.append(auth)
+            return True
+
+        def fake_report(*a, **kw):
+            return False
+
+        job = {
+            "job_id": "auth-job-001",
+            "command": "python3 train.py",
+            "env": {},
+            "cwd": None,
+            "setup_step": None,
+            "container_image": "nvcr.io/nvidia/pytorch:latest",
+            "container_registry_auth": {
+                "server": "nvcr.io",
+                "username": "$oauthtoken",
+                "password": "ngc-key-abc",
+            },
+            "runtime_deadline_seconds": None,
+            "cancel_requested": False,
+            "repo_clone": None,
+            "repo_token": None,
+        }
+        active_jobs: set = {"auth-job-001"}
+        lock = threading.Lock()
+
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(local_runner, "_docker_login", fake_docker_login), \
+             patch("subprocess.Popen", side_effect=fake_popen), \
+             patch.object(local_runner, "_detect_runner_gpu", return_value=False):
+            local_runner._run_compute_job(job, "https://api.example.com", "tok",
+                                          active_jobs, lock)
+
+        self.assertEqual(len(login_calls), 1, "docker login must be called once")
+        self.assertEqual(login_calls[0]["server"], "nvcr.io")
+        self.assertEqual(login_calls[0]["password"], "ngc-key-abc")
+        docker_run_calls = [c for c in subprocess_calls if c[0] == "popen"]
+        self.assertTrue(docker_run_calls, "docker run must be called after login")
+        self.assertIn("docker", docker_run_calls[0][1])
+
+    def test_docker_login_failure_reports_failed_and_skips_docker_run(self):
+        """When docker login fails, the job reports failed and docker run is not called."""
+        popen_calls = []
+
+        def fake_popen(args, **kwargs):
+            popen_calls.append(args)
+            raise AssertionError("docker run must not be called after login failure")
+
+        reports = []
+
+        def fake_report(orch_url, token, job_id, *, exec_status, **kwargs):
+            reports.append(exec_status)
+            return False
+
+        def fake_docker_login(auth, **kwargs):
+            return False  # login fails
+
+        job = {
+            "job_id": "auth-fail-002",
+            "command": "python3 train.py",
+            "env": {},
+            "cwd": None,
+            "setup_step": None,
+            "container_image": "nvcr.io/nvidia/pytorch:latest",
+            "container_registry_auth": {
+                "server": "nvcr.io",
+                "username": "$oauthtoken",
+                "password": "bad-key",
+            },
+            "runtime_deadline_seconds": None,
+            "cancel_requested": False,
+            "repo_clone": None,
+            "repo_token": None,
+        }
+        active_jobs: set = {"auth-fail-002"}
+        lock = threading.Lock()
+
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(local_runner, "_docker_login", fake_docker_login), \
+             patch("subprocess.Popen", side_effect=fake_popen):
+            local_runner._run_compute_job(job, "https://api.example.com", "tok",
+                                          active_jobs, lock)
+
+        self.assertIn("failed", reports)
+        self.assertEqual(popen_calls, [], "docker run must not be called on login failure")
+
+
 if __name__ == "__main__":
     unittest.main()

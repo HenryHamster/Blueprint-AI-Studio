@@ -181,6 +181,51 @@ def _heartbeat_loop(orchestrator_url: str, token: str, active_tasks: dict, lock:
 
 # ── Compute-job execution ─────────────────────────────────────────────────────
 
+def _docker_login(auth: dict, *, _subprocess_run=None) -> bool:
+    """Run `docker login` using the credentials in *auth*.
+
+    Returns True on success, False on any failure (non-zero exit, missing
+    required fields, subprocess error).  Auth must contain at least a
+    ``password`` key; ``server`` and ``username`` are optional but should
+    normally be present for private registries.
+
+    ``_subprocess_run`` is an optional override for the subprocess.run call,
+    provided so tests can inject a fake without monkey-patching the global.
+    """
+    password = auth.get("password") or ""
+    if not password:
+        return True  # nothing to log in to
+
+    server = auth.get("server") or ""
+    username = auth.get("username") or ""
+    _run = _subprocess_run if _subprocess_run is not None else subprocess.run
+
+    cmd = ["docker", "login", "--password-stdin"]
+    if username:
+        cmd += ["--username", username]
+    if server:
+        cmd.append(server)
+
+    try:
+        result = _run(
+            cmd,
+            input=password.encode(),
+            capture_output=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", "replace")[:500]
+            print(f"[compute] docker login failed (exit={result.returncode}): {stderr}", flush=True)
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        print("[compute] docker login timed out", flush=True)
+        return False
+    except Exception as exc:
+        print(f"[compute] docker login error: {exc}", flush=True)
+        return False
+
+
 def _detect_runner_gpu() -> bool:
     """Return True if a local NVIDIA GPU is present via nvidia-smi."""
     try:
@@ -331,6 +376,13 @@ def _run_compute_job(
 
         # Build command args — containerized or bare
         if container_image:
+            # Authenticate with the registry before pulling, if credentials provided.
+            if container_registry_auth.get("password"):
+                if not _docker_login(container_registry_auth):
+                    _report_compute_job(orchestrator_url, token, job_id,
+                                        exec_status="failed", exit_code=1)
+                    return
+
             gpus = _detect_runner_gpu()
             container_result_file = f"{_RUNNER_CONTAINER_OUT_DIR}/result.json"
             container_artifact_dir = f"{_RUNNER_CONTAINER_OUT_DIR}/artifacts"
