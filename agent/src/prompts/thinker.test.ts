@@ -1286,3 +1286,53 @@ describe('spawn-fix allowlist sync', () => {
     expect(prompt).not.toMatch(/`spawn-fix`[^)]*types[^)]*`fix`/);
   });
 });
+
+describe('buildThinkerPrompt stabilize-hardening guidance', () => {
+  const base: ThinkerPromptParams = {
+    contextPrefix: '',
+    projectName: 'Test Project',
+    clockHeader: '',
+    isSelfRepo: false,
+    userStateLine: '',
+    packerMetaSection: '',
+    strategicContext: '',
+    problemModelSection: '',
+    problemModelRecovery: 'empty',
+    reflectionSection: '',
+    selfImprovementBlock: '',
+    runningUpdateSection: '',
+    designDocJson: '',
+    visionJson: '',
+    outcomeSection: '',
+    previousDecisionOutcomes: '',
+    pastRetirementCritiquesSection: '',
+    retiredDirectionsSummarySection: '',
+    dirSummaryText: '',
+    dirHealthSummary: '',
+    userPausedSection: '',
+    rejectedProposalsSection: '',
+    operatorOverridesSection: '',
+    portfolioCompositionText: '',
+    modelHealthSection: '',
+    systemMaturitySection: '',
+    driftSection: '',
+    recentWorkSection: '',
+    feedbackSection: '',
+    questionSection: '',
+    threadSection: '',
+    taskId: 'test-task',
+    versionPhaseSection: '',
+    memoCitationsSection: '',
+    efficiencySnapshotSection: '',
+  };
+
+  it('instructs that stabilize is hardening time (not idle) and to commission an audit rather than hold', () => {
+    const prompt = buildThinkerPrompt(base);
+    // Stabilize must be framed as active hardening, not idling.
+    expect(prompt).toContain('Stabilize is hardening time, not idle time');
+    expect(prompt).toContain('NOT license to stop opening directions');
+    // The fix steers the strategist to go find work via an audit instead of holding.
+    expect(prompt).toContain('Commission an audit');
+    expect(prompt).toContain('do not manufacture lanes');
+  });
+});
