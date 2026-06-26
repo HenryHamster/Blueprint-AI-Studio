@@ -422,6 +422,7 @@ export function DirectionsPanel({ addToast, onViewFindings, onViewKnowledge, onN
                 projectId={selectedProjectId}
                 problemModel={data.problemModel}
                 selfReflectionLog={data.selfReflectionLog}
+                currentVersion={data.currentVersion}
                 addToast={addToast}
                 onUpdated={data.setProblemModel}
               />

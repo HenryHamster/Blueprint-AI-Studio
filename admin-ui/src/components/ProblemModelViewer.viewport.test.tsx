@@ -392,4 +392,177 @@ describe('ProblemModelViewer — viewport regression', () => {
       });
     });
   });
+
+  test('pending confirmations sort blocking types first and cap at 3 with show-more', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.height = '800px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProblemModelViewer
+          problemModel={makeProblemModel({
+            pending_user_confirmation: [
+              { id: 'p-1', type: 'major_decision', proposal: 'Decision A' },
+              { id: 'p-2', type: 'credentials_needed', proposal: 'Credentials B' },
+              { id: 'p-3', type: 'intent_change', proposal: 'Intent C' },
+              { id: 'p-4', type: 'access_needed', proposal: 'Access D' },
+            ],
+          })}
+          {...defaultProps}
+        />
+      );
+    });
+    // Only 3 visible items initially; credentials and access sort first
+    expect(host.textContent).toContain('Credentials B');
+    expect(host.textContent).toContain('Access D');
+    // Fourth item hidden behind show-more
+    expect(host.textContent).not.toContain('Decision A');
+    expect(host.textContent).toContain('Show 1 more');
+  });
+
+  test('renders user_purpose field when present', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProblemModelViewer
+          problemModel={makeProblemModel({
+            intent: {
+              purpose: 'Agent purpose text',
+              current_focus: 'Current focus text',
+              user_purpose: 'Operator-written statement of project intent',
+            },
+          })}
+          {...defaultProps}
+        />
+      );
+    });
+    expect(host.textContent).toContain('Operator purpose');
+    expect(host.textContent).toContain('Operator-written statement of project intent');
+  });
+
+  test('renders version goal strip when currentVersion is provided', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProblemModelViewer
+          problemModel={makeProblemModel()}
+          currentVersion={{
+            version_number: 5,
+            phase: 'open',
+            phase_changed_at: null,
+            phase_reasoning: null,
+            goal: 'Ship container-aware compute execution end-to-end',
+            goal_updated_at: '2026-06-01T10:00:00Z',
+            goal_editor_info: null,
+            live_current_focus: 'Ship container-aware compute execution end-to-end',
+            opened_at: '2026-05-30T00:00:00Z',
+            qualification_attempts: 0,
+            merged_task_count: 3,
+            last_qualification: null,
+          }}
+          {...defaultProps}
+        />
+      );
+    });
+    expect(host.textContent).toContain('Version goal');
+    expect(host.textContent).toContain('Ship container-aware compute execution end-to-end');
+  });
+
+  test('renders no-goal state when currentVersion has null goal', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProblemModelViewer
+          problemModel={makeProblemModel()}
+          currentVersion={{
+            version_number: 5,
+            phase: 'open',
+            phase_changed_at: null,
+            phase_reasoning: null,
+            goal: null,
+            goal_updated_at: null,
+            goal_editor_info: null,
+            live_current_focus: null,
+            opened_at: '2026-05-30T00:00:00Z',
+            qualification_attempts: 0,
+            merged_task_count: 0,
+            last_qualification: null,
+          }}
+          {...defaultProps}
+        />
+      );
+    });
+    expect(host.textContent).toContain('Version goal');
+    expect(host.textContent).toContain('No version goal set yet');
+  });
+
+  test('renders goal-drift indicator when live focus diverges from goal', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProblemModelViewer
+          problemModel={makeProblemModel()}
+          currentVersion={{
+            version_number: 5,
+            phase: 'open',
+            phase_changed_at: null,
+            phase_reasoning: null,
+            goal: 'Original version goal text',
+            goal_updated_at: '2026-06-01T10:00:00Z',
+            goal_editor_info: null,
+            live_current_focus: 'Focus has since changed to something different',
+            opened_at: '2026-05-30T00:00:00Z',
+            qualification_attempts: 0,
+            merged_task_count: 5,
+            last_qualification: null,
+          }}
+          {...defaultProps}
+        />
+      );
+    });
+    expect(host.textContent).toContain('Goal has drifted from live focus');
+    expect(host.textContent).toContain('Focus has since changed to something different');
+  });
+
+  test('version goal section absent when currentVersion is not provided', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <ProblemModelViewer
+          problemModel={makeProblemModel()}
+          {...defaultProps}
+        />
+      );
+    });
+    expect(host.textContent).not.toContain('Version goal');
+    expect(host.textContent).not.toContain('No version goal set yet');
+  });
 });

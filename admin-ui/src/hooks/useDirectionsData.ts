@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { apiFetch, fetchVersionLifecycle } from '../api';
+import type { CurrentVersion } from '../api';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { useDirectionForm } from './useDirectionForm';
 import { useAutonomousConfig } from './useAutonomousConfig';
@@ -41,6 +42,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
   // version" affordance: staging requires an open version (the backend stamps
   // staged_for_version from it and 404s when none is open).
   const [openVersionNumber, setOpenVersionNumber] = useState<number | null>(null);
+  const [currentVersion, setCurrentVersion] = useState<CurrentVersion | null>(null);
 
   // Error feedback
   const [error, setError] = useState<string | null>(null);
@@ -145,6 +147,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       if (versionLifecyclePromise) {
         const lifecycle = await versionLifecyclePromise;
         setOpenVersionNumber(lifecycle?.current_version?.version_number ?? null);
+        setCurrentVersion(lifecycle?.current_version ?? null);
       }
     } catch (err) {
       console.error('Failed to fetch directions:', err);
@@ -501,6 +504,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     runningUpdateReconciliation,
     selfReflectionLog,
     openVersionNumber,
+    currentVersion,
     error,
     setError,
     researchingIds,

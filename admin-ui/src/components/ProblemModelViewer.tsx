@@ -1,15 +1,16 @@
 import { useState } from 'react';
-import { Pencil, ChevronDown, ChevronRight, AlertCircle, Target, Box, CheckCircle2, Circle, Clock, Flag, X } from 'lucide-react';
+import { Pencil, ChevronDown, ChevronRight, AlertCircle, Target, Box, CheckCircle2, Circle, Clock, Flag, GitBranch } from 'lucide-react';
 import { timeAgo } from '../utils/time';
 import { MarkdownContent } from './MarkdownContent';
 import { ProblemModelEditor } from './ProblemModelEditor';
+import { PendingConfirmationList } from './ProblemModelAttention';
 import { dismissPendingConfirmation } from '../api';
+import type { CurrentVersion } from '../api';
 import type {
   ProblemModel,
   Gap,
   Capability,
   Friction,
-  PendingConfirmation,
   ProblemModelPatch,
   Source,
   SelfReflectionEntry,
@@ -20,6 +21,7 @@ interface ProblemModelViewerProps {
   projectId: string;
   problemModel: ProblemModel;
   selfReflectionLog?: SelfReflectionEntry[];
+  currentVersion?: CurrentVersion | null;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onUpdated: (patched: ProblemModel) => void;
 }
@@ -46,13 +48,6 @@ const sizeColors: Record<string, string> = {
   small: 'text-neutral-500',
   medium: 'text-neutral-400',
   large: 'text-neutral-300',
-};
-
-const pendingTypeLabels: Record<string, string> = {
-  credentials_needed: 'Credentials needed',
-  access_needed: 'Access needed',
-  intent_change: 'Intent change',
-  major_decision: 'Major decision',
 };
 
 const proofStatusLabels: Record<string, string> = {
@@ -86,11 +81,16 @@ function SourceBadge({ source }: { source: Source }) {
   );
 }
 
-function SectionHeader({ children, icon, count }: { children: React.ReactNode; icon?: React.ReactNode; count?: number }) {
+function SectionHeader({ children, icon, count, amberCount }: { children: React.ReactNode; icon?: React.ReactNode; count?: number; amberCount?: number }) {
   return (
     <div className="flex items-center gap-2 mb-2 mt-4 first:mt-0">
       {icon && <span className="text-neutral-500">{icon}</span>}
       <h3 className="text-sm font-semibold text-neutral-200 uppercase tracking-wide">{children}</h3>
+      {typeof amberCount === 'number' && (
+        <span className="ml-1 px-1.5 py-0.5 text-xs font-semibold rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
+          {amberCount}
+        </span>
+      )}
       {typeof count === 'number' && (
         <span className="text-xs text-neutral-500">({count})</span>
       )}
@@ -235,53 +235,6 @@ function FrictionRow({ friction }: { friction: Friction }) {
   );
 }
 
-function PendingConfirmationRow({
-  pending,
-  onDismiss,
-}: {
-  pending: PendingConfirmation;
-  onDismiss?: () => void;
-}) {
-  const [dismissing, setDismissing] = useState(false);
-  return (
-    <div className="border border-amber-500/40 rounded-md p-3 bg-amber-500/5">
-      <div className="flex items-start gap-2">
-        <AlertCircle size={14} className="text-amber-400 shrink-0 mt-0.5" />
-        <div className="flex-1 min-w-0">
-          <div className="flex items-baseline gap-2 mb-1">
-            <span className="text-xs font-semibold text-amber-300 uppercase tracking-wide">
-              {pendingTypeLabels[pending.type] || pending.type}
-            </span>
-            <span className="text-ui-sm font-mono text-neutral-600">{pending.id}</span>
-          </div>
-          <p className="text-sm text-neutral-100">{pending.proposal}</p>
-          {pending.rationale && (
-            <p className="text-xs text-neutral-400 mt-1">{pending.rationale}</p>
-          )}
-          {pending.created_at && (
-            <p className="text-ui-sm text-neutral-500 mt-1">{timeAgo(pending.created_at)}</p>
-          )}
-        </div>
-        {onDismiss && (
-          <button
-            type="button"
-            disabled={dismissing}
-            onClick={async () => {
-              setDismissing(true);
-              try { await onDismiss(); } finally { setDismissing(false); }
-            }}
-            className="shrink-0 inline-flex items-center gap-1 px-2 py-1 min-h-[44px] md:min-h-0 text-xs font-medium rounded border border-neutral-700 bg-neutral-800/50 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100 transition disabled:opacity-50"
-            title="Mark as resolved"
-          >
-            <X size={11} />
-            Resolve
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
 function SelfReflectionCard({ entry }: { entry: SelfReflectionEntry }) {
   return (
     <div className="border border-neutral-800 rounded-md p-3 bg-neutral-900/30 space-y-2">
@@ -317,6 +270,7 @@ export default function ProblemModelViewer({
   projectId,
   problemModel,
   selfReflectionLog = [],
+  currentVersion,
   addToast,
   onUpdated,
 }: ProblemModelViewerProps) {
@@ -335,8 +289,9 @@ export default function ProblemModelViewer({
   const lastUpdated = problemModel.last_updated ?? '';
   const lastUpdatedBy = problemModel.last_updated_by ?? null;
 
-  const isEmpty = !intent.purpose && !intent.current_focus && constraints.length === 0
-    && capabilities.length === 0 && gaps.length === 0 && friction.length === 0;
+  const isEmpty = !intent.purpose && !intent.user_purpose && !intent.current_focus
+    && constraints.length === 0 && capabilities.length === 0
+    && gaps.length === 0 && friction.length === 0;
 
   // Group capabilities by status for a cleaner visual grouping
   const capsByStatus = capabilities.reduce<Record<string, Capability[]>>((acc, cap) => {
@@ -354,6 +309,8 @@ export default function ProblemModelViewer({
   const hasContextFields = Boolean(
     context.project_type || context.users || context.team || context.deploy_cadence || context.notes
   );
+
+  const hasIntent = Boolean(intent.purpose || intent.user_purpose || intent.current_focus);
 
   return (
     <div className="flex flex-col h-full">
@@ -390,37 +347,32 @@ export default function ProblemModelViewer({
           </div>
         )}
 
-        {/* Pending confirmations — visually prominent when present */}
+        {/* Pending confirmations — calm rows, amber used once per row (left accent) */}
         {pending.length > 0 && (
           <section>
-            <SectionHeader icon={<AlertCircle size={14} />} count={pending.length}>
+            <SectionHeader icon={<AlertCircle size={14} />} amberCount={pending.length}>
               Needs your attention
             </SectionHeader>
-            <div className="space-y-2">
-              {pending.map((p) => (
-                <PendingConfirmationRow
-                  key={p.id}
-                  pending={p}
-                  onDismiss={async () => {
-                    try {
-                      await dismissPendingConfirmation(projectId, p.id);
-                      onUpdated({
-                        ...problemModel,
-                        pending_user_confirmation: pending.filter((x) => x.id !== p.id),
-                        revision: (problemModel.revision ?? 0) + 1,
-                      });
-                    } catch {
-                      addToast('Failed to dismiss — try again', 'error');
-                    }
-                  }}
-                />
-              ))}
-            </div>
+            <PendingConfirmationList
+              pending={pending}
+              onDismiss={async (id) => {
+                try {
+                  await dismissPendingConfirmation(projectId, id);
+                  onUpdated({
+                    ...problemModel,
+                    pending_user_confirmation: pending.filter((x) => x.id !== id),
+                    revision: (problemModel.revision ?? 0) + 1,
+                  });
+                } catch {
+                  addToast('Failed to dismiss — try again', 'error');
+                }
+              }}
+            />
           </section>
         )}
 
         {/* Intent */}
-        {(intent.purpose || intent.current_focus) && (
+        {hasIntent && (
           <section>
             <SectionHeader icon={<Flag size={14} />}>Intent</SectionHeader>
             {intent.purpose && (
@@ -429,11 +381,49 @@ export default function ProblemModelViewer({
                 <p className="text-sm text-neutral-200">{intent.purpose}</p>
               </div>
             )}
+            {intent.user_purpose && (
+              <div className="mb-2">
+                <h4 className="text-xs text-neutral-500 uppercase tracking-wide mb-0.5">Operator purpose</h4>
+                <p className="text-sm text-neutral-200">{intent.user_purpose}</p>
+              </div>
+            )}
             {intent.current_focus && (
               <div>
                 <h4 className="text-xs text-neutral-500 uppercase tracking-wide mb-0.5">Current focus</h4>
                 <p className="text-sm text-neutral-200">{intent.current_focus}</p>
               </div>
+            )}
+          </section>
+        )}
+
+        {/* Version goal strip — threaded from version-lifecycle, no new fetch */}
+        {currentVersion != null && (
+          <section>
+            <SectionHeader icon={<GitBranch size={14} />}>Version goal</SectionHeader>
+            {currentVersion.goal ? (
+              <div className="flex flex-col gap-1">
+                <p className="text-sm text-neutral-200" title={currentVersion.goal}>
+                  {currentVersion.goal}
+                </p>
+                {currentVersion.goal_updated_at && (
+                  <p className="text-ui-sm text-neutral-500">
+                    {currentVersion.goal_editor_info && <span>{currentVersion.goal_editor_info} </span>}
+                    {timeAgo(currentVersion.goal_updated_at)}
+                  </p>
+                )}
+                {currentVersion.live_current_focus && currentVersion.live_current_focus !== currentVersion.goal && (
+                  <div className="flex flex-col gap-1 pt-1 border-t border-amber-500/20">
+                    <p className="text-ui-sm px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                      Goal has drifted from live focus
+                    </p>
+                    <p className="text-ui-sm text-neutral-400" title={currentVersion.live_current_focus}>
+                      <span className="text-neutral-600">Live focus: </span>{currentVersion.live_current_focus}
+                    </p>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <p className="text-xs text-neutral-600 italic">No version goal set yet.</p>
             )}
           </section>
         )}
