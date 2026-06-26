@@ -41,8 +41,8 @@
     "research_completion.py": 6400,
     "research_scope_calibration.py": 650,
     "findings_index.py": 350,
-    "strategic_completion.py": 5300,
-    "rollup_management.py": 4800,
+    "strategic_completion.py": 6200,
+    "rollup_management.py": 5550,
     "rollup_migration_validation.py": 1100,
     "reaper.py": 3650,
     "reaper_sweeps.py": 2550,
@@ -206,6 +206,7 @@
     "components/ImprovementLanesPanel.tsx": 1150,
     "components/DirectionPortfolioSection.tsx": 1100,
     "components/HeaderBar.tsx": 1100,
-    "components/ResearchBrowser.tsx": 1050
+    "components/ResearchBrowser.tsx": 1050,
+    "components/ComputeJobsPanel.tsx": 1750
   }
 }

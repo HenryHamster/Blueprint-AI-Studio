@@ -62,6 +62,8 @@ from app.strategic_completion import (
     _spawn_retirement_memos,
     _strategic_event_completion_summary,
     _compute_model_gc_telemetry,
+    record_retired_direction_memory,
+    _check_gap_respawn_block,
 )
 from app.strategic_spawning import (
     _build_previous_decision_outcomes,
@@ -1155,6 +1157,201 @@ class TestIsDirectionDuplicate:
         ]
         # Overlap: migrate, authentication, service, oauth, token = 5 >= 4 → True
         assert _is_direction_duplicate(proposal, existing, []) is True
+
+
+# ── record_retired_direction_memory + _check_gap_respawn_block ───────────────
+
+
+class TestRecordRetiredDirectionMemory:
+    def test_records_entry_with_gap_id(self):
+        vision: dict = {}
+        d = {
+            "id": "d-abc",
+            "text": "model gc garbage collection optimize performance",
+            "gap_id": "g-model-gc",
+        }
+        record_retired_direction_memory(vision, d, reason="strategic_retire")
+        entries = vision["_recently_retired_directions"]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["id"] == "d-abc"
+        assert entry["gap_id"] == "g-model-gc"
+        assert entry["reason"] == "strategic_retire"
+        assert "model" in entry["text_tokens"]
+        assert "gc" in entry["text_tokens"]
+        assert "retired_at" in entry
+
+    def test_records_entry_without_gap_id(self):
+        vision: dict = {}
+        d = {"id": "d-xyz", "text": "cache layer optimization database"}
+        record_retired_direction_memory(vision, d, reason="auto_completed")
+        entry = vision["_recently_retired_directions"][0]
+        assert "gap_id" not in entry
+        assert entry["reason"] == "auto_completed"
+
+    def test_fifo_eviction_at_cap(self):
+        from app.strategic_completion import _RETIRED_MEMORY_CAP
+
+        vision: dict = {
+            "_recently_retired_directions": [
+                {"id": f"d-{i}", "text_tokens": [], "retired_at": "2026-01-01T00:00:00", "reason": "r"}
+                for i in range(_RETIRED_MEMORY_CAP)
+            ]
+        }
+        d = {"id": "d-new", "text": "unique new direction text"}
+        record_retired_direction_memory(vision, d, reason="strategic_retire")
+        entries = vision["_recently_retired_directions"]
+        assert len(entries) == _RETIRED_MEMORY_CAP
+        # Newest entry is last; oldest (d-0) was evicted
+        assert entries[-1]["id"] == "d-new"
+        assert all(e["id"] != "d-0" for e in entries)
+
+    def test_stopwords_excluded_from_tokens(self):
+        vision: dict = {}
+        d = {"id": "d-1", "text": "the fix add update improve database"}
+        record_retired_direction_memory(vision, d, reason="strategic_retire")
+        tokens = vision["_recently_retired_directions"][0]["text_tokens"]
+        # stopwords (fix, add, update, improve, the) should be excluded
+        assert "fix" not in tokens
+        assert "add" not in tokens
+        assert "database" in tokens
+
+
+class TestCheckGapRespawnBlock:
+    def _make_entry(self, *, direction_id="d-abc", text_tokens=None, gap_id=None, days_ago=1):
+        retired_at = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        entry: dict = {
+            "id": direction_id,
+            "text_tokens": text_tokens or [],
+            "retired_at": retired_at,
+            "reason": "strategic_retire",
+        }
+        if gap_id:
+            entry["gap_id"] = gap_id
+        return entry
+
+    def test_blocks_on_exact_gap_id_match(self):
+        entry = self._make_entry(direction_id="d-old", gap_id="g-model-gc")
+        reason = _check_gap_respawn_block(
+            "model gc new implementation",
+            "g-model-gc",
+            [entry],
+            cooldown_days=14,
+        )
+        assert reason is not None
+        assert "g-model-gc" in reason
+        assert "d-old" in reason
+
+    def test_blocks_on_text_token_overlap(self):
+        entry = self._make_entry(
+            direction_id="d-old",
+            text_tokens=["cache", "database", "query", "performance"],
+        )
+        reason = _check_gap_respawn_block(
+            "cache database query performance layer",
+            None,
+            [entry],
+            cooldown_days=14,
+        )
+        assert reason is not None
+        assert "d-old" in reason
+
+    def test_no_block_when_entry_outside_cooldown(self):
+        entry = self._make_entry(gap_id="g-model-gc", days_ago=20)
+        reason = _check_gap_respawn_block(
+            "model gc new implementation",
+            "g-model-gc",
+            [entry],
+            cooldown_days=14,
+        )
+        assert reason is None
+
+    def test_no_block_when_gap_id_differs(self):
+        entry = self._make_entry(gap_id="g-other-gap")
+        reason = _check_gap_respawn_block(
+            "model gc optimization",
+            "g-model-gc",
+            [entry],
+            cooldown_days=14,
+        )
+        assert reason is None
+
+    def test_no_block_when_text_overlap_below_threshold(self):
+        entry = self._make_entry(text_tokens=["cache", "database", "query"])
+        reason = _check_gap_respawn_block(
+            "cache database query latency improvement",
+            None,
+            [entry],
+            cooldown_days=14,
+        )
+        # Only 3 shared tokens → below threshold of 4
+        assert reason is None
+
+    def test_no_block_on_empty_memory(self):
+        reason = _check_gap_respawn_block("anything here", "g-any", [], cooldown_days=14)
+        assert reason is None
+
+    def test_zero_cooldown_disables_all_blocks(self):
+        entry = self._make_entry(gap_id="g-model-gc", days_ago=0)
+        reason = _check_gap_respawn_block(
+            "model gc new implementation",
+            "g-model-gc",
+            [entry],
+            cooldown_days=0,
+        )
+        # cooldown_days=0 means cutoff = now, so even a 0-day-old entry is outside window
+        assert reason is None
+
+
+def test_strategic_refresh_rejects_same_gap_duplicate_direction():
+    """Acceptance test: same-gap duplicate blocked via retired memory; distinct direction allowed.
+
+    Verifies:
+    1. Exact gap_id match → blocked (enforce mode)
+    2. Text-overlap match for gap-pruned direction → blocked via retained memory (enforce mode)
+    3. Genuinely distinct direction on same gap → NOT blocked (observe mode)
+    """
+    from app.strategic_completion import _RETIRED_MEMORY_CAP  # noqa: F401
+
+    # Build retired memory as if g-model-gc direction was previously retired
+    retired_dir = {
+        "id": "d-retired-gc",
+        "text": "model gc garbage collection entry deduplication",
+        "gap_id": "g-model-gc",
+    }
+    vision: dict = {}
+    record_retired_direction_memory(vision, retired_dir, reason="strategic_retire")
+    retired_memory = vision["_recently_retired_directions"]
+
+    # 1. Exact gap_id match → blocked in enforce mode
+    block_reason = _check_gap_respawn_block(
+        "model gc garbage collection entry deduplication",
+        "g-model-gc",
+        retired_memory,
+        cooldown_days=14,
+    )
+    assert block_reason is not None, "Same-gap exact duplicate should be blocked"
+    assert "g-model-gc" in block_reason
+
+    # 2. Near-duplicate text overlap (pruned direction survives in memory) → blocked
+    block_reason_overlap = _check_gap_respawn_block(
+        "model gc garbage collection entry memory pruning",  # 4+ shared tokens
+        None,  # gap_id absent (agent omitted it) → text-overlap gate fires
+        retired_memory,
+        cooldown_days=14,
+    )
+    assert block_reason_overlap is not None, (
+        "Text-overlap duplicate of a pruned retired direction should be blocked"
+    )
+
+    # 3. Genuinely distinct direction on a different gap → NOT blocked
+    no_block = _check_gap_respawn_block(
+        "authentication oauth token refresh pipeline",
+        "g-auth-refresh",  # different gap
+        retired_memory,
+        cooldown_days=14,
+    )
+    assert no_block is None, "Distinct direction on a different gap should not be blocked"
 
 
 # ── _record_strategic_task_failure ───────────────────────────────────────────

@@ -3043,6 +3043,71 @@ def _find_matching_direction(
     return None
 
 
+_RETIRED_MEMORY_CAP = 30
+_RETIRED_TEXT_TOKEN_CAP = 20
+
+
+def record_retired_direction_memory(
+    vision: dict,
+    direction: dict,
+    *,
+    reason: str,
+) -> None:
+    """Add a compact entry to vision['_recently_retired_directions'].
+
+    Called at every terminal-status write so the create_direction dedup check
+    can block same-gap or text-overlap re-spawns even after direction pruning.
+    Mutates vision in place; caller is responsible for flag_modified + session.add.
+    """
+    text = direction.get("text") or ""
+    tokens = list(
+        set(text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
+    )[:_RETIRED_TEXT_TOKEN_CAP]
+    entry: dict = {
+        "id": direction.get("id", ""),
+        "text_tokens": tokens,
+        "retired_at": _utcnow().isoformat(),
+        "reason": reason,
+    }
+    gap_id = direction.get("gap_id")
+    if gap_id:
+        entry["gap_id"] = str(gap_id)
+    existing = list(vision.get("_recently_retired_directions") or [])
+    existing.append(entry)
+    vision["_recently_retired_directions"] = existing[-_RETIRED_MEMORY_CAP:]
+
+
+def _check_gap_respawn_block(
+    text: str,
+    new_gap_id: str | None,
+    retired_memory: list,
+    cooldown_days: float,
+) -> str | None:
+    """Return block reason if text/gap matches a recently-retired direction, else None.
+
+    Gate 1: exact gap_id match against any retired memory entry within cooldown window.
+    Gate 2: text-token overlap >=4 (same threshold as _is_direction_duplicate).
+    Returns None when no block applies.
+    """
+    cooldown_cutoff = (_utcnow() - timedelta(days=cooldown_days)).isoformat()
+    new_text_tokens = set(text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
+    for mem_entry in retired_memory:
+        if mem_entry.get("retired_at", "") < cooldown_cutoff:
+            continue
+        if new_gap_id and mem_entry.get("gap_id") == new_gap_id:
+            return (
+                f"gap {new_gap_id} was recently staffed by retired direction "
+                f"{mem_entry.get('id')} ({mem_entry.get('reason')})"
+            )
+        mem_tokens = set(mem_entry.get("text_tokens") or [])
+        if len(new_text_tokens & mem_tokens) >= 4:
+            return (
+                f"text overlaps recently-retired direction "
+                f"{mem_entry.get('id')} ({mem_entry.get('reason')})"
+            )
+    return None
+
+
 async def _check_direction_starvation(
     project: Any, dirs_created: int, session: AsyncSession
 ) -> None:
@@ -4170,6 +4235,7 @@ async def _handle_strategic_completion(
     created_ids_fb: list = []
     retired_ids_fb: list = []
     created_rationales_fb: Dict[str, str] = {}
+    _pending_retire_memory: list = []
     retired_rationales_fb: Dict[str, str] = {}
     if direction_ops and isinstance(direction_ops, list):
         if len(direction_ops) > MAX_DIRECTION_OPS:
@@ -4244,6 +4310,36 @@ async def _handle_strategic_completion(
                         matched.get("status"),
                         project.id,
                     )
+                # Gap-scoped recently-retired block: hard-stops same-gap re-spawns
+                # even after the original direction has been pruned from the live list.
+                _gap_block_mode = str(
+                    _runtime_config.get("direction_gap_respawn_block_mode", "observe")
+                ).strip().lower()
+                if _gap_block_mode not in {"observe", "enforce"}:
+                    _gap_block_mode = "observe"
+                _gap_respawn_cooldown_days = float(
+                    _runtime_config.get("direction_gap_respawn_cooldown_days", 14) or 14
+                )
+                _retired_memory = list(
+                    (project.vision or {}).get("_recently_retired_directions") or []
+                )
+                _gap_block_reason = _check_gap_respawn_block(
+                    text,
+                    op_entry.get("gap_id"),
+                    _retired_memory,
+                    _gap_respawn_cooldown_days,
+                )
+                if _gap_block_reason:
+                    logger.warning(
+                        "[STRATEGIC] Task %s: create_direction '%s' blocked by recently-retired "
+                        "memory (%s) [mode=%s]",
+                        task.id,
+                        text[:60],
+                        _gap_block_reason,
+                        _gap_block_mode,
+                    )
+                    if _gap_block_mode == "enforce":
+                        continue
                 success_evidence = str(op_entry.get("success_evidence", "")).strip()
                 retirement_condition = str(
                     op_entry.get("retirement_condition", "")
@@ -4616,6 +4712,7 @@ async def _handle_strategic_completion(
                     if d.get("id") == dir_id:
                         d["status"] = "retired"
                         d["retired_at"] = _utcnow().isoformat()
+                        _pending_retire_memory.append(dict(d))
                         if rationale:
                             notes = d.get("notes", [])
                             notes.append(
@@ -4881,6 +4978,17 @@ async def _handle_strategic_completion(
 
             _dirs = list(directions)
             await with_directions_locked(session, task.project_id, lambda _: _dirs)
+
+        if _pending_retire_memory:
+            from app.task_locking import with_vision_locked
+
+            _retire_batch = list(_pending_retire_memory)
+
+            def _apply_retire_memory(vision: dict) -> None:
+                for _rd in _retire_batch:
+                    record_retired_direction_memory(vision, _rd, reason="strategic_retire")
+
+            await with_vision_locked(session, task.project_id, _apply_retire_memory)
 
     # Apply version_phase_decision + qualify_request from the parsed output
     # (fallback / log-parse path). In practice the agent emits both fields
