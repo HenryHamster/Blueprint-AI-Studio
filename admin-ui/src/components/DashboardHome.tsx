@@ -302,8 +302,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
       {/* Fleet Capacity — global slot utilization and saturation */}
       <FleetCapacityCard data={fleetUtilization} agentServingShas={agentServingShas} loading={loading} />
 
-      {/* Viewport Debt */}
-      {selectedProjectId && <ViewportDebtPanel projectId={selectedProjectId} />}
+      {/* Viewport Debt — only relevant for the self-repo; backend always scans Blueprint's own admin-ui */}
+      {selectedProjectId && selectedProject?.is_self_repo && <ViewportDebtPanel projectId={selectedProjectId} />}
 
       {/* Version Lifecycle */}
       {selectedProjectId && (
