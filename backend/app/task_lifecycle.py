@@ -6316,12 +6316,39 @@ async def close_orphan_pr_if_any(
     """
     ctx = task.context or {}
     pr_url = ctx.get("_pr_url") or ctx.get("pr_url") or ""
-    if not pr_url:
+    pr_number: int | None = None
+    if pr_url:
+        m = re.search(r"/pull/(\d+)", pr_url)
+        if m:
+            pr_number = int(m.group(1))
+    if pr_number is None:
+        # Also check review_loop.pr_number — set by the review pipeline for
+        # sub-rollup and review-loop PRs that store the number but not a full URL
+        # in _pr_url / pr_url (the canonical lookup above misses these, causing
+        # the cancel path to leak the PR open and block the parent rollup).
+        _rl = ctx.get("review_loop") or {}
+        if isinstance(_rl, dict) and _rl.get("pr_number") is not None:
+            try:
+                pr_number = int(_rl["pr_number"])
+            except (ValueError, TypeError):
+                pass
+    if pr_number is None:
+        # Also check rollup_pr_number / rollup_pr_url — set for rollup parents
+        # in awaiting-approval and security-blocked states (never seeds review_loop).
+        _rollup_url = ctx.get("rollup_pr_url") or ""
+        if _rollup_url:
+            _m = re.search(r"/pull/(\d+)", _rollup_url)
+            if _m:
+                pr_number = int(_m.group(1))
+    if pr_number is None:
+        _rpn = ctx.get("rollup_pr_number")
+        if _rpn is not None:
+            try:
+                pr_number = int(_rpn)
+            except (ValueError, TypeError):
+                pass
+    if pr_number is None:
         return False
-    m = re.search(r"/pull/(\d+)", pr_url)
-    if not m:
-        return False
-    pr_number = int(m.group(1))
 
     from app.github import close_pull_request, get_pull_request
     from app.routers.agent import get_github_token_for_task

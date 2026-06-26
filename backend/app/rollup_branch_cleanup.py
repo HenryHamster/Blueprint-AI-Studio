@@ -14,6 +14,8 @@ circular imports and preserve test-patchability.
 
 # fmt: off
 import logging
+import re
+import uuid as _uuid
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -76,6 +78,171 @@ def _partition_orphan_prs(
         else:
             live.append(pr)
     return live, orphan
+
+
+def _extract_task_pr_numbers(task) -> frozenset:
+    """Extract all PR numbers referenced in a task's context or payload.
+
+    Checks all canonical storage locations:
+    - ``context['review_loop']['pr_number']`` (set by the review pipeline)
+    - ``context['_pr_url']`` / ``context['pr_url']`` (set by cancel paths)
+    - ``context['rollup_pr_number']`` (set for rollup parents in awaiting-approval
+      and security-blocked states — never seeds review_loop)
+    - ``context['rollup_pr_url']`` (URL counterpart of rollup_pr_number)
+    - ``first_payload['pr_number']`` (canonical linkage for review/fix tasks)
+    """
+    ctx = getattr(task, "context", None) or {}
+    nums: set = set()
+
+    rl = ctx.get("review_loop") or {}
+    if isinstance(rl, dict):
+        rln = rl.get("pr_number")
+        if rln is not None:
+            try:
+                nums.add(int(rln))
+            except (ValueError, TypeError):
+                pass
+
+    for key in ("_pr_url", "pr_url", "rollup_pr_url"):
+        url = ctx.get(key) or ""
+        m = re.search(r"/pull/(\d+)", url)
+        if m:
+            nums.add(int(m.group(1)))
+
+    for key in ("rollup_pr_number",):
+        val = ctx.get(key)
+        if val is not None:
+            try:
+                nums.add(int(val))
+            except (ValueError, TypeError):
+                pass
+
+    fp_pr = (getattr(task, "first_payload", None) or {}).get("pr_number")
+    if fp_pr is not None:
+        try:
+            nums.add(int(fp_pr))
+        except (ValueError, TypeError):
+            pass
+
+    return frozenset(nums)
+
+
+def _is_owner_chain_live(task, tasks_by_id: dict) -> bool:
+    """Return True if ``task`` (or any replacement in its chain) is live.
+
+    "Live" means a non-terminal task that will drive the PR to merge.
+    CANCELLED tasks with a ``_replaced_by_task_id`` are chased through their
+    replacement chains using the same liveness predicate as
+    :func:`app.orchestrator_health._check_candidate_task_deps`.
+
+    Conservative rule: if a replacement ID is present but the replacement task
+    isn't in ``tasks_by_id``, we treat the chain as potentially live — we cannot
+    confirm it's dead.
+    """
+    from app.failure_classification import is_non_death_cancellation
+
+    visited: set = set()
+    current = task
+    while current is not None:
+        tid = getattr(current, "id", None)
+        if tid in visited:
+            break
+        visited.add(tid)
+
+        status = getattr(current, "status", None)
+
+        if status not in (TaskStatus.CANCELLED, TaskStatus.FAILED, TaskStatus.COMPLETED):
+            return True  # non-terminal → live
+
+        if status == TaskStatus.COMPLETED:
+            return False  # work done, not blocking
+
+        if status == TaskStatus.FAILED:
+            # Mirror the CANCELLED branch: follow the replacement chain first so
+            # a FAILED owner with a live replacement is treated as live.
+            # Genuine FAILED (no replacement, no SCOPE_EMPTY) is dead — not live.
+            ctx = getattr(current, "context", None) or {}
+            rep_id_str = ctx.get("_replaced_by_task_id")
+            if rep_id_str:
+                try:
+                    rep_id = _uuid.UUID(rep_id_str)
+                    replacement = tasks_by_id.get(rep_id)
+                    if replacement is not None:
+                        current = replacement
+                        continue
+                    # Replacement exists but not loaded — conservative: treat as live
+                    return True
+                except (ValueError, AttributeError):
+                    pass
+            return False  # genuinely failed, SCOPE_EMPTY, or co-deferred — all non-blocking
+
+        # CANCELLED — follow replacement chain
+        ctx = getattr(current, "context", None) or {}
+        rep_id_str = ctx.get("_replaced_by_task_id")
+        if rep_id_str:
+            try:
+                rep_id = _uuid.UUID(rep_id_str)
+                replacement = tasks_by_id.get(rep_id)
+                if replacement is not None:
+                    current = replacement
+                    continue
+                # Replacement exists but not in loaded set — conservative: treat as live
+                return True
+            except (ValueError, AttributeError):
+                pass
+
+        if is_non_death_cancellation(current):
+            return False  # SCOPE_EMPTY / co-deferred: satisfied, not live
+
+        return False  # permanently cancelled with no replacement
+
+    return False
+
+
+def _classify_prs_authoritative(
+    open_prs: list,
+    child_tasks: list,
+) -> tuple[list, list]:
+    """Classify open PRs into ``(blocking, orphaned)`` using authoritative task ownership.
+
+    Replaces the branch-regex attribution in :func:`_partition_orphan_prs` with
+    recorded ``pr_number`` lookup so that staging-branch-headed PRs
+    (``plan/8hex``, ``research/8hex``) are attributed correctly regardless of
+    head branch shape.
+
+    A PR is **orphaned** when every recorded owner task (found via
+    :func:`_extract_task_pr_numbers`) is terminal-and-dead-ended (no live
+    replacement chain). PRs with **no recorded owner** stay blocking — we never
+    auto-close a PR we can't positively attribute to a task.
+    """
+    tasks_by_id = {getattr(t, "id", None): t for t in child_tasks}
+
+    pr_owners: dict = {}
+    for task in child_tasks:
+        for pr_num in _extract_task_pr_numbers(task):
+            pr_owners.setdefault(pr_num, []).append(task)
+
+    blocking: list = []
+    orphaned: list = []
+
+    for pr in open_prs:
+        pr_num = pr.get("number")
+        if pr_num is None:
+            blocking.append(pr)
+            continue
+
+        owners = pr_owners.get(int(pr_num), [])
+        if not owners:
+            # No recorded owner → conservative: keep blocking
+            blocking.append(pr)
+            continue
+
+        if any(_is_owner_chain_live(t, tasks_by_id) for t in owners):
+            blocking.append(pr)
+        else:
+            orphaned.append(pr)
+
+    return blocking, orphaned
 
 
 async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
