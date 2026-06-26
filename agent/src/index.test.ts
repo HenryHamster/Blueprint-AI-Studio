@@ -458,7 +458,7 @@ describe('sanitize', () => {
 describe('_crashReport token redaction', () => {
   beforeEach(() => {
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue('');
     vi.mocked(fs.appendFileSync).mockReset();
     process.env.TASK_ID = 'task-crash-redact-test';
   });
@@ -781,7 +781,7 @@ describe('GracefulShutdownSignal (C7 graceful teardown)', () => {
 describe('postTerminalStatusSync (C7 heartbeat self-terminate posts FAILED)', () => {
   beforeEach(() => {
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue('');
     vi.mocked(fs.writeFileSync).mockReset();
     vi.mocked(fs.unlinkSync).mockReset();
   });
@@ -1157,7 +1157,7 @@ describe('testFixLoop failureSummary', () => {
     vi.mocked(execFileSync).mockReset();
     // git() helper at index.ts:507 calls .trim() on the return — give it a
     // string default so unmocked git calls (rev-parse, add -A, etc.) don't crash.
-    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue('');
     vi.mocked(spawn).mockReset();
     configureSpawnMock();
   });
@@ -1240,7 +1240,7 @@ describe('testFixLoop directory scoping', () => {
 
   beforeEach(() => {
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue('');
     vi.mocked(spawn).mockReset();
     configureSpawnMock();
   });
@@ -1373,7 +1373,7 @@ describe('testFixLoop divergence detection', () => {
   beforeEach(() => {
     _resetFixLoopEventStateForTesting();
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue('');
     vi.mocked(execSync).mockReset();
     vi.mocked(execSync).mockReturnValue('');
     vi.mocked(spawn).mockReset();
@@ -1422,7 +1422,7 @@ describe('testFixLoop divergence detection', () => {
 describe('testFixLoop early exit on identical errors', () => {
   beforeEach(() => {
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue('');
     vi.mocked(spawn).mockReset();
   });
 
@@ -1915,7 +1915,7 @@ describe('parseLLMCliTranslation', () => {
 describe('captureTestBaseline timeout selection', () => {
   beforeEach(() => {
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue('');
     vi.mocked(spawn).mockReset();
     configureSpawnMock();
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
@@ -1971,10 +1971,10 @@ describe('captureTestBaseline timeout selection', () => {
 describe('detectTestRunners auto-detect postgres flag', () => {
   beforeEach(() => {
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue('');
     vi.mocked(execSync).mockReset();
     // Default: Docker is available (execSync('docker version') succeeds)
-    vi.mocked(execSync).mockReturnValue('' as unknown as ReturnType<typeof execSync>);
+    vi.mocked(execSync).mockReturnValue('');
     vi.mocked(spawn).mockReset();
     configureSpawnMock();
     vi.mocked(fs.existsSync).mockReset();
@@ -2528,7 +2528,7 @@ describe('setupWorkspace reference-cache reuse', () => {
       if (String(cmd) === 'git' && a[0] === 'ls-remote') {
         throw new Error('fatal: branch not found'); // → staleBranchExists = false
       }
-      return '' as unknown as ReturnType<typeof execFileSync>;
+      return '';
     });
   }
 
@@ -2588,7 +2588,7 @@ describe('setupWorkspace reference-cache reuse', () => {
 describe('registerSizeCapMergeDriver', () => {
   beforeEach(() => {
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue('');
   });
 
   it('configures both merge.sizecap.name and merge.sizecap.driver in the given workspace', () => {
@@ -2625,7 +2625,7 @@ describe('failure category classification', () => {
     vi.mocked(execFileSync).mockImplementation((cmd: unknown) => {
       const cmdStr = String(cmd);
       // Allow rm (workspace cleanup) and curl (heartbeat) to succeed
-      if (cmdStr === 'rm' || cmdStr === 'curl') return '' as unknown as ReturnType<typeof execFileSync>;
+      if (cmdStr === 'rm' || cmdStr === 'curl') return '';
       // All git commands fail — simulates persistent clone failure across all retries
       throw new Error('fatal: Authentication failed');
     });
@@ -2644,7 +2644,7 @@ describe('failure category classification', () => {
 
   it('pushAndCreatePR attaches pr_creation_failed when GitHub PR creation returns 403', async () => {
     // Allow all execFileSync calls (git remote set-url, curl heartbeat)
-    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue('');
     // Mock spawn to make gitAsync push succeed
     vi.mocked(spawn).mockImplementation(() => {
       const proc = {
@@ -4687,8 +4687,8 @@ describe('child PID registration', () => {
       stdout: { on: vi.fn() },
       stderr: { on: vi.fn() },
       on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
-        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+        if (event === 'close') childHandlers.close = handler;
+        else if (event === 'error') childHandlers.error = handler;
       }),
       exitCode: null,
       signalCode: null,
@@ -4713,8 +4713,8 @@ describe('child PID registration', () => {
       stdout: { on: vi.fn() },
       stderr: { on: vi.fn() },
       on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
-        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+        if (event === 'close') childHandlers.close = handler;
+        else if (event === 'error') childHandlers.error = handler;
       }),
       exitCode: null,
       signalCode: null,
@@ -4736,8 +4736,8 @@ describe('child PID registration', () => {
       stdout: { on: vi.fn() },
       stderr: { on: vi.fn() },
       on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
-        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+        if (event === 'close') childHandlers.close = handler;
+        else if (event === 'error') childHandlers.error = handler;
       }),
       exitCode: null,
       signalCode: null,
@@ -4780,8 +4780,8 @@ describe('runProviderAgent PID register/unregister', () => {
       stdout: { on: vi.fn() },
       stderr: { on: vi.fn() },
       on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
-        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+        if (event === 'close') childHandlers.close = handler;
+        else if (event === 'error') childHandlers.error = handler;
       }),
       exitCode: null,
       signalCode: null,
@@ -4812,8 +4812,8 @@ describe('runProviderAgent PID register/unregister', () => {
       stdout: { on: vi.fn() },
       stderr: { on: vi.fn() },
       on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
-        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+        if (event === 'close') childHandlers.close = handler;
+        else if (event === 'error') childHandlers.error = handler;
       }),
       exitCode: null,
       signalCode: null,
@@ -5108,8 +5108,8 @@ describe('mid-stream stall watchdog', () => {
       },
       stderr: { on: vi.fn() },
       on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-        if (event === 'close') handlers.close = cb as ChildHandlers['close'];
-        else if (event === 'error') handlers.error = cb as ChildHandlers['error'];
+        if (event === 'close') handlers.close = cb;
+        else if (event === 'error') handlers.error = cb;
       }),
     };
     const emitStdout = (line: string) => {
@@ -5284,8 +5284,8 @@ describe('runProviderAgent stream-stall watchdog', () => {
       },
       stderr: { on: vi.fn() },
       on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
-        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+        if (event === 'close') childHandlers.close = handler;
+        else if (event === 'error') childHandlers.error = handler;
       }),
       exitCode: null as number | null,
       signalCode: null as NodeJS.Signals | null,
@@ -5432,8 +5432,8 @@ describe('forceKillTimer escalation hygiene', () => {
       },
       stderr: { on: vi.fn() },
       on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
-        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+        if (event === 'close') childHandlers.close = handler;
+        else if (event === 'error') childHandlers.error = handler;
       }),
       exitCode: null as number | null,
       signalCode: null as NodeJS.Signals | null,
@@ -5526,8 +5526,8 @@ describe('drainJsonChunks within-chunk yielding', () => {
       },
       stderr: { on: vi.fn() },
       on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
-        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+        if (event === 'close') childHandlers.close = handler;
+        else if (event === 'error') childHandlers.error = handler;
       }),
       exitCode: null as number | null,
       signalCode: null as NodeJS.Signals | null,
@@ -5685,8 +5685,8 @@ describe('LLM-no-progress watchdog (in-flight-tool suppression)', () => {
       },
       stderr: { on: vi.fn() },
       on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-        if (event === 'close') handlers.close = cb as ChildHandlers['close'];
-        else if (event === 'error') handlers.error = cb as ChildHandlers['error'];
+        if (event === 'close') handlers.close = cb;
+        else if (event === 'error') handlers.error = cb;
       }),
     };
     const emitStdout = (line: string) => {
@@ -6027,8 +6027,8 @@ describe('long-running workflow / sub-agent fan-out watchdog tolerance', () => {
       },
       stderr: { on: vi.fn() },
       on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-        if (event === 'close') handlers.close = cb as ChildHandlers['close'];
-        else if (event === 'error') handlers.error = cb as ChildHandlers['error'];
+        if (event === 'close') handlers.close = cb;
+        else if (event === 'error') handlers.error = cb;
       }),
     };
     const emitStdout = (line: string) => {
@@ -6270,8 +6270,8 @@ describe('final drain awaits in-flight drain before resolving (C7)', () => {
       },
       stderr: { on: vi.fn() },
       on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
-        if (event === 'close') childHandlers.close = handler as ChildHandlers['close'];
-        else if (event === 'error') childHandlers.error = handler as ChildHandlers['error'];
+        if (event === 'close') childHandlers.close = handler;
+        else if (event === 'error') childHandlers.error = handler;
       }),
       exitCode: null as number | null,
       signalCode: null as NodeJS.Signals | null,
@@ -6569,7 +6569,7 @@ describe('heartbeat 409 task-terminal detection', () => {
     fetchMock = makeFetchMock();
     vi.stubGlobal('fetch', fetchMock);
     vi.mocked(execFileSync).mockReset();
-    vi.mocked(execFileSync).mockReturnValue('' as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue('');
     vi.mocked(fs.writeFileSync).mockReset();
     vi.mocked(fs.unlinkSync).mockReset();
     _resetCancelRequestedForTesting();
@@ -6962,9 +6962,9 @@ describe('cloneWithRetry', () => {
       if (cmd === 'git') {
         callCount++;
         if (callCount <= 2) throw new Error(errorMsg);
-        return '' as unknown as ReturnType<typeof execFileSync>;
+        return '';
       }
-      return '' as unknown as ReturnType<typeof execFileSync>;
+      return '';
     });
 
     const logLines: string[] = [];
@@ -7001,9 +7001,9 @@ describe('cloneWithRetry', () => {
         callCount++;
         cloneArgs.push((a as string[]).slice());
         if (callCount === 1) throw new Error(authErr);
-        return '' as unknown as ReturnType<typeof execFileSync>;
+        return '';
       }
-      return '' as unknown as ReturnType<typeof execFileSync>;
+      return '';
     });
 
     // force_refresh token endpoint returns a fresh token.
@@ -7055,9 +7055,9 @@ describe('cloneWithRetry', () => {
       if (cmd === 'git') {
         callCount++;
         if (callCount === 1) throw new Error(netErr);
-        return '' as unknown as ReturnType<typeof execFileSync>;
+        return '';
       }
-      return '' as unknown as ReturnType<typeof execFileSync>;
+      return '';
     });
 
     const fetchMock = makeFetchMock().mockResolvedValue({

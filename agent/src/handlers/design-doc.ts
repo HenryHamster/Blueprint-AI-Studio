@@ -64,7 +64,7 @@ export async function handleDesignDocUpdate(
   const fileTreeSection = buildFileTree(ws);
   const projectName = strVal(payload.project_name, 'Unknown Project');
   const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
-  const projectId = strVal(projectMetadata?.project_id as string | undefined);
+  const projectId = strVal(projectMetadata?.project_id);
   const designDocRetryContext = buildRetryContext(task);
   const designDocFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
 
@@ -88,7 +88,7 @@ export async function handleDesignDocUpdate(
       pages = sections
         .filter((s): s is Record<string, unknown> => !!s && typeof s === 'object')
         .map((s) => {
-          const key = strVal(s.key as string | undefined);
+          const key = strVal(s.key);
           const parts: string[] = [];
           if (typeof s.status === 'string' && s.status.trim()) parts.push(`status: ${s.status}`);
           if (typeof s.summary === 'string' && s.summary.trim()) parts.push(s.summary);
@@ -134,7 +134,7 @@ export async function handleDesignDocUpdate(
           const h = Math.floor(ms / 3600000);
           return h < 24 ? `${h}h ago` : `${Math.floor(h / 24)}d ago`;
         })() : '?';
-        return `- [${strVal(m.type as string)}] (id: ${strVal(m.id as string)}, from: ${strVal(m.from as string)}, open ${age}) ${strVal(m.content as string).slice(0, 200)}`;
+        return `- [${strVal(m.type)}] (id: ${strVal(m.id)}, from: ${strVal(m.from)}, open ${age}) ${strVal(m.content).slice(0, 200)}`;
       }).join('\n')
     : '';
 
@@ -146,13 +146,13 @@ export async function handleDesignDocUpdate(
   if (shippedManifest.length > 0) {
     const lines: string[] = [];
     for (const group of shippedManifest) {
-      const dirId = group.direction_id ? strVal(group.direction_id as string) : 'unassigned';
+      const dirId = group.direction_id ? strVal(group.direction_id) : 'unassigned';
       const tasks = Array.isArray(group.tasks) ? group.tasks as Array<Record<string, unknown>> : [];
       const files = Array.isArray(group.all_changed_files) ? group.all_changed_files as string[] : [];
       lines.push(`### Direction: ${dirId} (${tasks.length} task${tasks.length !== 1 ? 's' : ''} merged)`);
       for (const t of tasks) {
-        const scope = t.scope ? ` [${strVal(t.scope as string)}]` : '';
-        lines.push(`  - ${strVal(t.title as string)}${scope}`);
+        const scope = t.scope ? ` [${strVal(t.scope)}]` : '';
+        lines.push(`  - ${strVal(t.title)}${scope}`);
       }
       if (files.length > 0) {
         lines.push(`  Changed files: ${files.slice(0, 20).join(', ')}${files.length > 20 ? ` (+${files.length - 20} more)` : ''}`);
