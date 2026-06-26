@@ -956,7 +956,7 @@ ${harnessCases}      bare)
         echo "[check]   Skipping the unfaithful run instead of blocking on an environment artifact. This is NOT a verdict on your change:"
         echo "[check]   - Validate the diff where the suite CAN faithfully run (the project's Docker/Postgres harness, or targeted single-file runs) and record that evidence in the PR body."
         echo "[check]   - CI runs the authoritative Postgres suite on the PR after ./pr open."
-        echo "[check]   - If you have NO faithful test evidence for a test-relevant change, call ./blocked \\"<reason>\\" --needs-capability \\"postgres test environment\\" instead of shipping blind."
+        echo "[check]   - If you have NO faithful test evidence for a test-relevant change, call ./blocked \\"<reason>\\" --needs-capability \\"the test environment this suite requires\\" instead of shipping blind."
         printf '%s %s\\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${dirPrefix}: pytest gate skipped — no Docker for the sanctioned harness and no Postgres test env; a bare run would be an unfaithful SQLite fallback" >> /tmp/check_gate_env_${taskId}.txt ;;
     esac`;
 }

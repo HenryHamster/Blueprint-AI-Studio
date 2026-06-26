@@ -709,6 +709,14 @@ export async function handleReleaseAudit(
     ? `\n## Version Goal\n\n${versionGoal}\n\nIn addition to the standard quality checks below, assess whether this diff plausibly delivers the version's strategic goal stated above. Add a \`goal_alignment\` object to your JSON output with:\n- \`state\` (string): one of \`"aligned"\` (diff plausibly delivers the goal), \`"shortfall"\` (diff falls short), or \`"not_applicable"\` (goal cannot be assessed from this diff).\n- \`assessed_grade\` (float 0.0–1.0): degree of alignment (1.0 = fully aligned, 0.0 = no alignment).\n- \`biggest_gap\` (string or null): one sentence describing the most significant gap if state is \`"shortfall"\`; null otherwise.\n- \`reasoning_summary\` (string): 1–3 sentences explaining the assessment, citing specific files or patterns from the diff.\n\nThis is an ADDITIONAL field alongside the required \`audit_score\`, \`test_erosion\`, and \`findings\` fields — it does not replace them.\n\n`
     : '';
 
+  const buildConfig = resolveBuildConfig(task);
+  // Only emit the migration-revision-divergence carve-out when the project has a
+  // migrations layout configured; most projects have none, so the rule would be
+  // noise (and bake in a stack they don't use).
+  const migrationDivergenceRule = buildConfig?.migration
+    ? `\n- Authorized migration revision-identity divergences are owned by a separate deterministic gate, NOT the audit. If the diff renumbers or reuses a migration revision id that is an authorized, reconciled divergence, do NOT raise a finding for the revision-identity/renumber itself — the qualifier's migration-identity gate evaluates it and deploy-time reconciliation handles it. You SHOULD still flag genuinely broken migration BODIES (bad DDL, missing/incorrect downgrade, destructive re-apply, data-loss risk) on those same files.`
+    : '';
+
   const releaseAuditPrompt = `${codebaseSummary}${playbookSection}${retryContext}${contextPrefix}${fileTreeSection}You are a release audit agent. You have been cloned onto \`${baseBranch}\` — the last known-good LTS branch — and your job is to review the incoming diff range \`${diffRange}\` against \`${baseBranch}\`'s standards. \`${candidateSha}\` is the PINNED release candidate commit (a snapshot of the integration branch); it has already been fetched into this clone, so the diff range resolves.
 
 IMPORTANT: You are running on \`${baseBranch}\` intentionally. You must judge the incoming changes by \`${baseBranch}\`'s standards, NOT by the new code's standards. This asymmetry is the entire point of the audit.
@@ -771,14 +779,12 @@ Field semantics:
 
 Rules:
 - Read the actual diff — do NOT speculate about code you haven't read.
-- IMPORTANT — substantiation required: Before recording any finding at severity high, medium, or critical, read the relevant unchanged files in the full repository (not just the diff) to check for existing mitigations (guards, exception handlers, per-request checks, hardcoded constants at the call site). Record what you read and why the issue is real in \`verification_note\`. A hardcoded constant reaching a sink is NOT injection. A per-request DB check is NOT a replay gap. A comparison that is exception-guarded is NOT a TypeError. Only record the finding if you can substantiate it after reading the whole-repo context.
-- Authorized Alembic revision-identity divergences are owned by a separate deterministic gate, NOT the audit. If the diff renumbers or reuses an Alembic revision id that is an authorized, reconciled divergence (e.g. the \`0143\` back-merge: the old \`0143\` migration replaced by a new \`0143\` plus a renumbered \`0144\`), do NOT raise a finding for the revision-identity/renumber itself — the qualifier's migration-identity gate evaluates it and deploy-time reconciliation handles it. You SHOULD still flag genuinely broken migration BODIES (bad DDL, missing/incorrect downgrade, destructive re-apply, data-loss risk) on those same files.
+- IMPORTANT — substantiation required: Before recording any finding at severity high, medium, or critical, read the relevant unchanged files in the full repository (not just the diff) to check for existing mitigations (guards, exception handlers, per-request checks, hardcoded constants at the call site). Confirm no existing mitigation neutralizes the issue before recording it. Record what you read and why the issue is real in \`verification_note\`. A hardcoded constant reaching a sink is NOT injection. A per-request DB check is NOT a replay gap. A comparison that is exception-guarded is NOT a TypeError. Only record the finding if you can substantiate it after reading the whole-repo context.${migrationDivergenceRule}
 - If \`git diff ${diffRange}\` produces no output (empty diff), set \`audit_score: 1.0\`, \`findings: []\`, and note it in a single low-severity finding.
 - IMPORTANT: Write ONLY the JSON object to \`/tmp/release_audit_report_${taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} — no markdown, no code fences, no extra text.
 - Also output the same JSON object as the final output in your logs.
 - Do NOT modify any files in the repository.${designDocAdvertisement(task)}`;
 
-  const buildConfig = resolveBuildConfig(task);
   const promptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const typeHints = getTaskTypeHints(buildConfig);
   const typeHint = typeHints['release_audit'] ? '\n\n' + typeHints['release_audit'] : '';

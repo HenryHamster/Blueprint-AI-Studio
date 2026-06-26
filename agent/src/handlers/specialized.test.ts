@@ -1619,7 +1619,7 @@ describe('handleMigrate — migrate self-review focus block', () => {
     vi.mocked(resolveBuildConfig).mockReturnValueOnce({
       directories: [{ path: 'svc', type: 'python' }],
       migration: { schema_revision_file: 'svc/app/config.py', schema_revision_const: 'SCHEMA_REV' },
-    } as ReturnType<typeof resolveBuildConfig>);
+    });
     await handleMigrate(TASK_ID, { ...BASE_PAYLOAD, prompt: 'Add column' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const focus = sliceMigrateFocus(capturedMigratePrompt());
     expect(focus).toContain('SCHEMA_REV');
@@ -1632,7 +1632,7 @@ describe('handleMigrate — migrate self-review focus block', () => {
     vi.mocked(resolveBuildConfig).mockReturnValueOnce({
       directories: [{ path: 'svc', type: 'python' }],
       migration: { schema_revision_file: '' },
-    } as ReturnType<typeof resolveBuildConfig>);
+    });
     await handleMigrate(TASK_ID, { ...BASE_PAYLOAD, prompt: 'Add column' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const focus = sliceMigrateFocus(capturedMigratePrompt());
     expect(focus).not.toContain('EXPECTED_SCHEMA_REVISION');
@@ -1671,7 +1671,7 @@ describe('specialized handler structural prompt invariants', () => {
       directories: [
         { path: 'svc', type: 'python', lint_cmd: 'ruff check', build_cmd: 'python -m build', test_cmd: 'pytest -q' },
       ],
-    } as ReturnType<typeof resolveBuildConfig>);
+    });
     await handleMigrate(TASK_ID, { ...BASE_PAYLOAD, prompt: 'add col' }, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
     const p = capturedMigratePrompt();
     expect(p).toContain('Task lifecycle — you own it end-to-end');
@@ -1700,7 +1700,7 @@ describe('specialized handler structural prompt invariants', () => {
 
   it.each([
     ['handleSecurityAudit', () => handleSecurityAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'OWASP Top 10'],
-    ['handlePerf',          () => handlePerf(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'N+1 database queries'],
+    ['handlePerf',          () => handlePerf(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'N+1 data-access queries'],
     ['handleDebug',         () => handleDebug(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'Do NOT make any code changes'],
     ['handleInvestigate',   () => handleInvestigate(TASK_ID, INVESTIGATE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'Do NOT modify any files'],
     ['handleSelfAudit',     () => handleSelfAudit(TASK_ID, BASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF()), 'test_coverage'],
@@ -1956,7 +1956,7 @@ describe('specialized handler task-specific content contracts', () => {
       ['partial object', { tech_stack: 'TypeScript', directory_layout: 'agent/' }],
       ['array output', ['TypeScript', 'agent/', 'tests']],
     ] as const)('drops invalid bootstrap overview %s', async (_label, invalidOverview) => {
-      vi.mocked(readHandlerOutput).mockReturnValue(invalidOverview as never);
+      vi.mocked(readHandlerOutput).mockReturnValue(invalidOverview);
       vi.mocked(runClaudeCode).mockResolvedValue({
         exitCode: 0,
         allOutput: 'bootstrap transcript tail',

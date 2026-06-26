@@ -333,7 +333,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     strVal(payload.base_branch)
     || strVal(ctx.research_branch)
     || strVal(ctx.original_base)
-    || resolveBaseBranch({} as Record<string, unknown>, task);
+    || resolveBaseBranch({}, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
   const projectMetaForPromotion = task.project_metadata as Record<string, unknown> | undefined;
   const promotionTarget =
@@ -474,14 +474,17 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     }
   }
 
-  // Capture test baseline on main branch so the test fix loop can distinguish
-  // pre-existing failures from newly-broken tests. Scoped to related_files to stay fast.
+  // Capture test baseline on the integration branch so the test fix loop can
+  // distinguish pre-existing failures from newly-broken tests. Only when the
+  // task's base branch is that integration branch. Scoped to related_files to
+  // stay fast.
   //
   // EXCEPTION: auto-remediation tasks deliberately skip baseline capture —
-  // their WHOLE JOB is to fix whatever's broken on main, pre-existing or
-  // otherwise. A baseline that excludes broken-main tests would make the
-  // remediation into a no-op: Claude would see "pre-existing failures, don't
-  // touch" and give up. We want it to see all failures and fix them.
+  // their WHOLE JOB is to fix whatever's broken on the integration branch,
+  // pre-existing or otherwise. A baseline that excludes those broken tests
+  // would make the remediation into a no-op: the agent would see "pre-existing
+  // failures, don't touch" and give up. We want it to see all failures and fix
+  // them.
   const isAutoRemediation = Boolean(
     (task.context as Record<string, unknown> | undefined)?.auto_remediation
   );
