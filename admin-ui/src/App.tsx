@@ -23,6 +23,7 @@ import { ComposeDrawer } from './components/ComposeDrawer';
 import { FleetDetailDrawer } from './components/FleetDetailDrawer';
 import { NewTaskModal } from './components/NewTaskModal';
 import { NewProjectModal } from './components/NewProjectModal';
+import { ProjectManagementModal } from './components/ProjectManagementModal';
 import { HeaderBar } from './components/HeaderBar';
 import type { SectionId } from './components/SettingsDropdown';
 import MetricsDashboard from './components/MetricsDashboard';
@@ -256,6 +257,7 @@ export default function App() {
 
   // New project modal
   const [showNewProjectModal, setShowNewProjectModal] = useState(false);
+  const [showProjectManagement, setShowProjectManagement] = useState(false);
   const [setupProjectId, setSetupProjectId] = useState<string | null>(null);
   const setupProject = useMemo(() => {
     if (!setupProjectId) return undefined;
@@ -620,6 +622,7 @@ export default function App() {
         needsAttentionCount={s.needsAttentionCount}
         onOpenNewTaskModal={s.openNewTaskModal}
         onNewProject={() => setShowNewProjectModal(true)}
+        onManageProjects={() => setShowProjectManagement(true)}
         onSignOut={() => signOut(auth)}
         userEmail={s.user.email || ''}
         wsRef={s.wsRef}
@@ -1203,6 +1206,17 @@ export default function App() {
             s.fetchProjects();
           }}
           setupProject={setupProject}
+        />
+      )}
+
+      {showProjectManagement && (
+        <ProjectManagementModal
+          projects={s.projects}
+          selectedProjectId={s.selectedProjectId}
+          onNewProject={() => setShowNewProjectModal(true)}
+          onRefreshProjects={s.fetchProjects}
+          onSelectProject={s.setSelectedProjectId}
+          onClose={() => setShowProjectManagement(false)}
         />
       )}
 

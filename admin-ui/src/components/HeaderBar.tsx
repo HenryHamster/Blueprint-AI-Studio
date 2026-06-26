@@ -216,6 +216,8 @@ export interface HeaderBarProps {
   health: OrchestratorHealth | null;
   detailedHealth: DetailedHealth | null;
   pipelineThrottle?: PipelineThrottle | null;
+  /** Opens the ProjectManagementModal (archive/delete/unarchive + new-project). */
+  onManageProjects?: () => void;
 }
 
 
@@ -411,22 +413,21 @@ export function HeaderBar(props: HeaderBarProps) {
 
       {/* Unified top bar: one coherent band */}
       <header className="flex items-center gap-2 border-b border-neutral-800/60 pb-1 mb-1">
-        {/* LEFT: ProjectSwitcher + future Manage projects slot */}
+        {/* LEFT: ProjectSwitcher + Manage projects slot */}
         <div className="flex items-center gap-1 shrink-0">
           <ProjectSwitcherDropdown
             projects={props.projects}
             selectedProjectId={props.selectedProjectId}
             onSelectProject={props.onSelectProject}
           />
-          {/* Future: Manage projects button */}
-          {props.onNewProject && (
+          {props.onManageProjects && (
             /* eslint-disable-next-line viewport/min-touch-target */
             <button
-              onClick={props.onNewProject}
+              onClick={props.onManageProjects}
               className="text-xs text-neutral-600 hover:text-neutral-400 px-2 py-1 rounded transition-colors"
-              title="New project"
+              title="Manage projects"
             >
-              + Project
+              Manage
             </button>
           )}
         </div>
