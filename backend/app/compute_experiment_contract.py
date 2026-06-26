@@ -102,8 +102,14 @@ def _validate_compute_launch_contract(
     ``require_smoke=True`` (the legacy default for author-generated contracts)
     previously hard-rejected contracts whose ``smoke_sample`` was missing or
     reported failure.  This check is now ADVISORY ONLY: the platform executes a
-    real pre-flight smoke (capability ``platform-preflight-smoke``) on the same
-    substrate class before any full VM is billed, which is the binding gate.
+    real pre-flight smoke (capability ``platform-preflight-smoke``) before any
+    full VM is billed, which is the binding gate.  That smoke runs the command
+    CONTAINERIZED — on the same substrate class as the full run (``docker pull``
+    + ``docker run`` of the declared image) — when ``container_image`` is set AND
+    Docker is available on the orchestrator host; it degrades to a bare-host
+    ``bash -lc`` smoke when no ``container_image`` is declared or Docker is absent
+    on the orchestrator (see ``run_preflight_smoke`` in compute_backends.py; this
+    closes the substrate-fidelity gap tracked as bug a58156be).
     A missing or self-reported-failing author smoke_sample is logged as a warning
     but no longer blocks the contract.  Operator-triggered launches may pass
     ``require_smoke=False`` to silence even the advisory log.
@@ -233,10 +239,13 @@ def _validate_compute_launch_contract(
     if require_smoke:
         # Author-attested smoke is now ADVISORY ONLY.  The platform-executed
         # pre-flight smoke (capability `platform-preflight-smoke`) runs the
-        # command on the real substrate before provisioning the full VM and is
-        # the binding gate.  A missing or self-reported-failing author
-        # smoke_sample is logged here for observability but does NOT reject the
-        # contract.
+        # command before provisioning the full VM and is the binding gate — it
+        # runs CONTAINERIZED on the same substrate class (docker pull + docker
+        # run of the declared container_image) when container_image is set AND
+        # Docker is present on the orchestrator, and degrades to a bare-host
+        # bash -lc smoke otherwise (no container_image, or Docker absent).  A
+        # missing or self-reported-failing author smoke_sample is logged here for
+        # observability but does NOT reject the contract.
         smoke = contract.get("smoke_sample")
         if not smoke or not isinstance(smoke, dict):
             logger.warning(

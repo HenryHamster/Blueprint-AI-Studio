@@ -2891,3 +2891,173 @@ async def test_run_preflight_smoke_timeout_does_not_fail_on_declared_metric():
     # metric_captured will be False (file not written), but the CALLER (compute_jobs)
     # must not penalize this — it only checks metric when exit_code == 0.
     assert result.metric_captured is False
+
+
+# --- containerized pre-flight smoke (container_image set) ----------------------
+
+
+def _make_fake_subprocess_exec(captured, *, returncode=0, stderr=b""):
+    """Return a fake asyncio.create_subprocess_exec that records its argv.
+
+    Captures each invocation's positional args/kwargs so tests can assert the
+    constructed shell command WITHOUT spawning a real process or needing Docker.
+    """
+
+    async def _fake_exec(*args, **kwargs):
+        captured.append({"args": args, "kwargs": kwargs})
+
+        class _FakeProc:
+            def __init__(self):
+                self.returncode = returncode
+
+            async def communicate(self):
+                return (b"", stderr)
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return returncode
+
+        return _FakeProc()
+
+    return _fake_exec
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_runs_containerized_when_image_set(monkeypatch):
+    """When container_image is set AND Docker is available, the smoke command is
+    wrapped in docker pull + docker run of the declared image, with the result
+    file mounted back to the host out dir — substrate-faithful smoke (bug a58156be)."""
+    import app.compute_backends as cb
+
+    captured: list[dict] = []
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: None)
+    monkeypatch.setattr(cb.asyncio, "create_subprocess_exec", _make_fake_subprocess_exec(captured))
+
+    result = await cb.run_preflight_smoke(
+        "python3 train.py",
+        container_image="ghcr.io/acme/trainer:latest",
+        timeout_seconds=5,
+    )
+
+    assert len(captured) == 1, "exactly one (main) subprocess call expected"
+    # The third positional arg to create_subprocess_exec is the bash -lc command.
+    assert captured[0]["args"][0] == "bash"
+    assert captured[0]["args"][1] == "-lc"
+    cmd = captured[0]["args"][2]
+    # docker pull + docker run of the declared image.
+    assert "docker pull ghcr.io/acme/trainer:latest" in cmd
+    assert "docker run --rm" in cmd
+    assert "ghcr.io/acme/trainer:latest" in cmd
+    assert "bash -lc" in cmd  # inner command re-wrapped inside the container
+    # tmpdir is bind-mounted as the container out dir so result.json lands on host.
+    assert ":/tmp/blueprint_out" in cmd
+    assert "BLUEPRINT_RESULT_FILE=/tmp/blueprint_out/result.json" in cmd
+    # No GPU detected -> no --gpus all flag.
+    assert "--gpus" not in cmd
+    assert result.ran_containerized is True
+    assert result.degraded_no_docker is False
+    assert result.startup_ok is True
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_degrades_to_bare_host_when_docker_absent(monkeypatch):
+    """When container_image is set but Docker is NOT on the orchestrator, the smoke
+    falls back to the bare-host bash -lc path and flags degraded_no_docker — it must
+    NOT hard-fail the job solely because Docker is missing on the orchestrator."""
+    import app.compute_backends as cb
+
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: None)
+
+    # No fake exec: let the real (bare) command run on the host.
+    result = await cb.run_preflight_smoke(
+        "echo hi",
+        container_image="ghcr.io/acme/trainer:latest",
+        timeout_seconds=5,
+    )
+
+    assert result.degraded_no_docker is True
+    assert result.ran_containerized is False
+    # Bare-host echo exits 0 -> startup OK -> the job is NOT failed for missing Docker.
+    assert result.startup_ok is True
+    assert result.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_container_registry_auth_emits_docker_login(monkeypatch):
+    """A registry auth carrying a password produces a docker login --password-stdin
+    preamble before the pull (the orchestrated path strips the password, but the
+    helper must honor it when provided directly)."""
+    import app.compute_backends as cb
+
+    captured: list[dict] = []
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: None)
+    monkeypatch.setattr(cb.asyncio, "create_subprocess_exec", _make_fake_subprocess_exec(captured))
+
+    result = await cb.run_preflight_smoke(
+        "python3 train.py",
+        container_image="reg.example.com/p/img:1",
+        container_registry_auth={
+            "server": "reg.example.com",
+            "username": "robot",
+            "password": "s3cret",
+        },
+        timeout_seconds=5,
+    )
+
+    cmd = captured[0]["args"][2]
+    assert "docker login reg.example.com -u robot --password-stdin" in cmd
+    assert "s3cret" in cmd  # password fed via printf | --password-stdin
+    # login precedes the pull which precedes the run.
+    assert cmd.index("docker login") < cmd.index("docker pull") < cmd.index("docker run")
+    assert result.ran_containerized is True
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_setup_step_runs_outside_container(monkeypatch):
+    """setup_step runs OUTSIDE the container (bare bash -lc), matching the real
+    local-subprocess backend, while the main command runs containerized."""
+    import app.compute_backends as cb
+
+    captured: list[dict] = []
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: None)
+    monkeypatch.setattr(cb.asyncio, "create_subprocess_exec", _make_fake_subprocess_exec(captured))
+
+    await cb.run_preflight_smoke(
+        "python3 main.py",
+        setup_step="pip install -e .",
+        container_image="ghcr.io/acme/trainer:latest",
+        timeout_seconds=6,
+    )
+
+    assert len(captured) == 2, "setup_step + main = two subprocess calls"
+    setup_cmd = captured[0]["args"][2]
+    main_cmd = captured[1]["args"][2]
+    # setup runs bare on the host — no docker wrapping.
+    assert setup_cmd == "pip install -e ."
+    assert "docker" not in setup_cmd
+    # main command is containerized.
+    assert "docker run --rm" in main_cmd
+    assert "docker pull ghcr.io/acme/trainer:latest" in main_cmd
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_no_container_image_is_unchanged(monkeypatch):
+    """The absent-container_image path is byte-for-byte unchanged: the command is
+    passed bare to bash -lc even when Docker happens to be available."""
+    import app.compute_backends as cb
+
+    captured: list[dict] = []
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(cb.asyncio, "create_subprocess_exec", _make_fake_subprocess_exec(captured))
+
+    result = await cb.run_preflight_smoke("echo hello", timeout_seconds=5)
+
+    cmd = captured[0]["args"][2]
+    assert cmd == "echo hello"  # no docker wrapping
+    assert result.ran_containerized is False
+    assert result.degraded_no_docker is False

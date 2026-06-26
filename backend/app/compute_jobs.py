@@ -1235,6 +1235,16 @@ async def _run_and_apply_preflight_smoke(
     env = {str(k): str(v) for k, v in (meta.get("env") or {}).items()}
     cwd = meta.get("cwd") or None
     setup_step = meta.get("setup_step") or None
+    # Containerize the smoke when the experiment spec declared an image, mirroring
+    # the launch path's reconstruction (see _build_launch_spec / create_compute_job).
+    # The persisted auth carries ONLY server/username — the password is stripped at
+    # create time (see create_compute_job), so docker login is skipped and
+    # gated-registry pulls may fail at smoke; public images are still validated.
+    container_image = meta.get("container_image") or None
+    registry_auth_meta = meta.get("container_registry_auth")
+    container_registry_auth = (
+        dict(registry_auth_meta) if isinstance(registry_auth_meta, dict) else None
+    )
 
     payload = task.first_payload if task is not None else {}
     criterion = (payload or {}).get("success_criterion") or {}
@@ -1255,6 +1265,8 @@ async def _run_and_apply_preflight_smoke(
         env=env,
         cwd=cwd,
         setup_step=setup_step,
+        container_image=container_image,
+        container_registry_auth=container_registry_auth,
     )
 
     now = _utcnow()
@@ -1271,7 +1283,13 @@ async def _run_and_apply_preflight_smoke(
         if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
             return
         if smoke_passed:
-            _set_meta(live, preflight_smoke_done=True, preflight_smoke_status="passed")
+            _set_meta(
+                live,
+                preflight_smoke_done=True,
+                preflight_smoke_status="passed",
+                preflight_smoke_containerized=smoke.ran_containerized,
+                preflight_smoke_degraded_no_docker=smoke.degraded_no_docker,
+            )
             live.updated_at = now
             session.add(live)
             await session.commit()
@@ -1283,6 +1301,8 @@ async def _run_and_apply_preflight_smoke(
             "exit_code": smoke.exit_code,
             "metric_captured": smoke.metric_captured,
             "error_excerpt": (smoke.error_excerpt or "")[:500],
+            "containerized": smoke.ran_containerized,
+            "degraded_no_docker": smoke.degraded_no_docker,
         }
         if declared_metric:
             diagnostic["declared_metric"] = declared_metric

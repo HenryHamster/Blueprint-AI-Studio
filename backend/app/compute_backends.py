@@ -231,6 +231,14 @@ class PreflightSmokeResult:
     metric_captured: bool
     declared_metric_value: float | None
     error_excerpt: str
+    # True when a container_image was declared but Docker was NOT available on the
+    # orchestrator host, so the smoke degraded to a bare-host ``bash -lc`` run
+    # instead of the substrate-faithful containerized path.  Visible to the caller
+    # and diagnostics so a degraded smoke is never mistaken for a containerized one.
+    degraded_no_docker: bool = False
+    # True when the smoke actually wrapped the command in ``docker pull`` +
+    # ``docker run`` (container_image declared AND Docker present).
+    ran_containerized: bool = False
 
 
 async def run_preflight_smoke(
@@ -241,12 +249,39 @@ async def run_preflight_smoke(
     env: dict[str, str] | None = None,
     cwd: str | None = None,
     setup_step: str | None = None,
+    container_image: str | None = None,
+    container_registry_auth: dict | None = None,
 ) -> PreflightSmokeResult:
     """Run a cheap local pre-flight smoke to catch commands that die on a DB-less substrate.
 
     Runs `command` (and optionally `setup_step`) locally with no DB credentials
     injected.  A non-zero exit before the timeout is a FAIL; a zero exit or a
     timeout (command still alive) is a PASS (plus optional metric check).
+
+    When ``container_image`` is set AND Docker is available on the orchestrator
+    host (``shutil.which("docker")``), the *main* command is wrapped in the SAME
+    ``docker login`` (optional) → ``docker pull`` → ``docker run`` path the real
+    local-subprocess backend uses (see ``_build_local_wrapper_command``), so the
+    smoke is substrate-faithful: it catches image-pull failures, in-container
+    import errors, and missing CUDA/GPU libraries before a full VM is billed.
+    The smoke's ``tmpdir`` is bind-mounted as the container out dir so the
+    ``result.json`` written *inside* the container lands at the host path this
+    function already reads, and ``RESULT_FILE_ENV`` is set inside the container by
+    the run prefix (not via ``run_env``).  ``gpus`` is enabled when a local GPU is
+    detected, matching the real local path.
+
+    The ``setup_step`` (if any) always runs OUTSIDE the container as a bare
+    ``bash -lc`` — consistent with the real local-subprocess backend, which runs
+    ``setup_step_block`` before the ``docker run`` line (dependency install happens
+    on the host/VM, not in the experiment image).
+
+    GRACEFUL DEGRADATION: when ``container_image`` is set but Docker is NOT
+    available on the orchestrator host, the smoke does NOT hard-fail — it falls
+    back to the existing bare-host ``bash -lc`` path (so the gate still catches
+    bare import/crash failures) and flags ``degraded_no_docker=True`` on the
+    result so the caller and diagnostics can see the smoke was not substrate-
+    faithful.  In that degraded mode the gate is NOT image-pull/in-container/CUDA
+    faithful.  The absent-``container_image`` path is byte-for-byte unchanged.
     """
     run_env: dict[str, str] = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
     # Mirror the GCP startup script: put the repo root on PYTHONPATH so commands
@@ -262,6 +297,44 @@ async def run_preflight_smoke(
     try:
         result_path = os.path.join(tmpdir, "result.json")
         run_env[RESULT_FILE_ENV] = result_path
+
+        # When a container image is declared, wrap the MAIN command in the same
+        # docker login/pull/run path the real local backend uses — but only if
+        # Docker is actually available on this orchestrator host.  Otherwise
+        # degrade gracefully to the bare-host smoke (current behavior) rather than
+        # hard-failing the job for a missing orchestrator-side dependency.
+        degraded_no_docker = False
+        ran_containerized = False
+        effective_command = command
+        if container_image:
+            if shutil.which("docker") is not None:
+                ran_containerized = True
+                prefix = _build_container_run_prefix(
+                    container_image,
+                    host_out_dir=tmpdir,  # -> result.json lands at result_path
+                    gpus=detect_local_gpu() is not None,
+                )
+                docker_parts: list[str] = []
+                auth = container_registry_auth or {}
+                pwd = str(auth.get("password") or "")
+                # The persisted auth carries only server/username (the password is
+                # stripped at create time), so for orchestrated jobs this login
+                # branch is dormant and password-gated pulls may fail at smoke —
+                # acceptable: public images and host-identity pulls still validate.
+                if pwd:
+                    server_q = shlex.quote(str(auth.get("server") or ""))
+                    user_q = shlex.quote(str(auth.get("username") or ""))
+                    docker_parts.append(
+                        f"printf '%s' {shlex.quote(pwd)} | "
+                        f"docker login {server_q} -u {user_q} --password-stdin "
+                        ">/dev/null 2>&1 &&"
+                    )
+                docker_parts.append(f"docker pull {shlex.quote(container_image)} &&")
+                docker_parts.append(f"{prefix} bash -lc {shlex.quote(command)}")
+                effective_command = " ".join(docker_parts)
+            else:
+                # Docker absent on the orchestrator: degrade, do not hard-fail.
+                degraded_no_docker = True
 
         async def _run_bash(cmd: str, t: int) -> tuple[int | None, str]:
             try:
@@ -287,6 +360,8 @@ async def run_preflight_smoke(
                 return -1, str(exc)[:_PREFLIGHT_STDERR_MAX_BYTES]
 
         # Run setup_step first if present; a non-zero (non-timeout) exit is a FAIL.
+        # setup_step always runs OUTSIDE the container (bare bash -lc), consistent
+        # with the real local-subprocess backend which runs setup before docker run.
         if setup_step:
             setup_t = max(10, timeout_seconds // 3)
             setup_exit, setup_err = await _run_bash(setup_step, setup_t)
@@ -297,9 +372,11 @@ async def run_preflight_smoke(
                     metric_captured=False,
                     declared_metric_value=None,
                     error_excerpt=f"setup_step failed (exit {setup_exit}): {setup_err}",
+                    degraded_no_docker=degraded_no_docker,
+                    ran_containerized=ran_containerized,
                 )
 
-        exit_code, stderr_text = await _run_bash(command, timeout_seconds)
+        exit_code, stderr_text = await _run_bash(effective_command, timeout_seconds)
         # Timed out (still running) counts as startup OK.
         startup_ok = exit_code is None or exit_code == 0
 
@@ -323,9 +400,10 @@ async def run_preflight_smoke(
             metric_captured=metric_captured,
             declared_metric_value=declared_metric_value,
             error_excerpt=stderr_text,
+            degraded_no_docker=degraded_no_docker,
+            ran_containerized=ran_containerized,
         )
     finally:
-        import shutil  # noqa: PLC0415
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
