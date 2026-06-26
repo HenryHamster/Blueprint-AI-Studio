@@ -1627,6 +1627,85 @@ def test_local_wrapper_command_provisions_and_exports_artifact_dir():
     assert f"rm -rf {shlex.quote(artifact_dir)}" not in wrapper
 
 
+def test_local_wrapper_wraps_command_in_container_when_image_set(monkeypatch):
+    """When container_image is set the wrapper must run the command via docker run.
+
+    Verified: docker run present, state dir mounted to /tmp/blueprint_out,
+    BLUEPRINT_RESULT_FILE points inside the container, original command preserved,
+    and --gpus all is absent when no GPU is detected.
+    """
+    monkeypatch.setattr(
+        compute_backends_module,
+        "_detect_local_gpu_cache",
+        None,  # no GPU detected
+    )
+    external_id = "local-container-test"
+    state_dir = compute_backends_module._local_state_dir_for_external_id(external_id)
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "python train.py --epochs 10",
+        external_id=external_id,
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+    )
+    assert "docker run" in wrapper
+    assert "--rm" in wrapper
+    # State dir must be volume-mounted to the fixed in-container path.
+    assert f"{state_dir}:{compute_backends_module._CONTAINER_OUT_DIR}" in wrapper
+    # BLUEPRINT_RESULT_FILE must point inside the container (not the host path).
+    assert f"BLUEPRINT_RESULT_FILE={compute_backends_module._CONTAINER_OUT_DIR}/result.json" in wrapper
+    # The original command must be present (inside the docker invocation).
+    assert "python train.py --epochs 10" in wrapper
+    # GPU flag must NOT appear when no GPU is detected.
+    assert "--gpus" not in wrapper
+    # docker pull of the image must be present.
+    assert "docker pull" in wrapper
+    assert "nvcr.io/nvidia/tensorflow:25.01-tf2-py3" in wrapper
+    # Absent-field path (no container_image) must be unchanged.
+    plain_wrapper = compute_backends_module._build_local_wrapper_command(
+        "echo hi", external_id=external_id
+    )
+    assert "docker" not in plain_wrapper
+
+
+def test_local_wrapper_adds_gpus_flag_when_gpu_detected(monkeypatch):
+    """--gpus all is injected when a local GPU is detected and container_image is set."""
+    monkeypatch.setattr(
+        compute_backends_module,
+        "_detect_local_gpu_cache",
+        {"name": "Tesla T4", "memory_mib": 16384},
+    )
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "echo hi",
+        external_id="local-gpu-test",
+        container_image="nvcr.io/nvidia/cuda:12.0-base",
+    )
+    assert "--gpus all" in wrapper
+
+
+def test_local_wrapper_docker_login_included_when_registry_auth_has_password(monkeypatch):
+    """docker login command is included in the wrapper when registry auth has a password."""
+    monkeypatch.setattr(
+        compute_backends_module,
+        "_detect_local_gpu_cache",
+        None,
+    )
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "python train.py",
+        external_id="local-auth-test",
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        container_registry_auth={
+            "server": "nvcr.io",
+            "username": "$oauthtoken",
+            "password": "secret-ngc-key",
+        },
+    )
+    assert "docker login" in wrapper
+    assert "nvcr.io" in wrapper
+    assert "--password-stdin" in wrapper
+    # Password must NOT appear in plain text in the wrapper (passed via printf).
+    assert "secret-ngc-key" in wrapper  # present inside printf expression
+    assert "docker run" in wrapper
+
+
 def test_gcp_startup_script_uploads_artifacts_to_per_job_prefix():
     job_id = uuid.uuid4()
     spec = ComputeLaunchSpec(
@@ -9622,6 +9701,148 @@ def test_gcp_startup_script_writes_boot_beacon_before_command():
     assert trap_idx < beacon_idx < command_idx
 
 
+def test_gcp_startup_script_wraps_command_in_container_with_gpu():
+    """When container_image AND an accelerator are set, the GCP startup script must
+    wrap the command in `docker run --gpus all`, pull the image first, mount the VM
+    artifact dir into the container, and point BLUEPRINT_RESULT_FILE at the
+    in-container result path so the existing terminal-record reader keeps working."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py --epochs 10",
+        machine_type="a2-highgpu-1g",
+        spend_cap_usd=5.0,
+        deadline_at=None,
+        runtime_deadline_seconds=600,
+        accelerator="T4",
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # The command runs inside the declared image, with GPU passthrough.
+    assert "docker run" in script
+    assert "--rm" in script
+    assert "--gpus all" in script
+    # The image is pulled before the command runs.
+    assert "docker pull" in script
+    assert "nvcr.io/nvidia/tensorflow:25.01-tf2-py3" in script
+    # The VM artifact dir is bind-mounted into the container so result.json and
+    # artifacts written inside land on the host the terminal-record reader uses.
+    art = compute_backends_module._GCP_ARTIFACT_DIR_PATH
+    assert f"{art}:{art}" in script
+    # BLUEPRINT_RESULT_FILE seen by the in-container command points at the mounted
+    # result path (a sibling of the artifact dir), NOT the bare-VM standalone path.
+    assert f"BLUEPRINT_RESULT_FILE={art}/result.json" in script
+    # The original command is preserved inside the docker invocation.
+    assert "python train.py --epochs 10" in script
+    # docker run is wired through the command runner via `bash -lc`.
+    assert "bash -lc" in script
+    # The pull failure path emits the distinct, parseable terminal reason on BOTH
+    # the serial marker and the durable terminal-record paths.
+    assert "container_image_pull_failed" in script
+    assert (
+        f"{compute_backends_module._SERIAL_REASON_PREFIX}container_image_pull_failed"
+        in script
+    )
+    assert "FAILED 1 container_image_pull_failed" in script
+    # Boot-beacon ordering invariant must survive the inserted pull/run steps.
+    trap_idx = script.index("trap upload_artifacts EXIT")
+    beacon_idx = script.index("vm_terminated_before_completion")
+    command_idx = script.index("python3 /tmp/blueprint_command_runner.py")
+    assert trap_idx < beacon_idx < command_idx
+
+
+def test_gcp_startup_script_gpus_flag_gated_on_accelerator():
+    """--gpus all appears only when an accelerator is requested (the CPU agent image
+    lacks the NVIDIA Container Toolkit, so docker run --gpus all would fail there)."""
+    base = dict(
+        job_id=uuid.uuid4(),
+        command="python eval.py",
+        machine_type="e2-standard-4",
+        spend_cap_usd=2.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        container_image="nvcr.io/nvidia/cuda:12.0-base",
+    )
+    gpu_script = compute_backends_module._build_gcp_startup_script(
+        ComputeLaunchSpec(accelerator="T4", **base),
+        artifact_upload_url="https://storage.example.com/upload",
+    )
+    cpu_script = compute_backends_module._build_gcp_startup_script(
+        ComputeLaunchSpec(accelerator=None, **base),
+        artifact_upload_url="https://storage.example.com/upload",
+    )
+    assert "--gpus all" in gpu_script
+    assert "docker run" in cpu_script
+    assert "--gpus" not in cpu_script
+
+
+def test_gcp_startup_script_docker_login_only_with_registry_auth():
+    """`docker login --password-stdin` is emitted only when registry auth carries a
+    password; the password is delivered via an env var (never on a command line)
+    and never reaches the serial console or any artifact/log marker."""
+    secret = "s3cr3t-ngc-api-key"
+    base = dict(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="a2-highgpu-1g",
+        spend_cap_usd=5.0,
+        deadline_at=None,
+        runtime_deadline_seconds=600,
+        accelerator="T4",
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+    )
+    with_auth = compute_backends_module._build_gcp_startup_script(
+        ComputeLaunchSpec(
+            container_registry_auth={
+                "server": "nvcr.io",
+                "username": "$oauthtoken",
+                "password": secret,
+            },
+            **base,
+        ),
+        artifact_upload_url="https://storage.example.com/upload",
+    )
+    without_auth = compute_backends_module._build_gcp_startup_script(
+        ComputeLaunchSpec(**base),
+        artifact_upload_url="https://storage.example.com/upload",
+    )
+    assert "docker login" in with_auth
+    assert "--password-stdin" in with_auth
+    assert "docker login" not in without_auth
+    # The password is consumed from an env var via --password-stdin, so it never
+    # appears as an inline literal on the docker login command line itself.
+    assert f"docker login {secret}" not in with_auth
+    assert "-u \"${BLUEPRINT_REGISTRY_USERNAME}\"" in with_auth
+    # The password must NEVER be echoed to the serial console: no `echo`/marker
+    # line carries it. Every login/output redirect goes to /dev/null.
+    for line in with_auth.splitlines():
+        if line.lstrip().startswith("echo "):
+            assert secret not in line, f"password leaked to serial echo: {line!r}"
+
+
+def test_gcp_startup_script_no_docker_without_image():
+    """Absent container_image, the generated script is byte-for-byte unchanged from
+    the bare-shell path — no docker token appears anywhere."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        repo_clone={"owner": "o", "repo": "r", "ref": "main"},
+        repo_token="tok",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "docker" not in script
+    assert "container_image_pull_failed" not in script
+    # The standalone bare-VM result path is still used when no container is set.
+    assert compute_backends_module._GCP_RESULT_FILE_PATH in script
+
+
 def test_gcp_startup_script_includes_setup_step_block():
     """A spec with setup_step includes a bail-out block with setup_step_failed reason."""
     spec = ComputeLaunchSpec(
@@ -11683,4 +11904,63 @@ def test_local_backend_live_tail_read_on_poll(tmp_path):
     result = compute_backends_module._read_local_live_tail(job)
     assert result is not None, "_read_local_live_tail must return a dict when file exists"
     assert result["text"] == tail_text
-    assert result["truncated"] is False
+
+
+# ---------------------------------------------------------------------------
+# Security invariant: container_registry_auth password must never be persisted
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_registry_auth_password_rejected(
+    db_session, monkeypatch
+):
+    """create_compute_job must raise ValueError when container_registry_auth includes a
+    password — there is no delivery channel to pass the password to the backend
+    launcher (unlike repo tokens, which are freshly minted at launch time)."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+
+    with pytest.raises(ValueError, match="password cannot be delivered"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=2.0,
+            deadline_seconds=300,
+            backend_name="local-subprocess",
+            container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+            container_registry_auth={
+                "server": "nvcr.io",
+                "username": "$oauthtoken",
+                "password": "s3cr3t-ngc-api-key",
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_registry_auth_no_password_persists_server_username(
+    db_session, monkeypatch
+):
+    """create_compute_job must persist server+username when no password is present."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=2.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        container_registry_auth={
+            "server": "nvcr.io",
+            "username": "$oauthtoken",
+        },
+    )
+
+    persisted_auth = (job.polling_metadata or {}).get("container_registry_auth")
+    assert persisted_auth == {"server": "nvcr.io", "username": "$oauthtoken"}

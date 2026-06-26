@@ -807,6 +807,16 @@ class ComputeExperimentPayload(_AcceptanceEvidenceMixin, _SystemPopulated):
     # budget is consumed by the main command. Use to install dependencies that are
     # absent from the base VM image (e.g. `pip install -r requirements.txt`).
     setup_step: str | None = None
+    # Optional container image URI. When set the compute backend wraps the command
+    # in ``docker run`` with the result-file directory volume-mounted. Absent ⇒
+    # existing bare bash -lc path, unchanged. General — no image hardcoding.
+    container_image: str | None = None
+    # Optional registry credentials for private/gated registries.
+    # Shape: {server, username}. The 'password' field is NOT supported in the
+    # orchestrated path — there is no delivery channel from create time to the
+    # backend launcher. Use a registry accessible via the VM's service-account
+    # identity (e.g. Artifact Registry with Workload Identity) or a public image.
+    container_registry_auth: dict[str, Any] | None = None
     # NOTE: the legacy ``act_on_verdict`` opt-in (axis B) was retired — disposition
     # is now decided at completion (always-dispose), not by an authoring-time flag.
     # ``extra='allow'`` keeps any legacy payload still carrying the key valid.

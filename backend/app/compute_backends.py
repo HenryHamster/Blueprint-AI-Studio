@@ -112,6 +112,11 @@ LOCAL_BACKEND_NAME = "local-subprocess"
 GCP_BACKEND_NAME = "gcp"
 LOCAL_GPU_BACKEND_NAME = "local-gpu"
 
+# Fixed in-container path where the job's state directory is mounted.
+# The command writes result.json and artifacts/ here; the host-side mount makes
+# them visible at the job's state dir path without any post-run copy step.
+_CONTAINER_OUT_DIR = "/tmp/blueprint_out"
+
 _DETECT_LOCAL_GPU_UNSET = object()
 _detect_local_gpu_cache: object = _DETECT_LOCAL_GPU_UNSET
 
@@ -189,6 +194,14 @@ class ComputeLaunchSpec:
     # reason `setup_step_failed`; the setup output is captured to setup_step.log in
     # the artifact dir for diagnosis. Absent ⇒ no setup step (legacy behavior).
     setup_step: str | None = None
+    # Optional container image URI (e.g. "nvcr.io/nvidia/tensorflow:25.01-tf2-py3").
+    # When set, the execution backend wraps the command in `docker run` with the
+    # result-file directory volume-mounted so output lands on the host unchanged.
+    # Absent ⇒ existing bare bash -lc path (byte-for-byte unchanged).
+    container_image: str | None = None
+    # Registry credentials for private/gated registries.  Only {server, username}
+    # survive to the persisted launch spec; password is never written to the DB.
+    container_registry_auth: dict | None = None
 
 
 @dataclass(slots=True)
@@ -448,6 +461,8 @@ class LocalSubprocessComputeBackend:
                     spec.command,
                     external_id=external_id,
                     setup_step=spec.setup_step,
+                    container_image=spec.container_image,
+                    container_registry_auth=spec.container_registry_auth,
                 ),
             ],
             cwd=spec.cwd or None,
@@ -873,8 +888,52 @@ def _read_local_terminal_status_for_external_id(
     )
 
 
+def _build_container_run_prefix(
+    image: str,
+    *,
+    host_out_dir: str,
+    container_out_dir: str = _CONTAINER_OUT_DIR,
+    gpus: bool = False,
+    extra_env: dict[str, str] | None = None,
+    extra_mounts: list[tuple[str, str]] | None = None,
+    workdir: str | None = None,
+) -> str:
+    """Return a shell prefix: ``docker run --rm [--gpus all] -v … -e … IMAGE``.
+
+    The caller appends ``bash -lc <quoted-command>`` after this prefix.
+    ``host_out_dir`` must exist on the host before docker run is called;
+    it is bind-mounted at ``container_out_dir`` so the command's
+    result.json and artifacts land at the same host paths the terminal-status
+    reader already uses. ``extra_mounts`` adds further ``host:container`` bind
+    mounts (e.g. the cloned repo) and ``workdir`` sets the in-container cwd.
+    """
+    result_file = f"{container_out_dir}/result.json"
+    artifact_dir = f"{container_out_dir}/artifacts"
+    parts = ["docker", "run", "--rm"]
+    if gpus:
+        parts += ["--gpus", "all"]
+    parts += [
+        "-v", shlex.quote(f"{host_out_dir}:{container_out_dir}"),
+        "-e", shlex.quote(f"{RESULT_FILE_ENV}={result_file}"),
+        "-e", shlex.quote(f"{ARTIFACT_DIR_ENV}={artifact_dir}"),
+    ]
+    for host_path, container_path in extra_mounts or []:
+        parts += ["-v", shlex.quote(f"{host_path}:{container_path}")]
+    for k, v in (extra_env or {}).items():
+        parts += ["-e", shlex.quote(f"{k}={v}")]
+    if workdir:
+        parts += ["-w", shlex.quote(workdir)]
+    parts.append(shlex.quote(image))
+    return " ".join(parts)
+
+
 def _build_local_wrapper_command(
-    command: str, *, external_id: str, setup_step: str | None = None
+    command: str,
+    *,
+    external_id: str,
+    setup_step: str | None = None,
+    container_image: str | None = None,
+    container_registry_auth: dict | None = None,
 ) -> str:
     state_dir = shlex.quote(_local_state_dir_for_external_id(external_id))
     pid_path = shlex.quote(_local_pid_path_for_external_id(external_id))
@@ -893,7 +952,30 @@ def _build_local_wrapper_command(
             "live_tail.b64",
         )
     )
-    command_literal = shlex.quote(command)
+    if container_image:
+        host_out_dir = _local_state_dir_for_external_id(external_id)
+        gpus = detect_local_gpu() is not None
+        prefix = _build_container_run_prefix(
+            container_image,
+            host_out_dir=host_out_dir,
+            gpus=gpus,
+        )
+        docker_parts: list[str] = []
+        auth = container_registry_auth or {}
+        pwd = str(auth.get("password") or "")
+        if pwd:
+            server_q = shlex.quote(str(auth.get("server") or ""))
+            user_q = shlex.quote(str(auth.get("username") or ""))
+            docker_parts.append(
+                f"printf '%s' {shlex.quote(pwd)} | "
+                f"docker login {server_q} -u {user_q} --password-stdin >/dev/null 2>&1 &&"
+            )
+        docker_parts.append(f"docker pull {shlex.quote(container_image)} &&")
+        docker_parts.append(f"{prefix} bash -lc {shlex.quote(command)}")
+        effective_command = " ".join(docker_parts)
+    else:
+        effective_command = command
+    command_literal = shlex.quote(effective_command)
     # Optional setup step: run before the main command; on failure write the
     # terminal file and exit so the main command never starts.
     setup_step_block = ""
@@ -1275,6 +1357,40 @@ def _build_gcp_startup_script(
     # both reference, so assign them before repo_setup_block is built below.
     result_file = shlex.quote(_GCP_RESULT_FILE_PATH)
     artifact_dir = shlex.quote(_GCP_ARTIFACT_DIR_PATH)
+    # Container mode: when the contract declares a runtime image, the command runs
+    # inside `docker run` instead of a bare `bash -lc`. The VM artifact dir is
+    # bind-mounted into the container so result.json and artifacts written inside
+    # land on the host where the terminal-record reader and artifact upload already
+    # look. result.json therefore moves from the standalone _GCP_RESULT_FILE_PATH
+    # to a sibling of the mounted artifact dir; every host reference below uses the
+    # `result_file` variable, so reassigning it here keeps the boot-beacon, TTL, and
+    # completion records pointed at the real file. Absent container_image ⇒ this
+    # whole block is skipped and the generated script is byte-for-byte unchanged.
+    container_run_prefix = ""
+    if spec.container_image:
+        container_result_host_path = os.path.join(
+            _GCP_ARTIFACT_DIR_PATH, "result.json"
+        )
+        result_file = shlex.quote(container_result_host_path)
+        _container_extra_mounts: list[tuple[str, str]] | None = None
+        _container_workdir: str | None = None
+        _container_extra_env: dict[str, str] | None = None
+        if spec.repo_clone:
+            # The repo is cloned to /tmp/blueprint_repo on the VM (see
+            # repo_setup_block); mount it into the container and run there so the
+            # command's imports resolve exactly as they do on the bare substrate.
+            _container_extra_mounts = [("/tmp/blueprint_repo", "/workspace")]
+            _container_workdir = "/workspace"
+            _container_extra_env = {"PYTHONPATH": "/workspace"}
+        container_run_prefix = _build_container_run_prefix(
+            spec.container_image,
+            host_out_dir=_GCP_ARTIFACT_DIR_PATH,
+            container_out_dir=_GCP_ARTIFACT_DIR_PATH,
+            gpus=spec.accelerator is not None,
+            extra_mounts=_container_extra_mounts,
+            extra_env=_container_extra_env,
+            workdir=_container_workdir,
+        )
     command_log_path = shlex.quote(
         os.path.join(_GCP_ARTIFACT_DIR_PATH, "command.log.json")
     )
@@ -1381,7 +1497,59 @@ def _build_gcp_startup_script(
             f"  exit 1\n"
             f"fi"
         )
-    command = shlex.quote(spec.command)
+    # In container mode the command runner still runs `bash -lc <command>`, but
+    # <command> is now the full `docker run … bash -lc <inner>` invocation, so the
+    # log-capture / live-tail machinery is unchanged.
+    docker_setup_block = ""
+    if spec.container_image:
+        command = shlex.quote(
+            f"{container_run_prefix} bash -lc {shlex.quote(spec.command)}"
+        )
+        # `docker login` (only when a password is supplied) followed by
+        # `docker pull`. Credentials are injected as shell env vars delivered via
+        # the encrypted instance-metadata startup script and consumed through
+        # --password-stdin — the password never appears on a command line, on the
+        # serial console, or in any uploaded artifact/log. A failed pull terminates
+        # LOUDLY with the parseable `container_image_pull_failed` reason on both the
+        # serial marker and the durable terminal-record paths (mirroring the
+        # clone-fail branch) rather than letting the command die with no marker.
+        pull_log = shlex.quote(os.path.join(_GCP_ARTIFACT_DIR_PATH, "pull.log"))
+        login_block = ""
+        auth = spec.container_registry_auth or {}
+        pwd = str(auth.get("password") or "")
+        if pwd:
+            login_block = (
+                f"export BLUEPRINT_REGISTRY_SERVER="
+                f"{shlex.quote(str(auth.get('server') or ''))}\n"
+                f"export BLUEPRINT_REGISTRY_USERNAME="
+                f"{shlex.quote(str(auth.get('username') or ''))}\n"
+                f"export BLUEPRINT_REGISTRY_PASSWORD={shlex.quote(pwd)}\n"
+                'if [ -n "${BLUEPRINT_REGISTRY_PASSWORD:-}" ]; then\n'
+                '  printf %s "${BLUEPRINT_REGISTRY_PASSWORD}" | '
+                'docker login "${BLUEPRINT_REGISTRY_SERVER}" '
+                '-u "${BLUEPRINT_REGISTRY_USERNAME}" '
+                "--password-stdin >/dev/null 2>&1 || true\n"
+                "fi\n"
+            )
+        docker_setup_block = (
+            login_block
+            + 'echo "Pulling container image..."\n'
+            + f"if ! docker pull {shlex.quote(spec.container_image)} "
+            + f">{pull_log} 2>&1; then\n"
+            + f'  echo "{_SERIAL_REASON_PREFIX}container_image_pull_failed"\n'
+            + f'  echo "{_SERIAL_STATUS_PREFIX}FAILED"\n'
+            + f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
+            + "  python3 /tmp/blueprint_terminal_record.py "
+            + f"{artifact_dir} FAILED 1 container_image_pull_failed "
+            + f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            + "  upload_artifacts\n"
+            + '  kill "$TTL_PID" 2>/dev/null || true\n'
+            + "  poweroff || shutdown -h now || true\n"
+            + "  exit 1\n"
+            + "fi\n"
+        )
+    else:
+        command = shlex.quote(spec.command)
     artifact_bundle = shlex.quote(_GCP_ARTIFACT_BUNDLE_PATH)
     artifact_upload_url = shlex.quote(artifact_upload_url)
     upload_timeout = _GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS
@@ -1473,7 +1641,7 @@ python3 /tmp/blueprint_terminal_record.py \
 {repo_setup_block}
 {setup_step_block}
 {cwd_line}
-EXIT_CODE=0
+{docker_setup_block}EXIT_CODE=0
 if python3 /tmp/blueprint_command_runner.py \
   {command} \
   {command_log_path} \

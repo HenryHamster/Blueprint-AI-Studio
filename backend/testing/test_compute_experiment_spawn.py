@@ -2258,6 +2258,124 @@ def test_declared_metric_valid_charsets_accepted():
 
 
 # ---------------------------------------------------------------------------
+# container_image / container_registry_auth contract-forwarding tests
+# ---------------------------------------------------------------------------
+
+
+def test_author_contract_picks_up_container_image_when_present():
+    """_author_compute_launch_contract forwards container_image from finding."""
+    finding = {
+        "command": "python train.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": "nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["container_image"] == "nvcr.io/nvidia/tensorflow:25.01-tf2-py3"
+
+
+def test_author_contract_picks_up_container_registry_auth_when_present():
+    """_author_compute_launch_contract forwards container_registry_auth from finding."""
+    auth = {"server": "nvcr.io", "username": "$oauthtoken", "password": "secret"}
+    finding = {
+        "command": "python train.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": "nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        "container_registry_auth": auth,
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["container_registry_auth"] == auth
+
+
+def test_author_contract_omits_container_fields_when_absent():
+    """_author_compute_launch_contract omits container fields when not in finding."""
+    finding = {"command": "python run.py", "spend_cap_usd": 1.0, "deadline_seconds": 60}
+    contract = _author_compute_launch_contract(finding)
+    assert "container_image" not in contract
+    assert "container_registry_auth" not in contract
+
+
+def test_validate_contract_accepts_valid_container_image():
+    """_validate_compute_launch_contract accepts a non-empty container_image string."""
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": "nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is True, f"expected ok but got reason={reason!r}"
+
+
+def test_validate_contract_rejects_empty_container_image():
+    """_validate_compute_launch_contract rejects an empty string container_image."""
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": "",
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "container_image" in reason
+
+
+def test_validate_contract_rejects_whitespace_container_image():
+    """_validate_compute_launch_contract rejects a whitespace-only container_image."""
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": "   ",
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "container_image" in reason
+
+
+def test_validate_contract_rejects_non_string_container_image():
+    """_validate_compute_launch_contract rejects a non-string container_image."""
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": 42,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "container_image" in reason
+
+
+def test_validate_contract_rejects_non_dict_container_registry_auth():
+    """_validate_compute_launch_contract rejects a non-dict container_registry_auth."""
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": "nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        "container_registry_auth": "not-a-dict",
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "container_registry_auth" in reason
+
+
+def test_validate_contract_rejects_non_string_field_in_container_registry_auth():
+    """_validate_compute_launch_contract rejects container_registry_auth with a non-string field."""
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": "nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        "container_registry_auth": {"server": "nvcr.io", "username": 123, "password": "pw"},
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "container_registry_auth" in reason
+
+
+# ---------------------------------------------------------------------------
 # compute_arm_aggregator: error-branch coverage
 # ---------------------------------------------------------------------------
 

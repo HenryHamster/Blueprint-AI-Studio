@@ -269,6 +269,8 @@ async def create_compute_job(
     live_proof: Any | None = None,
     live_proof_marker: Any | None = None,
     setup_step: str | None = None,
+    container_image: str | None = None,
+    container_registry_auth: dict | None = None,
 ) -> ComputeJob:
     if not command.strip():
         raise ValueError("command must be non-empty")
@@ -345,6 +347,7 @@ async def create_compute_job(
         accelerator=persisted_accelerator,
         accelerator_count=persisted_accelerator_count,
         live_proof_requirement=live_proof_requirement,
+        container_image=container_image,
     )
     existing = await _get_active_compute_job_for_task(session, task_id=locked_task.id)
     if existing is not None:
@@ -422,6 +425,28 @@ async def create_compute_job(
     }
     if setup_step is not None:
         polling_metadata["setup_step"] = setup_step
+    if container_image:
+        polling_metadata["container_image"] = container_image
+        if container_registry_auth and isinstance(container_registry_auth, dict):
+            if container_registry_auth.get("password"):
+                raise ValueError(
+                    "container_registry_auth.password cannot be delivered to the "
+                    "compute backend in the orchestrated path — the password is "
+                    "never persisted, and there is no re-attachment channel at "
+                    "launch time (unlike repo tokens, which are freshly minted). "
+                    "Use a container image in a public registry or one accessible "
+                    "via the VM's service-account identity (e.g. Artifact Registry "
+                    "with Workload Identity). Omit the password field or use a "
+                    "public image to proceed."
+                )
+            # Persist only server + username — password is never written to the row.
+            registry_meta: dict[str, str] = {}
+            if container_registry_auth.get("server"):
+                registry_meta["server"] = str(container_registry_auth["server"])
+            if container_registry_auth.get("username"):
+                registry_meta["username"] = str(container_registry_auth["username"])
+            if registry_meta:
+                polling_metadata["container_registry_auth"] = registry_meta
     if live_release_evidence is not None:
         polling_metadata[_LIVE_PROOF_METADATA_KEY] = live_release_evidence
     job = ComputeJob(
@@ -762,12 +787,14 @@ def _build_launch_request_fingerprint(
     accelerator: str | None = None,
     accelerator_count: int | None = None,
     live_proof_requirement: dict[str, str] | None = None,
+    container_image: str | None = None,
 ) -> str:
     payload = {
         "accelerator": accelerator,
         "accelerator_count": accelerator_count,
         "backend": backend_name,
         "command": command,
+        "container_image": container_image,
         "cwd": cwd,
         "deadline_seconds": deadline_seconds,
         "env": {str(k): str(v) for k, v in (env or {}).items()},
@@ -1955,6 +1982,10 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
     effective_provisioning_deadline = (
         prov_deadline if prov_deadline is not None else job.wall_clock_deadline
     )
+    registry_auth_meta = meta.get("container_registry_auth")
+    container_registry_auth = (
+        dict(registry_auth_meta) if isinstance(registry_auth_meta, dict) else None
+    )
     return ComputeLaunchSpec(
         job_id=job.id,
         external_id=job.external_compute_id,
@@ -1971,6 +2002,8 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         accelerator=job.accelerator_type,
         accelerator_count=int(job.accelerator_count or 1),
         setup_step=meta.get("setup_step") or None,
+        container_image=meta.get("container_image") or None,
+        container_registry_auth=container_registry_auth,
     )
 
 

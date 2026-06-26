@@ -58,6 +58,12 @@ class LaunchComputeJobRequest(BaseModel):
     # clone and BEFORE the main command. On failure the job fails immediately
     # with reason `setup_step_failed`; no main-command budget is consumed.
     setup_step: str | None = Field(default=None, max_length=10000)
+    # Optional container image URI and registry auth. When container_image is set
+    # the backend wraps the command in docker run. Only {server, username} are
+    # accepted — password is rejected at create time (no delivery channel to the
+    # backend launcher exists in the orchestrated path).
+    container_image: str | None = Field(default=None, max_length=512)
+    container_registry_auth: Dict[str, Any] | None = None
 
 
 @router.post("/compute-jobs")
@@ -126,6 +132,8 @@ async def launch_compute_job(
             live_proof=req.live_proof,
             live_proof_marker=req.live_proof_marker,
             setup_step=req.setup_step,
+            container_image=req.container_image,
+            container_registry_auth=req.container_registry_auth,
         )
     except ComputeLaunchPreconditionFailed as exc:
         raise HTTPException(status_code=412, detail=exc.detail) from exc

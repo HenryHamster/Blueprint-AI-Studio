@@ -83,6 +83,8 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "declared_metric",
         "sweep_id",
         "setup_step",
+        "container_image",
+        "container_registry_auth",
     ):
         val = _pick(opt_key)
         if val is not None:
@@ -214,6 +216,19 @@ def _validate_compute_launch_contract(
         )
     if not deadline > 0:
         return False, f"deadline_seconds must be positive (got {deadline})"
+
+    container_image = contract.get("container_image")
+    if container_image is not None:
+        if not isinstance(container_image, str) or not container_image.strip():
+            return False, "container_image must be a non-empty string URI when specified"
+        registry_auth = contract.get("container_registry_auth")
+        if registry_auth is not None:
+            if not isinstance(registry_auth, dict):
+                return False, "container_registry_auth must be an object with server/username/password"
+            for req_key in ("server", "username", "password"):
+                val = registry_auth.get(req_key)
+                if val is not None and not isinstance(val, str):
+                    return False, f"container_registry_auth.{req_key} must be a string"
 
     if require_smoke:
         # Author-attested smoke is now ADVISORY ONLY.  The platform-executed

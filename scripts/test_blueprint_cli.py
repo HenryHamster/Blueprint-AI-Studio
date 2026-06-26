@@ -4263,3 +4263,165 @@ def test_compute_run_arms_json_mode_produces_valid_json(tmp_path, monkeypatch, c
     arms_block = data["metrics"]["arms"]
     assert "arm_a" in arms_block
     assert "arm_b" in arms_block
+
+
+# ---------------------------------------------------------------------------
+# Container-image wrapping tests for _compute_run_local (single-command + arms)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_run_local_single_command_wrapped_in_docker(tmp_path, monkeypatch, capsys):
+    """When container_image is set, the single-command path runs 'docker run' not bare bash."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "python train.py",
+        "container_image": "myregistry.io/myimage:latest",
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    captured_cmds = []
+
+    def fake_run(cmd, env=None, **kwargs):
+        captured_cmds.append(list(cmd) if isinstance(cmd, list) else cmd)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    # The run command must use docker, not bare bash
+    run_cmds = [c for c in captured_cmds if isinstance(c, list) and c[:2] == ["docker", "run"]]
+    assert run_cmds, f"expected a 'docker run' invocation; got commands: {captured_cmds}"
+    docker_cmd = run_cmds[0]
+    assert "myregistry.io/myimage:latest" in docker_cmd
+    assert "BLUEPRINT_RESULT_FILE" in " ".join(docker_cmd)
+    # No --gpus when no GPU detected
+    assert "--gpus" not in docker_cmd
+
+
+def test_compute_run_local_single_command_docker_gpus_when_gpu_detected(tmp_path, monkeypatch, capsys):
+    """When container_image is set and a GPU is detected, --gpus all is added to docker run."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "python train.py",
+        "container_image": "myregistry.io/myimage:cuda",
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    captured_cmds = []
+
+    def fake_run(cmd, env=None, **kwargs):
+        captured_cmds.append(list(cmd) if isinstance(cmd, list) else cmd)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": True, "backend": "nvidia", "devices": ["Tesla T4"],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    run_cmds = [c for c in captured_cmds if isinstance(c, list) and c[:2] == ["docker", "run"]]
+    assert run_cmds, f"expected 'docker run'; got: {captured_cmds}"
+    docker_cmd = run_cmds[0]
+    assert "--gpus" in docker_cmd
+    assert "all" in docker_cmd
+
+
+def test_compute_run_local_no_container_uses_bare_bash(tmp_path, monkeypatch, capsys):
+    """When container_image is absent, the command runs via bare bash -lc (unchanged path)."""
+    import subprocess as _subprocess
+
+    captured_cmds = []
+
+    def fake_run(cmd, env=None, **kwargs):
+        captured_cmds.append(list(cmd) if isinstance(cmd, list) else cmd)
+        if env:
+            rf = env.get("BLUEPRINT_RESULT_FILE")
+            if rf:
+                with open(rf, "w") as f:
+                    json.dump({"loss": 0.5}, f)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "echo hi"])
+    blueprint._compute_run_local(args)
+
+    assert any(
+        isinstance(c, list) and c[:2] == ["bash", "-lc"]
+        for c in captured_cmds
+    ), f"expected bare 'bash -lc'; got: {captured_cmds}"
+    # No docker invocation
+    assert not any(
+        isinstance(c, list) and "docker" in c
+        for c in captured_cmds
+    ), f"expected no docker call; got: {captured_cmds}"
+
+
+def test_compute_run_local_arms_wrapped_in_docker_per_arm(tmp_path, monkeypatch, capsys):
+    """When container_image is set with arms, each arm command runs via a separate docker run."""
+    import subprocess as _subprocess
+
+    spec = {
+        "arms": [
+            {"name": "adam", "command": "python train.py --opt adam"},
+            {"name": "sgd", "command": "python train.py --opt sgd"},
+        ],
+        "declared_metric": "val_loss",
+        "container_image": "myregistry.io/myimage:latest",
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    captured_cmds = []
+
+    def fake_run(cmd, env=None, **kwargs):
+        captured_cmds.append(list(cmd) if isinstance(cmd, list) else cmd)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    docker_run_cmds = [
+        c for c in captured_cmds if isinstance(c, list) and c[:2] == ["docker", "run"]
+    ]
+    # One docker run per arm
+    assert len(docker_run_cmds) == 2, f"expected 2 docker run invocations; got: {captured_cmds}"
+    for docker_cmd in docker_run_cmds:
+        assert "myregistry.io/myimage:latest" in docker_cmd
+        assert "BLUEPRINT_RESULT_FILE" in " ".join(docker_cmd)
+        assert "--gpus" not in docker_cmd  # no GPU detected

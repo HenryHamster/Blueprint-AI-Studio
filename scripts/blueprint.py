@@ -3946,6 +3946,8 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     declared_metric: str | None = None
     success_criterion: dict | None = None
     arms: list | None = None
+    container_image: str | None = None
+    container_registry_auth: dict | None = None
     if getattr(args, "local_spec", None):
         # --local <spec.json>: read spec file; validate_backend_name is bypassed
         # because we call subprocess.run directly (no DB-backed flow).
@@ -3969,8 +3971,13 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         elif raw_sc is not None:
             print("error: spec 'success_criterion' must be an object with metric/operator/threshold")
             sys.exit(1)
+        container_image = spec.get("container_image") or None
+        raw_auth = spec.get("container_registry_auth")
+        if isinstance(raw_auth, dict):
+            container_registry_auth = raw_auth
     else:
         command = args.run_command
+        container_image = getattr(args, "container_image", None) or None
 
     # CLI flags as fallback criterion source (spec takes precedence)
     if success_criterion is None:
@@ -3997,6 +4004,32 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     else:
         env["BLUEPRINT_LOCAL_GPU"] = "none"
 
+    if container_image:
+        if container_registry_auth and isinstance(container_registry_auth, dict):
+            server = str(container_registry_auth.get("server") or "")
+            username = str(container_registry_auth.get("username") or "")
+            password = str(container_registry_auth.get("password") or "")
+            if server and username and password:
+                login_result = subprocess.run(
+                    ["docker", "login", server, "-u", username, "--password-stdin"],
+                    input=password.encode(),
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                if not _json_mode(args):
+                    status_str = "ok" if login_result.returncode == 0 else "failed (continuing)"
+                    print(f"docker login {server!r}: {status_str}")
+        if not _json_mode(args):
+            print(f"image       : {container_image}")
+            print("docker pull : pulling...")
+        pull_result = subprocess.run(
+            ["docker", "pull", container_image],
+            stdout=subprocess.DEVNULL if _json_mode(args) else None,
+        )
+        if pull_result.returncode != 0:
+            print(f"error: docker pull {container_image!r} failed (exit {pull_result.returncode})")
+            sys.exit(pull_result.returncode)
+
     if arms:
         arm_names = [a.get("name", f"arm_{i}") for i, a in enumerate(arms)]
         if not _json_mode(args):
@@ -4020,7 +4053,20 @@ def _compute_run_local(args: argparse.Namespace) -> None:
 
             if not _json_mode(args):
                 print(f"  [{arm_name}] running...")
-            arm_proc = subprocess.run(["bash", "-lc", arm_cmd], env=arm_env)
+            if container_image:
+                container_result = f"/tmp/blueprint_out/result_{arm_name}.json"
+                docker_arm_cmd = ["docker", "run", "--rm"]
+                if gpu_info["detected"]:
+                    docker_arm_cmd += ["--gpus", "all"]
+                docker_arm_cmd += [
+                    "-v", f"{tmpdir}:/tmp/blueprint_out",
+                    "-e", f"BLUEPRINT_RESULT_FILE={container_result}",
+                    "-e", "BLUEPRINT_ARTIFACT_DIR=/tmp/blueprint_out/artifacts",
+                    container_image, "bash", "-lc", arm_cmd,
+                ]
+                arm_proc = subprocess.run(docker_arm_cmd)
+            else:
+                arm_proc = subprocess.run(["bash", "-lc", arm_cmd], env=arm_env)
             arm_exit_code = arm_proc.returncode
 
             if arm_exit_code != 0:
@@ -4087,7 +4133,20 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     if not _json_mode(args):
         print("running...")
 
-    proc = subprocess.run(["bash", "-lc", command], env=env)
+    if container_image:
+        docker_single_cmd = ["docker", "run", "--rm"]
+        if gpu_info["detected"]:
+            docker_single_cmd += ["--gpus", "all"]
+        docker_single_cmd += [
+            "-v", f"{tmpdir}:/tmp/blueprint_out",
+            "-e", "BLUEPRINT_RESULT_FILE=/tmp/blueprint_out/result.json",
+            "-e", "BLUEPRINT_ARTIFACT_DIR=/tmp/blueprint_out/artifacts",
+            container_image, "bash", "-lc", command,
+        ]
+        proc = subprocess.run(docker_single_cmd)
+        result_file = os.path.join(tmpdir, "result.json")
+    else:
+        proc = subprocess.run(["bash", "-lc", command], env=env)
     exit_code = proc.returncode
     status = "SUCCEEDED" if exit_code == 0 else "FAILED"
 
@@ -4736,6 +4795,13 @@ def build_parser() -> argparse.ArgumentParser:
              "optionally 'declared_metric' (str) and 'success_criterion' (object with "
              "metric/operator/threshold). Runs the command locally without the orchestrator."
     )
+    p_compute_run.add_argument(
+        "--image", dest="container_image", default=None, metavar="IMAGE_URI",
+        help="Container image URI to run the command inside "
+             "(e.g. nvcr.io/nvidia/tensorflow:25.01-tf2-py3). "
+             "When set the command is wrapped in docker run with the result-file "
+             "directory volume-mounted. --gpus all is added when a local GPU is detected. "
+             "Spec file takes precedence over this flag.")
     p_compute_run.add_argument(
         "--criterion-metric", dest="criterion_metric", default=None, metavar="METRIC",
         help="Metric name for success criterion (positional form only; spec takes precedence).")

@@ -75,7 +75,7 @@ type JobResponse = Record<string, unknown>;
 
 function unwrapJobData(res: unknown): JobResponse | null {
   if (res && typeof res === 'object' && 'data' in res) {
-    const data = res.data;
+    const data = (res as Record<string, unknown>)['data'];
     if (data && typeof data === 'object') return data as JobResponse;
   }
   return null;
@@ -163,6 +163,12 @@ function buildLaunchBody(payload: Record<string, unknown>): Record<string, unkno
   // jobs without a declared metric are byte-for-byte unchanged.
   const declaredMetric = strVal(payload.declared_metric);
   if (declaredMetric) body.declared_metric = declaredMetric;
+  // Forward optional container image and registry auth when present.
+  const containerImage = strVal(payload.container_image);
+  if (containerImage) body.container_image = containerImage;
+  if (payload.container_registry_auth && typeof payload.container_registry_auth === 'object' && !Array.isArray(payload.container_registry_auth)) {
+    body.container_registry_auth = payload.container_registry_auth;
+  }
   return body;
 }
 
