@@ -8,6 +8,7 @@ import {
   setProjectPromotionEnabled,
   setVersionPhase,
   setVersionGoal,
+  setVersionTheme,
   triggerQualify,
   type AgentServingShasResponse,
   type QualificationVerdictRecord,
@@ -73,6 +74,8 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
   const [editingGoal, setEditingGoal] = useState<boolean>(false);
   const [goalInput, setGoalInput] = useState<string>('');
+  const [editingTheme, setEditingTheme] = useState<boolean>(false);
+  const [themeInput, setThemeInput] = useState<string>('');
   const [optimisticOverrides, setOptimisticOverrides] = useState<Partial<CurrentVersion> | null>(null);
   const [promotionEnabledOverride, setPromotionEnabledOverride] = useState<boolean | null>(null);
   const [cuttingVersion, setCuttingVersion] = useState<boolean>(false);
@@ -90,7 +93,10 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     if (data?.current_version?.goal !== undefined) {
       setGoalInput(data.current_version.goal || '');
     }
-  }, [data?.current_version?.goal]);
+    if (data?.current_version?.theme !== undefined) {
+      setThemeInput(data.current_version.theme || '');
+    }
+  }, [data?.current_version?.goal, data?.current_version?.theme]);
   useEffect(() => {
     setOptimisticOverrides(null);
   }, [data?.current_version?.phase, data?.current_version?.goal]);
@@ -195,6 +201,28 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
       setOptimisticOverrides(null);
       setEditingGoal(false);
       setGoalInput(cv?.goal || '');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleSetTheme = async () => {
+    if (!projectId) return;
+    setActionLoading('theme');
+    setActionMsg(null);
+    try {
+      const response = await setVersionTheme(projectId, themeInput || null);
+      setOptimisticOverrides({
+        theme: response.theme,
+      });
+      setActionMsg('Theme updated');
+      setEditingTheme(false);
+      onRefresh();
+    } catch (error) {
+      setActionMsg(error instanceof Error ? error.message : 'Request failed');
+      setOptimisticOverrides(null);
+      setEditingTheme(false);
+      setThemeInput(cv?.theme || '');
     } finally {
       setActionLoading(null);
     }
@@ -529,6 +557,71 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 data-viewport-allow-small-target
               >
                 Set goal
+              </button>
+            ) : null}
+            {editingTheme && projectId ? (
+              <div className="flex flex-col gap-1.5">
+                <select
+                  value={themeInput}
+                  onChange={(e) => setThemeInput(e.target.value)}
+                  disabled={actionLoading !== null}
+                  className="text-ui-md bg-neutral-800 border border-neutral-700 text-neutral-300 rounded px-2 py-1 focus:outline-none focus:border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <option value="">Clear theme</option>
+                  <option value="leanness">Leanness</option>
+                  <option value="reliability">Reliability</option>
+                  <option value="performance">Performance</option>
+                  <option value="feature">Feature</option>
+                  <option value="mixed">Mixed</option>
+                  <option value="none">None</option>
+                </select>
+                <div className="flex gap-1">
+                  <button
+                    onClick={handleSetTheme}
+                    disabled={actionLoading !== null}
+                    className="text-ui-sm px-2 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    data-viewport-allow-small-target
+                  >
+                    {actionLoading === 'theme' ? '…' : 'Save'}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setEditingTheme(false);
+                      setThemeInput(cv.theme || '');
+                    }}
+                    disabled={actionLoading !== null}
+                    className="text-ui-sm px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    data-viewport-allow-small-target
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : cv.theme ? (
+              <div className="flex flex-col gap-1">
+                <p className="text-ui-md text-neutral-300">
+                  <span className="text-neutral-500">Theme: </span>
+                  <span className="px-1.5 py-0.5 rounded bg-neutral-800/70 text-neutral-300 border border-neutral-700 font-medium">{cv.theme}</span>
+                </p>
+                {projectId && (
+                  <button
+                    onClick={() => setEditingTheme(true)}
+                    disabled={actionLoading !== null}
+                    className="text-ui-sm px-1.5 py-0.5 w-fit rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                    data-viewport-allow-small-target
+                  >
+                    Edit
+                  </button>
+                )}
+              </div>
+            ) : projectId ? (
+              <button
+                onClick={() => setEditingTheme(true)}
+                disabled={actionLoading !== null}
+                className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
+                data-viewport-allow-small-target
+              >
+                Set theme
               </button>
             ) : null}
             {cv.out_of_band_promotion && (

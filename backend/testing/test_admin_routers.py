@@ -4693,6 +4693,60 @@ class TestMessages:
         assert note.context.get("answer") == "Do X instead."
 
     @pytest.mark.asyncio
+    async def test_operator_reply_resolves_open_question(
+        self, client: AsyncClient, db_session
+    ):
+        """Operator replying to an open QUESTION via PATCH resolves it and posts a question_answer NOTE.
+
+        This exercises the frontend reply path: when the operator types an answer
+        to a system QUESTION and submits, the UI calls PATCH /messages/{id} with the
+        answer as the resolution. The backend marks the question resolved and creates
+        a question_answer NOTE linked back to it so the strategist sees it answered.
+        """
+        from sqlmodel import select
+
+        project = await _make_project(db_session)
+        question = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="system",
+            content="Should I use approach A or B?",
+            status="open",
+        )
+        db_session.add(question)
+        await db_session.commit()
+        await db_session.refresh(question)
+
+        resp = await client.patch(
+            f"/api/admin/messages/{question.id}",
+            json={"resolution": "Use approach A."},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "resolved"
+
+        # Question row is now resolved with the operator's answer stored
+        await db_session.refresh(question)
+        assert question.status == "resolved"
+        assert question.resolution == "Use approach A."
+
+        # A question_answer NOTE was created so the strategist can read it
+        notes = (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.message_type == MessageType.NOTE,
+                    ProjectMessage.from_type == "user",
+                )
+            )
+        ).scalars().all()
+        assert len(notes) == 1, "Exactly one answer note should be created"
+        note = notes[0]
+        assert note.context is not None
+        assert note.context.get("event_type") == "question_answer"
+        assert note.context.get("reply_to") == str(question.id)
+        assert note.context.get("answer") == "Use approach A."
+
+    @pytest.mark.asyncio
     async def test_delete_message(self, client: AsyncClient, db_session):
         """Can delete an existing message."""
         project = await _make_project(db_session)

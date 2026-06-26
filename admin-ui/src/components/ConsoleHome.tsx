@@ -1,8 +1,8 @@
 import { useState } from 'react';
-import { AlertTriangle, BarChart2, Clock, ExternalLink, Layers, PlusCircle } from 'lucide-react';
+import { AlertTriangle, BarChart2, Clock, ExternalLink, Layers, PlusCircle, Zap } from 'lucide-react';
 import { useDashboardDigest } from '../hooks/useDashboardDigest';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
-import { fetchFleetUtilization, fetchTask } from '../api';
+import { fetchFleetUtilization, fetchTask, triggerSelfAudit } from '../api';
 import { MetricCard, SuccessRateCard, CostCard, Skeleton } from './DashboardMetricCards';
 import { FleetCapacityCard, type FleetUtilizationResponse } from './FleetCapacityCard';
 import { SystemStatusCard } from './SystemStatusCard';
@@ -115,6 +115,27 @@ export function ConsoleHome({
   const trendHistory = digest?.trend_history ?? [];
 
   const [fetchError, setFetchError] = useState<string | null>(null);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditTaskId, setAuditTaskId] = useState<string | null>(null);
+  const [auditError, setAuditError] = useState<string | null>(null);
+
+  const handleRunSelfAudit = async () => {
+    if (!selectedProjectId) {
+      setAuditError('No project selected');
+      return;
+    }
+    setAuditLoading(true);
+    setAuditError(null);
+    try {
+      const result = await triggerSelfAudit(selectedProjectId);
+      setAuditTaskId(result.task_id);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to start self-audit';
+      setAuditError(message);
+    } finally {
+      setAuditLoading(false);
+    }
+  };
 
   const handleViewTaskById = (taskId: string) => {
     const task = tasks.find(t => t.id === taskId);
@@ -193,6 +214,28 @@ export function ConsoleHome({
             <Layers className="w-3 h-3" />
             Details
           </button>
+        )}
+      </div>
+
+      {/* Self-audit section */}
+      <div className="space-y-2">
+        <button
+          onClick={handleRunSelfAudit}
+          disabled={auditLoading}
+          className="w-full flex items-center gap-2 px-3 py-2 bg-neutral-900/50 border border-neutral-800/50 rounded-lg hover:bg-neutral-800/50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors text-left"
+        >
+          <Zap className="w-4 h-4 text-neutral-400 shrink-0" />
+          <span className="text-xs font-medium text-neutral-300">
+            {auditLoading ? 'Running Self-Audit...' : 'Run Self-Audit'}
+          </span>
+        </button>
+        {auditTaskId && (
+          <p className="text-xs text-emerald-400 px-1">
+            ✓ Self-audit task: <span className="font-mono">{auditTaskId.slice(0, 8)}</span>
+          </p>
+        )}
+        {auditError && (
+          <p className="text-xs text-red-400 px-1">{auditError}</p>
         )}
       </div>
 

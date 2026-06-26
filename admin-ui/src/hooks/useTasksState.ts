@@ -1,6 +1,6 @@
 import { useState, useEffect, useMemo } from 'react';
 import type { Task } from '../types/task';
-import { API_BASE_URL, apiFetch, authHeaders, authGet } from '../api';
+import { API_BASE_URL, apiFetch, authHeaders, authGet, resetTaskIterationCap, triggerTaskRollup } from '../api';
 import { STATUS_OPTIONS } from '../constants';
 import { usePersistedState } from './usePersistedState';
 
@@ -481,6 +481,33 @@ export function useTasksState(deps: UseTasksStateDeps) {
     setConfirmDialog(null);
   };
 
+  const handleResetIterationCap = async (taskId: string) => {
+    setActionLoadingMap(m => ({ ...m, [taskId]: 'reset-iteration-cap' }));
+    try {
+      const data = await resetTaskIterationCap(taskId);
+      fetchTasks();
+      addToast(`Iteration cap reset (archived ${data.archived_count} task${data.archived_count !== 1 ? 's' : ''})`, 'success');
+    } catch (error) {
+      addToast(error instanceof Error ? error.message : 'Failed to reset iteration cap', 'error');
+    } finally {
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
+    }
+  };
+
+  const handleTriggerRollup = async (taskId: string) => {
+    setActionLoadingMap(m => ({ ...m, [taskId]: 'trigger-rollup' }));
+    try {
+      const data = await triggerTaskRollup(taskId);
+      fetchTasks();
+      const prNum = data.rollup_pr_number ?? data.pr_number;
+      addToast(prNum ? `Rollup PR #${prNum} triggered` : 'Rollup triggered', 'success');
+    } catch (error) {
+      addToast(error instanceof Error ? error.message : 'Failed to trigger rollup', 'error');
+    } finally {
+      setActionLoadingMap(m => { const { [taskId]: _unused, ...rest } = m; void _unused; return rest; });
+    }
+  };
+
   const handleBulkCancel = async (taskIds: string[]) => {
     if (taskIds.length === 0) return;
     try {
@@ -527,5 +554,6 @@ export function useTasksState(deps: UseTasksStateDeps) {
     handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
     handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn,
     handleBulkAction, handleBulkCancel,
+    handleResetIterationCap, handleTriggerRollup,
   };
 }

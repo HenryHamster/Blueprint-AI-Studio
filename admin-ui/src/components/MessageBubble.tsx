@@ -223,7 +223,7 @@ export interface MessageBubbleProps {
   onSetResolveInput: (value: string) => void;
   onStartInvestigate: (msgId: string) => void;
   onCancelInvestigate: () => void;
-  onReply: (replyTo: { id: string; content: string; from: string }) => void;
+  onReply: (replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => void;
 }
 
 export function MessageBubble({
@@ -316,7 +316,9 @@ export function MessageBubble({
           )}
           {/* Content */}
           {userMsg ? (
-            <p className="text-sm text-neutral-200 leading-relaxed whitespace-pre-wrap">{msg.content}</p>
+            <div className="text-sm text-neutral-200 leading-relaxed">
+              <MarkdownContent content={msg.content} />
+            </div>
           ) : (
             <div className="text-sm text-neutral-200 leading-relaxed">
               <MarkdownContent content={msg.content} />
@@ -375,7 +377,7 @@ export function MessageBubble({
               </button>
             )}
             <button
-              onClick={() => onReply({ id: msg.id, content: msg.content, from: formatFromType(msg) })}
+              onClick={() => onReply({ id: msg.id, content: msg.content, from: formatFromType(msg), message_type: msg.message_type, status: msg.status })}
               title="Reply"
               className="text-neutral-600 hover:text-blue-400 p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
             >

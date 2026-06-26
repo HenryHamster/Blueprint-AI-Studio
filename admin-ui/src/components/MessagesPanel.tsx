@@ -208,7 +208,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // race window so a burst collapses to a single POST on the client side (the
   // server idempotency key is the backstop for retries that do reach it).
   const submittingRef = useRef(false);
-  const [replyTo, setReplyTo] = useState<{ id: string; content: string; from: string } | null>(null);
+  const [replyTo, setReplyTo] = useState<{ id: string; content: string; from: string; message_type: string; status: string } | null>(null);
   // Real arming outcome the server reported for the last send (null before any
   // send, or after the operator changes the message type so the composer reverts
   // to a fresh type-based prediction).
@@ -859,6 +859,26 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     submittingRef.current = true;
     setSubmitting(true);
     try {
+      // When the operator types an answer to an open QUESTION, resolve the question
+      // via PATCH — the backend posts a question_answer NOTE (linked back to the
+      // question) and marks the question resolved so the strategist sees it answered.
+      if (replyTo && replyTo.message_type === 'QUESTION' && replyTo.status === 'open') {
+        const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${replyTo.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ resolution: newContent.trim() }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        idempotencyKeyRef.current = null;
+        setNewContent('');
+        clearComposerDraft(auth.currentUser?.email, selectedProjectId);
+        setReplyTo(null);
+        setLastArming(null);
+        if (textareaRef.current) textareaRef.current.style.height = 'auto';
+        addToast('Question answered', 'success');
+        await fetchMessages();
+        return;
+      }
       const context: Record<string, unknown> = {};
       if (replyTo) {
         context.reply_to = replyTo.id;
@@ -1171,7 +1191,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     onSetResolveInput: setResolveInput,
     onStartInvestigate: (msgId: string) => setInvestigatingId(msgId),
     onCancelInvestigate: () => setInvestigatingId(null),
-    onReply: (replyTo: { id: string; content: string; from: string }) => {
+    onReply: (replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => {
       setReplyTo(replyTo);
       textareaRef.current?.focus();
     },

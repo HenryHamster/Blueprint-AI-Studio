@@ -1289,6 +1289,8 @@ export default function App() {
           onEditPrompt={s.handleEditPrompt}
           onDismiss={s.handleDismiss}
           onDuplicate={s.openDuplicateTaskModal}
+          onResetIterationCap={s.handleResetIterationCap}
+          onTriggerRollup={s.handleTriggerRollup}
           onPanelReview={(task) => {
             const payload = (task.payloads?.[0] ?? {}) as Record<string, unknown>;
             const prNumber = payload.pr_number as number | undefined;

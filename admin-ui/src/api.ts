@@ -2345,6 +2345,24 @@ export async function setProjectPromotionEnabled(
   return res.json();
 }
 
+export interface SelfAuditResponse {
+  task_id: string;
+  project_id: string;
+  status: string;
+}
+
+export async function triggerSelfAudit(projectId: string): Promise<SelfAuditResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/self-audit`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to trigger self-audit: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to trigger self-audit: ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function fetchVersionLifecycle(projectId: string): Promise<VersionLifecycleResponse> {
   const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-lifecycle`);
   if (!res.ok) throw new Error(`Failed to fetch version lifecycle: ${res.status}`);
@@ -2422,6 +2440,27 @@ export async function setVersionGoal(
     body: JSON.stringify({ goal: goal ?? null }),
   });
   if (!res.ok) throw new Error(`Failed to set version goal: ${res.status}`);
+  return res.json();
+}
+
+export interface SetVersionThemeResponse {
+  version_number: number;
+  theme: string | null;
+}
+
+export async function setVersionTheme(
+  projectId: string,
+  theme: string | null,
+): Promise<SetVersionThemeResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-theme`, {
+    method: 'POST',
+    body: JSON.stringify({ theme: theme ?? null }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to set version theme: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to set version theme: ${res.status}`);
+  }
   return res.json();
 }
 
@@ -3967,4 +4006,31 @@ export async function revokeFleetRunner(projectId: string, runnerId: string): Pr
     const msg = data?.detail || `Failed to revoke runner: ${res.status}`;
     throw new Error(typeof msg === 'string' ? msg : `Failed to revoke runner: ${res.status}`);
   }
+}
+
+/** Reset the review-fix iteration cap for a PR-linked task. Archives FAILED
+ *  review/fix tasks on the PR to drop them from the global count and zeroes
+ *  the per-chain iteration counter. */
+export async function resetTaskIterationCap(
+  taskId: string,
+): Promise<{ archived_count: number; previous_per_chain_iteration: number }> {
+  const res = await apiFetch(`/api/admin/tasks/${taskId}/reset-iteration-cap`, { method: 'POST' });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to reset iteration cap: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Force-create the rollup PR for an EVALUATING parent task. Idempotent —
+ *  returns the existing PR if one is already in progress. */
+export async function triggerTaskRollup(
+  taskId: string,
+): Promise<{ rollup_pr_number?: number; rollup_pr_url?: string; pr_number?: number; pr_url?: string }> {
+  const res = await apiFetch(`/api/admin/tasks/${taskId}/rollup`, { method: 'POST' });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to trigger rollup: ${res.status}`);
+  }
+  return res.json();
 }

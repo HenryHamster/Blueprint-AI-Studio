@@ -28,6 +28,8 @@ interface TaskDetailDrawerProps {
   onWidthChange?: (width: number) => void;
   onDuplicate?: (task: Task) => void;
   onPanelReview?: (task: Task) => void;
+  onResetIterationCap?: (id: string) => void;
+  onTriggerRollup?: (id: string) => void;
 }
 
 // A panel_review can be launched from a review/fix task only when that task
@@ -36,6 +38,15 @@ function panelReviewablePr(task: Task): boolean {
   if (task.task_type !== 'review' && task.task_type !== 'fix') return false;
   const payload = (task.payloads?.[0] ?? {}) as Record<string, unknown>;
   return payload.pr_number != null;
+}
+
+// A task has a PR number in context if it carries review_loop.pr_number or rollup_pr_number.
+// Used to determine whether "Reset Iteration Cap" is available.
+function hasReviewPr(task: Task): boolean {
+  const ctx = task.context as Record<string, unknown> | undefined;
+  if (!ctx) return false;
+  const reviewLoop = ctx['review_loop'] as Record<string, unknown> | undefined;
+  return !!(reviewLoop?.['pr_number'] || ctx['rollup_pr_number']);
 }
 
 type Tab = 'details' | 'logs' | 'changes';
@@ -231,6 +242,8 @@ export function TaskDetailDrawer({
   onWidthChange,
   onDuplicate,
   onPanelReview,
+  onResetIterationCap,
+  onTriggerRollup,
 }: TaskDetailDrawerProps) {
   const [activeTab, setActiveTab] = useState<Tab>('details');
   const [logFilter, setLogFilter] = useState('');
@@ -377,6 +390,8 @@ export function TaskDetailDrawer({
   const showApproval = task.requires_approval && !['FAILED', 'CANCELLED'].includes(task.status);
   const showCancel = isActive && !task.requires_approval;
   const showFailedActions = task.status === 'FAILED';
+  const showResetCap = !!onResetIterationCap && hasReviewPr(task);
+  const showTriggerRollup = !!onTriggerRollup && task.status === 'EVALUATING';
   const [showChangesForm, setShowChangesForm] = useState(false);
   const [changesFeedback, setChangesFeedback] = useState('');
 
@@ -561,8 +576,8 @@ export function TaskDetailDrawer({
         )}
 
         {/* Action Footer */}
-        {(showApproval || showCancel || showFailedActions) && (
-          <div className="border-t border-neutral-800 p-4 shrink-0 flex items-center gap-2">
+        {(showApproval || showCancel || showFailedActions || showResetCap || showTriggerRollup) && (
+          <div className="border-t border-neutral-800 p-4 shrink-0 flex items-center gap-2 flex-wrap">
             {showApproval && (
               <div className="flex flex-col gap-2 w-full">
                 <div className="flex flex-wrap gap-2">
@@ -691,6 +706,28 @@ export function TaskDetailDrawer({
                   {actionLoading === 'dismiss' && <Loader2 className="w-3 h-3 animate-spin" />}Dismiss
                 </button>
               </>
+            )}
+
+            {showResetCap && (
+              <button
+                onClick={() => onResetIterationCap?.(task.id)}
+                disabled={!!actionLoading}
+                title="Archive failed review/fix tasks on this PR and reset the iteration counter"
+                className="px-4 py-2 rounded-lg bg-amber-600/20 hover:bg-amber-600/30 text-amber-400 text-sm font-medium transition-colors disabled:opacity-50 border border-amber-600/30 flex items-center gap-1.5"
+              >
+                {actionLoading === 'reset-iteration-cap' && <Loader2 className="w-3 h-3 animate-spin" />}Reset Review Cap
+              </button>
+            )}
+
+            {showTriggerRollup && (
+              <button
+                onClick={() => onTriggerRollup?.(task.id)}
+                disabled={!!actionLoading}
+                title="Force-create the rollup PR for this EVALUATING parent task"
+                className="px-4 py-2 rounded-lg bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 text-sm font-medium transition-colors disabled:opacity-50 border border-blue-600/30 flex items-center gap-1.5"
+              >
+                {actionLoading === 'trigger-rollup' && <Loader2 className="w-3 h-3 animate-spin" />}Force Rollup
+              </button>
             )}
           </div>
         )}
