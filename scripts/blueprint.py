@@ -1925,12 +1925,14 @@ def _render_envelope(data: dict) -> None:
 # ── messages ─────────────────────────────────────────────────────────────────
 
 def cmd_messages(args: argparse.Namespace) -> None:
-    """Dispatch messages subcommands: list / send / answer."""
+    """Dispatch messages subcommands: list / send / answer / confirm."""
     sub = getattr(args, "messages_cmd", None) or "list"
     if sub == "send":
         _messages_send(args)
     elif sub == "answer":
         _messages_answer(args)
+    elif sub == "confirm":
+        _messages_confirm(args)
     else:
         _messages_list(args)
 
@@ -1981,21 +1983,77 @@ def _messages_send(args: argparse.Namespace) -> None:
 
 
 def _messages_answer(args: argparse.Namespace) -> None:
-    cfg = load_config()
-    if cfg.get("read_only"):
-        print(
-            "ERROR: 'answer' is a mutating action but the resolved config is "
-            "read-only (agent-JWT fallback). Provide an admin API key "
-            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    pid = get_project_id(getattr(args, "project_id", None))
+    _require_write_config("answer")
     message_id = args.message_id
-    result = api("POST", f"/api/admin/projects/{pid}/messages/{message_id}/answer", {
-        "content": args.content,
+    result = api("PATCH", f"/api/admin/messages/{message_id}", {
+        "resolution": args.content,
     })
     _emit(args, result, lambda d: print(f"  Answer sent: {d.get('id', '?')}"))
+
+
+def _messages_confirm(args: argparse.Namespace) -> None:
+    """Dispatch messages confirm subcommands: list / accept / dismiss."""
+    sub = getattr(args, "confirm_cmd", None) or "list"
+    if sub == "accept":
+        _messages_confirm_accept(args)
+    elif sub == "dismiss":
+        _messages_confirm_dismiss(args)
+    else:
+        _messages_confirm_list(args)
+
+
+def _messages_confirm_list(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    project = api("GET", f"/api/admin/projects/{pid}")
+    pm = project.get("problem_model") or {}
+    items = pm.get("pending_user_confirmation") or []
+    _emit(args, {"pending": items}, _render_pending_list)
+
+
+def _render_pending_list(data: dict) -> None:
+    items = data.get("pending") or []
+    print(f"=== PENDING CONFIRMATIONS ({len(items)}) ===")
+    if not items:
+        print("  (none)")
+        return
+    for p in items:
+        pid = p.get("id", "?")
+        ptype = p.get("type", "?")
+        proposal = (p.get("proposal") or "")[:100]
+        rationale = (p.get("rationale") or "")[:80]
+        created = (p.get("created_at") or "?")[:16]
+        print(f"  {pid}  [{ptype}]  {created}")
+        print(f"    {proposal}")
+        if rationale:
+            print(f"    rationale: {rationale}")
+
+
+def _messages_confirm_accept(args: argparse.Namespace) -> None:
+    _require_write_config("messages confirm accept")
+    pid = get_project_id(getattr(args, "project_id", None))
+    pending_id = args.pending_id
+    if not _confirm(f"Accept pending confirmation {pending_id}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    body: dict = {}
+    if getattr(args, "answer", None):
+        body["answer"] = args.answer
+    result = api("POST", f"/api/admin/projects/{pid}/pending-confirm/{pending_id}/accept", body)
+    _emit(args, result, lambda d: print(f"  Accepted: {pending_id}  status={d.get('status', 'ok')}"))
+
+
+def _messages_confirm_dismiss(args: argparse.Namespace) -> None:
+    _require_write_config("messages confirm dismiss")
+    pid = get_project_id(getattr(args, "project_id", None))
+    pending_id = args.pending_id
+    if not _confirm(f"Dismiss pending confirmation {pending_id}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    body: dict = {}
+    if getattr(args, "note", None):
+        body["note"] = args.note
+    result = api("POST", f"/api/admin/projects/{pid}/pending-confirm/{pending_id}/dismiss", body)
+    _emit(args, result, lambda d: print(f"  Dismissed: {pending_id}  status={d.get('status', 'ok')}"))
 
 
 # ── fleet (pool / warm / accounts / zones) ────────────────────────────────────
@@ -4847,6 +4905,30 @@ def build_parser() -> argparse.ArgumentParser:
                                         help="Answer a QUESTION message with a threaded reply.")
     p_msgs_answer.add_argument("message_id", help="ID of the message to answer.")
     p_msgs_answer.add_argument("content", help="Answer content.")
+    p_msgs_confirm = msgs_sub.add_parser(
+        "confirm", parents=[common],
+        help="List or respond to strategist pending_user_confirmation items.",
+        description="List pending confirmations from the problem model, then accept or dismiss them. "
+                    "Defaults to `list` when no subcommand is given.",
+    )
+    confirm_sub = p_msgs_confirm.add_subparsers(dest="confirm_cmd")
+    confirm_sub.add_parser("list", parents=[common], help="List pending confirmations.")
+    p_confirm_accept = confirm_sub.add_parser(
+        "accept", parents=[common],
+        help="Accept a pending confirmation (applies intent_change or records decision).")
+    p_confirm_accept.add_argument("pending_id", help="ID of the pending confirmation item.")
+    p_confirm_accept.add_argument("--answer", default=None,
+                                  help="Operator answer text (for major_decision items).")
+    p_confirm_accept.add_argument("--yes", action="store_true",
+                                  help="Skip the confirmation prompt.")
+    p_confirm_dismiss = confirm_sub.add_parser(
+        "dismiss", parents=[common],
+        help="Dismiss a pending confirmation (records dismissal in revision log).")
+    p_confirm_dismiss.add_argument("pending_id", help="ID of the pending confirmation item.")
+    p_confirm_dismiss.add_argument("--note", default=None,
+                                   help="Optional note explaining the dismissal.")
+    p_confirm_dismiss.add_argument("--yes", action="store_true",
+                                   help="Skip the confirmation prompt.")
 
     # logs
     p_logs = sub.add_parser("logs", parents=[common], help="Read Cloud Run logs via gcloud.",

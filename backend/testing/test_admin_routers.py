@@ -17540,6 +17540,131 @@ class TestComputeExperimentTaskLaunch:
         assert "command" in resp.text
 
 
+class TestRerunComputeExperiment:
+    """POST /api/admin/tasks/{task_id}/rerun — re-run a compute_experiment."""
+
+    async def _project_with_task(self, session, **payload_overrides):
+        project = Project(
+            name="acme/rerun",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="rerun",
+            integration_branch="automain",
+            promotion_target="automain",
+        )
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+        session.add(ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner"))
+        base_payload = {
+            "type": "compute_experiment",
+            "title": "GPU bench",
+            "prompt": "Run it.",
+            "base_branch": "automain",
+            "command": "python bench.py --out result.json",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 900,
+            "success_criterion": {
+                "kind": "metric",
+                "metric": "tokens_per_second",
+                "operator": ">=",
+                "threshold": 100.0,
+                "min_file_count": 1,
+            },
+        }
+        base_payload.update(payload_overrides)
+        task = Task(
+            project_id=project.id,
+            title="GPU bench",
+            description="Run it.",
+            payloads=[base_payload],
+            status=TaskStatus.COMPLETED,
+            created_by="USER",
+            launched_by_user_id=TEST_USER_ID,
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        return project, task
+
+    @pytest.mark.asyncio
+    async def test_rerun_creates_child_task_with_parent_link(
+        self, client: AsyncClient, db_session
+    ):
+        """POST /rerun creates a QUEUED task with parent_task_id pointing at source."""
+        _, source = await self._project_with_task(db_session)
+        resp = await client.post(f"/api/admin/tasks/{source.id}/rerun", json={})
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["parent_task_id"] == str(source.id)
+        child = (
+            await db_session.execute(select(Task).where(Task.id == uuid.UUID(data["id"])))
+        ).scalar_one()
+        assert child.status == TaskStatus.QUEUED
+        assert child.parent_task_id == source.id
+        # Payload inherits source fields.
+        assert child.payloads[0]["command"] == "python bench.py --out result.json"
+
+    @pytest.mark.asyncio
+    async def test_rerun_override_fields_take_precedence(
+        self, client: AsyncClient, db_session
+    ):
+        """Caller-supplied overrides replace source payload fields."""
+        _, source = await self._project_with_task(db_session)
+        resp = await client.post(
+            f"/api/admin/tasks/{source.id}/rerun",
+            json={
+                "spend_cap_usd": 2.5,
+                "deadline_seconds": 600,
+                "success_criterion": {
+                    "metric": "tokens_per_second",
+                    "operator": ">=",
+                    "threshold": 150.0,
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        child = (
+            await db_session.execute(select(Task).where(Task.id == uuid.UUID(data["id"])))
+        ).scalar_one()
+        assert child.payloads[0]["spend_cap_usd"] == 2.5
+        assert child.payloads[0]["deadline_seconds"] == 600
+        assert child.payloads[0]["success_criterion"]["threshold"] == 150.0
+
+    @pytest.mark.asyncio
+    async def test_rerun_non_compute_task_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """Re-running a non-compute_experiment task returns 422."""
+        project = Project(
+            name="acme/other",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="other",
+            integration_branch="automain",
+            promotion_target="automain",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        db_session.add(ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner"))
+        task = Task(
+            project_id=project.id,
+            title="Research task",
+            description="Do research",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="USER",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        resp = await client.post(f"/api/admin/tasks/{task.id}/rerun", json={})
+        assert resp.status_code == 422, resp.text
+        assert "compute_experiment" in resp.text
+
+
 class TestBugReportCitationGate:
     """Reproduce-on-HEAD citation grounding for free-text bug reports.
 

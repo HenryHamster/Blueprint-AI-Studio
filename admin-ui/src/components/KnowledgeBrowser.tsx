@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react';
-import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, RefreshCw, FileCode, Globe, HelpCircle, Cpu, Shield, ShieldCheck, ShieldAlert, AlertTriangle } from 'lucide-react';
+import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, RefreshCw, FileCode, Globe, HelpCircle, Cpu, Shield, ShieldCheck, ShieldAlert, AlertTriangle, Download } from 'lucide-react';
 import { ResolvedReferenceLink, isResolvableStorageUri, isSafeUrl } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
 import { ReleaseEvidencePanel } from './ReleaseEvidence';
@@ -330,6 +330,29 @@ function CopyableId({ id }: { id: string }) {
   );
 }
 
+function ExportMarkdown({ body }: { body?: string }) {
+  const [copied, setCopied] = useState(false);
+  const export_text = useCallback(() => {
+    const markdown = body || '';
+    navigator.clipboard?.writeText(markdown).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }).catch(() => {/* clipboard unavailable */});
+  }, [body]);
+  if (!body) return null;
+  return (
+    <button
+      data-viewport-allow-small-target
+      onClick={export_text}
+      title="Copy markdown to clipboard"
+      className="inline-flex items-center gap-1 text-ui-sm text-neutral-500 hover:text-neutral-300 transition-colors"
+    >
+      {copied ? <Check className="w-3 h-3 text-emerald-400" /> : <Download className="w-3 h-3" />}
+      export
+    </button>
+  );
+}
+
 const PAGE_SIZE = 50;
 
 export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask, onLaunchWebResearchTask, initialDirectionId, initialDocumentId }: KnowledgeBrowserProps) {
@@ -340,9 +363,10 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
     directionFilter: (initialDirectionId ?? null) as string | null,
     sourceKindFilter: null as string | null,
     challengeStateFilter: null as string | null,
+    sweepFilter: null as string | null,
     offset: 0,
   });
-  const { search, topicFilter, tagFilter, directionFilter, sourceKindFilter, challengeStateFilter, offset } = query;
+  const { search, topicFilter, tagFilter, directionFilter, sourceKindFilter, challengeStateFilter, sweepFilter, offset } = query;
 
   const [docs, setDocs] = useState<KnowledgeDocument[]>([]);
   const [total, setTotal] = useState(0);
@@ -350,12 +374,12 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<KnowledgeDocument | null>(null);
 
-  const setFilter = useCallback(<K extends 'search' | 'topicFilter' | 'tagFilter' | 'directionFilter' | 'sourceKindFilter' | 'challengeStateFilter'>(
+  const setFilter = useCallback(<K extends 'search' | 'topicFilter' | 'tagFilter' | 'directionFilter' | 'sourceKindFilter' | 'challengeStateFilter' | 'sweepFilter'>(
     key: K,
     value: typeof query[K],
   ) => {
     setQuery(prev => ({ ...prev, [key]: value, offset: 0 }));
-  }, [query]);
+  }, []);
 
   const loadMore = useCallback(() => {
     setQuery(prev => ({ ...prev, offset: prev.offset + PAGE_SIZE }));
@@ -375,6 +399,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
         direction: directionFilter ?? undefined,
         source_kind: sourceKindFilter ?? undefined,
         challenge_state: challengeStateFilter ?? undefined,
+        sweep: sweepFilter ?? undefined,
         limit: PAGE_SIZE,
         offset,
       })
@@ -391,7 +416,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
         .finally(() => { if (!cancelled) setLoading(false); });
     }, 250);
     return () => { cancelled = true; clearTimeout(handle); };
-  }, [selectedProjectId, search, topicFilter, tagFilter, directionFilter, sourceKindFilter, challengeStateFilter, offset]);
+  }, [selectedProjectId, search, topicFilter, tagFilter, directionFilter, sourceKindFilter, challengeStateFilter, sweepFilter, offset]);
 
   const openDoc = useCallback((doc: KnowledgeDocument) => {
     if (!selectedProjectId) return;
@@ -455,6 +480,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
               <h2 className="text-base font-semibold text-neutral-100 leading-snug">{selected.title}</h2>
               <div className="flex items-center gap-3 flex-wrap text-ui-sm text-neutral-500">
                 <CopyableId id={selected.id} />
+                <ExportMarkdown body={selected.body} />
                 <SourceKindBadge kind={selected.source_kind} />
                 <AcceptanceGradeBadge doc={selected} />
                 <OriginBadge doc={selected} />
@@ -465,6 +491,15 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                 )}
                 {selected.direction_id && <span className="px-1.5 py-0.5 rounded bg-blue-950/40 text-blue-300">{selected.direction_id}</span>}
                 {selected.topic && <span className="px-1.5 py-0.5 rounded bg-violet-950/40 text-violet-300">{selected.topic}</span>}
+                {selected.sweep_id && (
+                  // reason: sweep filter chip in compact detail meta row; text-ui-xs inline control
+                  <button
+                    data-viewport-allow-small-target
+                    onClick={e => { e.stopPropagation(); setFilter('sweepFilter', selected.sweep_id ?? null); }}
+                    className="text-ui-xs px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-300 hover:bg-amber-900/40 transition-colors font-mono"
+                    title={`Sweep ${selected.sweep_id}${selected.arm_label ? ` / ${selected.arm_label}` : ' (aggregate)'}`}
+                  >{selected.sweep_id.slice(0, 8)}…{selected.arm_label ? ` / ${selected.arm_label}` : ' agg'}</button>
+                )}
                 {selected.created_at && <span>{relativeDate(selected.created_at)}</span>}
                 {selected.source_task_id && onNavigateToTask && (() => {
                   const srcTaskId = selected.source_task_id;
@@ -550,7 +585,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
           /* List view */
           <>
             <div className="px-4 py-2 border-b border-neutral-800/50 shrink-0 space-y-2">
-              {(topicFilter || tagFilter || directionFilter) && (
+              {(topicFilter || tagFilter || directionFilter || sweepFilter) && (
                 <div className="flex items-center gap-1.5 flex-wrap">
                   {directionFilter && (
                     <span className="flex items-center gap-1 text-ui-sm bg-blue-950/40 border border-blue-900/50 text-blue-300 px-2 py-0.5 rounded">
@@ -571,6 +606,13 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                       #{tagFilter}
                       {/* reason: clear-tag-filter chip control; w-2.5 h-2.5 icon inline in chip */}
                       <button data-viewport-allow-small-target onClick={() => setFilter('tagFilter', null)} className="text-neutral-500 hover:text-neutral-200"><X className="w-2.5 h-2.5" /></button>
+                    </span>
+                  )}
+                  {sweepFilter && (
+                    <span className="flex items-center gap-1 text-ui-sm bg-amber-950/40 border border-amber-900/50 text-amber-300 px-2 py-0.5 rounded font-mono">
+                      sweep: {sweepFilter.slice(0, 8)}…
+                      {/* reason: clear-sweep-filter chip control; w-2.5 h-2.5 icon inline in chip */}
+                      <button data-viewport-allow-small-target onClick={() => setFilter('sweepFilter', null)} className="text-amber-500 hover:text-amber-200"><X className="w-2.5 h-2.5" /></button>
                     </span>
                   )}
                 </div>
@@ -700,6 +742,15 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                         onClick={e => { e.stopPropagation(); setFilter('topicFilter', doc.topic ?? null); }}
                         className="text-ui-xs px-1.5 py-0.5 rounded bg-violet-950/40 text-violet-300 hover:bg-violet-900/40 transition-colors"
                       >{doc.topic}</button>
+                    )}
+                    {doc.sweep_id && (
+                      // reason: sweep filter chip in compact card footer; text-ui-xs inline control
+                      <button
+                        data-viewport-allow-small-target
+                        onClick={e => { e.stopPropagation(); setFilter('sweepFilter', doc.sweep_id ?? null); }}
+                        className="text-ui-xs px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-300 hover:bg-amber-900/40 transition-colors font-mono"
+                        title={`Sweep ${doc.sweep_id}${doc.arm_label ? ` / ${doc.arm_label}` : ' (aggregate)'}`}
+                      >{doc.sweep_id.slice(0, 8)}…{doc.arm_label ? ` / ${doc.arm_label}` : ' agg'}</button>
                     )}
                     {(doc.tags ?? []).slice(0, 4).map(t => (
                       // reason: tag filter chip in compact card footer; text-ui-xs inline control

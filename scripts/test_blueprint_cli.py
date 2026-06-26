@@ -130,6 +130,10 @@ HELP_INVOCATIONS = [
     ["messages", "list"],
     ["messages", "send"],
     ["messages", "answer"],
+    ["messages", "confirm"],
+    ["messages", "confirm", "list"],
+    ["messages", "confirm", "accept"],
+    ["messages", "confirm", "dismiss"],
     ["fleet"],
     ["fleet", "pool"],
     ["fleet", "warm"],
@@ -471,10 +475,32 @@ def mock_api(monkeypatch):
                      "active_tasks": 0, "rl_hit_count": 1, "disabled_models": {}},
                 ],
             }
-        if "/messages" in path and "/answer" in path and method == "POST":
-            msg_id = path.split("/messages/")[1].split("/answer")[0]
-            return {"id": f"answer-{msg_id[:8]}", "parent_message_id": msg_id,
-                    "status": "created", "type": "ANSWER"}
+        if "/messages/" in path and method == "PATCH":
+            msg_id = path.split("/messages/")[1].split("?")[0]
+            return {"id": msg_id, "status": "resolved"}
+        if "/pending-confirm/" in path and "/accept" in path and method == "POST":
+            pending_id = path.split("/pending-confirm/")[1].split("/accept")[0]
+            return {"status": "accepted", "pending_id": pending_id, "type": "major_decision"}
+        if "/pending-confirm/" in path and "/dismiss" in path and method == "POST":
+            pending_id = path.split("/pending-confirm/")[1].split("/dismiss")[0]
+            return {"status": "dismissed", "pending_id": pending_id}
+        if path.rstrip("/").endswith("/projects/proj-1") and method == "GET":
+            return {
+                "id": "proj-1",
+                "project_name": "test-project",
+                "problem_model": {
+                    "pending_user_confirmation": [
+                        {"id": "pend-abc123", "type": "major_decision",
+                         "proposal": "Should we adopt the new auth flow?",
+                         "rationale": "Current flow has scaling issues",
+                         "created_at": "2026-06-15T10:00:00Z"},
+                        {"id": "pend-def456", "type": "intent_change",
+                         "proposal": "Shift focus to mobile-first design",
+                         "rationale": "User feedback indicates mobile priority",
+                         "created_at": "2026-06-14T08:00:00Z"},
+                    ]
+                },
+            }
         if "/messages" in path and method == "POST":
             return {"id": "msg-abc", "status": "created", "arming": "not_armed"}
         if "/messages" in path:
@@ -2882,29 +2908,31 @@ def test_messages_group(mock_api, monkeypatch, capsys):
 
 
 def test_messages_answer(mock_api, monkeypatch, capsys):
-    """messages answer sends a threaded reply linked to the target message id."""
+    """messages answer resolves a QUESTION via PATCH /api/admin/messages/{id}."""
 
-    # --- answer posts correct body with message_id in URL ---
+    # --- answer calls PATCH with resolution body ---
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
     monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
     mock_api.clear()
     rc = blueprint.main(["messages", "answer", "msg-002", "yes, we are stuck"])
     assert rc == 0
-    post_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "/answer" in p]
-    assert len(post_calls) == 1
-    _, path, body = post_calls[0]
-    assert "/messages/msg-002/answer" in path
-    assert body["content"] == "yes, we are stuck"
+    patch_calls = [(m, p, b) for m, p, b in mock_api if m == "PATCH" and "/messages/msg-002" in p]
+    assert len(patch_calls) == 1
+    _, path, body = patch_calls[0]
+    assert "/messages/msg-002" in path
+    assert body["resolution"] == "yes, we are stuck"
+    # The old /answer POST route must not have been called
+    assert not any("/answer" in p for _, p, _ in mock_api)
     out = capsys.readouterr().out
-    assert "answer-msg" in out
+    assert "Answer sent" in out
 
-    # --- answer with --json emits valid JSON with parent_message_id ---
+    # --- answer with --json emits valid JSON with id and status ---
     mock_api.clear()
     rc = blueprint.main(["--json", "messages", "answer", "msg-002", "response text"])
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
-    assert parsed["parent_message_id"] == "msg-002"
-    assert parsed["type"] == "ANSWER"
+    assert parsed["id"] == "msg-002"
+    assert parsed["status"] == "resolved"
 
     # --- read-only config refuses answer ---
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
@@ -5046,4 +5074,106 @@ def test_compute_launch_no_command_errors(mock_api, monkeypatch):
     })
     with pytest.raises(SystemExit) as exc:
         blueprint.main(["compute", "launch", "--yes"])
+    assert exc.value.code == 1
+
+
+# ── messages answer and confirm ───────────────────────────────────────────────
+
+def test_messages_answer_targets_real_endpoint(mock_api, monkeypatch, capsys):
+    """messages answer calls PATCH /api/admin/messages/{id} with resolution body,
+    not a fabricated POST to /projects/{pid}/messages/{id}/answer."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    msg_id = "msg-uuid-0001"
+    rc = blueprint.main(["messages", "answer", msg_id, "This is my answer"])
+    assert rc == 0
+    # Must have called PATCH /api/admin/messages/{msg_id}
+    patch_calls = [(m, p, b) for m, p, b in mock_api
+                   if m == "PATCH" and f"/messages/{msg_id}" in p]
+    assert patch_calls, "Expected a PATCH to /api/admin/messages/{msg_id}, none recorded"
+    _, path, body = patch_calls[0]
+    assert "resolution" in body, "Body must contain 'resolution' field"
+    assert body["resolution"] == "This is my answer"
+    # The old /answer POST route must NOT have been called
+    old_route_calls = [p for _, p, _ in mock_api if "/answer" in p]
+    assert not old_route_calls, f"Old /answer route was called: {old_route_calls}"
+
+
+def test_messages_confirm_list_json(mock_api, capsys):
+    """messages confirm list --json returns pending_user_confirmation from project."""
+    rc = blueprint.main(["--json", "messages", "confirm", "list"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert "pending" in parsed
+    assert len(parsed["pending"]) == 2
+    ids = [p["id"] for p in parsed["pending"]]
+    assert "pend-abc123" in ids
+    assert "pend-def456" in ids
+    # Must have fetched the project
+    assert any("/projects/proj-1" in p for _, p, _ in mock_api)
+
+
+def test_messages_confirm_list_human_render(mock_api, capsys):
+    """messages confirm list (human) shows pending IDs, types, and proposals."""
+    rc = blueprint.main(["messages", "confirm", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "PENDING CONFIRMATIONS" in out
+    assert "pend-abc123" in out
+    assert "major_decision" in out
+    assert "Should we adopt" in out
+
+
+def test_messages_confirm_accept_fires_with_yes(mock_api, monkeypatch, capsys):
+    """messages confirm accept --yes POSTs to /pending-confirm/{id}/accept."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["messages", "confirm", "accept", "pend-abc123",
+                         "--answer", "Yes, proceed", "--yes"])
+    assert rc == 0
+    accept_calls = [(m, p, b) for m, p, b in mock_api
+                    if m == "POST" and "/pending-confirm/pend-abc123/accept" in p]
+    assert accept_calls, "Expected POST to /pending-confirm/pend-abc123/accept"
+    _, _, body = accept_calls[0]
+    assert body.get("answer") == "Yes, proceed"
+    out = capsys.readouterr().out
+    assert "Accepted" in out
+
+
+def test_messages_confirm_accept_aborts_without_yes(mock_api, monkeypatch, capsys):
+    """messages confirm accept aborts on non-interactive stdin without --yes."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc = blueprint.main(["messages", "confirm", "accept", "pend-abc123"])
+    assert rc == 0
+    accept_calls = [p for m, p, _ in mock_api
+                    if m == "POST" and "/pending-confirm/" in p]
+    assert not accept_calls, "accept must not fire without --yes on non-interactive stdin"
+    out = capsys.readouterr().out
+    assert "Aborted" in out
+
+
+def test_messages_confirm_dismiss_fires_with_yes(mock_api, monkeypatch, capsys):
+    """messages confirm dismiss --yes POSTs to /pending-confirm/{id}/dismiss."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["messages", "confirm", "dismiss", "pend-def456",
+                         "--note", "Not needed anymore", "--yes"])
+    assert rc == 0
+    dismiss_calls = [(m, p, b) for m, p, b in mock_api
+                     if m == "POST" and "/pending-confirm/pend-def456/dismiss" in p]
+    assert dismiss_calls, "Expected POST to /pending-confirm/pend-def456/dismiss"
+    _, _, body = dismiss_calls[0]
+    assert body.get("note") == "Not needed anymore"
+    out = capsys.readouterr().out
+    assert "Dismissed" in out
+
+
+def test_messages_confirm_read_only_refused(mock_api, monkeypatch):
+    """messages confirm accept/dismiss refuse under a read-only config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["messages", "confirm", "accept", "pend-abc123", "--yes"])
     assert exc.value.code == 1

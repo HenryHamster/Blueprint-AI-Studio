@@ -22,6 +22,7 @@ const resolveArtifactDownloadUrl = vi.fn();
 const fetchComputeJobsAggregateSummary = vi.fn();
 const fetchHeldComputeExperiments = vi.fn();
 const fetchComputeSweepGroups = vi.fn();
+const rerunComputeExperiment = vi.fn();
 
 vi.mock('../api', () => ({
   fetchComputeJobs: (...args: unknown[]) => fetchComputeJobs(...args),
@@ -36,6 +37,7 @@ vi.mock('../api', () => ({
   fetchComputeJobsAggregateSummary: (...args: unknown[]) => fetchComputeJobsAggregateSummary(...args),
   fetchHeldComputeExperiments: (...args: unknown[]) => fetchHeldComputeExperiments(...args),
   fetchComputeSweepGroups: (...args: unknown[]) => fetchComputeSweepGroups(...args),
+  rerunComputeExperiment: (...args: unknown[]) => rerunComputeExperiment(...args),
 }));
 
 function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
@@ -2389,24 +2391,51 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('disables re-run button when job has no source task', async () => {
-    const onDuplicateTask = vi.fn();
     const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0, task_id: null });
     fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
-    const { findByRole } = render(<ComputeJobsPanel projectId="proj-1" onDuplicateTask={onDuplicateTask} />);
+    const { findByRole } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByRole('button', { name: 'Run analysis' });
     const rerunBtn = await findByRole('button', { name: 'Re-run' });
     expect(rerunBtn).toBeDisabled();
   });
 
-  test('enables re-run button when job has a source task', async () => {
-    const onDuplicateTask = vi.fn();
-    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0, task_id: 'task-1' });
+  test('re-run button opens inline panel with pre-populated fields', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0, task_id: 'task-1',
+      spend_cap_usd: 4.0,
+      launch_contract: { requested_deadline_seconds: 900 },
+      success_criterion: { metric: 'tokens_per_second', operator: '>=' as const, threshold: 100 },
+    });
     fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
-    const { findByRole } = render(<ComputeJobsPanel projectId="proj-1" onDuplicateTask={onDuplicateTask} />);
+    const { findByRole, findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByRole('button', { name: 'Run analysis' });
     const rerunBtn = await findByRole('button', { name: 'Re-run' });
     expect(rerunBtn).not.toBeDisabled();
     await act(async () => { rerunBtn.click(); });
-    expect(onDuplicateTask).toHaveBeenCalledWith('task-1');
+    const panel = await findByTestId('rerun-inline-panel');
+    expect(panel).toBeTruthy();
+    const spendInput = await findByTestId('rerun-spend-cap') as HTMLInputElement;
+    expect(spendInput.value).toBe('4');
+    const deadlineInput = await findByTestId('rerun-deadline-sec') as HTMLInputElement;
+    expect(deadlineInput.value).toBe('900');
+    const thresholdInput = await findByTestId('rerun-threshold') as HTMLInputElement;
+    expect(thresholdInput.value).toBe('100');
+  });
+
+  test('inline rerun panel calls rerunComputeExperiment on submit', async () => {
+    rerunComputeExperiment.mockResolvedValue({ id: 'new-task-1' });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    const terminal = makeJob({
+      status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0, task_id: 'task-1',
+      spend_cap_usd: 4.0,
+      success_criterion: { metric: 'acc', operator: '>=' as const, threshold: 0.9 },
+    });
+    fetchComputeJobs.mockResolvedValueOnce(wrapJobs([terminal]));
+    const { findByRole, findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByRole('button', { name: 'Run analysis' });
+    await act(async () => { (await findByRole('button', { name: 'Re-run' })).click(); });
+    await findByTestId('rerun-inline-panel');
+    await act(async () => { (await findByTestId('rerun-submit')).click(); });
+    expect(rerunComputeExperiment).toHaveBeenCalledWith('task-1', expect.objectContaining({ spend_cap_usd: 4.0 }));
   });
 });

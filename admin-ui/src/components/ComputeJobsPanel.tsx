@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen } from 'lucide-react';
-import { analyzeComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
+import { analyzeComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
@@ -606,7 +606,7 @@ interface ComputeJobsPanelProps {
   onNavigateToKnowledge?: (documentId: string) => void;
 }
 
-export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onDuplicateTask, onApproveExperiment, onDismissExperiment, onNavigateToKnowledge }: ComputeJobsPanelProps) {
+export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onApproveExperiment, onDismissExperiment, onNavigateToKnowledge }: ComputeJobsPanelProps) {
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
   const [heldExperiments, setHeldExperiments] = useState<HeldComputeExperiment[]>([]);
   const [hasMore, setHasMore] = useState(false);
@@ -618,6 +618,16 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [allTerminal, setAllTerminal] = useState(false);
   const [killingId, setKillingId] = useState<string | null>(null);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
+  const [rerunState, setRerunState] = useState<{
+    jobId: string;
+    taskId: string;
+    spendCap: string;
+    deadlineSec: string;
+    threshold: string;
+    criterion: { metric: string; operator: ComputeSuccessOperator } | null;
+    submitting: boolean;
+    error: string | null;
+  } | null>(null);
   const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
   const [analysisDocs, setAnalysisDocs] = useState<Record<string, KnowledgeDocument>>({});
   const [knowledgeDocs, setKnowledgeDocs] = useState<Record<string, KnowledgeDocument>>({});
@@ -803,6 +813,46 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     },
     [load, projectId],
   );
+
+  const handleRerunOpen = useCallback((job: ComputeJob) => {
+    if (!job.task_id) return;
+    setRerunState({
+      jobId: job.id,
+      taskId: job.task_id,
+      spendCap: job.spend_cap_usd != null ? String(job.spend_cap_usd) : '',
+      deadlineSec: job.launch_contract?.requested_deadline_seconds != null
+        ? String(job.launch_contract.requested_deadline_seconds)
+        : '',
+      threshold: job.success_criterion?.threshold != null ? String(job.success_criterion.threshold) : '',
+      criterion: job.success_criterion
+        ? { metric: job.success_criterion.metric, operator: job.success_criterion.operator as ComputeSuccessOperator }
+        : null,
+      submitting: false,
+      error: null,
+    });
+  }, []);
+
+  const handleRerunSubmit = useCallback(async () => {
+    if (!rerunState) return;
+    setRerunState((prev) => prev ? { ...prev, submitting: true, error: null } : prev);
+    try {
+      const body: { success_criterion?: { metric: string; operator: ComputeSuccessOperator; threshold: number }; spend_cap_usd?: number; deadline_seconds?: number } = {};
+      if (rerunState.spendCap !== '') body.spend_cap_usd = parseFloat(rerunState.spendCap);
+      if (rerunState.deadlineSec !== '') body.deadline_seconds = parseInt(rerunState.deadlineSec, 10);
+      if (rerunState.criterion && rerunState.threshold !== '') {
+        body.success_criterion = {
+          metric: rerunState.criterion.metric,
+          operator: rerunState.criterion.operator,
+          threshold: parseFloat(rerunState.threshold),
+        };
+      }
+      await rerunComputeExperiment(rerunState.taskId, body);
+      setRerunState(null);
+      await load();
+    } catch (e) {
+      setRerunState((prev) => prev ? { ...prev, submitting: false, error: e instanceof Error ? e.message : 'Re-run failed' } : prev);
+    }
+  }, [rerunState, load]);
 
   if (!projectId) {
     return (
@@ -1116,9 +1166,72 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         <Cpu className="w-3 h-3" />
                         {analyzingId === job.id ? 'Analyzing…' : 'Run analysis'}
                       </button>
-                      {onDuplicateTask && (
+                      {rerunState?.jobId === job.id ? (
+                        <div className="flex flex-col gap-2 rounded border border-sky-500/30 bg-sky-500/10 p-2 text-ui-sm" data-testid="rerun-inline-panel">
+                          <div className="font-semibold text-sky-200">Re-run with adjustments</div>
+                          <div className="flex flex-wrap gap-2">
+                            <label className="flex flex-col gap-0.5">
+                              <span className="text-neutral-400">Spend cap (USD)</span>
+                              <input
+                                type="number"
+                                min="0.01"
+                                step="0.01"
+                                value={rerunState.spendCap}
+                                onChange={(e) => setRerunState((p) => p ? { ...p, spendCap: e.target.value } : p)}
+                                className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                data-testid="rerun-spend-cap"
+                              />
+                            </label>
+                            <label className="flex flex-col gap-0.5">
+                              <span className="text-neutral-400">Deadline (sec)</span>
+                              <input
+                                type="number"
+                                min="1"
+                                step="1"
+                                value={rerunState.deadlineSec}
+                                onChange={(e) => setRerunState((p) => p ? { ...p, deadlineSec: e.target.value } : p)}
+                                className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                data-testid="rerun-deadline-sec"
+                              />
+                            </label>
+                            {rerunState.criterion && (
+                              <label className="flex flex-col gap-0.5">
+                                <span className="text-neutral-400">Threshold ({rerunState.criterion.metric} {rerunState.criterion.operator})</span>
+                                <input
+                                  type="number"
+                                  step="any"
+                                  value={rerunState.threshold}
+                                  onChange={(e) => setRerunState((p) => p ? { ...p, threshold: e.target.value } : p)}
+                                  className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                  data-testid="rerun-threshold"
+                                />
+                              </label>
+                            )}
+                          </div>
+                          {rerunState.error && (
+                            <div className="text-red-300 text-ui-xs" data-testid="rerun-error">{rerunState.error}</div>
+                          )}
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => void handleRerunSubmit()}
+                              disabled={rerunState.submitting}
+                              className="rounded bg-sky-500/30 text-sky-200 hover:bg-sky-500/40 px-3 py-1.5 text-ui-sm font-semibold disabled:opacity-50"
+                              data-testid="rerun-submit"
+                            >
+                              {rerunState.submitting ? 'Launching…' : 'Launch re-run'}
+                            </button>
+                            <button
+                              onClick={() => setRerunState(null)}
+                              className="rounded bg-neutral-700/40 text-neutral-300 hover:bg-neutral-700/60 px-3 py-1.5 text-ui-sm"
+                              data-testid="rerun-cancel"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
                         <button
-                          onClick={() => job.task_id && void onDuplicateTask(job.task_id)}
+                          onClick={() => handleRerunOpen(job)}
                           disabled={!job.task_id}
                           className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-sky-500/20 text-sky-200 hover:bg-sky-500/30 text-ui-md font-semibold px-3 transition-colors disabled:opacity-50"
                           title="Re-run this experiment with the same configuration"

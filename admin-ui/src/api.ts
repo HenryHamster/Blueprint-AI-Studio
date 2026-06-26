@@ -255,6 +255,33 @@ export async function createComputeExperiment(
   return res.json();
 }
 
+/** Overridable fields for re-running a compute_experiment from its result. */
+export interface RerunComputeExperimentRequest {
+  success_criterion?: ComputeSuccessCriterion;
+  spend_cap_usd?: number;
+  deadline_seconds?: number;
+}
+
+/**
+ * Re-run a compute_experiment task, optionally overriding criterion/spend/deadline.
+ * Creates a new task linked to the source via parent_task_id.
+ */
+export async function rerunComputeExperiment(
+  taskId: string,
+  body: RerunComputeExperimentRequest,
+): Promise<ComputeExperimentLaunchResponse> {
+  const res = await apiFetch(`/api/admin/tasks/${encodeURIComponent(taskId)}/rerun`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.detail as string | undefined) || `Error ${res.status}`;
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
 /**
  * Request body for the compute-experiment preflight projection endpoint.
  * Mirrors `ComputeExperimentPreflightPayload` in backend/app/admin.py.
@@ -278,6 +305,8 @@ export interface ComputeExperimentPreflightResponse {
   rate_per_hour: number | null;
   projected_cost_usd: number | null;
   max_runtime_seconds: number | null;
+  effective_spend_cap_usd: number | null;
+  effective_deadline_seconds: number | null;
   allowed_accelerator_types: string[] | null;
   allowed_machine_types: string[] | null;
   in_policy: boolean;
@@ -300,6 +329,58 @@ export async function computeExperimentPreflight(
     method: 'POST',
     body: JSON.stringify(body),
   }, 0, 15000, signal);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.error?.message || data?.detail || `Error ${res.status}`;
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+/** Request body for the compute-experiment idea-to-draft endpoint. */
+export interface ComputeExperimentDraftRequest {
+  idea: string;
+  github_repo?: string;
+  base_branch?: string;
+}
+
+/**
+ * Response from the draft endpoint. `draft_available` is false when the model
+ * could not produce a usable contract; callers should fall back to manual entry.
+ * All contract fields are optional — only populated when `draft_available` is true.
+ */
+export interface ComputeExperimentDraftResponse {
+  draft_available: boolean;
+  title?: string;
+  prompt?: string;
+  hypothesis?: string;
+  command?: string;
+  arms?: Array<{ name: string; command: string }>;
+  declared_metric?: string;
+  spend_cap_usd?: number;
+  deadline_seconds?: number;
+  experiment?: string;
+  benchmark?: string;
+  metric?: string;
+  success_criterion?: ComputeSuccessCriterion;
+  accelerator?: string;
+  machine_type?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Generate a draft compute-experiment launch contract from a plain-language idea.
+ * POST /api/admin/tasks/compute-experiment/draft — 0 retries, 30 s timeout.
+ * Throws on non-2xx; check `draft_available` before using contract fields.
+ */
+export async function draftComputeExperiment(
+  body: ComputeExperimentDraftRequest,
+  signal?: AbortSignal,
+): Promise<ComputeExperimentDraftResponse> {
+  const res = await apiFetch('/api/admin/tasks/compute-experiment/draft', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }, 0, 30000, signal);
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     const msg = data?.error?.message || data?.detail || `Error ${res.status}`;
@@ -3512,6 +3593,10 @@ export interface KnowledgeDocument {
    *  Present (non-null) only for compute_experiment documents whose launching job ran as
    *  a live-release proof; null/absent otherwise. */
   release_evidence?: LiveReleaseEvidence | null;
+  /** Sweep grouping ID for compute_experiment multi-arm experiments. Groups all arms and aggregate. */
+  sweep_id?: string | null;
+  /** Arm label within a sweep (e.g. 'baseline', 'variant'). Null for the aggregate sweep doc. */
+  arm_label?: string | null;
   /** Only present on get-by-id (the full markdown body). */
   body?: string;
 }
@@ -3526,7 +3611,7 @@ export interface KnowledgeDocumentsResponse {
 /** List / search a project's knowledge documents, newest-first. `q` drives full-text/tag/topic search. */
 export async function fetchKnowledgeDocuments(
   projectId: string,
-  params?: { q?: string; topic?: string; tag?: string; direction?: string; source_kind?: string; origin_state?: string; challenge_state?: string; finding_hash?: string; limit?: number; offset?: number },
+  params?: { q?: string; topic?: string; tag?: string; direction?: string; source_kind?: string; origin_state?: string; challenge_state?: string; finding_hash?: string; sweep?: string; limit?: number; offset?: number },
 ): Promise<KnowledgeDocumentsResponse> {
   const sp = new URLSearchParams();
   if (params?.q) sp.set('q', params.q);
@@ -3537,6 +3622,7 @@ export async function fetchKnowledgeDocuments(
   if (params?.origin_state) sp.set('origin_state', params.origin_state);
   if (params?.challenge_state) sp.set('challenge_state', params.challenge_state);
   if (params?.finding_hash) sp.set('finding_hash', params.finding_hash);
+  if (params?.sweep) sp.set('sweep_id', params.sweep);
   if (params?.limit !== undefined) sp.set('limit', String(params.limit));
   if (params?.offset !== undefined) sp.set('offset', String(params.offset));
   const query = sp.toString();

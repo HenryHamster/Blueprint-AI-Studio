@@ -4,6 +4,7 @@ import type { LaunchableTaskTypeOption } from '../taskCapabilities';
 import type { ComputeExperimentForm } from '../hooks/useTaskModal';
 import { COMPUTE_ACCELERATOR_OPTIONS, COMPUTE_EXPERIMENT_TASK_TYPE, canonicalMachineTypeForAccelerator } from '../hooks/useTaskModal';
 import type { ComputeSuccessOperator, ComputeExperimentPreflightResponse } from '../api';
+import { draftComputeExperiment } from '../api';
 
 const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
   create: Plus,
@@ -121,6 +122,54 @@ export function NewTaskModal({
   const [prNumberError, setPrNumberError] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const prNumberRef = useRef<HTMLInputElement>(null);
+
+  const [ideaText, setIdeaText] = useState('');
+  const [draftLoading, setDraftLoading] = useState(false);
+  const [draftError, setDraftError] = useState<string | null>(null);
+
+  const handleDraftContract = async () => {
+    if (!ideaText.trim()) return;
+    setDraftLoading(true);
+    setDraftError(null);
+    try {
+      const draft = await draftComputeExperiment({
+        idea: ideaText.trim(),
+        ...(newTaskRepo ? { github_repo: newTaskRepo } : {}),
+        ...(newTaskBranch ? { base_branch: newTaskBranch } : {}),
+      });
+      if (!draft.draft_available) {
+        setDraftError('Draft not available — fill the form manually.');
+        return;
+      }
+      const hasArms = Array.isArray(draft.arms) && draft.arms.length >= 2;
+      setComputeExperiment(f => ({
+        ...f,
+        useArmsMode: hasArms,
+        arms: hasArms ? (draft.arms ?? f.arms) : f.arms,
+        declaredMetric: draft.declared_metric ?? f.declaredMetric,
+        command: !hasArms ? (draft.command ?? f.command) : f.command,
+        accelerator: draft.accelerator ?? f.accelerator,
+        machineType: draft.machine_type ?? f.machineType,
+        spendCapUsd: draft.spend_cap_usd != null ? String(draft.spend_cap_usd) : f.spendCapUsd,
+        deadlineSeconds: draft.deadline_seconds != null ? String(draft.deadline_seconds) : f.deadlineSeconds,
+        experiment: draft.experiment ?? f.experiment,
+        benchmark: draft.benchmark ?? f.benchmark,
+        hypothesis: draft.hypothesis ?? f.hypothesis,
+        metric: draft.metric ?? f.metric,
+        successMetric: draft.success_criterion?.metric ?? f.successMetric,
+        successOperator: draft.success_criterion?.operator ?? f.successOperator,
+        successThreshold: draft.success_criterion?.threshold != null
+          ? String(draft.success_criterion.threshold)
+          : f.successThreshold,
+      }));
+      if (draft.title) setNewTaskTitle(draft.title);
+      if (draft.prompt) setNewTaskPrompt(draft.prompt);
+    } catch (err) {
+      setDraftError(err instanceof Error ? err.message : 'Draft failed');
+    } finally {
+      setDraftLoading(false);
+    }
+  };
 
   const handleTaskTypeChange = (value: string) => {
     setNewTaskType(value);
@@ -368,6 +417,29 @@ export function NewTaskModal({
                   {computeExperiment.useArmsMode ? 'Single command' : 'Multi-arm sweep'}
                 </button>
               </div>
+              <div className="mb-3">
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">
+                  Research Idea <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional — auto-fill form)</span>
+                </label>
+                <div className="flex gap-2 items-start">
+                  <textarea
+                    value={ideaText}
+                    onChange={e => setIdeaText(e.target.value)}
+                    className="flex-1 bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[64px] transition-all placeholder:text-neutral-600"
+                    placeholder="Describe your experiment in plain English…"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleDraftContract}
+                    disabled={draftLoading || !ideaText.trim()}
+                    className="min-h-[44px] sm:min-h-0 px-3 py-2 rounded-lg border border-neutral-700 text-xs font-medium text-neutral-300 hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed transition-all flex items-center gap-1.5 whitespace-nowrap"
+                  >
+                    {draftLoading && <Loader2 className="w-3 h-3 animate-spin" />}
+                    Draft contract
+                  </button>
+                </div>
+                {draftError && <p className="text-ui-sm text-red-400 mt-1">{draftError}</p>}
+              </div>
               {computeExperiment.useArmsMode ? (
                 <div className="mb-3">
                   <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">
@@ -551,6 +623,18 @@ export function NewTaskModal({
                   )}
                   {!preflightLoading && preflightResult && (
                     <div className="space-y-1">
+                      {preflightResult.effective_spend_cap_usd != null && preflightResult.effective_spend_cap_usd !== computeSpendCap && computeSpendCap > 0 && (
+                        <div className="flex justify-between text-amber-400">
+                          <span>Effective cap (clamped)</span>
+                          <span className="font-mono">${preflightResult.effective_spend_cap_usd.toFixed(2)}</span>
+                        </div>
+                      )}
+                      {preflightResult.effective_deadline_seconds != null && preflightResult.effective_deadline_seconds !== computeDeadline && computeDeadline > 0 && (
+                        <div className="flex justify-between text-amber-400">
+                          <span>Effective deadline (clamped)</span>
+                          <span className="font-mono">{preflightResult.effective_deadline_seconds}s</span>
+                        </div>
+                      )}
                       {preflightResult.rate_per_hour != null && (
                         <div className="flex justify-between text-neutral-400">
                           <span>Rate</span>
@@ -558,9 +642,9 @@ export function NewTaskModal({
                         </div>
                       )}
                       {preflightResult.projected_cost_usd != null && (
-                        <div className={`flex justify-between ${preflightResult.projected_cost_usd > computeSpendCap && computeSpendCap > 0 ? 'text-amber-400' : 'text-neutral-400'}`}>
+                        <div className={`flex justify-between ${preflightResult.projected_cost_usd > (preflightResult.effective_spend_cap_usd ?? computeSpendCap) && computeSpendCap > 0 ? 'text-amber-400' : 'text-neutral-400'}`}>
                           <span>Full-deadline cost</span>
-                          <span className="font-mono">${preflightResult.projected_cost_usd.toFixed(3)}{preflightResult.projected_cost_usd > computeSpendCap && computeSpendCap > 0 ? ' ⚠ exceeds cap' : ''}</span>
+                          <span className="font-mono">${preflightResult.projected_cost_usd.toFixed(3)}{preflightResult.projected_cost_usd > (preflightResult.effective_spend_cap_usd ?? computeSpendCap) && computeSpendCap > 0 ? ' ⚠ exceeds cap' : ''}</span>
                         </div>
                       )}
                       {preflightResult.max_runtime_seconds != null && (
