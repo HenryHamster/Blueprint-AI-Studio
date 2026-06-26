@@ -913,7 +913,7 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         test: 'test (a named test or selector exercising the seam end-to-end)',
         behavior: 'behavior (an observable runtime behavior)',
         artifact: 'artifact (an artifact a downstream task consumes)',
-        visual: 'visual (a viewport screenshot of an admin-ui component proving it renders correctly at a given width)',
+        visual: 'visual (a screenshot of a UI component proving it renders correctly at a given viewport width)',
       };
       if (kind) aeLines.push(`- Kind: ${kindLabels[kind] ?? kind}`);
       if (kind === 'visual') {

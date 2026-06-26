@@ -28,6 +28,13 @@ import {
   sanitizeCiFailureSelectors,
 } from './code-change-helpers.js';
 
+// Some tests below write a generated bash helper with mode 0o755 and execute it
+// (via a shebang/PATH-resolved curl stub), then parse its output. That requires
+// a Unix executable bit, which Windows lacks — there the subprocess yields empty
+// output. Gate those tests on this capability so they SKIP locally on Windows
+// while still running fully in Linux CI.
+const SUPPORTS_EXEC_BIT = process.platform !== 'win32';
+
 describe('writeCodeChangeHelpers — self-review fallback', () => {
   let capturedScripts: Record<string, string> = {};
 
@@ -959,7 +966,8 @@ describe('writeCodeChangeHelpers — ./blocked structured need', () => {
     }
   });
 
-  it('emits a normalized need in the payload when --needs-task is given an exact ref', async () => {
+  // needs exec bit: runs a generated bash helper + PATH-resolved curl stub (mode 0o755)
+  it.skipIf(!SUPPORTS_EXEC_BIT)('emits a normalized need in the payload when --needs-task is given an exact ref', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     writeCodeChangeHelpers(cfg);
     // A real task UUID is an exact ref → preserved as a kind=task need.
@@ -974,7 +982,8 @@ describe('writeCodeChangeHelpers — ./blocked structured need', () => {
     expect(viaHash.payload?.blocked_need).toEqual({ kind: 'task', ref: 'deadbeefcafe0001' });
   });
 
-  it('records a title-like --needs-task ref as a capability need (exact-task-ref policy)', async () => {
+  // needs exec bit: runs a generated bash helper + PATH-resolved curl stub (mode 0o755)
+  it.skipIf(!SUPPORTS_EXEC_BIT)('records a title-like --needs-task ref as a capability need (exact-task-ref policy)', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     writeCodeChangeHelpers(cfg);
     // 't-abc123' is neither a task UUID nor a finding hash → recorded as a
@@ -984,7 +993,8 @@ describe('writeCodeChangeHelpers — ./blocked structured need', () => {
     expect(payload?.blocked_need).toEqual({ kind: 'capability', ref: 't-abc123' });
   });
 
-  it('maps --needs-pr and --needs-capability to the right kind', async () => {
+  // needs exec bit: runs a generated bash helper + PATH-resolved curl stub (mode 0o755)
+  it.skipIf(!SUPPORTS_EXEC_BIT)('maps --needs-pr and --needs-capability to the right kind', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     writeCodeChangeHelpers(cfg);
     const pr = await runBlocked(['need pr', '--needs-pr', '7910']);
@@ -993,7 +1003,8 @@ describe('writeCodeChangeHelpers — ./blocked structured need', () => {
     expect(cap.payload?.blocked_need).toEqual({ kind: 'capability', ref: 'shared auth layer' });
   });
 
-  it('absent-need path is byte-for-byte the legacy payload (no blocked_need key)', async () => {
+  // needs exec bit: runs a generated bash helper + PATH-resolved curl stub (mode 0o755)
+  it.skipIf(!SUPPORTS_EXEC_BIT)('absent-need path is byte-for-byte the legacy payload (no blocked_need key)', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     writeCodeChangeHelpers(cfg);
     const { exit, payload } = await runBlocked(['just a reason']);
@@ -1181,7 +1192,8 @@ describe('writeCodeChangeHelpers — viewport upload block', () => {
     }
   });
 
-  it('viewport upload: stubbed curl captures POST only for PR-only regression', async () => {
+  // needs exec bit: runs the generated upload block + PATH-resolved curl stub (mode 0o755)
+  it.skipIf(!SUPPORTS_EXEC_BIT)('viewport upload: stubbed curl captures POST only for PR-only regression', async () => {
     const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
     writeCodeChangeHelpers(selfRepoCfg);
     const checkScript = capturedScripts['/tmp/workspace/check'];

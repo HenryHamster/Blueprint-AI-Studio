@@ -367,8 +367,8 @@ ${goalSection}${mergedPrsSection}## Your task
   "graded_candidate_sha": "${candidateSha}",
   "covers_goal": false,
   "coverage_score": 0.4,
-  "biggest_gap": "The goal requires a persisted gate but the merged diff only adds the agent handler — no backend gate wiring is present.",
-  "rationale": "Read release_qualifier.py and the new handler: the handler emits a grade but nothing in the merged diff reads it or blocks qualify, so under half the goal is delivered."
+  "biggest_gap": "The goal requires <a concrete capability the goal names>, but the merged diff only adds <the partial piece that is present> — the rest of that capability is not wired up.",
+  "rationale": "Read <the changed file(s)>: <why the diff only partially covers the goal>, so under half the goal is delivered."
 }
 \`\`\`
 

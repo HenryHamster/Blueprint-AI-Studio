@@ -175,6 +175,6 @@ export function buildMigrationConflictGuidance(
         `2. Rename this PR's migration file to the next sequential numeric prefix AFTER the base branch's latest, and update its \`revision\` string to a fresh unique id.\n` +
         `3. Set this PR's migration \`down_revision\` to the base branch's latest revision id so the chain is linear.\n`) +
     schemaStep +
-    `${testStepNum}. Re-run the backend tests (\`bash scripts/test-backend.sh\`) to confirm the chain applies cleanly.\n\n`
+    `${testStepNum}. Re-run the backend tests (using the project's configured backend test command) to confirm the chain applies cleanly.\n\n`
   );
 }

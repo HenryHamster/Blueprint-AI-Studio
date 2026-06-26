@@ -1252,8 +1252,8 @@ describe('handleStrategic executor prompt: arms-based compute_experiment commiss
     const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
     expect(executorPrompt).toBeDefined();
     // Arms example must include specific arm names unique to the arms example (not the single-command example).
-    expect(executorPrompt).toContain('"name": "adam"');
-    expect(executorPrompt).toContain('"name": "sgd"');
+    expect(executorPrompt).toContain('"name": "a"');
+    expect(executorPrompt).toContain('"name": "b"');
     // declared_metric documents what the command emits
     expect(executorPrompt).toContain('declared_metric');
   });

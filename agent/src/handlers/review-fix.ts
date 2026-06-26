@@ -484,7 +484,7 @@ export async function handleReview(
   // build. Without this, every cold-clone reviewer hits "cannot resolve <pkg>"
   // when running `npm run build`, mistakes the empty workspace for a real
   // build defect, and flags it as a blocker — burning review-fix iterations on
-  // a phantom env failure (PR #3884 saga, 2026-05-06).
+  // a phantom env failure.
   preinstallNodeDeps(WORKSPACE, reviewBuildConfig, ws, taskId);
 
   // Fetch PR metadata (title + body) from GitHub API — best-effort
@@ -834,8 +834,8 @@ ${reviewScopeBudgetSection}${scopePreamble}${taskTypeFocusHint}${buildReviewCore
   // next fix iteration's drift detector has a fresh snapshot. Without this,
   // drift falls back to the original create task's _pr_changed_files (which
   // is stale once a rebase-fix or new commits land), leaving drift_in/drift_out
-  // empty for exactly the cases we need them to fire (PR #3435-style rebase
-  // damage). Cap at 50 to match AgentStatusPayload.changed_files limit.
+  // empty for exactly the cases we need them to fire (rebase-induced drift).
+  // Cap at 50 to match AgentStatusPayload.changed_files limit.
   const reviewChangedFiles = changedFilePathList.slice(0, 50);
 
   await persistAndPostStatus(taskId, {
@@ -932,7 +932,7 @@ export async function handleFix(
   // moving base and a resolution was required). Threaded into ./check as
   // mergeVerify so the gate runs the affected backend test files under Postgres
   // before ./pr open can push — catching a silent drop / vintage skew the
-  // standalone gate would miss (incident: rollup PR #8920).
+  // standalone gate would miss.
   let conflictResolutionOccurred = false;
   try {
     git(['fetch', 'origin', `+refs/heads/${baseBranch}:refs/remotes/origin/${baseBranch}`]);

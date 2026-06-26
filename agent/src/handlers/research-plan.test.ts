@@ -2678,12 +2678,35 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(p).toContain('ATOMIC SCHEMA RULE');
-    // The atomic subtask owns the model file, the Alembic migration, and the
-    // EXPECTED_SCHEMA_REVISION bump together.
-    expect(p).toContain('backend/alembic/versions/');
-    expect(p).toContain('EXPECTED_SCHEMA_REVISION');
+    // The atomic subtask owns the model edit, its migration, and the revision
+    // bump together. The rule is stack-agnostic by default (no hardcoded paths).
+    expect(p).toContain('also generate the matching migration and bump the schema revision');
     // And it explicitly forbids splitting the migration into a dependent subtask.
     expect(p).toContain('Do NOT emit a separate dependent type="migrate" subtask');
+  });
+
+  // When the project supplies a migration layout (here Blueprint's own python
+  // backend), the rule threads the RESOLVED model/migration/schema-revision
+  // paths from build_config rather than hardcoding them — so a non-python or
+  // differently-laid-out project never sees Blueprint's paths.
+  it('handlePlan prompt threads resolved migration paths when build_config supplies a python layout', async () => {
+    const taskWithLayout = {
+      ...FP_TASK,
+      build_config: { directories: [{ path: 'backend', type: 'python' }] },
+    };
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, taskWithLayout, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('backend/alembic/versions');
+    expect(p).toContain('backend/app/models');
+    expect(p).toContain('EXPECTED_SCHEMA_REVISION');
+  });
+
+  it('handlePlan prompt does NOT hardcode Blueprint migration paths when no build_config is supplied', async () => {
+    await handlePlan(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The generic plan prompt runs on arbitrary projects — no Blueprint paths.
+    expect(p).not.toContain('backend/alembic/versions');
+    expect(p).not.toContain('EXPECTED_SCHEMA_REVISION');
   });
 
   // ── handlePlan affirmative no-op (#7021 principle one layer up) ───────────────

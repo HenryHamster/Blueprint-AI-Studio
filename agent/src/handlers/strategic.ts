@@ -878,12 +878,12 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "Full investigation prompt...", "direction_id": "d-xxx"}'
 ./strategic spawn-task '{"type": "web_research", "title": "...", "prompt": "What external knowledge to gather...", "direction_id": "d-xxx"}'
 ./strategic spawn-task '{"type": "design", "title": "...", "prompt": "Design question grounded in the codebase...", "direction_id": "d-xxx"}'
-./strategic spawn-task '{"type": "compute_experiment", "title": "Measure effect of batch size on throughput", "hypothesis": "Doubling batch size from 32 to 64 increases throughput by ≥20% without OOM on 16 GB GPU", "command": "python3 scripts/train.py --batch-size 64 --epochs 1 --output /tmp/metrics.json", "spend_cap_usd": 2.50, "deadline_seconds": 1800, "success_criterion": {"metric": "throughput_samples_per_sec", "operator": ">=", "threshold": 480}, "direction_id": "d-xxx"}'
+./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<falsifiable claim with a concrete threshold>", "command": "<command that writes the declared metric to $BLUEPRINT_RESULT_FILE>", "spend_cap_usd": 2.50, "deadline_seconds": 1800, "success_criterion": {"metric": "<metric_key>", "operator": ">=", "threshold": 0}, "direction_id": "d-xxx"}'
 # Multi-arm variant: use "arms" + "declared_metric" instead of a single "command".
 # Arms run sequentially in a single compute job. Each arm should write the declared_metric
 # key to $BLUEPRINT_RESULT_FILE; the value captured is whatever the last arm emits.
 # "declared_metric" (required with arms) is the exact metric key written to the result file.
-./strategic spawn-task '{"type": "compute_experiment", "title": "Compare optimiser: Adam vs SGD on val_loss", "hypothesis": "Adam converges to lower val_loss than SGD in 5 epochs on this dataset", "arms": [{"name": "adam", "command": "python3 scripts/train.py --optimizer adam --epochs 5"}, {"name": "sgd", "command": "python3 scripts/train.py --optimizer sgd --epochs 5"}], "declared_metric": "val_loss", "spend_cap_usd": 5.00, "deadline_seconds": 3600, "direction_id": "d-xxx"}'
+./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<arm A outperforms arm B on the declared metric>", "arms": [{"name": "a", "command": "<command for arm a>"}, {"name": "b", "command": "<command for arm b>"}], "declared_metric": "<metric_key>", "spend_cap_usd": 5.00, "deadline_seconds": 3600, "direction_id": "d-xxx"}'
 
 # Pull full detail for items the strategic packer trimmed (see "Context not
 # shipped this cycle" section in your prompt). Use only when you actually
@@ -1066,7 +1066,7 @@ ${strategicChallengeSection}
           'Your previous attempt did not execute any ./strategic create-direction commands.\n\n' +
           'The strategic analysis recommended creating new directions. Run the create-direction commands NOW:\n\n' +
           'For each new direction in the analysis, run:\n' +
-          './strategic create-direction \'{"text": "...", "priority": "high|medium|low", "category": "product|structural", "system_id": "sys-x", "rationale": "..."}\' \n\n' +
+          './strategic create-direction \'{"text": "...", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "success_evidence": "...", "retirement_condition": "...", "dedup_reasoning": {"closest_directions": ["d-xxx"], "distinction": "..."}}\' \n\n' +
           'Extract the directions from the analysis and call the commands. Nothing else.',
           ws, statusRef, model, effort, disallowedTools
         );

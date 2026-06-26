@@ -3286,7 +3286,10 @@ describe('persistAndPostStatus workspace_prep shipping', () => {
     delete process.env.BLUEPRINT_LANE_MODE;
   });
 
-  it('includes the recorded workspace prep outcome in /api/agent/status', async () => {
+  // skipIf(win32): the mock keys fs.existsSync on the POSIX path '/ws/.git', but
+  // prepareWorkspaceForRole builds the path with path.join (backslashes on Windows),
+  // so the strict === never matches and warm-reuse resolves cold. POSIX-only test.
+  it.skipIf(process.platform === 'win32')('includes the recorded workspace prep outcome in /api/agent/status', async () => {
     const existsSpy = vi.mocked(fs.existsSync);
     existsSpy.mockImplementation(path => path === '/ws/.git');
     process.env.BLUEPRINT_WARM_HANDOFF = '1';

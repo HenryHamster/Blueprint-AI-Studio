@@ -301,7 +301,7 @@ ${applyStepNum}. **Test the migration applies cleanly**: Run \`alembic upgrade h
 
 ${downgradeStepNum}. **Test downgrade** (if the migration is reversible): Run \`alembic downgrade -1\` then \`alembic upgrade head\` to confirm round-trip works. If downgrade is not possible (e.g., data loss), ensure the \`downgrade()\` function raises \`NotImplementedError\` with an explanation.
 
-${finishStepNum}. Once migration applies cleanly, run \`./check test\` (NOT just \`./check\` — migrations always touch backend, so the Docker pytest suite must pass before shipping). Then \`./pr open --title "migrate: <description>" --body "<summary>"\` to push and open the PR, then \`./done\` to mark the task complete. Use \`./fail "<reason>"\` if the migration genuinely cannot be made to work (e.g. autogenerate is fundamentally wrong about the schema and you can't recover).
+${finishStepNum}. Once migration applies cleanly, run \`./check test\` (NOT just \`./check\` — migrations touch the schema, so the project's full DB-backed backend test suite must pass before shipping). Then \`./pr open --title "migrate: <description>" --body "<summary>"\` to push and open the PR, then \`./done\` to mark the task complete. Use \`./fail "<reason>"\` if the migration genuinely cannot be made to work (e.g. autogenerate is fundamentally wrong about the schema and you can't recover).
 
 ALREADY-DONE CASE: If you discover the requested migration/model change ALREADY EXISTS on the base branch (e.g. a sibling PR already added the same revision file and model${hasSchemaRevisionGate ? ` and the matching ${migrateLayout.schemaRevisionConst} bump` : ''}), do NOT create a duplicate migration — a second revision with the same logical change would branch the revision chain and break chain-linearity tests. Instead, VERIFY the deliverable is present (name the revision file and model${hasSchemaRevisionGate ? ' and schema-revision value' : ''}) and call \`./done --already-done "<reason naming the existing revision file and model${hasSchemaRevisionGate ? ' and schema-revision value' : ''}, and the sibling PR if known>"\`. This lands the task COMPLETED with no PR and records why. Do NOT just exit — a bare no-diff exit is treated as incomplete and fails.
 
@@ -699,8 +699,15 @@ export async function handlePerf(
   const perfDirs = perfBuildConfig?.directories ?? [];
   const perfPythonDirs = perfDirs.filter(d => d.type === 'python');
   const perfNodeDirs = perfDirs.filter(d => d.type === 'node');
-  const perfPyDir = perfPythonDirs.length > 0 ? perfPythonDirs[0].path.replace(/\/$/, '') : 'backend';
-  const perfNodeDir = perfNodeDirs.length > 0 ? perfNodeDirs[0].path.replace(/\/$/, '') : 'admin-ui';
+  const hasPerfPyDir = perfPythonDirs.length > 0;
+  const hasPerfNodeDir = perfNodeDirs.length > 0;
+  const perfPyDir = hasPerfPyDir ? perfPythonDirs[0].path.replace(/\/$/, '') : 'backend';
+  const perfNodeDir = hasPerfNodeDir ? perfNodeDirs[0].path.replace(/\/$/, '') : 'admin-ui';
+  // Stack-specific anti-pattern hints are appended only when the corresponding
+  // directory type is actually detected in buildConfig, so a non-Python /
+  // non-frontend project does not get irrelevant ORM / component guidance.
+  const perfPyHint = hasPerfPyDir ? ` Check ${perfPyDir}/ for these patterns.` : '';
+  const perfNodeHint = hasPerfNodeDir ? ` Check ${perfNodeDir}/ for these patterns.` : '';
   const perfRetryContext = buildRetryContext(task);
   const perfFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   // Shared launch-context block; degrades to '' when absent (graceful).
@@ -711,15 +718,15 @@ export async function handlePerf(
 
 Analyze the codebase for the following performance anti-patterns. Only flag issues you can directly observe in the code — do NOT speculate about theoretical problems.
 
-1. **N+1 database queries**: ORM relationships loaded inside loops (e.g. accessing \`obj.related\` inside a for loop without eager loading). Check ${perfPyDir}/ for SQLAlchemy patterns.
-2. **Missing database indexes**: Columns used in WHERE clauses, JOIN conditions, or ORDER BY that lack an index. Check ${perfPyDir}/ for table definitions and compare against query patterns.
-3. **Synchronous blocking operations**: Network calls, file I/O, or CPU-heavy work done synchronously inside async request handlers.
-4. **Unpaginated large payload returns**: API endpoints that return full table scans or unbounded lists without LIMIT/offset or cursor pagination.
-5. **Frontend large bundle imports**: Direct imports of entire libraries where only a small subset is used (e.g. \`import _ from 'lodash'\` instead of \`import debounce from 'lodash/debounce'\`). Check ${perfNodeDir}/src.
-6. **Unnecessary React re-renders**: Components with expensive computations or callbacks not wrapped in useMemo/useCallback, causing re-renders on every parent update. Check ${perfNodeDir}/src for patterns.
+1. **N+1 data-access queries**: Relationships or records loaded inside loops (e.g. issuing one query per iteration) where a single batched/eager query would suffice.${perfPyHint}
+2. **Missing data-store indexes**: Columns used in WHERE/filter clauses, JOIN/lookup conditions, or ORDER BY/sort that lack an index. Compare schema definitions against query patterns.${perfPyHint}
+3. **Synchronous blocking operations**: Network calls, file I/O, or CPU-heavy work done synchronously inside async request handlers or hot paths.
+4. **Unpaginated large payload returns**: Endpoints or functions that return full table scans or unbounded lists without a limit/offset or cursor pagination.
+5. **Whole-library imports**: Importing an entire library where only a small submodule is used, when the library supports importing just that submodule (bloats the build / startup cost).${perfNodeHint}
+6. **Missing memoization of expensive recomputation**: Expensive computations or callbacks recomputed on every invocation/render where the result could be cached or memoized.${perfNodeHint}
 
 Instructions:
-1. Read key files in ${perfPyDir}/ (table/index definitions, query patterns, endpoint handlers) and ${perfNodeDir}/src (React components, imports).
+1. Read key files in the relevant directories (schema/index definitions, query patterns, request handlers, and any UI/component code) and trace how data flows through the hot paths.
 2. For each finding, identify the specific file, function, and line range where the problem is observable.
 3. Only report findings that are demonstrably present — cite the exact code pattern that shows the problem.
 4. Produce your findings as a JSON array written to /tmp/perf_report_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE}:
@@ -731,7 +738,7 @@ Instructions:
     "title": "Short description (under 60 chars)",
     "description": "What the problem is, why it matters, and the exact code pattern observed.",
     "fix_prompt": "Self-contained prompt for a create agent to fix this issue. Must describe exactly what to change and where.",
-    "related_files": ["backend/app/main.py"]
+    "related_files": ["path/to/file.ext"]
   }
 ]
 

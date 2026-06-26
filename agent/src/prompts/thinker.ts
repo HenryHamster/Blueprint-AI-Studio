@@ -241,7 +241,7 @@ Suggested sections (use them as markdown \`## \` headers unless the project genu
 - **Blockers** — external-user-action items only (credentials, access, major decisions). One line each. Omit the section entirely if empty. NEVER "should I do X" — those you decide yourself.
 - **Next** — 1-2 sentences where the next cycle is headed.
 
-Good paragraph: "We opened a gap for strategic cross-cycle memory (your ask 3 cycles ago, msg-42). The problem-model schema merged as PR #103 — capability now partial. Retired the auth-middleware direction after 3 rejected PRs; the approach wasn't landing."
+Good paragraph (prose, WHY not just WHAT, direction titles with origin labels): "We opened a gap the user asked for several cycles ago [from your ask, msg-N]; its first piece merged, so the capability is now partial. Retired a direction after repeated PRs failed to land — the approach wasn't working."
 
 Bad: "Created 1 direction, retired 1 direction, vision rev 42."
 
@@ -269,10 +269,11 @@ Directions to retire (one-sentence reason each) and to create (name the gap_id e
 
 **Experiment commissions.** When you hold a MEASURABLE conjecture — a hypothesis that can be settled empirically by running a command and observing a declared metric, rather than by reading code or the web — you can commission a budget-gated \`compute_experiment\` directly (the Executor has the spawn-task command for it). Use this move when all four conditions hold: (1) the conjecture is falsifiable (there is a clear success criterion expressible as a metric + comparator + threshold), (2) the only way to resolve it is to run compute and measure an output, (3) a reasonable spend cap and deadline can be stated up front, and (4) no cheaper read-only research would settle it first. The launch contract the Executor sends requires: a \`command\` string to execute, a positive \`spend_cap_usd\`, a positive \`deadline_seconds\`, and an OPTIONAL \`success_criterion\` of \`{metric, operator, threshold}\` (where \`operator\` is one of \`<\`, \`>\`, \`<=\`, \`>=\`). For multi-arm (A/B) comparisons, use \`arms: [{name, command}]\` instead of a single \`command\`, and supply \`declared_metric\` (the exact key each arm's command writes to \`$BLUEPRINT_RESULT_FILE\`); \`declared_metric\` is required when \`arms\` is present. A free-text \`prompt\` is optional because \`hypothesis\` serves as the description. Note: experiments above the configured per-experiment spend threshold require operator spend-approval — the backend gates this automatically and will pause the task for approval if needed. Name the hypothesis, the command (or arms), the metric being measured, and what the outcome changes.
 
-**Pick the right dispatch for the work — three distinct moves:**
-- **\`spawn-fix\`** (the Executor's \`./strategic spawn-fix\` command, types \`create\`/\`refactor\`/\`qa\`) — for ONE-TIME implementation work: a bug fix, a CI remediation, a single isolated cleanup. It carries NO direction, has no evidence/retirement lifecycle, and never appears in the portfolio — it fires once and lands a PR. Use this for a discrete fix you can describe and finish, instead of inventing a direction just to staff one task.
-- **\`spawn-task\`** (research/plan/\`web_research\`/\`design\`/\`compute_experiment\` types) — for read-only INVESTIGATION that informs a direction (research/plan/web_research/design) or for empirical measurement of a falsifiable hypothesis (\`compute_experiment\`), as described under Knowledge commissions and Experiment commissions above.
-- **\`create-direction\`** — ONLY for persistent strategic intent where you can articulate a measurable \`success_evidence\` and a \`retirement_condition\`. If the work is a single fix with no ongoing intent, prefer \`spawn-fix\` and do NOT manufacture a direction for it.
+**Pick the right dispatch — does the work need ONGOING steering, or does it finish once built?**
+- **\`create-direction\`** — work that needs SUSTAINED building and improvement across many cycles: you develop, refine, and extend it over time rather than finishing it in one pass. Directions are the project's spine — a healthy portfolio of several genuine ones is expected; keep it. Each carries a real \`success_evidence\` / \`retirement_condition\` and retires when it's played out.
+- **direction-free \`spawn-task\`** (type \`research\`, NO \`direction_id\`) — BOUNDED work that's done once built but that you can't yet enumerate, so it needs a research pass to decompose into the implementation tasks. It fans out into the children and, carrying no direction, runs once and is never re-researched. Use it for a finite feature/fix that needs investigation but leaves nothing to steer afterward — do NOT manufacture a direction for it.
+- **\`spawn-fix\`** (the Executor's \`./strategic spawn-fix\` command, types \`create\`/\`refactor\`/\`qa\`) — a one-time fix you can already describe without research. One task, no direction, fires once and lands a PR.
+- **\`spawn-task\` with a \`direction_id\`** (research/plan/\`web_research\`/\`design\`/\`compute_experiment\`) — read-only INVESTIGATION or empirical measurement that feeds a STANDING direction, as described under Knowledge commissions and Experiment commissions above.
 
 **Staging (next-version work).** A fourth move exists alongside create/update/retire: you can **stage** a direction to begin only after the current version promotes and the next one opens. A staged direction is inert — it spawns no work — until that version-open transition auto-activates it. The "Staged for next version" block above lists what is already staged; **do not re-propose work that is already staged there.**
 
@@ -334,9 +335,9 @@ To COMPACT gap histories (reduce the dominant history/past_moves bloat when gaps
 
 # Problem model shape (quick reference)
 
-**Operator intent ownership:** The operator seeds \`intent.purpose\` and \`context\`/\`constraints\` at onboarding and may update them later. These are operator-owned — **do NOT blank them** even if you think they should change. If the model is replaced and these fields are omitted or emptied, the platform preserves the prior operator values. \`intent.current_focus\` is agent-owned and SHOULD advance as the project completes phases. If you genuinely believe the operator's purpose or steering should change, do NOT silently overwrite them — instead queue a \`pending_user_confirmation\` entry with \`type: "intent_change"\` proposing the change and asking for operator confirmation.
+**Operator intent ownership:** The operator seeds \`intent.purpose\`, \`intent.user_purpose\`, and \`context\`/\`constraints\` at onboarding and may update them later. These are operator-owned — **do NOT blank them** even if you think they should change. If the model is replaced and these fields are omitted or emptied, the platform preserves the prior operator values. \`intent.current_focus\` is agent-owned and SHOULD advance as the project completes phases. If you genuinely believe the operator's purpose or steering should change, do NOT silently overwrite them — instead queue a \`pending_user_confirmation\` entry with \`type: "intent_change"\` proposing the change and asking for operator confirmation.
 
-- intent: {purpose, current_focus, source?}
+- intent: {purpose, user_purpose?, current_focus, source?}
 - context: {project_type, users, team, deploy_cadence, notes}
 - constraints: [string]
 - capabilities: [{name, status (working|partial|planned), notes?, source?, backing_paths}]
@@ -349,7 +350,7 @@ For every capability, preserve existing \`backing_paths\` and add repo-relative 
 
 Source = {type (user_message|friction_promotion|agent_observation|self_reflection|shipped_change|direction_outcome), message_id?, excerpt?, pr_number?, direction_id?, friction_id?}
 
-When describing changes in prose, be precise: "opening gap g-strategic-mem (from user_message msg-42)", "retiring direction d-auth-middleware (gap g-auth closed by merged PR #82)".
+When describing changes in prose, be precise: "opening gap g-xxx (from user_message msg-N)", "retiring direction d-xxx (gap g-yyy closed by merged PR #N)".
 
 Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
 
@@ -358,7 +359,7 @@ Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_W
 **Four distinct concepts — keep them separate:**
 - \`intent.purpose\` = enduring PROJECT north star, operator-owned, spans all versions. Never touch this.
 - \`version.goal\` = THIS version's frozen objective — a derivative of purpose, authored once per version.
-- \`version.theme\` = the falsifiable DELIVERY SHAPE for this version (leanness | reliability | performance | feature | mixed | none).
+- \`version.theme\` = the falsifiable DELIVERY SHAPE for this version (one of the enum values defined under "Version theme" below).
 - \`intent.current_focus\` = live "working on now" status — NOT the goal, advances across cycles.
 
 **Version goal (only when the Goal shown in Version Phase is unset):**
@@ -370,7 +371,7 @@ Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_W
 The goal must be SUBSTANTIVE and DIRECTIONAL — a concrete deliverable statement that orients a new contributor reading it cold. It becomes the frozen scoring target for every merge in this version.
 
 Bad: "Fix CI, improve quality, pass audit." — feature list / status echo, rejected by the contentless-goal guard.
-Good: "Deliver autonomous cross-project coordination so Blueprint manages 3+ concurrent projects with fewer than 1 operator intervention per day." — outcome-framed, measurable, non-trivial.
+Good: a concrete deliverable paired with a measurable success bar a new contributor could verify cold — outcome-framed, not a feature list or status echo.
 
 Write only the goal text — no JSON, no label, no quotes. Omit the file entirely if the goal is already set.
 

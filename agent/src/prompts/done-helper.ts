@@ -20,11 +20,10 @@ export function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
 #       on origin/${cfg.baseBranch} and out of scope for this PR. Posts a FEEDBACK
 #       project message describing the pre-existing issues + your reason
 #       so strategic/operators can spawn cleanup work later. The reason
-#       text MUST include the specific gates/files that failed and why
-#       fixing them is out of scope (e.g., "admin-ui eslint reports 4
-#       errors in DashboardHome.tsx that pre-date this PR; fixing them
-#       requires refactoring the digest-card layout which is not in
-#       scope for this auth-flow change").
+#       text MUST name the specific gate(s) and file(s) that failed and
+#       explain why fixing them is out of scope for this change (i.e.
+#       the failure already existed on the base branch and remediating
+#       it would require unrelated work beyond this task's diff).
 #
 #       USE ./blocked INSTEAD when the failure requires introducing a
 #       new bug or precondition (missing package, infra gap, agent
@@ -38,13 +37,11 @@ export function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
 #       reason recorded so operators see why there's no PR.
 #
 #       Use ONLY when you have VERIFIED the deliverable is already present
-#       (e.g. a sibling PR already added the migration / model / endpoint you
-#       were asked to add, and producing a duplicate would break an invariant
-#       like Alembic chain-linearity). The reason MUST name the concrete
-#       artifact you verified and where it lives (≥30 chars), e.g.
-#       "backend/alembic/versions/0133_poolvm_registry.py + PoolVm model +
-#       EXPECTED_SCHEMA_REVISION=0133 already present on base (sibling PR #6978);
-#       a new migration would branch the revision chain".
+#       (e.g. a sibling change already added the file / function / endpoint
+#       you were asked to add, and producing a duplicate would break an
+#       invariant). The reason MUST name the concrete artifact you verified
+#       and where you confirmed it lives (≥30 chars): the file path / symbol
+#       and the source you checked, plus why duplicating it would be wrong.
 #
 #       This is NOT a give-up verb. If you could NOT complete the work
 #       (errored, gave up, ran out of ideas) use ./fail. If an upstream

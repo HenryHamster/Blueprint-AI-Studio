@@ -1,9 +1,23 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
 import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
+
+// Capability probes: some tests spawn python3/jq or assert a Unix executable bit.
+// Those skip when the capability is absent (e.g. local Windows dev box without
+// python3/jq on PATH, or no Unix exec bit) but still run fully in Linux CI.
+const hasBin = (b: string): boolean => {
+  try {
+    return !spawnSync(b, ['--version'], { stdio: 'ignore' }).error;
+  } catch {
+    return false;
+  }
+};
+const HAS_PYTHON3 = hasBin('python3');
+const HAS_JQ = hasBin('jq');
+const SUPPORTS_EXEC_BIT = process.platform !== 'win32';
 
 // Regression guard for the committed before/after screenshot tooling (Phase 0).
 // scripts/viewport-snapshot.sh and scripts/viewport_manifest.py are invoked by
@@ -35,7 +49,8 @@ describe('scripts/viewport-snapshot.sh — committed snapshot tooling', () => {
     expect(src).toContain('VIEWPORT_GATE_INFRA_UNAVAILABLE');
   });
 
-  it('manifest helper is valid python (py_compile)', () => {
+  // Requires python3 on PATH (spawns py_compile).
+  it.skipIf(!HAS_PYTHON3)('manifest helper is valid python (py_compile)', () => {
     expect(() => execFileSync('python3', ['-m', 'py_compile', MANIFEST_PY])).not.toThrow();
   });
 
@@ -67,7 +82,8 @@ describe('scripts/viewport-snapshot.sh — committed snapshot tooling', () => {
     expect(src).toContain('/tmp/viewport_manifest_${TASK_ID}.json');
   });
 
-  it('scales change_pct to a 0-1 magnitude on the "after" row only', () => {
+  // Requires jq on PATH (runs the script's embedded jq filter).
+  it.skipIf(!HAS_JQ)('scales change_pct to a 0-1 magnitude on the "after" row only', () => {
     // Run the REAL jq filter embedded in the script against a sample manifest so a
     // regression in the change_pct/100 scaling (or in which rows carry magnitude)
     // is caught here, not in production. The backend rejects magnitude > 1.0, so
@@ -206,7 +222,8 @@ describe('scripts/viewport-live-capture.js — Playwright capture helper', () =>
     expect(src).toContain('fullPage: true');
   });
 
-  it('writes PNGs with the px suffix required by viewport_manifest.py width regex', () => {
+  // Requires python3 on PATH (runs viewport_manifest.py).
+  it.skipIf(!HAS_PYTHON3)('writes PNGs with the px suffix required by viewport_manifest.py width regex', () => {
     // viewport_manifest.py uses _WIDTH_RE = re.compile(r"-(\d+)px\.png$").
     // If the capture helper omits "px", the manifest emits width: null and every
     // upload returns 422 from the backend (width: int = Field(ge=1, le=4096)).
@@ -281,7 +298,8 @@ describe('writeViewportLiveHelper — generated ./viewport-live wrapper', () => 
     expect(src).toMatch(/TASK_ID="live-abc-xyz"/);
   });
 
-  it('writes the wrapper as an executable file', async () => {
+  // Requires a Unix executable bit (Windows has none; chmod is a no-op there).
+  it.skipIf(!SUPPORTS_EXEC_BIT)('writes the wrapper as an executable file', async () => {
     const { writeViewportLiveHelper } = await import('./prompt.js');
     writeViewportLiveHelper('mode-task', tmpDir);
 
