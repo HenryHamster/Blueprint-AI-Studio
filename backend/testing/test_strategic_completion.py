@@ -2001,6 +2001,59 @@ class TestCheckDirectionStarvation:
         # Alert fired to prompt manual intervention
         alert_mock.assert_called_once()
 
+    async def test_starvation_fallback_dedups_against_retired_memory(
+        self, strat_fail_db, mocker
+    ):
+        """Starvation fallback is suppressed when its text overlaps a recently-retired direction.
+
+        Proof: counter reset + operator alert fired, no direction created.
+        """
+        alert_mock = mocker.patch(
+            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
+        )
+        from datetime import timezone
+
+        recent_ts = (
+            __import__("datetime").datetime.now(timezone.utc).isoformat()
+        )
+        # Pre-seed retired memory with tokens that overlap the fallback
+        # "Deliver user-visible product improvements" (NO_PRODUCT_DIRECTIONS gap).
+        project = Project(
+            name="P",
+            user_id="u1",
+            vision={
+                "_direction_starvation_count": 4,
+                "_recently_retired_directions": [
+                    {
+                        "id": "d-retired1",
+                        "text_tokens": list(
+                            {"deliver", "user-visible", "product", "improvements"}
+                        ),
+                        "retired_at": recent_ts,
+                        "reason": "strategic_retire",
+                    }
+                ],
+            },
+            directions=[
+                _active_dir(id="1", category="structural"),
+                _active_dir(id="2", category="structural"),
+                _active_dir(id="3", category="structural"),
+            ],
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db
+        )
+
+        # No new direction created — dedup matched retired memory
+        assert len(project.directions) == 3
+        # Counter reset (dedup path resets and alerts instead of creating)
+        assert project.vision.get("_direction_starvation_count") == 0
+        # Alert fired to prompt manual intervention
+        alert_mock.assert_called_once()
+
 
 # ── Rationale persistence & retrieval ────────────────────────────────────────
 

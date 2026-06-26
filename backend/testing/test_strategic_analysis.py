@@ -3359,3 +3359,82 @@ def test_direction_knowledge_capped_at_five():
         knowledge_by_direction=knowledge_by_direction,
     )
     assert len(result["directions"][0]["direction_knowledge"]) == 5
+
+
+# ---------------------------------------------------------------------------
+# _build_retired_directions_summary — durable memory augmentation
+# ---------------------------------------------------------------------------
+
+
+def test_retired_directions_summary_includes_durable_memory_entries():
+    """Direction in vision['_recently_retired_directions'] but pruned from the
+    live directions list still appears in the retired-directions summary."""
+    project = _make_project(
+        directions=[],  # direction already pruned from live list
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-pruned",
+                    "text_tokens": ["improve", "auth", "performance"],
+                    "retired_at": "2026-06-01T00:00:00",
+                    "reason": "saturation",
+                    "gap_id": "g-auth",
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    entry = result[0]
+    assert entry["id"] == "d-pruned"
+    assert entry["status"] == "retired"
+    assert entry["retirement_reason"] == "saturation"
+    # text reconstructed from tokens
+    assert "auth" in entry["text"]
+
+
+def test_retired_directions_summary_deduplicates_live_and_memory():
+    """A direction present in both the live list and durable memory is not duplicated."""
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-both",
+                "status": "retired",
+                "retired_at": "2026-06-10T00:00:00",
+                "text": "improve auth",
+                "research_history": [],
+            }
+        ],
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-both",
+                    "text_tokens": ["improve", "auth"],
+                    "retired_at": "2026-06-10T00:00:00",
+                    "reason": "saturation",
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    ids = [e["id"] for e in result]
+    assert ids.count("d-both") == 1
+
+
+def test_retired_directions_summary_memory_respects_window():
+    """Durable memory entries older than window_days are excluded."""
+    project = _make_project(
+        directions=[],
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-ancient",
+                    "text_tokens": ["old", "direction"],
+                    "retired_at": "2020-01-01T00:00:00",  # well outside 90d window
+                    "reason": "completed",
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert result == []

@@ -3166,17 +3166,27 @@ async def _check_direction_starvation(
                     )
                     fallback_category = None
 
-                # Audit W2/D8: dedup the fallback against existing directions
-                # AND recently-rejected proposals before creating. The previous
-                # version skipped dedup, so a saturated project would loop
-                # creating near-identical fallbacks every 5 cycles.
+                # Audit W2/D8: dedup the fallback against existing directions,
+                # recently-rejected proposals, AND the durable retired-directions
+                # memory before creating. The previous version skipped the retired
+                # memory, so a direction retired a cycle ago could be recreated.
                 rejected_proposals = list(
                     (vision or {}).get("rejected_proposals") or []
+                )
+                retired_memory = list(
+                    (vision or {}).get("_recently_retired_directions") or []
                 )
                 is_dup = _is_direction_duplicate(
                     fallback_text,
                     directions,
                     rejected_proposals,
+                ) or bool(
+                    _check_gap_respawn_block(
+                        fallback_text,
+                        None,
+                        retired_memory,
+                        cooldown_days=30,
+                    )
                 )
                 if is_dup:
                     logger.warning(
