@@ -4597,3 +4597,128 @@ def test_compute_run_local_arms_wrapped_in_docker_per_arm(tmp_path, monkeypatch,
         assert "myregistry.io/myimage:latest" in docker_cmd
         assert "BLUEPRINT_RESULT_FILE" in " ".join(docker_cmd)
         assert "--gpus" not in docker_cmd  # no GPU detected
+
+
+# ---------------------------------------------------------------------------
+# docker-login alignment tests (_compute_docker_login / _compute_run_local)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_run_docker_login_password_only_and_failure(tmp_path, monkeypatch):
+    """Login is attempted when only a password is supplied; a failed login aborts before pull."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "python train.py",
+        "container_image": "nvcr.io/nvidia/pytorch:24.01",
+        "container_registry_auth": {"password": "secret"},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    login_calls = []
+
+    class _FailResult:
+        returncode = 1
+        stderr = b"unauthorized"
+
+    class _OkResult:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(cmd, **kwargs):
+        login_calls.append(list(cmd) if isinstance(cmd, list) else cmd)
+        if cmd[0] == "docker" and cmd[1] == "login":
+            return _FailResult()
+        return _OkResult()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    with pytest.raises(SystemExit) as exc_info:
+        blueprint._compute_run_local(args)
+
+    assert exc_info.value.code == 1
+    # login was attempted
+    login_invocations = [c for c in login_calls if isinstance(c, list) and c[:2] == ["docker", "login"]]
+    assert login_invocations, "docker login must be called when password is present"
+    # docker pull was NOT called after the failed login
+    pull_invocations = [c for c in login_calls if isinstance(c, list) and "pull" in c]
+    assert not pull_invocations, "docker pull must not be called after a failed login"
+
+
+def test_compute_run_docker_login_password_only_gates_login(tmp_path, monkeypatch):
+    """docker login is attempted even when server and username are absent, if password is set."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "echo hi",
+        "container_image": "nvcr.io/nvidia/pytorch:24.01",
+        "container_registry_auth": {"password": "tok3n"},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    login_cmds = []
+
+    class _R:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(cmd, **kwargs):
+        if isinstance(cmd, list) and cmd[:2] == ["docker", "login"]:
+            login_cmds.append(list(cmd))
+        return _R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    assert login_cmds, "expected docker login to be called when password is present without server/username"
+    login_cmd = login_cmds[0]
+    assert "--password-stdin" in login_cmd
+    # no --username flag because username was not set
+    assert "--username" not in login_cmd
+    # no server appended because server was not set
+    assert "nvcr.io" not in login_cmd
+
+
+def test_compute_run_docker_login_skipped_when_no_password(tmp_path, monkeypatch):
+    """docker login is not called when container_registry_auth lacks a password."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "echo hi",
+        "container_image": "myregistry.io/img:latest",
+        "container_registry_auth": {"server": "myregistry.io", "username": "user"},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    login_calls = []
+
+    class _R:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(cmd, **kwargs):
+        if isinstance(cmd, list) and cmd[:2] == ["docker", "login"]:
+            login_calls.append(list(cmd))
+        return _R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    assert not login_calls, "docker login must not be called when password is absent"

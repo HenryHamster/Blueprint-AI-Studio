@@ -3974,6 +3974,44 @@ def _read_arm_stderr_excerpt(path: str) -> str | None:
         return None
 
 
+def _compute_docker_login(auth: dict, *, _subprocess_run=None) -> bool:
+    """Run `docker login` using the credentials in *auth*.
+
+    Gates on ``password`` only — server and username are optional.
+    Returns True on success or when no password is present; False on any
+    failure (non-zero exit, timeout, subprocess error).
+
+    ``_subprocess_run`` is an optional override injected by tests.
+    """
+    password = auth.get("password") or ""
+    if not password:
+        return True
+
+    server = auth.get("server") or ""
+    username = auth.get("username") or ""
+    _run = _subprocess_run if _subprocess_run is not None else subprocess.run
+
+    cmd = ["docker", "login", "--password-stdin"]
+    if username:
+        cmd += ["--username", username]
+    if server:
+        cmd.append(server)
+
+    try:
+        result = _run(cmd, input=password.encode(), capture_output=True, timeout=60)
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", "replace")[:500]
+            print(f"error: docker login failed (exit={result.returncode}): {stderr}")
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        print("error: docker login timed out")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: docker login error: {exc}")
+        return False
+
+
 def _compute_run_local(args: argparse.Namespace) -> None:
     """Execute a compute_experiment command locally without the orchestrator.
 
@@ -4056,19 +4094,9 @@ def _compute_run_local(args: argparse.Namespace) -> None:
 
     if container_image:
         if container_registry_auth and isinstance(container_registry_auth, dict):
-            server = str(container_registry_auth.get("server") or "")
-            username = str(container_registry_auth.get("username") or "")
-            password = str(container_registry_auth.get("password") or "")
-            if server and username and password:
-                login_result = subprocess.run(
-                    ["docker", "login", server, "-u", username, "--password-stdin"],
-                    input=password.encode(),
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                )
-                if not _json_mode(args):
-                    status_str = "ok" if login_result.returncode == 0 else "failed (continuing)"
-                    print(f"docker login {server!r}: {status_str}")
+            if container_registry_auth.get("password"):
+                if not _compute_docker_login(container_registry_auth):
+                    sys.exit(1)
         if not _json_mode(args):
             print(f"image       : {container_image}")
             print("docker pull : pulling...")
