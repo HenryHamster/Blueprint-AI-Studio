@@ -156,7 +156,7 @@ describe('DirectionsPanel', () => {
 
   it('renders directions for the passed selectedProjectId and has no project picker', async () => {
     mockFetch(baseResponses);
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
     await screen.findByPlaceholderText('New direction...');
     // No project <select> dropdown should be rendered
     expect(screen.queryByRole('combobox', { name: /project/i })).toBeNull();
@@ -177,12 +177,12 @@ describe('DirectionsPanel', () => {
         design_doc: {},
       },
     });
-    const { rerender } = render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    const { rerender } = render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
     await screen.findByPlaceholderText('New direction...');
     const proj1CallCount = fetchSpy.mock.calls.filter((c) => String(c[0]).includes('proj1')).length;
     expect(proj1CallCount).toBeGreaterThan(0);
 
-    rerender(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj2" projects={TEST_PROJECTS} />);
+    rerender(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj2" projects={TEST_PROJECTS} />);
     await waitFor(() => {
       expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes('proj2'))).toBe(true);
     });
@@ -206,7 +206,7 @@ describe('DirectionsPanel', () => {
         design_doc: {},
       },
     });
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
     await screen.findByText('Build the feature');
     expect(screen.getByTestId('direction-card')).toBeInTheDocument();
   });
@@ -224,7 +224,7 @@ describe('DirectionsPanel', () => {
         design_doc: {},
       },
     });
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
     await screen.findByText('Active direction');
     // Section headers render as "{label} ({count})"
     expect(screen.getAllByText('Active (1)').length).toBeGreaterThan(0);
@@ -234,7 +234,7 @@ describe('DirectionsPanel', () => {
   it('clicking the Problem Model tab shows ProblemModelViewer', async () => {
     mockFetch(baseResponses);
     const user = userEvent.setup();
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
     await screen.findByPlaceholderText('New direction...');
     await user.click(screen.getByRole('button', { name: /Problem Model/ }));
     expect(screen.getByTestId('problem-model-viewer')).toBeInTheDocument();
@@ -243,7 +243,7 @@ describe('DirectionsPanel', () => {
   it('clicking the Running Update tab shows RunningUpdatePanel', async () => {
     mockFetch(baseResponses);
     const user = userEvent.setup();
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
     await screen.findByPlaceholderText('New direction...');
     await user.click(screen.getByRole('button', { name: /Running Update/ }));
     expect(screen.getByTestId('running-update-panel')).toBeInTheDocument();
@@ -252,7 +252,7 @@ describe('DirectionsPanel', () => {
   it('clicking the Design Doc tab shows DesignDocViewer', async () => {
     mockFetch(baseResponses);
     const user = userEvent.setup();
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
     await screen.findByPlaceholderText('New direction...');
     await user.click(screen.getByRole('button', { name: 'Design Doc' }));
     expect(screen.getByTestId('design-doc-viewer')).toBeInTheDocument();
@@ -261,7 +261,7 @@ describe('DirectionsPanel', () => {
   it('clicking the Add button triggers a POST fetch for the direction', async () => {
     mockFetch(baseResponses);
     const user = userEvent.setup();
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
     // Wait for form to appear
     const input = await screen.findByPlaceholderText('New direction...');
     // Add button is the only button in the same flex row as the input
@@ -304,7 +304,7 @@ describe('DirectionsPanel', () => {
       return Promise.resolve({ ok: true, json: () => Promise.resolve({ directions: [] }) } as Response);
     });
 
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
     const input = await screen.findByPlaceholderText('New direction...');
     const addBtn = input.parentElement?.querySelector('button');
     if (!addBtn) throw new Error('test setup: expected add button');
@@ -339,7 +339,7 @@ describe('DirectionsPanel', () => {
       return Promise.resolve({ ok: true, json: () => Promise.resolve({ directions: [] }) } as Response);
     });
 
-    render(<DirectionsPanel onClose={vi.fn()} addToast={addToast} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    render(<DirectionsPanel addToast={addToast} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
     const input = await screen.findByPlaceholderText('New direction...');
     const addBtn = input.parentElement?.querySelector('button');
     if (!addBtn) throw new Error('test setup: expected add button');
@@ -359,35 +359,35 @@ describe('DirectionsPanel', () => {
 
   it('renders the strategist-working indicator when strategistActive is true', async () => {
     mockFetch(baseResponses);
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive />);
     await screen.findByPlaceholderText('New direction...');
     expect(screen.getByText('Strategist working…')).toBeInTheDocument();
   });
 
   it('hides the strategist-working indicator when strategistActive is absent/false', async () => {
     mockFetch(baseResponses);
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
     await screen.findByPlaceholderText('New direction...');
     expect(screen.queryByText('Strategist working…')).toBeNull();
   });
 
   it('shows generic "Strategist working…" when strategistActive=true and no cycleProgress (minimal event backward-compat)', async () => {
     mockFetch(baseResponses);
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={null} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={null} />);
     await screen.findByPlaceholderText('New direction...');
     expect(screen.getByText('Strategist working…')).toBeInTheDocument();
   });
 
   it('shows phase label from enriched cycleProgress event', async () => {
     mockFetch(baseResponses);
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={{ task_id: 't1', phase_label: 'Reviewing directions' }} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={{ task_id: 't1', phase_label: 'Reviewing directions' }} />);
     await screen.findByPlaceholderText('New direction...');
     expect(screen.getByText('Strategist: Reviewing directions…')).toBeInTheDocument();
   });
 
   it('shows steering excerpt under the phase label in directions panel', async () => {
     mockFetch(baseResponses);
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={{ task_id: 't1', phase_label: 'Evaluating', steering_excerpt: 'Focus on reliability' }} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={{ task_id: 't1', phase_label: 'Evaluating', steering_excerpt: 'Focus on reliability' }} />);
     await screen.findByPlaceholderText('New direction...');
     expect(screen.getByText('Strategist: Evaluating…')).toBeInTheDocument();
     expect(screen.getByText(/"Focus on reliability"/)).toBeInTheDocument();
@@ -397,7 +397,7 @@ describe('DirectionsPanel', () => {
     mockFetch(baseResponses);
     render(
       <DirectionsPanel
-        onClose={vi.fn()}
+       
         addToast={vi.fn()}
         selectedProjectId="proj1"
         projects={TEST_PROJECTS}
@@ -415,7 +415,7 @@ describe('DirectionsPanel', () => {
     mockFetch(baseResponses);
     render(
       <DirectionsPanel
-        onClose={vi.fn()}
+       
         addToast={vi.fn()}
         selectedProjectId="proj1"
         projects={TEST_PROJECTS}
@@ -427,15 +427,4 @@ describe('DirectionsPanel', () => {
     expect(screen.queryByText('Cycle complete')).toBeNull();
   });
 
-  it('clicking the close backdrop fires onClose', async () => {
-    mockFetch(baseResponses);
-    const user = userEvent.setup();
-    const onClose = vi.fn();
-    const { container } = render(<DirectionsPanel onClose={onClose} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
-    await screen.findByPlaceholderText('New direction...');
-    // Backdrop is the div with both "absolute" and "inset-0" classes
-    const backdrop = container.querySelector('.absolute.inset-0');
-    await user.click(backdrop as HTMLElement);
-    expect(onClose).toHaveBeenCalledOnce();
-  });
 });

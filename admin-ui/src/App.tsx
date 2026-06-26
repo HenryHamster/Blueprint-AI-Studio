@@ -922,7 +922,6 @@ export default function App() {
       ) : activeTab === 'directions' ? (
         <ErrorBoundary level="panel">
           <DirectionsPanel
-            pageMode
             addToast={s.addToast}
             selectedProjectId={s.selectedProjectId}
             projects={s.projects}

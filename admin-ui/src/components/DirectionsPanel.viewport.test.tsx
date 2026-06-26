@@ -5,7 +5,6 @@ import { DirectionsPanel } from './DirectionsPanel';
 import type { Direction } from './DirectionsPanel';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt, stressStrings } from '../test/viewport';
 import { apiFetch } from '../api';
-
 // Partial mock — preserve every other export from `../api` so transitive
 // imports (TaskCard's `authGet`, etc.) resolve. Browser-mode vitest
 // validates ESM exports statically at import time, so a static factory
@@ -77,11 +76,9 @@ vi.mock('../api', async (importOriginal) => {
     }),
   };
 });
-
 describe('DirectionsPanel — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
-
   afterEach(() => {
     const r = root;
     if (r) {
@@ -95,7 +92,6 @@ describe('DirectionsPanel — viewport regression', () => {
       host = null;
     }
   });
-
   test('directions tab renders without horizontal overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
@@ -106,7 +102,6 @@ describe('DirectionsPanel — viewport regression', () => {
       await act(async () => {
         r.render(
           <DirectionsPanel
-            onClose={() => {}}
             addToast={() => {}}
             selectedProjectId="proj-test"
             projects={[{
@@ -128,7 +123,6 @@ describe('DirectionsPanel — viewport regression', () => {
       });
     });
   });
-
   test('problem-model tab renders without horizontal overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
@@ -139,7 +133,6 @@ describe('DirectionsPanel — viewport regression', () => {
       await act(async () => {
         r.render(
           <DirectionsPanel
-            onClose={() => {}}
             addToast={() => {}}
             selectedProjectId="proj-test"
             projects={[{
@@ -177,7 +170,6 @@ describe('DirectionsPanel — viewport regression', () => {
       });
     });
   });
-
   test('direction text fields and taxonomy labels do not silently clip text at 375px', async () => {
     await expectNoTextTruncationAt(375, async () => {
       host = document.createElement('div');
@@ -188,7 +180,6 @@ describe('DirectionsPanel — viewport regression', () => {
       await act(async () => {
         r.render(
           <DirectionsPanel
-            onClose={() => {}}
             addToast={() => {}}
             selectedProjectId="proj-test"
             projects={[{
@@ -210,7 +201,6 @@ describe('DirectionsPanel — viewport regression', () => {
       });
     }, { waitMs: 50 });
   });
-
   test('interactive controls meet 44px touch target at 375px', async () => {
     await expectMinTouchTargetAt(375, async () => {
       host = document.createElement('div');
@@ -221,7 +211,6 @@ describe('DirectionsPanel — viewport regression', () => {
       await act(async () => {
         r.render(
           <DirectionsPanel
-            onClose={() => {}}
             addToast={() => {}}
             selectedProjectId="proj-test"
             projects={[{
@@ -243,7 +232,6 @@ describe('DirectionsPanel — viewport regression', () => {
     }, { selector: 'button, a[href]' });
   });
 });
-
 // Worst-case direction: long text, held state, path tags, diagnosis,
 // research_history, cost breakdown — exercises every conditional render
 // path in DirectionCard that can produce dense/multi-badge rows at 375px.
@@ -258,11 +246,9 @@ const stressDir: Direction = {
   research_history: [{ timestamp: '2026-05-10T10:00:00Z', task_id: 'r1', tasks_created: 8,
     finding_titles: [stressStrings.shortTitle], key_finding_descriptions: [stressStrings.errorSnippet] }],
 };
-
 describe('DirectionsPanel stress fixture — realistic direction data', () => {
   let sRoot: Root | null = null;
   let sHost: HTMLDivElement | null = null;
-
   beforeEach(() => {
     vi.mocked(apiFetch).mockImplementation(async (url: string) => {
       if (url.includes('/directions') && !url.includes('/directions/')) {
@@ -272,24 +258,20 @@ describe('DirectionsPanel stress fixture — realistic direction data', () => {
       return new Response('{}', { status: 200 });
     });
   });
-
   afterEach(() => {
     if (sRoot) act(() => { sRoot!.unmount(); });
     sRoot = null;
     sHost?.remove();
     sHost = null;
   });
-
   const proj = { id: 'p', name: 'Stress Project', status: 'active' as const,
     github_owner: 'o', github_repo: 'r', autonomous_enabled: true, directions: [], created_at: '2026-01-01T00:00:00Z' };
-
   async function renderStressPanel(r: Root): Promise<void> {
     await act(async () => {
-      r.render(<DirectionsPanel onClose={() => {}} addToast={() => {}} selectedProjectId="p" projects={[proj]} />);
+      r.render(<DirectionsPanel  addToast={() => {}} selectedProjectId="p" projects={[proj]} />);
     });
     await act(async () => { await new Promise<void>((res) => setTimeout(res, 50)); });
   }
-
   test('stress fixture renders without horizontal overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {
       sHost = document.createElement('div');
@@ -298,7 +280,6 @@ describe('DirectionsPanel stress fixture — realistic direction data', () => {
       await renderStressPanel(sRoot);
     });
   });
-
   test('stress fixture has no silent text truncation at 375px', async () => {
     await expectNoTextTruncationAt(375, async () => {
       sHost = document.createElement('div');

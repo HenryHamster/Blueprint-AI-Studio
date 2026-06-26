@@ -1,11 +1,10 @@
-import { X, Zap } from 'lucide-react';
+import { Zap } from 'lucide-react';
 import type { ProblemModel, ProblemModelSizeHealth } from '../types';
 import type { Project } from '../types/project';
 
 export type DirectionsTab = 'directions' | 'problem-model' | 'running-update' | 'design-doc';
 
 export interface DirectionsPanelHeaderProps {
-  onClose: () => void;
   selectedProjectId: string | null;
   projects: Project[];
   proposedCount: number;
@@ -23,7 +22,6 @@ export interface DirectionsPanelHeaderProps {
  * and the tab bar. Extracted verbatim from DirectionsPanel.
  */
 export function DirectionsPanelHeader({
-  onClose,
   selectedProjectId,
   projects,
   proposedCount,
@@ -64,9 +62,6 @@ export function DirectionsPanelHeader({
             </span>
           )}
         </div>
-        <button onClick={onClose} className="text-neutral-500 hover:text-neutral-300 transition-colors min-h-[44px] min-w-[44px] flex items-center justify-center">
-          <X className="w-4 h-4" />
-        </button>
       </div>
 
       {/* Spawn triggers */}
