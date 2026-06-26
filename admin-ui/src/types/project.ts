@@ -43,6 +43,12 @@ export interface ResourceEnvelopeConfig {
   /** Hardware policy: if set, GPU jobs must use one of these accelerator types.
    *  `null`/undefined means unrestricted; an empty list `[]` blocks all GPU jobs. */
   allowed_accelerator_types?: string[] | null;
+  /** When true, this project's compute experiments only run on registered
+   *  self-hosted runners and never fall back to billable cloud compute. With no
+   *  live runner, experiments are held until one comes online (and time out after
+   *  a few hours rather than wedging). `false`/undefined means cloud fallback is
+   *  allowed (the default). */
+  require_local_runner?: boolean;
 }
 
 export interface BuildConfig {

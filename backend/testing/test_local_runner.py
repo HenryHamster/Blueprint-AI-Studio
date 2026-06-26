@@ -654,3 +654,123 @@ class TestOrchestratorRunnerRouting:
         await db_session.refresh(alive)
         assert never_heartbeated.status == "inactive"
         assert alive.status == "active"
+
+
+# ── Strategic-spawning local-runner availability signal ──────────────────────
+
+
+class TestLocalRunnerStatusForStrategist:
+    """`strategic_spawning._load_local_runner_status` — live local-runner
+    availability surfaced into the strategist's authoring context so it avoids
+    authoring GPU compute_experiment tasks (which silently fall back to billable
+    cloud GPU) while the operator's hardware is offline. Informational only.
+    """
+
+    @pytest.mark.asyncio
+    async def test_no_runners_reports_never_registered(self, db_session):
+        from app.strategic_spawning import _load_local_runner_status
+
+        project = await _make_project(db_session)
+        status = await _load_local_runner_status(db_session, project.id)
+        assert status == {
+            "ever_registered": False,
+            "active_total": 0,
+            "active_gpu": 0,
+        }
+        # The payload conditional-inclusion gate omits the field entirely when
+        # the project never registered a runner (mirrors _spawn_strategic_review).
+        payload_fragment = (
+            {"local_runner_status": status}
+            if status.get("ever_registered")
+            else {}
+        )
+        assert "local_runner_status" not in payload_fragment
+
+    @pytest.mark.asyncio
+    async def test_stale_gpu_runner_registered_but_not_active(self, db_session):
+        project = await _make_project(db_session)
+        # Registered with GPU but last heartbeat is outside the 300s liveness
+        # window → operator hardware is considered offline.
+        await _make_runner(
+            db_session,
+            project.id,
+            status="active",
+            capabilities={"task_types": "all", "has_gpu": True, "max_concurrent": 2},
+            last_seen_at=_utcnow() - timedelta(seconds=400),
+        )
+
+        from app.strategic_spawning import _load_local_runner_status
+
+        status = await _load_local_runner_status(db_session, project.id)
+        assert status["ever_registered"] is True
+        assert status["active_total"] == 0
+        assert status["active_gpu"] == 0
+        # Field IS included now (ever_registered True) so the agent sees the
+        # hardware is down (active_gpu == 0) and can hold GPU experiments.
+        payload_fragment = (
+            {"local_runner_status": status}
+            if status.get("ever_registered")
+            else {}
+        )
+        assert payload_fragment["local_runner_status"] is status
+
+    @pytest.mark.asyncio
+    async def test_live_gpu_runner_counts_as_active_gpu(self, db_session):
+        project = await _make_project(db_session)
+        await _make_runner(
+            db_session,
+            project.id,
+            status="active",
+            capabilities={"task_types": "all", "has_gpu": True, "max_concurrent": 2},
+            last_seen_at=_utcnow(),
+        )
+
+        from app.strategic_spawning import _load_local_runner_status
+
+        status = await _load_local_runner_status(db_session, project.id)
+        assert status["ever_registered"] is True
+        assert status["active_total"] == 1
+        assert status["active_gpu"] == 1
+
+    @pytest.mark.asyncio
+    async def test_mixed_runners_count_active_gpu_subset(self, db_session):
+        project = await _make_project(db_session)
+        # Live non-GPU runner → counts toward active_total but not active_gpu.
+        await _make_runner(
+            db_session,
+            project.id,
+            status="active",
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+            last_seen_at=_utcnow(),
+        )
+        # Live GPU runner → counts toward both.
+        await _make_runner(
+            db_session,
+            project.id,
+            status="active",
+            capabilities={"task_types": "all", "has_gpu": True, "max_concurrent": 2},
+            last_seen_at=_utcnow(),
+        )
+        # Stale GPU runner → registered but not live.
+        await _make_runner(
+            db_session,
+            project.id,
+            status="active",
+            capabilities={"task_types": "all", "has_gpu": True, "max_concurrent": 2},
+            last_seen_at=_utcnow() - timedelta(seconds=400),
+        )
+        # Deleted GPU runner → excluded from ever_registered and all counts.
+        await _make_runner(
+            db_session,
+            project.id,
+            status="deleted",
+            capabilities={"task_types": "all", "has_gpu": True, "max_concurrent": 2},
+            last_seen_at=_utcnow(),
+        )
+
+        from app.strategic_spawning import _load_local_runner_status
+
+        status = await _load_local_runner_status(db_session, project.id)
+        assert status["ever_registered"] is True
+        assert status["active_total"] == 2
+        assert status["active_gpu"] == 1

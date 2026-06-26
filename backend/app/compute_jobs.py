@@ -40,6 +40,7 @@ from app.compute_backends import (
 )
 from app.resource_envelope import (
     resolve_project_hardware_policy,
+    resolve_project_require_local_runner,
     resolve_project_spend_ceiling,
     resolve_project_spend_window_days,
 )
@@ -334,6 +335,31 @@ async def create_compute_job(
     runner_target_id: str | None = (locked_task.context or {}).get("runner_target_id") or None
     if runner_target_id is not None:
         normalized_backend = RUNNER_SUBPROCESS_BACKEND_NAME
+    # Enforce-local policy: when a project requires its compute_experiment work to run
+    # on a registered self-hosted local runner, a job that is NOT runner-pinned (no live
+    # runner claimed the task → it would provision billable cloud compute) must be
+    # rejected loudly. Pairs with the orchestrator's graceful dispatch hold (which keeps
+    # such tasks QUEUED until a runner appears); this is the defense-in-depth guarantee
+    # that no billable cloud GPU/VM is ever created for a require-local project.
+    _policy_project = await session.get(Project, locked_task.project_id)
+    _is_compute_experiment = str((locked_task.first_payload or {}).get("type") or "") == "compute_experiment"
+    if (
+        _policy_project is not None
+        and _is_compute_experiment
+        and resolve_project_require_local_runner(_policy_project)
+        and normalized_backend != RUNNER_SUBPROCESS_BACKEND_NAME
+    ):
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "local_runner_required",
+                "message": (
+                    "project policy require_local_runner is set: this compute_experiment "
+                    "must run on a registered self-hosted local runner, but no live runner "
+                    "claimed the task — refusing to provision billable cloud compute."
+                ),
+                "backend": normalized_backend,
+            }
+        )
     await _assert_compute_spend_not_gated(session, locked_task, capped_spend)
     live_proof_requirement = _resolve_live_proof_requirement(
         locked_task,

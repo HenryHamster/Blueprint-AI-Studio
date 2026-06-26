@@ -866,6 +866,13 @@ class ResourceEnvelope(BaseModel):
     # If set, GPU compute jobs must use one of these accelerators (e.g. ["T4", "L4"]).
     # An empty list blocks all GPU jobs. CPU jobs (no accelerator) are never blocked by this field.
     allowed_accelerator_types: list[str] | None = Field(None)
+    # When True, compute_experiment tasks for this project must run on a
+    # registered self-hosted local runner — they NEVER fall back to billable
+    # cloud compute. With no live runner the experiment is held (and eventually
+    # failed by a bounded timeout) rather than provisioned in the cloud. Scoped
+    # to compute_experiment tasks for now; a future field could extend the
+    # policy to other task types. Absent/None ⇒ False (cloud fallback permitted).
+    require_local_runner: bool | None = Field(None)
 
     @field_validator("allowed_machine_types", mode="before")
     @classmethod

@@ -34,6 +34,7 @@ from app.models import (
     MessageType,
     ProjectMessage,
     SystemMaturity,
+    LocalRunner,
 )
 from app.deploy_identity import project_matches_deploy_identity
 from app.payload_schemas import pack_under_budget, validate_internal_payload
@@ -97,6 +98,61 @@ _CHALLENGE_AGREEMENT_BUCKETS = (
     CHALLENGE_DISAGREES,
     CHALLENGE_INDETERMINATE,
 )
+
+# Mirrors ``orchestrator._RUNNER_LIVENESS_SECONDS`` (300): a registered runner is
+# considered live only if it heartbeated within this window. Replicated here
+# rather than imported to avoid an ``orchestrator -> autonomous_research ->
+# strategic_spawning`` import cycle (strategic_spawning is pulled in lazily by
+# the orchestrator's autonomous_research call chain; importing orchestrator at
+# this module's top would invert that order). Keep in sync with orchestrator.
+_RUNNER_LIVENESS_SECONDS = 300
+
+
+async def _load_local_runner_status(
+    session: AsyncSession, project_id: uuid.UUID
+) -> dict[str, Any]:
+    """Live self-hosted local-runner availability for the strategist's context.
+
+    Surfaces whether the operator's self-hosted GPU hardware is up so the
+    strategist can avoid authoring GPU ``compute_experiment`` tasks that would
+    otherwise silently fall back to billable cloud GPU while the hardware is
+    offline. Informational only — there is NO dispatch effect or hard block.
+
+    Returns ``{"ever_registered": bool, "active_total": int, "active_gpu": int}``:
+
+    * ``ever_registered`` — the project has >=1 non-deleted ``LocalRunner`` row
+      (operator set up local hardware at some point).
+    * ``active_total`` — runners with ``status=='active'`` that heartbeated within
+      the liveness window (mirrors the orchestrator dispatch-cache predicate).
+    * ``active_gpu`` — subset of ``active_total`` whose ``capabilities.has_gpu`` is
+      truthy.
+
+    One query (non-deleted runners for the project — a small set); the liveness
+    + GPU filtering is done in Python to stay dialect-agnostic over the JSONB
+    ``capabilities`` column.
+    """
+    rows = (
+        await session.execute(
+            select(LocalRunner).where(
+                LocalRunner.project_id == project_id,
+                LocalRunner.status != "deleted",
+            )
+        )
+    ).scalars().all()
+    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    active_total = 0
+    active_gpu = 0
+    for runner in rows:
+        last_seen = runner.last_seen_at
+        if runner.status == "active" and last_seen is not None and last_seen > cutoff:
+            active_total += 1
+            if (runner.capabilities or {}).get("has_gpu"):
+                active_gpu += 1
+    return {
+        "ever_registered": len(rows) > 0,
+        "active_total": active_total,
+        "active_gpu": active_gpu,
+    }
 
 
 def _empty_finding_challenge_summary() -> dict[str, Any]:
@@ -6015,6 +6071,11 @@ async def _spawn_strategic_review(
     # can fetch full bodies on demand — included only when documents exist.
     _knowledge_index = await build_knowledge_index(session, project.id)
     _compute_sweep_groups = await build_compute_sweep_groups(session, project.id)
+    # Live self-hosted local-runner availability, so the strategist avoids
+    # authoring GPU compute_experiment tasks (which silently fall back to
+    # billable cloud GPU) while the operator's hardware is offline. Included in
+    # the payload only when the project has ever registered a runner (below).
+    _local_runner_status = await _load_local_runner_status(session, project.id)
     _active_direction_ids = [
         d.get("id")
         for d in (project.directions or [])
@@ -6052,6 +6113,15 @@ async def _spawn_strategic_review(
             **({"prune_candidates": _prune_candidates} if _prune_candidates else {}),
             **({"knowledge_index": _knowledge_index} if _knowledge_index else {}),
             **({"compute_experiment_sweeps": _compute_sweep_groups} if _compute_sweep_groups else {}),
+            # Live local-runner availability — surfaced ONLY when the operator
+            # has ever registered self-hosted hardware. Absent => agent authors
+            # for cloud normally; present => agent can hold GPU experiments while
+            # active_gpu == 0 to avoid silent billable-cloud-GPU fallback.
+            **(
+                {"local_runner_status": _local_runner_status}
+                if _local_runner_status.get("ever_registered")
+                else {}
+            ),
             "running_update": project.running_update or "",
             "running_update_acknowledged_at": (
                 project.running_update_acknowledged_at.isoformat()

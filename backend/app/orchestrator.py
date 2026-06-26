@@ -75,6 +75,7 @@ from app.models import (
 )
 from app.resource_envelope import (
     get_project_recent_spend_usd,
+    resolve_project_require_local_runner,
     resolve_project_spend_ceiling,
     resolve_project_spend_window_days,
     resolve_project_vm_cap,
@@ -444,6 +445,7 @@ _last_sidecar_sweep: datetime = _utcnow()
 _last_bootstrap_recovery_sweep: datetime = _utcnow()
 _last_lane_baseline_backfill: datetime = _utcnow()
 _last_runner_deactivation_sweep: datetime = _utcnow()
+_last_local_runner_hold_sweep: datetime = _utcnow()
 _last_deadlock_check: datetime | None = None
 _last_zone_exhaustion_log: datetime | None = None
 _last_concurrency_broadcast: datetime | None = None
@@ -476,6 +478,12 @@ _all_accounts_blocked_alerted: bool = False
 # heartbeated within this window. Runners that miss heartbeats fall out of the
 # dispatch cache and are swept to status='inactive'.
 _RUNNER_LIVENESS_SECONDS = 300
+
+# A compute_experiment held for a require-local project is failed if no runner
+# claims it within this window — prevents a permanently-wedged project when the
+# operator's hardware stays offline. Generous default; operators can bring a
+# runner up well within it.
+_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS = 6 * 3600
 
 
 def _runner_handles_task_type(runner: LocalRunner, task_type: str) -> bool:
@@ -584,6 +592,10 @@ async def _try_runner_dispatch(
 
     new_ctx = dict(ctx)
     new_ctx["runner_target_id"] = str(runner.id)
+    # A task that was held (enforce-local) and is now pinned must not carry the
+    # stale wait stamp — otherwise the bounded-timeout sweep could fail it after
+    # it has already been claimed by a runner.
+    new_ctx.pop("awaiting_local_runner_since", None)
     task.context = new_ctx
     task.vm_instance_id = f"runner:{runner.id}"
     task.status = TaskStatus.PROVISIONING
@@ -631,6 +643,91 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
         .values(status="inactive")
     )
     await session.commit()
+
+
+async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
+    """Terminally fail compute_experiment tasks held too long for a local runner.
+
+    A require-local project's compute_experiment is held QUEUED (with
+    ``context['awaiting_local_runner_since']`` stamped) instead of provisioned in
+    the cloud when no live self-hosted runner claimed it. This sweep is the
+    safety valve: a hold older than ``_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS`` is
+    marked terminal-FAILED with an actionable reason so the project can never
+    wedge forever when the operator's hardware stays offline.
+
+    Returns the number of tasks failed. Mirrors the terminal-fail pattern used by
+    the stale-provisioning reaper: TaskStatus.FAILED + latest_status_message +
+    failure_category (PROVISION_FAILURE, an INFRA class) + failure alert +
+    record_task_result, committed in one batch.
+    """
+    from app.alert_dispatch import _maybe_create_failure_alert
+    from app.failure_classification import (
+        PROVISION_FAILURE,
+        persist_failure_category,
+    )
+    from app.routers.agent_status import record_task_result
+
+    cutoff = _utcnow() - timedelta(seconds=_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS)
+    # JSON-path predicates differ across dialects (Postgres prod vs SQLite tests),
+    # so select QUEUED tasks and filter the context stamp / payload type in
+    # Python — the candidate set is tiny (only require-local projects ever stamp).
+    rows = (
+        await session.execute(
+            select(Task).where(Task.status == TaskStatus.QUEUED)
+        )
+    ).scalars().all()
+
+    failed = 0
+    for task in rows:
+        ctx = task.context or {}
+        stamped = ctx.get("awaiting_local_runner_since")
+        if not stamped:
+            continue
+        # Belt-and-suspenders: only ever act on compute_experiment holds.
+        if str((task.first_payload or {}).get("type") or "") != "compute_experiment":
+            continue
+        try:
+            stamped_at = datetime.fromisoformat(str(stamped))
+        except (ValueError, TypeError):
+            continue
+        if stamped_at.tzinfo is not None:
+            stamped_at = stamped_at.astimezone(timezone.utc).replace(tzinfo=None)
+        if stamped_at > cutoff:
+            continue  # within the wait window — keep holding
+
+        hours = _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS // 3600
+        reason = (
+            f"require_local_runner: no self-hosted runner became available within "
+            f"{hours}h — operator hardware offline; bring a runner online and requeue"
+        )
+        task.status = TaskStatus.FAILED
+        task.latest_status_message = reason[:500]
+        persist_failure_category(task, PROVISION_FAILURE)
+        session.add(task)
+        try:
+            await _maybe_create_failure_alert(task, session, reason[:200])
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to create hold-timeout alert for task %s", task.id
+            )
+        record_task_result(
+            success=False,
+            failure_class=PROVISION_FAILURE,
+            task_id=str(task.id),
+            task_type="compute_experiment",
+        )
+        logger.warning(
+            "[RUNNERS] Failed compute_experiment %s: no local runner within %sh "
+            "(held since %s)",
+            task.id,
+            hours,
+            stamped,
+        )
+        failed += 1
+
+    if failed:
+        await session.commit()
+    return failed
 
 
 async def _emit_all_accounts_blocked_stall(
@@ -2035,7 +2132,8 @@ async def orchestrator_worker():
         _last_sidecar_sweep, \
         _last_bootstrap_recovery_sweep, \
         _last_lane_baseline_backfill, \
-        _last_runner_deactivation_sweep
+        _last_runner_deactivation_sweep, \
+        _last_local_runner_hold_sweep
     while True:
         queued_tasks = []
         session = None  # defined before try so except handler can reference it
@@ -3689,6 +3787,39 @@ async def orchestrator_worker():
                         ):
                             _cycle_dispatched += 1
                             continue
+
+                        # Enforce-local hold: a compute_experiment for a project
+                        # that requires a local runner must never be provisioned
+                        # in the cloud. When no live runner claimed it above, keep
+                        # it QUEUED (held) — the next cycle re-pins it the moment a
+                        # runner registers. A bounded sweep
+                        # (_fail_stale_local_runner_holds) terminally fails a hold
+                        # that exceeds the wait timeout, so the project can never
+                        # wedge forever.
+                        if (
+                            str((task.first_payload or {}).get("type") or "")
+                            == "compute_experiment"
+                        ):
+                            _holding_project = await session.get(
+                                Project, task.project_id
+                            )
+                            if _holding_project is not None and (
+                                resolve_project_require_local_runner(_holding_project)
+                            ):
+                                ctx = dict(task.context or {})
+                                if not ctx.get("awaiting_local_runner_since"):
+                                    ctx["awaiting_local_runner_since"] = (
+                                        _utcnow().isoformat()
+                                    )
+                                    task.context = ctx
+                                    session.add(task)
+                                    await session.commit()
+                                logger.info(
+                                    "[RUNNERS] Holding compute_experiment %s: "
+                                    "require_local_runner set, no live runner",
+                                    task.id,
+                                )
+                                continue
 
                         # Phase 2c: warm-VM continuity skip-provision branch.
                         # Three outcomes when warm_target_vm_id is set on the task:
@@ -7832,6 +7963,24 @@ async def orchestrator_worker():
                 except Exception:
                     logger.exception(
                         "[ORCHESTRATOR] Stale-runner deactivation sweep error"
+                    )
+            # Enforce-local hold timeout — every 300s. Terminally fails any
+            # compute_experiment that has been held QUEUED awaiting a self-hosted
+            # runner past _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS, so a require-local
+            # project can never wedge forever when the operator's hardware stays
+            # offline.
+            if _is_cadence_due(_last_local_runner_hold_sweep, 300):
+                _last_local_runner_hold_sweep = _utcnow()
+                try:
+                    async with AsyncSessionLocal() as _hold_sweep_session:
+                        await _bounded_leader_step(
+                            "local_runner_hold_timeout",
+                            _fail_stale_local_runner_holds(_hold_sweep_session),
+                            budget=30,
+                        )
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] Local-runner hold-timeout sweep error"
                     )
             # Drain the deferred missing-branch alert queue into durable,
             # idempotent operator Alerts. The synchronous branch resolvers

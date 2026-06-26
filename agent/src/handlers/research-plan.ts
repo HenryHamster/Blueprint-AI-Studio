@@ -2205,6 +2205,25 @@ ${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
     payload.available_capabilities,
   );
 
+  // Local-GPU-runner availability — thread the project's live operator-owned
+  // runner status into compute_experiment authoring so the model doesn't burn
+  // billable cloud GPU when the operator's machine is offline. The backend ships
+  // `local_runner_status` (top-level on the strategic payload, same shape as the
+  // other payload fields read above) ONLY when the project has ever registered a
+  // runner; when absent there is no local hardware → append nothing (author for
+  // cloud normally).
+  let localRunnerNote = '';
+  const localRunnerStatus = payload.local_runner_status as
+    { ever_registered?: boolean; active_total?: number; active_gpu?: number } | undefined;
+  if (localRunnerStatus && typeof localRunnerStatus === 'object' && !Array.isArray(localRunnerStatus)) {
+    const activeGpu = typeof localRunnerStatus.active_gpu === 'number' ? localRunnerStatus.active_gpu : 0;
+    if (activeGpu > 0) {
+      localRunnerNote = `\n    Local GPU available: ${activeGpu} live GPU-capable runner(s) registered for this project. GPU compute_experiments will run on operator-owned hardware (free) rather than billable cloud GPU — prefer authoring GPU experiments now while a runner is live.`;
+    } else if (localRunnerStatus.ever_registered) {
+      localRunnerNote = `\n    This project relies on operator-owned local GPU hardware which is CURRENTLY OFFLINE (0 live GPU runners). Do NOT author GPU compute_experiment findings right now — with no live runner they fall back to BILLABLE cloud GPU. Defer GPU experiments until a runner is live (or author CPU-only work).`;
+    }
+  }
+
   const researchRetryContext = buildRetryContext(task);
   const researchFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
   const researchEmptyRepoGuidance = buildEmptyRepoGuidance(task);
@@ -2364,7 +2383,7 @@ ALSO write /tmp/research_progress_${taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — 
     A timeout (exit_code=124) with startup_ok=true is acceptable — slow first iteration is fine.
     If the command genuinely cannot be smoked at all (requires hardware or resources unavailable
     here): set smoke_sample={"unsmokable":true,"unsmokable_reason":"<why>"} and the finding will
-    be held explicitly for operator review rather than dispatching silently.
+    be held explicitly for operator review rather than dispatching silently.${localRunnerNote}
 
 **Sub-research** — spawns another research cycle (use sparingly):
   research
@@ -2416,7 +2435,7 @@ implementation findings. Add metadata alongside them when relevant.
   "provides_capability": null,
   "direction_id": "d-xxx or null",
   "effort": "high|medium|low|null",
-  "compute_experiment": {"command": "command run inside a clone of this repo at cwd, e.g. 'python3 -m pkg.eval --episodes 1000'", "spend_cap_usd": 5.0, "deadline_seconds": 1800, "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}, "accelerator": "T4"},
+  "compute_experiment": {"command": "command run inside a clone of this repo at cwd, e.g. 'python3 -m pkg.eval --episodes 1000'", "spend_cap_usd": 5.0, "deadline_seconds": 1800, "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}, "accelerator": "T4", "container_image": "optional — e.g. 'nvcr.io/nvidia/tensorflow:25.01'; runs command INSIDE this docker image (needed for GPU/CUDA stacks the repo can't pip-install natively)", "setup_step": "optional — host-level prep run BEFORE/OUTSIDE the container; put container-dependent installs in command, NOT here"},
   "smoke_sample": {"exit_code": 0, "startup_ok": true, "metric_captured": true, "timed_out": false, "error_excerpt": ""},
   "claims": ["short factual assertion backed by your investigation (omit when synthesizing)"],
   "sources": [{"type": "file|pr|log|message", "ref": "path/to/file.<ext> or pr#123 or msg_id", "excerpt": "optional short quote"}]
@@ -2429,7 +2448,7 @@ implementation findings. Add metadata alongside them when relevant.
 
 **prerequisite** (optional, default null): Declare a FOUNDATION this finding depends on that is being (or was) built OUTSIDE this batch — an earlier or concurrently-in-flight cycle, or a named capability. Shape: \`{"kind": "task", "ref": "<task-id or finding-hash>"}\` to gate on a specific in-flight/queued task, or \`{"kind": "capability", "ref": "<capability-name>"}\` to gate on whichever task advertises that capability. For a capability ref, DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above so it resolves to the registry's canonical string (the matcher is EXACT, never fuzzy). When it resolves to a real foundation the dependent is structurally gated (depends_on edge) so it does not run against a base missing the foundation or duplicate it; when it does not resolve the dependent enters a BLOCKED state with the unmet prerequisite recorded as a machine-resolvable need, and is resumed when the foundation appears or escalated to the operator after a timeout. Use ONLY for cross-cycle / cross-batch foundations or named capabilities — for ordering findings WITHIN this batch, use depends_on_indices instead (NOT prerequisite). Omit (or null) when there is no external foundation.
 
-**compute_experiment** (optional, default null): Present ONLY on a compute_experiment/measurement/benchmark finding — the launch contract for the budgeted compute job. Required keys \`command\`, \`spend_cap_usd\` (positive), \`deadline_seconds\` (positive); optional \`success_criterion\` (numeric metric/operator/threshold goal) and benchmark metadata (\`machine_type\`, \`accelerator\`, \`experiment\`, \`benchmark\`, \`metric\`, \`cwd\`, \`env\`). The \`accelerator\` field (one of \`T4\`, \`L4\`, \`V100\`) is **sufficient on its own** to request a single GPU — you do NOT need to specify \`machine_type\` when requesting a single GPU by accelerator name; the system resolves the correct GPU machine type automatically. Omit entirely on non-experiment findings.
+**compute_experiment** (optional, default null): Present ONLY on a compute_experiment/measurement/benchmark finding — the launch contract for the budgeted compute job. Required keys \`command\`, \`spend_cap_usd\` (positive), \`deadline_seconds\` (positive); optional \`success_criterion\` (numeric metric/operator/threshold goal) and benchmark metadata (\`machine_type\`, \`accelerator\`, \`experiment\`, \`benchmark\`, \`metric\`, \`cwd\`, \`env\`). The \`accelerator\` field (one of \`T4\`, \`L4\`, \`V100\`) is **sufficient on its own** to request a single GPU — you do NOT need to specify \`machine_type\` when requesting a single GPU by accelerator name; the system resolves the correct GPU machine type automatically. Optional \`container_image\`: runs \`command\` INSIDE the given docker image (e.g. an NVIDIA NGC image such as \`nvcr.io/nvidia/tensorflow:25.01\`) — REQUIRED when the experiment needs a runtime the repo cannot \`pip install\` natively, e.g. a CUDA/cuDNN/framework stack; without it the command runs BARE and dies with ModuleNotFoundError. Optional \`setup_step\`: runs as bare \`bash -lc\` on the HOST, BEFORE and OUTSIDE the container — use it ONLY for host-level pre-container prep. Anything that needs the container's environment (pip installs into the experiment's interpreter, importing the container's libraries) MUST go in \`command\`, NOT \`setup_step\`. Omit entirely on non-experiment findings.
 
 **provides_capability** (optional, default null): A short kebab-case capability name this finding's task advertises (e.g. "<feature>-core"), so a sibling finding (or another lane) declaring \`{"kind": "capability", "ref": "<feature>-core"}\` can depend on it. DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above when one fits; propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability not already listed. Omit unless another task needs to gate on this one by capability. ${CAPABILITY_DECLARATION_DOC}
 

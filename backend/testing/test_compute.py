@@ -12239,6 +12239,111 @@ async def test_create_compute_job_runner_target_id_overrides_backend(
     assert "runtime_deadline_seconds" in meta
 
 
+async def _make_require_local_runner_task(
+    db_session,
+    *,
+    require_local_runner: bool,
+    runner_target_id: str | None = None,
+):
+    """Project (optionally carrying the require_local_runner policy) plus a
+    compute_experiment task, optionally runner-pinned via context. Mirrors
+    _make_compute_task but lets each case toggle the policy and the pin."""
+    build_config: dict = {}
+    if require_local_runner:
+        build_config["resource_envelope"] = {"require_local_runner": True}
+    project = Project(
+        name="Require Local Runner",
+        user_id="test-user",
+        build_config=build_config,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    context = {"runner_target_id": runner_target_id} if runner_target_id else None
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context=context,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task
+
+
+class TestCreateComputeJobRequireLocalRunner:
+    """The hard 'never bill cloud for compute when local-runner is required' gate
+    in create_compute_job: a require_local_runner project's compute_experiment job
+    that is NOT runner-pinned must be rejected before any billable cloud row is
+    written; a runner-pinned job (routed to runner-subprocess) and a project
+    without the policy proceed normally."""
+
+    @pytest.mark.asyncio
+    async def test_unpinned_compute_experiment_rejected_when_policy_set(
+        self, db_session, monkeypatch
+    ):
+        # Cloud mode: an unpinned job would otherwise default to the billable gcp backend.
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+        monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: None)
+        _project, task = await _make_require_local_runner_task(
+            db_session, require_local_runner=True
+        )
+        with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as excinfo:
+            await compute_jobs.create_compute_job(
+                db_session,
+                task,
+                command="python train.py",
+                machine_type="e2-standard-2",
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+            )
+        assert excinfo.value.detail.get("error") == "local_runner_required"
+
+    @pytest.mark.asyncio
+    async def test_runner_pinned_compute_experiment_allowed_when_policy_set(
+        self, db_session, monkeypatch
+    ):
+        from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+
+        monkeypatch.setattr(compute, "LOCAL_MODE", True)
+        _project, task = await _make_require_local_runner_task(
+            db_session,
+            require_local_runner=True,
+            runner_target_id=str(uuid.uuid4()),
+        )
+        job = await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+        assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+
+    @pytest.mark.asyncio
+    async def test_unpinned_compute_experiment_allowed_without_policy(
+        self, db_session, monkeypatch
+    ):
+        # No require_local_runner policy: an unpinned job lands on the normal
+        # cloud backend (gcp) — the gate must not fire.
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+        monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: None)
+        _project, task = await _make_require_local_runner_task(
+            db_session, require_local_runner=False
+        )
+        job = await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+        assert job.backend == "gcp"
+
+
 @pytest.mark.asyncio
 async def test_next_compute_job_claims_starting_job_and_prevents_double_claim(
     client, db_session, monkeypatch
