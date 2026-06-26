@@ -6315,8 +6315,14 @@ async def close_orphan_pr_if_any(
     lets the caller bail cleanly if the GitHub call hangs.
     """
     ctx = task.context or {}
-    pr_url = ctx.get("_pr_url") or ctx.get("pr_url") or ""
+
+    # Resolve PR number from any recorded location.  The url-keyed context
+    # entries (_pr_url / pr_url) are checked first for backward compat; then
+    # the per-review-cycle review_loop.pr_number (create/fix tasks) and the
+    # rollup_pr_number (plan/research sub-rollup tasks whose PR targets the
+    # parent staging branch rather than main).
     pr_number: int | None = None
+    pr_url = ctx.get("_pr_url") or ctx.get("pr_url") or ""
     if pr_url:
         m = re.search(r"/pull/(\d+)", pr_url)
         if m:

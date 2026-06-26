@@ -2165,11 +2165,15 @@ async def _check_and_trigger_rollup(
                             # Re-check with fresh data immediately before closing —
                             # a retry/respawn between list-time and close-time could
                             # adopt one of the identified orphan PRs.
+                            # populate_existing=True forces the ORM to re-read
+                            # already-loaded rows from the DB rather than returning
+                            # stale identity-mapped instances — detects concurrent
+                            # owner-status changes committed since the first query.
                             _fresh_child_tasks = (
                                 await session.execute(
                                     select(Task).where(
                                         Task.parent_task_id == parent_id_local
-                                    )
+                                    ).execution_options(populate_existing=True)
                                 )
                             ).scalars().all()
                             _still_live, _confirmed_orphans = _classify_prs_authoritative(
