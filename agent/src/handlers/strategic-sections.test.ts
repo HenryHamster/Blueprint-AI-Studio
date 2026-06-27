@@ -14,6 +14,7 @@ import {
   buildOpenMessagesText,
   buildDirSummaryText,
   buildDirHealthSummary,
+  buildSweepComparisonSection,
 } from './strategic-sections.js';
 
 describe('fmtScalar', () => {
@@ -1049,5 +1050,109 @@ describe('buildQuestionSection', () => {
     expect(result).toContain('from: operator');
     expect(result).toContain('What is the plan?');
     expect(result).toContain('./messages resolve');
+  });
+});
+
+describe('buildSweepComparisonSection', () => {
+  it('returns empty string for undefined or empty input', () => {
+    expect(buildSweepComparisonSection(undefined)).toBe('');
+    expect(buildSweepComparisonSection({})).toBe('');
+  });
+
+  it('returns empty string when no sweep has all arms verdicted', () => {
+    // One arm is UNMEASURED (criterion_met === null)
+    const result = buildSweepComparisonSection({
+      'sweep-1': [
+        { id: 'k-1', title: 'arm A', arm_label: 'arm-a', criterion_met: true },
+        { id: 'k-2', title: 'arm B', arm_label: 'arm-b', criterion_met: null },
+      ],
+    });
+    expect(result).toBe('');
+  });
+
+  it('returns empty string when an arm is unavailable', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-2': [
+        { id: 'k-3', title: 'arm A', arm_label: 'arm-a', criterion_met: true },
+        { id: 'k-4', title: 'arm B', arm_label: 'arm-b', criterion_met: false, unavailable_cause: 'compute_failed' },
+      ],
+    });
+    expect(result).toBe('');
+  });
+
+  it('classifies a completed sweep, names the winning arm, and demands one follow-on', () => {
+    // All arms have a definitive verdict — this is the named acceptance test
+    const result = buildSweepComparisonSection({
+      'sweep-abc': [
+        {
+          id: 'k-met',
+          title: 'Approach A: fast tokenizer',
+          arm_label: 'fast-tokenizer',
+          criterion_met: true,
+          summary: 'Achieved 98% accuracy at 2x throughput',
+        },
+        {
+          id: 'k-not',
+          title: 'Approach B: slow tokenizer',
+          arm_label: 'slow-tokenizer',
+          criterion_met: false,
+          summary: 'Only reached 85% accuracy',
+        },
+      ],
+    });
+    // Section header present
+    expect(result).toContain('## Completed experiment sweeps — synthesis required');
+    // Sweep id present
+    expect(result).toContain('Sweep sweep-abc');
+    // Names the winning arm
+    expect(result).toContain('Winner: **fast-tokenizer**');
+    // Both arms listed with verdicts
+    expect(result).toContain('**fast-tokenizer** [MET]');
+    expect(result).toContain('**slow-tokenizer** [NOT MET]');
+    // Demands a follow-on move
+    expect(result).toContain('exactly ONE follow-on move');
+    // Refers to fetch for full analysis
+    expect(result).toContain('./fetch knowledge');
+  });
+
+  it('shows "none (all NOT MET)" as winner when no arm met the criterion', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-all-fail': [
+        { id: 'k-a', title: 'arm A', arm_label: 'a', criterion_met: false },
+        { id: 'k-b', title: 'arm B', arm_label: 'b', criterion_met: false },
+      ],
+    });
+    expect(result).toContain('Winner: **none (all NOT MET)**');
+    expect(result).toContain('Winning: 0/2 arm(s) MET, 2/2 NOT MET');
+  });
+
+  it('renders multiple completed sweeps independently', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-x': [
+        { id: 'k-x1', title: 'arm X1', arm_label: 'x1', criterion_met: true },
+        { id: 'k-x2', title: 'arm X2', arm_label: 'x2', criterion_met: false },
+      ],
+      'sweep-y': [
+        { id: 'k-y1', title: 'arm Y1', arm_label: 'y1', criterion_met: false },
+        { id: 'k-y2', title: 'arm Y2', arm_label: 'y2', criterion_met: true },
+      ],
+    });
+    expect(result).toContain('Sweep sweep-x');
+    expect(result).toContain('Sweep sweep-y');
+    expect(result).toContain('Winner: **x1**');
+    expect(result).toContain('Winner: **y2**');
+  });
+
+  it('skips sweeps with no arms', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-empty': [],
+      'sweep-real': [
+        { id: 'k-r', title: 'arm R', arm_label: 'r', criterion_met: true },
+      ],
+    });
+    // Only the real sweep with a verdicted arm should appear
+    expect(result).not.toContain('Sweep sweep-empty');
+    // But the section still renders (sweep-real has 1 arm MET; single-arm sweeps are valid)
+    expect(result).toContain('Sweep sweep-real');
   });
 });

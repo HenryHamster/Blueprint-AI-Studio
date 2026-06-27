@@ -2266,6 +2266,8 @@ async def test_knowledge_index_entry_shape(db_session):
         "compute_acceptance_reason",
         "unavailable_cause",
         "criterion_met",
+        "criterion",
+        "per_arm_verdicts",
         "origin_provenance",
         "sweep_id",
         "arm_label",
@@ -2563,6 +2565,109 @@ async def test_build_compute_sweep_groups_excludes_cross_project(db_session):
             arm_label=arm,
         )
     assert await build_compute_sweep_groups(db_session, project_a.id) == {}
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_surfaces_per_arm_value_and_criterion(
+    db_session,
+):
+    """Sweep groups include per-arm metric values and criterion so the strategist
+    can tell 'which arm won by how much' without fetching each document body."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, task = await _make_web_research_task(
+        db_session, project_name="SWGMetric"
+    )
+
+    # Create two arms with a criterion and per-arm verdicts
+    verdict_arm_a = {
+        "analysis_mode": "deterministic",
+        "strategy": "metric",
+        "outcome": "SUCCESS",
+        "cost_usd": 0.05,
+        "criterion": {
+            "metric": "accuracy",
+            "operator": ">=",
+            "threshold": 0.85,
+            "value": 0.92,
+            "measurable": True,
+            "met": True,
+        },
+        "criterion_met": True,
+        "per_arm_verdicts": {
+            "baseline": {"value": 0.88, "met": False, "cost_usd": 0.025},
+            "treatment": {"value": 0.92, "met": True, "cost_usd": 0.025},
+        },
+        "probes": {"grounding": {"grounded": 1}},
+    }
+
+    verdict_arm_b = {
+        "analysis_mode": "deterministic",
+        "strategy": "metric",
+        "outcome": "SUCCESS",
+        "cost_usd": 0.05,
+        "criterion": {
+            "metric": "accuracy",
+            "operator": ">=",
+            "threshold": 0.85,
+            "value": 0.92,
+            "measurable": True,
+            "met": True,
+        },
+        "criterion_met": True,
+        "per_arm_verdicts": {
+            "baseline": {"value": 0.88, "met": False, "cost_usd": 0.025},
+            "treatment": {"value": 0.92, "met": True, "cost_usd": 0.025},
+        },
+        "probes": {"grounding": {"grounded": 1}},
+    }
+
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="arm baseline",
+        source_kind="compute_experiment",
+        sweep_id="sw-metric",
+        arm_label="baseline",
+        forward_quality_verdict=verdict_arm_a,
+        source_citations=["gs://bucket/result.json"],
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="arm treatment",
+        source_kind="compute_experiment",
+        sweep_id="sw-metric",
+        arm_label="treatment",
+        forward_quality_verdict=verdict_arm_b,
+        source_citations=["gs://bucket/result.json"],
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-metric" in groups
+    entries = groups["sw-metric"]
+    assert len(entries) == 2
+
+    by_label = {e["arm_label"]: e for e in entries}
+
+    # Both arms should have the per-arm values available in the payload
+    for arm_name in ["baseline", "treatment"]:
+        entry = by_label[arm_name]
+        # Entry should have criterion information
+        assert entry["criterion"] is not None
+        assert entry["criterion"]["metric"] == "accuracy"
+        assert entry["criterion"]["threshold"] == 0.85
+        # Entry should have per_arm_verdicts with measured values
+        assert entry["per_arm_verdicts"] is not None
+        assert "baseline" in entry["per_arm_verdicts"]
+        assert "treatment" in entry["per_arm_verdicts"]
+        # Each arm should have value and met status
+        assert entry["per_arm_verdicts"]["baseline"]["value"] == 0.88
+        assert entry["per_arm_verdicts"]["baseline"]["met"] is False
+        assert entry["per_arm_verdicts"]["treatment"]["value"] == 0.92
+        assert entry["per_arm_verdicts"]["treatment"]["met"] is True
 
 
 @pytest.mark.asyncio

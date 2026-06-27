@@ -12,10 +12,10 @@ export function buildSystemMaturitySection(systemMaturity: Array<Record<string, 
   const lines: string[] = ['\n## System Maturity'];
   lines.push('Per-system health snapshots from the last self_audit run. Use these to calibrate which systems need attention vs which can absorb new feature work.');
   for (const s of systemMaturity) {
-    const sid = strVal(s.system_id as string, '?');
+    const sid = strVal(s.system_id, '?');
     const score = typeof s.score === 'number' ? s.score.toFixed(2) : '?';
-    const mode = strVal(s.recommended_mode as string, 'unknown');
-    const audited = strVal(s.last_audited_at as string, 'never');
+    const mode = strVal(s.recommended_mode, 'unknown');
+    const audited = strVal(s.last_audited_at, 'never');
     lines.push(`\n### ${sid}  score=${score}  recommended_mode=${mode}  last_audited=${audited}`);
     if (s.top_issues && Array.isArray(s.top_issues) && (s.top_issues as unknown[]).length > 0) {
       lines.push('Top issues: ' + (s.top_issues as string[]).join('; '));
@@ -34,7 +34,7 @@ export function buildSystemMaturitySection(systemMaturity: Array<Record<string, 
  */
 export function buildModelHealthSection(modelHealth: Record<string, unknown> | null): string {
   if (!modelHealth) return '';
-  const status = strVal(modelHealth.model_size_status as string, 'unknown');
+  const status = strVal(modelHealth.model_size_status, 'unknown');
   const gaps = fmtScalar(modelHealth.active_gap_count);
   const caps = fmtScalar(modelHealth.capability_count);
   const friction = fmtScalar(modelHealth.active_friction_count);
@@ -65,7 +65,7 @@ export function buildDriftSection(driftSignals: Record<string, unknown> | null):
   const flaggedSys = bySys ? Object.entries(bySys).filter(([, sig]) => sig.over_claim_flag || sig.stalled_despite_churn_flag) : [];
   if (flaggedDirs.length === 0 && flaggedSys.length === 0) return '';
   const lines: string[] = ['\n## Drift Signals (short-window claim-vs-shipped consistency)'];
-  lines.push(`Window: ${strVal(driftSignals.window_days as string, '?')} days.`);
+  lines.push(`Window: ${strVal(driftSignals.window_days, '?')} days.`);
   lines.push('Directions or systems where claimed changes significantly exceed merged PRs — a signal of over-optimistic task output or stalled work.');
   for (const [did, sig] of flaggedDirs) {
     const flags = [sig.over_claim_flag ? 'over_claim' : '', sig.stalled_despite_churn_flag ? 'stalled_despite_churn' : ''].filter(Boolean).join(', ');
@@ -89,11 +89,11 @@ export function buildCapabilityVerificationSection(problemModel: Record<string, 
   for (const capability of capabilities) {
     const verification = capability.verification as Record<string, unknown> | undefined;
     if (!verification || typeof verification !== 'object') continue;
-    const effectiveStatus = strVal(verification.effective_status as string);
+    const effectiveStatus = strVal(verification.effective_status);
     if (effectiveStatus !== 'absent' && effectiveStatus !== 'partial') continue;
 
-    const name = strVal(capability.name as string, 'Unnamed capability');
-    const claimedStatus = strVal(capability.status as string);
+    const name = strVal(capability.name, 'Unnamed capability');
+    const claimedStatus = strVal(capability.status);
     const missing = Array.isArray(verification.missing) ? verification.missing as string[] : [];
     const present = Array.isArray(verification.present) ? verification.present as string[] : [];
     const claimedNote = claimedStatus ? ` (claimed status: ${claimedStatus})` : '';
@@ -149,9 +149,9 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     lines.push(`\n### Capability status contradicted by code (${fmtScalar(counts.capability_contradictions, String(capContradictions.length))})`);
     lines.push('Stored status disagrees with what the integration-branch file tree actually shows. Not a ban on future work — but do not reason as if the capability already works.');
     for (const c of capContradictions) {
-      const name = strVal(c.name as string, 'Unnamed capability');
-      const stored = strVal(c.stored_status as string, '?');
-      const effective = strVal(c.effective_status as string, '?');
+      const name = strVal(c.name, 'Unnamed capability');
+      const stored = strVal(c.stored_status, '?');
+      const effective = strVal(c.effective_status, '?');
       const missing = Array.isArray(c.missing) ? c.missing as string[] : [];
       const missingTotal = typeof c.missing_total === 'number' ? c.missing_total : missing.length;
       const missingOverflow = Math.max(0, missingTotal - missing.length);
@@ -167,10 +167,10 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     lines.push(`\n### Orphaned open gaps — unstaffed, not deferred (${fmtScalar(counts.orphaned_gaps, String(orphanedGaps.length))})`);
     lines.push('No active direction advances these and no deferral is recorded. Open a direction, defer the gap explicitly, or close it.');
     for (const g of orphanedGaps) {
-      const name = strVal(g.name as string, 'Unnamed gap');
-      const gid = strVal(g.gap_id as string, '?');
-      const priority = strVal(g.priority as string, 'medium');
-      const statusTail = strVal(g.status as string, 'active') === 'blocked' ? ' — BLOCKED' : '';
+      const name = strVal(g.name, 'Unnamed gap');
+      const gid = strVal(g.gap_id, '?');
+      const priority = strVal(g.priority, 'medium');
+      const statusTail = strVal(g.status, 'active') === 'blocked' ? ' — BLOCKED' : '';
       lines.push(`- **${name}** [${priority}] (gap ${gid})${statusTail}`);
     }
   }
@@ -180,9 +180,9 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     lines.push(`\n### Ungrounded active directions — advance no tracked gap (${fmtScalar(counts.ungrounded_directions, String(ungroundedDirs.length))})`);
     lines.push('These directions trace to no active gap. Link each to a gap (set gap_id), or retire it if it no longer serves the intent.');
     for (const d of ungroundedDirs) {
-      const text = strVal(d.text as string, '?');
-      const did = strVal(d.direction_id as string, '?');
-      const reason = strVal(d.reason as string) === 'gap_missing'
+      const text = strVal(d.text, '?');
+      const did = strVal(d.direction_id, '?');
+      const reason = strVal(d.reason) === 'gap_missing'
         ? 'its gap_id no longer resolves to an active gap'
         : 'no gap_id linkage';
       lines.push(`- ${text} (id: ${did}) — ${reason}`);
@@ -217,7 +217,7 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     if (inProgressTotal > 0) {
       lines.push('Already moving (tasks in flight — do not double-spawn):');
       for (const p of inProgress) {
-        lines.push(`- ${strVal(p.text as string, '?')} (id: ${strVal(p.direction_id as string, '?')}) — ${fmtScalar(p.in_flight, '0')} task(s) in flight`);
+        lines.push(`- ${strVal(p.text, '?')} (id: ${strVal(p.direction_id, '?')}) — ${fmtScalar(p.in_flight, '0')} task(s) in flight`);
       }
       if (inProgressTotal > inProgress.length) {
         lines.push(`- +${inProgressTotal - inProgress.length} more in-progress direction(s) not shown`);
@@ -226,7 +226,7 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     if (heldTotal > 0) {
       lines.push('Live-held on dependency (blocked or parked work is not waiting-on-action):');
       for (const p of held) {
-        lines.push(`- ${strVal(p.text as string, '?')} (id: ${strVal(p.direction_id as string, '?')}) — ${fmtScalar(p.held, '0')} held task(s), ${fmtScalar(p.findings, '0')} recent finding(s)`);
+        lines.push(`- ${strVal(p.text, '?')} (id: ${strVal(p.direction_id, '?')}) — ${fmtScalar(p.held, '0')} held task(s), ${fmtScalar(p.findings, '0')} recent finding(s)`);
       }
       if (heldTotal > held.length) {
         lines.push(`- +${heldTotal - held.length} more held direction(s) not shown`);
@@ -235,7 +235,7 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     if (recentTotal > 0) {
       lines.push('Recently converted/completed (fresh work before the cycle start — not stalled):');
       for (const p of recent) {
-        lines.push(`- ${strVal(p.text as string, '?')} (id: ${strVal(p.direction_id as string, '?')}) — ${fmtScalar(p.recently_completed, '0')} recently completed task(s), ${fmtScalar(p.findings, '0')} recent finding(s)`);
+        lines.push(`- ${strVal(p.text, '?')} (id: ${strVal(p.direction_id, '?')}) — ${fmtScalar(p.recently_completed, '0')} recently completed task(s), ${fmtScalar(p.findings, '0')} recent finding(s)`);
       }
       if (recentTotal > recent.length) {
         lines.push(`- +${recentTotal - recent.length} more recently-converted direction(s) not shown`);
@@ -244,7 +244,7 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     if (waitingTotal > 0) {
       lines.push('Research surfaced findings but NOTHING is acting on them — these are the directions most likely to need a plan/create task spawned:');
       for (const p of waiting) {
-        lines.push(`- ${strVal(p.text as string, '?')} (id: ${strVal(p.direction_id as string, '?')}) — ${fmtScalar(p.findings, '0')} recent finding(s), 0 tasks in flight`);
+        lines.push(`- ${strVal(p.text, '?')} (id: ${strVal(p.direction_id, '?')}) — ${fmtScalar(p.findings, '0')} recent finding(s), 0 tasks in flight`);
       }
       if (waitingTotal > waiting.length) {
         lines.push(`- +${waitingTotal - waiting.length} more waiting direction(s) not shown`);
@@ -275,8 +275,8 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     lines.push(`\n### Merge-accounting drift — badge says shipped, ancestry says NOT landed (${mergeDirTotal} direction(s), ${mergeNotLandedTotal} title(s); ${mergeUnverifiableTotal} unverifiable)`);
     lines.push('The merge badge marked these PRs shipped, but an ancestry check against the integration branch shows the merge commit is NOT reachable — the work did not actually land. Reconcile before crediting these directions. Unverifiable items (ancestry could not be confirmed) are tallied but are NOT treated as conflicts.');
     for (const m of mergeAccounting) {
-      const text = strVal(m.direction_text as string, '?');
-      const did = strVal(m.direction_id as string, '?');
+      const text = strVal(m.direction_text, '?');
+      const did = strVal(m.direction_id, '?');
       const notLanded = countOr(m.not_landed, 0);
       const landed = countOr(m.landed, 0);
       const unverifiable = countOr(m.unverifiable, 0);
@@ -323,7 +323,7 @@ export function buildPruneCandidatesSection(prune: Record<string, unknown> | und
 
   const counts = (prune.counts && typeof prune.counts === 'object')
     ? prune.counts as Record<string, unknown> : {};
-  const status = strVal(prune.model_size_status as string, 'large');
+  const status = strVal(prune.model_size_status, 'large');
 
   const lines: string[] = ['\n## Concrete prune candidates (model is ' + status + ')'];
   lines.push(
@@ -337,9 +337,9 @@ export function buildPruneCandidatesSection(prune: Record<string, unknown> | und
     lines.push(`\n### Resolved-yet-open gaps (${fmtScalar(counts.resolved_gaps, String(resolvedGaps.length))})`);
     lines.push('Active gaps whose direction has retired or shipped merged PRs — the work is done or abandoned but the gap is still open. Close or archive these.');
     for (const g of resolvedGaps) {
-      const name = strVal(g.name as string, 'Unnamed gap');
-      const gid = strVal(g.gap_id as string, '?');
-      const reason = strVal(g.reason as string) === 'direction_shipped'
+      const name = strVal(g.name, 'Unnamed gap');
+      const gid = strVal(g.gap_id, '?');
+      const reason = strVal(g.reason) === 'direction_shipped'
         ? 'its direction shipped merged PRs'
         : 'its direction was retired';
       const dirs = Array.isArray(g.directions) ? (g.directions as string[]).join(', ') : '';
@@ -356,8 +356,8 @@ export function buildPruneCandidatesSection(prune: Record<string, unknown> | und
     lines.push(`\n### Claimed-but-absent capabilities (${fmtScalar(counts.absent_capabilities, String(absentCaps.length))})`);
     lines.push('The grounded file-tree check shows the backing code does not exist. These are stale assertions safe to consolidate or drop.');
     for (const c of absentCaps) {
-      const name = strVal(c.name as string, 'Unnamed capability');
-      const stored = strVal(c.stored_status as string, '?');
+      const name = strVal(c.name, 'Unnamed capability');
+      const stored = strVal(c.stored_status, '?');
       lines.push(`- **${name}** (stored status=${stored}) — code is absent`);
     }
     if (countOrLocal(counts.absent_capabilities, absentCaps.length) > absentCaps.length) {
@@ -370,9 +370,9 @@ export function buildPruneCandidatesSection(prune: Record<string, unknown> | und
     lines.push(`\n### Expired deferral holds (${fmtScalar(counts.expired_holds, String(expiredHolds.length))})`);
     lines.push('Active gaps whose deferral hold_until has already passed — the hold you set has elapsed, so each is due for a decision (resume, re-defer, or close).');
     for (const g of expiredHolds) {
-      const name = strVal(g.name as string, 'Unnamed gap');
-      const gid = strVal(g.gap_id as string, '?');
-      const until = strVal(g.hold_until as string, '?');
+      const name = strVal(g.name, 'Unnamed gap');
+      const gid = strVal(g.gap_id, '?');
+      const until = strVal(g.hold_until, '?');
       lines.push(`- **${name}** (gap ${gid}) — hold expired ${until}`);
     }
     if (countOrLocal(counts.expired_holds, expiredHolds.length) > expiredHolds.length) {
@@ -385,8 +385,8 @@ export function buildPruneCandidatesSection(prune: Record<string, unknown> | und
     lines.push(`\n### Ungroundable capabilities — no backing paths, no source, no verification (${fmtScalar(counts.ungroundable_capabilities, String(ungroundableCaps.length))})`);
     lines.push('These capabilities have never been grounded: no file-tree backing paths, no source provenance, and no verification check has run. They are unverifiable claims. Ground them by adding backing_paths or a source, consolidate them into a grounded capability, or drop them.');
     for (const c of ungroundableCaps) {
-      const name = strVal(c.name as string, 'Unnamed capability');
-      const capStatus = strVal(c.status as string, '?');
+      const name = strVal(c.name, 'Unnamed capability');
+      const capStatus = strVal(c.status, '?');
       lines.push(`- **${name}** (status=${capStatus})`);
     }
     if (countOrLocal(counts.ungroundable_capabilities, ungroundableCaps.length) > ungroundableCaps.length) {
@@ -399,7 +399,7 @@ export function buildPruneCandidatesSection(prune: Record<string, unknown> | und
     lines.push(`\n### Advisory capability merge groups — shared domain keyword (${fmtScalar(counts.domain_merge_groups, String(domainMergeGroups.length))} group(s))`);
     lines.push('Live capabilities that share a domain keyword and may overlap in scope. These are advisory consolidation candidates — review whether they describe the same underlying capability or can be merged.');
     for (const g of domainMergeGroups) {
-      const bucket = strVal(g.bucket as string, '?');
+      const bucket = strVal(g.bucket, '?');
       const names = Array.isArray(g.names) ? (g.names as string[]).join(', ') : '?';
       lines.push(`- **${bucket}**: ${names}`);
     }
@@ -410,8 +410,8 @@ export function buildPruneCandidatesSection(prune: Record<string, unknown> | und
     lines.push(`\n### Heaviest active gap histories — compaction targets (${fmtScalar(counts.heavy_gaps, String(heavyGaps.length))})`);
     lines.push('Active gaps with the largest serialized history logs. Long histories inflate every strategic payload. Consider compacting old history entries for these gaps.');
     for (const g of heavyGaps) {
-      const name = strVal(g.name as string, 'Unnamed gap');
-      const gid = strVal(g.gap_id as string, '?');
+      const name = strVal(g.name, 'Unnamed gap');
+      const gid = strVal(g.gap_id, '?');
       const entries = fmtScalar(g.history_entry_count);
       const bytes = fmtScalar(g.approx_bytes);
       lines.push(`- **${name}** (gap ${gid}) — ${entries} history entries, ~${bytes} bytes`);
@@ -423,8 +423,8 @@ export function buildPruneCandidatesSection(prune: Record<string, unknown> | und
     lines.push(`\n### Long-name hygiene — names exceeding 80 chars (${fmtScalar(counts.long_names, String(longNames.length))})`);
     lines.push('Capability and gap names longer than 80 characters inflate every payload that ships the capability vocabulary. Rename to shorter, equally descriptive identifiers.');
     for (const e of longNames) {
-      const name = strVal(e.name as string, '?');
-      const kind = strVal(e.kind as string, '?');
+      const name = strVal(e.name, '?');
+      const kind = strVal(e.kind, '?');
       const length = fmtScalar(e.length);
       lines.push(`- **${name}** (${kind}, ${length} chars)`);
     }
@@ -442,6 +442,79 @@ function countOrLocal(value: unknown, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+/**
+ * Render a mandatory synthesis block for fully-verdicted multi-arm compute-experiment
+ * sweeps (all arms MET or NOT MET — no UNMEASURED or unavailable entries). A completed
+ * sweep cannot be silently skipped: the thinker MUST produce a comparative conclusion
+ * (which arm won, by what margin, what it implies) and exactly one follow-on move
+ * (adopt winning arm, commission deeper follow-on, or retire hypothesis as settled).
+ *
+ * Input is the `compute_experiment_sweeps` payload field: a map from sweep_id to an
+ * array of knowledge-index arm entries (shape: {id, title, arm_label, criterion_met,
+ * unavailable_cause, summary}).
+ *
+ * Returns '' when there are no fully-verdicted sweeps, so the section is omitted on
+ * the common path.
+ */
+export function buildSweepComparisonSection(
+  sweepMap: Record<string, Array<Record<string, unknown>>> | undefined,
+): string {
+  if (!sweepMap || typeof sweepMap !== 'object' || Array.isArray(sweepMap)) return '';
+
+  // Collect fully-verdicted sweeps: every arm is MET (criterion_met===true) or
+  // NOT MET (criterion_met===false). Arms that are UNMEASURED (null) or unavailable
+  // disqualify the sweep — the strategist cannot synthesize without all verdicts.
+  type FullSweep = { sweepId: string; arms: Array<Record<string, unknown>> };
+  const completed: FullSweep[] = [];
+  for (const [sweepId, arms] of Object.entries(sweepMap)) {
+    if (!Array.isArray(arms) || arms.length === 0) continue;
+    const allVerdicted = arms.every(arm => {
+      if (strVal(arm.unavailable_cause)) return false;
+      return arm.criterion_met === true || arm.criterion_met === false;
+    });
+    if (allVerdicted) completed.push({ sweepId, arms });
+  }
+
+  if (completed.length === 0) return '';
+
+  const lines: string[] = ['\n## Completed experiment sweeps — synthesis required'];
+  lines.push(
+    'Every arm below is fully verdicted. For EACH sweep you MUST (in Section 3): ' +
+    '(1) name the winning arm and state by how much it won, ' +
+    '(2) state what the result implies, and ' +
+    '(3) propose exactly ONE follow-on move: adopt the winning arm in an implementation direction, ' +
+    'commission a deeper follow-on experiment to resolve remaining ambiguity, or close the hypothesis as settled. ' +
+    'Do NOT leave a completed sweep without a move.',
+  );
+
+  for (const { sweepId, arms } of completed) {
+    const winningArms = arms.filter(a => a.criterion_met === true);
+    const losingArms = arms.filter(a => a.criterion_met === false);
+    const winnerLabel = winningArms.length > 0
+      ? winningArms.map(a => strVal(a.arm_label) || strVal(a.id)).join(', ')
+      : 'none (all NOT MET)';
+
+    lines.push(`\n### Sweep ${sweepId}`);
+    lines.push(`Winner: **${winnerLabel}**`);
+
+    for (const arm of arms) {
+      const armId = strVal(arm.id);
+      const armLabel = strVal(arm.arm_label) || armId;
+      const verdict = arm.criterion_met === true ? 'MET' : 'NOT MET';
+      const summary = strVal(arm.summary);
+      const summaryTail = summary ? ` — ${summary.slice(0, 200)}` : '';
+      lines.push(`- **${armLabel}** [${verdict}] [${armId}]${summaryTail}`);
+    }
+
+    lines.push(
+      `Use \`./fetch knowledge <id>\` for each arm's full analysis before concluding. ` +
+      `Winning: ${winningArms.length}/${arms.length} arm(s) MET, ${losingArms.length}/${arms.length} NOT MET.`,
+    );
+  }
+
+  return lines.join('\n');
+}
+
 export function buildOutcomeSection(outcomeEval: Record<string, unknown> | undefined): string {
   if (!outcomeEval || typeof outcomeEval !== 'object') return '';
   const window = outcomeEval.window as Record<string, unknown> | undefined;
@@ -452,12 +525,12 @@ export function buildOutcomeSection(outcomeEval: Record<string, unknown> | undef
   const lines: string[] = [];
   if (window) {
     lines.push(`# Outcome evaluation (since vision rev ${fmtScalar(window.vision_revision, '0')})`);
-    lines.push(`Window: ${strVal(window.from as string, '?')} to ${strVal(window.to as string, '?')}`);
+    lines.push(`Window: ${strVal(window.from, '?')} to ${strVal(window.to, '?')}`);
   }
   if (overall) {
     const sr = typeof overall.success_rate === 'number' ? Math.round(overall.success_rate * 100) : '?';
     const productRatioStr = typeof overall.product_ratio === 'number' ? `, product ratio: ${Math.round((overall.product_ratio) * 100)}%` : '';
-    lines.push(`Overall: ${fmtScalar(overall.cycles, '0')} cycles, ${fmtScalar(overall.merged, '0')} merged, ${fmtScalar(overall.failed, '0')} failed (${sr}% success rate, trend: ${strVal(overall.trend as string, 'stable')}${productRatioStr})`);
+    lines.push(`Overall: ${fmtScalar(overall.cycles, '0')} cycles, ${fmtScalar(overall.merged, '0')} merged, ${fmtScalar(overall.failed, '0')} failed (${sr}% success rate, trend: ${strVal(overall.trend, 'stable')}${productRatioStr})`);
   }
 
   if (systems.length > 0) {
@@ -466,7 +539,7 @@ export function buildOutcomeSection(outcomeEval: Record<string, unknown> | undef
     lines.push('Each vision system compared against actual direction outcomes:');
     for (const sys of systems) {
       const gap = (sys.directions_count as number) === 0 ? ' [NO DIRECTIONS MAPPED]' : '';
-      lines.push(`- ${strVal(sys.name as string)} (${strVal(sys.id as string)}): planned=${strVal(sys.planned_status as string)}, ${fmtScalar(sys.directions_count, '0')} directions, ${fmtScalar(sys.merged, '0')} merged, ${fmtScalar(sys.failed, '0')} failed${gap}`);
+      lines.push(`- ${strVal(sys.name)} (${strVal(sys.id)}): planned=${strVal(sys.planned_status)}, ${fmtScalar(sys.directions_count, '0')} directions, ${fmtScalar(sys.merged, '0')} merged, ${fmtScalar(sys.failed, '0')} failed${gap}`);
     }
   }
 
@@ -475,8 +548,8 @@ export function buildOutcomeSection(outcomeEval: Record<string, unknown> | undef
     lines.push('## Direction outcomes');
     lines.push('What each direction actually produced. Use confirmed findings to judge real impact:');
     for (const d of dirOutcomes) {
-      const sysTag = d.system_id ? ` (system: ${strVal(d.system_id as string)})` : '';
-      lines.push(`\n### ${strVal(d.text as string)} (${strVal(d.id as string)})${sysTag} [${strVal(d.status as string)}]`);
+      const sysTag = d.system_id ? ` (system: ${strVal(d.system_id)})` : '';
+      lines.push(`\n### ${strVal(d.text)} (${strVal(d.id)})${sysTag} [${strVal(d.status)}]`);
       lines.push(`Stats: ${fmtScalar(d.cycles, '0')} cycles, ${fmtScalar(d.merged, '0')} merged, ${fmtScalar(d.failed, '0')} failed`);
       const typeDist = d.type_distribution as Record<string, number> | undefined;
       if (typeDist && Object.keys(typeDist).length > 0) {

@@ -544,6 +544,8 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
             verdict.get("unavailable_cause") if is_compute else None
         ),
         "criterion_met": criterion_met,
+        "criterion": verdict.get("criterion") if is_compute else None,
+        "per_arm_verdicts": verdict.get("per_arm_verdicts") if is_compute else None,
         "origin_provenance": serialize_origin_provenance(doc),
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
     }

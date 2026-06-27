@@ -60,6 +60,7 @@ import {
   buildOpenMessagesText,
   buildDirSummaryText,
   buildDirHealthSummary,
+  buildSweepComparisonSection,
 } from './strategic-sections.js';
 
 /**
@@ -686,6 +687,11 @@ prompts, schemas, tools, or orchestration.` : '';
       // from the same registry namespace every other task type uses.
       availableCapabilitiesSection: buildStrategicAvailableCapabilitiesSection(
         payload.available_capabilities,
+      ),
+      // Fully-verdicted multi-arm sweep synthesis: every completed sweep demands
+      // exactly one follow-on move from the thinker so no sweep is silently skipped.
+      sweepComparisonSection: buildSweepComparisonSection(
+        payload.compute_experiment_sweeps as Record<string, Array<Record<string, unknown>>> | undefined,
       ),
     });
 
