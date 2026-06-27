@@ -3617,6 +3617,9 @@ export interface KnowledgeDocument {
   sweep_id?: string | null;
   /** Arm label within a sweep (e.g. 'baseline', 'variant'). Null for the aggregate sweep doc. */
   arm_label?: string | null;
+  /** Criterion verdict (True/False/None) from the success criterion evaluation for compute_experiment
+   *  documents. None = unmeasured/not evaluable. Distinct from compute_acceptance_grade. */
+  criterion_met?: boolean | null;
   /** Only present on get-by-id (the full markdown body). */
   body?: string;
 }

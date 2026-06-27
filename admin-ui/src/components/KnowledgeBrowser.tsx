@@ -4,6 +4,7 @@ import { ResolvedReferenceLink, isResolvableStorageUri, isSafeUrl } from './Task
 import { MarkdownContent } from './MarkdownContent';
 import { ReleaseEvidencePanel } from './ReleaseEvidence';
 import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
+import { CriterionVerdictBadge } from './CriterionVerdictBadge';
 import {
   fetchKnowledgeDocuments,
   fetchKnowledgeDocument,
@@ -482,6 +483,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                 <CopyableId id={selected.id} />
                 <ExportMarkdown body={selected.body} />
                 <SourceKindBadge kind={selected.source_kind} />
+                <CriterionVerdictBadge doc={selected} />
                 <AcceptanceGradeBadge doc={selected} />
                 <OriginBadge doc={selected} />
                 {selected.authoring_branch && selected.head_sha && (
@@ -725,6 +727,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                   {doc.summary && <p className="text-ui-md text-neutral-500 mt-1 line-clamp-2 leading-snug">{doc.summary}</p>}
                   <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
                     <SourceKindBadge kind={doc.source_kind} />
+                    <CriterionVerdictBadge doc={doc} />
                     <AcceptanceGradeBadge doc={doc} />
                     <OriginBadge doc={doc} />
                     {doc.direction_id && (

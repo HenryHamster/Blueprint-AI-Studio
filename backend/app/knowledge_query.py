@@ -329,6 +329,11 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
         "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
         "release_evidence": verdict.get("release_evidence"),
         "unavailable_cause": verdict.get("unavailable_cause"),
+        "criterion_met": (
+            verdict.get("criterion_met")
+            if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
+            else None
+        ),
         "authoring_branch": doc.authoring_branch,
         "head_sha": doc.head_sha,
         "sweep_id": doc.sweep_id,
