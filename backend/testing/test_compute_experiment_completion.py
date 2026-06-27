@@ -6324,3 +6324,130 @@ async def test_multi_arm_metric_absent_from_all_arms_still_fires_unmeasured(
     assert ctx_criterion["measurable"] is False
     assert ctx_criterion["met"] is False
     assert ctx_criterion["value"] is None
+
+
+@pytest.mark.asyncio
+async def test_per_arm_cost_sums_to_total(db_session, _quiet_compute_io):
+    """Per-arm cost apportionment: two arms with elapsed_seconds sum cost correctly.
+
+    When total_cost=0.40, arm1 has elapsed_seconds=30, arm2 has elapsed_seconds=90,
+    verify that arm1.cost_usd ≈ 0.10 and arm2.cost_usd ≈ 0.30, and sum ≈ 0.40.
+    """
+    from app.compute_jobs import build_compute_result_logs
+
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.40
+    job.final_cost_usd = 0.40
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": {
+                "arm_1": {"elapsed_seconds": 30, "accuracy": 0.92},
+                "arm_2": {"elapsed_seconds": 90, "accuracy": 0.88},
+            },
+        },
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs = build_compute_result_logs(job)
+    result = json.loads(logs)
+
+    assert result["final_cost_usd"] == pytest.approx(0.40)
+    assert "arms" in result
+    arms = result["arms"]
+    assert "arm_1" in arms
+    assert "arm_2" in arms
+
+    arm_1_cost = arms["arm_1"]["cost_usd"]
+    arm_2_cost = arms["arm_2"]["cost_usd"]
+
+    assert arm_1_cost == pytest.approx(0.10)
+    assert arm_2_cost == pytest.approx(0.30)
+    assert arm_1_cost + arm_2_cost == pytest.approx(0.40)
+
+
+def test_is_zero_cost_backend_runner_subprocess():
+    """RUNNER_SUBPROCESS_BACKEND_NAME is a zero-cost backend."""
+    from app.compute_backends import (
+        is_zero_cost_backend,
+        RUNNER_SUBPROCESS_BACKEND_NAME,
+    )
+
+    assert is_zero_cost_backend(RUNNER_SUBPROCESS_BACKEND_NAME) is True
+
+
+@pytest.mark.asyncio
+async def test_per_arm_cost_zero_elapsed_no_raise(db_session, _quiet_compute_io):
+    """Per-arm cost injection: zero or missing elapsed_seconds gracefully skips injection.
+
+    When arms have no elapsed_seconds (or all are 0), the function must not raise
+    and must return valid JSON without injecting cost_usd keys.
+    """
+    from app.compute_jobs import build_compute_result_logs
+
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.20
+    job.final_cost_usd = 0.20
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": {
+                "arm_a": {"elapsed_seconds": 0, "accuracy": 0.95},
+                "arm_b": {"accuracy": 0.92},  # no elapsed_seconds
+            },
+        },
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs = build_compute_result_logs(job)
+    result = json.loads(logs)
+
+    assert result["final_cost_usd"] == pytest.approx(0.20)
+    assert "arms" in result
+    arms = result["arms"]
+    assert "arm_a" in arms
+    assert "arm_b" in arms
+
+    # cost_usd should not be injected when elapsed_seconds is 0 or missing
+    assert "cost_usd" not in arms["arm_a"]
+    assert "cost_usd" not in arms["arm_b"]
+
+    # Arms data should be intact
+    assert arms["arm_a"]["accuracy"] == pytest.approx(0.95)
+    assert arms["arm_b"]["accuracy"] == pytest.approx(0.92)

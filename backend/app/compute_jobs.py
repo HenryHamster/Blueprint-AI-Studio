@@ -2538,6 +2538,22 @@ def build_compute_result_logs(job: ComputeJob) -> str:
         # as-is for multi-arm experiments.
         if isinstance(reported.get("arms"), dict) and "arms" not in result:
             result["arms"] = reported["arms"]
+    # Inject per-arm cost_usd by apportioning total cost by elapsed_seconds fraction.
+    # Sum elapsed_seconds across all arms; if total is 0 or missing, skip injection.
+    if final_cost is not None and isinstance(result.get("arms"), dict):
+        arms_block = result["arms"]
+        total_elapsed = 0.0
+        for arm_dict in arms_block.values():
+            if isinstance(arm_dict, dict):
+                elapsed = arm_dict.get("elapsed_seconds")
+                if isinstance(elapsed, (int, float)):
+                    total_elapsed += float(elapsed)
+        if total_elapsed > 0:
+            for arm_dict in arms_block.values():
+                if isinstance(arm_dict, dict):
+                    elapsed = arm_dict.get("elapsed_seconds")
+                    if isinstance(elapsed, (int, float)):
+                        arm_dict["cost_usd"] = float(final_cost) * (float(elapsed) / total_elapsed)
     # Embed the bounded command log text so downstream analysis (knowledge doc,
     # LLM analysis prompt) can find results that live in stdout/stderr rather
     # than in $BLUEPRINT_RESULT_FILE. Capped at _COMMAND_LOG_EMBED_CHARS so a
