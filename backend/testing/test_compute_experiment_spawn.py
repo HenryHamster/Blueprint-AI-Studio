@@ -3310,3 +3310,4 @@ class TestRunnerSubprocessPreflightSmokeSkip:
 
         # Smoke already stamped — idempotent guard means it must NOT be re-run.
         smoke_mock.assert_not_called()
+

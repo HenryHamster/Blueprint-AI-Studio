@@ -2689,6 +2689,233 @@ async def test_process_compute_jobs_once_records_cost_failure_without_firing_wak
 
 
 @pytest.mark.asyncio
+async def test_poll_failure_threshold_transitions_job_to_failed(
+    db_session, monkeypatch
+):
+    """After COMPUTE_MAX_CONSECUTIVE_POLL_FAILURES poll_status failures the job
+    is terminalized to FAILED rather than remaining RUNNING indefinitely."""
+    project = Project(name="Poll Failure Threshold", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.PARKED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 999",
+        machine_type="e2-standard-2",
+        spend_cap_usd=10.0,
+        deadline_seconds=3600,
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.started_at = datetime.utcnow() - timedelta(minutes=5)
+    job.external_compute_id = "poll-failure-threshold"
+    db_session.add(
+        TaskWakeRegistration(
+            task_id=task.id,
+            project_id=project.id,
+            wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND,
+            wake_source_ref=str(job.id),
+            wake_action=WakeAction.FINALIZE,
+            deadline_at=datetime.utcnow() + timedelta(hours=1),
+        )
+    )
+    await db_session.commit()
+
+    terminate_calls = []
+
+    class FakeBackend:
+        async def poll_status(self, persisted_job):
+            raise RuntimeError("backend unreachable")
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            raise AssertionError("poll_cost should not run after status failure")
+
+        async def terminate(self, persisted_job, *, reason):
+            terminate_calls.append(reason)
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    monkeypatch.setattr(compute_jobs, "COMPUTE_MAX_CONSECUTIVE_POLL_FAILURES", 3)
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    # Two failures — still below threshold, job stays RUNNING.
+    for _ in range(2):
+        await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    db_session.expire_all()
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+
+    # Third failure hits the threshold — job transitions to FAILED.
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    db_session.expire_all()
+    await db_session.refresh(job)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+
+    assert job.status == ComputeJobStatus.FAILED
+    assert job.outcome == ComputeJobOutcome.FAILURE
+    assert job.completed_at is not None
+    assert "consecutive poll failures" in (job.terminal_reason or "")
+    assert terminate_calls, "backend.terminate should be called on safety kill"
+    assert reg.delivery_state == WakeDeliveryState.FIRED
+
+
+@pytest.mark.asyncio
+async def test_poll_failure_wall_clock_deadline_transitions_to_timed_out(
+    db_session, monkeypatch
+):
+    """A single poll_status failure with a past wall-clock deadline terminates
+    the job as TIMED_OUT rather than waiting for the threshold."""
+    project = Project(name="Poll Failure Deadline", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.PARKED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 999",
+        machine_type="e2-standard-2",
+        spend_cap_usd=10.0,
+        deadline_seconds=3600,
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.started_at = datetime.utcnow() - timedelta(hours=2)
+    # Place wall_clock_deadline in the past.
+    job.wall_clock_deadline = datetime.utcnow() - timedelta(minutes=10)
+    job.external_compute_id = "poll-failure-deadline"
+    db_session.add(
+        TaskWakeRegistration(
+            task_id=task.id,
+            project_id=project.id,
+            wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND,
+            wake_source_ref=str(job.id),
+            wake_action=WakeAction.FINALIZE,
+            deadline_at=datetime.utcnow() + timedelta(hours=1),
+        )
+    )
+    await db_session.commit()
+
+    class FakeBackend:
+        async def poll_status(self, persisted_job):
+            raise RuntimeError("backend unreachable")
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            raise AssertionError("poll_cost should not run after status failure")
+
+        async def terminate(self, persisted_job, *, reason):
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    db_session.expire_all()
+    await db_session.refresh(job)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert job.completed_at is not None
+    assert "exceeded deadline" in (job.terminal_reason or "")
+    assert reg.delivery_state == WakeDeliveryState.FIRED
+
+
+@pytest.mark.asyncio
+async def test_poll_failure_estimated_spend_cap_transitions_to_spend_cap_exceeded(
+    db_session, monkeypatch
+):
+    """When estimated cost (accrued + rate * elapsed) exceeds the spend cap and
+    poll_status fails, the job is terminalized as SPEND_CAP_EXCEEDED."""
+    project = Project(name="Poll Failure Spend Cap", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.PARKED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 999",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=86400,  # 24h — deadline well in the future
+    )
+    job.status = ComputeJobStatus.RUNNING
+    # Started 1 minute ago; at $0.1/s that's $6 >> $1.00 cap.
+    job.started_at = datetime.utcnow() - timedelta(minutes=1)
+    job.wall_clock_deadline = datetime.utcnow() + timedelta(hours=20)
+    job.external_compute_id = "poll-failure-spend-cap"
+    # Store cost_rate_per_second in polling_metadata so the helper can estimate.
+    meta = dict(job.polling_metadata or {})
+    meta["cost_rate_per_second"] = 0.1  # $0.1/s * 60s = $6 >> $1 cap
+    job.polling_metadata = meta
+    db_session.add(
+        TaskWakeRegistration(
+            task_id=task.id,
+            project_id=project.id,
+            wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND,
+            wake_source_ref=str(job.id),
+            wake_action=WakeAction.FINALIZE,
+            deadline_at=datetime.utcnow() + timedelta(hours=1),
+        )
+    )
+    await db_session.commit()
+
+    class FakeBackend:
+        async def poll_status(self, persisted_job):
+            raise RuntimeError("backend unreachable")
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            raise AssertionError("poll_cost should not run after status failure")
+
+        async def terminate(self, persisted_job, *, reason):
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    db_session.expire_all()
+    await db_session.refresh(job)
+    reg = (await db_session.execute(select(TaskWakeRegistration))).scalars().one()
+
+    assert job.status == ComputeJobStatus.FAILED
+    assert job.outcome == ComputeJobOutcome.SPEND_CAP_EXCEEDED
+    assert job.completed_at is not None
+    assert "spend cap" in (job.terminal_reason or "")
+    assert reg.delivery_state == WakeDeliveryState.FIRED
+
+
+@pytest.mark.asyncio
 async def test_process_compute_jobs_once_records_terminate_failure_and_still_terminalizes(
     db_session, monkeypatch
 ):
