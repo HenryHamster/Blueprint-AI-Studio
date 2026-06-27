@@ -792,6 +792,32 @@ def test_resolve_env_runtime_fallback_reads_openai_oauth_from_codex_home(
     assert metadata == {}
 
 
+def test_resolve_env_runtime_fallback_reads_zai_anthropic_compat_env(monkeypatch):
+    monkeypatch.delenv("ZAI_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "zai-compat-token")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.z.ai/api/anthropic/")
+
+    secret, provider, auth_mode, model, execution_mode, metadata = (
+        _resolve_env_runtime_fallback(
+            provider="zai",
+            model=None,
+            execution_mode=None,
+            task=_task(payload={"type": "create"}),
+            runtime_config={},
+        )
+    )
+
+    assert secret == "zai-compat-token"
+    assert provider == "zai"
+    assert auth_mode == "api_key"
+    assert model == "glm-5.2"
+    assert execution_mode is None
+    assert metadata == {
+        "anthropic_base_url": "https://api.z.ai/api/anthropic/"
+    }
+
+
 def test_resolve_env_runtime_fallback_reads_gemini_service_account(
     tmp_path, monkeypatch
 ):
@@ -878,6 +904,7 @@ def test_runtime_fallback_seam_no_circular_import_and_identical_symbols():
         "anthropic": "claude-opus-4-8",
         "openai": "gpt-5.4",
         "gemini": "gemini-2.5-pro",
+        "zai": "glm-5.2",
     }
 
 

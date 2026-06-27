@@ -205,7 +205,7 @@ function makeProps() {
     onUpdatePromotionTarget: noopAsync,
     projects: [],
     onSelectProject: noop,
-    activeTab: 'home' as const,
+    activeTab: 'cockpit' as const,
     onTabChange: noop,
     health: null,
     detailedHealth: null,
