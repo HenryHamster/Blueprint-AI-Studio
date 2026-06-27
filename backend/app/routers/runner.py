@@ -23,6 +23,7 @@ and this endpoint hands those pinned tasks to the polling runner.
 """
 
 import logging
+import math
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -49,6 +50,36 @@ _MULTIPART_BODY_MARGIN = 1 * 1024 * 1024  # 1 MiB
 logger = logging.getLogger("blueprint")
 
 router = APIRouter(prefix="/api/runner", tags=["runner"])
+
+
+def _filter_result_metrics(raw: dict) -> dict:
+    """Filter runner-supplied result_metrics to safe, serialisable values.
+
+    Mirrors the per-entry logic in compute_backends._decode_result_metrics:
+    - bool → float
+    - finite int/float → float
+    - "arms" key with a dict or non-empty list → preserved verbatim
+    - strings, None, non-finite floats, nested objects → dropped
+    - capped at _MAX_RUNNER_RESULT_METRICS_KEYS entries
+    """
+    out: dict[str, Any] = {}
+    for key, value in raw.items():
+        if len(out) >= _MAX_RUNNER_RESULT_METRICS_KEYS:
+            break
+        if not isinstance(key, str):
+            continue
+        if key == "arms" and isinstance(value, (dict, list)) and value:
+            out[key] = value
+            continue
+        if isinstance(value, bool):
+            out[key] = float(value)
+        elif isinstance(value, (int, float)):
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                continue
+            out[key] = numeric
+        # strings, None, nested dicts/lists → dropped
+    return out
 
 
 class HeartbeatRequest(BaseModel):
@@ -312,12 +343,7 @@ async def report_compute_job(
         if payload.exit_code is not None and isinstance(payload.exit_code, int):
             meta["runner_exit_code"] = payload.exit_code
         if payload.result_metrics is not None and isinstance(payload.result_metrics, dict):
-            # Bound server-side: cap at _MAX_RUNNER_RESULT_METRICS_KEYS keys
-            bounded_metrics = {
-                k: v for i, (k, v) in enumerate(payload.result_metrics.items())
-                if i < _MAX_RUNNER_RESULT_METRICS_KEYS
-            }
-            meta["runner_result_metrics"] = bounded_metrics
+            meta["runner_result_metrics"] = _filter_result_metrics(payload.result_metrics)
         if payload.command_log is not None:
             if isinstance(payload.command_log, dict):
                 log_text = payload.command_log.get("text", "")

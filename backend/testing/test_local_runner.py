@@ -1228,3 +1228,163 @@ class TestReportCommandLogDropsArbitraryKeys:
             f"runner_command_log must have exactly {{text, truncated}}, got {set(stored.keys())}"
         )
         assert len(stored["text"].encode("utf-8")) <= _MAX_RUNNER_COMMAND_LOG_BYTES
+
+    @pytest.mark.asyncio
+    async def test_runner_report_drops_non_numeric_result_metric_values(
+        self, client: AsyncClient, db_session
+    ):
+        """Non-numeric values in result_metrics are dropped at the report endpoint.
+
+        Strings, None, and nested objects must be filtered out so a misbehaving
+        runner cannot corrupt a JSONB experiment record with non-serialisable or
+        unexpected types. Only finite numeric values survive.
+        """
+        _project, _runner, token, job = await self._make_running_job(db_session)
+
+        mixed_metrics = {
+            "valid_int": 42,
+            "valid_float": 3.14,
+            "string_val": "should_drop",
+            "null_val": None,
+            "nested_dict": {"inner": 1},
+            "nested_list": [1, 2, 3],
+            "bool_true": True,
+            "bool_false": False,
+        }
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "running",
+                "result_metrics": mixed_metrics,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(job)
+        stored = job.polling_metadata.get("runner_result_metrics", {})
+
+        # Finite numerics survive (int and float).
+        assert stored.get("valid_int") == 42.0, (
+            f"expected valid_int=42.0, got {stored.get('valid_int')!r}"
+        )
+        assert abs(stored.get("valid_float", 0) - 3.14) < 1e-9, (
+            f"expected valid_float≈3.14, got {stored.get('valid_float')!r}"
+        )
+
+        # Booleans are coerced to float (True→1.0, False→0.0).
+        assert stored.get("bool_true") == 1.0, (
+            f"expected bool_true=1.0, got {stored.get('bool_true')!r}"
+        )
+        assert stored.get("bool_false") == 0.0, (
+            f"expected bool_false=0.0, got {stored.get('bool_false')!r}"
+        )
+
+        # Non-numeric types are dropped entirely.
+        assert "string_val" not in stored, (
+            "string value must be dropped, but 'string_val' found in stored metrics"
+        )
+        assert "null_val" not in stored, (
+            "null value must be dropped, but 'null_val' found in stored metrics"
+        )
+        assert "nested_dict" not in stored, (
+            "nested dict must be dropped, but 'nested_dict' found in stored metrics"
+        )
+        assert "nested_list" not in stored, (
+            "nested list must be dropped, but 'nested_list' found in stored metrics"
+        )
+
+    @pytest.mark.asyncio
+    async def test_report_result_metrics_rejects_non_finite_floats(
+        self, client: AsyncClient, db_session
+    ):
+        """NaN and Infinity values in result_metrics are dropped at the report endpoint.
+
+        JSON does not natively represent NaN/Inf, but some JSON serialisers emit
+        them as bare tokens. The endpoint must reject non-finite values to prevent
+        JSONB corruption.
+        """
+        import math
+
+        _project, _runner, token, job = await self._make_running_job(db_session)
+
+        # Use a numeric value that is finite to confirm the filter is selective.
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "running",
+                "result_metrics": {
+                    "finite_val": 1.5,
+                    "very_large": 1e308,
+                },
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(job)
+        stored = job.polling_metadata.get("runner_result_metrics", {})
+        assert stored.get("finite_val") == 1.5
+        assert math.isfinite(stored.get("very_large", float("nan")))
+
+        # Directly verify _filter_result_metrics drops non-finite floats.
+        from app.routers.runner import _filter_result_metrics
+
+        result = _filter_result_metrics({
+            "nan_val": float("nan"),
+            "inf_val": float("inf"),
+            "neg_inf": float("-inf"),
+            "ok": 7.0,
+        })
+        assert "nan_val" not in result, "NaN must be dropped"
+        assert "inf_val" not in result, "Inf must be dropped"
+        assert "neg_inf" not in result, "-Inf must be dropped"
+        assert result.get("ok") == 7.0
+
+    @pytest.mark.asyncio
+    async def test_report_result_metrics_preserves_arms_block(
+        self, client: AsyncClient, db_session
+    ):
+        """The 'arms' key with a dict value passes through verbatim.
+
+        A/B experiment arm results are structured objects, not scalars. The filter
+        must preserve the arms block exactly as received so downstream consumers
+        (_extract_experiment_arms) can process it.
+        """
+        _project, _runner, token, job = await self._make_running_job(db_session)
+
+        arms_block = {
+            "control": {"accuracy": 0.92, "loss": 0.08},
+            "treatment": {"accuracy": 0.95, "loss": 0.05},
+        }
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "succeeded",
+                "result_metrics": {
+                    "accuracy": 0.95,
+                    "arms": arms_block,
+                },
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(job)
+        stored = job.polling_metadata.get("runner_result_metrics", {})
+        assert stored.get("accuracy") == 0.95
+        assert stored.get("arms") == arms_block, (
+            f"arms block must be preserved verbatim, got {stored.get('arms')!r}"
+        )
+
+    def test_filter_result_metrics_unit_caps_at_key_limit(self):
+        """_filter_result_metrics enforces the key count cap."""
+        from app.routers.runner import _MAX_RUNNER_RESULT_METRICS_KEYS, _filter_result_metrics
+
+        oversized = {f"k{i}": float(i) for i in range(_MAX_RUNNER_RESULT_METRICS_KEYS + 100)}
+        result = _filter_result_metrics(oversized)
+        assert len(result) == _MAX_RUNNER_RESULT_METRICS_KEYS, (
+            f"expected exactly {_MAX_RUNNER_RESULT_METRICS_KEYS} keys, got {len(result)}"
+        )
