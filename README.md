@@ -253,7 +253,7 @@ Key test invariants:
 - Schema revision (`EXPECTED_SCHEMA_REVISION` in `backend/app/main.py`) — must match the latest Alembic migration
 - Database migrations are immutable — new migrations must chain from the latest `down_revision`
 - Use `./check` for the fast repo gate; use `./check test` for the lightweight backend smoke pass
-- Use `./blueprint status` (or `./blueprint --help`) to query the operator CLI; `./blueprint` is a root wrapper over `scripts/blueprint.py`
+- Use `./blueprint status` (or `./blueprint --help`) to query the operator CLI; `./blueprint` is a thin bash wrapper that forwards to `python3 scripts/blueprint.py`. On Windows / PowerShell (where the bash wrapper does not run), call the script directly: `python scripts/blueprint.py status`
 
 ### Adding Features
 
@@ -327,7 +327,7 @@ For detailed debugging guidance, see **[DEBUG_GUIDE.md](docs/DEBUG_GUIDE.md)**, 
 - Network timeout — retry task
 
 **Orchestrator won't start new tasks**
-- Circuit breaker tripped (too many failures) — click **Reset** in Project settings
+- Circuit breaker tripped (too many failures) — click the **Autonomy** indicator in the top bar to expand the status popover, then click **Reset Circuit Breaker**
 - Concurrency limit reached — increase `MAX_CONCURRENT_VMS` or wait for tasks to complete
 - Database unreachable — check `DATABASE_URL` connection string and database health
 
