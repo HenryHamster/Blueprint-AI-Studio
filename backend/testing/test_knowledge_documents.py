@@ -3098,3 +3098,105 @@ async def test_compute_sweep_verdict_reflects_criterion_met(db_session):
     assert by_label["not_met_arm"]["criterion_met"] is False
 
     assert by_label["unmeasured_arm"]["criterion_met"] is None
+
+
+# ── sweep disposition state in compute sweep groups ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_sweep_groups_expose_existing_disposition_state(db_session):
+    """build_compute_sweep_groups annotates the first arm entry of each sweep
+    with sweep_disposition when an act-on-verdict disposition task exists.
+
+    A sweep without a disposition task must NOT have sweep_disposition set.
+    A sweep whose disposition task is QUEUED must expose task_id and status.
+    A sweep whose disposition task is COMPLETED must expose COMPLETED status.
+    """
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, source_task = await _make_web_research_task(db_session, project_name="DISP")
+
+    sweep_a = "sw-disposition-a"
+    sweep_b = "sw-no-disposition"
+
+    # Create two arms for sweep_a (will have a disposition task).
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=source_task.id,
+        title="sweep_a arm 1",
+        source_kind="compute_experiment",
+        sweep_id=sweep_a,
+        arm_label="arm1",
+        forward_quality_verdict={"analysis_mode": "deterministic", "criterion_met": True},
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=source_task.id,
+        title="sweep_a arm 2",
+        source_kind="compute_experiment",
+        sweep_id=sweep_a,
+        arm_label="arm2",
+        forward_quality_verdict={"analysis_mode": "deterministic", "criterion_met": False},
+    )
+
+    # Create two arms for sweep_b (no disposition task).
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=source_task.id,
+        title="sweep_b arm 1",
+        source_kind="compute_experiment",
+        sweep_id=sweep_b,
+        arm_label="ctrl",
+        forward_quality_verdict={"analysis_mode": "deterministic", "criterion_met": False},
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=source_task.id,
+        title="sweep_b arm 2",
+        source_kind="compute_experiment",
+        sweep_id=sweep_b,
+        arm_label="exp",
+        forward_quality_verdict={"analysis_mode": "deterministic", "criterion_met": False},
+    )
+
+    # Spawn a disposition task for sweep_a via context key.
+    disposition_task = Task(
+        project_id=project.id,
+        title=f"act-on-verdict: sweep {sweep_a[:8]}",
+        description="Aggregate disposition follow-on",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        requires_approval=False,
+        payloads=[{"type": "create", "prompt": "act on sweep", "base_branch": "main"}],
+        context={"act_on_verdict_sweep_id": sweep_a},
+    )
+    db_session.add(disposition_task)
+    await db_session.commit()
+    await db_session.refresh(disposition_task)
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+
+    assert sweep_a in groups, f"sweep_a must appear in sweep groups; got {list(groups)}"
+    assert sweep_b in groups, f"sweep_b must appear in sweep groups; got {list(groups)}"
+
+    # sweep_a: first arm entry must carry sweep_disposition with task_id + status.
+    entries_a = groups[sweep_a]
+    first_a = entries_a[0]
+    assert "sweep_disposition" in first_a, (
+        "first arm entry of sweep_a must have sweep_disposition when a disposition task exists"
+    )
+    disp = first_a["sweep_disposition"]
+    assert isinstance(disp, dict)
+    assert disp["task_id"] == str(disposition_task.id)
+    assert disp["status"] == TaskStatus.QUEUED.value
+
+    # sweep_b: no disposition task — sweep_disposition must be absent.
+    entries_b = groups[sweep_b]
+    first_b = entries_b[0]
+    assert "sweep_disposition" not in first_b, (
+        "sweep_b must not have sweep_disposition when no disposition task exists"
+    )

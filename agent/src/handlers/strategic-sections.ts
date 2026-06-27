@@ -468,10 +468,19 @@ export function buildSweepComparisonSection(
   // Collect fully-verdicted sweeps: every arm is MET (criterion_met===true) or
   // NOT MET (criterion_met===false). Arms that are UNMEASURED (null) or unavailable
   // disqualify the sweep — the strategist cannot synthesize without all verdicts.
+  // Sweeps that already have a disposition task in flight are tracked separately so
+  // the strategist is not prompted to re-synthesize them.
   type FullSweep = { sweepId: string; arms: Array<Record<string, unknown>> };
+  type DisposedSweep = { sweepId: string; disposition: Record<string, unknown> };
   const completed: FullSweep[] = [];
+  const disposed: DisposedSweep[] = [];
   for (const [sweepId, arms] of Object.entries(sweepMap)) {
     if (!Array.isArray(arms) || arms.length === 0) continue;
+    const dispArm = arms.find(a => a.sweep_disposition != null && typeof a.sweep_disposition === 'object' && !Array.isArray(a.sweep_disposition));
+    if (dispArm) {
+      disposed.push({ sweepId, disposition: dispArm.sweep_disposition as Record<string, unknown> });
+      continue;
+    }
     const allVerdicted = arms.every(arm => {
       if (strVal(arm.unavailable_cause)) return false;
       return arm.criterion_met === true || arm.criterion_met === false;
@@ -479,17 +488,20 @@ export function buildSweepComparisonSection(
     if (allVerdicted) completed.push({ sweepId, arms });
   }
 
-  if (completed.length === 0) return '';
+  if (completed.length === 0 && disposed.length === 0) return '';
 
-  const lines: string[] = ['\n## Completed experiment sweeps — synthesis required'];
-  lines.push(
-    'Every arm below is fully verdicted. For EACH sweep you MUST (in Section 3): ' +
-    '(1) name the winning arm and state by how much it won, ' +
-    '(2) state what the result implies, and ' +
-    '(3) propose exactly ONE follow-on move: adopt the winning arm in an implementation direction, ' +
-    'commission a deeper follow-on experiment to resolve remaining ambiguity, or close the hypothesis as settled. ' +
-    'Do NOT leave a completed sweep without a move.',
-  );
+  const lines: string[] = [];
+  if (completed.length > 0) {
+    lines.push('\n## Completed experiment sweeps — synthesis required');
+    lines.push(
+      'Every arm below is fully verdicted. For EACH sweep you MUST (in Section 3): ' +
+      '(1) name the winning arm and state by how much it won, ' +
+      '(2) state what the result implies, and ' +
+      '(3) propose exactly ONE follow-on move: adopt the winning arm in an implementation direction, ' +
+      'commission a deeper follow-on experiment to resolve remaining ambiguity, or close the hypothesis as settled. ' +
+      'Do NOT leave a completed sweep without a move.',
+    );
+  }
 
   for (const { sweepId, arms } of completed) {
     const criterion = arms.find(a => a.criterion && typeof a.criterion === 'object')?.criterion as Record<string, unknown> | undefined;
@@ -562,6 +574,16 @@ export function buildSweepComparisonSection(
       `Use \`./fetch knowledge <id>\` for each arm's full analysis before concluding. ` +
       `Winning: ${armRows.filter(a => a.met).length}/${armRows.length} arm(s) MET, ${armRows.filter(a => !a.met).length}/${armRows.length} NOT MET.`,
     );
+  }
+
+  if (disposed.length > 0) {
+    lines.push('\n## Sweep dispositions in flight — do not re-synthesize');
+    lines.push('These sweeps are fully verdicted but already have a disposition task in progress. Skip re-synthesis and wait for the follow-on to complete.');
+    for (const { sweepId, disposition } of disposed) {
+      const status = typeof disposition.status === 'string' ? disposition.status : 'unknown';
+      const taskId = typeof disposition.task_id === 'string' ? disposition.task_id : 'n/a';
+      lines.push(`- **${sweepId}**: disposition task \`${taskId}\` (${status})`);
+    }
   }
 
   return lines.join('\n');

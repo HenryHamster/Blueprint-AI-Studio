@@ -721,6 +721,35 @@ async def build_compute_sweep_groups(
     multi = {sid: entries for sid, entries in by_sweep.items() if len(entries) >= _SWEEP_MIN_DOCS}
     if not multi:
         return {}
+
+    # Annotate the first entry of each sweep with the disposition task (act-on-verdict
+    # sweep follow-on) when one exists, so the strategist can skip re-synthesizing sweeps
+    # that already have a follow-on in progress or completed.
+    from app.models import Task as _Task  # noqa: PLC0415
+
+    _sweep_ids = list(multi.keys())
+    _disp_rows = (
+        await session.execute(
+            select(_Task).where(
+                _Task.project_id == project_id,
+                _Task.context["act_on_verdict_sweep_id"].as_string().in_(_sweep_ids),
+            )
+        )
+    ).scalars().all()
+    _disposition: dict[str, dict] = {}
+    for _t in _disp_rows:
+        _sid = (_t.context or {}).get("act_on_verdict_sweep_id")
+        if not _sid or _sid not in multi:
+            continue
+        _status = _t.status.value if hasattr(_t.status, "value") else str(_t.status)
+        _existing = _disposition.get(_sid)
+        # Prefer any non-failed status over a failed one when multiple tasks exist.
+        if _existing is None or _existing.get("status") in ("failed", "cancelled"):
+            _disposition[_sid] = {"task_id": str(_t.id), "status": _status}
+    for _sid, _disp in _disposition.items():
+        if multi[_sid]:
+            multi[_sid][0]["sweep_disposition"] = _disp
+
     # Sort sweeps by the created_at of their newest entry (descending).
     ordered = sorted(
         multi.items(),
