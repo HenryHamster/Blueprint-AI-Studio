@@ -253,6 +253,73 @@ async def test_research_payload_includes_knowledge_index_scoped_to_direction(
 
 
 @pytest.mark.asyncio
+async def test_research_payload_includes_compute_experiment_sweeps(
+    db_session,
+):
+    """A spawned research task carries compute_experiment_sweeps when completed
+    sweeps exist; lone-arm sweeps (only one doc) are excluded from the grouped map."""
+    from app.models import KnowledgeDocument, SourceKind
+
+    project = Project(
+        name="Sweep Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-sweep-research")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    src = Task(
+        project_id=project.id,
+        title="compute exp",
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(src)
+    await db_session.commit()
+    await db_session.refresh(src)
+
+    sweep_id = "sweep-abc123"
+    for arm_name in ("arm-a", "arm-b"):
+        db_session.add(
+            KnowledgeDocument(
+                project_id=project.id,
+                source_task_id=src.id,
+                title=f"Experiment {arm_name}",
+                summary=f"Result for {arm_name}",
+                body="# Result\n\nsome data",
+                topic="perf",
+                direction_id="d-sweep-research",
+                source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+                sweep_id=sweep_id,
+            )
+        )
+    await db_session.commit()
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [
+        t for t in result.scalars().all() if t.first_payload.get("type") == "research"
+    ]
+    assert len(research) == 1
+    payload = research[0].first_payload
+    assert "compute_experiment_sweeps" in payload
+    sweeps = payload["compute_experiment_sweeps"]
+    assert sweep_id in sweeps
+    assert len(sweeps[sweep_id]) == 2
+    arm_titles = {e["title"] for e in sweeps[sweep_id]}
+    assert "Experiment arm-a" in arm_titles
+    assert "Experiment arm-b" in arm_titles
+    # Bodies must not be included (index entries only)
+    assert all("body" not in e for e in sweeps[sweep_id])
+
+
+@pytest.mark.asyncio
 async def test_research_payload_annotations_include_capability_proof_status(
     db_session,
 ):

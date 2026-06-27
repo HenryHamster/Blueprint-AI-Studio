@@ -214,6 +214,103 @@ class TestRunnerRateLimiterUnit:
             else:
                 del rl_mod._ENDPOINT_LIMITS["next_task"]
 
+    @pytest.mark.asyncio
+    async def test_stale_windows_are_evicted_on_sweep(self):
+        """Stale windows for runners that stopped polling are removed by sweep, bounding memory."""
+        from app import runner_rate_limiter as rl_mod
+        import time
+
+        limiter = RunnerRateLimiter()
+
+        original_window = rl_mod._WINDOW_SECONDS
+        rl_mod._WINDOW_SECONDS = 0.05  # 50ms
+        try:
+            # Add 10 runner windows.
+            runners = [str(uuid.uuid4()) for _ in range(10)]
+            for runner in runners:
+                allowed, _ = await limiter.check(runner, "next_task")
+                assert allowed is True
+
+            assert len(limiter._windows) == 10
+
+            # Wait for all windows to expire (runners "stopped polling").
+            time.sleep(0.1)
+
+            # Sweep must remove ALL stale windows — dict must shrink to 0.
+            await limiter.sweep()
+            assert len(limiter._windows) == 0, (
+                f"Expected 0 windows after sweep of stopped runners, "
+                f"got {len(limiter._windows)}. Stale windows were not evicted."
+            )
+
+            # Add 5 more runner windows, let them expire, then add 1 new active runner.
+            stale_runners = [str(uuid.uuid4()) for _ in range(5)]
+            for runner in stale_runners:
+                await limiter.check(runner, "next_task")
+
+            time.sleep(0.1)  # stale_runners' windows now expired
+
+            new_runner = str(uuid.uuid4())
+            await limiter.check(new_runner, "next_task")
+
+            # Before sweep: 5 stale + 1 active = 6 entries.
+            assert len(limiter._windows) == 6
+
+            # After sweep: only the 1 active runner remains.
+            await limiter.sweep()
+            assert len(limiter._windows) == 1, (
+                f"Expected 1 window after sweep (only active runner), "
+                f"got {len(limiter._windows)}. Stale windows were not evicted."
+            )
+
+            # Verify the surviving window belongs to new_runner.
+            assert (new_runner, "next_task") in limiter._windows
+        finally:
+            rl_mod._WINDOW_SECONDS = original_window
+
+    @pytest.mark.asyncio
+    async def test_periodic_sweep_via_check_count(self):
+        """Periodic sweep triggered inside check() evicts stale windows automatically."""
+        from app import runner_rate_limiter as rl_mod
+        import time
+
+        limiter = RunnerRateLimiter()
+
+        original_window = rl_mod._WINDOW_SECONDS
+        original_interval = rl_mod._SWEEP_INTERVAL
+        rl_mod._WINDOW_SECONDS = 0.05  # 50ms
+        rl_mod._SWEEP_INTERVAL = 10  # sweep every 10 calls
+        try:
+            # Add 5 stale runner windows, then let them expire.
+            stale_runners = [str(uuid.uuid4()) for _ in range(5)]
+            for runner in stale_runners:
+                await limiter.check(runner, "next_task")
+
+            time.sleep(0.1)
+
+            # Add one active runner.  Use a fresh UUID so it doesn't conflict.
+            active_runner = str(uuid.uuid4())
+            await limiter.check(active_runner, "next_task")
+
+            # Before sweep fires: 5 stale + 1 active = 6 entries.
+            assert len(limiter._windows) == 6
+
+            # Drive check_count to the next sweep boundary (interval=10, already at 6).
+            # Four more calls to any runner will trigger the sweep at call #10.
+            filler = str(uuid.uuid4())
+            for _ in range(4):
+                await limiter.check(filler, "next_task")
+
+            # The sweep should have fired and removed the 5 stale windows,
+            # leaving active_runner + filler = 2 entries.
+            assert len(limiter._windows) <= 2, (
+                f"Expected ≤2 windows after periodic sweep, "
+                f"got {len(limiter._windows)}. Stale windows were not evicted."
+            )
+        finally:
+            rl_mod._WINDOW_SECONDS = original_window
+            rl_mod._SWEEP_INTERVAL = original_interval
+
 
 # ── Integration tests via HTTP client ────────────────────────────────────────
 

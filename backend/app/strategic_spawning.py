@@ -4096,12 +4096,14 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # design output) so the strategist knows what knowledge already exists and
     # can fetch full bodies on demand — included only when documents exist.
     _knowledge_index = await build_knowledge_index(session, project.id)
+    _dd_compute_sweep_groups = await build_compute_sweep_groups(session, project.id)
 
     payload: dict = pack_under_budget(
         {
             "type": "design_doc_update",
             "design_doc": _design_doc_index(reconciled_design_doc),
             **({"knowledge_index": _knowledge_index} if _knowledge_index else {}),
+            **({"compute_experiment_sweeps": _dd_compute_sweep_groups} if _dd_compute_sweep_groups else {}),
             "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
             "vision": project.vision or {},

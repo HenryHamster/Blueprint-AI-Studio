@@ -732,7 +732,7 @@ describe('buildContextPrefix — compute experiment sweeps', () => {
     expect(prefix).not.toContain('## Completed experiment sweeps');
   });
 
-  it('omits sweep section when taskType is not strategic_review', () => {
+  it('renders sweep section for research tasks when sweeps are present', () => {
     const prefix = buildContextPrefix({
       payloads: [{
         type: 'research',
@@ -744,6 +744,26 @@ describe('buildContextPrefix — compute experiment sweeps', () => {
               arm_label: 'a',
               criterion_met: true,
               compute_acceptance_grade: 'measured_only',
+            },
+          ],
+        },
+      }],
+    });
+    expect(prefix).toContain('## Completed experiment sweeps');
+    expect(prefix).toContain('sweep-abc');
+  });
+
+  it('omits sweep section when taskType is not research/strategic_review/design_doc_update', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'create',
+        compute_experiment_sweeps: {
+          'sweep-abc': [
+            {
+              id: 'kd-arm-1',
+              title: 'Some arm',
+              arm_label: 'a',
+              compute_acceptance_grade: 'acceptance',
             },
           ],
         },

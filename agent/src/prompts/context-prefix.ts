@@ -436,9 +436,9 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
   }
 
   // Completed experiment sweeps — comparative arm results grouped by sweep_id.
-  // Presence-gated: only rendered for strategic_review tasks when the backend
-  // ships a non-empty compute_experiment_sweeps map.
-  if (taskType === 'strategic_review') {
+  // Presence-gated: rendered for strategic_review, research, and design_doc_update
+  // tasks when the backend ships a non-empty compute_experiment_sweeps map.
+  if (['strategic_review', 'research', 'design_doc_update'].includes(taskType)) {
     const sweepMap = payload?.compute_experiment_sweeps as Record<string, Array<Record<string, unknown>>> | undefined;
     if (sweepMap && typeof sweepMap === 'object' && !Array.isArray(sweepMap)) {
       const sweepIds = Object.keys(sweepMap);

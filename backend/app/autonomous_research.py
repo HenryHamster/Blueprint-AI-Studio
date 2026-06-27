@@ -21,7 +21,7 @@ from app.models import (
     AlertSeverity,
 )
 from app.database import AsyncSessionLocal, resolve_dialect_name
-from app.knowledge_query import build_knowledge_index
+from app.knowledge_query import build_knowledge_index, build_compute_sweep_groups
 from app.payload_schemas import (
     validate_internal_payload,
     ALL_TASK_TYPES,
@@ -2233,6 +2233,12 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
         )
         if _knowledge_index:
             research_payload["knowledge_index"] = _knowledge_index
+        _compute_sweep_groups = await build_compute_sweep_groups(
+            session, project.id,
+            **({"direction_id": current_dir_id} if current_dir_id else {}),
+        )
+        if _compute_sweep_groups:
+            research_payload["compute_experiment_sweeps"] = _compute_sweep_groups
         research_payload = validate_internal_payload(
             research_payload, "autonomous_research:research"
         )

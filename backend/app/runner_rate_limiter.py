@@ -32,6 +32,12 @@ _ENDPOINT_LIMITS: dict[str, int] = {
     "upload_compute_job_artifact": _DEFAULT_LIMIT,
 }
 
+# Sweep all windows for expired entries every N check() calls.  Between sweeps,
+# memory grows proportionally to the number of distinct (runner_id, endpoint)
+# pairs that have ever polled — the sweep bounds this by removing windows whose
+# most-recent timestamp has itself expired (i.e. the runner stopped polling).
+_SWEEP_INTERVAL = 100
+
 
 class RunnerRateLimiter:
     """Sliding-window rate limiter keyed on (runner_id, endpoint)."""
@@ -40,9 +46,23 @@ class RunnerRateLimiter:
         self._lock = asyncio.Lock()
         # Maps (runner_id, endpoint) -> deque of monotonic timestamps
         self._windows: dict[tuple[str, str], deque] = {}
+        self._check_count = 0
 
     def _get_limit(self, endpoint: str) -> int:
         return _ENDPOINT_LIMITS.get(endpoint, _DEFAULT_LIMIT)
+
+    def _sweep_locked(self, now: float) -> None:
+        """Remove windows whose newest timestamp has expired (call while holding self._lock).
+
+        A window whose most-recent entry is beyond the cutoff has no unexpired
+        timestamps — all earlier entries are even older — so the whole window
+        can be dropped.  This evicts stale (runner_id, endpoint) pairs for
+        runners that have stopped polling, bounding memory to active runners.
+        """
+        cutoff = now - _WINDOW_SECONDS
+        stale = [k for k, w in self._windows.items() if not w or w[-1] <= cutoff]
+        for k in stale:
+            del self._windows[k]
 
     async def check(self, runner_id: str, endpoint: str) -> tuple[bool, int]:
         """Return (allowed, retry_after_seconds).
@@ -56,6 +76,11 @@ class RunnerRateLimiter:
         key = (runner_id, endpoint)
 
         async with self._lock:
+            # Periodic sweep to evict stale windows for runners that stopped polling.
+            self._check_count += 1
+            if self._check_count % _SWEEP_INTERVAL == 0:
+                self._sweep_locked(now)
+
             window = self._windows.get(key)
             if window is None:
                 window = deque()
@@ -74,9 +99,15 @@ class RunnerRateLimiter:
             retry_after = max(1, int(_WINDOW_SECONDS - (now - oldest)) + 1)
             return False, retry_after
 
+    async def sweep(self) -> None:
+        """Evict all windows with no unexpired entries.  Exposed for tests."""
+        async with self._lock:
+            self._sweep_locked(monotonic())
+
     def clear(self) -> None:
         """Reset all state.  Intended for tests only."""
         self._windows.clear()
+        self._check_count = 0
 
 
 # Module-level singleton — imported and called by routers/runner.py.
