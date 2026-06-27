@@ -301,6 +301,19 @@ def reset_detect_local_gpu_cache():
 
 
 @pytest.fixture(autouse=True)
+def reset_runner_rate_limiter():
+    """Reset the in-memory runner rate limiter buckets before every test.
+
+    Prevents rate-limit state from leaking across tests.
+    """
+    from app.runner_rate_limiter import reset_runner_rate_limiter
+
+    reset_runner_rate_limiter()
+    yield
+    reset_runner_rate_limiter()
+
+
+@pytest.fixture(autouse=True)
 def reset_rate_limiter():
     """
     Reset the slowapi in-memory rate-limit counters before every test so that

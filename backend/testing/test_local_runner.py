@@ -1557,3 +1557,58 @@ class TestDirectComputeExperimentDispatch:
         await db_session.refresh(task)
         assert task.status == TaskStatus.FAILED
         assert await _compute_job_for_task(db_session, task.id) is None
+
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_runner_polling_endpoint_rate_limited(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """Runner heartbeat endpoint returns 429 + Retry-After once limit is exceeded.
+
+    Verifies: (a) under-limit calls return 200, (b) the call that crosses the
+    threshold returns 429 with a Retry-After header, (c) a second distinct runner
+    is not throttled (per-(runner_id, endpoint) bucketing, not global).
+    """
+    import app.runner_rate_limiter as rl_mod
+    from app.runner_rate_limiter import reset_runner_rate_limiter
+
+    project = await _make_project(db_session)
+    runner_a, token_a = await _make_runner(db_session, project.id)
+    runner_b, token_b = await _make_runner(db_session, project.id)
+
+    # Lower the heartbeat limit to 3 so the test is fast and deterministic.
+    monkeypatch.setitem(rl_mod._ENDPOINT_LIMITS, "heartbeat", 3)
+    reset_runner_rate_limiter()
+
+    # First 3 calls from runner A must succeed.
+    for _ in range(3):
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
+
+    # 4th call from runner A must be rate-limited.
+    resp = await client.post(
+        "/api/runner/heartbeat",
+        json={"active_task_ids": []},
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert resp.status_code == 429, f"Expected 429, got {resp.status_code}"
+    retry_after = resp.headers.get("Retry-After")
+    assert retry_after is not None, "Expected Retry-After header in 429 response"
+    assert int(retry_after) > 0, f"Retry-After must be positive, got {retry_after!r}"
+
+    # Runner B's bucket is independent — it must still get through.
+    resp_b = await client.post(
+        "/api/runner/heartbeat",
+        json={"active_task_ids": []},
+        headers={"Authorization": f"Bearer {token_b}"},
+    )
+    assert resp_b.status_code == 200, (
+        f"Runner B should not be throttled, got {resp_b.status_code}"
+    )
