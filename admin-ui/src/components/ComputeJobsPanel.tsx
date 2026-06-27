@@ -1845,32 +1845,92 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               })()}
               {!active && (() => {
                 const ask = askState[job.id] ?? { question: '', submitting: false, result: null, error: null };
+
+                // Suggest starter questions based on job content
+                const starterQuestions: string[] = [];
+                if (job.criterion_verdict) {
+                  const cv = job.criterion_verdict;
+                  const status = cv.met ? 'pass' : 'fail';
+                  starterQuestions.push(`Why did this ${status} the ${cv.metric} criterion?`);
+                  if (cv.value !== null && cv.threshold !== null) {
+                    starterQuestions.push(`How did the measured ${cv.metric} (${cv.value}) compare to the threshold (${cv.threshold})?`);
+                  }
+                }
+                const metrics = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
+                const arms = metrics ? normalizeArms(metrics.arms) : null;
+                if (arms && arms.length > 1) {
+                  starterQuestions.push(`Which arm performed best and why?`);
+                  starterQuestions.push(`What were the per-arm results?`);
+                }
+                if (job.final_cost_usd !== null) {
+                  starterQuestions.push(`Why did this run cost $${job.final_cost_usd.toFixed(2)}?`);
+                }
+                if (!starterQuestions.length && job.status !== 'SUCCEEDED') {
+                  starterQuestions.push(`What went wrong in this run?`);
+                }
+
+                // Helper to parse citations into readable format
+                const formatCitation = (c: string): { label: string; value: string } => {
+                  // Citations are typically "source:identifier" format
+                  // e.g., "result_metrics:accuracy" or "arm:control"
+                  const parts = c.split(':');
+                  if (parts.length >= 2) {
+                    const source = parts[0];
+                    const key = parts.slice(1).join(':');
+                    return {
+                      label: source,
+                      value: key,
+                    };
+                  }
+                  return { label: 'evidence', value: c };
+                };
+
                 return (
                   <div className="mt-1.5" data-testid="compute-ask-section">
                     <form
                       onSubmit={(e) => { e.preventDefault(); void handleAsk(job.id); }}
-                      className="flex gap-1.5"
+                      className="flex flex-col gap-1.5"
                     >
-                      <input
-                        type="text"
-                        value={ask.question}
-                        onChange={(e) => setAskState((prev) => ({
-                          ...prev,
-                          [job.id]: { ...(prev[job.id] ?? { question: '', submitting: false, result: null, error: null }), question: e.target.value },
-                        }))}
-                        placeholder="Ask about this run…"
-                        disabled={ask.submitting}
-                        className="flex-1 min-w-0 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-ui-sm text-neutral-100 placeholder-neutral-600"
-                        data-testid="compute-ask-input"
-                      />
-                      <button
-                        type="submit"
-                        disabled={ask.submitting || !ask.question.trim()}
-                        className="min-h-[44px] rounded bg-indigo-500/20 px-3 text-ui-sm font-semibold text-indigo-200 hover:bg-indigo-500/30 transition-colors disabled:opacity-50"
-                        data-testid="compute-ask-submit"
-                      >
-                        {ask.submitting ? 'Asking…' : 'Ask'}
-                      </button>
+                      <div className="flex gap-1.5">
+                        <input
+                          type="text"
+                          value={ask.question}
+                          onChange={(e) => setAskState((prev) => ({
+                            ...prev,
+                            [job.id]: { ...(prev[job.id] ?? { question: '', submitting: false, result: null, error: null }), question: e.target.value },
+                          }))}
+                          placeholder={starterQuestions.length > 0 ? starterQuestions[0] : "Ask about this run…"}
+                          disabled={ask.submitting}
+                          className="flex-1 min-w-0 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-ui-sm text-neutral-100 placeholder-neutral-600"
+                          data-testid="compute-ask-input"
+                        />
+                        <button
+                          type="submit"
+                          disabled={ask.submitting || !ask.question.trim()}
+                          className="min-h-[44px] rounded bg-indigo-500/20 px-3 text-ui-sm font-semibold text-indigo-200 hover:bg-indigo-500/30 transition-colors disabled:opacity-50"
+                          data-testid="compute-ask-submit"
+                        >
+                          {ask.submitting ? 'Asking…' : 'Ask'}
+                        </button>
+                      </div>
+                      {!ask.question && starterQuestions.length > 0 && (
+                        <div className="flex flex-wrap gap-1">
+                          {starterQuestions.slice(0, 2).map((q) => (
+                            <button
+                              key={q}
+                              type="button"
+                              onClick={() => setAskState((prev) => ({
+                                ...prev,
+                                [job.id]: { ...(prev[job.id] ?? { question: '', submitting: false, result: null, error: null }), question: q },
+                              }))}
+                              className="min-h-[44px] rounded border border-indigo-500/40 bg-indigo-500/10 px-2 py-1 text-ui-xs text-indigo-300 hover:bg-indigo-500/20 transition-colors"
+                              data-testid="compute-ask-starter"
+                            >
+                              {q}
+                            </button>
+                          ))}
+                        </div>
+                      )}
                     </form>
                     {ask.error && (
                       <div className="mt-1 text-ui-sm text-red-300" data-testid="compute-ask-error">{ask.error}</div>
@@ -1880,13 +1940,23 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         <div className="text-indigo-200 break-words whitespace-pre-wrap">{ask.result.answer}</div>
                         {ask.result.citations.length > 0 && (
                           <div className="mt-1 flex flex-col gap-0.5" data-testid="compute-ask-citations">
-                            {ask.result.citations.map((c) => (
-                              <div key={c} className="font-mono text-ui-xs text-indigo-300/80 break-all">{c}</div>
-                            ))}
+                            <div className="text-indigo-300/70 text-ui-xs font-semibold">Evidence:</div>
+                            {ask.result.citations.map((c) => {
+                              const { label, value } = formatCitation(c);
+                              return (
+                                <div key={c} className="text-ui-xs text-indigo-300/80 rounded bg-indigo-500/20 px-1.5 py-0.5">
+                                  <span className="font-semibold">{label}:</span> {value}
+                                </div>
+                              );
+                            })}
+                            <div className="mt-0.5 text-ui-xs text-emerald-300/80" data-testid="compute-ask-grounded">✓ Grounded in run data</div>
                           </div>
                         )}
-                        {ask.result.grounding_miss && (
-                          <div className="mt-0.5 text-ui-xs text-indigo-400/70 italic" data-testid="compute-ask-ungrounded">No evidence found for this question</div>
+                        {!ask.result.citations.length && ask.result.grounding_miss && (
+                          <div className="mt-1 text-ui-xs text-amber-300/70" data-testid="compute-ask-ungrounded">No evidence found for this question</div>
+                        )}
+                        {!ask.result.citations.length && !ask.result.grounding_miss && (
+                          <div className="mt-1 text-ui-xs text-neutral-400/70 italic" data-testid="compute-ask-no-citation-info">No citations provided</div>
                         )}
                       </div>
                     )}

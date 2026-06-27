@@ -2812,5 +2812,182 @@ describe('ComputeJobsPanel render + kill', () => {
     // API called with correct args
     expect(askComputeJob).toHaveBeenCalledWith('job-1', 'What accuracy did this run achieve?');
   });
+
+  test('shows starter questions based on criterion verdict', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      criterion_verdict: {
+        metric: 'accuracy',
+        operator: '>=',
+        threshold: 0.9,
+        value: 0.95,
+        met: true,
+        measurable: true,
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const { findAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Starter question buttons appear
+    const starterQuestions = await findAllByTestId('compute-ask-starter');
+    expect(starterQuestions.length).toBeGreaterThan(0);
+    // Suggestion includes the criterion
+    expect(starterQuestions[0].textContent).toContain('accuracy');
+  });
+
+  test('clicking starter question populates the input field', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      criterion_verdict: {
+        metric: 'accuracy',
+        operator: '>=',
+        threshold: 0.9,
+        value: 0.95,
+        met: true,
+        measurable: true,
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const { findAllByTestId, findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input');
+    expect(input).toHaveValue('');
+    const starterQuestions = await findAllByTestId('compute-ask-starter');
+    await act(async () => { starterQuestions[0].click(); });
+    // Input now contains the clicked question
+    expect(input).toHaveValue(starterQuestions[0].textContent || '');
+  });
+
+  test('formats citations with readable labels instead of opaque strings', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: 'The control arm achieved 88% accuracy.',
+      citations: ['result_metrics:accuracy', 'arm:control'],
+      grounding_miss: false,
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'How did control perform?' } });
+    });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+    const citations = await findByTestId('compute-ask-citations');
+    // Citations rendered with formatted labels
+    expect(citations.textContent).toContain('result_metrics:');
+    expect(citations.textContent).toContain('accuracy');
+    expect(citations.textContent).toContain('arm:');
+    expect(citations.textContent).toContain('control');
+  });
+
+  test('shows "Grounded in run data" only when citations are present', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: 'The accuracy was 92%.',
+      citations: ['result_metrics:accuracy'],
+      grounding_miss: false,
+    });
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'What accuracy?' } });
+    });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+    const groundedLabel = await findByTestId('compute-ask-grounded');
+    expect(groundedLabel.textContent).toContain('Grounded in run data');
+    // No ungrounded message when citations present
+    expect(queryByTestId('compute-ask-ungrounded')).toBeNull();
+  });
+
+  test('shows ungrounded message when no citations and grounding_miss true', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: null,
+      citations: [],
+      grounding_miss: true,
+    });
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'Unknown question' } });
+    });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+    const ungroundedMsg = await findByTestId('compute-ask-ungrounded');
+    expect(ungroundedMsg.textContent).toContain('No evidence found');
+    // Grounded label not shown
+    expect(queryByTestId('compute-ask-grounded')).toBeNull();
+  });
+
+  test('shows starter questions for multi-arm runs', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'control': { accuracy: 0.88 },
+            'treatment': { accuracy: 0.92 },
+          },
+        },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const { findAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const starterQuestions = await findAllByTestId('compute-ask-starter');
+    // Includes arm-related questions
+    const armQuestions = starterQuestions.filter((q) => q.textContent?.toLowerCase().includes('arm'));
+    expect(armQuestions.length).toBeGreaterThan(0);
+  });
+
+  test('placeholder text suggests first starter question when available', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      criterion_verdict: {
+        metric: 'f1_score',
+        operator: '>=',
+        threshold: 0.85,
+        value: 0.88,
+        met: true,
+        measurable: true,
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const { container } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = container.querySelector('[data-testid="compute-ask-input"]') as HTMLInputElement;
+    // Placeholder includes first starter question suggestion
+    expect(input.placeholder).toContain('f1_score');
+  });
+
+  test('shows no-citation-info when answer has no citations and grounding_miss is false', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: 'The run completed successfully.',
+      citations: [],
+      grounding_miss: false,
+    });
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'What happened?' } });
+    });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+    const noCitationMsg = await findByTestId('compute-ask-no-citation-info');
+    expect(noCitationMsg.textContent).toContain('No citations provided');
+    // Other messages absent
+    expect(queryByTestId('compute-ask-grounded')).toBeNull();
+    expect(queryByTestId('compute-ask-ungrounded')).toBeNull();
+  });
 });
 
