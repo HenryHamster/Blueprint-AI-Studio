@@ -20,6 +20,7 @@ from app.models import (
     Project,
     ProjectMessage,
     QualificationVerdict,
+    ReleaseDeployArtifact,
     ReleaseVersion,
     Task,
     TaskStatus,
@@ -1549,6 +1550,162 @@ async def test_agent_fetch_qualification_goal_alignment_in_fallback(
     assert ga is not None
     assert ga["assessed_grade"] == pytest.approx(0.6)
     assert ga["biggest_gap"] == "Performance work incomplete"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
+    client: AsyncClient, db_session
+):
+    """Lifecycle fetch returns current version facts without full audit findings."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-version-phase"
+    )
+    version.phase = "stabilize"
+    version.goal = "Harden the release gate"
+    version.theme = "reliability"
+    version.phase_changed_at = datetime(2026, 6, 2, 9, 30, 0)
+    version.qualification_attempts = 2
+    version.serving_status = "unconfirmed"
+    version.deploy_confirm_deadline = datetime(2026, 6, 2, 10, 0, 0)
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": "abc123" * 6 + "abcd",
+        "confidence": 0.61,
+        "threshold": 0.8,
+        "sub_scores": {"audit": 0.4, "ci": 1.0},
+        "blocker": "audit_findings",
+        "finalized_at": "2026-06-02T09:45:00",
+        "audit_findings": [
+            {"severity": "HIGH", "summary": "Missing auth"},
+            {"severity": "MEDIUM", "summary": "Weak test"},
+        ],
+        "excluded_audit_findings": [{"severity": "LOW", "summary": "Style"}],
+        "challenger_refuted_audit_findings": [
+            {"severity": "MEDIUM", "summary": "False positive"}
+        ],
+        "goal_alignment": {"state": "shortfall", "biggest_gap": "release gate"},
+    }
+    flag_modified(version, "last_qualification")
+
+    closed = ReleaseVersion(
+        project_id=project.id,
+        version_number=9,
+        status="promoted",
+        phase="stabilize",
+        goal="Previous release",
+        theme="performance",
+        opened_at=datetime(2026, 5, 1, 0, 0, 0),
+        promoted_at=datetime(2026, 5, 10, 12, 0, 0),
+        serving_status="serving_confirmed",
+        served_sha="legacyfeed",
+        served_at=datetime(2026, 5, 10, 12, 30, 0),
+        last_qualification={
+            "status": "promoted",
+            "confidence": 0.91,
+            "audit_findings": [{"severity": "LOW", "summary": "Historical"}],
+        },
+    )
+    db_session.add(closed)
+    db_session.add(
+        ReleaseDeployArtifact(
+            version_id=closed.id,
+            artifact_kind="backend_revision",
+            serving_status="serving_confirmed",
+            served_identifier="feedface",
+            served_at=datetime(2026, 5, 10, 12, 31, 0),
+        )
+    )
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+
+    data = body["data"]
+    assert data["source"] == "open_version"
+    current = data["current_version"]
+    assert current["version_number"] == 10
+    assert current["phase"] == "stabilize"
+    assert current["goal"] == "Harden the release gate"
+    assert current["theme"] == "reliability"
+    assert current["phase_changed_at"] == "2026-06-02T09:30:00"
+    assert current["qualification_attempts"] == 2
+    assert current["qualification_state"]["state"] == "not_promoted"
+    assert current["serving"]["status"] == "unconfirmed"
+    assert current["deploy_confirm_deadline"] == "2026-06-02T10:00:00"
+
+    qual = current["last_qualification"]
+    assert qual["status"] == "not_promoted"
+    assert qual["candidate_sha"].startswith("abc123")
+    assert qual["audit_findings_count"] == 2
+    assert qual["excluded_audit_findings_count"] == 1
+    assert qual["challenger_refuted_audit_findings_count"] == 1
+    assert "audit_findings" not in qual
+    assert "excluded_audit_findings" not in qual
+    assert "challenger_refuted_audit_findings" not in qual
+
+    recent = data["recent_versions"]
+    assert len(recent) == 1
+    assert recent[0]["version_number"] == 9
+    assert recent[0]["serving"]["status"] == "serving_confirmed"
+    assert recent[0]["serving"]["sha"] == "feedface"
+    assert "audit_findings" not in recent[0]["last_qualification"]
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_alias_returns_no_open_version(
+    client: AsyncClient, db_session
+):
+    project, task = await _make_project_task(
+        db_session, vm="agent-vm-version-phase-alias"
+    )
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version_phase",
+        headers={"x-agent-token": token},
+    )
+
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["source"] == "no_open_version"
+    assert data["current_version"] is None
+    assert data["recent_versions"] == []
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    project_a = Project(name="Version Phase A", user_id="test-user-vpa")
+    project_b = Project(name="Version Phase B", user_id="test-user-vpb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(
+        project_id=project_a.id,
+        payloads=[{}],
+        vm_instance_id="agent-vm-version-phase-cross",
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), task_a.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
 
 
 # ---------------------------------------------------------------------------

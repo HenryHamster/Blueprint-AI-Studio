@@ -359,6 +359,22 @@ describe('handleStrategic problem_model recovery framing', () => {
     expect(section).not.toContain('this is the first cycle');
   });
 
+  it('dropped version_phase advertises ./fetch version-phase recovery', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      _packer_meta: {
+        dropped: [{ key: 'version_phase', reason: 'exceeds remaining budget after floor' }],
+        trimmed: [],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-vp-fetch', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const section = String(capturedThinkerParams?.packerMetaSection);
+    expect(section).toContain('version_phase');
+    expect(section).toContain('./fetch version-phase');
+  });
+
   it('true-empty: no packer drop/trim and empty model → bootstrap framing (first cycle)', async () => {
     const payload: Record<string, unknown> = {
       project_name: 'Blueprint',

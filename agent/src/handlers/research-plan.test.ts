@@ -1771,6 +1771,19 @@ describe('buildVersionPhaseSection', () => {
     expect(blank).not.toContain('Theme:');
   });
 
+  it('does not encourage re-authoring goal or theme when both are already set', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 21,
+      phase: 'build',
+      goal: 'Make lifecycle context recovery reliable after promotion.',
+      theme: 'reliability',
+    });
+    expect(result).toContain('Goal: Make lifecycle context recovery reliable after promotion.');
+    expect(result).toContain('Theme: reliability');
+    expect(result).not.toContain('ACTION NEEDED: Author the version goal');
+    expect(result).not.toContain('ACTION NEEDED: Author the version theme');
+  });
+
   it('emits explicit author-the-goal instruction when goal_needed flag is true', () => {
     const result = buildVersionPhaseSection({
       version_number: 2,

@@ -542,7 +542,7 @@ export async function handleStrategic(
         '  - `./fetch gap <id>` — single gap with full history/past_moves/evidence',
         '  - `./fetch message <ref>` — inspect a message by short ref (8+ hex chars) or UUID, including one aged out of the live thread; then `./messages resolve <ref>` accepts the same ref',
         '  - `./fetch section <key>` — single design_doc section, full prose/specs, presence-grounded (e.g. `./fetch section systems/auth`); the design_doc ships as a compact index so pull a section before relying on its detail',
-        '  - `./fetch problem-model` — the FULL untrimmed problem_model (all gaps, friction, archived) if it was trimmed/dropped above',
+        '  - `./fetch version-phase` — compact current version phase/lifecycle context if version_phase/current_version was trimmed or dropped',
       );
       return lines.join('\n');
     };
@@ -956,6 +956,7 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 ./fetch gap <gap_id>               # single problem_model gap
 ./fetch message <ref>              # inspect a message by short ref (8+ hex chars) or UUID,
                                    # even one that has aged out of the live thread
+./fetch version-phase              # compact current version phase/lifecycle context
 
 # Operational Knowledge (playbook)
 # You always receive a complete index of playbook keys (playbook_keys_index) —

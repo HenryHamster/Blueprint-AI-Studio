@@ -89,14 +89,13 @@ echo ""
 // /api/agent/projects/{project_id}/... — all share the standard agent auth and
 // are callable by any of the project's agent tokens, so the helper works for
 // every task type, not just strategic-cycle agents.
-export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'qualification' | 'vm-cost' | 'efficiency-snapshot';
+export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot';
 
 // Canonical order of the full vocabulary. STRATEGIC provisions all of these.
 // `knowledge` is a SEARCH-shaped verb (token-scoped list/search + get-by-id),
-// distinct from the single-id project-path verbs that precede it; it is appended
-// last so the historical path-verb ordering is otherwise preserved.
+// distinct from the single-id project-path verbs that precede it.
 export const STRATEGIC_FETCH_VERBS: FetchVerb[] = [
-  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'qualification', 'vm-cost', 'efficiency-snapshot',
+  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot',
 ];
 
 // Read-only verb subsets for non-strategic agents. Research resolves directions,
@@ -121,6 +120,7 @@ const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
   'message':       'message)    PATH_SUFFIX="messages/$ID"',
   'section':       'section)    PATH_SUFFIX="design-doc/$ID"',
   'qualification': 'qualification) PATH_SUFFIX="qualification"',
+  'version-phase': 'version-phase) PATH_SUFFIX="version-phase"',
   'vm-cost':            'vm-cost)              PATH_SUFFIX="vm-cost"',
   'efficiency-snapshot': 'efficiency-snapshot)  PATH_SUFFIX="efficiency-snapshot"',
 };
@@ -172,6 +172,7 @@ const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'section':       '`./fetch section <key>` — a full design-doc section',
   'knowledge':     '`./fetch knowledge [--topic T] [--direction D] [--q TERM] [--source-kind K] [--tag T]` — list/search knowledge documents (web_research/design outputs); `./fetch knowledge <id>` for one document\'s full body',
   'qualification': '`./fetch qualification` — latest qualification verdict for the open version: candidate SHA, confidence, sub_scores, and full audit findings list (no id)',
+  'version-phase': '`./fetch version-phase` — compact current version phase/lifecycle context, qualification state, serving/deploy status, and recent closed versions (no id)',
   'vm-cost':            '`./fetch vm-cost` — live VM cost by task type: cost_usd, task/VM count, merged count, and merge-yield per type over the last 7 days (no id)',
   'efficiency-snapshot': '`./fetch efficiency-snapshot` — current efficiency metrics: cost_per_merged_pr, vm_reuse_rate, llm_cost_per_merged_pr, and format_compliance over the last 7 days (no id)',
 };
@@ -207,15 +208,16 @@ TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 PROJECT="${projectId}"
 [ -n "$PROJECT" ] || { echo "[ERROR] no project_id available; ./fetch is unavailable in this workspace" >&2; exit 1; }
 
-# problem-model takes no id; everything else requires one. For "message" the
-# id may be a short ref (first 8+ hex chars of the message UUID — the same ref
-# operators see in the admin UI) or a full UUID; the backend resolves it and
-# fails loudly on ambiguous/missing refs.
+# problem-model, qualification, version-phase, vm-cost, and efficiency-snapshot
+# take no id; everything else requires one. For "message" the id may be a short
+# ref (first 8+ hex chars of the message UUID — the same ref operators see in
+# the admin UI) or a full UUID; the backend resolves it and fails loudly on
+# ambiguous/missing refs.
 case "$KIND" in
 ${caseBody}
 esac
 
-if [ "$KIND" != "problem-model" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ -z "$ID" ]; then
+if [ "$KIND" != "problem-model" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ -z "$ID" ]; then
   echo "[ERROR] fetch $KIND requires an id argument" >&2
   exit 1
 fi
@@ -280,7 +282,7 @@ export function buildFetchGuidance(verbs: FetchVerb[]): string {
   if (granted.length === 0) return '';
   const lines = granted.map(v => `- ${FETCH_VERB_HELP[v]}`).join('\n');
   return `# MID-RUN FETCH (./fetch)
-You were launched from a context snapshot that may have trimmed, summarized, or only referenced some items. When a direction, design-doc section, playbook entry, problem-model, or gap you need was shipped trimmed/summarized or only by id, run \`./fetch <verb> [id]\` to pull its full current content before acting on it. Read-only and project-scoped.
+You were launched from a context snapshot that may have trimmed, summarized, or only referenced some items. When an available context item below was shipped trimmed/summarized or only by id, run \`./fetch <verb> [id]\` to pull its current content before acting on it. Read-only and project-scoped.
 Available verbs in this workspace:
 ${lines}
 
