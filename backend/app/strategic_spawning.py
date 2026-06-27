@@ -39,6 +39,17 @@ from app.models import (
 from app.deploy_identity import project_matches_deploy_identity
 from app.resource_envelope import resolve_project_require_local_runner
 from app.payload_schemas import pack_under_budget, validate_internal_payload
+from app.strategic_payload_compaction import (
+    _CONVERSATION_THREAD_KEEP_WHEN_TRIMMED,
+    _OUTCOME_DIRECTION_OUTCOMES_KEEP,
+    _VERSION_PHASE_RECENT_VERSIONS_CAP,
+    _direction_activity_score,
+    _enrich_drift_with_trend,
+    _summarize_directions,
+    _summarize_drift_signals,
+    _summarize_version_phase,
+    _version_phase_floor,
+)
 from app.release_artifacts import (
     summarize_required_artifact_gap,
     version_serving_summary as _version_serving_summary,
@@ -1169,158 +1180,6 @@ def _format_fleet_utilization_axis(fleet: dict | None) -> str | None:
     return line
 
 
-_VERSION_PHASE_RECENT_VERSIONS_CAP = 3
-
-
-def _summarize_version_phase(block: dict) -> dict:
-    """Trim version_phase for inclusion under budget pressure.
-
-    Drops ``thresholds`` from ``promotion_readiness`` (verbose config), trims
-    ``confidence`` to {mean, stdev, stable}, and caps ``recent_versions`` to
-    the 3 most recent entries so the agent sees the trend without dragging full
-    verdict history through the payload.
-    """
-    if not block:
-        return {}
-    out = dict(block)
-    pr = block.get("promotion_readiness")
-    if isinstance(pr, dict):
-        conf = pr.get("confidence") or {}
-        out["promotion_readiness"] = {
-            k: v
-            for k, v in pr.items()
-            if k not in {"thresholds", "blocker_counts", "confidence"}
-        }
-        if isinstance(conf, dict):
-            out["promotion_readiness"]["confidence"] = {
-                "mean": conf.get("mean"),
-                "stdev": conf.get("stdev"),
-                "stable": conf.get("stable"),
-            }
-    rv = block.get("recent_versions")
-    if isinstance(rv, list):
-        out["recent_versions"] = rv[:_VERSION_PHASE_RECENT_VERSIONS_CAP]
-    return out
-
-
-def _summarize_drift_signals(drift: dict) -> dict:
-    """Return a payload-friendly subset of drift_detection.compute_direction_drift.
-
-    Strips per-direction signals when the project has many directions and
-    keeps only flagged or non-neutral entries, so the strategic payload
-    doesn't carry zero-information rows for every direction.
-    """
-    if not drift:
-        return {}
-    by_direction = drift.get("by_direction") or {}
-    by_system = drift.get("by_system") or {}
-    # Keep flagged directions in full; for others summarize only if the
-    # consistency dropped below 0.8.
-    interesting_directions = {
-        did: sig
-        for did, sig in by_direction.items()
-        if (
-            sig.get("over_claim_flag")
-            or sig.get("stalled_despite_churn_flag")
-            or (
-                sig.get("claim_shipped_consistency", 1.0) < 0.8
-                and sig.get("claimed_changes_count", 0) > 0
-            )
-        )
-    }
-    return {
-        "by_direction": interesting_directions,
-        "by_system": by_system,
-        "generated_at": drift.get("generated_at"),
-        "window_days": drift.get("window_days"),
-    }
-
-
-# How many stored snapshots to look back when computing consecutive_flagged_cycles.
-_DRIFT_TREND_LOOKBACK = 5
-
-
-async def _enrich_drift_with_trend(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    drift_summary: dict,
-) -> dict:
-    """Add consecutive_flagged_cycles to each direction already in drift_summary.
-
-    For each interesting direction, reads the last _DRIFT_TREND_LOOKBACK stored
-    snapshots (newest first) and counts how many consecutive leading entries had
-    at least one flag set. This lets the strategic agent distinguish a one-off
-    spike from a sustained breakdown without reading the full history.
-
-    Only enriches directions already filtered into drift_summary by
-    _summarize_drift_signals, so the extra queries are bounded by the
-    flagged-direction count (typically 0-3 per project).
-    """
-    from app.drift_detection import last_n_drift_snapshots
-
-    by_direction = (drift_summary or {}).get("by_direction") or {}
-    if not by_direction:
-        return drift_summary
-    enriched_directions = {}
-    for direction_id, sig in by_direction.items():
-        snapshots = await last_n_drift_snapshots(
-            session, project_id, direction_id, n=_DRIFT_TREND_LOOKBACK
-        )
-        consecutive = 0
-        for snap in snapshots:
-            if snap.over_claim_flag or snap.stalled_despite_churn_flag:
-                consecutive += 1
-            else:
-                break
-        enriched_sig = dict(sig)
-        if consecutive > 0:
-            enriched_sig["consecutive_flagged_cycles"] = consecutive
-        enriched_directions[direction_id] = enriched_sig
-    return {**drift_summary, "by_direction": enriched_directions}
-
-
-# Per-payload caps used by the strategic-spawn schema's summarize_fns. These are
-# what the agent sees by default; for full content the agent uses ./fetch.
-_DIRECTIONS_SUMMARY_KEEP = 12
-_OUTCOME_DIRECTION_OUTCOMES_KEEP = 10
-_CONVERSATION_THREAD_KEEP_WHEN_TRIMMED = 8
-
-
-def _direction_activity_score(stat: dict) -> int:
-    """Sort key for choosing which direction stats stay in the strategic payload.
-
-    Higher = more activity. Combines work shipped (merged), work pending (failed),
-    and recency (cycles). High-priority directions get a small boost so a quiet
-    high-priority direction doesn't get evicted by a chatty low-priority one.
-
-    "Work shipped" counts VERIFIED merges (``verified_prs_merged``, populated in
-    the direction_stats loop) so a direction whose merges never actually landed —
-    or landed degraded/unverified — does not win payload space over one that
-    truly shipped. Falls back to the raw ``prs_merged`` for back-compat with
-    stat dicts that predate the verified field.
-    """
-    if not isinstance(stat, dict):
-        return 0
-    merged = int(stat.get("verified_prs_merged", stat.get("prs_merged", 0)) or 0)
-    failed = int(stat.get("tasks_failed") or 0)
-    cycles = int(stat.get("total_cycles") or 0)
-    priority = stat.get("priority")
-    priority_bonus = {"high": 5, "medium": 0, "low": -2}.get(priority, 0)
-    proposed_bonus = 3 if stat.get("status") == "proposed" else 0
-    return merged * 3 + failed + cycles + priority_bonus + proposed_bonus
-
-
-def _summarize_directions(stats: list) -> list:
-    """Keep the top-N direction_summary entries by activity score.
-
-    Dropped directions are still discoverable by id via the agent's
-    ``./fetch direction <id>`` helper, so the agent can pull the full
-    record when it needs to reason about a quiet direction.
-    """
-    if not isinstance(stats, list) or len(stats) <= _DIRECTIONS_SUMMARY_KEEP:
-        return stats
-    sorted_stats = sorted(stats, key=_direction_activity_score, reverse=True)
-    return sorted_stats[:_DIRECTIONS_SUMMARY_KEEP]
 
 
 # Cap on staged-direction entries surfaced to the strategist. Staged directions
@@ -2622,7 +2481,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "retirement_deferrals": {"priority": "high"},
     # LTS version/phase context — present only on self-repo projects. High priority
     # so it survives budget pressure (the agent needs it for phase-transition decisions).
-    "version_phase": {"priority": "high", "summarize": _summarize_version_phase},
+    "version_phase": {
+        "priority": "high",
+        "summarize": _summarize_version_phase,
+        "floor": _version_phase_floor,
+    },
     # What is actually deployed (running live on the promotion target) vs what
     # has merged to the integration branch but is not yet promoted. High
     # priority: it is load-bearing for every runtime-metric judgment, and small.
@@ -4900,6 +4763,7 @@ async def _spawn_strategic_review(
                         artifact_evidence=_open_artifacts,
                     ),
                     "tasks_merged_this_version": _tasks_merged,
+                    "qualification_attempts": _open_version.qualification_attempts,
                     # Signals the strategist to author the objective this cycle.
                     # Absent once the goal is set (null goal → action needed).
                     **(
@@ -5323,6 +5187,57 @@ async def _spawn_strategic_review(
         _prior_n = _open_version.version_number - 1
         _cur_n = _open_version.version_number
         _target = _promotion_target or "main"
+        _cur_goal = (_open_version.goal or "").strip()
+        _cur_theme = (_open_version.theme or "").strip()
+        _goal_state = (
+            f"v{_cur_n} already has `version_phase.goal` set: "
+            f"{_cur_goal[:220]!r}."
+            if _cur_goal
+            else (
+                f"`version_phase.goal` on v{_cur_n} is null, so this version "
+                "still needs its objective."
+            )
+        )
+        _theme_state = (
+            f"v{_cur_n} already has `version_phase.theme` set to "
+            f"{_cur_theme!r}."
+            if _cur_theme
+            else (
+                f"`version_phase.theme` on v{_cur_n} is null, so this version "
+                "still needs its delivery theme."
+            )
+        )
+        _setup_actions: list[str] = []
+        if _cur_goal:
+            _setup_actions.append(
+                f"use v{_cur_n}'s existing `version_phase.goal` as the frozen "
+                "objective; leave the stored version goal unchanged this cycle"
+            )
+        else:
+            _setup_actions.append(
+                f"rewrite `intent.current_focus` to state what v{_cur_n} is "
+                f"for (not what v{_prior_n} achieved)"
+            )
+            _setup_actions.append(
+                f"output `new_version_goal` — a 1-3 sentence concrete, "
+                f"outcome-framed objective for v{_cur_n} (this is stored as "
+                "the frozen version goal the blind merge-grade will score "
+                "merged diffs against; write it as a DELIVERABLE statement, "
+                "not a status line)"
+            )
+        if _cur_theme:
+            _setup_actions.append(
+                f"use v{_cur_n}'s existing `version_phase.theme` as the "
+                "delivery theme; leave the stored version theme unchanged this cycle"
+            )
+        else:
+            _setup_actions.append(
+                f"output `new_version_theme` with the delivery theme for "
+                f"v{_cur_n}"
+            )
+        _setup_instruction = "; ".join(
+            f"({idx}) {action}" for idx, action in enumerate(_setup_actions, start=1)
+        )
         # Ground the assertion in the prior version's actual promoted record
         # (promoted_at + final confidence) when readable — best-effort; the
         # positive "it promoted" framing holds regardless because a version with
@@ -5449,9 +5364,9 @@ async def _spawn_strategic_review(
                 f"it is still inside the post-promotion confirmation window. Do "
                 f"NOT yet treat the milestone as fully shipped; the sweep will "
                 f"resolve it to serving_confirmed, confirmation_timed_out, or "
-                f"deploy_failed shortly. You may begin setting v{_cur_n}'s "
-                f"mission: output `new_version_goal` with a 1-3 sentence "
-                f"concrete, outcome-framed objective for v{_cur_n}. Do not "
+                f"deploy_failed shortly. You may prepare v{_cur_n}'s mission. "
+                f"{_goal_state} {_theme_state} Next-version setup: "
+                f"{_setup_instruction}. Do not "
                 f"declare v{_prior_n} live until serving is confirmed, and do "
                 f"NOT re-promote/re-qualify v{_prior_n}."
                 f"{_artifact_txt}"
@@ -5465,22 +5380,15 @@ async def _spawn_strategic_review(
                 f"work to promote, qualify, re-audit, or re-qualify v{_prior_n}; "
                 f"that is already done and merged to {_target} (cross-check "
                 f"`version_phase.recent_versions` and `deployment_state` — "
-                f"v{_prior_n} is recorded there with status='promoted'). The "
-                f"`goal` field on v{_cur_n} is null — this version has no "
-                f"objective yet (the old auto-copy of current_focus has been "
-                f"removed). A null "
+                f"v{_prior_n} is recorded there with status='promoted'). "
+                f"{_goal_state} {_theme_state} A null "
                 f"`version_phase.last_qualification` on v{_cur_n} means this "
                 f"fresh version has not yet begun its OWN qualification (expected "
                 f"for a just-opened version) — it does NOT mean v{_prior_n}'s "
                 f"promotion is pending or failed. As your FIRST action this "
-                f"cycle, author v{_cur_n}'s objective: (1) rewrite "
-                f"`intent.current_focus` to state what v{_cur_n} is for (not what "
-                f"v{_prior_n} achieved); (2) output `new_version_goal` — a 1-3 "
-                f"sentence concrete, outcome-framed objective for v{_cur_n} (this "
-                f"is stored as the frozen version goal the blind merge-grade will "
-                f"score merged diffs against; write it as a DELIVERABLE statement, "
-                f"not a status line); (3) retire directions v{_prior_n} already "
-                f"satisfied, and propose the directions the next milestone needs."
+                f"cycle, complete next-version setup: {_setup_instruction}; "
+                f"retire directions v{_prior_n} already satisfied, and propose "
+                f"the directions the next milestone needs."
             )
         prompt_suffix = (
             f"{prompt_suffix}\n{_post_promote_hint}"

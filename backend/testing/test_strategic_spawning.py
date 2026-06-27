@@ -5159,6 +5159,97 @@ def test_no_data_returns_proposed_scope_unchanged():
 # ── pack_under_budget integration ─────────────────────────────────────────────
 
 
+def test_pack_under_budget_keeps_version_phase_floor_under_pressure():
+    """Lifecycle context must never disappear just because sibling context is
+    bloated. A compact version_phase floor should preserve the current goal and
+    theme, while _packer_meta records the degradation so the agent can fetch
+    full lifecycle detail if needed."""
+
+    large_finding = {
+        "severity": "high",
+        "summary": "Nested audit detail that should not be required inline.",
+        "details": "audit-finding-body " * 300,
+        "evidence": ["evidence " * 200 for _ in range(6)],
+    }
+    version_phase = {
+        "version_number": 21,
+        "phase": "build",
+        "goal": "Ship the post-promotion observability milestone.",
+        "theme": "reliability",
+        "tasks_merged_this_version": 9,
+        "last_qualification": {
+            "status": "not_promoted",
+            "confidence": 0.74,
+            "blocker": "audit_findings",
+            "audit_findings": [large_finding for _ in range(30)],
+        },
+        "recent_versions": [
+            {
+                "version_number": 20 - i,
+                "status": "promoted",
+                "tasks_merged_this_version": 4 + i,
+                "last_qualification": {
+                    "status": "promoted",
+                    "confidence": 0.91 - (i * 0.01),
+                    "blocker": None,
+                    "audit_findings": [large_finding for _ in range(12)],
+                },
+                "acceptance_aggregate": {
+                    "merged": 4 + i,
+                    "proven": 3 + i,
+                    "proven_rate": 0.75,
+                },
+            }
+            for i in range(5)
+        ],
+        "acceptance_aggregate": {"merged": 9, "proven": 7, "proven_rate": 0.7778},
+    }
+    payload = {
+        "type": "strategic_review",
+        "research_mode": "strategic",
+        "project_name": "Blueprint",
+        "base_branch": "automain",
+        "is_self_repo": True,
+        "enable_self_improvement": True,
+        "vision": {"purpose": "test lifecycle floor"},
+        "direction_counts": {"active": 18, "paused": 0, "total": 18, "max_active": 20},
+        "max_active_directions": 20,
+        "version_phase": version_phase,
+        "directions_summary": [
+            {
+                "id": f"d-vp-{i}",
+                "status": "active",
+                "priority": "medium",
+                "text": "large direction " * 80,
+                "research_context": "direction context " * 400,
+            }
+            for i in range(30)
+        ],
+        "conversation_thread": [
+            {"role": "user", "content": "conversation bulk " * 300}
+            for _ in range(20)
+        ],
+    }
+
+    packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA, budget=6000)
+
+    assert "version_phase" in packed, (
+        f"version_phase must floor instead of dropping; meta={packed['_packer_meta']}"
+    )
+    vp = packed["version_phase"]
+    assert vp["version_number"] == 21
+    assert vp["phase"] == "build"
+    assert vp["goal"] == "Ship the post-promotion observability milestone."
+    assert vp["theme"] == "reliability"
+
+    meta = packed["_packer_meta"]
+    dropped_keys = {entry["key"] for entry in meta["dropped"]}
+    trimmed = [entry for entry in meta["trimmed"] if entry["key"] == "version_phase"]
+    assert "version_phase" not in dropped_keys, meta
+    assert trimmed, f"version_phase degradation must be visible in _packer_meta: {meta}"
+    assert trimmed[0]["kind"] in {"summarized", "floored"}
+
+
 @pytest.mark.asyncio
 async def test_strategic_review_packer_meta_present_on_small_project(db_session):
     """Small project: packer ships everything cleanly, meta lists no trims."""
@@ -5425,6 +5516,70 @@ async def test_direction_counts_survive_problem_model_floor_pressure(db_session)
     assert "directions_summary" not in packed or len(packed["directions_summary"]) < 20
 
 
+def test_directions_summary_summarization_compacts_bulky_nested_context():
+    """When directions_summary must summarize, bulky research_context and
+    recent_findings_evidence should compact per entry instead of causing the
+    whole direction summary to ship multi-KB rows or disappear."""
+
+    payload = {
+        "type": "strategic_review",
+        "research_mode": "strategic",
+        "project_name": "Blueprint",
+        "base_branch": "main",
+        "is_self_repo": False,
+        "enable_self_improvement": False,
+        "vision": {"purpose": "test direction compacting"},
+        "direction_counts": {"active": 24, "paused": 0, "total": 24, "max_active": 30},
+        "max_active_directions": 30,
+        "directions_summary": [
+            {
+                "id": f"d-heavy-{i:02d}",
+                "status": "active",
+                "priority": "high" if i < 3 else "medium",
+                "text": "direction summary text " * 10,
+                "total_cycles": 5,
+                "prs_merged": i,
+                "verified_prs_merged": i,
+                "tasks_failed": 0,
+                "research_context": "research-context-body " * 300,
+                "recent_findings_evidence": [
+                    {
+                        "finding_id": f"f-{i}-{j}",
+                        "summary": "finding summary " * 80,
+                        "evidence": "finding evidence body " * 180,
+                        "source": {"task_id": f"task-{i}-{j}", "logs": "log " * 250},
+                    }
+                    for j in range(4)
+                ],
+            }
+            for i in range(24)
+        ],
+    }
+
+    packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA, budget=30000)
+
+    assert "directions_summary" in packed, (
+        f"directions_summary should compact, not drop; meta={packed['_packer_meta']}"
+    )
+    assert 0 < len(packed["directions_summary"]) <= 12
+    for entry in packed["directions_summary"]:
+        entry_bytes = len(json.dumps(entry, default=str).encode())
+        assert entry_bytes < 2000, (
+            f"direction summary entry stayed too bulky ({entry_bytes}B): {entry}"
+        )
+        if "research_context" in entry:
+            assert len(entry["research_context"]) < 1000
+        if "recent_findings_evidence" in entry:
+            evidence_bytes = len(
+                json.dumps(entry["recent_findings_evidence"], default=str).encode()
+            )
+            assert evidence_bytes < 1000
+
+    serialized = json.dumps(packed["directions_summary"], default=str)
+    assert "research-context-body " * 80 not in serialized
+    assert "finding evidence body " * 80 not in serialized
+
+
 @pytest.mark.asyncio
 async def test_drift_signals_survives_budget_pressure(db_session):
     """drift_signals must not be dropped when low-priority fields are evicted.
@@ -5590,6 +5745,94 @@ def test_summarize_version_phase_preserves_acceptance_aggregate():
     assert out["tasks_merged_this_version"] == 6
     # The trim still drops verbose thresholds from promotion_readiness.
     assert "thresholds" not in out["promotion_readiness"]
+
+
+def test_summarize_version_phase_strips_nested_audit_findings_but_keeps_facts():
+    """The version_phase summarizer must keep the lifecycle facts that steer the
+    strategist while stripping bulky nested audit findings from both the current
+    qualification and recent-version history."""
+    from app.strategic_spawning import _summarize_version_phase
+
+    huge_finding = {
+        "severity": "high",
+        "summary": "large audit finding",
+        "details": "finding detail " * 500,
+        "evidence": ["evidence detail " * 200 for _ in range(4)],
+    }
+    block = {
+        "version_number": 21,
+        "phase": "stabilize",
+        "goal": "Make promotion lifecycle context impossible to lose.",
+        "theme": "reliability",
+        "tasks_merged_this_version": 11,
+        "acceptance_aggregate": {"merged": 11, "proven": 9, "proven_rate": 0.8182},
+        "last_qualification": {
+            "status": "not_promoted",
+            "confidence": 0.73,
+            "blocker": "audit_findings",
+            "candidate_sha": "abcdef1234567890",
+            "audit_findings": [huge_finding for _ in range(12)],
+            "sub_scores": {"audit": 0.42, "tests": 1.0},
+        },
+        "recent_versions": [
+            {
+                "version_number": 20 - i,
+                "status": "promoted",
+                "phase": "stabilize",
+                "tasks_merged_this_version": 5 + i,
+                "acceptance_aggregate": {
+                    "merged": 5 + i,
+                    "proven": 4 + i,
+                    "proven_rate": 0.8,
+                },
+                "last_qualification": {
+                    "status": "promoted" if i != 1 else "not_promoted",
+                    "confidence": 0.92 - (i * 0.04),
+                    "blocker": None if i != 1 else "ci_red",
+                    "audit_findings": [huge_finding for _ in range(10)],
+                },
+            }
+            for i in range(5)
+        ],
+    }
+
+    out = _summarize_version_phase(block)
+
+    assert out["version_number"] == 21
+    assert out["phase"] == "stabilize"
+    assert out["goal"] == "Make promotion lifecycle context impossible to lose."
+    assert out["theme"] == "reliability"
+    assert out["tasks_merged_this_version"] == 11
+    assert out["acceptance_aggregate"] == {
+        "merged": 11,
+        "proven": 9,
+        "proven_rate": 0.8182,
+    }
+
+    last = out["last_qualification"]
+    assert last["status"] == "not_promoted"
+    assert last["confidence"] == 0.73
+    assert last["blocker"] == "audit_findings"
+    assert "audit_findings" not in last
+    assert last["sub_scores"] == {"audit": 0.42, "tests": 1.0}
+
+    recent = out["recent_versions"]
+    assert len(recent) == 3
+    assert recent[0]["version_number"] == 20
+    assert recent[0]["tasks_merged_this_version"] == 5
+    assert recent[0]["acceptance_aggregate"] == {
+        "merged": 5,
+        "proven": 4,
+        "proven_rate": 0.8,
+    }
+    recent_lq = recent[1]["last_qualification"]
+    assert recent_lq["status"] == "not_promoted"
+    assert recent_lq["confidence"] == 0.88
+    assert recent_lq["blocker"] == "ci_red"
+
+    serialized = json.dumps(out, default=str)
+    assert "large audit finding" not in serialized
+    assert "finding detail" not in serialized
 
 
 @pytest.mark.asyncio
@@ -6816,6 +7059,80 @@ async def test_post_promote_handoff_hint_grounds_in_prior_promoted_record(
     assert "confidence 0.93" in suffix
     # And the binding instruction: do not re-qualify the already-shipped version.
     assert "re-qualify v1" in suffix
+
+
+@pytest.mark.asyncio
+async def test_post_promote_handoff_respects_existing_fresh_goal_and_theme(
+    db_session, mocker, _lts_split_active
+):
+    """A fresh post-promotion version can already have its goal/theme authored
+    by the time the strategic review spawns. The handoff suffix must not carry
+    stale null-goal instructions that contradict version_phase."""
+    from datetime import datetime, timedelta
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    promoted_at = now - timedelta(hours=2)
+    prior = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="stabilize",
+        status="promoted",
+        opened_at=now - timedelta(days=4),
+        promoted_at=promoted_at,
+        last_qualification={"status": "promoted", "confidence": 0.96},
+        serving_status="serving_confirmed",
+        served_sha="abc123def456",
+        served_at=promoted_at,
+    )
+    fresh_goal = "Make lifecycle context recovery reliable after promotion."
+    fresh_theme = "reliability"
+    fresh = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="build",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification=None,
+        qualification_attempts=0,
+        goal=fresh_goal,
+        theme=fresh_theme,
+    )
+    db_session.add_all([prior, fresh])
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    vp = payload.get("version_phase") or {}
+    assert vp.get("goal") == fresh_goal
+    assert vp.get("theme") == fresh_theme
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "Version handoff" in suffix
+    assert fresh_goal in suffix or vp.get("goal") == fresh_goal
+    assert fresh_theme in suffix or vp.get("theme") == fresh_theme
+    assert "goal field on v2 is null" not in suffix
+    assert "new_version_goal" not in suffix
+    assert "new_version_theme" not in suffix
 
 
 @pytest.mark.asyncio

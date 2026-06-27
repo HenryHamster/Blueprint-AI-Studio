@@ -19,9 +19,11 @@ no change.
 
 import logging
 import uuid
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
 from app.database import get_session
@@ -39,6 +41,164 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 logger = logging.getLogger(__name__)
 
 _RESEARCH_HISTORY_KEEP_ON_FETCH = 20
+_RECENT_CLOSED_VERSIONS_KEEP = 5
+
+
+def _iso(dt: Any) -> str | None:
+    return dt.isoformat() if dt else None
+
+
+def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return lifecycle-safe qualification summary without full audit payloads."""
+    if not isinstance(qual, dict) or not qual:
+        return None
+
+    keys = (
+        "status",
+        "candidate_sha",
+        "confidence",
+        "threshold",
+        "started_at",
+        "finalized_at",
+        "blocker",
+        "sub_scores",
+        "ci_resolution",
+        "audit_missing_reason",
+        "would_promote",
+        "promotion_pr_url",
+        "promotion_conflict",
+        "promotion_error_detail",
+        "error",
+        "detail",
+        "theme_delivery",
+        "goal_alignment",
+        "blind_merge_grade",
+        "merge_grade_status",
+        "merge_grade_coverage",
+        "merge_grade_biggest_gap",
+    )
+    out = {key: qual.get(key) for key in keys if qual.get(key) is not None}
+
+    promotion_pending = qual.get("promotion_pending")
+    if isinstance(promotion_pending, dict):
+        out["promotion_pending"] = {
+            key: promotion_pending.get(key)
+            for key in (
+                "pr_number",
+                "pr_url",
+                "auto_merge_enabled",
+                "managed_check_wait",
+                "migration_carrying",
+                "ci_state",
+            )
+            if promotion_pending.get(key) is not None
+        }
+
+    for source_key, count_key in (
+        ("audit_findings", "audit_findings_count"),
+        ("excluded_audit_findings", "excluded_audit_findings_count"),
+        (
+            "challenger_refuted_audit_findings",
+            "challenger_refuted_audit_findings_count",
+        ),
+    ):
+        value = qual.get(source_key)
+        if isinstance(value, list):
+            out[count_key] = len(value)
+
+    for count_key in (
+        "audit_findings_total",
+        "audit_findings_truncated",
+        "excluded_audit_findings_total",
+        "excluded_audit_findings_truncated",
+    ):
+        if qual.get(count_key) is not None:
+            out[count_key] = qual.get(count_key)
+
+    return out
+
+
+def _compose_serving_block(
+    aggregate: dict[str, Any],
+    artifacts: list[dict[str, Any]],
+    version: ReleaseVersion,
+) -> dict[str, Any]:
+    aggregate_status = aggregate.get("serving_status")
+    serving_sha = next(
+        (
+            e["served_identifier"]
+            for e in artifacts
+            if e.get("serving_status") == "serving_confirmed"
+            and e.get("served_identifier") is not None
+        ),
+        version.served_sha,
+    )
+    confirmed_at = next(
+        (
+            e["served_at"]
+            for e in artifacts
+            if e.get("serving_status") == "serving_confirmed" and e.get("served_at")
+        ),
+        _iso(version.served_at),
+    )
+    return {
+        "status": aggregate_status,
+        "sha": serving_sha,
+        "confirmed_at": confirmed_at,
+        "failure_reason": aggregate.get("reason_code")
+        if aggregate_status == "deploy_failed"
+        else None,
+        "artifacts": artifacts,
+    }
+
+
+def _compact_version_lifecycle(
+    version: ReleaseVersion,
+    project: Project,
+) -> dict[str, Any]:
+    from app import release_version as _release_version
+    from app.release_artifacts import version_serving_summary
+
+    aggregate_serving, artifacts = version_serving_summary(version, project)
+    qual = (
+        version.last_qualification
+        if isinstance(version.last_qualification, dict)
+        else {}
+    )
+    return {
+        "id": str(version.id),
+        "version_number": version.version_number,
+        "status": version.status,
+        "phase": version.phase,
+        "goal": version.goal,
+        "theme": version.theme,
+        "opened_at": _iso(version.opened_at),
+        "phase_changed_at": _iso(version.phase_changed_at),
+        "phase_reasoning": version.phase_reasoning,
+        "promoted_at": _iso(version.promoted_at),
+        "promoted_sha": version.promoted_sha,
+        "goal_updated_at": _iso(version.goal_updated_at),
+        "qualification_attempts": version.qualification_attempts,
+        "active_candidate_sha": qual.get("candidate_sha"),
+        "last_qualification": _compact_last_qualification(qual),
+        "qualification_state": _release_version.summarize_qualification_state(
+            qual,
+            version.serving_status,
+            version.deploy_failure_reason,
+            aggregate_serving_status=aggregate_serving["serving_status"],
+            aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
+            artifact_evidence=artifacts,
+        ),
+        "serving_status": version.serving_status,
+        "served_sha": version.served_sha,
+        "served_at": _iso(version.served_at),
+        "deploy_failure_reason": version.deploy_failure_reason,
+        "deploy_confirm_deadline": _iso(version.deploy_confirm_deadline),
+        "aggregate_serving_status": aggregate_serving["serving_status"],
+        "aggregate_deploy_failure_reason": aggregate_serving["reason_code"],
+        "artifacts": artifacts,
+        "serving": _compose_serving_block(aggregate_serving, artifacts, version),
+    }
 
 
 async def _resolve_agent_project(
@@ -338,6 +498,73 @@ async def agent_fetch_qualification(
         "goal_alignment": qual.get("goal_alignment"),
         "source": "last_qualification",
         **requalification_extra,
+    }
+
+
+@router.get("/projects/{project_id}/version_phase")
+@router.get("/projects/{project_id}/version-phase")
+@limiter.limit("60/minute")
+async def agent_fetch_version_phase(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return compact release-version lifecycle context for strategic recovery.
+
+    Read-only and project-scoped. This intentionally omits full audit findings
+    and task changelogs; agents that need the full qualification finding list can
+    use ``./fetch qualification`` explicitly.
+    """
+    project = await _resolve_agent_project(project_id, token, session)
+
+    open_row = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .options(selectinload(ReleaseVersion.deploy_artifacts))
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status == "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+    recent_closed_rows = (
+        (
+            await session.execute(
+                select(ReleaseVersion)
+                .options(selectinload(ReleaseVersion.deploy_artifacts))
+                .where(
+                    ReleaseVersion.project_id == project_id,
+                    ReleaseVersion.status != "open",
+                )
+                .order_by(ReleaseVersion.opened_at.desc())
+                .limit(_RECENT_CLOSED_VERSIONS_KEEP)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    return {
+        "status": "success",
+        "data": {
+            "source": "open_version" if open_row is not None else "no_open_version",
+            "current_version": (
+                _compact_version_lifecycle(open_row, project)
+                if open_row is not None
+                else None
+            ),
+            "recent_versions": [
+                _compact_version_lifecycle(row, project) for row in recent_closed_rows
+            ],
+        },
     }
 
 
