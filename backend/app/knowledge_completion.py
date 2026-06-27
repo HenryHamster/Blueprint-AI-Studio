@@ -1616,6 +1616,7 @@ async def _gather_compute_evidence(
         return None
 
     metrics: dict[str, Any] = {}
+    arms: Any | None = None
     raw_metrics = (job.polling_metadata or {}).get("result_metrics")
     if isinstance(raw_metrics, dict):
         metrics = {
@@ -1623,6 +1624,7 @@ async def _gather_compute_evidence(
             for k, v in raw_metrics.items()
             if isinstance(v, (int, float)) and not isinstance(v, bool)
         }
+        arms = _extract_experiment_arms(raw_metrics)
 
     artifact_uri: str | None = None
     storage_uri: str | None = None
@@ -1707,6 +1709,15 @@ async def _gather_compute_evidence(
         if c_metric and c_value is not None:
             _add_real(f"{artifact_uri}#metric:{c_metric}={c_value}")
 
+    # Per-arm citations: each arm in a multi-arm sweep is a distinct citable unit
+    # so operators can ask "which arm won?" and get a grounded answer.
+    if isinstance(arms, dict):
+        for arm_name in arms:
+            _add_real(f"{artifact_uri}#arms:{arm_name}")
+    elif isinstance(arms, list):
+        for i in range(len(arms)):
+            _add_real(f"{artifact_uri}#arms:{i}")
+
     if not real_evidence:
         return None
 
@@ -1746,6 +1757,7 @@ async def _gather_compute_evidence(
         "artifact_uri": artifact_uri,
         "file_count": file_count,
         "metrics": metrics,
+        "arms": arms,
         "citations": citations,
         "real_evidence": real_evidence,
         "log_excerpt": log_excerpt,
@@ -2603,6 +2615,12 @@ def _build_compute_qa_prompt(
     criterion_line = json.dumps(criterion, sort_keys=True) if criterion else "(none)"
     log_text = evidence.get("command_log_text") or evidence.get("log_excerpt") or ""
     log_section = f"Command output (excerpt):\n{log_text}\n" if log_text else ""
+    arms = evidence.get("arms")
+    arms_section = (
+        f"Per-arm results:\n{json.dumps(arms, sort_keys=True, default=str)}\n"
+        if arms is not None
+        else ""
+    )
     allowed = "\n".join(f"  - {c}" for c in evidence["citations"])
     return (
         "You are answering a question about a completed compute experiment. "
@@ -2613,6 +2631,7 @@ def _build_compute_qa_prompt(
         f"Cost (USD): {cost}\n"
         f"Success criterion: {criterion_line}\n"
         f"Metrics:\n{metrics_lines}\n"
+        f"{arms_section}"
         f"{log_section}"
         f"Question: {question[:500]}\n\n"
         "Choose citations ONLY from this allowed list (copy verbatim):\n"

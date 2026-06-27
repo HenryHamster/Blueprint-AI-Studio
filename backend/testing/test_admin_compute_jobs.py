@@ -1609,3 +1609,86 @@ async def test_ask_compute_job_no_evidence_declines_honestly(
     assert "citations" in body
     assert body["grounded"] is False
     assert isinstance(body["citations"], list)
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_includes_per_arm_evidence(
+    client: AsyncClient, db_session
+):
+    """_gather_compute_evidence exposes per-arm sweep results so operators can ask
+    'which arm won?' and receive a grounded, arm-citing answer."""
+    project = await _make_project(db_session, name="Ask Arm Evidence Project")
+    await _add_member(db_session, project.id, "member")
+
+    task = Task(
+        project_id=project.id,
+        title="sweep experiment",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "experiment": "arm_sweep_v1"}],
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 2.0}},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=2.0,
+        result_reference="gs://bucket/sweeps/sweep-1/result.json",
+        polling_metadata={
+            "result_metrics": {
+                "accuracy": 0.91,
+                "arms": {
+                    "control": {"accuracy": 0.85, "score": 0.80},
+                    "treatment": {"accuracy": 0.95, "score": 0.92},
+                },
+            }
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    captured_prompts: list[str] = []
+
+    class _FakeContent:
+        text = '{"answer": "treatment arm won with 0.95 accuracy", "citations": ["gs://bucket/sweeps/sweep-1/result.json#arms:treatment"]}'
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+
+    class _FakeMessages:
+        async def create(self, **kwargs):
+            captured_prompts.append(
+                (kwargs.get("messages") or [{}])[0].get("content", "")
+            )
+            return _FakeResponse()
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    with (
+        patch("anthropic.AsyncAnthropic", return_value=_FakeClient()),
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "Which arm performed better?"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["grounded"] is True
+    # The arm citation must pass the allowed-set gate (arm refs added to evidence)
+    assert any("arms:treatment" in c for c in body["citations"])
+    # The prompt must have included the per-arm section so the LLM saw arm data
+    assert len(captured_prompts) >= 1
+    prompt_text = captured_prompts[0]
+    assert "Per-arm results" in prompt_text
+    assert "control" in prompt_text
+    assert "treatment" in prompt_text
