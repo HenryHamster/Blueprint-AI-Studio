@@ -153,6 +153,109 @@ def evaluate_merge_grade(
     }
 
 
+# Number of tasks merged after the last merge-grade before the grade is
+# considered stale (goal-coverage read may no longer reflect current merged work).
+_DRIFT_STALE_MERGE_THRESHOLD = 5
+
+
+def compute_goal_coverage_drift(
+    goal: str | None,
+    *,
+    merge_grade_status: str | None,
+    merge_grade_coverage: float | None = None,
+    merge_grade_biggest_gap: str | None = None,
+    goal_alignment: Any | None = None,
+    merges_since_grade: int = 0,
+) -> dict[str, Any]:
+    """Derive a cheap goal-coverage divergence signal from already-persisted fields.
+
+    Pure / side-effect-free — no I/O, no LLM call. Inputs come from the latest
+    ``QualificationVerdict`` columns and a cheap merged-task count delta.
+
+    Return dict keys:
+      ``signal``  — ``"on_track"`` | ``"drifting"`` | ``"no_grade_yet"`` |
+                    ``"not_applicable"``
+      ``coverage``       — persisted coverage score (float | None)
+      ``biggest_gap``    — persisted biggest-gap string (str | None)
+      ``merges_since_grade`` — how many tasks merged since the grade was taken
+      ``stale``          — True when merges_since_grade >= threshold
+      ``detail``         — short human-readable explanation
+
+    Divergence fires when EITHER:
+      * the last grade already showed a goal miss (``merge_grade_status == "fail"``)
+      * material new work accumulated since the last grade (stale + was on_track)
+    """
+    goal_text = (goal or "").strip()
+    if not goal_text or is_contentless_goal(goal_text):
+        return {
+            "signal": "not_applicable",
+            "coverage": None,
+            "biggest_gap": None,
+            "merges_since_grade": merges_since_grade,
+            "stale": False,
+            "detail": "No version goal set — coverage drift not applicable.",
+        }
+
+    if merge_grade_status is None:
+        return {
+            "signal": "no_grade_yet",
+            "coverage": None,
+            "biggest_gap": merge_grade_biggest_gap,
+            "merges_since_grade": merges_since_grade,
+            "stale": False,
+            "detail": "No merge-grade has been taken for this version yet.",
+        }
+
+    stale = merges_since_grade >= _DRIFT_STALE_MERGE_THRESHOLD
+    coverage = merge_grade_coverage
+    biggest_gap = merge_grade_biggest_gap
+
+    # Prefer goal_alignment.biggest_gap when it carries one and merge_grade doesn't
+    if biggest_gap is None and isinstance(goal_alignment, dict):
+        ga_gap = goal_alignment.get("biggest_gap")
+        if ga_gap:
+            biggest_gap = str(ga_gap).strip()[:_FINDING_SUMMARY_MAX]
+
+    if merge_grade_status == "fail":
+        return {
+            "signal": "drifting",
+            "coverage": coverage,
+            "biggest_gap": biggest_gap,
+            "merges_since_grade": merges_since_grade,
+            "stale": stale,
+            "detail": (
+                "Last merge-grade flagged a goal miss"
+                + (
+                    f"; {merges_since_grade} additional tasks merged since grade."
+                    if merges_since_grade
+                    else "."
+                )
+            ),
+        }
+
+    if stale:
+        return {
+            "signal": "drifting",
+            "coverage": coverage,
+            "biggest_gap": biggest_gap,
+            "merges_since_grade": merges_since_grade,
+            "stale": True,
+            "detail": (
+                f"{merges_since_grade} tasks merged since last merge-grade — "
+                "coverage read may no longer reflect current merged work."
+            ),
+        }
+
+    return {
+        "signal": "on_track",
+        "coverage": coverage,
+        "biggest_gap": biggest_gap,
+        "merges_since_grade": merges_since_grade,
+        "stale": False,
+        "detail": "Last merge-grade passed; no material new work since.",
+    }
+
+
 def compute_composite(
     ci_green: bool,
     audit_score: float,

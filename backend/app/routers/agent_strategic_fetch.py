@@ -448,6 +448,24 @@ async def agent_fetch_qualification(
             project_id,
         )
 
+    # Goal-coverage drift signal (ADDITIVE). Best-effort: failure degrades to
+    # goal_coverage_drift: None without breaking the read.
+    goal_coverage_drift: dict | None = None
+    try:
+        from app.release_readiness import (  # noqa: PLC0415
+            compute_goal_coverage_drift_signal,
+        )
+
+        goal_coverage_drift = await compute_goal_coverage_drift_signal(
+            session, project_id
+        )
+    except Exception:
+        logger.exception(
+            "[AGENT_FETCH] goal_coverage_drift compute failed for project %s; "
+            "serving qualification without the drift signal",
+            project_id,
+        )
+
     verdict = (
         (
             await session.execute(
@@ -480,6 +498,7 @@ async def agent_fetch_qualification(
             "theme_delivery": verdict.theme_delivery,
             "goal_alignment": verdict.goal_alignment,
             "source": "qualification_verdict",
+            "goal_coverage_drift": goal_coverage_drift,
             **requalification_extra,
         }
 
@@ -497,6 +516,7 @@ async def agent_fetch_qualification(
         "theme_delivery": qual.get("theme_delivery"),
         "goal_alignment": qual.get("goal_alignment"),
         "source": "last_qualification",
+        "goal_coverage_drift": goal_coverage_drift,
         **requalification_extra,
     }
 
@@ -552,6 +572,24 @@ async def agent_fetch_version_phase(
         .all()
     )
 
+    # Goal-coverage drift signal for the open version (ADDITIVE). Best-effort:
+    # failure degrades to goal_coverage_drift: None without breaking the read.
+    version_phase_drift: dict | None = None
+    if open_row is not None:
+        try:
+            from app.release_readiness import (  # noqa: PLC0415
+                compute_goal_coverage_drift_signal,
+            )
+
+            version_phase_drift = await compute_goal_coverage_drift_signal(
+                session, project_id
+            )
+        except Exception:
+            logger.exception(
+                "[AGENT_FETCH] goal_coverage_drift compute failed for project %s",
+                project_id,
+            )
+
     return {
         "status": "success",
         "data": {
@@ -564,6 +602,7 @@ async def agent_fetch_version_phase(
             "recent_versions": [
                 _compact_version_lifecycle(row, project) for row in recent_closed_rows
             ],
+            "goal_coverage_drift": version_phase_drift,
         },
     }
 

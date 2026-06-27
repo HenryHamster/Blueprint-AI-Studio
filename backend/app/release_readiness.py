@@ -1191,3 +1191,91 @@ async def compute_requalification_readiness(
         "reason": reason,
         "findings": gating,
     }
+
+
+async def compute_goal_coverage_drift_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> dict[str, Any] | None:
+    """Compute a cheap goal-coverage divergence signal for the open version.
+
+    Best-effort and fail-safe: any failure returns None (caller degrades
+    gracefully). Reads persisted merge-grade fields from the latest
+    QualificationVerdict + a cheap COUNT of tasks merged since that verdict,
+    then delegates to the pure ``compute_goal_coverage_drift`` scorer.
+
+    Returns a dict with keys ``signal``, ``coverage``, ``biggest_gap``,
+    ``merges_since_grade``, ``stale``, ``detail`` — or None on any error.
+    """
+    from app.release_scoring import compute_goal_coverage_drift  # noqa: PLC0415
+    from app import release_version as _rv  # noqa: PLC0415
+
+    try:
+        version = (
+            (
+                await session.execute(
+                    select(ReleaseVersion)
+                    .where(
+                        ReleaseVersion.project_id == project_id,
+                        ReleaseVersion.status == "open",
+                    )
+                    .order_by(ReleaseVersion.opened_at.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if version is None:
+            return None
+
+        goal = version.goal
+
+        # Find the latest verdict that carries a merge-grade result.
+        verdict = (
+            (
+                await session.execute(
+                    select(QualificationVerdict)
+                    .where(
+                        QualificationVerdict.release_version_id == version.id,
+                        QualificationVerdict.merge_grade_status.is_not(None),
+                    )
+                    .order_by(QualificationVerdict.created_at.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+        if verdict is None:
+            return compute_goal_coverage_drift(
+                goal,
+                merge_grade_status=None,
+                merges_since_grade=0,
+            )
+
+        merges_since: int = 0
+        if verdict.finalized_at is not None:
+            try:
+                merges_since = await _rv.count_merged_since(
+                    session, project_id, verdict.finalized_at
+                )
+            except Exception:
+                logger.exception(
+                    "[DRIFT] count_merged_since failed for project %s", project_id
+                )
+
+        return compute_goal_coverage_drift(
+            goal,
+            merge_grade_status=verdict.merge_grade_status,
+            merge_grade_coverage=verdict.merge_grade_coverage,
+            merge_grade_biggest_gap=verdict.merge_grade_biggest_gap,
+            goal_alignment=verdict.goal_alignment,
+            merges_since_grade=merges_since,
+        )
+    except Exception:
+        logger.exception(
+            "[DRIFT] goal_coverage_drift compute failed for project %s", project_id
+        )
+        return None

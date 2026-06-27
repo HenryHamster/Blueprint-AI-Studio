@@ -1947,6 +1947,89 @@ describe('buildVersionPhaseSection', () => {
     // Explicitly does not advocate rushing.
     expect(result).toContain('Do NOT rush to qualify');
   });
+
+  it('renders a drifting goal_coverage_drift signal with emphasis and biggest_gap', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'build',
+      goal_coverage_drift: {
+        signal: 'drifting',
+        coverage: 0.45,
+        biggest_gap: 'feature Y not covered',
+        merges_since_grade: 3,
+        stale: true,
+        detail: 'Accumulated work deviates from frozen goal',
+      },
+    });
+    expect(result).toContain('drifting');
+    expect(result).toContain('biggest_gap=feature Y not covered');
+    expect(result).toContain('merges_since_grade=3');
+    expect(result).toContain('stale=true');
+    expect(result).toContain('course-correct or propose a goal amendment');
+    expect(result).toContain('Drift detail: Accumulated work deviates from frozen goal');
+  });
+
+  it('renders an on_track goal_coverage_drift signal without drifting emphasis', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'build',
+      goal_coverage_drift: {
+        signal: 'on_track',
+        coverage: 0.85,
+        biggest_gap: 'minor gap A',
+        merges_since_grade: 1,
+        stale: false,
+      },
+    });
+    expect(result).toContain('Goal-coverage drift: signal=on_track');
+    expect(result).not.toContain('course-correct or propose a goal amendment');
+  });
+
+  it('omits the goal_coverage_drift section entirely when absent', () => {
+    const result = buildVersionPhaseSection({ version_number: 2, phase: 'build' });
+    expect(result).not.toContain('Goal-coverage drift');
+  });
+
+  it('omits goal_coverage_drift section when signal is missing', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'build',
+      goal_coverage_drift: { coverage: 0.5 },
+    });
+    expect(result).not.toContain('Goal-coverage drift');
+  });
+
+  it('renders goal_alignment from last_qualification when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        goal_alignment: {
+          status: 'partial',
+          coverage: 0.6,
+          biggest_gap: 'feature Y not shipped',
+        },
+      },
+    });
+    expect(result).toContain('Last qualification goal alignment: status=partial');
+    expect(result).toContain('coverage=0.6');
+    expect(result).toContain('biggest_gap=feature Y not shipped');
+  });
+
+  it('omits goal_alignment line when last_qualification is absent', () => {
+    const result = buildVersionPhaseSection({ version_number: 2, phase: 'build' });
+    expect(result).not.toContain('Last qualification goal alignment');
+  });
+
+  it('omits goal_alignment line when last_qualification has no goal_alignment', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'build',
+      last_qualification: { status: 'pending' },
+    });
+    expect(result).not.toContain('Last qualification goal alignment');
+  });
 });
 
 describe('buildMemoCitationsSection', () => {

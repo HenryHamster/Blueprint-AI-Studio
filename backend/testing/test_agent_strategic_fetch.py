@@ -2801,3 +2801,182 @@ async def test_strategic_resolve_question_posts_answer_note(
         and n.context.get("reply_to") == str(msg.id)
     ]
     assert len(matching) == 1, f"Expected 1 question_answer NOTE, got {len(matching)}"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_surfaces_goal_coverage_drift(
+    client: AsyncClient, db_session
+):
+    """version_phase endpoint includes goal_coverage_drift for open version with a
+    merge-grade verdict that shows a goal miss — signals drifting + biggest_gap."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-vp-drift"
+    )
+    version.goal = "Harden the auth layer and improve test reliability"
+    version.phase = "build"
+    flag_modified(version, "goal")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create a QualificationVerdict whose merge-grade indicates a goal miss.
+    from app.models import QualificationVerdict as QV
+    verdict = QV(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="deadbeef" * 5,
+        confidence=0.55,
+        terminal_status="not_promoted",
+        audit_findings=[],
+        merge_grade_status="fail",
+        merge_grade_coverage=0.35,
+        merge_grade_biggest_gap="Auth improvements not merged",
+        finalized_at=datetime(2026, 6, 1, 10, 0, 0),
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    await db_session.refresh(verdict)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+
+    data = body["data"]
+    # Backward-compat: existing keys unchanged
+    assert data["source"] == "open_version"
+    assert data["current_version"] is not None
+    assert "recent_versions" in data
+
+    # New additive field: goal_coverage_drift
+    drift = data.get("goal_coverage_drift")
+    assert drift is not None, "goal_coverage_drift must be present for open version"
+    assert drift["signal"] == "drifting"
+    assert drift["biggest_gap"] == "Auth improvements not merged"
+    assert drift["coverage"] == pytest.approx(0.35)
+    # No material new work added after the verdict (count_merged_since returns 0
+    # when no COMPLETED tasks exist in the window), so stale may be False.
+    assert isinstance(drift["merges_since_grade"], int)
+    assert "stale" in drift
+    assert "detail" in drift
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_drift_not_applicable_empty_goal(
+    client: AsyncClient, db_session
+):
+    """goal_coverage_drift is not_applicable when version has no goal."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-vp-drift-na"
+    )
+    # Ensure goal is empty/None
+    version.goal = None
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    drift = body["data"].get("goal_coverage_drift")
+    assert drift is not None
+    assert drift["signal"] == "not_applicable"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_includes_goal_coverage_drift_signal(
+    client: AsyncClient, db_session
+):
+    """qualification endpoint includes goal_coverage_drift; existing keys unchanged."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qual-drift"
+    )
+    from sqlalchemy.orm.attributes import flag_modified
+
+    version.goal = "Ship the new data pipeline"
+    flag_modified(version, "goal")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="cafebabe" * 5,
+        confidence=0.91,
+        terminal_status="dry_run",
+        audit_findings=[],
+        merge_grade_status="pass",
+        merge_grade_coverage=0.88,
+        merge_grade_biggest_gap=None,
+        finalized_at=datetime(2026, 6, 15, 12, 0, 0),
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    # Backward-compat: existing keys must not change
+    assert body["source"] == "qualification_verdict"
+    assert body["candidate_sha"] is not None
+    assert "requalification_ready" in body
+    assert "finding_resolution" in body
+
+    # New additive field
+    drift = body.get("goal_coverage_drift")
+    assert drift is not None
+    assert drift["signal"] == "on_track"
+    assert drift["coverage"] == pytest.approx(0.88)
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_drift_in_fallback_path(
+    client: AsyncClient, db_session
+):
+    """goal_coverage_drift is present in the last_qualification fallback path too."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qual-drift-fb"
+    )
+    from sqlalchemy.orm.attributes import flag_modified
+
+    version.goal = "Improve observability"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "confidence": 0.5,
+        "candidate_sha": "aabbccdd" * 5,
+    }
+    flag_modified(version, "goal")
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "last_qualification"
+    # New additive field present even on fallback path (no verdict → no_grade_yet)
+    drift = body.get("goal_coverage_drift")
+    assert drift is not None
+    assert drift["signal"] == "no_grade_yet"

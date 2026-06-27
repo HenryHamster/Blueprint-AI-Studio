@@ -819,6 +819,44 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     }
   }
 
+  // Goal-coverage drift signal (continuous BUILD/STABILIZE early-warning).
+  const driftRaw = versionPhase.goal_coverage_drift;
+  if (driftRaw && typeof driftRaw === 'object' && !Array.isArray(driftRaw)) {
+    const drift = driftRaw as Record<string, unknown>;
+    const driftSignal = typeof drift.signal === 'string' ? drift.signal : null;
+    if (driftSignal) {
+      const driftBits: string[] = [`signal=${driftSignal}`];
+      if (typeof drift.coverage === 'number') driftBits.push(`coverage=${drift.coverage}`);
+      if (typeof drift.biggest_gap === 'string' && drift.biggest_gap) driftBits.push(`biggest_gap=${drift.biggest_gap}`);
+      if (typeof drift.merges_since_grade === 'number') driftBits.push(`merges_since_grade=${drift.merges_since_grade}`);
+      if (drift.stale === true) driftBits.push(`stale=true`);
+      const driftDetail = typeof drift.detail === 'string' && drift.detail ? drift.detail : null;
+      const driftLine = `Goal-coverage drift: ${driftBits.join(', ')}`;
+      if (driftSignal === 'drifting') {
+        parts.push(`**${driftLine}** ← accumulated work diverging from version goal; course-correct or propose a goal amendment before qualification deadlock`);
+      } else {
+        parts.push(driftLine);
+      }
+      if (driftDetail) parts.push(`  Drift detail: ${driftDetail}`);
+    }
+  }
+
+  // Goal-alignment verdict from the last qualification (carried inside last_qualification.goal_alignment).
+  if (lastQualification) {
+    const goalAlignmentRaw = lastQualification.goal_alignment;
+    if (goalAlignmentRaw && typeof goalAlignmentRaw === 'object' && !Array.isArray(goalAlignmentRaw)) {
+      const ga = goalAlignmentRaw as Record<string, unknown>;
+      const gaStatus = typeof ga.status === 'string' ? ga.status : (typeof ga.state === 'string' ? ga.state : null);
+      if (gaStatus) {
+        const gaBits: string[] = [`status=${gaStatus}`];
+        if (typeof ga.coverage === 'number') gaBits.push(`coverage=${ga.coverage}`);
+        if (typeof ga.biggest_gap === 'string' && ga.biggest_gap) gaBits.push(`biggest_gap=${ga.biggest_gap}`);
+        if (typeof ga.goal_alignment === 'string' && ga.goal_alignment) gaBits.push(`alignment=${ga.goal_alignment}`);
+        parts.push(`Last qualification goal alignment: ${gaBits.join(', ')}`);
+      }
+    }
+  }
+
   // Promotion-readiness trend (cross-version aggregation).
   const promotionReadinessRaw = versionPhase.promotion_readiness;
   if (promotionReadinessRaw && typeof promotionReadinessRaw === 'object' && !Array.isArray(promotionReadinessRaw)) {

@@ -414,6 +414,9 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
     pr = _compact_promotion_readiness(block.get("promotion_readiness"), floor=floor)
     if pr:
         out["promotion_readiness"] = pr
+    drift = _compact_scalar_mapping(block.get("goal_coverage_drift"), text_cap=text_cap)
+    if drift:
+        out["goal_coverage_drift"] = drift
     for key in (
         "last_qualification_candidate_currency",
         "stabilize_stall",

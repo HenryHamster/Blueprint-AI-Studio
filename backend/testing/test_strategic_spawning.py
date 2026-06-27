@@ -5981,6 +5981,95 @@ async def test_version_phase_includes_recent_versions(
 
 
 @pytest.mark.asyncio
+async def test_version_phase_block_carries_goal_coverage_drift(
+    db_session, mocker, _lts_split_active
+):
+    """The always-on version_phase block carries goal_coverage_drift when the
+    helper returns a non-None dict, and the key survives _compact_version_phase
+    at both normal and floor levels."""
+    from datetime import datetime
+    from app.models import ReleaseVersion, QualificationVerdict
+
+    await _ensure_releaseversion_table(db_session)
+    await _ensure_verdict_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="build",
+        status="open",
+        goal="Ship feature X and Y",
+        opened_at=now,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Seed a QualificationVerdict with a merge_grade that flags a goal miss
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            merge_grade_status="fail",
+            merge_grade_coverage=0.45,
+            merge_grade_biggest_gap="feature Y not covered",
+            goal_alignment="partial",
+            finalized_at=now,
+        )
+    )
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    vp = payload.get("version_phase")
+    assert vp is not None, "version_phase block should be present"
+    drift = vp.get("goal_coverage_drift")
+    assert drift is not None, "goal_coverage_drift should be present in version_phase"
+    assert "signal" in drift, "goal_coverage_drift must have 'signal' key"
+    assert drift["signal"] == "drifting", (
+        f"signal should be 'drifting' given stale merge grade, got {drift['signal']!r}"
+    )
+    assert "biggest_gap" in drift, "goal_coverage_drift must carry biggest_gap"
+
+    # Confirm it survives compaction at both normal and floor levels.
+    from app.strategic_payload_compaction import (
+        _summarize_version_phase,
+        _version_phase_floor,
+    )
+
+    normal = _summarize_version_phase(vp)
+    assert "goal_coverage_drift" in normal, (
+        "goal_coverage_drift must survive _summarize_version_phase"
+    )
+    assert normal["goal_coverage_drift"].get("signal") == "drifting"
+
+    floor = _version_phase_floor(vp)
+    assert "goal_coverage_drift" in floor, (
+        "goal_coverage_drift must survive _version_phase_floor"
+    )
+
+
+@pytest.mark.asyncio
 async def test_version_phase_recent_versions_use_aggregate_pending_truth(
     db_session, mocker, _lts_split_active
 ):

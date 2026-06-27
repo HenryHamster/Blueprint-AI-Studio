@@ -27384,3 +27384,139 @@ async def test_record_promotion_failure_increments_count(db_session, mocker):
         lock_released=False,
     )
     assert version.last_qualification["promotion_failure_count"] == 2
+
+
+class TestComputeGoalCoverageDrift:
+    """Unit tests for the pure compute_goal_coverage_drift scorer."""
+
+    def test_not_applicable_empty_goal(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "",
+            merge_grade_status="pass",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "not_applicable"
+
+    def test_not_applicable_none_goal(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            None,
+            merge_grade_status="pass",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "not_applicable"
+
+    def test_not_applicable_contentless_goal(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        for placeholder in ("test", "n/a", "tbd", "placeholder"):
+            result = compute_goal_coverage_drift(
+                placeholder,
+                merge_grade_status="pass",
+                merges_since_grade=0,
+            )
+            assert result["signal"] == "not_applicable", f"Expected not_applicable for '{placeholder}'"
+
+    def test_no_grade_yet_when_status_none(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status=None,
+            merges_since_grade=3,
+        )
+        assert result["signal"] == "no_grade_yet"
+        assert result["coverage"] is None
+
+    def test_on_track_pass_grade_low_delta(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Harden the release gate",
+            merge_grade_status="pass",
+            merge_grade_coverage=0.85,
+            merge_grade_biggest_gap=None,
+            merges_since_grade=2,
+        )
+        assert result["signal"] == "on_track"
+        assert result["stale"] is False
+        assert result["coverage"] == pytest.approx(0.85)
+        assert result["merges_since_grade"] == 2
+
+    def test_drifting_when_fail_grade(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve test reliability",
+            merge_grade_status="fail",
+            merge_grade_coverage=0.3,
+            merge_grade_biggest_gap="Integration tests not updated",
+            merges_since_grade=1,
+        )
+        assert result["signal"] == "drifting"
+        assert result["biggest_gap"] == "Integration tests not updated"
+        assert result["coverage"] == pytest.approx(0.3)
+
+    def test_drifting_stale_when_material_new_work(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Performance optimization",
+            merge_grade_status="pass",
+            merge_grade_coverage=0.9,
+            merges_since_grade=5,  # at threshold
+        )
+        assert result["signal"] == "drifting"
+        assert result["stale"] is True
+        assert result["merges_since_grade"] == 5
+
+    def test_stale_threshold_boundary(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        # 4 merges = not stale
+        result_ok = compute_goal_coverage_drift(
+            "Some real goal",
+            merge_grade_status="pass",
+            merge_grade_coverage=0.8,
+            merges_since_grade=4,
+        )
+        assert result_ok["signal"] == "on_track"
+        assert result_ok["stale"] is False
+
+        # 5 merges = stale -> drifting
+        result_stale = compute_goal_coverage_drift(
+            "Some real goal",
+            merge_grade_status="pass",
+            merge_grade_coverage=0.8,
+            merges_since_grade=5,
+        )
+        assert result_stale["signal"] == "drifting"
+        assert result_stale["stale"] is True
+
+    def test_biggest_gap_falls_back_to_goal_alignment(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Fix auth layer",
+            merge_grade_status="fail",
+            merge_grade_biggest_gap=None,
+            goal_alignment={"biggest_gap": "Auth not addressed", "state": "shortfall"},
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "drifting"
+        assert result["biggest_gap"] == "Auth not addressed"
+
+    def test_biggest_gap_merge_grade_takes_precedence(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Fix auth layer",
+            merge_grade_status="fail",
+            merge_grade_biggest_gap="Missing rate limiting",
+            goal_alignment={"biggest_gap": "Auth not addressed"},
+            merges_since_grade=0,
+        )
+        assert result["biggest_gap"] == "Missing rate limiting"

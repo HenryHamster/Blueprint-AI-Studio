@@ -4826,6 +4826,18 @@ async def _spawn_strategic_review(
                 logger.exception(
                     "[STRATEGIC] recent_closed_versions fetch failed; continuing"
                 )
+            try:
+                from app.release_readiness import compute_goal_coverage_drift_signal
+
+                _drift = await compute_goal_coverage_drift_signal(session, project.id)
+                if _drift is not None:
+                    if _version_phase_block is None:
+                        _version_phase_block = {}
+                    _version_phase_block["goal_coverage_drift"] = _drift
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] goal_coverage_drift fetch failed; continuing"
+                )
         except Exception:
             logger.exception("[STRATEGIC] version_phase block build failed; continuing")
     # Deployment-state block — only under an LTS split (integration branch !=
