@@ -3,7 +3,7 @@ import { AlertTriangle, ChevronDown, ChevronUp, FileDown, GitBranch, HelpCircle,
 import { parseTimestamp, timeAgo } from '../utils/time';
 import type { AccountMutationResult, AccountMutationReturn, AccountUpdatePayload, AuthMode, MaxPlanAccount, ProviderCatalogEntry, ProviderName } from '../types/settings';
 
-const PROVIDER_ORDER: ProviderName[] = ['anthropic', 'openai', 'gemini'];
+const PROVIDER_ORDER: ProviderName[] = ['anthropic', 'zai', 'openai', 'gemini'];
 
 // Availability snapshot keys the BACKEND owns on provider_metadata. The edit
 // dialog never lets the operator touch these directly; when an operator edits
@@ -26,6 +26,7 @@ const FALLBACK_AUTH_MODES: Record<ProviderName, AuthMode[]> = {
   anthropic: ['oauth', 'api_key'],
   openai: ['api_key', 'oauth'],
   gemini: ['api_key', 'service_account'],
+  zai: ['api_key'],
 };
 
 const METADATA_HINTS: Record<string, { label: string; placeholder: string }> = {
@@ -82,6 +83,13 @@ const CREDENTIAL_GUIDES: Record<string, CredentialGuide> = {
       'Grant it the `Vertex AI User` role (and `Service Account Token Creator` on itself if you use impersonation).',
       'Add a JSON key and download it.',
       'Upload the JSON below, then fill in the `project` (GCP project ID) and `location` (Vertex region) metadata fields.',
+    ],
+  },
+  'zai:api_key': {
+    summary: 'Z.AI GLM through the Claude-compatible endpoint.',
+    steps: [
+      'Go to https://docs.z.ai and create an API key for your Z.AI account.',
+      'Paste the API key here. Blueprint maps it to Claude Code via `ANTHROPIC_BASE_URL` automatically.',
     ],
   },
 };
@@ -827,6 +835,8 @@ function AccountAddForm({
       ? 'auth.json'
       : newAccountProvider === 'gemini'
       ? 'Gemini API key'
+      : newAccountProvider === 'zai'
+      ? 'Z.AI API key'
       : newAccountProvider === 'openai'
       ? 'OpenAI API key'
       : newAccountAuthMode === 'api_key'

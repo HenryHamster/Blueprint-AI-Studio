@@ -71,6 +71,13 @@ _CRED_REDACT_SUBS = (
     (re.compile(r"oauth_token[=:]\s*[^\s&'\"]+", re.IGNORECASE), "oauth_token=***"),
     (
         re.compile(
+            r"([\"']?\b(?:AGENT_SECRET_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|OPENAI_API_KEY|CODEX_API_KEY|GEMINI_API_KEY|ZAI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|X-Agent-Token)\b[\"']?\s*[:=]\s*)(?!['\"]?AIza\*\*\*)(?:(['\"])(?:[^'\"\\]|\\.)+\2|[^\s,'\";&\])\n]{4,})",
+            re.IGNORECASE,
+        ),
+        r"\1***",
+    ),
+    (
+        re.compile(
             r"-----BEGIN[A-Z\s]+PRIVATE\s+KEY-----[\s\S]*?-----END[A-Z\s]+PRIVATE\s+KEY-----"
         ),
         "***PRIVATE KEY***",

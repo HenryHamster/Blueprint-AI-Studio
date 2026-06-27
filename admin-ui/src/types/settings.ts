@@ -1,4 +1,4 @@
-export type ProviderName = 'anthropic' | 'openai' | 'gemini';
+export type ProviderName = 'anthropic' | 'openai' | 'gemini' | 'zai';
 export type AuthMode = 'oauth' | 'api_key' | 'service_account';
 
 // One entry of the backend-published task-capability contract (the
@@ -47,10 +47,10 @@ export interface TaskTypeRoutingEntry {
   effort?: EffortLevel;
 }
 
-export type ProviderSettingsByEffort = Record<
+export type ProviderSettingsByEffort = Partial<Record<
   ProviderName,
   Partial<Record<EffortLevel, Record<string, unknown>>>
->;
+>>;
 
 export interface DeployState {
   status: string;

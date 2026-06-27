@@ -27,6 +27,7 @@ _ENV_FALLBACK_DEFAULT_MODELS = {
     "anthropic": "claude-opus-4-8",
     "openai": "gpt-5.4",
     "gemini": "gemini-2.5-pro",
+    "zai": "glm-5.2",
 }
 
 
@@ -35,6 +36,8 @@ def _provider_env_credential_hint(provider: str | None) -> str:
         return "OPENAI_API_KEY or CODEX_API_KEY or CODEX_HOME/auth.json"
     if provider == "gemini":
         return "GEMINI_API_KEY or GOOGLE_APPLICATION_CREDENTIALS (+ GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION)"
+    if provider == "zai":
+        return "ZAI_API_KEY or ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN with ANTHROPIC_BASE_URL"
     return "ANTHROPIC_API_KEY"
 
 
@@ -153,6 +156,38 @@ def _resolve_env_runtime_fallback(
             secret,
             provider_name,
             "service_account",
+            runtime_model,
+            runtime_execution_mode,
+            provider_metadata,
+        )
+
+    if provider_name == "zai":
+        secret = (
+            os.getenv("ZAI_API_KEY")
+            or os.getenv("ANTHROPIC_AUTH_TOKEN")
+            or os.getenv("ANTHROPIC_API_KEY")
+        )
+        base_url = (
+            os.getenv("ZAI_ANTHROPIC_BASE_URL")
+            or os.getenv("ZAI_BASE_URL")
+            or os.getenv("ANTHROPIC_BASE_URL")
+            or ""
+        ).strip()
+        if base_url:
+            provider_metadata["anthropic_base_url"] = base_url
+        if not secret:
+            return (
+                None,
+                provider_name,
+                None,
+                runtime_model,
+                runtime_execution_mode,
+                provider_metadata,
+            )
+        return (
+            secret,
+            provider_name,
+            "api_key",
             runtime_model,
             runtime_execution_mode,
             provider_metadata,

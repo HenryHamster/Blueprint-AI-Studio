@@ -35,11 +35,13 @@ _PROVIDER_DEP_KEYS = {
     LLMProviderName.ANTHROPIC.value: "anthropic_api",
     LLMProviderName.OPENAI.value: "openai_api",
     LLMProviderName.GEMINI.value: "gemini_api",
+    LLMProviderName.ZAI.value: "zai_api",
 }
 _RAW_PROVIDER_ENV_VARS = {
     LLMProviderName.ANTHROPIC.value: ("ANTHROPIC_API_KEY",),
     LLMProviderName.OPENAI.value: ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_HOME"),
     LLMProviderName.GEMINI.value: ("GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"),
+    LLMProviderName.ZAI.value: ("ZAI_API_KEY",),
 }
 
 

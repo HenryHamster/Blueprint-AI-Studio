@@ -24,6 +24,7 @@ from app.models import (
     LLMAuthMode,
     LLMProviderName,
     MaxPlanAccount,
+    PoolVmState,
     Project,
     ProjectMember,
     ProjectStatus,
@@ -35,7 +36,7 @@ from app.models import (
     TaskWakeRegistration,
     WakeDeliveryState,
 )
-from app.auth import create_agent_token
+from app.auth import create_agent_token, create_vm_scoped_token
 from app.schemas import AgentStatusPayload
 from app.task_capabilities import TaskType, task_type_catalog
 
@@ -14826,6 +14827,25 @@ async def _make_openai_oauth_task(db_session) -> tuple[Task, MaxPlanAccount, Pro
     return task, account, project
 
 
+def _vm_token_without_project(vm_instance_id: str) -> str:
+    import jwt as _jwt
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    from app.auth import AGENT_JWT_ALGORITHM, AGENT_JWT_SECRET, VM_SCOPED_TOKEN_SCOPE
+
+    now = _dt.now(_tz.utc)
+    return _jwt.encode(
+        {
+            "token_scope": VM_SCOPED_TOKEN_SCOPE,
+            "vm_instance_id": vm_instance_id,
+            "exp": now + _td(hours=8),
+            "iat": now,
+        },
+        AGENT_JWT_SECRET,
+        algorithm=AGENT_JWT_ALGORITHM,
+    )
+
+
 @pytest.mark.asyncio
 async def test_rotate_credentials_updates_openai_oauth_secret(
     client: AsyncClient, db_session, mocker
@@ -14849,6 +14869,164 @@ async def test_rotate_credentials_updates_openai_oauth_secret(
 
     await db_session.refresh(account)
     assert account.secret_blob_ref == "projects/test/secrets/rotate/versions/2"
+
+
+@pytest.mark.asyncio
+async def test_rotate_credentials_updates_openai_oauth_secret_from_pool_vm_token(
+    client: AsyncClient, db_session, mocker
+):
+    """Taskless warm-pool validation can refresh Codex OAuth before a task is
+    claimed. A VM-scoped token must rotate the pinned account's secret."""
+    from app.warm_pool import register_pool_vm
+
+    mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value="projects/test/secrets/rotate-pool/versions/4"),
+    )
+    _, account, project = await _make_openai_oauth_task(db_session)
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="agent-vm-pool-rotate",
+        project_id=project.id,
+        account_id=str(account.id),
+        provider="openai",
+        auth_mode="oauth",
+        model="gpt-5.3-codex",
+        state=PoolVmState.IDLE,
+    )
+    await db_session.commit()
+
+    token = create_vm_scoped_token("agent-vm-pool-rotate", str(project.id))
+    new_blob = '{"tokens":{"access_token":"pool-fresh","refresh_token":"rt-pool-fresh"}}'
+    res = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={"secret": new_blob},
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json() == {"rotated": True}
+
+    await db_session.refresh(account)
+    assert account.secret_blob_ref == "projects/test/secrets/rotate-pool/versions/4"
+
+
+@pytest.mark.asyncio
+async def test_rotate_credentials_rejects_pool_vm_token_without_project(
+    client: AsyncClient, db_session
+):
+    from app.warm_pool import register_pool_vm
+
+    _, account, project = await _make_openai_oauth_task(db_session)
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="agent-vm-pool-no-project",
+        project_id=project.id,
+        account_id=str(account.id),
+        provider="openai",
+        auth_mode="oauth",
+        state=PoolVmState.IDLE,
+    )
+    await db_session.commit()
+
+    res = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={
+            "x-agent-token": _vm_token_without_project("agent-vm-pool-no-project")
+        },
+        json={"secret": '{"tokens":{"access_token":"fresh"}}'},
+    )
+
+    assert res.status_code == 401
+    assert "project" in res.text
+
+
+@pytest.mark.asyncio
+async def test_rotate_credentials_rejects_pool_vm_cross_tenant_account(
+    client: AsyncClient, db_session, mocker
+):
+    from app.warm_pool import register_pool_vm
+
+    store_secret = mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value="projects/test/secrets/rotate-cross/versions/1"),
+    )
+    _, _, project = await _make_openai_oauth_task(db_session)
+    other_account = MaxPlanAccount(
+        user_id="other-user",
+        name="other-codex-oauth",
+        provider=LLMProviderName.OPENAI,
+        auth_mode=LLMAuthMode.OAUTH,
+        secret_blob_ref='{"tokens":{"access_token":"other","refresh_token":"rt-other"}}',
+    )
+    db_session.add(other_account)
+    await db_session.commit()
+    await db_session.refresh(other_account)
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="agent-vm-pool-cross-tenant",
+        project_id=project.id,
+        account_id=str(other_account.id),
+        provider="openai",
+        auth_mode="oauth",
+        state=PoolVmState.IDLE,
+    )
+    await db_session.commit()
+
+    token = create_vm_scoped_token("agent-vm-pool-cross-tenant", str(project.id))
+    res = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={"secret": '{"tokens":{"access_token":"fresh"}}'},
+    )
+
+    assert res.status_code == 403
+    store_secret.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rotate_credentials_rejects_pool_vm_account_identity_mismatch(
+    client: AsyncClient, db_session, mocker
+):
+    from app.warm_pool import register_pool_vm
+
+    store_secret = mocker.patch(
+        "app.secrets_manager.store_user_secret",
+        new=AsyncMock(return_value="projects/test/secrets/rotate-mismatch/versions/1"),
+    )
+    _, _, project = await _make_openai_oauth_task(db_session)
+    zai_account = MaxPlanAccount(
+        user_id=project.user_id,
+        name="zai-api",
+        provider=LLMProviderName.ZAI,
+        auth_mode=LLMAuthMode.API_KEY,
+        secret_blob_ref="projects/test/secrets/zai/versions/1",
+    )
+    db_session.add(zai_account)
+    await db_session.commit()
+    await db_session.refresh(zai_account)
+    await register_pool_vm(
+        db_session,
+        vm_instance_id="agent-vm-pool-identity-mismatch",
+        project_id=project.id,
+        account_id=str(zai_account.id),
+        provider="openai",
+        auth_mode="oauth",
+        state=PoolVmState.IDLE,
+    )
+    await db_session.commit()
+
+    token = create_vm_scoped_token(
+        "agent-vm-pool-identity-mismatch", str(project.id)
+    )
+    res = await client.post(
+        "/api/agent/credentials/rotate",
+        headers={"x-agent-token": token},
+        json={"secret": '{"tokens":{"access_token":"fresh"}}'},
+    )
+
+    assert res.status_code == 409
+    store_secret.assert_not_called()
 
 
 @pytest.mark.asyncio

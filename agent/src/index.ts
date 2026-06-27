@@ -156,6 +156,22 @@ export function rotateOAuthCredentialsIfChanged(taskId: string): Promise<void> {
   });
 }
 
+async function persistOAuthRotationAfterProviderValidation(
+  taskId: string,
+  reportPreClaimFailure: (reason: string) => void,
+): Promise<void> {
+  try {
+    await rotateOAuthCredentialsIfChanged(taskId);
+  } catch (rotationErr) {
+    const reason = `oauth credential rotation failed after provider validation: ${
+      rotationErr instanceof Error ? rotationErr.message : String(rotationErr)
+    }`;
+    log(reason);
+    reportPreClaimFailure(reason);
+    throw rotationErr;
+  }
+}
+
 // ── Build configuration (from project settings, passed via claim response) ───
 export type { DirectoryConfig, MigrationConfig } from './utils/test-runners.js';
 export type { BuildConfig };
@@ -402,6 +418,11 @@ const MANAGED_LLM_ENV_KEYS = [
   'LLM_CLI_TRANSLATION',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'ANTHROPIC_API_KEY',
+  'ANTHROPIC_AUTH_TOKEN',
+  'ANTHROPIC_BASE_URL',
+  'ZAI_API_KEY',
+  'ZAI_ANTHROPIC_BASE_URL',
+  'ZAI_BASE_URL',
   'OPENAI_API_KEY',
   'CODEX_API_KEY',
   'CODEX_HOME',
@@ -1456,7 +1477,8 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
 // execution-mode constants (PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE,
 // LLM_CLI_TRANSLATION in providers/runners.ts) are FROZEN at import from the
 // boot /etc/agent.env, and the provider secret material (CLAUDE_CODE_OAUTH_TOKEN,
-// ANTHROPIC_API_KEY, GEMINI_API_KEY, CODEX_HOME, …) lives in the process env +
+// ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, ZAI_API_KEY, GEMINI_API_KEY,
+// CODEX_HOME, ...) lives in the process env +
 // on-disk credential files written at boot. So when the backend warm-claims a
 // task that resolves to a DIFFERENT LLM account, a JWT-only rotation cannot
 // adopt the new material — the role would run on the wrong provider.
@@ -3090,6 +3112,7 @@ async function completeStartup(
     recordInitialOAuthAuthHash();
     if (startupStatusRef) startupStatusRef.value = 'Completing startup: validating provider auth';
     await validateProviderAuth(runner, reportPreClaimFailure, process.env.LLM_MODEL);
+    await persistOAuthRotationAfterProviderValidation(bootTaskId, reportPreClaimFailure);
     if (bootTaskId) {
       sendHeartbeatSync(bootTaskId, 'AGENT_AUTH_OK: provider validation complete');
     }
@@ -3251,6 +3274,7 @@ export async function main() {
       const bootRunner = getProviderRunner();
       recordInitialOAuthAuthHash();
       await validateProviderAuth(bootRunner, reportPreClaimFailure, process.env.LLM_MODEL);
+      await persistOAuthRotationAfterProviderValidation('', reportPreClaimFailure);
       captureBootCredentialSnapshot();
       log(`Pool mode enabled — polling for first task (max idle ${getPoolMaxIdleLifetimeMs()}ms)`);
       const poolResult = await bootstrapPoolMode({

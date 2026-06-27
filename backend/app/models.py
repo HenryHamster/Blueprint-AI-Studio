@@ -298,6 +298,7 @@ class LLMProviderName(str, Enum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
     GEMINI = "gemini"
+    ZAI = "zai"
 
 
 class LLMAuthMode(str, Enum):
