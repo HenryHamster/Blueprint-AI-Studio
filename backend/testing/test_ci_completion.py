@@ -4343,8 +4343,9 @@ async def test_review_wait_started_set_on_first_entry_not_overwritten(
 
 @pytest.mark.asyncio
 async def test_review_wait_backstop_fires_after_timeout(db_session, mocker):
-    """After the 60-minute backstop threshold, requires_approval and
-    review_wait_escalated are set, and a failure alert is created."""
+    """After the 60-minute backstop threshold, when respawn is suppressed,
+    requires_approval and review_wait_escalated are set, and a failure alert
+    is created."""
     from datetime import datetime, timedelta
 
     from app.ci_completion import handle_ci_completion
@@ -4353,6 +4354,12 @@ async def test_review_wait_backstop_fires_after_timeout(db_session, mocker):
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    # Respawn-first runs before the human gate; mock it as suppressed
+    # (None, False) so the requires_approval fallback is what we assert here.
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, False)),
+    )
 
     project = Project(name="Review wait backstop", user_id="test-user")
     db_session.add(project)
@@ -4431,6 +4438,223 @@ async def test_review_wait_backstop_does_not_refire(db_session, mocker):
     # handle_ci_completion; that gate lives in the separate merge helper.)
     assert result is True
     alert_mock.assert_not_called()
+
+
+def _make_fake_review_task(project_id):
+    """A minimal stand-in for the freshly spawned review task."""
+    return Task(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        title="Respawned review",
+        payloads=[{"type": "review"}],
+        status=TaskStatus.QUEUED,
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_review_wait_respawns_review(db_session, mocker):
+    """When CI passed but review approval never arrived past the backstop
+    deadline, a fresh review task is respawned BEFORE gating on a human:
+    requires_approval stays False, no failure alert fires, and the respawn is
+    recorded in review_loop with the window reset for the new reviewer."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    project = Project(name="Review wait respawn", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fake_review = _make_fake_review_task(project.id)
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(fake_review, True)),
+    )
+
+    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={"review_wait_started": old_started},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    # A fresh review was spawned with task_type "review".
+    spawn_mock.assert_awaited_once()
+    spawn_args = spawn_mock.await_args
+    assert spawn_args.args[1] == "review", "must respawn a review task"
+
+    await db_session.refresh(task)
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("review_wait_respawned") is True
+    assert review_loop.get("review_wait_respawn_task_id") == str(fake_review.id)
+    assert review_loop.get("review_wait_respawn_count") == 1
+    # Window reset for the new reviewer — review_wait_started moved forward.
+    assert review_loop.get("review_wait_started") != old_started
+    # No human gate, no orphan escalation, no alert.
+    assert task.requires_approval is not True, (
+        "requires_approval must NOT be set when a review respawn succeeds"
+    )
+    assert review_loop.get("review_wait_escalated") is not True
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_review_wait_respawn_suppressed_falls_back_to_approval(
+    db_session, mocker
+):
+    """If respawn is suppressed (None, False) — cap/merged/closed — the human
+    gate fallback fires: requires_approval + review_wait_escalated + one alert."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, False)),
+    )
+
+    project = Project(name="Review wait respawn suppressed", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={"review_wait_started": old_started},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    await db_session.refresh(task)
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("review_wait_respawned") is not True
+    assert review_loop.get("review_wait_escalated") is True
+    assert task.requires_approval is True
+    alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_review_wait_respawn_capped(db_session, mocker):
+    """A second timeout with review_wait_respawn_count already at the cap must
+    NOT respawn again — it falls back to the human gate."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(_make_fake_review_task(uuid.uuid4()), True)),
+    )
+
+    project = Project(name="Review wait respawn capped", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        # Already respawned once (cap is 1) — next timeout must gate.
+        ci_loop_extra={
+            "review_wait_started": old_started,
+            "review_wait_respawn_count": 1,
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    spawn_mock.assert_not_awaited()
+    await db_session.refresh(task)
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("review_wait_escalated") is True
+    assert task.requires_approval is True
+    alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_review_wait_auto_respawn_disabled(db_session, mocker):
+    """With review_wait_auto_respawn=False, the legacy immediate
+    requires_approval behavior is preserved (no respawn attempt)."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(_make_fake_review_task(uuid.uuid4()), True)),
+    )
+    # Disable auto-respawn via runtime config.
+    from app.shared_state import runtime_config
+
+    mocker.patch.dict(runtime_config, {"review_wait_auto_respawn": False})
+
+    project = Project(name="Review wait respawn disabled", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={"review_wait_started": old_started},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    spawn_mock.assert_not_awaited()
+    await db_session.refresh(task)
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("review_wait_escalated") is True
+    assert task.requires_approval is True
+    alert_mock.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

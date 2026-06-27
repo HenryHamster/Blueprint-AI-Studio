@@ -191,22 +191,74 @@ async def _spawn_residual_fingerprint_remediation(
     # IGNORED + SUSPENDED block re-spawn; REMEDIATING + last_spawned_at
     # drive the per-fingerprint cooldown. Row count for REMEDIATING
     # also drives the project-wide concurrency cap (see below).
+    # suspended_at + recovery_attempts drive exponential-backoff auto-recovery.
     case_rows_result = await session.execute(
         select(
             ResidualRemediationCase.fingerprint,
             ResidualRemediationCase.status,
             ResidualRemediationCase.last_spawned_at,
+            ResidualRemediationCase.suspended_at,
+            ResidualRemediationCase.recovery_attempts,
         ).where(ResidualRemediationCase.project_id == project.id)
     )
     case_rows = case_rows_result.all()
     blocked_fingerprints: set[str] = {
         fp
-        for fp, status, _ in case_rows
+        for fp, status, _, _sat, _ra in case_rows
         if status in (ResidualCaseStatus.IGNORED, ResidualCaseStatus.SUSPENDED)
     }
     last_spawned_by_fp: dict[str, datetime] = {
-        fp: ts for fp, _, ts in case_rows if ts is not None
+        fp: ts for fp, _, ts, _sat, _ra in case_rows if ts is not None
     }
+
+    # Auto-recover SUSPENDED cases whose exponential-backoff cooldown has elapsed.
+    # This brings residual cases to parity with branch suspension auto-recovery.
+    from app.auto_remediation import (  # deferred — avoids top-level circular import
+        _suspension_cooldown_elapsed,
+    )
+    from app.notification_dispatch import (
+        post_residual_fix_auto_recovered_message,
+    )
+
+    now_dt = _utcnow()
+    for fp, status, _ts, suspended_at, recovery_attempts in case_rows:
+        if status != ResidualCaseStatus.SUSPENDED:
+            continue
+        suspended_at_str = suspended_at.isoformat() if suspended_at else None
+        meta = {"suspended_at": suspended_at_str, "recovery_attempts": recovery_attempts or 0}
+        if not _suspension_cooldown_elapsed(meta, now_dt):
+            continue
+        # Cooldown elapsed and below max attempts — auto-recover this case.
+        case_row = (
+            await session.execute(
+                select(ResidualRemediationCase).where(
+                    ResidualRemediationCase.project_id == project.id,
+                    ResidualRemediationCase.fingerprint == fp,
+                )
+            )
+        ).scalar_one_or_none()
+        if case_row is None:
+            continue
+        new_attempts = (case_row.recovery_attempts or 0) + 1
+        case_row.status = ResidualCaseStatus.ACTIVE
+        case_row.suspended_at = None
+        case_row.recovery_attempts = new_attempts
+        case_row.updated_at = now_dt
+        session.add(case_row)
+        blocked_fingerprints.discard(fp)
+        logger.info(
+            "[AUTO REMEDIATION] Auto-recovering SUSPENDED fingerprint %s "
+            "(project %s, recovery attempt %d).",
+            fp[:32],
+            project.id,
+            new_attempts,
+        )
+        await post_residual_fix_auto_recovered_message(
+            session,
+            project.id,
+            fingerprint=fp,
+            recovery_attempts=new_attempts,
+        )
 
     # Project-wide concurrency cap. Count case rows currently in the
     # in-flight REMEDIATING state — independent of the CI auto-fix
@@ -214,7 +266,7 @@ async def _spawn_residual_fingerprint_remediation(
     # The DB row count is authoritative; old in-memory dedup is gone.
     max_concurrent = int(_runtime_config.get("max_concurrent_auto_remediations", 2))
     active_count = sum(
-        1 for _, status, _ in case_rows if status == ResidualCaseStatus.REMEDIATING
+        1 for _, status, _ts, _sat, _ra in case_rows if status == ResidualCaseStatus.REMEDIATING
     )
     if active_count >= max_concurrent:
         logger.info(
@@ -236,7 +288,6 @@ async def _spawn_residual_fingerprint_remediation(
     no_error_min_count = int(
         _runtime_config.get("residual_remediation_no_error_min_count", 20)
     )
-    now_dt = _utcnow()
     cooldown_delta = timedelta(seconds=cooldown_seconds)
 
     for fp_entry in fingerprints:
@@ -510,28 +561,78 @@ async def _spawn_viewport_regression_remediation(
     # Load case rows for spawn-side filters in one query:
     # IGNORED + SUSPENDED block re-spawn; last_spawned_at drives per-fingerprint
     # cooldown; REMEDIATING count drives the project-wide concurrency cap.
+    # suspended_at + recovery_attempts drive exponential-backoff auto-recovery.
     case_rows_result = await session.execute(
         select(
             ResidualRemediationCase.fingerprint,
             ResidualRemediationCase.status,
             ResidualRemediationCase.last_spawned_at,
+            ResidualRemediationCase.suspended_at,
+            ResidualRemediationCase.recovery_attempts,
         ).where(ResidualRemediationCase.project_id == project.id)
     )
     case_rows = case_rows_result.all()
     blocked_fingerprints: set[str] = {
         fp
-        for fp, status, _ in case_rows
+        for fp, status, _, _sat, _ra in case_rows
         if status in (ResidualCaseStatus.IGNORED, ResidualCaseStatus.SUSPENDED)
     }
     last_spawned_by_fp: dict[str, datetime] = {
-        fp: ts for fp, _, ts in case_rows if ts is not None
+        fp: ts for fp, _, ts, _sat, _ra in case_rows if ts is not None
     }
+
+    # Auto-recover SUSPENDED cases whose exponential-backoff cooldown has elapsed.
+    from app.auto_remediation import (  # deferred — avoids top-level circular import
+        _suspension_cooldown_elapsed,
+    )
+    from app.notification_dispatch import (
+        post_residual_fix_auto_recovered_message,
+    )
+
+    now_dt = _utcnow()
+    for fp, status, _ts, suspended_at, recovery_attempts in case_rows:
+        if status != ResidualCaseStatus.SUSPENDED:
+            continue
+        suspended_at_str = suspended_at.isoformat() if suspended_at else None
+        meta = {"suspended_at": suspended_at_str, "recovery_attempts": recovery_attempts or 0}
+        if not _suspension_cooldown_elapsed(meta, now_dt):
+            continue
+        case_row = (
+            await session.execute(
+                select(ResidualRemediationCase).where(
+                    ResidualRemediationCase.project_id == project.id,
+                    ResidualRemediationCase.fingerprint == fp,
+                )
+            )
+        ).scalar_one_or_none()
+        if case_row is None:
+            continue
+        new_attempts = (case_row.recovery_attempts or 0) + 1
+        case_row.status = ResidualCaseStatus.ACTIVE
+        case_row.suspended_at = None
+        case_row.recovery_attempts = new_attempts
+        case_row.updated_at = now_dt
+        session.add(case_row)
+        blocked_fingerprints.discard(fp)
+        logger.info(
+            "[VIEWPORT REMEDIATION] Auto-recovering SUSPENDED fingerprint %s "
+            "(project %s, recovery attempt %d).",
+            fp[:32],
+            project.id,
+            new_attempts,
+        )
+        await post_residual_fix_auto_recovered_message(
+            session,
+            project.id,
+            fingerprint=fp,
+            recovery_attempts=new_attempts,
+        )
 
     # Project-wide concurrency cap (shared with CODE_ERROR lane; both write to the
     # same ResidualRemediationCase table so REMEDIATING rows from either lane count).
     max_concurrent = int(_runtime_config.get("max_concurrent_auto_remediations", 2))
     active_count = sum(
-        1 for _, status, _ in case_rows if status == ResidualCaseStatus.REMEDIATING
+        1 for _, status, _ts, _sat, _ra in case_rows if status == ResidualCaseStatus.REMEDIATING
     )
     if active_count >= max_concurrent:
         logger.info(

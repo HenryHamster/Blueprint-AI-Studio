@@ -14412,6 +14412,129 @@ async def test_smoketest_result_plan_output_is_dict(
 
 
 @pytest.mark.asyncio
+async def test_smoketest_plan_spawn_retries_on_transient_error(
+    client: AsyncClient, db_session, mocker
+):
+    """A transient DB error (e.g. serialization conflict) on the first flush must
+    not become a permanent operator gate. The spawn block must retry exactly once
+    on the recovered session and succeed — producing a plan task with no operator
+    alert — when the retry flush succeeds."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+
+    _, task = await _setup_smoketest_task(db_session, "agent-vm-smoke-retry")
+
+    import json as _json
+    from sqlalchemy.exc import OperationalError
+
+    smoketest_payload = {
+        "passed": False,
+        "tests": [{"name": "test_login", "status": "fail", "message": "timeout"}],
+        "suites": {
+            "startup": {"passed": True, "tests": []},
+            "curated": {
+                "passed": False,
+                "tests": [{"name": "test_login", "status": "fail"}],
+            },
+        },
+    }
+
+    # Simulate a transient serialization error on the first session.flush()
+    # inside maybe_spawn_smoketest_fix, then let subsequent flushes proceed normally.
+    original_flush = db_session.flush
+    flush_call_count = 0
+
+    async def _patched_flush(*args, **kwargs):
+        nonlocal flush_call_count
+        flush_call_count += 1
+        # Fail only the first flush inside the smoketest spawn block.
+        # The setup commits above have already flushed several times, so we
+        # use a sentinel to fire exactly once when plan_task is being flushed.
+        if flush_call_count == 1:
+            flush_call_count += 1  # prevent double-trigger
+            raise OperationalError(
+                "could not serialize access due to concurrent update",
+                params=None,
+                orig=Exception("serialization conflict"),
+            )
+        return await original_flush(*args, **kwargs)
+
+    token = create_agent_token(str(task.id), "agent-vm-smoke-retry")
+    payload_data = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "artifact_type": "SMOKETEST_RESULT",
+        "logs": _json.dumps(smoketest_payload),
+    }
+
+    # Patch session.flush on the spawn module's session reference.
+    # We patch at the agent_status_spawn module level to intercept its flush calls.
+    _flush_calls = []
+    _real_flush = None
+
+    import app.agent_status_spawn as _spawn_mod
+
+    original_maybe_spawn = _spawn_mod.maybe_spawn_smoketest_fix
+
+    async def _intercepted_spawn(task_arg, payload_arg, session_arg, task_id_str_arg):
+        nonlocal _real_flush
+        _real_flush = session_arg.flush
+        _fail_once = {"done": False}
+
+        async def _fault_injecting_flush(*a, **kw):
+            if not _fail_once["done"]:
+                _fail_once["done"] = True
+                raise OperationalError(
+                    "could not serialize access due to concurrent update",
+                    params=None,
+                    orig=Exception("serialization conflict"),
+                )
+            return await _real_flush(*a, **kw)
+
+        session_arg.flush = _fault_injecting_flush
+        try:
+            return await original_maybe_spawn(
+                task_arg, payload_arg, session_arg, task_id_str_arg
+            )
+        finally:
+            session_arg.flush = _real_flush
+
+    mocker.patch.object(_spawn_mod, "maybe_spawn_smoketest_fix", _intercepted_spawn)
+
+    resp = await client.post(
+        "/api/agent/status", json=payload_data, headers={"x-agent-token": token}
+    )
+    assert resp.status_code == 200
+
+    # The retry should have produced exactly one plan task.
+    result = await db_session.execute(
+        select(Task).where(Task.parent_task_id == task.id)
+    )
+    spawned = result.scalars().all()
+    assert len(spawned) == 1, (
+        f"Expected 1 plan task from retry spawn, got {len(spawned)}"
+    )
+    plan_task = spawned[0]
+    assert plan_task.first_payload.get("type") == "plan"
+    assert plan_task.status == TaskStatus.QUEUED
+
+    # No operator-alert task should have been created (retry succeeded).
+    from app.models import Alert
+    from sqlalchemy import select as _select
+
+    alert_result = await db_session.execute(
+        _select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.title.like("%spawn failed%"),
+        )
+    )
+    assert alert_result.scalars().all() == [], (
+        "Operator alert must NOT be created when the retry spawn succeeds"
+    )
+
+
+@pytest.mark.asyncio
 async def test_debug_result_high_confidence_spawns_fix_task(
     client: AsyncClient, db_session, mocker
 ):
