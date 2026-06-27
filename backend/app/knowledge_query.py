@@ -699,6 +699,14 @@ async def build_compute_sweep_groups(
     ``_SWEEP_MIN_DOCS`` docs (lone-arm sweeps already appear in the flat
     knowledge_index). Bounded to ``limit`` distinct sweeps, newest-first.
     Sweeps with no sweep_id are excluded.
+
+    Completeness gate: when compute_experiment Task rows for this project
+    carry a matching sweep_id in their first payload, every such task must
+    have a usable KnowledgeDocument (source_task_id match, no
+    unavailable_cause) before the sweep is returned. Sweeps that fail this
+    check are excluded so the strategist cannot synthesise from partial
+    evidence. When no Task manifest is discoverable for a sweep, the
+    docs-only (>= _SWEEP_MIN_DOCS) behavior is preserved unchanged.
     """
     stmt = build_knowledge_documents_stmt(
         project_id,
@@ -710,17 +718,84 @@ async def build_compute_sweep_groups(
     )
     rows = (await session.execute(stmt)).scalars().all()
 
-    by_sweep: dict[str, list[dict]] = {}
+    # Group raw doc objects by sweep_id so the completeness check can access
+    # source_task_id and forward_quality_verdict before converting to entries.
+    by_sweep_docs: dict[str, list[KnowledgeDocument]] = {}
     for doc in rows:
         sid = doc.sweep_id
         if sid is None:
             continue
-        by_sweep.setdefault(sid, []).append(_knowledge_index_entry(doc, summary_chars))
+        by_sweep_docs.setdefault(sid, []).append(doc)
 
-    # Keep only sweeps with at least _SWEEP_MIN_DOCS, then cap at limit (newest sweep wins).
-    multi = {sid: entries for sid, entries in by_sweep.items() if len(entries) >= _SWEEP_MIN_DOCS}
+    # Filter to sweeps with at least _SWEEP_MIN_DOCS docs.
+    multi_docs = {
+        sid: docs
+        for sid, docs in by_sweep_docs.items()
+        if len(docs) >= _SWEEP_MIN_DOCS
+    }
+    if not multi_docs:
+        return {}
+
+    # Build the set of usable source_task_ids per sweep.
+    # A doc is usable when source_task_id is set and unavailable_cause is absent.
+    usable_task_ids: dict[str, set[str]] = {}
+    for sid, docs in multi_docs.items():
+        usable: set[str] = set()
+        for doc in docs:
+            if doc.source_task_id is None:
+                continue
+            fqv = (
+                doc.forward_quality_verdict
+                if isinstance(doc.forward_quality_verdict, dict)
+                else {}
+            )
+            if not fqv.get("unavailable_cause"):
+                usable.add(str(doc.source_task_id))
+        usable_task_ids[sid] = usable
+
+    from app.models import Task
+
+    task_stmt = select(Task.id, Task.payloads).where(
+        Task.project_id == project_id,
+        Task.payloads[0]["type"].as_string() == "compute_experiment",
+        Task.payloads[0]["sweep_id"].as_string().in_(list(multi_docs.keys())),
+    )
+    if direction_id:
+        task_stmt = task_stmt.where(Task.context["direction_id"].as_string() == direction_id)
+
+    task_rows = (await session.execute(task_stmt)).all()
+
+    # Group task_ids by sweep_id, only for the candidate sweep_ids.
+    tasks_by_sweep: dict[str, list[str]] = {}
+    for task_id, payloads in task_rows:
+        first = (payloads or [{}])[0]
+        tsid = first.get("sweep_id")
+        if tsid and tsid in multi_docs:
+            tasks_by_sweep.setdefault(tsid, []).append(str(task_id))
+
+    # Determine which sweeps pass the completeness gate.
+    complete_sids: set[str] = set()
+    for sid in multi_docs:
+        task_ids = tasks_by_sweep.get(sid)
+        if not task_ids:
+            # No Task manifest found for this sweep → docs-only fallback.
+            complete_sids.add(sid)
+        else:
+            # Every planned arm (task) must have a usable knowledge doc.
+            if all(tid in usable_task_ids[sid] for tid in task_ids):
+                complete_sids.add(sid)
+
+    # Convert docs to entries only for sweeps that pass the completeness gate.
+    multi: dict[str, list[dict]] = {}
+    for sid, docs in multi_docs.items():
+        if sid not in complete_sids:
+            continue
+        # docs are already ordered newest-first from the query.
+        multi[sid] = [_knowledge_index_entry(doc, summary_chars) for doc in docs]
+
     if not multi:
         return {}
+
     # Sort sweeps by the created_at of their newest entry (descending).
     ordered = sorted(
         multi.items(),
