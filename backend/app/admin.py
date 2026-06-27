@@ -2001,11 +2001,11 @@ class ComputeExperimentDraftSuccessCriterion(BaseModel):
 
 class ComputeExperimentDraft(BaseModel):
     draft_available: bool
-    notes: str | None = None
-    title: str | None = None
-    prompt: str | None = None
-    hypothesis: str | None = None
-    command: str | None = None
+    notes: str | None = Field(default=None, max_length=1000)
+    title: str | None = Field(default=None, max_length=200)
+    prompt: str | None = Field(default=None, max_length=50000)
+    hypothesis: str | None = Field(default=None, max_length=500)
+    command: str | None = Field(default=None, max_length=50000)
     arms: list[dict[str, str]] | None = None
     declared_metric: str | None = None
     spend_cap_usd: float | None = None
@@ -2131,12 +2131,15 @@ def _coerce_draft(raw: dict) -> ComputeExperimentDraft:
 
     declared_metric = _safe_metric(raw.get("declared_metric")) if arms else None
 
+    def _trunc(v: object, limit: int) -> str | None:
+        return str(v)[:limit] if isinstance(v, str) else None
+
     return ComputeExperimentDraft(
         draft_available=True,
-        title=raw.get("title") if isinstance(raw.get("title"), str) else None,
-        prompt=raw.get("prompt") if isinstance(raw.get("prompt"), str) else None,
-        hypothesis=raw.get("hypothesis") if isinstance(raw.get("hypothesis"), str) else None,
-        command=raw.get("command") if isinstance(raw.get("command"), str) and not arms else None,
+        title=_trunc(raw.get("title"), 200),
+        prompt=_trunc(raw.get("prompt"), 50000),
+        hypothesis=_trunc(raw.get("hypothesis"), 500),
+        command=_trunc(raw.get("command"), 50000) if not arms else None,
         arms=arms,
         declared_metric=declared_metric,
         spend_cap_usd=float(spend_cap),

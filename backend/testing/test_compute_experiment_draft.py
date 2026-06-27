@@ -273,3 +273,47 @@ class TestCoerceDraftUnit:
 
         assert _parse_draft_json("not json at all") is None
         assert _parse_draft_json("") is None
+
+    def test_coerce_draft_truncates_oversized_fields(self):
+        """_coerce_draft truncates free-text fields that exceed their max_length bounds."""
+        from app.admin import _coerce_draft
+
+        raw = {
+            "title": "T" * 300,
+            "prompt": "P" * 60000,
+            "hypothesis": "H" * 700,
+            "command": "C" * 60000,
+            "notes": None,
+        }
+        draft = _coerce_draft(raw)
+        assert draft.title is not None and len(draft.title) == 200
+        assert draft.prompt is not None and len(draft.prompt) == 50000
+        assert draft.hypothesis is not None and len(draft.hypothesis) == 500
+        assert draft.command is not None and len(draft.command) == 50000
+
+    def test_coerce_draft_within_bounds_not_truncated(self):
+        """_coerce_draft preserves fields that are within their max_length bounds."""
+        from app.admin import _coerce_draft
+
+        raw = {
+            "title": "Short title",
+            "prompt": "Short prompt",
+            "hypothesis": "Short hyp",
+            "command": "python run.py",
+        }
+        draft = _coerce_draft(raw)
+        assert draft.title == "Short title"
+        assert draft.prompt == "Short prompt"
+        assert draft.hypothesis == "Short hyp"
+        assert draft.command == "python run.py"
+
+    def test_compute_experiment_draft_model_rejects_oversized_notes(self):
+        """ComputeExperimentDraft model raises ValidationError when notes exceeds max_length."""
+        from app.admin import ComputeExperimentDraft
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            ComputeExperimentDraft(
+                draft_available=False,
+                notes="N" * 1001,
+            )
