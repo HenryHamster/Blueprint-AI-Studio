@@ -2808,3 +2808,86 @@ async def test_propagate_landed_bfs_stamps_grandchildren(cleanup_db):
     )
     assert (grandchild.context or {}).get("landed_on_integration") is True
     assert "_non_merge_unblock_reason" not in (grandchild.context or {})
+
+
+# ---------------------------------------------------------------------------
+# _do_rollup_post_merge_housekeeping: multi-direction refresh
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_merge_housekeeping_refreshes_all_directions(mocker):
+    """A rollup spanning TWO member directions must refresh BOTH directions'
+    outcomes — not just the first one.
+
+    Before the fix, `next(...)` returned only the first matching child, so
+    siblings whose direction_id differed were never refreshed, leaving the
+    'direction already merged but 0 tasks in flight' accounting undercount.
+    """
+    from app.rollup_management import _do_rollup_post_merge_housekeeping
+
+    mock_refresh = mocker.patch(
+        "app.direction_outcomes.refresh_direction_outcomes_after_merge",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.viewport_coverage.update_viewport_coverage_snapshot_from_diff",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.github.get_pull_request_diff", new_callable=AsyncMock, return_value="")
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    dir_a = str(uuid.uuid4())
+    dir_b = str(uuid.uuid4())
+    research_a = str(uuid.uuid4())
+    research_b = str(uuid.uuid4())
+
+    def _child(direction_id, research_task_id):
+        c = MagicMock()
+        c.context = {"direction_id": direction_id, "research_task_id": research_task_id}
+        return c
+
+    child_a = _child(dir_a, research_a)
+    child_b = _child(dir_b, research_b)
+    # A second child for dir_a — must NOT trigger a duplicate refresh call.
+    child_a2 = _child(dir_a, research_a)
+
+    parent = MagicMock()
+    parent.id = "parent-id"
+    parent.project_id = "proj-id"
+    parent.context = {}
+
+    session = MagicMock()
+    session.get = AsyncMock(return_value=None)
+    session.commit = AsyncMock()
+    session.add = MagicMock()
+
+    await _do_rollup_post_merge_housekeeping(
+        parent=parent,
+        project=None,
+        session=session,
+        gh_token="tok",
+        owner="owner",
+        repo="repo",
+        rollup_pr_number=1,
+        staging_branch="staging/test",
+        target_branch="main",
+        completed_children=[child_a, child_b, child_a2],
+        completed_count=3,
+        landed=True,
+        terminal=False,
+    )
+
+    # Must have been called exactly once per DISTINCT direction_id.
+    assert mock_refresh.call_count == 2, (
+        f"Expected refresh called for 2 distinct directions, got {mock_refresh.call_count}"
+    )
+    refreshed_children = {call.args[0] for call in mock_refresh.call_args_list}
+    # child_a and child_b must be the representatives; child_a2 is a duplicate.
+    assert child_a in refreshed_children, "direction A representative not refreshed"
+    assert child_b in refreshed_children, "direction B representative not refreshed"
+    assert child_a2 not in refreshed_children, "duplicate direction A child must not be refreshed"

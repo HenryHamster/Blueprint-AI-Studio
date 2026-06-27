@@ -1053,17 +1053,15 @@ async def _do_rollup_post_merge_housekeeping(
     if landed:
         from app.direction_outcomes import refresh_direction_outcomes_after_merge
 
-        _dir_child = next(
-            (
-                c
-                for c in completed_children
-                if (c.context or {}).get("direction_id")
-                and (c.context or {}).get("research_task_id")
-            ),
-            None,
-        )
-        if _dir_child is not None:
-            await refresh_direction_outcomes_after_merge(_dir_child, session)
+        _dir_representatives: dict[str, "Task"] = {}
+        for c in completed_children:
+            _ctx = c.context or {}
+            _did = _ctx.get("direction_id")
+            _rid = _ctx.get("research_task_id")
+            if _did and _rid and _did not in _dir_representatives:
+                _dir_representatives[_did] = c
+        for _rep in _dir_representatives.values():
+            await refresh_direction_outcomes_after_merge(_rep, session)
     try:
         await delete_branch(gh_token, owner, repo, staging_branch)
     except Exception as del_err:
