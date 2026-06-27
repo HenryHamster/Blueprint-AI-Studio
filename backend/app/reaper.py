@@ -2353,10 +2353,12 @@ async def reaper_service():
                     landed_cb=_mark_landed_parent_dependents,
                 )
 
-                # Step 3.5: Cancel EVALUATING provider tasks whose direction closed.
-                # Research/refactor tasks that provided for a now-retired direction
-                # hold no VM but sit EVALUATING forever — auto-cancel them so they
-                # don't accumulate as invisible orphans.
+                # Step 3.5: Detach EVALUATING provider tasks whose direction closed.
+                # direction_id is provenance, not a kill-tether — a retired
+                # direction must NEVER cancel in-flight/completed work (cancelling
+                # cascaded to FAIL parents and strand spawned fix tasks). Clear the
+                # stale direction_id so the generic EVALUATING sweep can resolve the
+                # task via its own children/PR.
                 _mark_reaper_progress()
                 await sweep_orphaned_direction_provider_tasks(session)
 

@@ -375,25 +375,28 @@ _ORPHANED_PROVIDER_SWEEP_BATCH = 200
 
 
 async def sweep_orphaned_direction_provider_tasks(session) -> int:
-    """Cancel EVALUATING research/refactor tasks whose parent direction is retired.
+    """Detach (never cancel) EVALUATING tasks whose parent direction is retired.
 
-    When a direction closes (status in _RETIRED_DIRECTION_STATUSES), any EVALUATING
-    task that was providing for it has nowhere to land.  Such tasks hold no VM (slots
-    already released), so the heartbeat reaper ignores them, and a null updated_at
-    can hide them from the staleness sweep — they orphan forever until an operator
-    manually cancels them.
+    A retired direction (status in _RETIRED_DIRECTION_STATUSES) must NEVER cancel
+    in-flight or completed work.  ``context["direction_id"]`` is PROVENANCE — it
+    records which autonomous-improvement direction prompted the task — not an
+    ownership or liveness tether.  Cancelling here was actively destructive: an
+    audit/research task that already spawned downstream fix tasks (but holds no PR)
+    would be cancelled, which cascaded to FAIL its parent and tear down the shared
+    staging branch, stranding the spawned fix tasks.
 
-    This sweep finds EVALUATING tasks that carry a direction_id in their context and
-    whose direction row now has a retired status, then either:
-    - If the task has an open PR (pr_number in first payload), orphan it by clearing
-      the direction_id from context (allowing the PR to land independently).
-    - Otherwise, cancel it cleanly (not a pipeline failure — the direction simply
-      closed before the task completed).
+    So for every EVALUATING task whose direction row is now retired, we simply
+    detach it: clear ``direction_id`` from context while keeping the task
+    EVALUATING.  Nothing hangs forever — the generic ``sweep_evaluating_parents``
+    sweep (which also covers ``Task.updated_at IS NULL``) resolves the task via its
+    own children/PR once it is no longer pinned to a dead direction.
 
-    Returns the number of tasks cancelled (not counting orphaned tasks).
+    A direction that does not exist in the Direction table (e.g. never synced) is
+    left alone — missing != retired.
+
+    Returns the number of tasks detached.
     """
-    cancelled = 0
-    orphaned = 0
+    detached = 0
     try:
         # Step A: find EVALUATING tasks with a direction_id in context.
         # The context["direction_id"] key is set by research/refactor flows
@@ -476,56 +479,34 @@ async def sweep_orphaned_direction_provider_tasks(session) -> int:
                 if dir_status not in _RETIRED_DIRECTION_STATUSES:
                     continue
 
-                # Check if the task has an open PR in its first payload.
-                pr_number = task.first_payload.get("pr_number")
-                if pr_number:
-                    # Task has an open PR — orphan it by clearing direction_id
-                    # so the PR can land independently.
-                    logger.warning(
-                        "[REAPER] Orphaning task %s: direction %s is %s but task has open PR %s — preserving",
-                        str(task.id)[:8],
-                        did,
-                        dir_status,
-                        pr_number,
-                    )
-                    ctx = dict(task.context or {})
-                    ctx.pop("direction_id", None)
-                    task.context = ctx
-                    flag_modified(task, "context")
-                    session.add(task)
-                    orphaned += 1
-                else:
-                    # No open PR — cancel the task cleanly.
-                    logger.warning(
-                        "[REAPER] Auto-cancelling EVALUATING task %s: direction %s is %s",
-                        str(task.id)[:8],
-                        did,
-                        dir_status,
-                    )
-                    task.status = TaskStatus.CANCELLED
-                    task.latest_status_message = (
-                        f"Auto-cancelled: direction {did} is {dir_status} — "
-                        "provider task has nowhere to land"
-                    )
-                    session.add(task)
-                    cancelled += 1
+                # direction_id is provenance, not a kill-tether: a retired
+                # direction must never cancel in-flight/completed work. Always
+                # detach (clear direction_id) and keep the task EVALUATING; the
+                # generic EVALUATING sweep resolves it via its own children/PR.
+                logger.warning(
+                    "[REAPER] Detaching EVALUATING task %s from retired direction "
+                    "%s (%s) — provenance only, not cancelling",
+                    str(task.id)[:8],
+                    did,
+                    dir_status,
+                )
+                ctx = dict(task.context or {})
+                ctx.pop("direction_id", None)
+                task.context = ctx
+                flag_modified(task, "context")
+                session.add(task)
+                detached += 1
 
-        if cancelled or orphaned:
+        if detached:
             await session.commit()
-            if cancelled:
-                logger.info(
-                    "[REAPER] Cancelled %d EVALUATING tasks for retired directions",
-                    cancelled,
-                )
-            if orphaned:
-                logger.info(
-                    "[REAPER] Orphaned %d EVALUATING tasks with open PRs for retired directions",
-                    orphaned,
-                )
+            logger.info(
+                "[REAPER] Detached %d EVALUATING tasks from retired directions",
+                detached,
+            )
     except Exception as e:
         logger.error(
             "[REAPER] Orphaned direction provider sweep error: %s", e, exc_info=True
         )
         with contextlib.suppress(Exception):
             await session.rollback()
-    return cancelled
+    return detached

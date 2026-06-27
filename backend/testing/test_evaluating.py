@@ -4754,14 +4754,15 @@ async def test_handle_approval_gate_timeout_dispositions_and_contract(eval_db, m
 
 
 @pytest.mark.asyncio
-async def test_sweep_orphaned_provider_task_cancelled_for_retired_direction(
+async def test_sweep_orphaned_provider_task_detached_not_cancelled_for_retired_direction(
     eval_db, mocker
 ):
-    """An EVALUATING research task whose direction is retired must be cancelled.
+    """An EVALUATING task whose direction is retired must be DETACHED, not cancelled.
 
-    Regression: EVALUATING provider tasks (no VM held) with a retired direction
-    could accumulate forever because they have nowhere to land once the direction
-    closes.  The sweep should detect and cancel them cleanly.
+    direction_id is provenance, not a kill-tether: a retired direction must never
+    cancel in-flight work.  The sweep should clear the stale direction_id while
+    keeping the task EVALUATING (the generic EVALUATING sweep then resolves it via
+    its own children/PR).
     """
     from app.reaper_evaluating_sweeps import sweep_orphaned_direction_provider_tasks
 
@@ -4793,25 +4794,27 @@ async def test_sweep_orphaned_provider_task_cancelled_for_retired_direction(
     await eval_db.commit()
     await eval_db.refresh(task)
 
-    cancelled = await sweep_orphaned_direction_provider_tasks(eval_db)
+    detached = await sweep_orphaned_direction_provider_tasks(eval_db)
 
-    assert cancelled == 1
+    assert detached == 1
     await eval_db.refresh(task)
-    assert task.status == TaskStatus.CANCELLED
-    assert direction_key in (task.latest_status_message or "")
-    assert "completed" in (task.latest_status_message or "")
+    # Must NOT be cancelled — status is preserved.
+    assert task.status == TaskStatus.EVALUATING
+    # The stale provenance direction_id is cleared.
+    assert (task.context or {}).get("direction_id") is None
 
 
 @pytest.mark.asyncio
-async def test_sweep_orphaned_provider_task_null_updated_at_cancelled(
+async def test_sweep_orphaned_provider_task_null_updated_at_detached(
     eval_db, mocker
 ):
-    """A null-updated_at EVALUATING task on a closed direction is reaped.
+    """A null-updated_at EVALUATING task on a closed direction is detached.
 
     Regression: null updated_at makes a task invisible to the staleness sweep
     (NULL < cutoff evaluates to NULL/false in SQL).  Simulate the null by
     force-setting updated_at to None after insert, then verify the orphan sweep
-    still detects and cancels the task via the direction-status check.
+    still detects the task via the direction-status check and detaches it (clears
+    direction_id) without cancelling it.
     """
     from sqlalchemy import text
     from app.reaper_evaluating_sweeps import sweep_orphaned_direction_provider_tasks
@@ -4850,18 +4853,19 @@ async def test_sweep_orphaned_provider_task_null_updated_at_cancelled(
     )
     await eval_db.commit()
 
-    cancelled = await sweep_orphaned_direction_provider_tasks(eval_db)
+    detached = await sweep_orphaned_direction_provider_tasks(eval_db)
 
-    assert cancelled == 1
+    assert detached == 1
     await eval_db.refresh(task)
-    assert task.status == TaskStatus.CANCELLED
+    assert task.status == TaskStatus.EVALUATING
+    assert (task.context or {}).get("direction_id") is None
 
 
 @pytest.mark.asyncio
-async def test_sweep_orphaned_provider_task_active_direction_not_cancelled(
+async def test_sweep_orphaned_provider_task_active_direction_not_touched(
     eval_db, mocker
 ):
-    """An EVALUATING task whose direction is still active must NOT be cancelled."""
+    """An EVALUATING task whose direction is still active must be left untouched."""
     from app.reaper_evaluating_sweeps import sweep_orphaned_direction_provider_tasks
 
     project = Project(name="Active Direction Test", user_id="user1")
@@ -4889,20 +4893,22 @@ async def test_sweep_orphaned_provider_task_active_direction_not_cancelled(
     await eval_db.commit()
     await eval_db.refresh(task)
 
-    cancelled = await sweep_orphaned_direction_provider_tasks(eval_db)
+    detached = await sweep_orphaned_direction_provider_tasks(eval_db)
 
-    assert cancelled == 0
+    assert detached == 0
     await eval_db.refresh(task)
     assert task.status == TaskStatus.EVALUATING
+    # Active direction → provenance is preserved.
+    assert (task.context or {}).get("direction_id") == direction_key
 
 
 @pytest.mark.asyncio
-async def test_sweep_orphaned_provider_task_no_direction_row_not_cancelled(
+async def test_sweep_orphaned_provider_task_no_direction_row_not_touched(
     eval_db, mocker
 ):
     """An EVALUATING task with a direction_id that has no Direction row is left alone.
 
-    Missing row != retired; the sweep must not cancel tasks for directions that
+    Missing row != retired; the sweep must not touch tasks for directions that
     simply were never synced to the Direction table.
     """
     from app.reaper_evaluating_sweeps import sweep_orphaned_direction_provider_tasks
@@ -4922,22 +4928,24 @@ async def test_sweep_orphaned_provider_task_no_direction_row_not_cancelled(
     await eval_db.commit()
     await eval_db.refresh(task)
 
-    cancelled = await sweep_orphaned_direction_provider_tasks(eval_db)
+    detached = await sweep_orphaned_direction_provider_tasks(eval_db)
 
-    assert cancelled == 0
+    assert detached == 0
     await eval_db.refresh(task)
     assert task.status == TaskStatus.EVALUATING
+    # Missing direction row → provenance is preserved.
+    assert (task.context or {}).get("direction_id") == "d-missing01"
 
 
 @pytest.mark.asyncio
 async def test_sweep_orphaned_provider_task_with_open_pr_not_cancelled(
     eval_db, mocker
 ):
-    """An EVALUATING task with a retired direction but an open PR must be orphaned, not cancelled.
+    """An EVALUATING task with a retired direction but an open PR must be detached, not cancelled.
 
     When a direction expires/completes, tasks that have already opened a PR have
     salvageable work — the PR should be allowed to land rather than the task being
-    killed. The sweep should clear the direction_id from context (orphaning it so
+    killed. The sweep should clear the direction_id from context (detaching it so
     subsequent sweeps skip it) but preserve the task's EVALUATING status and PR.
     """
     from app.reaper_evaluating_sweeps import sweep_orphaned_direction_provider_tasks
@@ -4974,10 +4982,10 @@ async def test_sweep_orphaned_provider_task_with_open_pr_not_cancelled(
     await eval_db.commit()
     await eval_db.refresh(task)
 
-    # Sweep should count it as 0 cancelled (it was orphaned, not cancelled).
-    cancelled = await sweep_orphaned_direction_provider_tasks(eval_db)
+    # The open-PR task is detached just like every other case.
+    detached = await sweep_orphaned_direction_provider_tasks(eval_db)
 
-    assert cancelled == 0
+    assert detached == 1
     await eval_db.refresh(task)
     # Task must NOT be cancelled.
     assert task.status == TaskStatus.EVALUATING
@@ -4985,3 +4993,69 @@ async def test_sweep_orphaned_provider_task_with_open_pr_not_cancelled(
     assert (task.context or {}).get("direction_id") is None
     # The PR should still be in the payload.
     assert (task.payloads or [{}])[0].get("pr_number") == 12345
+
+
+@pytest.mark.asyncio
+async def test_sweep_orphaned_provider_task_with_live_child_not_cancelled(
+    eval_db, mocker
+):
+    """Reproduces the incident: a retired direction must not destroy in-flight work.
+
+    An audit/research provider task that already spawned downstream fix tasks (but
+    holds no PR) used to be CANCELLED when its direction retired, which cascaded to
+    FAIL the parent and tear down the shared staging branch — stranding the spawned
+    fix tasks. After the fix, the provider task is merely DETACHED (direction_id
+    cleared, status stays EVALUATING) and its live descendant is untouched.
+    """
+    from app.reaper_evaluating_sweeps import sweep_orphaned_direction_provider_tasks
+
+    project = Project(name="Live Child Provider Test", user_id="user1")
+    eval_db.add(project)
+    await eval_db.commit()
+    await eval_db.refresh(project)
+
+    direction_key = "d-livechild01"
+    direction = Direction(
+        project_id=project.id,
+        direction_key=direction_key,
+        status="superseded",
+        data={"id": direction_key, "status": "superseded"},
+    )
+    eval_db.add(direction)
+    await eval_db.commit()
+
+    # EVALUATING provider task tied to the now-retired direction (no PR).
+    provider = Task(
+        project_id=project.id,
+        payloads=[{"type": "research", "prompt": "audit provider"}],
+        status=TaskStatus.EVALUATING,
+        context={"direction_id": direction_key},
+    )
+    eval_db.add(provider)
+    await eval_db.commit()
+    await eval_db.refresh(provider)
+
+    # A live (QUEUED) descendant fix task spawned by the provider.
+    child = Task(
+        project_id=project.id,
+        parent_task_id=provider.id,
+        payloads=[{"type": "create", "prompt": "spawned fix"}],
+        status=TaskStatus.QUEUED,
+        context={"direction_id": direction_key},
+    )
+    eval_db.add(child)
+    await eval_db.commit()
+    await eval_db.refresh(child)
+
+    detached = await sweep_orphaned_direction_provider_tasks(eval_db)
+
+    # Only the EVALUATING provider is in scope; the QUEUED child is not swept.
+    assert detached == 1
+    await eval_db.refresh(provider)
+    await eval_db.refresh(child)
+    # Provider must NOT be cancelled — just detached.
+    assert provider.status == TaskStatus.EVALUATING
+    assert (provider.context or {}).get("direction_id") is None
+    # The live descendant is completely untouched.
+    assert child.status == TaskStatus.QUEUED
+    assert (child.context or {}).get("direction_id") == direction_key
