@@ -314,6 +314,7 @@ export function TaskDetailDrawer({
     setConfirmCancel(false);
     setShowChangesForm(false);
     setChangesFeedback('');
+    setActiveTab('details');
   }, [task.id, task.payloads, task.description]);
 
   const loadPrFiles = async (withPatch: boolean) => {

@@ -3004,6 +3004,95 @@ async def test_per_arm_verdicts_even_split_when_no_durations(
     assert pav["arm_b"]["cost_usd"] == pytest.approx(0.25, rel=1e-4)
 
 
+@pytest.mark.asyncio
+async def test_per_arm_cost_apportionment_mixed_durations_sums_to_total(
+    db_session, _quiet_compute_io
+):
+    """per-arm costs sum to the experiment total in a mixed-duration run; a
+    crashed arm (no elapsed_seconds, no metric) is reported as unmeasured
+    (met=None), NOT as 'not met' (met=False).
+
+    Three-arm experiment: two arms finish with timing data; one crashes and
+    reports neither a metric nor elapsed_seconds.  The timed arms' apportioned
+    costs must sum to the full experiment total (not exceed it), and the
+    crashed arm must carry cost_usd=None and met=None.
+    """
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "mixed-duration-apportionment",
+            "success_criterion": {
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+            },
+        }
+    ]
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job, _artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    # fast: 30 s, 0.91 accuracy (MET); slow: 90 s, 0.88 accuracy (NOT MET);
+    # crashed: no timing, no metric (UNMEASURED).
+    # total elapsed from timed arms = 120 s; total cost = $1.20
+    # → fast gets $1.20 * 30/120 = $0.30, slow gets $1.20 * 90/120 = $0.90,
+    #   crashed gets None (no timing → cannot apportion).
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": {
+                "fast": {"accuracy": 0.91, "exit_code": 0, "elapsed_seconds": 30.0},
+                "slow": {"accuracy": 0.88, "exit_code": 0, "elapsed_seconds": 90.0},
+                "crashed": {"exit_code": 1},  # no metric, no elapsed
+            },
+        },
+    }
+    job.accrued_cost_usd = 1.20
+    job.final_cost_usd = 1.20
+    db_session.add(job)
+    await db_session.commit()
+
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.91, final_cost_usd=1.20)
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+
+    assert "per_arm_verdicts" in verdict
+    pav = verdict["per_arm_verdicts"]
+
+    # Timed arms: value + met populated
+    assert pav["fast"]["value"] == pytest.approx(0.91)
+    assert pav["fast"]["met"] is True  # 0.91 >= 0.9
+    assert pav["slow"]["value"] == pytest.approx(0.88)
+    assert pav["slow"]["met"] is False  # 0.88 < 0.9
+
+    # Crashed arm: unmeasured — met must be None, not False
+    assert pav["crashed"]["value"] is None
+    assert pav["crashed"]["met"] is None, (
+        "crashed arm (no metric) must be unmeasured (met=None), not 'not met' (met=False)"
+    )
+    assert pav["crashed"]["cost_usd"] is None
+
+    # Timed arms' apportioned costs must sum to the experiment total
+    fast_cost = pav["fast"]["cost_usd"]
+    slow_cost = pav["slow"]["cost_usd"]
+    assert fast_cost is not None
+    assert slow_cost is not None
+    assert fast_cost + slow_cost == pytest.approx(1.20, rel=1e-4), (
+        "per-arm costs for timed arms must sum to the experiment total"
+    )
+    assert fast_cost == pytest.approx(0.30, rel=1e-4)
+    assert slow_cost == pytest.approx(0.90, rel=1e-4)
+
+
 def _mock_anthropic_returning(citations: list[str]):
     """Build a mock anthropic.AsyncAnthropic class that returns a cited analysis."""
     fake_text = json.dumps(

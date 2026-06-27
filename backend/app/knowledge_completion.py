@@ -1174,8 +1174,15 @@ def _enrich_per_arm_cost(
     n_arms = len(per_arm_verdicts)
 
     for arm_name, pav in per_arm_verdicts.items():
-        if total_elapsed > 0 and arm_name in elapsed:
-            arm_cost = total_cost * elapsed[arm_name] / total_elapsed
+        if total_elapsed > 0:
+            # Time-weighted split: only apportion arms that have elapsed data.
+            # Arms without timing (e.g. crashed before finishing) get None so
+            # the timed arms' costs don't over-count beyond the total.
+            arm_cost = (
+                total_cost * elapsed[arm_name] / total_elapsed
+                if arm_name in elapsed
+                else None
+            )
         else:
             arm_cost = total_cost / n_arms if n_arms > 0 else None
         pav["cost_usd"] = arm_cost
@@ -1229,7 +1236,9 @@ def _evaluate_criterion_per_arm(
                     break
 
         value = _coerce_number(raw_value)
-        met = _criterion_met(raw_value, op, threshold)
+        # Distinguish unmeasured (crashed/missing) from failed: None means the
+        # arm didn't report the metric at all, not that it failed the criterion.
+        met = _criterion_met(raw_value, op, threshold) if value is not None else None
         per_arm[str(arm_name)] = {"value": value, "met": met}
 
     return per_arm if per_arm else None
@@ -1446,7 +1455,12 @@ def _build_compute_experiment_document(
             for arm_name, verdict in per_arm_verdicts.items():
                 value = verdict.get("value")
                 met = verdict.get("met")
-                status = "✓ MET" if met else "✗ NOT MET"
+                if met is None:
+                    status = "— UNMEASURED"
+                elif met:
+                    status = "✓ MET"
+                else:
+                    status = "✗ NOT MET"
                 if value is not None:
                     body_lines.append(f"- **{arm_name}:** {status} ({criterion.get('metric')}={value})")
                 else:
@@ -2229,6 +2243,7 @@ async def _persist_compute_knowledge_document(
         ),
         "release_evidence": stored_verdict.get("release_evidence"),
         "analysis_fallback_reason": stored_verdict.get("fallback_reason"),
+        "per_arm_verdicts": stored_verdict.get("per_arm_verdicts"),
     }
     task.plan_output = plan_output
     flag_modified(task, "plan_output")

@@ -2439,6 +2439,104 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(rerunComputeExperiment).toHaveBeenCalledWith('task-1', expect.objectContaining({ spend_cap_usd: 4.0 }));
   });
 
+  test('arms breakdown shows per-arm pass/fail chip and cost when per_arm_verdicts present', async () => {
+    const armsJob = makeJob({
+      id: 'job-pav',
+      task_title: 'DEN vs NN experiment',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 2.0,
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'DEN': { score: 0.91 },
+            'NN': { score: 0.85 },
+          },
+        },
+      },
+      per_arm_verdicts: {
+        'DEN': { value: 0.91, met: true, cost_usd: 1.20 },
+        'NN': { value: 0.85, met: false, cost_usd: 0.80 },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([armsJob]));
+    const { findByTestId, getAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const armsBlock = await findByTestId('arms-breakdown');
+    // Both arm names present
+    expect(armsBlock.textContent).toContain('DEN');
+    expect(armsBlock.textContent).toContain('NN');
+    // pass/fail chips appear for both arms
+    const verdictChips = getAllByTestId('arm-verdict-chip');
+    expect(verdictChips).toHaveLength(2);
+    const passChip = verdictChips.find((c) => c.textContent === 'pass');
+    const failChip = verdictChips.find((c) => c.textContent === 'fail');
+    expect(passChip).toBeTruthy();
+    expect(failChip).toBeTruthy();
+    expect(passChip!.className).toContain('emerald');
+    expect(failChip!.className).toContain('red');
+    // cost chips appear for both arms
+    const costChips = getAllByTestId('arm-cost');
+    expect(costChips).toHaveLength(2);
+    expect(armsBlock.textContent).toContain('$1.20');
+    expect(armsBlock.textContent).toContain('$0.80');
+  });
+
+  test('arms breakdown shows amber n/a chip when per_arm_verdicts has met=null (unmeasured arm)', async () => {
+    const armsJob = makeJob({
+      id: 'job-pav-null-met',
+      task_title: 'null met experiment',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.5,
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-measured': { score: 0.92 },
+            'arm-crashed': {},
+          },
+        },
+      },
+      per_arm_verdicts: {
+        'arm-measured': { value: 0.92, met: true, cost_usd: 1.00 },
+        'arm-crashed': { value: null, met: null, cost_usd: 0.50 },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([armsJob]));
+    const { findByTestId, getAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('arms-breakdown');
+    const verdictChips = getAllByTestId('arm-verdict-chip');
+    expect(verdictChips).toHaveLength(2);
+    const passChip = verdictChips.find((c) => c.textContent === 'pass');
+    const naChip = verdictChips.find((c) => c.textContent === 'n/a');
+    expect(passChip).toBeTruthy();
+    expect(naChip).toBeTruthy();
+    expect(passChip!.className).toContain('emerald');
+    expect(naChip!.className).toContain('amber');
+  });
+
+  test('arms breakdown omits verdict chip and cost when per_arm_verdicts absent', async () => {
+    const armsJob = makeJob({
+      id: 'job-no-pav',
+      task_title: 'no verdict experiment',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-a': { score: 0.9 },
+            'arm-b': { score: 0.8 },
+          },
+        },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([armsJob]));
+    const { findByTestId, queryAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('arms-breakdown');
+    expect(queryAllByTestId('arm-verdict-chip')).toHaveLength(0);
+    expect(queryAllByTestId('arm-cost')).toHaveLength(0);
+  });
+
   test('test_per_arm_comparison_renders_cost_and_passfail_chip', async () => {
     // job1 has per-arm costs and criterion_verdict.per_arm so the comparison
     // matrix can show numeric cost_usd chips and pass/fail verdicts per arm.
@@ -2683,3 +2781,4 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(queryAllByTestId('arm-passfail-chip')).toHaveLength(0);
   });
 });
+

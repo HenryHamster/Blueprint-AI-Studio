@@ -3163,6 +3163,14 @@ export interface ComputeJob {
   experiment?: string | null;
   benchmark?: string | null;
   hypothesis?: string | null;
+  // Per-arm criterion verdicts with apportioned costs; present when the task
+  // recorded per-arm evaluation (multi-arm experiments with a success criterion).
+  // Keyed by arm name. Absent on legacy rows or single-arm jobs.
+  per_arm_verdicts?: Record<string, {
+    value: number | null;
+    met: boolean | null;
+    cost_usd: number | null;
+  }> | null;
 }
 
 export interface ComputeJobsSummary {

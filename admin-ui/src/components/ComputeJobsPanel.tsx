@@ -1518,6 +1518,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                             const otherStrings = Object.entries(arm.metrics).filter(
                               ([mk, mv]) => typeof mv === 'string' && !DIAGNOSTIC_KEYS.has(mk),
                             );
+                            const pav = job.per_arm_verdicts?.[arm.name];
                             return (
                               <div
                                 key={arm.name}
@@ -1532,6 +1533,25 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                                     >
                                       exit {exitCodeVal}
                                     </span>
+                                  )}
+                                  {pav != null && pav.met !== null && (
+                                    <span
+                                      className={`rounded border px-1 py-0.5 text-ui-xs font-semibold ${pav.met ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : 'border-red-500/40 bg-red-500/15 text-red-300'}`}
+                                      data-testid="arm-verdict-chip"
+                                    >
+                                      {pav.met ? 'pass' : 'fail'}
+                                    </span>
+                                  )}
+                                  {pav != null && pav.met === null && (
+                                    <span
+                                      className="rounded border px-1 py-0.5 text-ui-xs font-semibold border-amber-500/40 bg-amber-500/15 text-amber-300"
+                                      data-testid="arm-verdict-chip"
+                                    >
+                                      n/a
+                                    </span>
+                                  )}
+                                  {pav?.cost_usd != null && (
+                                    <span className="text-ui-xs text-neutral-400 font-mono" data-testid="arm-cost">{fmtUsd(pav.cost_usd)}</span>
                                   )}
                                 </div>
                                 {labelVal && (

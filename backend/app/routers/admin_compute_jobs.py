@@ -150,6 +150,7 @@ async def _build_compute_job_payload(
             )
         # Derive knowledge_document_id from the task's plan_output.
         knowledge_document_id: str | None = None
+        per_arm_verdicts: dict | None = None
         if task_obj is not None:
             knowledge_doc = (task_obj.plan_output or {}).get("knowledge_document") or {}
             raw_kdoc_id = (
@@ -158,6 +159,8 @@ async def _build_compute_job_payload(
             knowledge_document_id = (
                 str(raw_kdoc_id) if raw_kdoc_id is not None else None
             )
+            raw_pav = knowledge_doc.get("per_arm_verdicts") if isinstance(knowledge_doc, dict) else None
+            per_arm_verdicts = raw_pav if isinstance(raw_pav, dict) else None
         experiment: str | None = None
         benchmark: str | None = None
         hypothesis: str | None = None
@@ -174,6 +177,7 @@ async def _build_compute_job_payload(
         data["success_criterion"] = success_criterion
         data["criterion_verdict"] = criterion_verdict
         data["knowledge_document_id"] = knowledge_document_id
+        data["per_arm_verdicts"] = per_arm_verdicts
         data["experiment"] = experiment
         data["benchmark"] = benchmark
         data["hypothesis"] = hypothesis

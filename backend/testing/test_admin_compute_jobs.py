@@ -645,6 +645,55 @@ async def test_list_compute_jobs_includes_success_criterion_and_verdict(
 
 
 @pytest.mark.asyncio
+async def test_list_compute_jobs_per_arm_verdicts_exposed(
+    client: AsyncClient, db_session
+):
+    """The list endpoint exposes per_arm_verdicts from plan_output.knowledge_document."""
+    project = await _make_project(db_session, name="Per-Arm Verdicts Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    per_arm = {
+        "arm_a": {"value": 0.92, "met": True, "cost_usd": 0.30},
+        "arm_b": {"value": 0.88, "met": False, "cost_usd": 0.90},
+    }
+    task = Task(
+        project_id=project.id,
+        title="per-arm task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment"}],
+        plan_output={
+            "compute_result": {"outcome": "SUCCESS", "final_cost_usd": 1.20},
+            "knowledge_document": {"per_arm_verdicts": per_arm},
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=2.0,
+        accrued_cost_usd=1.20,
+        completed_at=datetime.utcnow(),
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs = resp.json()["compute_jobs"]
+    assert len(jobs) == 1
+
+    assert jobs[0]["per_arm_verdicts"] == per_arm
+    assert jobs[0]["per_arm_verdicts"]["arm_a"]["cost_usd"] == pytest.approx(0.30)
+    assert jobs[0]["per_arm_verdicts"]["arm_b"]["met"] is False
+
+
+@pytest.mark.asyncio
 async def test_list_compute_jobs_no_criterion_returns_null(
     client: AsyncClient, db_session
 ):
