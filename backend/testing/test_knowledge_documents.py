@@ -2265,6 +2265,7 @@ async def test_knowledge_index_entry_shape(db_session):
         "compute_acceptance_grade",
         "compute_acceptance_reason",
         "unavailable_cause",
+        "criterion_met",
         "origin_provenance",
         "sweep_id",
         "arm_label",
@@ -2891,3 +2892,104 @@ def test_build_compute_experiment_document_failed_arms_list():
     assert "result file not written" in failed_section
     # arm_b succeeded — must not appear in the failed section
     assert "arm_b" not in failed_section
+
+
+# ── criterion_met surfacing in knowledge index and sweep groups ───────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_sweep_verdict_reflects_criterion_met(db_session):
+    """_knowledge_index_entry exposes criterion_met from forward_quality_verdict,
+    independent of compute_acceptance_grade.
+
+    A compute_experiment doc with criterion_met=True and grade 'measured_only'
+    (not 'acceptance') must surface criterion_met=True in the index entry —
+    proving the verdict is NOT derived from the acceptance grade.
+    A doc with criterion_met=False must surface False; a doc with no
+    criterion_met key in its verdict must surface None.
+    """
+    from app.knowledge_query import build_compute_sweep_groups, build_knowledge_index
+
+    project, task = await _make_web_research_task(db_session, project_name="CRIT")
+
+    # ARM 1: criterion MET but grade is measured_only (deterministic path).
+    # This is the bug-case: old code would have shown NOT MET because grade != acceptance.
+    met_doc = await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="arm met",
+        source_kind="compute_experiment",
+        sweep_id="sw-crit",
+        arm_label="met_arm",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": True,
+            "criterion": {"metric": "accuracy", "value": 0.95},
+        },
+        # No source_citations → measured_only grade (not acceptance).
+        source_citations=None,
+    )
+
+    # ARM 2: criterion NOT MET, also measured_only grade.
+    not_met_doc = await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="arm not met",
+        source_kind="compute_experiment",
+        sweep_id="sw-crit",
+        arm_label="not_met_arm",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": False,
+            "criterion": {"metric": "accuracy", "value": 0.72},
+        },
+        source_citations=None,
+    )
+
+    # ARM 3: unmeasured — forward_quality_verdict has no criterion_met key.
+    unmeasured_doc = await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="arm unmeasured",
+        source_kind="compute_experiment",
+        sweep_id="sw-crit",
+        arm_label="unmeasured_arm",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            # criterion_met absent → None
+        },
+        source_citations=None,
+    )
+
+    # --- via build_knowledge_index ---
+    index = await build_knowledge_index(db_session, project.id)
+    by_id = {e["id"]: e for e in index}
+
+    met_entry = by_id[str(met_doc.id)]
+    not_met_entry = by_id[str(not_met_doc.id)]
+    unmeasured_entry = by_id[str(unmeasured_doc.id)]
+
+    # Verify grade is NOT 'acceptance' for met_arm — confirms verdict is not grade-derived.
+    assert met_entry["compute_acceptance_grade"] != "acceptance"
+    assert met_entry["criterion_met"] is True
+
+    assert not_met_entry["compute_acceptance_grade"] != "acceptance"
+    assert not_met_entry["criterion_met"] is False
+
+    assert unmeasured_entry["criterion_met"] is None
+
+    # --- via build_compute_sweep_groups (same _knowledge_index_entry path) ---
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-crit" in groups
+    sweep_entries = groups["sw-crit"]
+    by_label = {e["arm_label"]: e for e in sweep_entries}
+
+    assert by_label["met_arm"]["criterion_met"] is True
+    assert by_label["met_arm"]["compute_acceptance_grade"] != "acceptance"
+
+    assert by_label["not_met_arm"]["criterion_met"] is False
+
+    assert by_label["unmeasured_arm"]["criterion_met"] is None

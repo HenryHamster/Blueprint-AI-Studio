@@ -456,15 +456,17 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
             const title = strVal(arm.title);
             if (!id || !title) continue;
             const armLabel = strVal(arm.arm_label);
-            const grade = strVal(arm.compute_acceptance_grade);
             const unavailableCause = strVal(arm.unavailable_cause);
+            const criterionMet = arm.criterion_met;
             let verdict: string;
             if (unavailableCause) {
               verdict = `unavailable (${unavailableCause})`;
-            } else if (grade === 'acceptance') {
+            } else if (criterionMet === true) {
               verdict = 'MET';
-            } else {
+            } else if (criterionMet === false) {
               verdict = 'NOT MET';
+            } else {
+              verdict = 'UNMEASURED';
             }
             const armPrefix = armLabel ? `**${armLabel}**` : id;
             sweepLines.push(`- ${armPrefix} [${verdict}] [${id}] ${title}`);

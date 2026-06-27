@@ -739,6 +739,7 @@ async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session)
         "compute_acceptance_grade",
         "compute_acceptance_reason",
         "unavailable_cause",
+        "criterion_met",
         "origin_provenance",
         "sweep_id",
         "arm_label",
@@ -769,9 +770,19 @@ async def test_spawn_review_omits_knowledge_index_when_none(db_session):
 
 
 async def _seed_sweep_arm(
-    session, project, *, sweep_id, arm_label, title="Arm doc"
+    session,
+    project,
+    *,
+    sweep_id,
+    arm_label,
+    title="Arm doc",
+    criterion_met=None,
 ):
-    """Persist one compute_experiment KnowledgeDocument carrying sweep identity."""
+    """Persist one compute_experiment KnowledgeDocument carrying sweep identity.
+
+    criterion_met (True/False/None) is stored in forward_quality_verdict so
+    that _knowledge_index_entry surfaces the true success-criterion verdict.
+    """
     from app.models import KnowledgeDocument
 
     task = Task(
@@ -784,6 +795,7 @@ async def _seed_sweep_arm(
     session.add(task)
     await session.commit()
     await session.refresh(task)
+    forward_quality_verdict = {"analysis_mode": "deterministic", "criterion_met": criterion_met}
     doc = KnowledgeDocument(
         project_id=project.id,
         source_task_id=task.id,
@@ -794,6 +806,7 @@ async def _seed_sweep_arm(
         source_kind="compute_experiment",
         sweep_id=sweep_id,
         arm_label=arm_label,
+        forward_quality_verdict=forward_quality_verdict,
     )
     session.add(doc)
     await session.commit()
@@ -862,6 +875,43 @@ async def test_spawn_review_omits_sweep_groups_when_none(db_session):
         if t.payloads[0]["type"] == "strategic_review"
     )
     assert "compute_experiment_sweeps" not in payload
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_sweep_entries_carry_criterion_met(db_session):
+    """strategic_review sweep entries expose criterion_met from forward_quality_verdict,
+    not from the acceptance grade — ensuring the strategist sees the true verdict."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+    # Two arms: one met (True), one not met (False). Both use measured_only grade
+    # (no source_citations, no llm analysis) to prove verdict is criterion_met-derived.
+    await _seed_sweep_arm(
+        db_session, project, sweep_id="sw-crit", arm_label="met", criterion_met=True
+    )
+    await _seed_sweep_arm(
+        db_session, project, sweep_id="sw-crit", arm_label="not_met", criterion_met=False
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "strategic_review"
+    )
+    assert "compute_experiment_sweeps" in payload
+    groups = payload["compute_experiment_sweeps"]
+    assert "sw-crit" in groups
+    by_label = {e["arm_label"]: e for e in groups["sw-crit"]}
+    # Met arm: criterion_met=True, grade is NOT acceptance.
+    assert by_label["met"]["criterion_met"] is True
+    assert by_label["met"]["compute_acceptance_grade"] != "acceptance"
+    # Not-met arm: criterion_met=False.
+    assert by_label["not_met"]["criterion_met"] is False
 
 
 @pytest.mark.asyncio

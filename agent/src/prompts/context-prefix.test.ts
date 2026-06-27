@@ -78,8 +78,8 @@ describe('buildContextPrefix', () => {
         // compute_experiment_sweeps is a dict {sweepId: [_knowledge_index_entry, ...]}
         compute_experiment_sweeps: {
           'sw-abcd1234': [
-            { id: 'kd-aaa', title: 'arm baseline', arm_label: 'baseline', compute_acceptance_grade: 'measured_only', summary: 'accuracy 0.88' },
-            { id: 'kd-bbb', title: 'arm treatment', arm_label: 'treatment', compute_acceptance_grade: 'acceptance', summary: 'accuracy 0.93' },
+            { id: 'kd-aaa', title: 'arm baseline', arm_label: 'baseline', criterion_met: false, compute_acceptance_grade: 'measured_only', summary: 'accuracy 0.88' },
+            { id: 'kd-bbb', title: 'arm treatment', arm_label: 'treatment', criterion_met: true, compute_acceptance_grade: 'measured_only', summary: 'accuracy 0.93' },
           ],
         },
       }],
@@ -608,7 +608,8 @@ describe('buildContextPrefix — compute experiment sweeps', () => {
               title: 'Arm A: baseline',
               summary: 'Baseline result summary.',
               arm_label: 'baseline',
-              compute_acceptance_grade: 'acceptance',
+              criterion_met: true,
+              compute_acceptance_grade: 'measured_only',
               source_kind: 'compute_experiment',
             },
             {
@@ -616,6 +617,7 @@ describe('buildContextPrefix — compute experiment sweeps', () => {
               title: 'Arm B: optimized',
               summary: 'Optimized result summary.',
               arm_label: 'optimized',
+              criterion_met: false,
               compute_acceptance_grade: 'measured_only',
               source_kind: 'compute_experiment',
             },
@@ -634,6 +636,68 @@ describe('buildContextPrefix — compute experiment sweeps', () => {
     expect(prefix).toContain('[NOT MET]');
     expect(prefix).toContain('[kd-arm-2]');
     expect(prefix).toContain('./fetch knowledge <id>');
+  });
+
+  it('renders UNMEASURED when criterion_met is null/undefined', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        compute_experiment_sweeps: {
+          'sweep-null': [
+            {
+              id: 'kd-arm-x',
+              title: 'Arm X: unmeasured',
+              summary: 'Metric not captured.',
+              arm_label: 'unmeasured',
+              criterion_met: null,
+              compute_acceptance_grade: 'measured_only',
+              source_kind: 'compute_experiment',
+            },
+            {
+              id: 'kd-arm-y',
+              title: 'Arm Y: met',
+              arm_label: 'met',
+              criterion_met: true,
+              compute_acceptance_grade: 'measured_only',
+              source_kind: 'compute_experiment',
+            },
+          ],
+        },
+      }],
+    });
+    expect(prefix).toContain('[UNMEASURED]');
+    expect(prefix).toContain('[MET]');
+    expect(prefix).not.toContain('[NOT MET]');
+  });
+
+  it('criterion_met=true renders MET even when grade is measured_only (not acceptance)', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        compute_experiment_sweeps: {
+          'sweep-det': [
+            {
+              id: 'kd-det-1',
+              title: 'Deterministic met arm',
+              arm_label: 'det',
+              criterion_met: true,
+              compute_acceptance_grade: 'measured_only',
+              source_kind: 'compute_experiment',
+            },
+            {
+              id: 'kd-det-2',
+              title: 'Deterministic not-met arm',
+              arm_label: 'det2',
+              criterion_met: false,
+              compute_acceptance_grade: 'measured_only',
+              source_kind: 'compute_experiment',
+            },
+          ],
+        },
+      }],
+    });
+    expect(prefix).toContain('[MET]');
+    expect(prefix).toContain('[NOT MET]');
   });
 
   it('shows unavailable verdict when unavailable_cause is set', () => {
@@ -678,7 +742,8 @@ describe('buildContextPrefix — compute experiment sweeps', () => {
               id: 'kd-arm-1',
               title: 'Some arm',
               arm_label: 'a',
-              compute_acceptance_grade: 'acceptance',
+              criterion_met: true,
+              compute_acceptance_grade: 'measured_only',
             },
           ],
         },

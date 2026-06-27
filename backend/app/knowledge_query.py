@@ -515,6 +515,11 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
         if isinstance(doc.forward_quality_verdict, dict)
         else {}
     )
+    is_compute = doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
+    # criterion_met: tri-state (True/False/None) read from the persisted verdict.
+    # True = criterion was met, False = not met, None = unmeasured/not evaluable.
+    # Distinct from compute_acceptance_grade (a trustworthiness signal).
+    criterion_met: bool | None = verdict.get("criterion_met") if is_compute else None
     return {
         "id": str(doc.id),
         "title": doc.title,
@@ -525,18 +530,15 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
         "sweep_id": doc.sweep_id,
         "arm_label": doc.arm_label,
         "analysis_fallback_reason": (
-            verdict.get("fallback_reason")
-            if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
-            else None
+            verdict.get("fallback_reason") if is_compute else None
         ),
         "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
         "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
         "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
         "unavailable_cause": (
-            verdict.get("unavailable_cause")
-            if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
-            else None
+            verdict.get("unavailable_cause") if is_compute else None
         ),
+        "criterion_met": criterion_met,
         "origin_provenance": serialize_origin_provenance(doc),
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
     }
