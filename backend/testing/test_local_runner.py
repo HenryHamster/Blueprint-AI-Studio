@@ -1120,3 +1120,111 @@ class TestRegistryPasswordErasedOnTerminalFinalization:
 
         assert "container_registry_auth" not in (job.polling_metadata or {})
         assert job.polling_metadata.get("runner_target_id") == "some-runner-id"
+
+
+class TestReportCommandLogDropsArbitraryKeys:
+    """Pin the allowlist behavior of the /compute-job/{id}/report endpoint.
+
+    The handler ONLY extracts ``text`` from ``command_log`` and writes a
+    fixed-shape ``{"text": ..., "truncated": ...}`` object — no injected keys
+    leak through, and result_metrics is bounded by _MAX_RUNNER_RESULT_METRICS_KEYS.
+    """
+
+    async def _make_running_job(self, db_session):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+        return project, runner, token, job
+
+    @pytest.mark.asyncio
+    async def test_report_command_log_drops_arbitrary_keys(
+        self, client: AsyncClient, db_session
+    ):
+        """Extra/hostile keys in command_log must NOT appear in polling_metadata."""
+        from app.routers.runner import _MAX_RUNNER_RESULT_METRICS_KEYS
+
+        _project, runner, token, job = await self._make_running_job(db_session)
+
+        # Build a command_log with hostile keys beyond ``text``.
+        hostile_command_log = {
+            "text": "run ok",
+            "injected": "x",
+            "container_registry_auth": {"password": "leak"},
+            "runner_exit_code": 999,
+        }
+
+        # Build a result_metrics dict exceeding the key cap.
+        oversized_metrics = {f"metric_{i}": i for i in range(_MAX_RUNNER_RESULT_METRICS_KEYS + 50)}
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "running",
+                "command_log": hostile_command_log,
+                "result_metrics": oversized_metrics,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["ok"] is True
+
+        await db_session.refresh(job)
+        meta = job.polling_metadata
+
+        # runner_command_log must contain ONLY text and truncated.
+        command_log_stored = meta.get("runner_command_log", {})
+        assert set(command_log_stored.keys()) == {"text", "truncated"}, (
+            f"runner_command_log must have exactly {{text, truncated}}, got {set(command_log_stored.keys())}"
+        )
+        assert command_log_stored["text"] == "run ok"
+        assert command_log_stored["truncated"] is False
+
+        # Hostile keys must NOT appear as top-level polling_metadata keys.
+        for hostile_key in ("injected", "container_registry_auth", "runner_exit_code"):
+            assert hostile_key not in meta, (
+                f"hostile key '{hostile_key}' leaked into top-level polling_metadata"
+            )
+
+        # result_metrics must be bounded.
+        stored_metrics = meta.get("runner_result_metrics", {})
+        assert len(stored_metrics) <= _MAX_RUNNER_RESULT_METRICS_KEYS, (
+            f"result_metrics has {len(stored_metrics)} keys, expected <= {_MAX_RUNNER_RESULT_METRICS_KEYS}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_report_command_log_truncates_oversized_text(
+        self, client: AsyncClient, db_session
+    ):
+        """Oversized text in command_log is truncated and truncated=True is set."""
+        from app.routers.runner import _MAX_RUNNER_COMMAND_LOG_BYTES
+
+        _project, _runner, token, job = await self._make_running_job(db_session)
+
+        # Build a text that exceeds the byte cap.
+        big_text = "A" * (_MAX_RUNNER_COMMAND_LOG_BYTES + 1000)
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "running",
+                "command_log": {"text": big_text, "extra_hostile": "should_drop"},
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(job)
+        stored = job.polling_metadata.get("runner_command_log", {})
+        assert stored.get("truncated") is True, "truncated must be True for oversized text"
+        assert set(stored.keys()) == {"text", "truncated"}, (
+            f"runner_command_log must have exactly {{text, truncated}}, got {set(stored.keys())}"
+        )
+        assert len(stored["text"].encode("utf-8")) <= _MAX_RUNNER_COMMAND_LOG_BYTES
