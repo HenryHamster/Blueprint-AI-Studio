@@ -1,5 +1,6 @@
 import { CheckSquare, X } from 'lucide-react';
 import type { Task } from '../types/task';
+import { buildBulkCancelConsequence } from './taskCancelCopy';
 
 interface ConfirmDialogConfig {
   title: string;
@@ -28,7 +29,7 @@ function buildBulkConfirmList(tasks: Task[]): string {
 }
 
 // Prepend a one-line consequence summary above the affected-task list so the
-// operator sees the blast radius before confirming a bulk mutation.
+// operator sees the scoped impact before confirming a bulk mutation.
 function buildBulkConfirmMessage(tasks: Task[], consequence?: string): string {
   const list = buildBulkConfirmList(tasks);
   return consequence ? `${consequence}\n\n${list}` : list;
@@ -73,7 +74,7 @@ export function BulkActionBar({
         <button
           onClick={() => setConfirmDialog({
             title: `Cancel ${cancellableTasks.length} task${cancellableTasks.length !== 1 ? 's' : ''}?`,
-            message: buildBulkConfirmMessage(cancellableTasks, 'Stops these tasks and terminates their VMs. In-progress work is discarded.'),
+            message: buildBulkConfirmMessage(cancellableTasks, buildBulkCancelConsequence(cancellableTasks)),
             confirmLabel: `Cancel ${cancellableTasks.length}`,
             onConfirm: () => handleBulkCancel(cancellableTasks.map(t => t.id)),
           })}

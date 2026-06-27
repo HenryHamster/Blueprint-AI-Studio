@@ -209,6 +209,27 @@ Any action that is hard to reverse (cancel a wave of tasks, delete a direction, 
 
 "Are you sure? Yes / No" is not sufficient.
 
+### Cancellation semantics must be explicit
+Task cancellation is a `status → CANCELLED` mutation. Current surfaces are:
+- Drawer/card Cancel Task: non-approval QUEUED, PROVISIONING, IN_PROGRESS,
+  EVALUATING, BLOCKED, or PARKED tasks.
+- Drawer/card Reject: approval-gated non-terminal tasks.
+- Bulk cancel: selected QUEUED, PROVISIONING, IN_PROGRESS, EVALUATING, BLOCKED, or PARKED tasks.
+
+Backend effects:
+- Direct active children are cascaded to CANCELLED when their `parent_task_id`
+  is the cancelled task and their status is QUEUED, PROVISIONING,
+  IN_PROGRESS, or EVALUATING.
+- Orphan PR cleanup runs where task context identifies an open PR; cleanup is
+  best effort and must not block the cancel.
+- Queued, blocked, and parked tasks may have no VM to terminate.
+- Waiting dependents may be stranded if they depended on a cancelled task.
+
+Impact counts shown by the UI must be labeled by scope. A drawer or card can
+show loaded/visible dependent counts as a fallback, but exact cancellation
+impact must come from a backend-owned summary such as
+`GET /api/admin/tasks/{task_id}/cancel-impact`.
+
 ### Settings that alter risk or cost are policy changes
 Anything that changes the resource envelope, provider assignment, autonomous mode, or auto-merge gate is a **policy change**, not a setting update. It must:
 1. Show the current value and the new value before applying

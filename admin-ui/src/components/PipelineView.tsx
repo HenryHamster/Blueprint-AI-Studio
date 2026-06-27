@@ -182,7 +182,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
       {(blockingCount ?? 0) > 0 && (task.status === 'FAILED' || task.status === 'CANCELLED') && (
         <span className="inline-flex items-center gap-1 text-ui-xs font-medium bg-red-500/10 border border-red-500/30 text-red-400 px-1.5 py-0.5 rounded whitespace-nowrap shrink-0">
           <AlertTriangle className="w-2.5 h-2.5" />
-          Blocking {blockingCount}
+          Blocking {blockingCount} visible
         </span>
       )}
 

@@ -202,7 +202,10 @@ List all tasks in a project.
 
 ### `POST /api/projects/{project_id}/cancel`
 
-Cancel a project and its active work.
+Cancel a project and its active work. Marks the project `CANCELLED`, cancels
+project tasks in `QUEUED`, `PROVISIONING`, `IN_PROGRESS`, `EVALUATING`, or
+`PARKED`, and deletes VMs only for cancelled tasks that have a
+`vm_instance_id`. This is a project-wide owner action.
 
 ---
 
@@ -953,7 +956,9 @@ Manual operator escape hatches for the autonomous pipeline.
 | POST | `/api/admin/projects/{project_id}/self-audit` | Enqueue a `self_audit` task for the project. |
 | POST | `/api/admin/projects/{project_id}/qualify` | Manually trigger the release qualifier for the open version. |
 | POST | `/api/admin/projects/{project_id}/clear-wave-deps` | Clear only stale/legacy wave serialization edges on QUEUED tasks; structural prerequisites are preserved. |
-| PATCH | `/api/admin/tasks/{task_id}` | Mutate an existing task in place — drives the drawer's Retry (`status → QUEUED`), Cancel/Dismiss (`status → CANCELLED`), and Edit (`payloads[0].prompt`) actions. Does not create a new task. |
+| PATCH | `/api/admin/tasks/{task_id}` | Mutate an existing task in place — drives single-task Retry (`status → QUEUED`), Cancel/Dismiss/Reject/card cancel (`status → CANCELLED`), and Edit (`payloads[0].prompt`) actions. Does not create a new task. |
+| GET | `/api/admin/tasks/{task_id}/cancel-impact` | Preview cancellation impact for confirmations: active child cascade count, waiting dependent count, VM cleanup signals, and PR cleanup hints. |
+| POST | `/api/admin/tasks/bulk-action` | Bulk approve, retry, or cancel selected tasks. |
 | POST | `/api/admin/tasks/{task_id}/archive` | Move a terminal task out of the active board into the archive view (status unchanged). |
 | POST | `/api/admin/tasks/{task_id}/unarchive` | Restore an archived task to the active board. |
 | POST | `/api/admin/tasks/{task_id}/rollup` | Manually trigger the rollup PR for an EVALUATING parent task. |
@@ -973,7 +978,10 @@ Manual operator actions that kick off pipeline work
 - **`POST /api/admin/projects/{project_id}/self-audit`** — spawn a self-audit task.
 - **`POST /api/admin/projects/{project_id}/qualify`** — trigger a release-qualification run.
 - **`POST /api/admin/projects/{project_id}/clear-wave-deps`** — clear only stale/legacy wave serialization edges on QUEUED tasks while PRESERVING structural prerequisites (research prerequisites, blocked-need resolution, sibling foundations). Returns `cleared`, `preserved`, and `total_queued`.
-- **`PATCH /api/admin/tasks/{task_id}`** — the single operator task-mutation endpoint behind the drawer actions: **Retry** sends `{"status": "QUEUED"}` (re-queues the same task — no new task row), **Cancel/Dismiss** send `{"status": "CANCELLED"}`, and **Edit** sends `{"payloads": [{"prompt": "..."}]}`. Status transitions, cascade cancellation, and requeue are applied in `admin_task_mutations.modify_task_apply`.
+- **`PATCH /api/admin/tasks/{task_id}`** — single-task mutation. **Retry** sends `{"status": "QUEUED"}` (re-queues the same task — no new task row), **Cancel/Dismiss/Reject/card cancel** send `{"status": "CANCELLED"}`, and **Edit** sends `{"payloads": [{"prompt": "..."}]}`. Status transitions, cascade cancellation, and requeue are applied in `admin_task_mutations.modify_task_apply`.
+- **`POST /api/admin/tasks/bulk-action`** — body: `{"action": "approve" | "retry" | "cancel", "task_ids": ["..."]}`. Returns `results`, `success_count`, and `error_count`.
+- **`GET /api/admin/tasks/{task_id}/cancel-impact`** — read-only confirmation helper. Returns authoritative project-scoped counts for direct active children that would cascade cancel, waiting dependents with `depends_on` edges, target/child VM cleanup signals, and conservative PR cleanup hints.
+- Cancellation via `PATCH status → CANCELLED` or bulk `action=cancel` sets the selected task terminal, clears approval, cascades `CANCELLED` to direct active children (`parent_task_id == task.id`, status `QUEUED`/`PROVISIONING`/`IN_PROGRESS`/`EVALUATING`), and runs best-effort orphan PR cleanup where task context identifies an open PR. VM/account cleanup runs only for cancelled rows that have a `vm_instance_id` or account lease. Queued, blocked, and parked tasks may have no provisioned VM to terminate. Waiting dependents may be stranded; use `/cancel-impact` for full project-scoped counts before presenting exact impact.
 - **`POST /api/admin/tasks/{task_id}/archive`** / **`/unarchive`** — move a terminal task out of (or back into) the active board without changing its status.
 - **`POST /api/admin/tasks/{task_id}/rollup`** — force a rollup of the given task's branch.
 - **`GET /api/admin/projects/{project_id}/findings`** — list audit/research findings.

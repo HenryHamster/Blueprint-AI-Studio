@@ -86,6 +86,8 @@ from app.admin_helpers import (  # noqa: F401
     _get_user_task_with_role,
 )
 from app.admin_task_mutations import (
+    CANCEL_CASCADE_CHILD_STATUSES,
+    CANCEL_WAITING_DEPENDENT_STATUSES,
     _handle_rollup_pr_approval,
     _handle_task_pr_approval,
     modify_task_apply,
@@ -883,14 +885,7 @@ async def bulk_action_tasks(
         _child_result = await session.execute(
             select(Task).where(
                 Task.parent_task_id.in_(list(valid_map.values())),
-                Task.status.in_(
-                    [
-                        TaskStatus.QUEUED,
-                        TaskStatus.PROVISIONING,
-                        TaskStatus.IN_PROGRESS,
-                        TaskStatus.EVALUATING,
-                    ]
-                ),
+                Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
             )
         )
         for _child in _child_result.scalars().all():
@@ -1145,6 +1140,117 @@ def _task_llm_cost_fields(task: Task) -> dict:
     return {
         "task_llm_cost_usd": round(llm_cost, 6) if llm_cost else None,
         "task_llm_cost_any_unpriced": any_unpriced,
+    }
+
+
+def _status_value(status: TaskStatus | str) -> str:
+    return status.value if isinstance(status, TaskStatus) else str(status)
+
+
+def _status_values(statuses: tuple[TaskStatus, ...]) -> list[str]:
+    return [_status_value(status) for status in statuses]
+
+
+def _task_has_cancel_pr_context_reference(task: Task) -> bool:
+    ctx = task.context or {}
+    if not isinstance(ctx, dict):
+        return False
+    if ctx.get("_pr_url") or ctx.get("pr_url"):
+        return True
+
+    review_loop = ctx.get("review_loop") or {}
+    if isinstance(review_loop, dict) and review_loop.get("pr_number") is not None:
+        return True
+
+    return bool(ctx.get("rollup_pr_url") or ctx.get("rollup_pr_number") is not None)
+
+
+@router.get("/tasks/{task_id}/cancel-impact")
+async def get_task_cancel_impact(
+    task_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        tid = uuid.UUID(task_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = await _get_user_task_with_role(
+        tid, current_user["user_id"], session, "member"
+    )
+
+    active_children = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == task.id,
+                    Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    dependent_candidates = (
+        await session.execute(
+            select(Task.id, Task.depends_on).where(
+                Task.project_id == task.project_id,
+                Task.id != task.id,
+                Task.status.in_(CANCEL_WAITING_DEPENDENT_STATUSES),
+            )
+        )
+    ).all()
+    waiting_dependent_count = sum(
+        1
+        for _dependent_id, depends_on in dependent_candidates
+        if str(task.id) in {str(dep_id) for dep_id in (depends_on or [])}
+    )
+
+    impact_task_ids = [task.id, *(child.id for child in active_children)]
+    pr_artifact_task_ids: set[str] = set()
+    if impact_task_ids:
+        pr_artifact_task_ids = {
+            str(row)
+            for row in (
+                await session.execute(
+                    select(Artifact.task_id).where(
+                        Artifact.task_id.in_(impact_task_ids),
+                        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        }
+
+    pr_context_reference_count = sum(
+        1
+        for candidate in [task, *active_children]
+        if _task_has_cancel_pr_context_reference(candidate)
+    )
+
+    return {
+        "task_id": str(task.id),
+        "status": _status_value(task.status),
+        "active_child_cascade_count": len(active_children),
+        "active_child_cascade_statuses": _status_values(CANCEL_CASCADE_CHILD_STATUSES),
+        "waiting_dependent_count": waiting_dependent_count,
+        "waiting_dependent_statuses": _status_values(
+            CANCEL_WAITING_DEPENDENT_STATUSES
+        ),
+        "target_vm_instance_id": task.vm_instance_id,
+        "target_has_vm_id": bool(task.vm_instance_id),
+        "target_vm_provisioned": task.vm_provisioned_at is not None,
+        "active_child_vm_id_count": sum(
+            1 for child in active_children if child.vm_instance_id
+        ),
+        "active_child_vm_provisioned_count": sum(
+            1 for child in active_children if child.vm_provisioned_at is not None
+        ),
+        "orphan_pr_cleanup_context_reference_count": pr_context_reference_count,
+        "pull_request_artifact_task_count": len(pr_artifact_task_ids),
     }
 
 

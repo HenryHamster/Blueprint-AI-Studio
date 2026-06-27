@@ -417,22 +417,25 @@ Attempt 1: FAILED (clone_failed)
 
 ### Manual Retry, Dismiss, Cancel & Archive
 
-Operator actions in the task drawer mutate the **existing** task — they do not
-spawn a fresh task row (the only exception is the automatic CI-driven `fix`
-tasks above):
+Operator task actions mutate the **existing** task — they do not spawn a fresh
+task row (the only exception is the automatic CI-driven `fix` tasks above):
 
 | Action | Where | Effect |
 |--------|-------|--------|
 | **Retry** | FAILED task drawer | Re-queues the **same** task (`status → QUEUED`). It re-provisions and runs again under the same task id — no new task is created. |
 | **Dismiss** | FAILED task drawer | Cancels the task (`status → CANCELLED`) to clear it from attention without re-running it. |
-| **Cancel Task** | active (IN_PROGRESS/QUEUED) task drawer | Stops the running task (`status → CANCELLED`). |
+| **Cancel Task** | Non-approval QUEUED, PROVISIONING, IN_PROGRESS, EVALUATING, BLOCKED, or PARKED task drawer/card | Cancels the task (`status → CANCELLED`). Running/provisioning tasks stop the agent and clean up the VM; queued/blocked/parked tasks may have no VM to terminate. |
+| **Reject** | Approval-gated task drawer/card | Cancels the task (`status → CANCELLED`) instead of approving it. |
+| **Bulk cancel** | Selected QUEUED, PROVISIONING, IN_PROGRESS, EVALUATING, BLOCKED, or PARKED tasks | Cancels each selected non-terminal task through the bulk-action endpoint. |
 | **Edit** | FAILED task drawer | Updates the task prompt in place before you Retry it. |
 | **Archive** | task card / drawer | Moves a terminal task out of the active board into the archive view; does not change its status. |
 
 **Blast radius:**
 - **Retry** touches only the single task you act on. It re-uses the same id, so its history and prior attempts stay attached — check the **Logs** tab after it re-runs to confirm the new attempt actually made progress.
-- **Dismiss** (on a FAILED task) cancels only that task.
-- **Cancel Task** (on an active task) cascades `CANCELLED` to all active children (status `QUEUED`, `PROVISIONING`, `IN_PROGRESS`, or `EVALUATING`) and closes any orphan PRs they hold. Tasks that were `QUEUED`/`BLOCKED` waiting on a cancelled child become stranded dependents — the UI warns you of this count before you confirm. Use Cancel with care on parent tasks with running subtrees.
+- **Cancel** and **Dismiss** send `status → CANCELLED`. The backend also cancels direct active children whose `parent_task_id` is the cancelled task and whose status is `QUEUED`, `PROVISIONING`, `IN_PROGRESS`, or `EVALUATING`.
+- The cancel path closes orphan PRs for the cancelled task and for cascaded children when a PR can be resolved from task context. GitHub cleanup is best effort; cancellation still completes if the PR lookup/close fails.
+- VM cleanup only runs for cancelled rows that have a `vm_instance_id`. QUEUED, BLOCKED, and PARKED tasks often have no VM yet, so there may be nothing to terminate.
+- Waiting dependents can be stranded. The drawer asks `/api/admin/tasks/{task_id}/cancel-impact` for project-scoped dependent and child-cascade counts before showing exact impact. If that read fails, the drawer falls back to a visibly labeled loaded-task count rather than presenting page-scoped data as authoritative.
 
 ---
 

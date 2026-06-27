@@ -1,6 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+
+const apiMocks = vi.hoisted(() => ({
+  authGet: vi.fn(),
+  fetchTaskPrFiles: vi.fn(),
+}));
 
 // Stub firebase before any module that transitively imports it — getAuth()
 // throws at load time when test env lacks VITE_FIREBASE_* vars.
@@ -8,6 +13,12 @@ vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
   signInWithGoogle: vi.fn(),
   signOut: vi.fn(),
+}));
+
+vi.mock('../api', () => ({
+  API_BASE_URL: '',
+  authGet: apiMocks.authGet,
+  fetchTaskPrFiles: apiMocks.fetchTaskPrFiles,
 }));
 
 import { TaskDetailDrawer } from './TaskDetailDrawer';
@@ -39,6 +50,29 @@ const baseHandlers = {
 
 let writeTextSpy: ReturnType<typeof vi.fn>;
 
+function jsonResponse(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status });
+}
+
+function makeCancelImpact(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    task_id: 'task-1',
+    status: 'IN_PROGRESS',
+    waiting_dependent_count: 0,
+    waiting_dependent_statuses: ['QUEUED', 'BLOCKED', 'PROVISIONING', 'PARKED'],
+    active_child_cascade_count: 0,
+    active_child_cascade_statuses: ['QUEUED', 'PROVISIONING', 'IN_PROGRESS', 'EVALUATING'],
+    target_vm_instance_id: null,
+    target_has_vm_id: false,
+    target_vm_provisioned: false,
+    active_child_vm_id_count: 0,
+    active_child_vm_provisioned_count: 0,
+    orphan_pr_cleanup_context_reference_count: 0,
+    pull_request_artifact_task_count: 0,
+    ...overrides,
+  };
+}
+
 describe('TaskDetailDrawer', () => {
   const originalError = console.error;
 
@@ -47,6 +81,8 @@ describe('TaskDetailDrawer', () => {
     // scrollIntoView is not implemented in jsdom
     window.HTMLElement.prototype.scrollIntoView = vi.fn();
     writeTextSpy = vi.fn().mockResolvedValue(undefined);
+    apiMocks.authGet.mockResolvedValue(jsonResponse(makeCancelImpact()));
+    apiMocks.fetchTaskPrFiles.mockResolvedValue({ files: null, pr_number: null });
   });
 
   afterEach(() => {
@@ -175,7 +211,7 @@ describe('TaskDetailDrawer', () => {
     expect(screen.getByText('Approve Spend')).toBeInTheDocument();
   });
 
-  it('cancel confirmation spells out the consequence (VM terminated, work discarded)', async () => {
+  it('cancel confirmation spells out the running consequence (VM cleanup, work discarded)', async () => {
     const user = userEvent.setup();
     render(
       <TaskDetailDrawer
@@ -185,7 +221,7 @@ describe('TaskDetailDrawer', () => {
       />
     );
     await user.click(screen.getByText('Cancel Task'));
-    expect(screen.getByText(/terminates its VM/i)).toBeInTheDocument();
+    expect(screen.getByText(/cleans up its VM/i)).toBeInTheDocument();
     expect(screen.getByText(/In-progress work is discarded/i)).toBeInTheDocument();
     // No stranded-dependents warning when nothing depends on this task.
     expect(screen.queryByTestId('cancel-blast-radius')).not.toBeInTheDocument();
@@ -193,12 +229,14 @@ describe('TaskDetailDrawer', () => {
 
   it('cancel confirmation warns about stranded waiting dependents (blast radius)', async () => {
     const user = userEvent.setup();
+    apiMocks.authGet.mockRejectedValueOnce(new Error('impact endpoint unavailable'));
     const parent = makeTask({ id: 'parent', status: 'IN_PROGRESS' });
     const dependents = [
       makeTask({ id: 'child-1', status: 'QUEUED', depends_on: ['parent'] }),
       makeTask({ id: 'child-2', status: 'BLOCKED', depends_on: ['parent'] }),
+      makeTask({ id: 'child-3', status: 'PARKED', depends_on: ['parent'] }),
       // A completed dependent must NOT count toward the blast radius.
-      makeTask({ id: 'child-3', status: 'COMPLETED', depends_on: ['parent'] }),
+      makeTask({ id: 'child-4', status: 'COMPLETED', depends_on: ['parent'] }),
     ];
     render(
       <TaskDetailDrawer
@@ -209,8 +247,81 @@ describe('TaskDetailDrawer', () => {
       />
     );
     await user.click(screen.getByText('Cancel Task'));
-    const blast = screen.getByTestId('cancel-blast-radius');
-    expect(blast).toHaveTextContent('2 waiting tasks depend on this');
+    expect(await screen.findByTestId('cancel-impact-fallback')).toHaveTextContent(
+      'Full impact check failed',
+    );
+    const blast = await screen.findByTestId('cancel-blast-radius');
+    expect(blast).toHaveTextContent('3 visible waiting tasks depend on this in the loaded task set');
+  });
+
+  it('blocks confirm cancel until backend cancel-impact has resolved', async () => {
+    const user = userEvent.setup();
+    const onCancel = vi.fn();
+    let resolveImpact: (response: Response) => void = () => {};
+    apiMocks.authGet.mockReturnValueOnce(
+      new Promise<Response>(resolve => {
+        resolveImpact = resolve;
+      }),
+    );
+
+    render(
+      <TaskDetailDrawer
+        task={makeTask({ status: 'IN_PROGRESS' })}
+        logLines={[]}
+        {...baseHandlers}
+        onCancel={onCancel}
+      />,
+    );
+
+    await user.click(screen.getByText('Cancel Task'));
+    const confirmButton = screen.getByRole('button', { name: /Confirm cancel/i });
+    expect(confirmButton).toBeDisabled();
+
+    await user.click(confirmButton);
+    expect(onCancel).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveImpact(jsonResponse(makeCancelImpact()));
+    });
+
+    await waitFor(() => expect(confirmButton).not.toBeDisabled());
+    await user.click(confirmButton);
+    expect(onCancel).toHaveBeenCalledWith('task-1');
+  });
+
+  it('cancel confirmation uses backend cancel-impact count when available', async () => {
+    const user = userEvent.setup();
+    apiMocks.authGet.mockResolvedValueOnce(jsonResponse(makeCancelImpact({
+      waiting_dependent_count: 4,
+      active_child_cascade_count: 2,
+      target_vm_instance_id: 'agent-vm-parent',
+      target_has_vm_id: true,
+      target_vm_provisioned: true,
+      active_child_vm_id_count: 2,
+      active_child_vm_provisioned_count: 1,
+      orphan_pr_cleanup_context_reference_count: 2,
+      pull_request_artifact_task_count: 1,
+    })));
+    const parent = makeTask({ id: 'parent', status: 'IN_PROGRESS' });
+    const visibleDependent = makeTask({ id: 'child-visible', status: 'QUEUED', depends_on: ['parent'] });
+    render(
+      <TaskDetailDrawer
+        task={parent}
+        tasks={[parent, visibleDependent]}
+        logLines={[]}
+        {...baseHandlers}
+      />
+    );
+    await user.click(screen.getByText('Cancel Task'));
+    expect(await screen.findByText('4 waiting tasks depend on this and may be stranded.')).toBeInTheDocument();
+    expect(screen.getByTestId('cancel-child-cascade')).toHaveTextContent('2 active child tasks may be cancelled');
+    expect(screen.getByTestId('cancel-vm-cleanup')).toHaveTextContent('target VM provisioned');
+    expect(screen.getByTestId('cancel-vm-cleanup')).toHaveTextContent('2 child VMs recorded');
+    expect(screen.getByTestId('cancel-vm-cleanup')).toHaveTextContent('1 child VM provisioned');
+    expect(screen.getByTestId('cancel-pr-cleanup')).toHaveTextContent(
+      '2 tasks with PR context and 1 PR artifact task',
+    );
+    expect(screen.queryByText(/visible waiting task/)).not.toBeInTheDocument();
   });
 
   it('shows Retry button when task status is FAILED', () => {

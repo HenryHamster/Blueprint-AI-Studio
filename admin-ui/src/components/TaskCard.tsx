@@ -8,6 +8,7 @@ import { humanizeUnverifiedReason } from '../utils/unverifiedReasonLabels';
 import { authGet, API_BASE_URL } from '../api';
 import { EXIT_REASON_COLORS } from '../utils/fixLoopColors';
 import { useTaskCapabilities } from '../taskCapabilities';
+import { buildCancelTitle, isCancellableTaskStatus } from './taskCancelCopy';
 import type { FixLoopSummary } from '../types/task';
 import { deriveSpawnGateState } from '../types/task';
 
@@ -607,17 +608,11 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
   }, []);
 
   const isChild = !!task.parent_task_id;
-  // Consequence-precise action copy. Cancel terminates the VM; dismiss only
-  // flips a failed task to CANCELLED (kept in history); archive moves it off the
-  // board but is recoverable. The blast-radius hint warns when downstream tasks
-  // depend on this one (blockingCount is the count of tasks with this id in
-  // their depends_on edge).
-  const blockingHint = (blockingCount ?? 0) > 0
-    ? ` — ${blockingCount} task${(blockingCount ?? 0) > 1 ? 's' : ''} waiting on this`
-    : '';
+  // Dependency counts come from the visible/loaded task set, not a global
+  // impact endpoint, so labels must keep that scope explicit.
   const cancelTitle = confirmAction === 'cancel'
     ? `Confirm cancel (${confirmCountdown}s)`
-    : `Cancel — stops the agent and terminates its VM${blockingHint}`;
+    : buildCancelTitle(task, blockingCount ?? 0);
   const dismissTitle = 'Dismiss — marks this failed task cancelled; it stays in history and will not retry';
   const archiveTitle = 'Archive — moves this task off the board to the archive (recoverable via Unarchive)';
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
@@ -761,7 +756,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 <CheckCircle className="w-3.5 h-3.5" />
               </button>
             )}
-            {(task.status === 'IN_PROGRESS' || task.status === 'QUEUED' || task.status === 'PROVISIONING' || task.status === 'BLOCKED') && (
+            {isCancellableTaskStatus(task.status) && (
               <button
                 title={cancelTitle}
                 onClick={(e) => { e.stopPropagation(); handleDestructiveClick('cancel', () => onCancel(task.id)); }}
@@ -826,7 +821,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
         {(blockingCount ?? 0) > 0 && (task.status === 'FAILED' || task.status === 'CANCELLED') && (
           <span className="inline-flex items-center gap-1 text-ui-sm font-medium bg-red-500/10 border border-red-500/30 text-red-400 px-1.5 py-0.5 rounded">
             <AlertTriangle className="w-3 h-3" />
-            Blocking {blockingCount} task{(blockingCount ?? 0) > 1 ? 's' : ''}
+            Blocking {blockingCount} visible task{(blockingCount ?? 0) > 1 ? 's' : ''}
           </span>
         )}
         {directionId && (

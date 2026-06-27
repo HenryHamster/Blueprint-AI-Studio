@@ -680,17 +680,25 @@ describe('TaskCard BLOCKED status', () => {
     const task = makeTask({ status: 'BLOCKED' });
     render(<TaskCard task={task} {...baseProps} onCancel={onCancel} />);
     // First click arms the confirm, second confirms.
-    const cancelBtn = screen.getByTitle(/^Cancel — stops the agent/);
+    const cancelBtn = screen.getByTitle(/^Cancel — cancels this blocked task/);
     await user.click(cancelBtn);
     await user.click(screen.getByTitle(/Confirm cancel/));
     expect(onCancel).toHaveBeenCalledWith('task-1');
+  });
+
+  it('queued cancel tooltip avoids VM termination copy', () => {
+    const task = makeTask({ status: 'QUEUED' });
+    render(<TaskCard task={task} {...baseProps} />);
+    const cancelBtn = screen.getByTitle(/^Cancel — cancels before it starts/);
+    expect(cancelBtn).toBeInTheDocument();
+    expect(cancelBtn.getAttribute('title')).not.toContain('VM');
   });
 
   it('cancel tooltip surfaces blast radius when other tasks depend on this one', () => {
     const task = makeTask({ status: 'IN_PROGRESS' });
     render(<TaskCard task={task} {...baseProps} blockingCount={3} />);
     expect(
-      screen.getByTitle('Cancel — stops the agent and terminates its VM — 3 tasks waiting on this'),
+      screen.getByTitle('Cancel — stops the agent and cleans up its VM. In-progress work is discarded and not saved. — 3 visible tasks waiting on this'),
     ).toBeInTheDocument();
   });
 
