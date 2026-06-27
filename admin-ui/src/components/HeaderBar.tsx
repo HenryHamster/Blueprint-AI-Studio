@@ -446,7 +446,7 @@ export function HeaderBar(props: HeaderBarProps) {
           data-viewport-allow-truncation
           className="flex items-center gap-0.5 flex-1 overflow-x-auto min-w-0 mx-1"
         >
-          {(['home', 'board', 'directions', 'compute'] as const).map(tab => {
+          {(['cockpit', 'board', 'directions', 'compute', 'home'] as const).map(tab => {
             const isActive = props.activeTab === tab;
             return (
               <button
@@ -783,6 +783,13 @@ export function HeaderBar(props: HeaderBarProps) {
                   </button>
                 )}
                 <button
+                  onClick={() => { props.onTabChange('cockpit'); setShowMobileMenu(false); }}
+                  className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
+                >
+                  <Compass className="w-4 h-4 shrink-0" />
+                  <span>Cockpit</span>
+                </button>
+                <button
                   onClick={() => { props.onTabChange('directions'); setShowMobileMenu(false); }}
                   className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
                 >
@@ -805,7 +812,7 @@ export function HeaderBar(props: HeaderBarProps) {
                         ['R', 'Refresh tasks'],
                         ['1', 'Kanban view'],
                         ['2', 'Pipeline view'],
-                        ['3', 'Home view'],
+                        ['3', 'Cockpit'],
                         ['D', 'Directions tab'],
                         ['S', 'Toggle settings'],
                         ['M', 'Toggle metrics'],
