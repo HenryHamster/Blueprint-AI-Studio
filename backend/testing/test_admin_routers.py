@@ -21084,3 +21084,100 @@ class TestPoolAccountMutationsRequireAdmin:
             assert resp.status_code == 403
         finally:
             app.dependency_overrides.pop(require_admin, None)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Task payload secret redaction (compute_experiment launch-spec secrets)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestTaskPayloadSecretRedaction:
+    """A compute_experiment task carries launch-spec secrets inline in
+    Task.payloads (container_registry_auth, env) that the agent claim-path needs
+    but operators must never see. The operator-facing task list/detail endpoints
+    must redact them — matching serialize_compute_job_response_safe — so the same
+    registry password isn't redacted in one operator view and leaked in another.
+    """
+
+    @staticmethod
+    def _secret_payload():
+        return [
+            {
+                "type": "compute_experiment",
+                "title": "GPU run",
+                "prompt": "run it",
+                "base_branch": "main",
+                "command": "python run.py",
+                "cwd": "/work",
+                "container_registry_auth": {
+                    "server": "nvcr.io",
+                    "username": "$oauthtoken",
+                    "password": "SUPER-SECRET-REGISTRY-PW",
+                },
+                "env": {"HF_TOKEN": "hf_SECRET_ENV_TOKEN"},
+            }
+        ]
+
+    async def _make_compute_task(self, db_session):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="GPU run",
+            status=TaskStatus.QUEUED,
+            payloads=self._secret_payload(),
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        return project, task
+
+    @pytest.mark.asyncio
+    async def test_operator_task_detail_redacts_registry_password(
+        self, client: AsyncClient, db_session
+    ):
+        _project, task = await self._make_compute_task(db_session)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        payload = body["payloads"][0]
+        # secret-bearing launch-spec keys are stripped
+        assert "container_registry_auth" not in payload
+        assert "env" not in payload
+        # internal launch-spec keys mirrored from the compute-job serializer
+        assert "command" not in payload
+        assert "cwd" not in payload
+        # non-secret fields are preserved
+        assert payload["type"] == "compute_experiment"
+        assert payload["base_branch"] == "main"
+        # the plaintext secrets never appear anywhere in the serialized response
+        assert "SUPER-SECRET-REGISTRY-PW" not in resp.text
+        assert "hf_SECRET_ENV_TOKEN" not in resp.text
+
+        # redaction must not mutate / persist the stored payload — the agent
+        # claim-path still needs the secret to launch the compute job.
+        await db_session.refresh(task)
+        assert (
+            task.payloads[0]["container_registry_auth"]["password"]
+            == "SUPER-SECRET-REGISTRY-PW"
+        )
+        assert task.payloads[0]["env"]["HF_TOKEN"] == "hf_SECRET_ENV_TOKEN"
+
+    @pytest.mark.asyncio
+    async def test_operator_task_list_redacts_registry_password(
+        self, client: AsyncClient, db_session
+    ):
+        project, task = await self._make_compute_task(db_session)
+
+        resp = await client.get(f"/api/admin/tasks?project_id={project.id}")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        match = next(t for t in body["tasks"] if t["id"] == str(task.id))
+        payload = match["payloads"][0]
+        assert "container_registry_auth" not in payload
+        assert "env" not in payload
+        assert payload["base_branch"] == "main"
+        assert "SUPER-SECRET-REGISTRY-PW" not in resp.text
+        assert "hf_SECRET_ENV_TOKEN" not in resp.text

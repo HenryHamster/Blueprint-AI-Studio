@@ -70,7 +70,11 @@ from app.vm_cost_rates import (
     validate_compute_request,
 )
 from app.resource_envelope import resolve_project_hardware_policy
-from app.schemas import TaskEvaluationSummary, TaskEvaluationSummaryItem
+from app.schemas import (
+    TaskEvaluationSummary,
+    TaskEvaluationSummaryItem,
+    redact_task_payloads,
+)
 from app.task_outcomes import build_task_evaluation_summary
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
@@ -457,7 +461,7 @@ async def get_all_tasks(
             # non-PARKED or pre-migration task; the admin UI guards on presence.
             "parked_at": t.parked_at.isoformat() if t.parked_at else None,
             "park_reason": t.park_reason,
-            "payloads": t.payloads,
+            "payloads": redact_task_payloads(t.payloads),
             "context": {
                 k: v
                 for k, v in (t.context or {}).items()
@@ -1280,7 +1284,7 @@ async def get_task(
         "parked_at": task.parked_at.isoformat() if task.parked_at else None,
         "park_reason": task.park_reason,
         "wake_registration": _serialize_task_wake_registration(wake_registration),
-        "payloads": task.payloads,
+        "payloads": redact_task_payloads(task.payloads),
         "context": {
             k: v
             for k, v in (task.context or {}).items()

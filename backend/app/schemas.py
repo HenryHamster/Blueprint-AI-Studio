@@ -534,6 +534,42 @@ _POLLING_METADATA_LAUNCH_SPEC_KEYS = frozenset(
     {"env", "command", "cwd", "container_registry_auth"}
 )
 
+
+def redact_task_payloads(payloads: Any) -> Any:
+    """Strip launch-spec secret keys from operator-facing task payloads.
+
+    A ``compute_experiment`` task stores its launch contract inline in
+    ``Task.payloads`` — including ``container_registry_auth`` (a registry
+    password / NGC API key) and ``env`` (operator-supplied secrets). The
+    agent-claim path legitimately needs these (the claiming agent forwards them
+    when it creates the compute job, and a retried task re-reads them), so the
+    values must stay in the row. But the operator-facing task list/detail
+    endpoints must not echo them back: ``serialize_compute_job_response_safe``
+    already redacts these same keys from compute-job responses, so without this
+    the very registry password redacted in one operator view leaks in another.
+
+    Returns a new list with the secret keys removed from each payload dict. The
+    input is never mutated (a fresh dict is built only for entries that carry a
+    secret key), so redaction can't leak back into an ORM-attached attribute and
+    accidentally persist. A non-list ``payloads`` and non-dict entries pass
+    through untouched.
+    """
+    if not isinstance(payloads, list):
+        return payloads
+    redacted = []
+    for entry in payloads:
+        if isinstance(entry, dict) and any(
+            k in entry for k in _POLLING_METADATA_LAUNCH_SPEC_KEYS
+        ):
+            entry = {
+                k: v
+                for k, v in entry.items()
+                if k not in _POLLING_METADATA_LAUNCH_SPEC_KEYS
+            }
+        redacted.append(entry)
+    return redacted
+
+
 # Regex patterns for scrubbing secrets/credentials from RPC error messages.
 _URL_QUERY_RE = re.compile(r"\?[^\s'\"<>]*")
 _BEARER_LIKE_RE = re.compile(
