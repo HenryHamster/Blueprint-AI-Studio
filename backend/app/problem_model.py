@@ -28,6 +28,7 @@ are a projected view over directions, not a separate store.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -567,6 +568,102 @@ def archive_closed_gaps(model: ProblemModel) -> ProblemModel:
             still_active.append(gap)
     model.gaps = still_active
     return model
+
+
+def reconcile_gaps_for_retired_directions(
+    raw_model: dict | None,
+    retired_direction_ids: Iterable[str],
+    now_iso: str,
+    rationale: str | None = None,
+) -> tuple[dict, list[str]]:
+    """Reconcile problem-model gaps when their staffing direction(s) retire.
+
+    Pure, side-effecting-on-its-argument helper invoked under the project row
+    lock by both retire paths (the live ``retire_direction`` strategic op and
+    the batch/log-parse strategic-completion pass). It operates directly on the
+    *raw* JSONB dict (gaps as raw dicts, straight from ``project.problem_model``)
+    so it never has to round-trip through the pydantic model.
+
+    For every retired direction id, across every gap whose ``active_moves`` list
+    contains that id (``active_moves`` is the authoritative staffing list — we
+    match on the direction id, not the direction's ``gap_id`` hint):
+
+    - prune the retired id out of ``gap.active_moves`` and union it into
+      ``gap.past_moves`` (no duplicate if it is already there);
+    - if that prune empties ``active_moves`` (it was the gap's LAST active move)
+      AND the gap has no existing ``deferral``, record a :class:`GapDeferral`
+      naming the retired direction(s) as the trigger — acknowledging the now
+      unstaffed gap instead of silently orphaning it.
+
+    It deliberately does NOT change ``gap.status`` (never auto-closes a gap) and
+    NEVER overwrites an existing ``deferral``. It is idempotent: re-running with
+    an id that has already been pruned is a no-op (the id is no longer in
+    ``active_moves`` to match), so it cannot duplicate a ``past_moves`` entry or
+    clobber a recorded deferral.
+
+    Backward-compatible by construction: gaps missing any of
+    ``active_moves`` / ``past_moves`` / ``deferral``, a model missing ``gaps``,
+    and retired ids matching no gap are all no-ops (never raise).
+
+    Args:
+        raw_model: the raw ``project.problem_model`` dict (may be ``None``/empty).
+        retired_direction_ids: the direction ids that just retired.
+        now_iso: ISO-8601 timestamp stamped onto any newly recorded deferral.
+        rationale: optional override for the deferral rationale; when omitted a
+            default naming the retired direction(s) is used.
+
+    Returns:
+        ``(raw_model, newly_deferred_gap_ids)`` — the same (mutated) dict and
+        the ids of gaps that gained a fresh deferral on this call.
+    """
+    model = raw_model if isinstance(raw_model, dict) else {}
+    retired = {str(d) for d in (retired_direction_ids or []) if d}
+    newly_deferred: list[str] = []
+    if not retired:
+        return model, newly_deferred
+
+    gaps = model.get("gaps")
+    if not isinstance(gaps, list):
+        return model, newly_deferred
+
+    for gap in gaps:
+        if not isinstance(gap, dict):
+            continue
+        active = gap.get("active_moves")
+        if not isinstance(active, list):
+            continue
+        matched = [m for m in active if str(m) in retired]
+        if not matched:
+            continue
+
+        gap["active_moves"] = [m for m in active if str(m) not in retired]
+
+        past = gap.get("past_moves")
+        if not isinstance(past, list):
+            past = []
+        past_seen = {str(p) for p in past}
+        for m in matched:
+            if str(m) not in past_seen:
+                past.append(m)
+                past_seen.add(str(m))
+        gap["past_moves"] = past
+
+        # Last active move removed AND no deferral yet -> acknowledge the now
+        # unstaffed gap. An existing deferral is left exactly as-is.
+        if not gap["active_moves"] and not gap.get("deferral"):
+            trigger = ", ".join(str(m) for m in matched)
+            deferral_rationale = rationale or (
+                f"auto-deferred: last staffing direction {trigger} retired"
+            )
+            gap["deferral"] = GapDeferral(
+                rationale=deferral_rationale,
+                created_at=now_iso,
+            ).model_dump()
+            gid = gap.get("id")
+            if gid is not None:
+                newly_deferred.append(str(gid))
+
+    return model, newly_deferred
 
 
 def reconcile_gap_staffing(

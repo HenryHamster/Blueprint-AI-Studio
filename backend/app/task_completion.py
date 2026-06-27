@@ -2974,6 +2974,11 @@ _TERMINAL_TASK_STATUSES = frozenset(
     [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.BLOCKED]
 )
 
+# Best-effort deadline: if this many hours have elapsed since the oldest arm
+# was created and some arms are still non-terminal (wedged), finalize the
+# aggregate on partial results rather than deferring indefinitely.
+_SWEEP_AGGREGATE_BEST_EFFORT_DEADLINE_HOURS = 24
+
 
 def _build_sweep_aggregate_prompt(
     tasks: list,
@@ -3084,14 +3089,36 @@ async def _maybe_spawn_sweep_aggregate_followon(
         if t.status not in _TERMINAL_TASK_STATUSES and t.id != task.id
     ]
     if non_terminal:
-        logger.info(
-            "[COMPUTE] Sweep %s: arm %s terminal but %d sibling(s) still non-terminal; "
-            "deferring aggregate follow-on",
-            sweep_id,
-            task.id,
-            len(non_terminal),
+        # Check whether the best-effort deadline has elapsed.  If the oldest arm
+        # was created more than _SWEEP_AGGREGATE_BEST_EFFORT_DEADLINE_HOURS ago,
+        # finalize on partial results rather than waiting for wedged arms.
+        oldest_created = min(
+            (t.created_at for t in sibling_rows if t.created_at is not None),
+            default=None,
         )
-        return None
+        past_deadline = oldest_created is not None and (
+            _utcnow() - oldest_created
+        ) > timedelta(hours=_SWEEP_AGGREGATE_BEST_EFFORT_DEADLINE_HOURS)
+        if not past_deadline:
+            logger.info(
+                "[COMPUTE] Sweep %s: arm %s terminal but %d sibling(s) still non-terminal; "
+                "deferring aggregate follow-on",
+                sweep_id,
+                task.id,
+                len(non_terminal),
+            )
+            return None
+        # Deadline elapsed — finalize best-effort; treat wedged arms as failures.
+        logger.warning(
+            "[COMPUTE] Sweep %s: %d arm(s) wedged past %dh deadline — "
+            "finalizing best-effort aggregate on %d/%d terminal arm(s)",
+            sweep_id,
+            len(non_terminal),
+            _SWEEP_AGGREGATE_BEST_EFFORT_DEADLINE_HOURS,
+            len(sibling_rows) - len(non_terminal),
+            len(sibling_rows),
+        )
+        failure_mode = True
 
     # All arms are terminal — check whether an aggregate follow-on already exists.
     for sibling in sibling_rows:

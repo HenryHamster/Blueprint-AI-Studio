@@ -1478,6 +1478,18 @@ async def strategic_operation(
         )
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
+        # Reconcile the problem-model gap this direction was staffing in the SAME
+        # committed transaction: prune the retired id from gap.active_moves (->
+        # past_moves) and, if it was the gap's last active move, record a
+        # GapDeferral so the now-unstaffed gap is acknowledged instead of being
+        # flagged as a stale active-move / orphaned gap next strategic cycle.
+        from app.problem_model import reconcile_gaps_for_retired_directions
+        from app.task_locking import with_problem_model_locked
+
+        def _reconcile_pm(pm: dict) -> None:
+            reconcile_gaps_for_retired_directions(pm, [dir_id], now_iso)
+
+        await with_problem_model_locked(session, project.id, _reconcile_pm)
         verdicts = list(ctx.get("_strategic_retirement_gate_verdicts", []))
         verdicts.append(gate_audit)
         retired_ids = list(ctx.get("_strategic_retired_ids", []))

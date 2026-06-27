@@ -44,6 +44,7 @@ from app.problem_model import (
     parse_problem_model,
     reconcile_gap_staffing,
     reconcile_gap_staffing_raw,
+    reconcile_gaps_for_retired_directions,
 )
 
 
@@ -3881,6 +3882,165 @@ def test_watermark_survives_echo_omitting_field_and_filters_proposed_side():
     history_ts = {e["ts"] for e in gap_result["history"]}
     assert old_evt["ts"] not in history_ts
     assert new_evt["ts"] in history_ts
+
+
+# ---------------------------------------------------------------------------
+# reconcile_gaps_for_retired_directions — gap staffing reconciliation on retire
+# ---------------------------------------------------------------------------
+
+_NOW = "2026-06-27T12:00:00"
+
+
+def _staffed_gap(gap_id: str, active, past=None, **extra):
+    """Raw gap dict (as stored in the JSONB column) with staffing moves."""
+    gap = {
+        "id": gap_id,
+        "name": gap_id,
+        "status": "active",
+        "active_moves": list(active),
+        "past_moves": list(past or []),
+    }
+    gap.update(extra)
+    return gap
+
+
+def test_retire_direction_prunes_active_moves_and_defers_last_move():
+    """Acceptance: retiring a gap's LAST active move prunes it into past_moves
+    AND records a GapDeferral naming the retired direction, without touching
+    status."""
+    model = {"gaps": [_staffed_gap("g-1", ["d-1"])]}
+
+    out, deferred = reconcile_gaps_for_retired_directions(model, ["d-1"], _NOW)
+
+    gap = out["gaps"][0]
+    assert gap["active_moves"] == []
+    assert gap["past_moves"] == ["d-1"]
+    assert deferred == ["g-1"]
+    # Deferral recorded with the trigger direction named + created_at stamp.
+    assert gap["deferral"]["created_at"] == _NOW
+    assert "d-1" in gap["deferral"]["rationale"]
+    # Status is NEVER changed — gap is not auto-closed.
+    assert gap["status"] == "active"
+
+
+def test_reconcile_non_last_move_prunes_without_deferral():
+    """A gap that still has another active move after the prune is reconciled
+    but NOT deferred (it remains staffed)."""
+    model = {"gaps": [_staffed_gap("g-1", ["d-1", "d-2"])]}
+
+    out, deferred = reconcile_gaps_for_retired_directions(model, ["d-1"], _NOW)
+
+    gap = out["gaps"][0]
+    assert gap["active_moves"] == ["d-2"]
+    assert gap["past_moves"] == ["d-1"]
+    assert deferred == []
+    assert "deferral" not in gap or gap.get("deferral") is None
+    assert gap["status"] == "active"
+
+
+def test_reconcile_does_not_duplicate_existing_past_move():
+    """Union semantics: an id already in past_moves is not duplicated."""
+    model = {"gaps": [_staffed_gap("g-1", ["d-1", "d-2"], past=["d-1"])]}
+
+    out, _ = reconcile_gaps_for_retired_directions(model, ["d-1"], _NOW)
+
+    gap = out["gaps"][0]
+    assert gap["past_moves"] == ["d-1"]  # not ["d-1", "d-1"]
+    assert gap["active_moves"] == ["d-2"]
+
+
+def test_reconcile_preserves_existing_deferral():
+    """An existing deferral is left exactly as-is even when the retire empties
+    active_moves."""
+    existing = {"rationale": "operator paused", "created_at": "2026-01-01T00:00:00"}
+    model = {"gaps": [_staffed_gap("g-1", ["d-1"], deferral=dict(existing))]}
+
+    out, deferred = reconcile_gaps_for_retired_directions(model, ["d-1"], _NOW)
+
+    gap = out["gaps"][0]
+    assert gap["active_moves"] == []
+    assert gap["past_moves"] == ["d-1"]
+    # Deferral untouched; gap id NOT reported as newly deferred.
+    assert gap["deferral"] == existing
+    assert deferred == []
+
+
+def test_reconcile_already_pruned_id_is_noop():
+    """Idempotent: re-running with an id already pruned does not duplicate
+    past_moves or clobber the recorded deferral."""
+    model = {"gaps": [_staffed_gap("g-1", ["d-1"])]}
+
+    first, _ = reconcile_gaps_for_retired_directions(model, ["d-1"], _NOW)
+    gap_after_first = dict(first["gaps"][0])
+
+    # Second pass with the same (already-pruned) id.
+    second, deferred = reconcile_gaps_for_retired_directions(
+        first, ["d-1"], "2026-12-31T00:00:00"
+    )
+    gap = second["gaps"][0]
+    assert gap["active_moves"] == []
+    assert gap["past_moves"] == ["d-1"]
+    assert deferred == []  # nothing newly deferred on the no-op pass
+    # Deferral created_at retains the FIRST timestamp (not clobbered).
+    assert gap["deferral"]["created_at"] == gap_after_first["deferral"]["created_at"]
+
+
+def test_reconcile_matches_on_direction_id_not_gap_hint():
+    """Matching is on active_moves membership, not the direction's gap_id hint:
+    a gap whose active_moves contains the id is reconciled even with no hint,
+    and a gap NOT staffing the id is left untouched."""
+    model = {
+        "gaps": [
+            _staffed_gap("g-1", ["d-1"]),
+            _staffed_gap("g-2", ["d-9"]),
+        ]
+    }
+
+    out, deferred = reconcile_gaps_for_retired_directions(model, ["d-1"], _NOW)
+
+    g1 = next(g for g in out["gaps"] if g["id"] == "g-1")
+    g2 = next(g for g in out["gaps"] if g["id"] == "g-2")
+    assert g1["active_moves"] == [] and g1["past_moves"] == ["d-1"]
+    assert deferred == ["g-1"]
+    # g-2 never staffed d-1 -> fully untouched.
+    assert g2["active_moves"] == ["d-9"]
+    assert g2["past_moves"] == []
+    assert "deferral" not in g2
+
+
+def test_reconcile_tolerates_missing_keys_and_unknown_ids():
+    """Backward-compat: gaps without active_moves/past_moves keys, a model
+    without gaps, and ids matching no gap are all no-ops (never raise)."""
+    # Gap missing active_moves entirely.
+    model = {"gaps": [{"id": "g-1", "name": "g-1", "status": "active"}]}
+    out, deferred = reconcile_gaps_for_retired_directions(model, ["d-1"], _NOW)
+    assert deferred == []
+    assert "active_moves" not in out["gaps"][0]
+
+    # Model without gaps key.
+    out2, deferred2 = reconcile_gaps_for_retired_directions({}, ["d-1"], _NOW)
+    assert deferred2 == []
+
+    # None model + empty id iterable.
+    out3, deferred3 = reconcile_gaps_for_retired_directions(None, [], _NOW)
+    assert out3 == {} and deferred3 == []
+
+
+def test_reconcile_result_validates_as_problem_model():
+    """The mutated raw dict still round-trips through the pydantic model — the
+    recorded deferral matches the GapDeferral shape (no invented fields)."""
+    model = {
+        "revision": 3,
+        "gaps": [_staffed_gap("g-1", ["d-1"], description="a gap")],
+    }
+    out, _ = reconcile_gaps_for_retired_directions(model, ["d-1"], _NOW)
+
+    parsed = ProblemModel.model_validate(out)
+    gap = parsed.gaps[0]
+    assert isinstance(gap.deferral, GapDeferral)
+    assert gap.deferral.created_at == _NOW
+    assert gap.active_moves == []
+    assert gap.past_moves == ["d-1"]
 
 
 # ---------------------------------------------------------------------------

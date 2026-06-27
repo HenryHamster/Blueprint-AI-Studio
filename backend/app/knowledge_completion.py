@@ -1134,6 +1134,7 @@ _DISABLE_LLM_COMPUTE_ANALYSIS_ENV = "DISABLE_LLM_COMPUTE_ANALYSIS"
 # log can never blow up the analysis prompt.
 _COMPUTE_LOG_TEXT_CAP = 4000
 _COMPUTE_MAX_CITATIONS = 20
+_COMPUTE_QA_MAX_TOKENS = 800
 
 
 def _enrich_per_arm_cost(
@@ -2589,7 +2590,15 @@ async def _stamp_compute_analysis_unavailable(
     return envelope
 
 
-_COMPUTE_QA_MAX_TOKENS = 800
+def _qa_unavailable(reason: str) -> dict[str, Any]:
+    """Return a ComputeQAResponse-shaped dict for unavailable Q&A."""
+    return {
+        "answer": None,
+        "citations": [],
+        "grounding": {"checked": True, "file_citations": 0, "grounded": 0, "unresolved": []},
+        "grounding_miss": True,
+        "fallback_reason": reason,
+    }
 
 
 def _build_compute_qa_prompt(
@@ -2653,19 +2662,13 @@ async def answer_compute_experiment_question(
 ) -> dict[str, Any]:
     """Answer a free-form question grounded in a completed experiment's durable evidence.
 
-    Returns ``{"answer": ..., "citations": [...], "grounded": bool}``. Declines
-    honestly when evidence is insufficient or the LLM is unavailable. Never
-    persists any data — purely ephemeral Q&A.
+    Returns a ComputeQAResponse-shaped dict with answer, citations, grounding stamp,
+    grounding_miss, and fallback_reason. Declines honestly when evidence is insufficient
+    or the LLM is unavailable. Never persists any data — purely ephemeral Q&A.
     """
-    if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1":
-        return {"answer": "Analysis is currently disabled.", "citations": [], "grounded": False}
     api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
-        return {
-            "answer": "Cannot answer: no LLM credentials are configured.",
-            "citations": [],
-            "grounded": False,
-        }
+    if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1" or not api_key:
+        return _qa_unavailable("llm-disabled")
     evidence = await _gather_compute_evidence(
         task,
         logs=logs,
@@ -2674,22 +2677,16 @@ async def answer_compute_experiment_question(
         session=session,
     )
     if evidence is None:
-        return {
-            "answer": (
-                "The available evidence for this run is not sufficient to answer "
-                "the question; no durable artifacts or metrics were found."
-            ),
-            "citations": [],
-            "grounded": False,
-        }
+        return _qa_unavailable("no-evidence")
     prompt = _build_compute_qa_prompt(
         task,
-        question=question,
         outcome=outcome,
         cost=cost,
         criterion=criterion,
         evidence=evidence,
+        question=question,
     )
+    allowed_set = set(evidence.get("citations", []))
     for attempt in range(2):
         try:
             import anthropic as _anthropic
@@ -2705,17 +2702,30 @@ async def answer_compute_experiment_question(
             data = _parse_compute_analysis_json(raw)
             if not isinstance(data, dict) or "answer" not in data:
                 raise ValueError("QA response missing 'answer'")
-            allowed_set = set(evidence["citations"])
             raw_cits = data.get("citations") or []
             grounded_cits = [
                 c.strip()
                 for c in raw_cits
                 if isinstance(c, str) and c.strip() in allowed_set
             ][:_COMPUTE_MAX_CITATIONS]
+            unresolved_cits = [
+                c.strip()
+                for c in raw_cits
+                if isinstance(c, str) and c.strip() not in allowed_set
+            ]
+            grounding_stamp = {
+                "checked": True,
+                "file_citations": len(raw_cits),
+                "grounded": len(grounded_cits),
+                "unresolved": unresolved_cits,
+            }
+            miss_reason = None if grounded_cits else "no-grounded-citations"
             return {
                 "answer": str(data["answer"])[:4000],
                 "citations": grounded_cits,
-                "grounded": True,
+                "grounding": grounding_stamp,
+                "grounding_miss": miss_reason is not None,
+                "fallback_reason": miss_reason,
             }
         except (json.JSONDecodeError, KeyError, ValueError, IndexError) as exc:
             if attempt == 0:
@@ -2725,7 +2735,7 @@ async def answer_compute_experiment_question(
         except Exception as exc:  # noqa: BLE001
             logger.info("[COMPUTE] QA LLM call failed (%s)", exc)
             break
-    return {"answer": "Unable to generate an answer at this time.", "citations": [], "grounded": False}
+    return _qa_unavailable("llm-error")
 
 
 async def _handle_web_research_completion(

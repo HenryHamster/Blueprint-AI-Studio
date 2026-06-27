@@ -5065,6 +5065,29 @@ async def _handle_strategic_completion(
 
             await with_vision_locked(session, task.project_id, _apply_retire_memory)
 
+        # Reconcile problem-model gaps for the batch's retired directions in a
+        # single deferred locked pass (mirrors the _pending_retire_memory flush
+        # above) — NOT inside the per-op loop. Prunes each retired id from its
+        # gap's active_moves (-> past_moves) and records a GapDeferral when the
+        # retire emptied a gap's active_moves, so a gap whose only staffing
+        # direction just retired is acknowledged instead of flagged as a stale
+        # active-move / orphaned gap by the next cycle's reconciliation view.
+        if retires_applied and retired_ids_fb:
+            from app.problem_model import reconcile_gaps_for_retired_directions
+            from app.task_locking import with_problem_model_locked
+
+            _reconcile_ids = list(retired_ids_fb)
+            _reconcile_now = _utcnow().isoformat()
+
+            def _apply_gap_reconcile(pm: dict) -> None:
+                reconcile_gaps_for_retired_directions(
+                    pm, _reconcile_ids, _reconcile_now
+                )
+
+            await with_problem_model_locked(
+                session, task.project_id, _apply_gap_reconcile
+            )
+
         if _pending_rejected_proposals:
             from app.task_locking import with_vision_locked
 

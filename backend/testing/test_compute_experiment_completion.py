@@ -6451,3 +6451,103 @@ async def test_per_arm_cost_zero_elapsed_no_raise(db_session, _quiet_compute_io)
     # Arms data should be intact
     assert arms["arm_a"]["accuracy"] == pytest.approx(0.95)
     assert arms["arm_b"]["accuracy"] == pytest.approx(0.92)
+
+
+# ── Sweep aggregate best-effort finalization past deadline ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sweep_aggregate_best_effort_when_arm_wedged_past_deadline(
+    db_session, _quiet_compute_io, mocker
+):
+    """When a sweep arm is wedged (non-terminal) but the best-effort deadline has
+    elapsed, _maybe_spawn_sweep_aggregate_followon must finalize on partial results
+    rather than deferring indefinitely.
+
+    Acceptance: the aggregate follow-on is spawned (not None) in failure/diagnose
+    mode, and its prompt references the wedged arm's status so the agent knows one
+    arm never finished.
+    """
+    from app.task_completion import (
+        _ACT_ON_VERDICT_SWEEP_KEY,
+        _maybe_spawn_sweep_aggregate_followon,
+    )
+
+    sweep_id = f"sweep-{uuid.uuid4().hex[:12]}"
+
+    project = Project(name="WedgedSweepDeadlineTest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Arm A: terminally completed with a result.
+    terminal_arm = Task(
+        project_id=project.id,
+        title="compute_experiment: arm-A-done",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "sweep_id": sweep_id,
+                "experiment": "arm-A-done",
+            }
+        ],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    terminal_arm.plan_output = {
+        "compute_result": {"outcome": "SUCCESS", "final_cost_usd": 0.25}
+    }
+    db_session.add(terminal_arm)
+
+    # Arm B: QUEUED — simulates a backend that became permanently unreachable
+    # before transitioning to a terminal state (the "wedged" arm).
+    wedged_arm = Task(
+        project_id=project.id,
+        title="compute_experiment: arm-B-wedged",
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "sweep_id": sweep_id,
+                "experiment": "arm-B-wedged",
+            }
+        ],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(wedged_arm)
+    await db_session.commit()
+    await db_session.refresh(terminal_arm)
+    await db_session.refresh(wedged_arm)
+
+    # Simulate the deadline having elapsed: patch _utcnow to return a time well
+    # past 24 h after the oldest arm's created_at so the deadline branch fires.
+    future_time = terminal_arm.created_at + timedelta(hours=25)
+    mocker.patch("app.task_completion._utcnow", return_value=future_time)
+
+    result = await _maybe_spawn_sweep_aggregate_followon(
+        db_session,
+        terminal_arm,
+        sweep_id,
+        {},
+        "",
+        failure_mode=False,
+    )
+    await db_session.commit()
+
+    # Must have spawned despite the wedged arm — not deferred.
+    assert result is not None, (
+        "Expected aggregate follow-on to be spawned past deadline, got None"
+    )
+    # Wedged arm counts as failure → diagnose-and-fix title.
+    assert "diagnose" in result.title.lower(), (
+        f"Expected diagnose-and-fix title for wedged sweep; got: {result.title!r}"
+    )
+    # Context carries the sweep key for idempotency.
+    assert (result.context or {}).get(_ACT_ON_VERDICT_SWEEP_KEY) == sweep_id
+    # Prompt must reference the wedged arm so the agent is aware results are partial.
+    prompt = (result.first_payload or {}).get("prompt", "")
+    assert "arm-B-wedged" in prompt or "QUEUED" in prompt, (
+        f"Aggregate prompt must reference the wedged arm; got: {prompt[:300]!r}"
+    )

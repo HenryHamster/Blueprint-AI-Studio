@@ -16111,3 +16111,84 @@ async def test_set_problem_model_lifts_new_version_theme_api_path(
     assert version.theme == corrected_theme, (
         f"Strategist must be able to correct its own theme; got {version.theme!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_batch_retire_reconciles_gap_active_moves_and_records_deferral(
+    db_session, mocker
+):
+    """End-to-end (batch/log-parse path): retiring a gap's last staffing
+    direction prunes it from the problem-model gap's active_moves (-> past_moves)
+    and records a GapDeferral, in the same completion pass."""
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._spawn_retirement_memos", new_callable=AsyncMock
+    )
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={
+            "revision": 1,
+            "gaps": [
+                {
+                    "id": "g-ret",
+                    "name": "unstaffed soon",
+                    "status": "active",
+                    "active_moves": ["d-ret"],
+                    "past_moves": [],
+                }
+            ],
+        },
+        directions=[
+            {"id": "d-ret", "text": "Work the gap", "status": "active"},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "retire",
+                    "direction_id": "d-ret",
+                    "rationale": "no longer worthwhile",
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    # Direction flipped to retired in the live list.
+    d = next(d for d in project.directions if d["id"] == "d-ret")
+    assert d["status"] == "retired"
+
+    # The staffed gap is reconciled end-to-end.
+    gap = next(g for g in project.problem_model["gaps"] if g["id"] == "g-ret")
+    assert gap["active_moves"] == []
+    assert gap["past_moves"] == ["d-ret"]
+    # Last active move retired -> deferral recorded naming the trigger direction.
+    assert gap.get("deferral")
+    assert "d-ret" in gap["deferral"]["rationale"]
+    assert gap["deferral"]["created_at"]
+    # Status is never auto-closed.
+    assert gap["status"] == "active"

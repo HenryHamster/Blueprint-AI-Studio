@@ -682,7 +682,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [askState, setAskState] = useState<Record<string, {
     question: string;
     submitting: boolean;
-    result: { answer: string; citations: string[]; grounded: boolean } | null;
+    result: { answer: string | null; citations: string[]; grounding_miss: boolean; fallback_reason: string | null } | null;
     error: string | null;
   }>>({});
 
@@ -1885,7 +1885,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                             ))}
                           </div>
                         )}
-                        {!ask.result.grounded && (
+                        {ask.result.grounding_miss && (
                           <div className="mt-0.5 text-ui-xs text-indigo-400/70 italic" data-testid="compute-ask-ungrounded">No evidence found for this question</div>
                         )}
                       </div>

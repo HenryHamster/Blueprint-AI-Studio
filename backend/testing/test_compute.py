@@ -2522,6 +2522,85 @@ async def test_compute_monitor_records_backend_rpc_failure_without_terminalizing
 
 
 @pytest.mark.asyncio
+async def test_running_job_past_deadline_terminates_when_poll_unreachable(
+    db_session, monkeypatch
+):
+    """A RUNNING job whose backend is persistently unreachable must transition
+    to TIMED_OUT once its wall_clock_deadline has passed, not stay RUNNING
+    forever. The monitor fires terminate + finalizes in the same tick that
+    detects the expired deadline, even though poll_status raised."""
+    project = Project(name="Poll Unreachable Deadline", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, status=TaskStatus.PARKED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="sleep 10",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.RUNNING
+    job.external_compute_id = "unreachable-backend-vm"
+    # Backdate the wall_clock_deadline so it has already expired.
+    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=1)
+    db_session.add(
+        TaskWakeRegistration(
+            task_id=task.id,
+            project_id=project.id,
+            wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND,
+            wake_source_ref=str(job.id),
+            wake_action=WakeAction.FINALIZE,
+            deadline_at=datetime.utcnow() + timedelta(hours=1),
+        )
+    )
+    await db_session.commit()
+
+    terminate_reasons: list[str] = []
+
+    class FakeBackend:
+        async def poll_status(self, persisted_job):
+            raise RuntimeError("backend unreachable")
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            raise AssertionError("poll_cost should not run when deadline has passed")
+
+        async def terminate(self, persisted_job, *, reason):
+            terminate_reasons.append(reason)
+            return True
+
+    monkeypatch.setattr(
+        compute_jobs, "get_compute_backend", lambda _name: FakeBackend()
+    )
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+
+    db_session.expire_all()
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.TIMED_OUT
+    assert job.outcome == ComputeJobOutcome.TIMED_OUT
+    assert job.completed_at is not None
+    assert "deadline" in (job.terminal_reason or "")
+    assert terminate_reasons == ["deadline"]
+    diagnostic = (job.polling_metadata or {}).get("compute_rpc_diagnostic")
+    assert diagnostic is not None
+    assert diagnostic["operation"] == "poll_status"
+    assert diagnostic["reason"] == "poll_unreachable_at_deadline"
+
+
+@pytest.mark.asyncio
 async def test_process_compute_jobs_once_records_cost_failure_without_firing_wake(
     db_session, monkeypatch
 ):

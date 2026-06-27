@@ -4533,6 +4533,110 @@ async def test_retire_direction_spawns_and_persists_memo_task(db_session, mocker
 
 
 @pytest.mark.asyncio
+async def test_retire_direction_reconciles_problem_model_gap(db_session, mocker):
+    """Live API retire path reconciles the problem-model gap in the same
+    committed transaction: prunes the retired id from gap.active_moves into
+    past_moves and records a GapDeferral when it was the gap's last move."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    direction_id = "d-gap-staff"
+    project = Project(
+        name="P-gap-reconcile",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={
+            "revision": 1,
+            "gaps": [
+                {
+                    "id": "g-staffed",
+                    "name": "staffed gap",
+                    "status": "active",
+                    "active_moves": [direction_id],
+                    "past_moves": [],
+                }
+            ],
+        },
+        directions=[
+            {
+                "id": direction_id,
+                "text": "Close the staffed gap",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "success_evidence": "Gap closed",
+                "retirement_condition": "Gap closed",
+            },
+            {"id": "d-other", "text": "Other", "status": "active", "notes": []},
+            {"id": "d-other-2", "text": "Other 2", "status": "active", "notes": []},
+            {"id": "d-other-3", "text": "Other 3", "status": "active", "notes": []},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
+        ) as ac:
+            r = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "retire_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "direction_id": direction_id,
+                        "rationale": "Gap is closed.",
+                    },
+                },
+            )
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "ok"
+
+        await db_session.refresh(project)
+        gap = next(g for g in project.problem_model["gaps"] if g["id"] == "g-staffed")
+        assert gap["active_moves"] == []
+        assert gap["past_moves"] == [direction_id]
+        assert gap.get("deferral")
+        assert direction_id in gap["deferral"]["rationale"]
+        assert gap["deferral"]["created_at"]
+        # Gap is never auto-closed.
+        assert gap["status"] == "active"
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
 async def test_strategic_api_create_direction_rejects_missing_structured_fields(
     db_session, mocker
 ):

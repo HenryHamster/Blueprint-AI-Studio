@@ -612,6 +612,43 @@ async def with_vision_locked(
     return True
 
 
+async def with_problem_model_locked(
+    session: AsyncSession,
+    project_id,
+    mutate_fn: Callable[[dict], None],
+    *,
+    skip_locked: bool = False,
+    timeout: float = 30.0,
+) -> bool:
+    """Atomic read-modify-write of project.problem_model under a project row lock.
+
+    Mirror of ``with_vision_locked`` for the sibling ``problem_model`` JSON
+    column. Acquires SELECT FOR UPDATE (``skip_locked=False`` by default so
+    background callers wait rather than silently skip), hands ``mutate_fn`` the
+    current problem_model dict loaded *inside* the lock, then writes the result
+    back via ``flag_modified``. Caller is responsible for committing.
+
+    This is the canonical helper for serializing problem-model mutations that
+    are not full agent ``set_problem_model`` rewrites — e.g. the in-transaction
+    gap reconciliation on direction retire
+    (:func:`app.problem_model.reconcile_gaps_for_retired_directions`). Loading
+    the dict inside the lock is what prevents a concurrent strategic write from
+    clobbering the reconciliation via a stale read-modify-write race — the same
+    lost-update class already eliminated for ``vision`` and ``directions``.
+    """
+    async with project_lock(
+        session, project_id, skip_locked=skip_locked, timeout=timeout
+    ) as project:
+        if project is None:
+            return False
+        problem_model = dict(project.problem_model or {})
+        mutate_fn(problem_model)
+        project.problem_model = problem_model
+        flag_modified(project, "problem_model")
+        session.add(project)
+    return True
+
+
 async def with_directions_locked(
     session: AsyncSession,
     project_id,

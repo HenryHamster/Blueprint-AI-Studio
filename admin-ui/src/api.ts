@@ -345,9 +345,11 @@ export async function rerunComputeExperiment(
 
 /** Response from POST /compute-jobs/{job_id}/ask — grounded answer to a free-form question. */
 export interface ComputeJobAskResponse {
-  answer: string;
+  answer: string | null;
   citations: string[];
-  grounded: boolean;
+  grounding: { checked: boolean; file_citations: number; grounded: number; unresolved: string[] };
+  grounding_miss: boolean;
+  fallback_reason: string | null;
 }
 
 /**

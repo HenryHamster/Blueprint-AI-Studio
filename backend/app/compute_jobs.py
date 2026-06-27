@@ -1665,6 +1665,47 @@ async def _process_single_compute_job(
             job.id,
             exc,
         )
+        # When the wall-clock deadline has already passed, terminate immediately
+        # rather than deferring to the next poll cycle — a persistently
+        # unreachable backend would otherwise keep the job RUNNING forever.
+        if job.wall_clock_deadline is not None and now >= job.wall_clock_deadline:
+            terminate_diagnostic = _build_compute_rpc_diagnostic(
+                job,
+                operation="poll_status",
+                exc=exc,
+                started_at=started_at,
+                failed_at=failed_at,
+                next_retry_at=None,
+                reason="poll_unreachable_at_deadline",
+            )
+            terminated = True
+            if job.external_compute_id:
+                try:
+                    terminated = await backend.terminate(job, reason="deadline")
+                except Exception:
+                    logger.exception(
+                        "[COMPUTE_JOB] terminate failed for unreachable job=%s at deadline",
+                        job.id,
+                    )
+                    terminated = False
+            await _apply_polled_compute_job_result(
+                session_factory,
+                job.id,
+                now=now,
+                poll_attempt_count=(job.poll_attempt_count or 0) + 1,
+                next_poll_at=now
+                + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+                status=ComputeStatusResult(status=ComputeJobStatus.FAILED),
+                accrued_cost_usd=float(job.accrued_cost_usd or 0.0),
+                terminal_status=ComputeJobStatus.TIMED_OUT,
+                outcome=ComputeJobOutcome.TIMED_OUT,
+                terminal_reason=(
+                    "compute job exceeded deadline; backend unreachable at kill time"
+                ),
+                terminate_ok=terminated,
+                compute_rpc_diagnostic=terminate_diagnostic,
+            )
+            return
         await _record_compute_rpc_failure(
             session_factory,
             job.id,

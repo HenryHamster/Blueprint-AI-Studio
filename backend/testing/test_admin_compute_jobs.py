@@ -1535,7 +1535,9 @@ async def test_ask_compute_job_grounded_answer(client: AsyncClient, db_session):
     canned = {
         "answer": "The accuracy metric was 0.95, meeting the declared criterion.",
         "citations": ["gs://bucket/results/exp.json#metric:accuracy=0.95"],
-        "grounded": True,
+        "grounding": {"checked": True, "file_citations": 1, "grounded": 1, "unresolved": []},
+        "grounding_miss": False,
+        "fallback_reason": None,
     }
     with patch(
         "app.knowledge_completion.answer_compute_experiment_question",
@@ -1550,7 +1552,8 @@ async def test_ask_compute_job_grounded_answer(client: AsyncClient, db_session):
     body = resp.json()
     assert body["answer"] == "The accuracy metric was 0.95, meeting the declared criterion."
     assert body["citations"] == ["gs://bucket/results/exp.json#metric:accuracy=0.95"]
-    assert body["grounded"] is True
+    assert body["grounding_miss"] is False
+    assert body["grounding"]["grounded"] == 1
 
 
 @pytest.mark.asyncio
@@ -1607,8 +1610,70 @@ async def test_ask_compute_job_no_evidence_declines_honestly(
     body = resp.json()
     assert "answer" in body
     assert "citations" in body
-    assert body["grounded"] is False
+    assert body["grounding_miss"] is True
     assert isinstance(body["citations"], list)
+
+
+@pytest.mark.asyncio
+async def test_ask_endpoint_returns_grounded_answer_and_rejects_ungrounded(
+    client: AsyncClient, db_session
+):
+    """Grounded Q&A: answer path returns grounding_miss=False; no-evidence path returns grounding_miss=True."""
+    project = await _make_project(db_session, name="Ask Grounded vs Ungrounded")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 2.0}},
+    )
+
+    # --- grounded answer path ---
+    grounded_response = {
+        "answer": "Sharpe ratio was 1.43, exceeding the 1.2 threshold.",
+        "citations": ["gs://bp-artifacts/proj/task/result/#metric:sharpe_ratio=1.43"],
+        "grounding": {"checked": True, "file_citations": 1, "grounded": 1, "unresolved": []},
+        "grounding_miss": False,
+        "fallback_reason": None,
+    }
+    with patch(
+        "app.knowledge_completion.answer_compute_experiment_question",
+        new=AsyncMock(return_value=grounded_response),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "What was the Sharpe ratio?"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["answer"] == "Sharpe ratio was 1.43, exceeding the 1.2 threshold."
+    assert body["grounding_miss"] is False
+    assert body["grounding"]["grounded"] == 1
+    assert body["fallback_reason"] is None
+
+    # --- ungrounded / no-evidence path ---
+    ungrounded_response = {
+        "answer": None,
+        "citations": [],
+        "grounding": {"checked": True, "file_citations": 0, "grounded": 0, "unresolved": []},
+        "grounding_miss": True,
+        "fallback_reason": "no-evidence",
+    }
+    with patch(
+        "app.knowledge_completion.answer_compute_experiment_question",
+        new=AsyncMock(return_value=ungrounded_response),
+    ):
+        resp2 = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "What was the p-value?"},
+        )
+
+    assert resp2.status_code == 200
+    body2 = resp2.json()
+    assert body2["answer"] is None
+    assert body2["grounding_miss"] is True
+    assert body2["fallback_reason"] == "no-evidence"
+    assert body2["citations"] == []
 
 
 @pytest.mark.asyncio
@@ -1683,7 +1748,9 @@ async def test_ask_compute_job_includes_per_arm_evidence(
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["grounded"] is True
+    # New Q&A response shape: a successful grounded answer carries grounding_miss=False
+    # (this PR replaced the legacy top-level ``grounded`` boolean).
+    assert body["grounding_miss"] is False
     # The arm citation must pass the allowed-set gate (arm refs added to evidence)
     assert any("arms:treatment" in c for c in body["citations"])
     # The prompt must have included the per-arm section so the LLM saw arm data
