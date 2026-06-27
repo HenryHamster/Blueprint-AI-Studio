@@ -4254,6 +4254,171 @@ async def test_gap_reconciled_on_reground_fallback_path(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_gap_reconciled_on_retire_fallback_path(db_session, mocker):
+    """The fallback retire path prunes the direction from the gap's active_moves
+    and auto-defers the gap when it becomes unstaffed, in the same locked
+    transaction as the directions write."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="GAPRECON-FB-RETIRE",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-xxx",
+                "text": "Close the metering gap",
+                "status": "active",
+                "priority": "high",
+                "gap_id": "g-metering",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-metering",
+                    "name": "metering",
+                    "status": "active",
+                    "active_moves": ["d-xxx"],
+                    "past_moves": [],
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "retire",
+                    "direction_id": "d-xxx",
+                    "rationale": "Done — metering gap closed",
+                }
+            ],
+        }
+    )
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    gap = next(
+        g for g in project.problem_model["gaps"] if g["id"] == "g-metering"
+    )
+    # Direction pruned from active_moves, archived in past_moves.
+    assert "d-xxx" not in gap["active_moves"]
+    assert "d-xxx" in gap["past_moves"]
+    # Gap auto-deferred because no active staffing remains.
+    assert gap.get("deferral") is not None
+
+
+@pytest.mark.asyncio
+async def test_gap_deferral_suppresses_orphan_after_retire(db_session, mocker):
+    """After the fallback retire reconciles a gap, the cycle-start advisory no
+    longer reports that gap as an orphan (stale_active_moves / orphaned_gaps)."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+    from app.strategic_spawning import _build_cycle_start_reconciliation
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="GAPRECON-FB-ORPHAN",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-yyy",
+                "text": "Close the latency gap",
+                "status": "active",
+                "priority": "medium",
+                "gap_id": "g-latency",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-latency",
+                    "name": "latency",
+                    "status": "active",
+                    "active_moves": ["d-yyy"],
+                    "past_moves": [],
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "retire",
+                    "direction_id": "d-yyy",
+                    "rationale": "Latency gap resolved",
+                }
+            ],
+        }
+    )
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(project)
+
+    # Build the cycle-start reconciliation view on the post-retire model.
+    directions_after = project.directions or []
+    recon = _build_cycle_start_reconciliation(
+        directions_after, project.problem_model, {}
+    )
+
+    # The retired direction's gap must NOT appear as an orphan.
+    orphaned = recon.get("orphaned_gaps", [])
+    stale = recon.get("stale_active_moves", [])
+    gap_ids_orphaned = [o.get("gap_id") for o in orphaned]
+    gap_ids_stale = [s.get("gap_id") for s in stale]
+    assert "g-latency" not in gap_ids_orphaned, (
+        f"g-latency should not be an orphan after retire reconciliation; got {orphaned}"
+    )
+    assert "g-latency" not in gap_ids_stale, (
+        f"g-latency should not appear in stale_active_moves after retire; got {stale}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_absent_dedup_reasoning_no_error_on_create(db_session, mocker):
     """Omitting dedup_reasoning entirely causes no error — direction is created normally."""
     import json
