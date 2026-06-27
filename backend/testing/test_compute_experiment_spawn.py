@@ -3147,3 +3147,166 @@ async def test_degraded_smoke_does_not_reject_container_job(
     assert meta.get("preflight_smoke_done") is True
     assert meta.get("preflight_smoke_status") == "passed"
     assert meta.get("preflight_smoke_degraded_no_docker") is True
+
+
+# ---------------------------------------------------------------------------
+# Runner-subprocess pre-flight smoke skip (regression gate)
+# ---------------------------------------------------------------------------
+
+
+class TestRunnerSubprocessPreflightSmokeSkip:
+    """_process_single_compute_job deliberately skips the leader-local pre-flight
+    smoke for runner-subprocess jobs.
+
+    The platform pre-flight smoke runs the command on the leader host before a
+    full VM is billed.  For runner-subprocess jobs the actual command must run
+    on operator hardware (which may need local GPU/CUDA/data that the leader
+    lacks) — a leader-local smoke is wrong and would validate a different
+    substrate than the real execution environment.
+
+    These tests pin that intentional skip as a regression gate:
+    - Negative case (acceptance-evidence selector): a QUEUED runner-subprocess
+      job must NOT call ``_run_and_apply_preflight_smoke``.
+    - Positive counterpart: a QUEUED job on ANY other backend MUST call it,
+      confirming the skip is backend-specific and not accidentally global.
+
+    If the negative test starts asserting that smoke was called, that is a
+    regression — the platform smoke is the wrong gate for runner-subprocess.
+    """
+
+    def _mock_job(self, backend: str):
+        """Return a minimal mock ComputeJob with QUEUED status for the given backend."""
+        from unittest.mock import MagicMock
+
+        job = MagicMock()
+        # task_id=None: skips the task DB lookup so tests run without a real session.
+        job.task_id = None
+        job.status = ComputeJobStatus.QUEUED
+        job.backend = backend
+        # Empty dict, no preflight_smoke_done stamp — the job has not been smoked yet.
+        job.polling_metadata = {}
+        job.external_compute_id = None
+        return job
+
+    @pytest.mark.asyncio
+    async def test_runner_subprocess_queued_job_skips_preflight_smoke(self, mocker):
+        """A QUEUED runner-subprocess job must NOT trigger the leader-side
+        pre-flight smoke.  Acceptance-evidence selector: pinned in task
+        evidence as test_runner_subprocess_queued_job_skips_preflight_smoke."""
+        from unittest.mock import MagicMock
+
+        from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+        from app.compute_jobs import _process_single_compute_job
+
+        job = self._mock_job(RUNNER_SUBPROCESS_BACKEND_NAME)
+
+        smoke_mock = mocker.patch(
+            "app.compute_jobs._run_and_apply_preflight_smoke",
+            new_callable=AsyncMock,
+        )
+        # Runner path bypasses smoke and proceeds to _reserve_compute_job_launch.
+        # Return None so the function exits cleanly without needing a real session.
+        mocker.patch(
+            "app.compute_jobs._reserve_compute_job_launch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.compute_jobs.get_compute_backend",
+            return_value=MagicMock(),
+        )
+
+        await _process_single_compute_job(job, session_factory=AsyncMock())
+
+        smoke_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_runner_subprocess_queued_job_triggers_preflight_smoke(
+        self, mocker
+    ):
+        """A QUEUED job on a non-runner-subprocess backend (e.g. local-subprocess)
+        MUST trigger the leader-side pre-flight smoke — confirming the skip is
+        backend-specific and that the general path is still wired correctly."""
+        from unittest.mock import MagicMock
+
+        from app.compute_jobs import _process_single_compute_job
+
+        job = self._mock_job("local-subprocess")
+
+        smoke_mock = mocker.patch(
+            "app.compute_jobs._run_and_apply_preflight_smoke",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.compute_jobs.get_compute_backend",
+            return_value=MagicMock(),
+        )
+
+        await _process_single_compute_job(job, session_factory=AsyncMock())
+
+        # Smoke must be called exactly once; the function returns immediately after.
+        smoke_mock.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_runner_subprocess_with_preflight_smoke_done_still_skips_smoke(
+        self, mocker
+    ):
+        """Even if preflight_smoke_done were somehow stamped on a runner-subprocess
+        job, the backend guard fires first — smoke is never called for this backend."""
+        from unittest.mock import MagicMock
+
+        from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+        from app.compute_jobs import _process_single_compute_job
+
+        job = self._mock_job(RUNNER_SUBPROCESS_BACKEND_NAME)
+        # Simulate an already-stamped preflight_smoke_done on a runner-subprocess job.
+        job.polling_metadata = {"preflight_smoke_done": True}
+
+        smoke_mock = mocker.patch(
+            "app.compute_jobs._run_and_apply_preflight_smoke",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.compute_jobs._reserve_compute_job_launch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.compute_jobs.get_compute_backend",
+            return_value=MagicMock(),
+        )
+
+        await _process_single_compute_job(job, session_factory=AsyncMock())
+
+        smoke_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_non_runner_with_preflight_smoke_done_skips_smoke(self, mocker):
+        """A non-runner-subprocess job that already has preflight_smoke_done=True
+        must skip smoke (idempotency guard) and proceed straight to launch.
+        This is the idempotent-stamp behaviour, not the backend-skip behaviour."""
+        from unittest.mock import MagicMock
+
+        from app.compute_jobs import _process_single_compute_job
+
+        job = self._mock_job("local-subprocess")
+        job.polling_metadata = {"preflight_smoke_done": True}
+
+        smoke_mock = mocker.patch(
+            "app.compute_jobs._run_and_apply_preflight_smoke",
+            new_callable=AsyncMock,
+        )
+        mocker.patch(
+            "app.compute_jobs._reserve_compute_job_launch",
+            new_callable=AsyncMock,
+            return_value=None,
+        )
+        mocker.patch(
+            "app.compute_jobs.get_compute_backend",
+            return_value=MagicMock(),
+        )
+
+        await _process_single_compute_job(job, session_factory=AsyncMock())
+
+        # Smoke already stamped — idempotent guard means it must NOT be re-run.
+        smoke_mock.assert_not_called()
