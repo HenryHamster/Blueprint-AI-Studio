@@ -3104,13 +3104,15 @@ class TestProjectConcurrencyCap:
         )
 
     @pytest.mark.asyncio
-    async def test_compute_experiment_on_fresh_project_dispatches_to_provisioning(
+    async def test_compute_experiment_on_fresh_project_launches_and_parks(
         self, orch_cap_db, mocker
     ):
         """Regression guard: a compute_experiment task on an auto-created project
-        (autonomous_enabled=False, bootstrap_completed_at set) must dispatch to
-        PROVISIONING in a single orchestrator cycle without being starved by the
-        bootstrap-recovery sweep or autonomous-research gating.
+        (autonomous_enabled=False, bootstrap_completed_at set) must be dispatched in
+        a single orchestrator cycle without being starved by the bootstrap-recovery
+        sweep or autonomous-research gating. The orchestrator now launches the
+        ComputeJob directly and PARKS the task (no agent half), so a successful
+        dispatch lands the task in PARKED rather than the old PROVISIONING.
 
         Before the fix the auto-created project had autonomous_enabled=True and
         no bootstrap_completed_at, which caused _sweep_bootstrap_recovery to
@@ -3184,6 +3186,8 @@ class TestProjectConcurrencyCap:
                     {
                         "type": "compute_experiment",
                         "command": "echo hello",
+                        "spend_cap_usd": 1.0,
+                        "deadline_seconds": 300,
                         "github_repo": "acme/fresh-repo",
                     }
                 ],
@@ -3206,11 +3210,12 @@ class TestProjectConcurrencyCap:
                 .first()
             )
         assert row is not None
-        assert row.status == TaskStatus.PROVISIONING, (
-            f"compute_experiment on fresh auto-created project must dispatch to "
-            f"PROVISIONING; got {row.status}. "
-            "Check that autonomous_enabled=False and bootstrap_completed_at are "
-            "set on auto-created projects (admin.py create_compute_experiment_task)."
+        assert row.status == TaskStatus.PARKED, (
+            f"compute_experiment on fresh auto-created project must be dispatched "
+            f"(launched directly + PARKED) in one cycle; got {row.status}. "
+            "Check that autonomous_enabled=False and bootstrap_completed_at are set "
+            "on auto-created projects (admin.py create_compute_experiment_task), and "
+            "that the direct compute_experiment dispatch path launches + parks."
         )
 
 

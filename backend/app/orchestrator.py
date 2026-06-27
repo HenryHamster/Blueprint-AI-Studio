@@ -586,39 +586,23 @@ async def _try_runner_dispatch(
     # Already pinned by a prior cycle — leave it for the runner to pull.
     if ctx.get("runner_target_id"):
         return False
-    task_type = (task.first_payload or {}).get("type", "")
-
-    candidates = active_runners_cache.get(task.project_id) or []
-    eligible = [
-        r
-        for r in candidates
-        if _runner_handles_task_type(r, task_type)
-        and not _runner_at_capacity(r, runner_pins_this_cycle.get(r.id, 0))
-    ]
-    if not eligible:
-        return False
-
-    # Compute experiments that declare a GPU accelerator may only be pinned to
-    # runners advertising has_gpu=True — a CPU runner cannot provide a GPU.
-    # Non-GPU compute experiments fall through to the normal eligibility check.
-    if task_type == "compute_experiment":
-        payload = task.first_payload or {}
-        accelerator = payload.get("accelerator") or (
-            payload.get("compute_experiment") or {}
-        ).get("accelerator")
-        if accelerator:
-            eligible = [r for r in eligible if (r.capabilities or {}).get("has_gpu")]
-            if not eligible:
-                return False
-
-    # Prefer the least-loaded runner by EFFECTIVE load (heartbeat-reported active
-    # count plus pins already made to it this cycle), so a multi-runner fleet
-    # spreads a same-cycle burst across runners instead of stacking one.
-    runner = min(
-        eligible,
-        key=lambda r: _runner_active_task_count(r)
-        + runner_pins_this_cycle.get(r.id, 0),
+    payload = task.first_payload or {}
+    task_type = payload.get("type", "")
+    # A declared accelerator (flat or nested compute_experiment form) restricts
+    # eligibility to GPU runners. Read generically so the gate is uniform; agent
+    # task types simply carry no accelerator and are unaffected.
+    accelerator = payload.get("accelerator") or (
+        payload.get("compute_experiment") or {}
+    ).get("accelerator")
+    runner = _select_eligible_runner(
+        active_runners_cache,
+        task.project_id,
+        task_type,
+        accelerator,
+        runner_pins_this_cycle,
     )
+    if runner is None:
+        return False
 
     new_ctx = dict(ctx)
     new_ctx["runner_target_id"] = str(runner.id)
@@ -652,6 +636,455 @@ async def _try_runner_dispatch(
         runner.id,
     )
     return True
+
+
+def _num_or_none(value) -> float | None:
+    """Coerce ``value`` to a finite float, or None when it is not numeric.
+
+    Mirrors the agent handler's ``numOrNull`` so the orchestrator validates the
+    spend-cap / deadline launch fields exactly as the agent did (rejecting missing
+    keys, JSON ``null``, non-numeric strings, NaN/inf) rather than crashing on a
+    bare ``float(payload[...])`` or silently clamping a bad value into a billable
+    job.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        f = float(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            f = float(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if f != f or f in (float("inf"), float("-inf")):  # NaN / inf
+        return None
+    return f
+
+
+def _select_eligible_runner(
+    active_runners_cache: dict[uuid.UUID, list[LocalRunner]],
+    project_id: uuid.UUID,
+    task_type: str,
+    accelerator: str | None,
+    runner_pins_this_cycle: dict[uuid.UUID, int],
+) -> "LocalRunner | None":
+    """Pick the least-loaded eligible runner for a task/job, or None.
+
+    Eligibility: the runner handles ``task_type`` (its advertised allowlist) and is
+    not at its per-cycle pull capacity; when an ``accelerator`` is declared it must
+    also advertise ``has_gpu`` (a CPU runner cannot provide a GPU). Selection prefers
+    the least EFFECTIVE load — heartbeat-reported active count plus pins already made
+    to the runner this cycle — so a same-cycle burst spreads across a fleet instead
+    of stacking onto one runner.
+
+    Shared by agent-task dispatch (:func:`_try_runner_dispatch`) and direct
+    compute-job dispatch (:func:`_dispatch_compute_experiment_directly`) so both use
+    a single eligibility / least-loaded rule.
+    """
+    candidates = active_runners_cache.get(project_id) or []
+    eligible = [
+        r
+        for r in candidates
+        if _runner_handles_task_type(r, task_type)
+        and not _runner_at_capacity(r, runner_pins_this_cycle.get(r.id, 0))
+    ]
+    if accelerator:
+        eligible = [r for r in eligible if (r.capabilities or {}).get("has_gpu")]
+    if not eligible:
+        return None
+    return min(
+        eligible,
+        key=lambda r: _runner_active_task_count(r)
+        + runner_pins_this_cycle.get(r.id, 0),
+    )
+
+
+def _build_compute_launch_kwargs(
+    payload: dict, *, command: str, spend_cap_usd: float, deadline_seconds: int
+) -> dict:
+    """Map a ``compute_experiment`` task payload to ``create_compute_job`` kwargs.
+
+    Server-side mirror of the agent handler's ``buildLaunchBody``: forwards only the
+    fields that are present so backend defaults apply, so a task launched directly
+    by the orchestrator produces the same ComputeJob the agent's
+    ``POST /api/agent/compute-jobs`` used to create. ``arms``/``declared_metric`` are
+    intentionally NOT forwarded — the multi-arm command is already synthesized into
+    ``payload['command']`` at task creation (``compute_experiment_contract``), exactly
+    as the agent saw it; ``declared_metric`` drives the platform pre-flight smoke, not
+    ``create_compute_job``. The validated ``command``/``spend_cap_usd``/``deadline_seconds``
+    are passed in by the caller (already range-checked).
+    """
+    def _present(value) -> bool:
+        return isinstance(value, str) and value.strip() != ""
+
+    kwargs: dict = {
+        "command": command,
+        "spend_cap_usd": spend_cap_usd,
+        "deadline_seconds": deadline_seconds,
+    }
+    if _present(payload.get("machine_type")):
+        kwargs["machine_type"] = payload["machine_type"]
+    if _present(payload.get("cwd")):
+        kwargs["cwd"] = payload["cwd"]
+    if isinstance(payload.get("env"), dict):
+        kwargs["env"] = payload["env"]
+    if _present(payload.get("backend_name")):
+        kwargs["backend_name"] = payload["backend_name"]
+    if _present(payload.get("provisioning_model")):
+        kwargs["provisioning_model"] = payload["provisioning_model"]
+    # Accelerator: accept the nested compute_experiment form too, matching the
+    # runner-selection gate and _try_runner_dispatch (a flat-only read would treat
+    # a nested-accelerator GPU job as CPU and drop the accelerator).
+    accelerator = payload.get("accelerator") or (
+        payload.get("compute_experiment") or {}
+    ).get("accelerator")
+    if _present(accelerator):
+        kwargs["accelerator"] = accelerator
+    # Live-proof: accept the live_release_* / requires_live_release aliases too,
+    # mirroring the agent's buildLaunchBody so a contract using either form gets the
+    # same live-release enforcement.
+    live_proof = payload.get("live_proof")
+    if live_proof is None:
+        live_proof = payload.get("live_release_proof")
+    if live_proof is None:
+        live_proof = payload.get("requires_live_release")
+    if live_proof is not None:
+        kwargs["live_proof"] = live_proof
+    live_proof_marker = payload.get("live_proof_marker") or payload.get(
+        "live_release_proof_marker"
+    )
+    if _present(live_proof_marker):
+        kwargs["live_proof_marker"] = live_proof_marker
+    if _present(payload.get("setup_step")):
+        kwargs["setup_step"] = payload["setup_step"]
+    if _present(payload.get("container_image")):
+        kwargs["container_image"] = payload["container_image"]
+    if isinstance(payload.get("container_registry_auth"), dict):
+        kwargs["container_registry_auth"] = payload["container_registry_auth"]
+    return kwargs
+
+
+async def _fail_compute_experiment_task(
+    session: AsyncSession, task: Task, failure_class: str, message: str
+) -> str:
+    """Terminal-FAIL a ``compute_experiment`` whose launch failed at dispatch.
+
+    Mirrors the terminal-fail pattern used elsewhere in dispatch (status + message +
+    failure_category + failure alert + ``record_task_result``, committed in one
+    batch) so the failure is classified for direction rollups / research dedup. Used
+    only for genuine launch failures (misconfig, non-recoverable preconditions) with
+    ``failure_class="compute_launch_failed"`` — recoverable live-release preconditions
+    take the BLOCKED path in the caller, never this one. Returns ``"failed"``.
+    """
+    from app.alert_dispatch import _maybe_create_failure_alert
+    from app.broadcast import broadcast_to_project
+    from app.failure_classification import persist_failure_category
+    from app.routers.agent_status import record_task_result
+
+    task.status = TaskStatus.FAILED
+    task.latest_status_message = message[:500]
+    persist_failure_category(task, failure_class)
+    session.add(task)
+    try:
+        await _maybe_create_failure_alert(task, session, message[:200])
+    except Exception:
+        logger.exception(
+            "[ORCHESTRATOR] Failed to create compute-launch failure alert for task %s",
+            task.id,
+        )
+    record_task_result(
+        success=False,
+        failure_class=failure_class,
+        task_id=str(task.id),
+        task_type="compute_experiment",
+    )
+    await session.commit()
+    try:
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {
+                "task_id": str(task.id),
+                "status": TaskStatus.FAILED,
+                "message": message[:200],
+            },
+        )
+    except Exception:
+        logger.exception(
+            "[ORCHESTRATOR] task_updated broadcast failed for compute_experiment %s",
+            task.id,
+        )
+    logger.warning(
+        "[ORCHESTRATOR] compute_experiment %s launch failed (%s): %s",
+        task.id,
+        failure_class,
+        message[:200],
+    )
+    return "failed"
+
+
+async def _dispatch_compute_experiment_directly(
+    session: AsyncSession,
+    task: Task,
+    active_runners_cache: dict[uuid.UUID, list[LocalRunner]],
+    runner_pins_this_cycle: dict[uuid.UUID, int],
+) -> str:
+    """Launch a ``compute_experiment``'s ComputeJob and PARK the task — no agent half.
+
+    The orchestrator does the compute_experiment agent leg's mechanical work itself:
+    select an eligible runner (so a GPU job pins to operator hardware), create the
+    ComputeJob, and park the task on the existing ``compute_job_terminal`` wake. The
+    backend monitor + ``_handle_compute_experiment_completion`` then finalize the task
+    exactly as on the agent path — only *who launches* changes.
+
+    Runner selection reuses the same eligibility as :func:`_try_runner_dispatch`
+    (handles the type, not at capacity, GPU-advertising when an accelerator is
+    declared); the chosen runner is stamped into ``task.context['runner_target_id']``
+    so ``create_compute_job`` routes the job to the runner-subprocess backend and the
+    runner's ``next-compute-job`` poll claims it. Cloud fallback is preserved: with no
+    eligible runner and no enforce-local policy, ``create_compute_job`` picks the
+    GCP/local backend as before.
+
+    Returns:
+        ``"launched"`` — ComputeJob created, task PARKED on the job-terminal wake.
+        ``"failed"``   — launch misconfigured / non-recoverable precondition; task
+                         terminal-FAILED.
+        ``"blocked"``  — a recoverable live-release precondition (release not yet
+                         serving-confirmed); task BLOCKED, auto-unblock sweep re-queues
+                         it once the deploy confirms (not a failure, no retry burn).
+        ``"held"``     — ``require_local_runner`` set and no live runner; held QUEUED
+                         (``awaiting_local_runner_since`` stamped; the existing bounded
+                         sweep terminal-fails a hold that outlives the wait window).
+    Only ``"launched"`` and ``"failed"`` count as a dispatch; ``"blocked"``/``"held"``
+    leave the task waiting. The caller owns the dispatch loop; this function commits
+    its own outcome.
+    """
+    from app.broadcast import broadcast_to_project
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.compute_jobs import (
+        COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        ComputeLaunchPreconditionFailed,
+        create_compute_job,
+    )
+    from app.models import WakeAction
+    from app.task_lifecycle import park_task
+
+    # resolve_project_require_local_runner is imported at module scope (see the
+    # top-of-file app.resource_envelope import).
+
+    payload = task.first_payload or {}
+
+    # ── Validate launch fields up front (mirror the agent handler) ─────────────
+    # Fail loudly + cleanly on a misconfigured task instead of crash-looping on a
+    # bare float(payload[...]) (KeyError/TypeError) or silently clamping a zero or
+    # negative cap into a real billable job.
+    command = str(payload.get("command") or "").strip()
+    spend_cap = _num_or_none(payload.get("spend_cap_usd"))
+    deadline_seconds = _num_or_none(payload.get("deadline_seconds"))
+    config_errors: list[str] = []
+    if not command:
+        config_errors.append("command is required")
+    if spend_cap is None or spend_cap <= 0:
+        config_errors.append("spend_cap_usd must be a positive number")
+    if deadline_seconds is None or deadline_seconds <= 0:
+        config_errors.append("deadline_seconds must be a positive number")
+    if config_errors:
+        return await _fail_compute_experiment_task(
+            session,
+            task,
+            "compute_launch_failed",
+            "Compute experiment misconfigured: " + "; ".join(config_errors),
+        )
+
+    # Accelerator (flat or nested compute_experiment form) gates runner eligibility.
+    accelerator = payload.get("accelerator") or (
+        payload.get("compute_experiment") or {}
+    ).get("accelerator")
+
+    # ── Select an eligible runner (shared rule with _try_runner_dispatch) ──────
+    runner = _select_eligible_runner(
+        active_runners_cache,
+        task.project_id,
+        "compute_experiment",
+        accelerator,
+        runner_pins_this_cycle,
+    )
+
+    project = await session.get(Project, task.project_id)
+    require_local = bool(
+        project is not None and resolve_project_require_local_runner(project)
+    )
+
+    # ── Enforce-local hold: require_local + no runner → keep QUEUED, never cloud ─
+    if runner is None and require_local:
+        ctx = dict(task.context or {})
+        changed = ctx.pop("runner_target_id", None) is not None  # drop any stale pin
+        if not ctx.get("awaiting_local_runner_since"):
+            ctx["awaiting_local_runner_since"] = _utcnow().isoformat()
+            changed = True
+        if changed:
+            task.context = ctx
+            session.add(task)
+            await session.commit()
+        logger.info(
+            "[RUNNERS] Holding compute_experiment %s: require_local_runner set, "
+            "no live eligible runner",
+            task.id,
+        )
+        return "held"
+
+    # ── Pin to the chosen runner; the job inherits it via task.context ─────────
+    if runner is not None:
+        ctx = dict(task.context or {})
+        ctx["runner_target_id"] = str(runner.id)
+        ctx.pop("awaiting_local_runner_since", None)
+        task.context = ctx
+        session.add(task)
+    elif (task.context or {}).get("runner_target_id"):
+        # No eligible runner this cycle (and not enforce-local): drop a STALE pin
+        # left by a prior cycle so create_compute_job takes cloud fallback instead
+        # of forcing the job onto a now-offline/ineligible runner that will never
+        # pull it (it would sit QUEUED until the provisioning sub-deadline →
+        # TIMED_OUT). _try_runner_dispatch avoids this by short-circuiting on an
+        # already-set pin; the direct path clears it here.
+        ctx = dict(task.context or {})
+        ctx.pop("runner_target_id", None)
+        task.context = ctx
+        session.add(task)
+
+    # Flush the runner pin (or its clearing) BEFORE create_compute_job. That call
+    # re-locks the task with populate_existing=True, which overwrites any unflushed
+    # in-session attribute change with the row as last persisted — so without this
+    # flush the pin set above is silently discarded and a GPU job falls back to the
+    # cloud backend instead of routing to the runner. (Relying on session autoflush
+    # here is fragile; make it explicit.)
+    await session.flush()
+
+    # ── Launch the ComputeJob (server-side mirror of the agent handler) ────────
+    launch_kwargs = _build_compute_launch_kwargs(
+        payload,
+        command=command,
+        spend_cap_usd=float(spend_cap),
+        deadline_seconds=int(deadline_seconds),
+    )
+    if runner is not None:
+        # A runner was selected → the job runs on operator hardware. Pin the
+        # runner-subprocess backend explicitly so create_compute_job does not first
+        # derive — and, in a non-cloud env, reject — a tentative cloud GPU backend
+        # before its runner_target_id override is reached. The flushed
+        # runner_target_id in task.context still drives next-compute-job routing.
+        launch_kwargs["backend_name"] = RUNNER_SUBPROCESS_BACKEND_NAME
+    try:
+        job = await create_compute_job(session, task, **launch_kwargs)
+    except ComputeLaunchPreconditionFailed as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        msg = str(detail.get("message") or "compute launch precondition failed")
+        # A live-release precondition is RECOVERABLE — the target release is just
+        # not serving-confirmed yet. Enter the first-class BLOCKED state instead of
+        # terminal-failing, mirroring the agent path's BLOCKED_PRECONDITION handling.
+        if detail.get("error") == "live_release_precondition_failed":
+            from app.task_blocked import enter_blocked_state
+
+            # source="agent" so the unblock sweep RE-QUEUES this block: only
+            # source=="agent" no-dependency blockers get the optimistic "retry"
+            # path (blocked_task_unblock_sweeps.py); any other source stays
+            # "waiting" forever — which would silently wedge the experiment. The
+            # agent path surfaced this exact block as source="agent". Re-dispatch
+            # here is cheap (no agent VM — just a re-entry into this function), so
+            # the bounded optimistic-retry budget comfortably covers a normal
+            # serving-confirm window.
+            enter_blocked_state(
+                task,
+                waiting_on="precondition",
+                reason=msg[:500],
+                source="agent",
+            )
+            session.add(task)
+            await session.commit()
+            try:
+                await broadcast_to_project(
+                    str(task.project_id),
+                    "task_updated",
+                    {"task_id": str(task.id), "status": TaskStatus.BLOCKED},
+                )
+            except Exception:
+                logger.exception(
+                    "[ORCHESTRATOR] task_updated broadcast failed for blocked "
+                    "compute_experiment %s",
+                    task.id,
+                )
+            logger.info(
+                "[ORCHESTRATOR] compute_experiment %s BLOCKED on live-release "
+                "precondition (recoverable): %s",
+                task.id,
+                msg[:200],
+            )
+            return "blocked"
+        # Non-live-release preconditions (spend ceiling, hardware policy,
+        # concurrency, local_runner_required) are genuine launch failures, not
+        # recoverable blocks — label them ``compute_launch_failed`` exactly as the
+        # agent path did. Using ``BLOCKED_PRECONDITION`` on a terminal FAILED task
+        # would make a parent waiting on this child mis-read it as still in flight
+        # (blocked_task_unblock_sweeps treats failure_category BLOCKED_PRECONDITION
+        # as "waiting") and wedge.
+        return await _fail_compute_experiment_task(
+            session, task, "compute_launch_failed", msg
+        )
+    except ValueError as exc:
+        return await _fail_compute_experiment_task(
+            session, task, "compute_launch_failed", f"Compute job launch failed: {exc}"
+        )
+
+    # Charge the in-cycle pin slot only after a durable launch (mirrors
+    # _try_runner_dispatch, so a same-cycle burst never over-pins one runner).
+    if runner is not None:
+        runner_pins_this_cycle[runner.id] = (
+            runner_pins_this_cycle.get(runner.id, 0) + 1
+        )
+
+    # ── Park the task on the job-terminal wake (releases its slot now) ─────────
+    meta = job.polling_metadata or {}
+    park_deadline_seconds = meta.get("park_deadline_seconds")
+    if not isinstance(park_deadline_seconds, (int, float)) or park_deadline_seconds <= 0:
+        park_deadline_seconds = int(deadline_seconds) + 600
+    deadline_at = _utcnow() + timedelta(seconds=int(park_deadline_seconds))
+    await park_task(
+        session,
+        task,
+        wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+        wake_source_ref=str(job.id),
+        wake_action=WakeAction.FINALIZE,
+        deadline_at=deadline_at,
+        reason=f"Parked on compute job {job.id} terminal",
+        source_metadata={
+            "job_id": str(job.id),
+            "experiment": payload.get("experiment"),
+        },
+    )
+    await session.commit()
+    # Mirror the agent-status PARKED path's websocket broadcast so the board
+    # reflects PARKED in real time instead of a stale QUEUED card until next poll.
+    try:
+        await broadcast_to_project(
+            str(task.project_id),
+            "task_updated",
+            {"task_id": str(task.id), "status": TaskStatus.PARKED},
+        )
+    except Exception:
+        logger.exception(
+            "[ORCHESTRATOR] task_updated broadcast failed for parked "
+            "compute_experiment %s",
+            task.id,
+        )
+    logger.info(
+        "[ORCHESTRATOR] Launched compute_experiment %s as job %s (%s); task PARKED",
+        task.id,
+        job.id,
+        f"runner {runner.id}" if runner is not None else "cloud backend",
+    )
+    return "launched"
 
 
 async def _deactivate_stale_runners(session: AsyncSession) -> None:
@@ -3856,6 +4289,34 @@ async def orchestrator_worker():
                             await session.commit()
                             continue
 
+                        # Direct compute_experiment launch (no agent half). A
+                        # compute_experiment's agent leg is purely mechanical —
+                        # create the ComputeJob + park on its terminal wake, no LLM
+                        # and no repo checkout — so the orchestrator does that work
+                        # itself here and the task never enters agent dispatch (which
+                        # would pin the mechanical leg to a runner that may not run
+                        # the agent at all — a silent wedge — and couple the GPU job's
+                        # runner pin to the agent task). This branch fully owns
+                        # compute_experiment dispatch: runner selection, the
+                        # enforce-local hold, and cloud fallback all happen inside it,
+                        # so a compute_experiment never reaches _try_runner_dispatch or
+                        # the legacy hold path below.
+                        if (
+                            str((task.first_payload or {}).get("type") or "")
+                            == "compute_experiment"
+                        ):
+                            _ce_outcome = (
+                                await _dispatch_compute_experiment_directly(
+                                    session,
+                                    task,
+                                    _active_runners_cache,
+                                    _runner_pins_this_cycle,
+                                )
+                            )
+                            if _ce_outcome in ("launched", "failed"):
+                                _cycle_dispatched += 1
+                            continue
+
                         # Pull-based fleet runner routing. Checked BEFORE the
                         # warm-pool / GCP dispatch paths: if an eligible live
                         # runner is registered for this project, pin the task to
@@ -3873,39 +4334,6 @@ async def orchestrator_worker():
                         ):
                             _cycle_dispatched += 1
                             continue
-
-                        # Enforce-local hold: a compute_experiment for a project
-                        # that requires a local runner must never be provisioned
-                        # in the cloud. When no live runner claimed it above, keep
-                        # it QUEUED (held) — the next cycle re-pins it the moment a
-                        # runner registers. A bounded sweep
-                        # (_fail_stale_local_runner_holds) terminally fails a hold
-                        # that exceeds the wait timeout, so the project can never
-                        # wedge forever.
-                        if (
-                            str((task.first_payload or {}).get("type") or "")
-                            == "compute_experiment"
-                        ):
-                            _holding_project = await session.get(
-                                Project, task.project_id
-                            )
-                            if _holding_project is not None and (
-                                resolve_project_require_local_runner(_holding_project)
-                            ):
-                                ctx = dict(task.context or {})
-                                if not ctx.get("awaiting_local_runner_since"):
-                                    ctx["awaiting_local_runner_since"] = (
-                                        _utcnow().isoformat()
-                                    )
-                                    task.context = ctx
-                                    session.add(task)
-                                    await session.commit()
-                                logger.info(
-                                    "[RUNNERS] Holding compute_experiment %s: "
-                                    "require_local_runner set, no live runner",
-                                    task.id,
-                                )
-                                continue
 
                         # Phase 2c: warm-VM continuity skip-provision branch.
                         # Three outcomes when warm_target_vm_id is set on the task:

@@ -1120,3 +1120,172 @@ class TestRegistryPasswordErasedOnTerminalFinalization:
 
         assert "container_registry_auth" not in (job.polling_metadata or {})
         assert job.polling_metadata.get("runner_target_id") == "some-runner-id"
+
+
+# ── Direct compute_experiment dispatch (no agent half) ───────────────────────
+
+
+async def _compute_job_for_task(session, task_id):
+    """Return the ComputeJob created for a task, or None."""
+    from sqlmodel import select
+
+    return (
+        await session.execute(select(ComputeJob).where(ComputeJob.task_id == task_id))
+    ).scalars().first()
+
+
+def _ce_payload(**overrides):
+    """A minimal valid compute_experiment task payload."""
+    p = {
+        "type": "compute_experiment",
+        "command": "echo hi",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+    }
+    p.update(overrides)
+    return p
+
+
+class TestDirectComputeExperimentDispatch:
+    """The orchestrator launches compute_experiment ComputeJobs directly (no agent
+    half): runner-pinned when an eligible runner exists, cloud fallback otherwise,
+    enforce-local hold, recoverable-block / clean-fail on launch errors."""
+
+    @pytest.mark.asyncio
+    async def test_launch_pins_gpu_runner_and_parks(self, db_session):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": True, "max_concurrent": 2},
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload(accelerator="T4")],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [runner]}, {}
+        )
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.PARKED
+        job = await _compute_job_for_task(db_session, task.id)
+        assert job is not None
+        # GPU job pinned to the runner → runner-subprocess backend + pin recorded.
+        assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+        assert (job.polling_metadata or {}).get("runner_target_id") == str(runner.id)
+
+    @pytest.mark.asyncio
+    async def test_launch_cloud_fallback_when_no_runner(self, db_session):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload(machine_type="e2-standard-2")],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        # No runner registered and no enforce-local policy → cloud fallback.
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {}, {}
+        )
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.PARKED
+        job = await _compute_job_for_task(db_session, task.id)
+        assert job is not None
+        assert job.backend != RUNNER_SUBPROCESS_BACKEND_NAME
+
+    @pytest.mark.asyncio
+    async def test_held_when_require_local_and_no_runner(self, db_session):
+        project = await _make_project(db_session)
+        project.build_config = {"resource_envelope": {"require_local_runner": True}}
+        db_session.add(project)
+        await db_session.commit()
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {}, {}
+        )
+        assert outcome == "held"
+        await db_session.refresh(task)
+        # Held QUEUED with the wait stamp; NEVER a billable cloud job.
+        assert task.status == TaskStatus.QUEUED
+        assert (task.context or {}).get("awaiting_local_runner_since")
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_clears_stale_pin_on_cloud_fallback(self, db_session):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload(machine_type="e2-standard-2")],
+            status=TaskStatus.QUEUED,
+            # A pin left by a prior cycle whose runner is gone.
+            context={"runner_target_id": str(uuid.uuid4())},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {}, {}
+        )
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.PARKED
+        # Stale pin dropped → job took cloud fallback, not the dead runner.
+        assert "runner_target_id" not in (task.context or {})
+        job = await _compute_job_for_task(db_session, task.id)
+        assert job is not None
+        assert job.backend != RUNNER_SUBPROCESS_BACKEND_NAME
+
+    @pytest.mark.asyncio
+    async def test_fails_cleanly_on_misconfig(self, db_session):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload(command="")],  # empty command → misconfigured
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {}, {}
+        )
+        assert outcome == "failed"
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.FAILED
+        assert (task.context or {}).get("failure_category") == "compute_launch_failed"
+        # A misconfigured launch never creates a (billable) compute job.
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_non_positive_spend_cap_fails_not_clamped(self, db_session):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload(spend_cap_usd=0)],  # zero cap → reject loudly
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {}, {}
+        )
+        assert outcome == "failed"
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.FAILED
+        assert await _compute_job_for_task(db_session, task.id) is None
