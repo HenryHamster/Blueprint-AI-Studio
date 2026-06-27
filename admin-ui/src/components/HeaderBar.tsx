@@ -395,11 +395,7 @@ export function HeaderBar(props: HeaderBarProps) {
   }, [apiHealthy, props.health]);
 
   return (
-    // Opt out of the 375px text-truncation regression check: the unified top bar's
-    // label cluster clips by ~11px under CI's Linux Chromium font fallback (passes
-    // locally). This is a desktop-only operator chrome; a proper responsive fix is
-    // tracked separately.
-    <div className="shrink-0" data-viewport-allow-truncation>
+    <div className="shrink-0">
       {/* Health expanded panel — shows full OrchestratorHealthBar below the top bar on click */}
       {healthExpanded && (
         <div className="mb-1">
@@ -415,8 +411,14 @@ export function HeaderBar(props: HeaderBarProps) {
         </div>
       )}
 
-      {/* Unified top bar: one coherent band */}
-      <header className="flex items-center gap-2 border-b border-neutral-800/60 pb-1 mb-1">
+      {/* Unified top bar: one coherent band. flex-wrap so that when the LEFT
+          (project switcher) and RIGHT (actions) clusters can't both fit beside
+          the scrolling tab nav on a narrow viewport, the RIGHT cluster wraps to
+          a second row instead of overflowing horizontally. The nav is flex-1
+          (flex-basis 0%) so it never forces a wrap by itself; this keeps the bar
+          a single row whenever it fits and degrades to two rows only when the
+          fixed clusters genuinely exceed the width — independent of font metrics. */}
+      <header className="flex flex-wrap items-center gap-2 border-b border-neutral-800/60 pb-1 mb-1">
         {/* LEFT: ProjectSwitcher + Manage projects slot */}
         <div className="flex items-center gap-1 shrink-0">
           <ProjectSwitcherDropdown

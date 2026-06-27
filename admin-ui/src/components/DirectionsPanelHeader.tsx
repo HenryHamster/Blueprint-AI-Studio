@@ -94,11 +94,21 @@ export function DirectionsPanelHeader({
         </div>
       </div>
 
-      {/* Tabs */}
-      <div className="flex items-center border-b border-neutral-800 shrink-0">
+      {/* Tabs — horizontal-scroll strip so the dense tab row never forces the
+          panel wide on narrow viewports: the strip's box stays within the
+          viewport and its buttons scroll instead of overflowing. Opt the scroll
+          container out of the overflow/truncation invariants because its buttons
+          legitimately extend past the fold inside the scroll region (same pattern
+          as HeaderBar's primary-tab nav). Each button is shrink-0 + whitespace-
+          nowrap so it keeps its label and scrolls rather than squishing. */}
+      <div
+        data-viewport-allow-overflow
+        data-viewport-allow-truncation
+        className="flex items-center border-b border-neutral-800 shrink-0 overflow-x-auto min-w-0"
+      >
         <button
           onClick={() => setActiveTab('directions')}
-          className={`px-4 py-2.5 text-sm font-medium transition-colors min-h-[44px] md:min-h-auto ${
+          className={`px-4 py-2.5 text-sm font-medium transition-colors min-h-[44px] md:min-h-auto shrink-0 whitespace-nowrap ${
             activeTab === 'directions'
               ? 'text-neutral-100 border-b-2 border-blue-500'
               : 'text-neutral-500 hover:text-neutral-300'
@@ -108,7 +118,7 @@ export function DirectionsPanelHeader({
         </button>
         <button
           onClick={() => setActiveTab('problem-model')}
-          className={`px-4 py-2.5 text-sm font-medium transition-colors min-h-[44px] md:min-h-auto ${
+          className={`px-4 py-2.5 text-sm font-medium transition-colors min-h-[44px] md:min-h-auto shrink-0 whitespace-nowrap ${
             activeTab === 'problem-model'
               ? 'text-neutral-100 border-b-2 border-cyan-500'
               : 'text-neutral-500 hover:text-neutral-300'
@@ -127,7 +137,7 @@ export function DirectionsPanelHeader({
         </button>
         <button
           onClick={() => setActiveTab('running-update')}
-          className={`px-4 py-2.5 text-sm font-medium transition-colors min-h-[44px] md:min-h-auto ${
+          className={`px-4 py-2.5 text-sm font-medium transition-colors min-h-[44px] md:min-h-auto shrink-0 whitespace-nowrap ${
             activeTab === 'running-update'
               ? 'text-neutral-100 border-b-2 border-emerald-500'
               : 'text-neutral-500 hover:text-neutral-300'
@@ -140,7 +150,7 @@ export function DirectionsPanelHeader({
         </button>
         <button
           onClick={() => setActiveTab('design-doc')}
-          className={`px-4 py-2.5 text-sm font-medium transition-colors min-h-[44px] md:min-h-auto ${
+          className={`px-4 py-2.5 text-sm font-medium transition-colors min-h-[44px] md:min-h-auto shrink-0 whitespace-nowrap ${
             activeTab === 'design-doc'
               ? 'text-neutral-100 border-b-2 border-purple-500'
               : 'text-neutral-500 hover:text-neutral-300'

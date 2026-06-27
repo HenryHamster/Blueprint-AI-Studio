@@ -171,7 +171,7 @@ function GapLinkSelect({
           setValue('');
         }
       }}
-      className="text-xs bg-neutral-900 border border-neutral-700 text-neutral-400 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-neutral-600"
+      className="text-xs bg-neutral-900 border border-neutral-700 text-neutral-400 rounded px-2 py-1 min-w-0 max-w-full focus:outline-none focus:ring-1 focus:ring-neutral-600"
     >
       <option value="">Link direction…</option>
       {directions.map(d => (
