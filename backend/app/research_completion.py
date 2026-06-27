@@ -2850,7 +2850,22 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     ) or _get_project_integration_branch(project_obj)
     short_id = str(task.id).replace("-", "")[:8]
     research_branch_prefix = getattr(project_obj, "research_branch_prefix", "research/")
-    research_branch = f"{research_branch_prefix}{short_id}"
+    # When this task is a requeue-clone that already opened a rollup PR, carry
+    # the original staging branch forward instead of deriving a new
+    # research/<id> branch from the clone's task ID.  Reusing the branch keeps
+    # the merge-guard invariant (reviewed-branch == PR-head) intact: the PR
+    # head still points at the original branch, so the merge guard won't abort
+    # with a branch-mismatch error on every subsequent iteration.
+    # Guard: only reuse when BOTH research_branch AND rollup_pr_number are
+    # present — rollup_pr_number confirms a PR was actually opened (not just a
+    # branch-setup step that failed before the PR was created).
+    _rctx = task.context or {}
+    _inherited_research_branch = _rctx.get("research_branch")
+    _has_rollup_pr = bool(_rctx.get("rollup_pr_number"))
+    if _inherited_research_branch and _has_rollup_pr:
+        research_branch = _inherited_research_branch
+    else:
+        research_branch = f"{research_branch_prefix}{short_id}"
 
     # Stamp spawn-pending before _ensure_branch commits its row-lock release
     # (task_completion.py ~line 1260). If spawn is interrupted mid-flight by a

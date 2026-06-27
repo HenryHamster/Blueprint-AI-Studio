@@ -2720,3 +2720,91 @@ async def test_escalation_merge_propagates_landed_to_rollup_children(cleanup_db,
     assert (child2.context or {}).get("landed_on_integration") is True
     assert "_non_merge_unblock_reason" not in (child1.context or {})
     assert "_non_merge_unblock_reason" not in (child2.context or {})
+
+
+@pytest.mark.asyncio
+async def test_propagate_landed_bfs_stamps_grandchildren(cleanup_db):
+    """Variant 2 regression: _propagate_landed_to_staging_merged_descendants must
+    stamp descendants at ANY depth, not only direct children.
+
+    Scenario: an outer rollup lands on integration. Its direct child is a
+    sub-rollup (plan task) whose own child (a create task, grandchild of the outer
+    rollup) merged into the sub-rollup's staging branch but carries
+    landed_on_integration=False.  The BFS sweep from the outer rollup's ID must
+    propagate through the sub-rollup and reach the grandchild.
+
+    Without the BFS (_propagate_landed_to_staging_merged_descendants), only
+    _propagate_landed_to_rollup_children is available — it stamps direct children
+    (the sub-rollup) but never descends to the grandchild, permanently wedging any
+    cross-base dependent that waits on has_landed_signal(grandchild).
+    """
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.landed_signal import has_landed_signal
+
+    project = await _make_project(cleanup_db, integration_branch="main")
+
+    # Outer rollup parent (a research/plan task)
+    outer_parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+        },
+    )
+    # Direct child: a sub-rollup (plan task) that merged into outer parent's staging
+    # branch. _propagate_landed_to_rollup_children would stamp this (it's a DIRECT
+    # child) but would not descend further.
+    sub_rollup = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="plan",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=outer_parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    # Grandchild: a create task that merged into the sub-rollup's staging branch.
+    # _propagate_landed_to_rollup_children WOULD NOT reach this task — it only stamps
+    # direct children. The BFS sweep must propagate here so cross-base dependents
+    # waiting on has_landed_signal(grandchild) can dispatch.
+    grandchild = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=sub_rollup.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+
+    # Run the BFS sweep from the outer rollup parent
+    await _propagate_landed_to_staging_merged_descendants(outer_parent.id, cleanup_db)
+    await cleanup_db.commit()
+
+    await cleanup_db.refresh(sub_rollup)
+    await cleanup_db.refresh(grandchild)
+
+    # Sub-rollup (direct child) must be stamped
+    assert has_landed_signal(sub_rollup), (
+        "sub_rollup (direct child) must receive landed signal from BFS sweep"
+    )
+    assert (sub_rollup.context or {}).get("landed_on_integration") is True
+
+    # Grandchild must ALSO be stamped — the key regression assertion.
+    # Without the BFS, grandchild.landed_on_integration would stay False because
+    # _propagate_landed_to_rollup_children alone would miss it.
+    assert has_landed_signal(grandchild), (
+        "grandchild must receive landed signal via BFS — "
+        "_propagate_landed_to_rollup_children alone would miss it"
+    )
+    assert (grandchild.context or {}).get("landed_on_integration") is True
+    assert "_non_merge_unblock_reason" not in (grandchild.context or {})

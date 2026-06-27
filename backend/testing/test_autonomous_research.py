@@ -16722,3 +16722,99 @@ def test_build_onboarding_proof_block_fully_stamped_non_self_project():
     assert block["first_merge_gate_executed_tests"] is True
     assert block["first_pr_merged_at"] == "2026-01-20T00:00:00"
     assert block["first_autonomous_improvement_at"] == "2026-01-20T01:00:00"
+
+
+@pytest.mark.asyncio
+async def test_research_requeue_clone_reuses_inherited_staging_branch(
+    db_session, mocker
+):
+    """Variant 1 regression (research): a research-task clone that already opened
+    a rollup PR must reuse the inherited research_branch rather than deriving a new
+    staging branch from the clone's task ID.
+
+    Scenario: research task A has research_branch='research/oldhex12' and
+    rollup_pr_number=42 in its context.  A's parent requeues, A is cancelled, and
+    the clone B inherits A's context.  When B runs _handle_research_completion it
+    MUST use 'research/oldhex12', not derive a new 'research/<B-short-id>' —
+    otherwise the merge guard aborts because the PR head still points at the
+    original branch.
+
+    Without the fix (research_completion.py branch reuse guard), _ensure_branch
+    would be called with the clone's derived branch ('research/<B-short-id>'),
+    desync'ing from the open PR.
+    """
+    direction = _active_direction("d-branch-reuse01", "Branch reuse direction")
+    project = Project(
+        name="ResearchBranchReuseTest",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Clone task: inherits research_branch + rollup_pr_number from the cancelled
+    # original.  The clone has a NEW task UUID so its derived short_id differs
+    # from the inherited branch suffix "oldhex12".
+    original_research_branch = "research/oldhex12"
+    clone_task = await _make_research_task(project, direction, db_session)
+    clone_task.context = {
+        **(clone_task.context or {}),
+        "research_branch": original_research_branch,
+        "rollup_pr_number": 42,
+        "_attempt_number": 2,
+    }
+    db_session.add(clone_task)
+    await db_session.commit()
+    await db_session.refresh(clone_task)
+
+    # Verify the clone's derived short_id would produce a DIFFERENT branch,
+    # making the regression observable.
+    derived_branch = f"research/{str(clone_task.id).replace('-', '')[:8]}"
+    assert derived_branch != original_research_branch, (
+        "Test setup: clone's derived branch must differ from the inherited branch "
+        "— if they match, the regression is not observable"
+    )
+
+    captured_branch: list = []
+
+    async def _capture_ensure_branch(task, branch, *_a, **_kw):
+        captured_branch.append(branch)
+        return task
+
+    mocker.patch("app.task_completion._ensure_branch", new=_capture_ensure_branch)
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.research_completion._validate_plan_dependencies", return_value=True
+    )
+    mocker.patch("app.research_completion._log_file_overlaps", return_value=[])
+    mocker.patch("app.max_plan_pool._all_accounts", return_value=[])
+    mocker.patch(
+        "app.research_completion._apply_structural_actionability_downgrade",
+        return_value=0,
+    )
+    mocker.patch("app.research_completion._is_high_stakes_finding", return_value=False)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[_make_finding("Fix something", direction_id=direction["id"])],
+    )
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health",
+        return_value=(False, None),
+    )
+
+    await _handle_research_completion(clone_task, "", db_session)
+
+    # _ensure_branch must have been called with the INHERITED branch, not the
+    # clone-derived 'research/<clone-id-prefix>' branch.
+    assert captured_branch, (
+        "_ensure_branch must have been called — function may have short-circuited "
+        "before reaching branch creation"
+    )
+    assert captured_branch[0] == original_research_branch, (
+        f"Expected _ensure_branch called with '{original_research_branch}', "
+        f"got '{captured_branch[0]!r}'. "
+        "Fix: research_completion.py must reuse inherited research_branch when "
+        "rollup_pr_number is set (mirrors plan_completion.py:554-560)."
+    )
