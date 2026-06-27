@@ -1769,6 +1769,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     resp = JSONResponse(
         status_code=exc.status_code,
         content={"error": {"code": exc.status_code, "message": exc.detail}},
+        headers=exc.headers,
     )
     return _apply_cors_headers(resp, request)
 

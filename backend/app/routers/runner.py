@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import create_agent_token, get_current_runner
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+from app.runner_rate_limiter import check_runner_rate_limit
 from app.database import get_session
 from app.models import ComputeJob, ComputeJobStatus, LocalRunner, Project, Task, TaskStatus, _utcnow
 from app.task_capabilities import agent_capability_slice
@@ -104,6 +105,10 @@ async def next_task(
     ``/api/agent/claim`` to perform the PROVISIONING → IN_PROGRESS transition
     (identical contract to GCP-provisioned VMs).
     """
+    allowed, retry_after = await check_runner_rate_limit(str(runner.id), "next_task")
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
     pinned_vm_id = f"runner:{runner.id}"
     result = await session.execute(
         select(Task)
@@ -167,6 +172,10 @@ async def heartbeat(
     per-cycle dispatch cache can prefer less-loaded runners without an extra
     per-task query.
     """
+    allowed, retry_after = await check_runner_rate_limit(str(runner.id), "heartbeat")
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
     runner.last_seen_at = _utcnow()
     # Re-arm an inactive runner on every authenticated heartbeat. The stale-runner
     # sweep flips active->inactive after a single missed 300s window (slept/network-
@@ -212,6 +221,10 @@ async def next_compute_job(
     double-claiming the same job. On a hit the job is atomically transitioned
     STARTING→RUNNING and the exec fields are returned to the runner.
     """
+    allowed, retry_after = await check_runner_rate_limit(str(runner.id), "next_compute_job")
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
     now = _utcnow()
     result = await session.execute(
         select(ComputeJob)
@@ -309,6 +322,10 @@ async def report_compute_job(
     endpoint still returns ``{ok, cancel_requested}`` so the runner can observe
     the cancel signal even after the job has been finalized.
     """
+    allowed, retry_after = await check_runner_rate_limit(str(runner.id), "report_compute_job")
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
     now = _utcnow()
     result = await session.execute(
         select(ComputeJob)
@@ -443,6 +460,10 @@ async def upload_compute_job_artifact(
     for the monitor/finalize path. Scoped to the pinned runner exactly like the
     report endpoint, so runner A cannot upload to a job claimed by runner B.
     """
+    allowed, retry_after = await check_runner_rate_limit(str(runner.id), "upload_compute_job_artifact")
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
     # Early-reject obviously-oversized uploads before buffering the whole body.
     content_length = request.headers.get("content-length")
     if content_length is not None:
