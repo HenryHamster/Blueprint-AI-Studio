@@ -326,6 +326,16 @@ function SweepKnowledgeGroupsSection({
   const entries = Object.entries(sweepGroups);
   if (entries.length === 0) return null;
 
+  const verdictLabel = (met: boolean | null | undefined) => met === true ? 'MET' : met === false ? 'NOT MET' : 'UNMEASURED';
+  const gradeLabel = (grade: string | null | undefined) => grade === 'acceptance' ? 'accepted' : grade === 'measured_only' ? 'measured' : '—';
+  const armEvidence = (doc: ComputeSweepGroupsResponse['sweep_groups'][string][number]) => {
+    const verdicts = doc.per_arm_verdicts ? Object.entries(doc.per_arm_verdicts) : [];
+    if (verdicts.length === 0) return doc.criterion?.metric ?? '—';
+    return verdicts
+      .map(([arm, v]) => `${arm}: ${v.value ?? 'n/a'} ${verdictLabel(v.met)}${v.cost_usd != null ? ` (${fmtUsd(v.cost_usd)})` : ''}`)
+      .join(' · ');
+  };
+
   function toggleCompare(sweepId: string) {
     setCompareSet((prev) => {
       const next = new Set(prev);
@@ -375,7 +385,9 @@ function SweepKnowledgeGroupsSection({
                   <thead>
                     <tr>
                       <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Run</th>
-                      <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Grade</th>
+                      <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Verdict</th>
+                      <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Criterion</th>
+                      <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Evidence</th>
                       <th className="text-left pb-1 text-neutral-500 font-normal">Summary</th>
                     </tr>
                   </thead>
@@ -395,7 +407,9 @@ function SweepKnowledgeGroupsSection({
                             <span className="truncate">{(doc.arm_label ?? doc.title).slice(0, 28)}</span>
                           )}
                         </td>
-                        <td className="py-0.5 pr-3 text-neutral-400">{doc.acceptance_grade ?? '—'}</td>
+                        <td className="py-0.5 pr-3 text-neutral-400">{verdictLabel(doc.criterion_met)} / {gradeLabel(doc.compute_acceptance_grade)}</td>
+                        <td className="py-0.5 pr-3 text-neutral-400">{doc.criterion ? `${doc.criterion.metric} ${doc.criterion.operator} ${doc.criterion.threshold}` : '—'}</td>
+                        <td className="py-0.5 pr-3 text-neutral-400 max-w-xs truncate">{armEvidence(doc)}</td>
                         <td className="py-0.5 text-neutral-400 max-w-xs truncate">{doc.summary?.slice(0, 80) ?? '—'}</td>
                       </tr>
                     ))}
@@ -419,9 +433,9 @@ function SweepKnowledgeGroupsSection({
                         doc.arm_label ?? doc.title
                       )}
                     </span>
-                    {doc.acceptance_grade && (
-                      <span className="shrink-0 rounded border border-neutral-600/40 bg-neutral-800/60 px-1 py-0.5 text-ui-xs text-neutral-300">
-                        {doc.acceptance_grade}
+                    {doc.criterion_met !== undefined && (
+                      <span className={`shrink-0 rounded border px-1 py-0.5 text-ui-xs ${doc.criterion_met === true ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : doc.criterion_met === false ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-amber-500/40 bg-amber-500/15 text-amber-300'}`}>
+                        {verdictLabel(doc.criterion_met)}
                       </span>
                     )}
                   </div>

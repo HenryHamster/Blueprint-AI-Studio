@@ -2358,13 +2358,13 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(marginChip.textContent).toContain('arm-slow');
   });
 
-  test('compares_runs_grouped_by_sweep_id: renders sweep knowledge groups section when sweep groups returned', async () => {
+  test('compares_runs_grouped_by_sweep_id renders backend criterion verdict values', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([]));
     fetchComputeSweepGroups.mockResolvedValue({
       sweep_groups: {
         'sweep-abc': [
-          { id: 'doc-1', title: 'accuracy_v1 sweep run A', summary: 'Achieved 0.91 accuracy', acceptance_grade: 'B', arm_label: 'run-a', created_at: '2026-06-20T10:00:00Z' },
-          { id: 'doc-2', title: 'accuracy_v1 sweep run B', summary: 'Achieved 0.95 accuracy', acceptance_grade: 'A', arm_label: 'run-b', created_at: '2026-06-20T11:00:00Z' },
+          { id: 'doc-1', title: 'accuracy_v1 sweep run A', summary: 'Achieved 0.91 accuracy', compute_acceptance_grade: 'measured_only', criterion_met: false, criterion: { metric: 'accuracy', operator: '>=', threshold: 0.93 }, per_arm_verdicts: { 'run-a': { value: 0.91, met: false, cost_usd: 0.42 } }, arm_label: 'run-a', created_at: '2026-06-20T10:00:00Z' },
+          { id: 'doc-2', title: 'accuracy_v1 sweep run B', summary: 'Achieved 0.95 accuracy', compute_acceptance_grade: 'acceptance', criterion_met: true, criterion: { metric: 'accuracy', operator: '>=', threshold: 0.93 }, per_arm_verdicts: { 'run-b': { value: 0.95, met: true, cost_usd: 0.53 } }, arm_label: 'run-b', created_at: '2026-06-20T11:00:00Z' },
         ],
       },
     });
@@ -2381,8 +2381,10 @@ describe('ComputeJobsPanel render + kill', () => {
     const table = await findByTestId('sweep-knowledge-comparison-table');
     expect(table.textContent).toContain('run-a');
     expect(table.textContent).toContain('run-b');
-    expect(table.textContent).toContain('A');
-    expect(table.textContent).toContain('B');
+    expect(table.textContent).toContain('NOT MET / measured');
+    expect(table.textContent).toContain('MET / accepted');
+    expect(table.textContent).toContain('accuracy >= 0.93');
+    expect(table.textContent).toContain('run-b: 0.95 MET ($0.53)');
   });
 
   test('compares_runs_grouped_by_sweep_id: hides sweep knowledge groups section when no groups returned', async () => {
@@ -2990,4 +2992,3 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(queryByTestId('compute-ask-ungrounded')).toBeNull();
   });
 });
-
