@@ -90,6 +90,15 @@ Welcome to the Blueprint documentation. This directory contains comprehensive gu
   - Performance optimization tips
   - Common pitfalls and solutions
 
+### Operator Experience
+
+- **[operator-experience-operating-model.md](operator-experience-operating-model.md)** — Canonical operator IA and decision loops
+  - Five operator spaces: Operate, Work, Strategy, Fleet, Policy
+  - Core object relationships (project, task, wave, PR, direction, finding, version, runner, account)
+  - Decision loops by task type (review/fix, research, compute experiment, PR merge)
+  - Useful queue definitions (needs decision, needs intervention, needs review, safe to ignore)
+  - Design rules for future implementation tasks
+
 ### Analysis & Reference
 
 - **[codebase-analysis.md](codebase-analysis.md)** — High-level codebase overview
