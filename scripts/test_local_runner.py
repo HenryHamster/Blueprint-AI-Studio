@@ -503,6 +503,15 @@ class TestRunComputeJob(unittest.TestCase):
         base.update(kwargs)
         return base
 
+    @unittest.skipUnless(
+        os.name == "posix",
+        "Integration test: the runner executes the command via `bash -lc` and the "
+        "command writes $BLUEPRINT_RESULT_FILE (a host path). This requires bash and "
+        "the host filesystem to share path semantics — true on Linux/CI and WSL "
+        "(where the runner actually runs), but NOT on Windows-native Python + MSYS "
+        "bash, where a `C:\\...` path is unwritable from bash. Sibling tests that use "
+        "path-free commands (e.g. `exit 42`) or mock Popen are not affected.",
+    )
     def test_successful_command_reports_succeeded_with_metrics(self):
         """A command that exits 0 and writes result.json → succeeded report with metrics."""
         reports = []
@@ -1309,6 +1318,95 @@ class TestArtifactUpload(unittest.TestCase):
                 local_runner._upload_artifact(
                     "https://api.example.com", "tok", "job-1", art
                 )
+
+
+class TestBoundedDedupLog(unittest.TestCase):
+    """Command-log capture: consecutive-duplicate collapsing + head/tail budget."""
+
+    def _feed(self, log, data: bytes, chunk: int = 8192):
+        for i in range(0, len(data), chunk):
+            log.feed(data[i : i + chunk])
+
+    def test_small_log_passthrough_untruncated(self):
+        log = local_runner._BoundedDedupLog(max_bytes=1000, head_bytes=200)
+        self._feed(log, b"line one\nline two\nline three\n")
+        text, truncated = log.result()
+        self.assertFalse(truncated)
+        self.assertEqual(text, "line one\nline two\nline three\n")
+
+    def test_consecutive_duplicates_collapse(self):
+        log = local_runner._BoundedDedupLog(max_bytes=10000, head_bytes=2000)
+        log.feed(b"begin\n")
+        for _ in range(500):
+            log.feed(b"'+ptx85' is not a recognized feature\n")
+        log.feed(b"end\n")
+        text, truncated = log.result()
+        # Spam line stored exactly once, with an accurate repeat marker.
+        self.assertEqual(text.count("'+ptx85' is not a recognized feature"), 1)
+        self.assertIn("repeated 499 more time(s)", text)
+        self.assertIn("begin", text)
+        self.assertIn("end", text)
+        self.assertFalse(truncated)  # collapsed well under budget
+
+    def test_tail_survives_when_over_budget(self):
+        # Head 100B + tail 200B. A long unique body must drop the MIDDLE, keeping
+        # the final summary lines (where results live).
+        log = local_runner._BoundedDedupLog(max_bytes=300, head_bytes=100)
+        body = "".join(f"row{i:04d}\n" for i in range(200)).encode("utf-8")
+        self._feed(log, b"HEADER_START\n" + body)
+        self._feed(log, b"FAIL module_x\nall_green=0\n")
+        text, truncated = log.result()
+        self.assertTrue(truncated)
+        self.assertIn("HEADER_START", text)         # head kept
+        self.assertIn("FAIL module_x", text)         # tail kept
+        self.assertIn("all_green=0", text)           # final summary kept
+        self.assertIn("elided", text)                # middle marked elided
+
+    def test_distinct_lines_not_collapsed(self):
+        log = local_runner._BoundedDedupLog(max_bytes=10000, head_bytes=2000)
+        self._feed(log, b"a\nb\na\nb\n")  # alternating, not consecutive dups
+        text, _ = log.result()
+        self.assertNotIn("repeated", text)
+        self.assertEqual(text, "a\nb\na\nb\n")
+
+    def test_trailing_line_without_newline_captured(self):
+        log = local_runner._BoundedDedupLog(max_bytes=1000, head_bytes=200)
+        self._feed(log, b"first\nlast-no-newline")
+        text, _ = log.result()
+        self.assertIn("last-no-newline", text)
+
+    def test_newline_free_stream_is_bounded(self):
+        # A '\r'-based progress stream never emits '\n'. _pending must NOT grow
+        # without bound — it force-flushes past the budget. Assert the buffer and
+        # the final text stay within a small multiple of max_bytes (no OOM).
+        log = local_runner._BoundedDedupLog(max_bytes=2000, head_bytes=500)
+        for _ in range(5000):
+            log.feed(b"\rprogress " + b"=" * 50)  # 60 bytes each, no newline
+        self.assertLessEqual(len(log._pending), 2000 + 60)
+        text, truncated = log.result()
+        self.assertLessEqual(len(text.encode("utf-8")), 2000)
+        self.assertTrue(truncated)
+
+    def test_single_oversized_line_clipped_to_budget(self):
+        # One line far larger than the budget must be clipped (not stored whole)
+        # AND reported truncated — the previous ring-buffer guard kept it un-popped.
+        log = local_runner._BoundedDedupLog(max_bytes=1000, head_bytes=200)
+        self._feed(log, b"A" * 50000 + b"\nTAIL_END\n")
+        text, truncated = log.result()
+        self.assertLessEqual(len(text.encode("utf-8")), 1000)
+        self.assertTrue(truncated)
+        self.assertIn("TAIL_END", text)  # most-recent output survives
+
+    def test_assembled_text_never_exceeds_max_bytes(self):
+        # The elision marker must fit WITHIN max_bytes (reserve), so the backend's
+        # equal-size cap never re-truncates and clips the tail.
+        log = local_runner._BoundedDedupLog(max_bytes=4096, head_bytes=1024)
+        body = "".join(f"unique line {i}\n" for i in range(5000)).encode("utf-8")
+        self._feed(log, body)
+        text, truncated = log.result()
+        self.assertTrue(truncated)
+        self.assertLessEqual(len(text.encode("utf-8")), 4096)
+        self.assertIn("elided", text)
 
 
 if __name__ == "__main__":

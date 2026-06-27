@@ -29,6 +29,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from collections import deque
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -129,11 +130,150 @@ def _post(url: str, token: str, body: dict) -> tuple[int, dict | None]:
 # ── Compute-job constants ─────────────────────────────────────────────────────
 
 _RUNNER_CONTAINER_OUT_DIR = "/tmp/blueprint_out"
-_RUNNER_MAX_COMMAND_LOG_BYTES = 32768
+# Total command-log budget reported to the orchestrator. Matches the backend's
+# own _MAX_RUNNER_COMMAND_LOG_BYTES so a captured log is never re-truncated on
+# arrival. Raised from 32768 now that consecutive-duplicate-line collapsing keeps
+# the captured text dense (see _BoundedDedupLog).
+_RUNNER_MAX_COMMAND_LOG_BYTES = 65536
+# Bytes of the log HEAD always retained (run setup / environment). The remainder
+# of the budget is a rolling TAIL — test suites and training loops print their
+# pass/fail summary at the END, so a head-only cap discarded exactly the results a
+# downstream verdict needs.
+_RUNNER_COMMAND_LOG_HEAD_BYTES = 8192
 _RUNNER_HEARTBEAT_INTERVAL = 30.0
 # v1 cap on durable artifact uploads. The runner skips (does not fail) any run
 # whose artifact dir exceeds this; the backend mirrors the cap and 413s.
 _RUNNER_ARTIFACT_MAX_BYTES = 25 * 1024 * 1024  # 25 MiB
+
+
+class _BoundedDedupLog:
+    """Stream-capture command output with two defenses against noisy logs.
+
+    1. Consecutive-duplicate-line collapsing — a burst of an identical line is
+       stored ONCE followed by a ``[previous line repeated N more time(s)]``
+       marker. This is content-agnostic (no hardcoded patterns): it collapses the
+       unsuppressable CUDA ``'+ptxNN' is not a recognized feature`` warning a newer
+       GPU spams in an older container, and any other repeated spam, so noise can
+       never crowd out the run's real output.
+    2. Head+tail byte budget — the first ``head_bytes`` and the last
+       ``max_bytes - head_bytes`` bytes are always kept; the middle is elided. The
+       previous head-only cap dropped the END of the log, which is exactly where a
+       test suite or training loop prints its pass/fail summary — the result a
+       downstream verdict agent must reason over.
+
+    Fed arbitrary byte chunks via :meth:`feed` (from the reader thread); :meth:`result`
+    returns ``(text, truncated)`` where ``truncated`` is True iff content was elided.
+    ``feed`` and ``result`` are serialized by a lock so ``result`` may be called while
+    the reader thread is still delivering output (the runner joins the reader with a
+    timeout, so it can still be alive).
+
+    The assembled text — including the elision marker — never exceeds ``max_bytes``
+    (the head+tail budgets reserve room for the marker), so the orchestrator's own
+    equal-size cap never re-truncates it on arrival.
+    """
+
+    # Reserve for the "...[log middle elided...]..." marker so head+marker+tail
+    # stays within max_bytes (the marker is ~49 bytes; round up).
+    _ELISION_MARKER = b"\n...[log middle elided to fit capture budget]...\n"
+    _ELISION_RESERVE = 64
+
+    def __init__(self, max_bytes: int, head_bytes: int) -> None:
+        self._max_bytes = max(0, max_bytes)
+        usable = max(0, self._max_bytes - self._ELISION_RESERVE)
+        self._head_budget = max(0, min(head_bytes, usable))
+        self._tail_budget = max(0, usable - self._head_budget)
+        self._pending = bytearray()           # buffered incomplete trailing line
+        self._head = bytearray()
+        self._head_full = False
+        self._tail: deque[bytes] = deque()
+        self._tail_bytes = 0
+        self._elided = False
+        self._last_line: bytes | None = None   # last DISTINCT line (sans newline)
+        self._repeat = 0
+        self._lock = threading.Lock()
+
+    def feed(self, chunk: bytes) -> None:
+        with self._lock:
+            self._pending.extend(chunk)
+            while True:
+                nl = self._pending.find(b"\n")
+                if nl < 0:
+                    break
+                line = bytes(self._pending[: nl + 1])  # keep the newline on storage
+                del self._pending[: nl + 1]
+                self._emit_line(line)
+            # Bound the unflushed partial line: a newline-free stream (e.g. '\r'
+            # progress bars, which reach feed() because stderr is merged into
+            # stdout) must not buffer the whole stream in memory. Once the partial
+            # line exceeds the total budget, force-flush it as a synthetic line —
+            # _store/_push_tail then clip it to the byte budget.
+            if len(self._pending) > self._max_bytes:
+                forced = bytes(self._pending)
+                self._pending = bytearray()
+                self._emit_line(forced)
+
+    def _emit_line(self, line: bytes) -> None:
+        key = line.rstrip(b"\n")
+        if self._last_line is not None and key == self._last_line:
+            self._repeat += 1
+            return
+        self._flush_repeat()
+        self._last_line = key
+        self._store(line)
+
+    def _flush_repeat(self) -> None:
+        if self._repeat > 0:
+            marker = (
+                f"  [previous line repeated {self._repeat} more time(s)]\n"
+            ).encode("utf-8")
+            self._repeat = 0
+            self._store(marker)
+
+    def _store(self, data: bytes) -> None:
+        if not self._head_full and len(self._head) < self._head_budget:
+            take = self._head_budget - len(self._head)
+            self._head.extend(data[:take])
+            if len(data) > take:
+                self._head_full = True
+                self._push_tail(data[take:])
+        else:
+            self._head_full = True
+            self._push_tail(data)
+
+    def _push_tail(self, data: bytes) -> None:
+        if self._tail_budget <= 0:
+            if data:
+                self._elided = True
+            return
+        # A single item larger than the whole tail budget can never be trimmed by
+        # popping (we always keep >=1 item). Keep only its LAST tail_budget bytes —
+        # the most recent output (end-of-run results) — so the buffer honors the
+        # budget instead of growing unbounded and mis-reporting truncated=False.
+        if len(data) > self._tail_budget:
+            data = data[-self._tail_budget:]
+            self._elided = True
+        self._tail.append(data)
+        self._tail_bytes += len(data)
+        while self._tail_bytes > self._tail_budget and len(self._tail) > 1:
+            self._tail_bytes -= len(self._tail.popleft())
+            self._elided = True
+
+    def result(self) -> tuple[str, bool]:
+        with self._lock:
+            if self._pending:
+                self._emit_line(bytes(self._pending))
+                self._pending = bytearray()
+            self._flush_repeat()
+            head = bytes(self._head)
+            tail = b"".join(self._tail)
+            if self._elided:
+                text = (
+                    head.decode("utf-8", "replace")
+                    + self._ELISION_MARKER.decode("utf-8")
+                    + tail.decode("utf-8", "replace")
+                )
+                return text, True
+            return (head + tail).decode("utf-8", "replace"), False
 
 
 # ── GPU detection ────────────────────────────────────────────────────────────
@@ -615,8 +755,13 @@ def _run_compute_job(
         print(f"[compute] started job {job_id} pid={proc.pid}", flush=True)
         _report_compute_job(orchestrator_url, token, job_id, exec_status="running")
 
-        # Capture stdout in a background thread (bounded to _RUNNER_MAX_COMMAND_LOG_BYTES)
-        output_state: dict = {"captured": bytearray(), "truncated": False}
+        # Capture stdout in a background thread with consecutive-duplicate-line
+        # collapsing + a head+tail budget (see _BoundedDedupLog), so spammy
+        # repeated lines (e.g. CUDA ptx warnings) don't crowd out real output and
+        # the END of the log — where results/summaries live — always survives.
+        log_capture = _BoundedDedupLog(
+            _RUNNER_MAX_COMMAND_LOG_BYTES, _RUNNER_COMMAND_LOG_HEAD_BYTES
+        )
 
         def _read_stdout() -> None:
             assert proc.stdout is not None
@@ -624,13 +769,7 @@ def _run_compute_job(
                 chunk = proc.stdout.read(8192)
                 if not chunk:
                     break
-                if len(output_state["captured"]) < _RUNNER_MAX_COMMAND_LOG_BYTES:
-                    remaining = _RUNNER_MAX_COMMAND_LOG_BYTES - len(output_state["captured"])
-                    output_state["captured"].extend(chunk[:remaining])
-                    if len(chunk) > remaining:
-                        output_state["truncated"] = True
-                else:
-                    output_state["truncated"] = True
+                log_capture.feed(chunk)
 
         reader = threading.Thread(target=_read_stdout, daemon=True)
         reader.start()
@@ -703,14 +842,13 @@ def _run_compute_job(
         except (OSError, json.JSONDecodeError, ValueError):
             pass
 
-        captured = output_state["captured"]
-        truncated = output_state["truncated"]
+        log_text, truncated = log_capture.result()
         command_log: dict | None = None
-        if captured or truncated:
+        if log_text or truncated:
             command_log = {
-                "text": captured.decode("utf-8", "replace"),
+                "text": log_text,
                 "truncated": truncated,
-                "byte_count": len(captured),
+                "byte_count": len(log_text.encode("utf-8")),
             }
 
         exec_status_final = "succeeded" if exit_code_val == 0 else "failed"

@@ -2555,18 +2555,37 @@ def build_compute_result_logs(job: ComputeJob) -> str:
                     if isinstance(elapsed, (int, float)):
                         arm_dict["cost_usd"] = float(final_cost) * (float(elapsed) / total_elapsed)
     # Embed the bounded command log text so downstream analysis (knowledge doc,
-    # LLM analysis prompt) can find results that live in stdout/stderr rather
-    # than in $BLUEPRINT_RESULT_FILE. Capped at _COMMAND_LOG_EMBED_CHARS so a
-    # noisy command log can never bloat the artifact JSON unreasonably.
-    _COMMAND_LOG_EMBED_CHARS = 8000
+    # LLM analysis/verdict prompt) can find results that live in stdout/stderr
+    # rather than in $BLUEPRINT_RESULT_FILE. Capped at _COMMAND_LOG_EMBED_CHARS so
+    # a noisy command log can never bloat the artifact JSON unreasonably. When the
+    # log exceeds the cap, keep the HEAD (run setup) AND the TAIL (results) and
+    # elide the middle — a head-only slice dropped exactly the end-of-run pass/fail
+    # summary a verdict agent must reason over.
+    _COMMAND_LOG_EMBED_CHARS = 16000
+    _COMMAND_LOG_EMBED_HEAD_CHARS = 4000
     command_log = meta.get("command_log")
     if isinstance(command_log, dict):
         cl_text = str(command_log.get("text") or "").strip()
         if cl_text:
-            result["command_log_text"] = redact_command_log_text(cl_text)[
-                :_COMMAND_LOG_EMBED_CHARS
-            ]
-            result["command_log_truncated"] = bool(command_log.get("truncated"))
+            redacted = redact_command_log_text(cl_text)
+            if len(redacted) <= _COMMAND_LOG_EMBED_CHARS:
+                embed = redacted
+                embed_truncated = False
+            else:
+                head = redacted[:_COMMAND_LOG_EMBED_HEAD_CHARS]
+                tail = redacted[
+                    -(_COMMAND_LOG_EMBED_CHARS - _COMMAND_LOG_EMBED_HEAD_CHARS):
+                ]
+                elided = len(redacted) - len(head) - len(tail)
+                embed = (
+                    f"{head}\n...[{elided} chars elided — middle of log]...\n{tail}"
+                )
+                embed_truncated = True
+            result["command_log_text"] = embed
+            # Truncated if the runner already truncated OR we elided here.
+            result["command_log_truncated"] = (
+                bool(command_log.get("truncated")) or embed_truncated
+            )
     return json.dumps(result)
 
 
