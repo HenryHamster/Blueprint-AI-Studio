@@ -2713,16 +2713,20 @@ async def answer_compute_experiment_question(
                 for c in raw_cits
                 if isinstance(c, str) and c.strip() not in allowed_set
             ]
+            real_evidence_set = set(evidence.get("real_evidence", []))
+            durable_cits = [
+                c for c in grounded_cits if c in real_evidence_set
+            ]
             grounding_stamp = {
                 "checked": True,
                 "file_citations": len(raw_cits),
-                "grounded": len(grounded_cits),
+                "grounded": len(durable_cits),
                 "unresolved": unresolved_cits,
             }
-            miss_reason = None if grounded_cits else "no-grounded-citations"
+            miss_reason = None if durable_cits else "no-grounded-citations"
             return {
                 "answer": str(data["answer"])[:4000],
-                "citations": grounded_cits,
+                "citations": durable_cits,
                 "grounding": grounding_stamp,
                 "grounding_miss": miss_reason is not None,
                 "fallback_reason": miss_reason,

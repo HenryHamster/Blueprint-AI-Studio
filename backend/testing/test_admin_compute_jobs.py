@@ -1043,6 +1043,7 @@ async def _make_terminal_job_with_task(
     status=ComputeJobStatus.SUCCEEDED,
     plan_output=None,
     result_reference="gs://bucket/jobs/job-1/result.json",
+    polling_metadata=None,
 ):
     """Seed a terminal compute job with an optional plan_output on its task."""
     task = Task(
@@ -1064,6 +1065,7 @@ async def _make_terminal_job_with_task(
         spend_cap_usd=5.0,
         accrued_cost_usd=1.5,
         result_reference=result_reference,
+        polling_metadata=polling_metadata,
     )
     session.add(job)
     await session.commit()
@@ -1759,3 +1761,72 @@ async def test_ask_compute_job_includes_per_arm_evidence(
     assert "Per-arm results" in prompt_text
     assert "control" in prompt_text
     assert "treatment" in prompt_text
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_supplementary_citation_not_grounded(
+    client: AsyncClient, db_session
+):
+    """When the LLM cites only supplementary citations (signed URLs, not durable evidence),
+    the response sets grounded=False and returns an empty citations list.
+
+    This test exercises the durable_cits gate: the job has real metrics so
+    _gather_compute_evidence returns a non-None evidence bundle, the signed URL
+    is injected into the supplementary set (allowed_set) via a mocked storage
+    helper, and the LLM mock cites that signed URL.  The durable_cits filter
+    strips it out (https:// is not durable), producing grounding_miss=True.
+    """
+    _SIGNED_URL = "https://storage.example.com/signed-url?token=xyz"
+
+    project = await _make_project(db_session, name="Ask Supplementary Project")
+    await _add_member(db_session, project.id, "member")
+    # Supply result_metrics so _gather_compute_evidence does not short-circuit
+    # at the 'file_count <= 0 and not metrics' guard before any citation work.
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 1.0}},
+        polling_metadata={"result_metrics": {"p_success": 0.95}},
+    )
+
+    class _FakeContent:
+        # LLM cites only the supplementary signed URL (not in real_evidence)
+        text = f'{{"answer": "The result was successful.", "citations": ["{_SIGNED_URL}"]}}'
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+
+    class _FakeMessages:
+        async def create(self, **kwargs):
+            return _FakeResponse()
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    async def _fake_signed_url(uri):
+        # Inject the signed URL into the supplementary set so the LLM's citation
+        # lands in allowed_set but is excluded from real_evidence_set — this is
+        # exactly the path the durable_cits filter must catch.
+        return _SIGNED_URL
+
+    with (
+        patch("anthropic.AsyncAnthropic", return_value=_FakeClient()),
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}),
+        patch(
+            "app.storage.generate_download_signed_url",
+            side_effect=_fake_signed_url,
+        ),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "Was it successful?"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # Grounding gate: supplementary citations (signed URLs) must not satisfy
+    # the durable-evidence requirement even when the LLM cites them correctly.
+    assert body["grounding_miss"] is True
+    # No durable citations means empty citations list
+    assert body["citations"] == []
+    assert body["grounding"]["grounded"] == 0
