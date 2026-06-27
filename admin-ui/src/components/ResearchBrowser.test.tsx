@@ -669,6 +669,80 @@ describe('ResearchBrowser quality card interactivity', () => {
   });
 });
 
+describe('ResearchBrowser actionable findings', () => {
+  function makeRefutedResearchTask(): Task {
+    return {
+      ...makeResearchTask([
+        makeFinding({ title: 'Open proposal' }),
+        makeFinding({ title: 'Already shipped' }),
+        makeFinding({ title: 'Just a note', type: 'direction_note' }),
+        makeFinding({ title: 'Refuted proposal' }),
+      ]),
+      context: {
+        deferred_findings: [{
+          title: 'Refuted proposal',
+          deferred_reason: 'adversarial_gate',
+          adversarial_gate_reason: 'No reproduce-on-HEAD evidence',
+        }],
+      },
+    };
+  }
+
+  it('Actionable filter shows only unimplemented, non-metadata, non-refuted findings', async () => {
+    const user = userEvent.setup();
+    const shippedImpl = makeImplementationTask({
+      context: { research_task_id: 'research-1', finding_index: 1 },
+    });
+    render(
+      <ResearchBrowser
+        tasks={[makeRefutedResearchTask(), shippedImpl]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Actionable' }));
+
+    // Only the open, unrefuted, non-metadata proposal survives.
+    expect(screen.getByText('Open proposal')).toBeInTheDocument();
+    expect(screen.queryByText('Already shipped')).not.toBeInTheDocument();
+    expect(screen.queryByText('Just a note')).not.toBeInTheDocument();
+    expect(screen.queryByText('Refuted proposal')).not.toBeInTheDocument();
+  });
+
+  it('group header shows an actionable count distinct from the proposed count', () => {
+    const shippedImpl = makeImplementationTask({
+      context: { research_task_id: 'research-1', finding_index: 1 },
+    });
+    render(
+      <ResearchBrowser
+        tasks={[makeRefutedResearchTask(), shippedImpl]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    // One genuinely actionable proposal — the shipped finding, the refuted one,
+    // and the metadata note are all excluded — surfaced as an emphasized chip.
+    const chip = screen.getByText(/1 actionable/);
+    expect(chip).toBeInTheDocument();
+    expect(chip.className).toContain('cyan');
+  });
+
+  it('does not show an actionable chip when every finding is implemented', () => {
+    const shippedImpl = makeImplementationTask({
+      context: { research_task_id: 'research-1', finding_index: 0 },
+    });
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([makeFinding({ title: 'Done finding' })]), shippedImpl]}
+        selectedProjectId={null}
+        onClose={() => {}}
+      />,
+    );
+    expect(screen.queryByText(/actionable/)).not.toBeInTheDocument();
+  });
+});
+
 describe('ResearchBrowser researchFeed prop', () => {
   it('uses researchFeed findings instead of tasks prop when provided', () => {
     const taskFinding = makeFinding({ title: 'From tasks prop' });

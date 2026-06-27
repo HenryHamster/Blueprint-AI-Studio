@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect } from 'react';
+import { useState, useMemo, useEffect, useCallback } from 'react';
 import { X, ChevronDown, ChevronRight, Compass, Search, CheckCircle, Clock, XCircle, Minus, ExternalLink, BarChart2, GitBranch } from 'lucide-react';
 import type { ResearchFinding } from './TaskCard';
 import type { FindingChallenge } from '../types/task';
@@ -83,19 +83,34 @@ interface FindingMetrics {
   failedCount: number;
   proposedCount: number;
   staleCount: number;
+  /**
+   * Unimplemented findings that still warrant an implementation decision:
+   * no child task, not a metadata-only finding, and not refuted by the
+   * adversarial gate. This is the "needs attention" subset of proposedCount,
+   * which otherwise lumps in metadata notes and refuted proposals.
+   */
+  actionableCount: number;
 }
 
-function computeFindingMetrics(findings: EnrichedFinding[]): FindingMetrics {
-  let mergedCount = 0, activeCount = 0, prCount = 0, failedCount = 0, proposedCount = 0, staleCount = 0;
+function computeFindingMetrics(
+  findings: EnrichedFinding[],
+  isRefuted?: (f: EnrichedFinding) => boolean,
+): FindingMetrics {
+  let mergedCount = 0, activeCount = 0, prCount = 0, failedCount = 0, proposedCount = 0, staleCount = 0, actionableCount = 0;
   for (const f of findings) {
     const status = f.outcome ? f.outcome.status : undefined;
     if (status === 'COMPLETED') mergedCount++;
     if (f.outcome && !['COMPLETED', 'FAILED', 'CANCELLED'].includes(f.outcome.status)) activeCount++;
     if (f.outcome?.prUrl) prCount++;
     if (f.outcome && ['FAILED', 'CANCELLED'].includes(f.outcome.status)) failedCount++;
-    if (!f.outcome) { proposedCount++; if (getStaleness(f.taskCreatedAt) !== 'fresh') staleCount++; }
+    if (!f.outcome) {
+      proposedCount++;
+      if (getStaleness(f.taskCreatedAt) !== 'fresh') staleCount++;
+      const isMeta = METADATA_FINDING_TYPES.has(f.finding.type ?? '');
+      if (!isMeta && !(isRefuted?.(f) ?? false)) actionableCount++;
+    }
   }
-  return { mergedCount, activeCount, prCount, failedCount, proposedCount, staleCount };
+  return { mergedCount, activeCount, prCount, failedCount, proposedCount, staleCount, actionableCount };
 }
 
 const INCLUDED_STATUSES = new Set(['COMPLETED', 'IN_PROGRESS', 'EVALUATING']);
@@ -261,7 +276,7 @@ function OutcomeSummaryPills({ summary }: { summary: TaskEvaluationSummary }) {
   );
 }
 
-type OutcomeFilter = 'all' | 'shipped' | 'in_progress' | 'proposed' | 'failed' | 'findings_documented';
+type OutcomeFilter = 'all' | 'actionable' | 'shipped' | 'in_progress' | 'proposed' | 'failed' | 'findings_documented';
 
 const IN_PROGRESS_OUTCOMES = new Set(['IN_PROGRESS', 'EVALUATING', 'QUEUED', 'PROVISIONING', 'BLOCKED', 'PARKED']);
 const FAILED_OUTCOMES = new Set(['FAILED', 'CANCELLED']);
@@ -270,6 +285,7 @@ const METADATA_FINDING_TYPES = new Set(['design_doc_observation', 'direction_not
 
 const OUTCOME_FILTER_OPTIONS: { value: OutcomeFilter; label: string; color: string }[] = [
   { value: 'all', label: 'All', color: 'text-neutral-300' },
+  { value: 'actionable', label: 'Actionable', color: 'text-cyan-300' },
   { value: 'shipped', label: 'Shipped', color: 'text-emerald-400' },
   { value: 'in_progress', label: 'In Progress', color: 'text-cyan-400' },
   { value: 'proposed', label: 'Proposed', color: 'text-neutral-400' },
@@ -376,6 +392,19 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
     return map;
   }, [tasks, researchFeed]);
 
+  // True when an unimplemented finding was refuted by the adversarial gate on
+  // its parent research task. Mirrors the badge lookup below: prefer the stable
+  // finding_hash key, fall back to title. Used to keep refuted proposals out of
+  // the "actionable" count and filter.
+  const isFindingRefuted = useCallback((ef: EnrichedFinding): boolean => {
+    if (ef.outcome) return false;
+    const fh = ef.finding.finding_hash;
+    const deferred =
+      (fh ? adversarialDeferredByKey.get(`${ef.taskId}:hash:${fh}`) : undefined)
+      ?? adversarialDeferredByKey.get(`${ef.taskId}:title:${ef.finding.title.toLowerCase()}`);
+    return !!deferred;
+  }, [adversarialDeferredByKey]);
+
   // Group findings by direction — prefer dedicated researchFeed over the paginated tasks prop.
   const groups = useMemo((): FindingGroup[] => {
     const byDirection = new Map<string, EnrichedFinding[]>();
@@ -449,6 +478,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
       // All non-documented filters exclude metadata findings (they have no implementation child).
       if (isMetadata) return false;
       if (outcomeFilter === 'all') return true;
+      if (outcomeFilter === 'actionable') return !f.outcome && !isFindingRefuted(f);
       if (outcomeFilter === 'shipped') return f.outcome?.status === 'COMPLETED';
       if (outcomeFilter === 'in_progress') return !!f.outcome && IN_PROGRESS_OUTCOMES.has(f.outcome.status);
       if (outcomeFilter === 'proposed') return !f.outcome;
@@ -471,7 +501,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
         ),
       }))
       .filter(g => g.findings.length > 0 || (outcomeFilter === 'all' && (!q || g.directionText.toLowerCase().includes(q))));
-  }, [groups, search, outcomeFilter, directionFilter]);
+  }, [groups, search, outcomeFilter, directionFilter, isFindingRefuted]);
 
   const totalFindings = filteredGroups.reduce((sum, g) => sum + g.findings.length, 0);
 
@@ -482,8 +512,8 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
   }, [expandedGroups, filteredGroups]);
 
   const groupMetrics = useMemo(
-    () => new Map(filteredGroups.map(g => [g.directionId ?? '_undirected', computeFindingMetrics(g.findings)])),
-    [filteredGroups]
+    () => new Map(filteredGroups.map(g => [g.directionId ?? '_undirected', computeFindingMetrics(g.findings, isFindingRefuted)])),
+    [filteredGroups, isFindingRefuted]
   );
 
   const toggleGroup = (id: string) => {
@@ -673,8 +703,8 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
           {filteredGroups.map(group => {
             const groupKey = group.directionId ?? '_undirected';
             const isExpanded = effectiveExpanded.has(groupKey);
-            const { mergedCount, activeCount, prCount, failedCount, proposedCount, staleCount } =
-              groupMetrics.get(groupKey) ?? computeFindingMetrics(group.findings);
+            const { mergedCount, activeCount, prCount, failedCount, proposedCount, staleCount, actionableCount } =
+              groupMetrics.get(groupKey) ?? computeFindingMetrics(group.findings, isFindingRefuted);
 
             return (
               <div key={groupKey} className="bg-neutral-900/50 border border-neutral-800 rounded-lg overflow-hidden">
@@ -705,6 +735,14 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                     )}
                     <span className="text-neutral-500 tabular-nums">
                       {group.findings.length}
+                      {actionableCount > 0 && (
+                        <span
+                          className="text-cyan-300 ml-1 font-medium"
+                          title="Unimplemented findings still awaiting an implementation decision (excludes metadata notes and refuted proposals)"
+                        >
+                          {actionableCount} actionable
+                        </span>
+                      )}
                       {mergedCount > 0 && <span className="text-emerald-500 ml-1">{mergedCount} merged</span>}
                       {activeCount > 0 && <span className="text-cyan-400 ml-1">{activeCount} active</span>}
                       {prCount > 0 && <span className="text-blue-400 ml-1">{prCount} PRs</span>}
