@@ -359,10 +359,11 @@ export interface ComputeJobAskResponse {
 export async function askComputeJob(
   jobId: string,
   question: string,
+  history?: Array<{ question: string; answer: string }>,
 ): Promise<ComputeJobAskResponse> {
   const res = await apiFetch(`/api/admin/compute-jobs/${encodeURIComponent(jobId)}/ask`, {
     method: 'POST',
-    body: JSON.stringify({ question }),
+    body: JSON.stringify({ question, ...(history && history.length > 0 ? { history } : {}) }),
   });
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));

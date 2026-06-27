@@ -10,7 +10,7 @@ import json
 import logging
 import uuid
 from datetime import timedelta
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -415,6 +415,7 @@ async def analyze_project_compute_job(
 async def ask_compute_job(
     job_id: uuid.UUID,
     question: str = Body(..., embed=True),
+    history: List[Any] = Body(default=[]),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -461,4 +462,5 @@ async def ask_compute_job(
         result_reference=job.result_reference,
         session=session,
         logs=logs,
+        history=history or [],
     )
