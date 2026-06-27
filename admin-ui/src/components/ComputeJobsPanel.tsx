@@ -142,6 +142,16 @@ function armComparisonVerdict(arms: ArmRecord[], metricKey: string, direction: M
   return { winnerName: winner.name, winnerValue: winner.value, runnerUpName: runnerUp.name, runnerUpValue: runnerUp.value, margin };
 }
 
+function criterionMet(value: number, operator: string, threshold: number): boolean {
+  if (operator === '>=') return value >= threshold;
+  if (operator === '>') return value > threshold;
+  if (operator === '<=') return value <= threshold;
+  if (operator === '<') return value < threshold;
+  if (operator === '==') return value === threshold;
+  if (operator === '!=') return value !== threshold;
+  return false;
+}
+
 function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
   let criterionMetric: string | null = null;
   const extraKeys = new Set<string>();
@@ -228,6 +238,9 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
               const rm = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
               const arms = normalizeArms(rm?.arms);
               if (!arms) return null;
+              const perArm = job.criterion_verdict?.per_arm;
+              const cvOperator = job.criterion_verdict?.operator;
+              const cvThreshold = job.criterion_verdict?.threshold;
               return (
                 <div key={job.id} className="mb-1.5">
                   <div className="text-ui-sm font-semibold text-neutral-300 font-mono mb-0.5">
@@ -237,6 +250,16 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
                     const armExitCode = typeof arm.metrics.exit_code === 'number' ? arm.metrics.exit_code : null;
                     const armError = typeof arm.metrics.error === 'string' ? arm.metrics.error : typeof arm.metrics.reason === 'string' ? arm.metrics.reason : null;
                     const armFailed = (armExitCode !== null && armExitCode !== 0) || armError !== null;
+                    const armCostUsd = typeof arm.metrics.cost_usd === 'number' ? arm.metrics.cost_usd as number : null;
+                    let armPassFail: 'pass' | 'fail' | 'inconclusive' | null = null;
+                    if (perArm && arm.name in perArm && cvOperator && cvThreshold != null) {
+                      const pav = perArm[arm.name];
+                      if (pav == null) {
+                        armPassFail = 'inconclusive';
+                      } else {
+                        armPassFail = criterionMet(pav, cvOperator, cvThreshold) ? 'pass' : 'fail';
+                      }
+                    }
                     return (
                       <div key={arm.name} className={`flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm font-mono mb-0.5 pl-2`}>
                         <span className={`font-semibold ${armFailed ? 'text-red-300' : 'text-neutral-400'}`}>{arm.name}:</span>
@@ -248,7 +271,29 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
                             exit {armExitCode}
                           </span>
                         )}
-                        {Object.entries(arm.metrics).filter(([mk]) => !DIAGNOSTIC_KEYS.has(mk)).map(([mk, mv]) => (
+                        {armCostUsd !== null && (
+                          <span
+                            className="rounded border border-neutral-700/50 bg-neutral-800/40 px-1 py-0.5 text-ui-xs text-neutral-300"
+                            data-testid="arm-cost-usd"
+                          >
+                            {fmtUsd(armCostUsd)}
+                          </span>
+                        )}
+                        {armPassFail !== null && (
+                          <span
+                            className={`rounded border px-1 py-0.5 text-ui-xs font-semibold ${
+                              armPassFail === 'pass'
+                                ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                                : armPassFail === 'inconclusive'
+                                ? 'border-amber-500/40 bg-amber-500/15 text-amber-300'
+                                : 'border-red-500/40 bg-red-500/15 text-red-300'
+                            }`}
+                            data-testid="arm-passfail-chip"
+                          >
+                            {armPassFail}
+                          </span>
+                        )}
+                        {Object.entries(arm.metrics).filter(([mk]) => !DIAGNOSTIC_KEYS.has(mk) && mk !== 'cost_usd').map(([mk, mv]) => (
                           <span key={mk}>
                             <span className="text-neutral-500">{mk}:</span>{' '}
                             <span className="text-neutral-300">{String(mv)}</span>

@@ -2438,4 +2438,248 @@ describe('ComputeJobsPanel render + kill', () => {
     await act(async () => { (await findByTestId('rerun-submit')).click(); });
     expect(rerunComputeExperiment).toHaveBeenCalledWith('task-1', expect.objectContaining({ spend_cap_usd: 4.0 }));
   });
+
+  test('test_per_arm_comparison_renders_cost_and_passfail_chip', async () => {
+    // job1 has per-arm costs and criterion_verdict.per_arm so the comparison
+    // matrix can show numeric cost_usd chips and pass/fail verdicts per arm.
+    const job1 = makeJob({
+      id: 'perarm-job1',
+      task_title: 'run A',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 2.0,
+      experiment: 'perarm-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: {
+        metric: 'accuracy',
+        operator: '>=',
+        threshold: 0.9,
+        value: 0.95,
+        met: true,
+        measurable: true,
+        per_arm: { 'arm-good': 0.95, 'arm-bad': 0.82 },
+      },
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-good': { accuracy: 0.95, cost_usd: 1.50, elapsed_seconds: 1800 },
+            'arm-bad': { accuracy: 0.82, cost_usd: 0.50, elapsed_seconds: 600 },
+          },
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'perarm-job2',
+      task_title: 'run B',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.5,
+      experiment: 'perarm-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: {
+        metric: 'accuracy',
+        operator: '>=',
+        threshold: 0.9,
+        value: 0.88,
+        met: false,
+        measurable: true,
+      },
+      polling_metadata: { result_metrics: { accuracy: 0.88 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job1, job2]));
+    const { findByTestId, getAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Open comparison mode
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    // arms-comparison section appears (job1 has arms)
+    const armsSection = await findByTestId('arms-comparison');
+    expect(armsSection).toBeTruthy();
+    // Per-arm costs rendered as formatted USD chips
+    const costChips = getAllByTestId('arm-cost-usd');
+    expect(costChips.length).toBeGreaterThanOrEqual(2);
+    const costTexts = costChips.map((c) => c.textContent);
+    expect(costTexts.some((t) => t?.includes('$1.50'))).toBe(true);
+    expect(costTexts.some((t) => t?.includes('$0.50'))).toBe(true);
+    // cost_usd must not also appear as plain "cost_usd: 1.5" metric text
+    expect(armsSection.textContent).not.toContain('cost_usd:');
+    // Per-arm pass/fail chips: arm-good passes (0.95 >= 0.9), arm-bad fails (0.82 < 0.9)
+    const pfChips = getAllByTestId('arm-passfail-chip');
+    const pfTexts = pfChips.map((c) => c.textContent);
+    expect(pfTexts).toContain('pass');
+    expect(pfTexts).toContain('fail');
+    // pass chip uses emerald styling, fail chip uses red
+    const passChip = pfChips.find((c) => c.textContent === 'pass');
+    const failChip = pfChips.find((c) => c.textContent === 'fail');
+    expect(passChip?.className).toContain('emerald');
+    expect(failChip?.className).toContain('red');
+  });
+
+  test('per-arm pass/fail chip handles != operator correctly', async () => {
+    // arm-neq-pass has value 0.5 which != 0.9 (should pass); arm-neq-fail has value 0.9 which == 0.9 (should fail)
+    const job = makeJob({
+      id: 'neq-job',
+      task_title: 'neq run',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'neq-sweep',
+      success_criterion: { metric: 'score', operator: '!=' as const, threshold: 0.9 },
+      criterion_verdict: {
+        metric: 'score',
+        operator: '!=',
+        threshold: 0.9,
+        value: 0.5,
+        met: true,
+        measurable: true,
+        per_arm: { 'arm-neq-pass': 0.5, 'arm-neq-fail': 0.9 },
+      },
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-neq-pass': { score: 0.5 },
+            'arm-neq-fail': { score: 0.9 },
+          },
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'neq-job2',
+      task_title: 'neq run 2',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'neq-sweep',
+      success_criterion: { metric: 'score', operator: '!=' as const, threshold: 0.9 },
+      criterion_verdict: { metric: 'score', operator: '!=', threshold: 0.9, value: 0.5, met: true, measurable: true },
+      polling_metadata: { result_metrics: { score: 0.5 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job, job2]));
+    const { findByTestId, getAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    await findByTestId('arms-comparison');
+    const pfChips = getAllByTestId('arm-passfail-chip');
+    const pfTexts = pfChips.map((c) => c.textContent);
+    // arm-neq-pass (0.5 != 0.9) → pass; arm-neq-fail (0.9 != 0.9 is false) → fail
+    expect(pfTexts).toContain('pass');
+    expect(pfTexts).toContain('fail');
+    const passChip = pfChips.find((c) => c.textContent === 'pass');
+    const failChip = pfChips.find((c) => c.textContent === 'fail');
+    expect(passChip?.className).toContain('emerald');
+    expect(failChip?.className).toContain('red');
+  });
+
+  test('per-arm pass/fail chip renders amber inconclusive when per_arm value is null', async () => {
+    const job = makeJob({
+      id: 'null-arm-job',
+      task_title: 'null arm run',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'null-arm-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: {
+        metric: 'accuracy',
+        operator: '>=',
+        threshold: 0.9,
+        value: 0.9,
+        met: true,
+        measurable: true,
+        per_arm: { 'arm-measured': 0.95, 'arm-unmeasured': null },
+      },
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-measured': { accuracy: 0.95 },
+            'arm-unmeasured': {},
+          },
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'null-arm-job2',
+      task_title: 'null arm run 2',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'null-arm-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.88, met: false, measurable: true },
+      polling_metadata: { result_metrics: { accuracy: 0.88 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job, job2]));
+    const { findByTestId, getAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    await findByTestId('arms-comparison');
+    const pfChips = getAllByTestId('arm-passfail-chip');
+    const pfTexts = pfChips.map((c) => c.textContent);
+    expect(pfTexts).toContain('inconclusive');
+    expect(pfTexts).toContain('pass');
+    const inconclusiveChip = pfChips.find((c) => c.textContent === 'inconclusive');
+    expect(inconclusiveChip?.className).toContain('amber');
+  });
+
+  test('per-arm pass/fail chip does not render when criterion_verdict has no per_arm but job has arms', async () => {
+    const jobWithArmsNoPérArm = makeJob({
+      id: 'no-per-arm-job',
+      task_title: 'no perarm run',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.5,
+      experiment: 'no-perarm-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: {
+        metric: 'accuracy',
+        operator: '>=',
+        threshold: 0.9,
+        value: 0.92,
+        met: true,
+        measurable: true,
+        // no per_arm field
+      },
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-alpha': { accuracy: 0.92, cost_usd: 0.75 },
+            'arm-beta': { accuracy: 0.88, cost_usd: 0.75 },
+          },
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'no-per-arm-job2',
+      task_title: 'no perarm run 2',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'no-perarm-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.88, met: false, measurable: true },
+      polling_metadata: { result_metrics: { accuracy: 0.88 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([jobWithArmsNoPérArm, job2]));
+    const { findByTestId, queryAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    await findByTestId('arms-comparison');
+    // pass/fail chips must NOT render when per_arm is absent
+    expect(queryAllByTestId('arm-passfail-chip')).toHaveLength(0);
+  });
 });

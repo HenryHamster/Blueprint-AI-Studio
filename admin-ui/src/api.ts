@@ -3153,6 +3153,7 @@ export interface ComputeJob {
     met: boolean;
     measurable: boolean;
     binding_status?: string | null;
+    per_arm?: Record<string, number | null>;
   } | null;
   // Durable KnowledgeDocument auto-persisted on task completion for all
   // measured terminal jobs. Surfaced from task.plan_output.knowledge_document.id.
