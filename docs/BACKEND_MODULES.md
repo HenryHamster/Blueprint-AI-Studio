@@ -901,17 +901,6 @@ Tracks two complementary precision signals:
 
 ---
 
-#### `theme_delivery.py`
-
-Pure certification layer (no DB writes) that maps a version goal and a PR
-diffstat to a deterministic cert object. The release qualifier uses this to
-detect when a release candidate's diffstat directionally contradicts its
-stated theme (e.g., a "lean/shrink" goal with a net line-count increase).
-
-**Theme categories checked:** leanness, reliability, performance, feature.
-
----
-
 ### Failure & Anomaly Detection
 
 #### `failure_classification.py`
@@ -1254,7 +1243,6 @@ Test files mirror source structure:
 | release_scoring.py | Readiness score computation | models |
 | release_readiness.py | Qualification history aggregation | models |
 | release_promotion.py | Promotion execution | github, models |
-| theme_delivery.py | PR diffstat vs. version-goal certification | — |
 | **Monitoring & Diagnostics** | | |
 | failure_classification.py | Error categorization | — |
 | ci_merge_helpers.py | Merge decision logic | github, task_lifecycle |

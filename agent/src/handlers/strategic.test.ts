@@ -1116,9 +1116,9 @@ describe('handleStrategic executor prompt: version-signal sibling passthrough', 
   });
 });
 
-describe('handleStrategic pre-merge: new_version_theme written into problem_model JSON', () => {
-  it('pre-merges new_version_theme (and new_version_goal) into problem_model JSON when thinker emits them', async () => {
-    const taskId = 'task-premerge-theme';
+describe('handleStrategic pre-merge: new_version_goal written into problem_model JSON', () => {
+  it('pre-merges new_version_goal into problem_model JSON when the thinker emits it', async () => {
+    const taskId = 'task-premerge-goal';
     const pmPath = `/tmp/problem_model_${taskId}.json`;
     const initialPm = { intent: { purpose: 'ok' }, gaps: [] };
 
@@ -1127,7 +1127,6 @@ describe('handleStrategic pre-merge: new_version_theme written into problem_mode
       ok: true,
       analysisText: 'analysis',
       newVersionGoal: 'Ship reliable error recovery so ops incidents drop by 50%.',
-      newVersionTheme: 'reliability',
     });
 
     // fs.readFileSync returns the initial problem_model JSON for the pre-merge read.
@@ -1147,7 +1146,7 @@ describe('handleStrategic pre-merge: new_version_theme written into problem_mode
     const statusRef = { value: '' };
     await handleStrategic(taskId, { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef);
 
-    // writeFileSync must have been called with the pm path and a JSON that contains both fields.
+    // writeFileSync must have been called with the pm path and a JSON that contains the goal field.
     const writeCalls = vi.mocked(fs.writeFileSync).mock.calls;
     const pmWrite = writeCalls.find((c) => c[0] === pmPath);
     expect(pmWrite).toBeDefined();
@@ -1155,7 +1154,6 @@ describe('handleStrategic pre-merge: new_version_theme written into problem_mode
     expect(typeof writtenStr).toBe('string');
     const written = JSON.parse(writtenStr as string) as Record<string, unknown>;
     expect(written.new_version_goal).toBe('Ship reliable error recovery so ops incidents drop by 50%.');
-    expect(written.new_version_theme).toBe('reliability');
   });
 });
 

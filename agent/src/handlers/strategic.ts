@@ -701,24 +701,22 @@ prompts, schemas, tools, or orchestration.` : '';
     if (!thinkerGateResult.ok) return;
     const analysisText = thinkerGateResult.analysisText;
 
-    // If the thinker emitted a version goal or theme (Section 7 files), pre-merge
-    // them into the problem_model JSON now so the executor's set-problem-model call
-    // carries them without needing to search prose. Non-fatal: if the merge fails
-    // (malformed JSON, write error) the executor can still proceed; the goal/theme
+    // If the thinker emitted a version goal (Section 7 file), pre-merge it into
+    // the problem_model JSON now so the executor's set-problem-model call carries
+    // it without needing to search prose. Non-fatal: if the merge fails
+    // (malformed JSON, write error) the executor can still proceed; the goal
     // stays unset this cycle and the thinker can retry next cycle.
-    const { newVersionGoal, newVersionTheme } = thinkerGateResult;
-    if (newVersionGoal || newVersionTheme) {
+    const { newVersionGoal } = thinkerGateResult;
+    if (newVersionGoal) {
       const pmPath = `/tmp/problem_model_${taskId}.json`;
       try {
         const pmRaw = fs.readFileSync(pmPath, 'utf8');
         const pm = JSON.parse(pmRaw) as Record<string, unknown>;
-        if (newVersionGoal) pm.new_version_goal = newVersionGoal;
-        if (newVersionTheme) pm.new_version_theme = newVersionTheme;
+        pm.new_version_goal = newVersionGoal;
         fs.writeFileSync(pmPath, `${JSON.stringify(pm, null, 2)}\n`);
-        const merged = [newVersionGoal && 'new_version_goal', newVersionTheme && 'new_version_theme'].filter(Boolean).join(', ');
-        sendLog(ws, `[INFO] Pre-merged ${merged} into problem_model JSON\n`);
+        sendLog(ws, `[INFO] Pre-merged new_version_goal into problem_model JSON\n`);
       } catch (e) {
-        sendLog(ws, `[WARNING] Failed to pre-merge version goal/theme into problem_model JSON (executor will handle it): ${String(e)}\n`);
+        sendLog(ws, `[WARNING] Failed to pre-merge version goal into problem_model JSON (executor will handle it): ${String(e)}\n`);
       }
     }
 
@@ -986,7 +984,7 @@ ${strategicChallengeSection}
 
 # Instructions
 
-1. **Problem model (REQUIRED).** First do step 5 below: if the Thinker emitted \`version_phase_decision\`, \`qualify_request\`, \`new_version_goal\`, and/or \`new_version_theme\`, edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add those top-level sibling fields. Then pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\` — the \`cat\` re-reads the file, so the sibling fields you added in step 5 are included. Don't summarize or re-emit the model's own content — read-and-pass; the only edit permitted is step 5's sibling fields.
+1. **Problem model (REQUIRED).** First do step 5 below: if the Thinker emitted \`version_phase_decision\`, \`qualify_request\`, and/or \`new_version_goal\`, edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add those top-level sibling fields. Then pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\` — the \`cat\` re-reads the file, so the sibling fields you added in step 5 are included. Don't summarize or re-emit the model's own content — read-and-pass; the only edit permitted is step 5's sibling fields.
 
    Fallback (use judgment): if the file is still missing, empty, or the JSON is malformed after the bounded repair reopen, you may construct a corrected problem_model yourself — but ground it STRICTLY in the thinker's analysis below (Sections 1-6) and in the project described by CLAUDE.md. Verify findings against the analysis before writing. If even the analysis is insufficient, call \`./strategic pending-confirm\` with type "major_decision" to surface the gap rather than ship bad state. NEVER describe this execution environment, this prompt, your role, or the ./strategic / ./design-doc commands — the problem_model describes the managed project from CLAUDE.md.${executorFetchRecoveryNote}
 
@@ -1027,9 +1025,7 @@ ${strategicChallengeSection}
 
    Likewise, if \`new_version_goal\` is already present as a top-level key in \`/tmp/problem_model_${taskId}.json\` (pre-merged from the Thinker's Section 7 output file before this executor pass), it is already set — the \`cat\` in step 1 will carry it through automatically. Do NOT overwrite or re-add it. If it is absent from the file, the Thinker did not set a version goal this cycle; do NOT fabricate one.
 
-   Likewise, if \`new_version_theme\` is already present as a top-level key in \`/tmp/problem_model_${taskId}.json\` (pre-merged from the Thinker's Section 7 output file before this executor pass), it is already set — the \`cat\` in step 1 will carry it through automatically. Do NOT overwrite or re-add it. If it is absent from the file, the Thinker did not set a version theme this cycle; do NOT fabricate one.
-
-   \`version_phase_decision\`, \`qualify_request\`, \`new_version_goal\`, and \`new_version_theme\` are independent siblings; add whichever the Thinker emitted (any, all, or none).
+   \`version_phase_decision\`, \`qualify_request\`, and \`new_version_goal\` are independent siblings; add whichever the Thinker emitted (any, all, or none).
 
    Because step 1 passes \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\`, editing the file here is what carries these siblings through — step 1 will re-read the file and the fields will be included. If the file is missing/malformed and you took step 1's fallback (constructing the model inline), include these siblings in that inline JSON instead.
 

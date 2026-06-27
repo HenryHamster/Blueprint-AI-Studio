@@ -922,38 +922,6 @@ class TestLoadPolicyProvenance:
             "smoketest": 0.30,
         }
 
-    def test_runtime_config_includes_theme_thresholds_when_seeded(self, mocker):
-        """theme_warn/block thresholds seeded in runtime_config pass through _policy_from_runtime_config.
-
-        This guards against the regression where _policy_from_runtime_config returns
-        early (runtime_config has promotion_threshold/weights) without including
-        theme thresholds, making the operator arming knob inert in production.
-        """
-        mocker.patch.dict(
-            rq._runtime_config,
-            {
-                "promotion_threshold": 0.90,
-                "promotion_weights": {
-                    "audit": 0.40,
-                    "test_erosion": 0.30,
-                    "smoketest": 0.30,
-                },
-                "theme_warn_threshold": 0.70,
-                "theme_block_threshold": 0.5,
-            },
-            clear=False,
-        )
-
-        policy = rq._policy_from_runtime_config()
-        assert policy is not None
-        assert policy.get("theme_warn_threshold") == pytest.approx(0.70), (
-            "theme_warn_threshold must pass through _policy_from_runtime_config; "
-            "without this the operator arming knob is inert in production"
-        )
-        assert policy.get("theme_block_threshold") == pytest.approx(0.5), (
-            "theme_block_threshold must pass through _policy_from_runtime_config"
-        )
-
 
 # ===========================================================================
 # _score_audit / _score_smoketest — artifact → sub-score derivation
@@ -20296,7 +20264,6 @@ class TestFormatQualificationForApi:
             "promotion_pr_url": "https://example.com/pr/123",
             "promotion_conflict": True,
             "promotion_error_detail": "merge conflict",
-            "theme_delivery": {"theme_class": "leanness", "assessed_grade": 1.0},
             "goal_alignment": {
                 "state": "aligned",
                 "assessed_grade": 0.85,
@@ -20324,7 +20291,6 @@ class TestFormatQualificationForApi:
         assert out["promotion_pr_url"] == "https://example.com/pr/123"
         assert out["promotion_conflict"] is True
         assert out["promotion_error_detail"] == "merge conflict"
-        assert out["theme_delivery"] == qual["theme_delivery"]
         assert out["goal_alignment"] == qual["goal_alignment"]
 
 
@@ -24621,13 +24587,6 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
     latest last_qualification overwrite."""
     import uuid
 
-    _theme_cert = {
-        "theme_class": "leanness",
-        "assessed_grade": 0.0,
-        "net_loc": 120,
-        "directional_contradiction": True,
-        "state": "blocked",
-    }
     verdict = QualificationVerdict(
         project_id=uuid.uuid4(),
         release_version_id=uuid.uuid4(),
@@ -24667,7 +24626,6 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
         promotion_pr_url="https://example.com/pr/7",
         promotion_conflict=True,
         promotion_error_detail="merge conflict",
-        theme_delivery=_theme_cert,
         goal_alignment={
             "state": "aligned",
             "assessed_grade": 0.9,
@@ -24696,8 +24654,6 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
     assert out["promotion_pr_url"] == "https://example.com/pr/7"
     assert out["promotion_conflict"] is True
     assert out["promotion_error_detail"] == "merge conflict"
-    # Theme-delivery cert surfaces from migration-0305 column.
-    assert out["theme_delivery"] == _theme_cert
     # Goal-alignment cert surfaces from migration-0328 column.
     assert out["goal_alignment"] == {
         "state": "aligned",
@@ -24705,7 +24661,7 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
         "biggest_gap": None,
         "reasoning_summary": "Goal delivered.",
     }
-    # Legacy rows (no theme_delivery set) must return None, not raise.
+    # Legacy rows must return None for optional certs, not raise.
     verdict_legacy = QualificationVerdict(
         project_id=uuid.uuid4(),
         release_version_id=uuid.uuid4(),
@@ -24719,7 +24675,6 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
         threshold=0.8,
     )
     out_legacy = rq.format_verdict_for_api(verdict_legacy)
-    assert out_legacy["theme_delivery"] is None
     assert out_legacy["goal_alignment"] is None
 
 
@@ -26573,327 +26528,6 @@ async def test_timed_out_qualification_requalifies_same_sha(db_session, mocker):
 
 
 # ===========================================================================
-# Theme-delivery certification
-# ===========================================================================
-
-
-class TestThemeDeliveryCertification:
-    """Theme-delivery evidence layer: classify, evidence, cert, and qualify gate."""
-
-    # --- Unit tests: theme_delivery module ----------------------------------
-
-    def test_classify_theme_leanness(self):
-        """Goal containing a leanness keyword → theme_class=leanness, falsifiable=True."""
-        from app import theme_delivery
-
-        result = theme_delivery.classify_theme(
-            "STABILIZE — lean the product code surface"
-        )
-        assert result["theme_class"] == "leanness"
-        assert result["falsifiable"] is True
-
-    def test_classify_theme_unknown(self):
-        """Goal with no recognized keyword → theme_class=unknown, falsifiable=False."""
-        from app import theme_delivery
-
-        result = theme_delivery.classify_theme("Improve the new dashboard widgets")
-        assert result["theme_class"] == "unknown"
-        assert result["falsifiable"] is False
-
-    def test_build_cert_dark_threshold_never_blocks(self):
-        """Default threshold=0.0 (ships dark): directional contradiction never blocks."""
-        from app import theme_delivery
-
-        evidence = {
-            "net_loc": 4443,
-            "per_module_deltas": {"reaper.py": 4443},
-            "named_targets": [],
-            "theme_class": "leanness",
-            "falsifiable": True,
-        }
-        cert = theme_delivery.build_theme_delivery_cert(
-            "lean the code",
-            evidence,
-            {"theme_warn_threshold": 0.70, "theme_block_threshold": 0.0},
-        )
-        # directional_contradiction is True but threshold=0.0 → grade(0.0) < 0.0 is False
-        assert cert["directional_contradiction"] is True
-        assert cert["state"] != "blocked", (
-            f"threshold=0.0 must never block; got state={cert['state']!r}"
-        )
-
-    def test_build_cert_directional_contradiction_blocks_when_threshold_armed(self):
-        """Armed threshold (>0.0) + net-additive LOC → state=blocked."""
-        from app import theme_delivery
-
-        evidence = {
-            "net_loc": 4443,
-            "per_module_deltas": {"reaper.py": 4443},
-            "named_targets": [],
-            "theme_class": "leanness",
-            "falsifiable": True,
-        }
-        cert = theme_delivery.build_theme_delivery_cert(
-            "lean the code",
-            evidence,
-            {"theme_warn_threshold": 0.70, "theme_block_threshold": 0.5},
-        )
-        assert cert["directional_contradiction"] is True
-        assert cert["state"] == "blocked"
-        assert cert["deterministic_grade"] == 0.0
-
-    # --- Unit test: compute_composite integration ---------------------------
-
-    def test_compute_composite_theme_delivery_blocked(self):
-        """theme_delivery_blocked=True forces confidence=0.0 and blocker=theme_delivery_shortfall."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=1.0,
-            test_erosion=1.0,
-            smoketest_score=1.0,
-            policy=_POLICY,
-            theme_delivery_blocked=True,
-        )
-        assert result["confidence"] == 0.0
-        assert result["promote"] is False
-        assert result["blocker"] == "theme_delivery_shortfall"
-
-    def test_compute_composite_theme_delivery_blocked_default_false(self):
-        """Backward compat: omitting theme_delivery_blocked does not block."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=1.0,
-            test_erosion=1.0,
-            smoketest_score=1.0,
-            policy=_POLICY,
-        )
-        assert result["blocker"] is None
-        assert result["promote"] is True
-
-    # --- Integration test: _finalize_qualification gate --------------------
-
-    @pytest.mark.asyncio
-    async def test_theme_delivery_certification(self, db_session, mocker):
-        """ACCEPTANCE: directional contradiction hard-blocks qualify when threshold is armed.
-
-        Case 1: leanness goal + armed threshold + +4443 net LOC
-                → status=not_promoted, blocker=theme_delivery_shortfall,
-                  confidence=0.0, promote not called, state=blocked.
-
-        Case 2: same goal + armed threshold + -1000 net LOC
-                → no theme block (directional_contradiction=False, state=certified).
-        """
-        from app import shared_state
-
-        shared_state.runtime_config["promotion_enabled"] = False
-
-        # Arm the block threshold so directional contradiction becomes a hard gate.
-        _armed_policy = {
-            "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
-            "threshold": 0.90,
-            "theme_warn_threshold": 0.70,
-            "theme_block_threshold": 0.5,
-        }
-        mocker.patch("app.release_qualifier._load_policy", return_value=_armed_policy)
-
-        _clean_audit_logs = {
-            "audit_score": 1.0,
-            "test_erosion": {
-                "deleted_test_files": [],
-                "assertion_delta": 5,
-                "test_count_delta": 2,
-            },
-        }
-        _clean_smoke_logs = {
-            "passed": True,
-            "tests": [{"name": "a", "status": "pass"}],
-            "suites": {"startup": {"passed": True}},
-        }
-
-        # --- Case 1: +4443 net LOC contradicts leanness → hard block --------
-        project, version = await _make_project_and_version(db_session)
-        version.goal = "STABILIZE — lean the product code surface"
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        await _seed_qualification_children(
-            db_session,
-            project,
-            version,
-            audit_logs=_clean_audit_logs,
-            smoke_logs=_clean_smoke_logs,
-        )
-
-        mocker.patch(
-            "app.release_qualifier._fetch_version_theme_evidence",
-            new=AsyncMock(
-                return_value={
-                    "net_loc": 4443,
-                    "per_module_deltas": {"reaper.py": 4443},
-                    "named_targets": [],
-                    "theme_class": "leanness",
-                    "falsifiable": True,
-                }
-            ),
-        )
-        promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        assert result["status"] == "not_promoted", (
-            f"expected not_promoted (theme hard-blocked), got {result!r}"
-        )
-        assert result["blocker"] == "theme_delivery_shortfall", (
-            f"expected theme_delivery_shortfall blocker, got {result.get('blocker')!r}"
-        )
-        assert result["confidence"] == 0.0
-        promote_spy.assert_not_called()
-
-        lq = version.last_qualification
-        assert lq["theme_delivery"]["directional_contradiction"] is True, (
-            "directional_contradiction must be True when leanness goal has net-additive LOC"
-        )
-        assert lq["theme_delivery"]["state"] == "blocked", (
-            f"expected cert state=blocked, got {lq['theme_delivery']['state']!r}"
-        )
-
-        # --- Case 2: -1000 net LOC is consistent with leanness → passes ----
-        project2, version2 = await _make_project_and_version(db_session)
-        version2.goal = "STABILIZE — lean the product code surface"
-        db_session.add(version2)
-        await db_session.commit()
-        await db_session.refresh(version2)
-
-        await _seed_qualification_children(
-            db_session,
-            project2,
-            version2,
-            audit_logs=_clean_audit_logs,
-            smoke_logs=_clean_smoke_logs,
-        )
-
-        mocker.patch(
-            "app.release_qualifier._fetch_version_theme_evidence",
-            new=AsyncMock(
-                return_value={
-                    "net_loc": -1000,
-                    "per_module_deltas": {"reaper.py": -1000},
-                    "named_targets": [],
-                    "theme_class": "leanness",
-                    "falsifiable": True,
-                }
-            ),
-        )
-
-        await rq._finalize_qualification(db_session, version2)
-        await db_session.commit()
-        await db_session.refresh(version2)
-
-        lq2 = version2.last_qualification
-        assert lq2.get("blocker") != "theme_delivery_shortfall", (
-            f"reductive LOC must not theme-block; got blocker={lq2.get('blocker')!r}"
-        )
-        assert lq2["theme_delivery"]["directional_contradiction"] is False
-        assert lq2["theme_delivery"]["state"] == "certified"
-
-    @pytest.mark.asyncio
-    async def test_theme_delivery_shortfall_warn_notification(self, db_session, mocker):
-        """WARN tier: shortfall state fires theme_delivery_shortfall operator notification.
-
-        Default theme_block_threshold=0.0 ships dark (no hard block), but
-        assessed_grade=0.0 < theme_warn_threshold=0.70 puts cert in 'shortfall' state
-        and must fire a theme_delivery_shortfall notification so operators can observe
-        the advisory signal even before arming the hard block.
-        """
-        from app import shared_state
-
-        shared_state.runtime_config["promotion_enabled"] = False
-
-        # Dark threshold: warn fires, hard block does NOT.
-        _dark_policy = {
-            "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
-            "threshold": 0.90,
-            "theme_warn_threshold": 0.70,
-            "theme_block_threshold": 0.0,
-        }
-        mocker.patch("app.release_qualifier._load_policy", return_value=_dark_policy)
-
-        _clean_audit_logs = {
-            "audit_score": 1.0,
-            "test_erosion": {
-                "deleted_test_files": [],
-                "assertion_delta": 5,
-                "test_count_delta": 2,
-            },
-        }
-        _clean_smoke_logs = {
-            "passed": True,
-            "tests": [{"name": "a", "status": "pass"}],
-            "suites": {"startup": {"passed": True}},
-        }
-
-        project, version = await _make_project_and_version(db_session)
-        version.goal = "STABILIZE — lean the product code surface"
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        await _seed_qualification_children(
-            db_session,
-            project,
-            version,
-            audit_logs=_clean_audit_logs,
-            smoke_logs=_clean_smoke_logs,
-        )
-
-        # Net-additive LOC: shortfall (assessed_grade=0.0 < warn=0.70) but dark block
-        mocker.patch(
-            "app.release_qualifier._fetch_version_theme_evidence",
-            new=AsyncMock(
-                return_value={
-                    "net_loc": 4443,
-                    "per_module_deltas": {"reaper.py": 4443},
-                    "named_targets": [],
-                    "theme_class": "leanness",
-                    "falsifiable": True,
-                }
-            ),
-        )
-
-        notify_spy = mocker.patch(
-            "app.release_qualifier._notify_operator", new=AsyncMock()
-        )
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        # With dark threshold the cert is "shortfall" (not "blocked") — version
-        # is not hard-blocked by theme but the advisory notification must fire.
-        lq = version.last_qualification
-        assert lq["theme_delivery"]["state"] == "shortfall", (
-            f"expected shortfall with dark threshold; got {lq['theme_delivery']['state']!r}"
-        )
-        assert result.get("blocker") != "theme_delivery_shortfall", (
-            "dark threshold must not produce a hard block"
-        )
-
-        # Verify the WARN notification was emitted
-        theme_notify_calls = [
-            call
-            for call in notify_spy.call_args_list
-            if len(call.args) >= 3 and call.args[2] == "theme_delivery_shortfall"
-        ]
-        assert len(theme_notify_calls) >= 1, (
-            "expected at least one theme_delivery_shortfall notification; "
-            f"got notify calls: {[c.args[2] for c in notify_spy.call_args_list]}"
-        )
-
-
-# ===========================================================================
 # evaluate_merge_grade — pure scoring function unit tests
 # ===========================================================================
 
@@ -27082,19 +26716,6 @@ class TestBlindMergeGradeBlock:
         )
         assert result["blocker"] is None
         assert result["promote"] is True
-
-    def test_compute_composite_blocker_precedence_theme_before_merge_grade(self):
-        """theme_delivery_blocked fires before merge_grade_blocked in the chain."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=1.0,
-            test_erosion=1.0,
-            smoketest_score=1.0,
-            policy=_POLICY,
-            theme_delivery_blocked=True,
-            merge_grade_blocked=True,
-        )
-        assert result["blocker"] == "theme_delivery_shortfall"
 
     def test_compute_composite_merge_grade_misses_label(self):
         """merge_grade_misses=True emits the merge_grade_misses blocker label."""

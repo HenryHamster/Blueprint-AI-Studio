@@ -407,7 +407,6 @@ async def _record_qualification_verdict(
             test_erosion_detail=base_record.get("test_erosion_detail"),
             smoketest_detail=base_record.get("smoketest_detail"),
             audit_reconciliation=base_record.get("audit_reconciliation"),
-            theme_delivery=base_record.get("theme_delivery"),
             goal_alignment=base_record.get("goal_alignment"),
             blind_merge_grade=base_record.get("blind_merge_grade"),
             # Blind merge-grade goal-coverage verdict (dir d-c0fe439f) — durably

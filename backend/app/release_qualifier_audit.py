@@ -453,8 +453,8 @@ async def _spawn_release_merge_grade_task(
         # The ONLY narrative the grader is allowed to see: the frozen goal.
         "version_goal": version_goal,
         # The merged-PR window for this version (same acceptance-window /
-        # merged-PR discovery theme evidence uses); the agent fetches each PR's
-        # diff to grade goal coverage.
+        # merged-PR discovery the blind merge-grade uses); the agent fetches each
+        # PR's diff to grade goal coverage.
         "merged_prs": list(merged_pr_numbers),
         # Explicitly pin to Opus — regression guard against silent downgrade
         # (mirrors release_audit / release_audit_challenge).

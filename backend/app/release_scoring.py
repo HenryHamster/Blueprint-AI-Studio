@@ -268,7 +268,6 @@ def compute_composite(
     ci_required: bool = True,
     migration_collision: bool = False,
     migration_apply_blocked: bool = False,
-    theme_delivery_blocked: bool = False,
     merge_grade_blocked: bool = False,
     merge_grade_misses: bool = False,
 ) -> dict[str, Any]:
@@ -407,12 +406,6 @@ def compute_composite(
         # from the filename-identity collision above — checked after it so a
         # candidate failing both reports the identity collision first.
         blocker = "migration_apply_drift"
-    elif theme_delivery_blocked:
-        # The candidate's diffstat directionally contradicts its stated theme
-        # (e.g. a leanness candidate that added net LOC) and the operator has
-        # raised theme_block_threshold above 0.0 to arm hard-blocking.
-        # Ships dark by default (threshold=0.0 never fires).
-        blocker = "theme_delivery_shortfall"
     elif merge_grade_misses:
         # The armable-dark blind-grade gate: coverage_verdict == "misses" AND the
         # operator has raised merge_grade_block_threshold above 0.0.  Distinct from

@@ -5161,8 +5161,8 @@ def test_no_data_returns_proposed_scope_unchanged():
 
 def test_pack_under_budget_keeps_version_phase_floor_under_pressure():
     """Lifecycle context must never disappear just because sibling context is
-    bloated. A compact version_phase floor should preserve the current goal and
-    theme, while _packer_meta records the degradation so the agent can fetch
+    bloated. A compact version_phase floor should preserve the current goal,
+    while _packer_meta records the degradation so the agent can fetch
     full lifecycle detail if needed."""
 
     large_finding = {
@@ -5175,7 +5175,6 @@ def test_pack_under_budget_keeps_version_phase_floor_under_pressure():
         "version_number": 21,
         "phase": "build",
         "goal": "Ship the post-promotion observability milestone.",
-        "theme": "reliability",
         "tasks_merged_this_version": 9,
         "last_qualification": {
             "status": "not_promoted",
@@ -5240,7 +5239,6 @@ def test_pack_under_budget_keeps_version_phase_floor_under_pressure():
     assert vp["version_number"] == 21
     assert vp["phase"] == "build"
     assert vp["goal"] == "Ship the post-promotion observability milestone."
-    assert vp["theme"] == "reliability"
 
     meta = packed["_packer_meta"]
     dropped_keys = {entry["key"] for entry in meta["dropped"]}
@@ -5763,7 +5761,6 @@ def test_summarize_version_phase_strips_nested_audit_findings_but_keeps_facts():
         "version_number": 21,
         "phase": "stabilize",
         "goal": "Make promotion lifecycle context impossible to lose.",
-        "theme": "reliability",
         "tasks_merged_this_version": 11,
         "acceptance_aggregate": {"merged": 11, "proven": 9, "proven_rate": 0.8182},
         "last_qualification": {
@@ -5801,7 +5798,6 @@ def test_summarize_version_phase_strips_nested_audit_findings_but_keeps_facts():
     assert out["version_number"] == 21
     assert out["phase"] == "stabilize"
     assert out["goal"] == "Make promotion lifecycle context impossible to lose."
-    assert out["theme"] == "reliability"
     assert out["tasks_merged_this_version"] == 11
     assert out["acceptance_aggregate"] == {
         "merged": 11,
@@ -7151,10 +7147,10 @@ async def test_post_promote_handoff_hint_grounds_in_prior_promoted_record(
 
 
 @pytest.mark.asyncio
-async def test_post_promote_handoff_respects_existing_fresh_goal_and_theme(
+async def test_post_promote_handoff_respects_existing_fresh_goal(
     db_session, mocker, _lts_split_active
 ):
-    """A fresh post-promotion version can already have its goal/theme authored
+    """A fresh post-promotion version can already have its goal authored
     by the time the strategic review spawns. The handoff suffix must not carry
     stale null-goal instructions that contradict version_phase."""
     from datetime import datetime, timedelta
@@ -7182,7 +7178,6 @@ async def test_post_promote_handoff_respects_existing_fresh_goal_and_theme(
         served_at=promoted_at,
     )
     fresh_goal = "Make lifecycle context recovery reliable after promotion."
-    fresh_theme = "reliability"
     fresh = ReleaseVersion(
         project_id=project.id,
         version_number=2,
@@ -7193,7 +7188,6 @@ async def test_post_promote_handoff_respects_existing_fresh_goal_and_theme(
         last_qualification=None,
         qualification_attempts=0,
         goal=fresh_goal,
-        theme=fresh_theme,
     )
     db_session.add_all([prior, fresh])
     await db_session.commit()
@@ -7213,15 +7207,12 @@ async def test_post_promote_handoff_respects_existing_fresh_goal_and_theme(
 
     vp = payload.get("version_phase") or {}
     assert vp.get("goal") == fresh_goal
-    assert vp.get("theme") == fresh_theme
 
     suffix = payload.get("prompt_suffix", "")
     assert "Version handoff" in suffix
     assert fresh_goal in suffix or vp.get("goal") == fresh_goal
-    assert fresh_theme in suffix or vp.get("theme") == fresh_theme
     assert "goal field on v2 is null" not in suffix
     assert "new_version_goal" not in suffix
-    assert "new_version_theme" not in suffix
 
 
 @pytest.mark.asyncio

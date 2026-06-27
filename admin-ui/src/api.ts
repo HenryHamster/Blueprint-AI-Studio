@@ -2054,15 +2054,6 @@ export interface AuditReconciliation {
   excluded_findings_count: number;
 }
 
-export interface ThemeDeliveryCert {
-  theme_class?: string | null;
-  assessed_grade?: number | null;
-  net_loc?: number | null;
-  directional_contradiction?: boolean | null;
-  state?: string | null;
-  shortfalls?: Array<{ criterion: string; why: string; evidence?: Record<string, unknown> }> | null;
-}
-
 export interface GoalAlignment {
   assessed_grade?: number | null;
   state?: string | null;  // 'aligned' | 'shortfall' | 'not_applicable'
@@ -2143,7 +2134,6 @@ export interface VersionQualification {
   promotion_pr_url?: string | null;
   promotion_conflict?: boolean | null;
   promotion_error_detail?: string | null;
-  theme_delivery?: ThemeDeliveryCert | null;
   goal_alignment?: GoalAlignment | null;
   blind_merge_grade?: BlindMergeGrade | null;
 }
@@ -2315,9 +2305,6 @@ export interface CurrentVersion {
   tasks_merged_has_more?: boolean;
   /** Acceptance-criteria bucket counts for all merged tasks in this version. */
   acceptance_aggregate?: Record<string, number> | null;
-  /** Delivery theme for this version (e.g. leanness, reliability, performance,
-   *  feature, mixed, none). Null when the thinker has not set one yet. */
-  theme?: string | null;
 }
 
 export interface RecentVersion {
@@ -2614,27 +2601,6 @@ export async function setVersionGoal(
   return res.json();
 }
 
-export interface SetVersionThemeResponse {
-  version_number: number;
-  theme: string | null;
-}
-
-export async function setVersionTheme(
-  projectId: string,
-  theme: string | null,
-): Promise<SetVersionThemeResponse> {
-  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-theme`, {
-    method: 'POST',
-    body: JSON.stringify({ theme: theme ?? null }),
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    const msg = data?.detail || `Failed to set version theme: ${res.status}`;
-    throw new Error(typeof msg === 'string' ? msg : `Failed to set version theme: ${res.status}`);
-  }
-  return res.json();
-}
-
 export interface CutVersionResponse {
   abandoned_version: {
     version_number: number;
@@ -2769,7 +2735,6 @@ export interface QualificationVerdictRecord {
   promotion_pr_url?: string | null;
   promotion_conflict?: boolean | null;
   promotion_error_detail?: string | null;
-  theme_delivery?: ThemeDeliveryCert | null;
   goal_alignment?: GoalAlignment | null;
   blind_merge_grade?: BlindMergeGrade | null;
 }

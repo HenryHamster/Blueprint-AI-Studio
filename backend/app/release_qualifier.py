@@ -73,7 +73,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
-from app import github, release_version, theme_delivery
+from app import github, release_version
 from app.database import AsyncSessionLocal, resolve_async_engine
 from app.failure_classification import (
     AGENT_TIMEOUT,
@@ -307,11 +307,7 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
                 f"runtime_config promotion_weights sum to {weight_sum:.4f}, expected ~1.0"
             )
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
-        for _k in (
-            "theme_warn_threshold",
-            "theme_block_threshold",
-            "merge_grade_block_threshold",
-        ):
+        for _k in ("merge_grade_block_threshold",):
             _v = _runtime_config.get(_k)
             if _v is not None:
                 with contextlib.suppress(TypeError, ValueError):
@@ -374,11 +370,7 @@ def _resolve_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
             )
 
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
-        for _k in (
-            "theme_warn_threshold",
-            "theme_block_threshold",
-            "merge_grade_block_threshold",
-        ):
+        for _k in ("merge_grade_block_threshold",):
             if _k in parsed:
                 with contextlib.suppress(TypeError, ValueError):
                     result[_k] = float(parsed[_k])
@@ -1606,9 +1598,6 @@ _BLOCKER_LABELS: dict[str, str] = {
         "the candidate's migration chain does not apply cleanly against "
         "production's recorded schema state (deploy-fatal drift)"
     ),
-    "theme_delivery_shortfall": (
-        "the candidate's diffstat directionally contradicts its stated theme"
-    ),
     "merge_grade_goal_coverage": (
         "the blind merge-grade found the merged diffs do not advance the version goal"
     ),
@@ -2116,7 +2105,7 @@ async def _merged_pr_numbers_for_version(
 ) -> list[int]:
     """Return the PR numbers merged into this version's acceptance window.
 
-    Reuses the SAME landed-merge predicate the theme-evidence path uses
+    Reuses the SAME landed-merge predicate the blind merge-grade path uses
     (``landed_signal_predicate`` + the version's opened_at window) so the blind
     merge-grade child grades exactly the diffs that landed in this version.
     Pure DB read — no GitHub I/O; the agent fetches each PR's diff itself.
@@ -2149,47 +2138,6 @@ async def _merged_pr_numbers_for_version(
         if isinstance(pn, int) and pn > 0 and pn not in pr_numbers:
             pr_numbers.append(pn)
     return sorted(pr_numbers)
-
-
-async def _fetch_version_theme_evidence(
-    session: AsyncSession,
-    version_obj: release_version.ReleaseVersion,
-) -> dict[str, Any] | None:
-    """Fetch PR-file diffstats for theme-delivery evidence. Fail-safe (returns None on error)."""
-    try:
-        project = await session.get(Project, version_obj.project_id)
-        if project is None:
-            return None
-        resolved = await _resolve_github_with_session(session, project)
-        if resolved is None:
-            return None
-        token, owner, repo = resolved
-        pr_files: dict[int, list[dict[str, Any]]] = {}
-        if version_obj.opened_at is not None:
-            rows = (
-                (
-                    await session.execute(
-                        select(Task).where(
-                            Task.project_id == version_obj.project_id,
-                            Task.status == TaskStatus.COMPLETED,
-                            landed_signal_predicate(session),
-                            Task.updated_at >= version_obj.opened_at,
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            for t in rows:
-                if release_version._task_completed_at(t) < version_obj.opened_at:
-                    continue
-                pn = (t.first_payload or {}).get("pr_number")
-                if isinstance(pn, int) and pn > 0:
-                    with contextlib.suppress(Exception):
-                        pr_files[pn] = await github.get_pr_files(token, owner, repo, pn)
-        return theme_delivery.compute_theme_evidence(version_obj.goal, pr_files)
-    except Exception:  # noqa: BLE001
-        return None
 
 
 async def _finalize_qualification(
@@ -3191,27 +3139,6 @@ async def _finalize_qualification(
         )
     migration_apply_blocked = apply_verdict == "block"
 
-    # --- Theme-delivery evidence (fail-safe) --------------------------------
-    # Pre-computed in _finalize_locked_version before the lock when possible;
-    # fall back to computing inline for direct calls (tests, timeout path).
-    _theme_ev = (
-        _pre_gates.get("pre_theme_evidence")
-        if _pre_gates is not None
-        else await _fetch_version_theme_evidence(session, version)
-    )
-    _theme_cert: dict[str, Any] = (
-        theme_delivery.build_theme_delivery_cert(version.goal, _theme_ev, policy)
-        if _theme_ev is not None
-        else {
-            "state": "not_applicable",
-            "theme_class": "unknown",
-            "falsifiable": False,
-            "directional_contradiction": False,
-            "net_loc": 0,
-        }
-    )
-    _theme_blocked = _theme_cert.get("state") == "blocked"
-
     # --- Blind merge-grade goal-coverage gate (dir d-c0fe439f) --------------
     # An uninvested release_merge_grade agent graded the merged diffs against the
     # frozen version.goal (blind to running_update).  Read its verdict and turn a
@@ -3341,7 +3268,6 @@ async def _finalize_qualification(
         ci_required=ci_required,
         migration_collision=migration_collision,
         migration_apply_blocked=migration_apply_blocked,
-        theme_delivery_blocked=_theme_blocked,
         merge_grade_blocked=merge_grade_blocked,
     )
 
@@ -3424,7 +3350,6 @@ async def _finalize_qualification(
         "migration_apply_safety": apply_verdict,
         "migration_apply_safety_detail": apply_detail,
         "acceptance_aggregate": acceptance_aggregate,
-        "theme_delivery": _theme_cert,
         # Blind merge-grade goal-coverage verdict (dir d-c0fe439f). Mirrored into
         # last_qualification AND persisted on QualificationVerdict so an operator
         # can see the single biggest gap toward the goal.
@@ -3438,33 +3363,6 @@ async def _finalize_qualification(
         # predates this field.
         "goal_alignment": (audit_report or {}).get("goal_alignment"),
     }
-
-    # Advisory WARN notification: theme cert advisory shortfall (not a hard block).
-    # Fires when the cert is in "shortfall" state — assessed_grade is below the
-    # warn threshold but the block threshold is dark (0.0) so promotion proceeds.
-    if _theme_cert.get("state") == "shortfall":
-        await _notify_operator(
-            session,
-            version,
-            "theme_delivery_shortfall",
-            (
-                f"v{version.version_number} theme-delivery advisory shortfall: "
-                f"assessed_grade {_theme_cert.get('assessed_grade', 0.0):.2f} "
-                f"below warn threshold {_theme_cert.get('threshold_warn', 0.70):.2f}. "
-                f"Theme: {_theme_cert.get('theme_class')}. "
-                f"Net LOC: {_theme_cert.get('net_loc', 'N/A')}. "
-                f"Shipping dark — no hard block until threshold_block > 0."
-            ),
-            extra={
-                "theme_class": _theme_cert.get("theme_class"),
-                "assessed_grade": _theme_cert.get("assessed_grade"),
-                "threshold_warn": _theme_cert.get("threshold_warn"),
-                "net_loc": _theme_cert.get("net_loc"),
-                "directional_contradiction": _theme_cert.get(
-                    "directional_contradiction"
-                ),
-            },
-        )
 
     # Per-project override (falls back to the fleet-wide promotion_enabled when
     # this project has no explicit override) — additive, behavior unchanged for
@@ -4209,7 +4107,6 @@ async def _finalize_locked_version(
             "migration_detail": pre_migration_detail,
             "apply_verdict": pre_apply_verdict,
             "apply_detail": pre_apply_detail,
-            "pre_theme_evidence": await _fetch_version_theme_evidence(session, peek),
             "pre_merge_grade_already_on_main": _pre_merge_grade_already_on_main,
         }
 

@@ -3755,21 +3755,6 @@ class ReleaseVersion(SQLModel, table=True):
         sa_column=Column(String(255), nullable=True),
     )
 
-    # Delivery theme authored by the strategist (new_version_theme field).
-    # One of: leanness | reliability | performance | feature | mixed | none.
-    # Nullable: pre-0332 rows carry no theme.
-    theme: str | None = Field(
-        default=None,
-        sa_column=Column(String(32), nullable=True),
-    )
-
-    # Editor provenance for the theme: "[operator:email]" or "[strategist:id]" format,
-    # mirroring goal_editor_info. Operator-set themes are frozen to strategist overwrites.
-    theme_editor_info: str | None = Field(
-        default=None,
-        sa_column=Column(String(255), nullable=True),
-    )
-
     opened_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
@@ -4216,14 +4201,6 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
     audit_reconciliation: Any | None = Field(
-        default=None,
-        sa_column=Column(JSONB, nullable=True),
-    )
-
-    # Theme-delivery certification: {state, theme_class, deterministic_grade,
-    # assessed_grade, directional_contradiction, criteria, shortfalls, ...}
-    # Nullable: existing verdict rows carry no theme_delivery data.
-    theme_delivery: Any | None = Field(
         default=None,
         sa_column=Column(JSONB, nullable=True),
     )

@@ -1564,7 +1564,6 @@ async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
     )
     version.phase = "stabilize"
     version.goal = "Harden the release gate"
-    version.theme = "reliability"
     version.phase_changed_at = datetime(2026, 6, 2, 9, 30, 0)
     version.qualification_attempts = 2
     version.serving_status = "unconfirmed"
@@ -1595,7 +1594,6 @@ async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
         status="promoted",
         phase="stabilize",
         goal="Previous release",
-        theme="performance",
         opened_at=datetime(2026, 5, 1, 0, 0, 0),
         promoted_at=datetime(2026, 5, 10, 12, 0, 0),
         serving_status="serving_confirmed",
@@ -1634,7 +1632,6 @@ async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
     assert current["version_number"] == 10
     assert current["phase"] == "stabilize"
     assert current["goal"] == "Harden the release gate"
-    assert current["theme"] == "reliability"
     assert current["phase_changed_at"] == "2026-06-02T09:30:00"
     assert current["qualification_attempts"] == 2
     assert current["qualification_state"]["state"] == "not_promoted"

@@ -1017,7 +1017,6 @@ def to_phase_block(
         "version_number": version.version_number,
         "phase": version.phase,
         "goal": version.goal,
-        "theme": version.theme,
         "phase_changed_at": version.phase_changed_at.isoformat()
         if version.phase_changed_at
         else None,
@@ -1270,58 +1269,6 @@ def set_version_goal(
         old_goal or "(none)",
         new_goal or "(none)",
         editor_id or "unknown",
-    )
-
-
-_VALID_THEMES = frozenset(
-    {"leanness", "reliability", "performance", "feature", "mixed", "none"}
-)
-_THEME_MAX = 32
-
-
-def set_version_theme(
-    version: ReleaseVersion,
-    theme: str | None,
-    *,
-    editor_id: str | None = None,
-    source: str = "operator",
-) -> None:
-    """Update the delivery theme on an open ``ReleaseVersion`` row.
-
-    Unlike the goal, the theme is a bounded enum
-    (leanness | reliability | performance | feature | mixed | none).
-    Raises ``ValueError`` for unrecognised values.
-
-    No-ops silently when the theme is already set to the requested value.
-    Caller is responsible for ``session.add(version)`` and committing.
-    """
-    new_theme = theme[:_THEME_MAX] if theme else None
-    if new_theme is not None and new_theme not in _VALID_THEMES:
-        raise ValueError(
-            f"Invalid theme '{new_theme}'; must be one of: "
-            + ", ".join(sorted(_VALID_THEMES))
-        )
-    if version.theme == new_theme:
-        logger.debug(
-            "[RELEASE_VERSION] set_version_theme: version v%d project=%s "
-            "already set to same theme — no-op",
-            version.version_number,
-            version.project_id,
-        )
-        return
-    old_theme = version.theme
-    version.theme = new_theme
-    if editor_id:
-        version.theme_editor_info = f"[{source}:{editor_id}]"
-    logger.info(
-        "[RELEASE_VERSION] theme update for version v%d project=%s "
-        "(old: %s) (new: %s) editor=%s source=%s",
-        version.version_number,
-        version.project_id,
-        old_theme or "(none)",
-        new_theme or "(none)",
-        editor_id or "unknown",
-        source,
     )
 
 

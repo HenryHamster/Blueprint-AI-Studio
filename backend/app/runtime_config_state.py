@@ -1018,12 +1018,13 @@ def _read_promotion_policy_file() -> dict | None:
                 f"promotion_policy.yaml weights sum to {weight_sum:.4f}, expected ~1.0"
             )
         result: dict = {"weights": weights, "threshold": threshold}
-        for _k in ("theme_warn_threshold", "theme_block_threshold"):
-            if _k in parsed:
-                try:
-                    result[_k] = float(parsed[_k])
-                except (TypeError, ValueError):
-                    pass
+        if "merge_grade_block_threshold" in parsed:
+            try:
+                result["merge_grade_block_threshold"] = float(
+                    parsed["merge_grade_block_threshold"]
+                )
+            except (TypeError, ValueError):
+                pass
         return result
     except Exception as exc:  # noqa: BLE001 — fall back on any failure, never raise
         logger.warning(
@@ -1056,13 +1057,10 @@ def _seed_promotion_policy() -> None:
         }
     runtime_config["promotion_threshold"] = float(policy["threshold"])
     runtime_config["promotion_weights"] = dict(policy["weights"])
-    for _k in (
-        "theme_warn_threshold",
-        "theme_block_threshold",
-        "merge_grade_block_threshold",
-    ):
-        if _k in policy:
-            runtime_config[_k] = policy[_k]
+    if "merge_grade_block_threshold" in policy:
+        runtime_config["merge_grade_block_threshold"] = policy[
+            "merge_grade_block_threshold"
+        ]
 
 
 _seed_promotion_policy()

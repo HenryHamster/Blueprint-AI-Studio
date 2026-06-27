@@ -1755,33 +1755,14 @@ describe('buildVersionPhaseSection', () => {
     expect(blank).not.toContain('Goal:');
   });
 
-  it('renders the version theme when present', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 4,
-      phase: 'build',
-      theme: 'reliability',
-    });
-    expect(result).toContain('Theme: reliability');
-  });
-
-  it('omits the Theme line when theme is absent or blank', () => {
-    const absent = buildVersionPhaseSection({ version_number: 4, phase: 'build' });
-    expect(absent).not.toContain('Theme:');
-    const blank = buildVersionPhaseSection({ version_number: 4, phase: 'build', theme: '   ' });
-    expect(blank).not.toContain('Theme:');
-  });
-
-  it('does not encourage re-authoring goal or theme when both are already set', () => {
+  it('does not encourage re-authoring goal when it is already set', () => {
     const result = buildVersionPhaseSection({
       version_number: 21,
       phase: 'build',
       goal: 'Make lifecycle context recovery reliable after promotion.',
-      theme: 'reliability',
     });
     expect(result).toContain('Goal: Make lifecycle context recovery reliable after promotion.');
-    expect(result).toContain('Theme: reliability');
     expect(result).not.toContain('ACTION NEEDED: Author the version goal');
-    expect(result).not.toContain('ACTION NEEDED: Author the version theme');
   });
 
   it('emits explicit author-the-goal instruction when goal_needed flag is true', () => {
@@ -1793,17 +1774,6 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('ACTION NEEDED: Author the version goal');
     expect(result).toContain('new_version_goal');
     expect(result).not.toContain('Goal:');
-  });
-
-  it('emits explicit author-the-theme instruction when theme_needed flag is true', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 2,
-      phase: 'build',
-      theme_needed: true,
-    });
-    expect(result).toContain('ACTION NEEDED: Author the version theme');
-    expect(result).toContain('new_version_theme');
-    expect(result).not.toContain('Theme:');
   });
 
   it('instructs agent to emit version_phase_decision when flipping', () => {

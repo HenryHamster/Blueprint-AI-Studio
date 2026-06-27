@@ -4786,13 +4786,6 @@ async def _spawn_strategic_review(
                         if _open_version.goal is None
                         else {}
                     ),
-                    # Signals the strategist to author the delivery theme this cycle.
-                    # Absent once the theme is set (null theme → action needed).
-                    **(
-                        {"theme_needed": True}
-                        if _open_version.theme is None
-                        else {}
-                    ),
                 }
             # Enrich with cross-version promotion-readiness trend.  Best-effort:
             # absent when no QualificationVerdict rows exist yet.
@@ -5215,7 +5208,6 @@ async def _spawn_strategic_review(
         _cur_n = _open_version.version_number
         _target = _promotion_target or "main"
         _cur_goal = (_open_version.goal or "").strip()
-        _cur_theme = (_open_version.theme or "").strip()
         _goal_state = (
             f"v{_cur_n} already has `version_phase.goal` set: "
             f"{_cur_goal[:220]!r}."
@@ -5223,15 +5215,6 @@ async def _spawn_strategic_review(
             else (
                 f"`version_phase.goal` on v{_cur_n} is null, so this version "
                 "still needs its objective."
-            )
-        )
-        _theme_state = (
-            f"v{_cur_n} already has `version_phase.theme` set to "
-            f"{_cur_theme!r}."
-            if _cur_theme
-            else (
-                f"`version_phase.theme` on v{_cur_n} is null, so this version "
-                "still needs its delivery theme."
             )
         )
         _setup_actions: list[str] = []
@@ -5251,16 +5234,6 @@ async def _spawn_strategic_review(
                 "the frozen version goal the blind merge-grade will score "
                 "merged diffs against; write it as a DELIVERABLE statement, "
                 "not a status line)"
-            )
-        if _cur_theme:
-            _setup_actions.append(
-                f"use v{_cur_n}'s existing `version_phase.theme` as the "
-                "delivery theme; leave the stored version theme unchanged this cycle"
-            )
-        else:
-            _setup_actions.append(
-                f"output `new_version_theme` with the delivery theme for "
-                f"v{_cur_n}"
             )
         _setup_instruction = "; ".join(
             f"({idx}) {action}" for idx, action in enumerate(_setup_actions, start=1)
@@ -5392,7 +5365,7 @@ async def _spawn_strategic_review(
                 f"NOT yet treat the milestone as fully shipped; the sweep will "
                 f"resolve it to serving_confirmed, confirmation_timed_out, or "
                 f"deploy_failed shortly. You may prepare v{_cur_n}'s mission. "
-                f"{_goal_state} {_theme_state} Next-version setup: "
+                f"{_goal_state} Next-version setup: "
                 f"{_setup_instruction}. Do not "
                 f"declare v{_prior_n} live until serving is confirmed, and do "
                 f"NOT re-promote/re-qualify v{_prior_n}."
@@ -5408,7 +5381,7 @@ async def _spawn_strategic_review(
                 f"that is already done and merged to {_target} (cross-check "
                 f"`version_phase.recent_versions` and `deployment_state` — "
                 f"v{_prior_n} is recorded there with status='promoted'). "
-                f"{_goal_state} {_theme_state} A null "
+                f"{_goal_state} A null "
                 f"`version_phase.last_qualification` on v{_cur_n} means this "
                 f"fresh version has not yet begun its OWN qualification (expected "
                 f"for a just-opened version) — it does NOT mean v{_prior_n}'s "

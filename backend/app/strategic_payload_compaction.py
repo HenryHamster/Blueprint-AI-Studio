@@ -120,7 +120,6 @@ def _compact_cert(value: Any, *, text_cap: int) -> dict | None:
     for key in (
         "state",
         "status",
-        "theme_class",
         "deterministic_grade",
         "assessed_grade",
         "threshold_warn",
@@ -265,9 +264,6 @@ def _compact_last_qualification(value: Any, *, floor: bool = False) -> dict | No
     challenge_summary = _compact_verdict_like(value.get("challenge_verdicts"), text_cap=text_cap)
     if challenge_summary:
         out["challenge_verdicts_summary"] = challenge_summary
-    theme_delivery = _compact_cert(value.get("theme_delivery"), text_cap=text_cap)
-    if theme_delivery:
-        out["theme_delivery"] = theme_delivery
     merge_grade = _compact_cert(value.get("merge_grade"), text_cap=text_cap)
     if merge_grade:
         out["merge_grade"] = merge_grade
@@ -381,9 +377,7 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
         "version_number",
         "phase",
         "goal",
-        "theme",
         "goal_needed",
-        "theme_needed",
         "phase_changed_at",
         "tasks_merged_this_version",
         "qualification_attempts",
@@ -396,7 +390,7 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
             out,
             block,
             key,
-            text_cap=text_cap if key in {"goal", "theme"} else None,
+            text_cap=text_cap if key == "goal" else None,
         )
     _put_present(out, block, "phase_reasoning", text_cap=text_cap)
     acceptance = block.get("acceptance_aggregate")

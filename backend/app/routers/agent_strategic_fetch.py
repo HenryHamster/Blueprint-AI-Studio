@@ -70,7 +70,6 @@ def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] |
         "promotion_error_detail",
         "error",
         "detail",
-        "theme_delivery",
         "goal_alignment",
         "blind_merge_grade",
         "merge_grade_status",
@@ -171,7 +170,6 @@ def _compact_version_lifecycle(
         "status": version.status,
         "phase": version.phase,
         "goal": version.goal,
-        "theme": version.theme,
         "opened_at": _iso(version.opened_at),
         "phase_changed_at": _iso(version.phase_changed_at),
         "phase_reasoning": version.phase_reasoning,
@@ -495,7 +493,6 @@ async def agent_fetch_qualification(
             "excluded_findings": verdict.excluded_audit_findings or [],
             "challenger_refuted_findings": verdict.challenger_refuted_audit_findings
             or [],
-            "theme_delivery": verdict.theme_delivery,
             "goal_alignment": verdict.goal_alignment,
             "source": "qualification_verdict",
             "goal_coverage_drift": goal_coverage_drift,
@@ -513,7 +510,6 @@ async def agent_fetch_qualification(
         "excluded_findings": qual.get("excluded_audit_findings") or [],
         "challenger_refuted_findings": qual.get("challenger_refuted_audit_findings")
         or [],
-        "theme_delivery": qual.get("theme_delivery"),
         "goal_alignment": qual.get("goal_alignment"),
         "source": "last_qualification",
         "goal_coverage_drift": goal_coverage_drift,

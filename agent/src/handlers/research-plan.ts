@@ -734,10 +734,7 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     ? versionPhase.tasks_merged_this_version : null;
   const goal = typeof versionPhase.goal === 'string' && versionPhase.goal.trim()
     ? versionPhase.goal.trim() : null;
-  const theme = typeof versionPhase.theme === 'string' && versionPhase.theme.trim()
-    ? versionPhase.theme.trim() : null;
   const goalNeeded = versionPhase.goal_needed === true;
-  const themeNeeded = versionPhase.theme_needed === true;
   // The backend always sends last_qualification as an object (the structured
   // qualification record: {status, candidate_sha, confidence, blocker, ...}) or
   // null — never a string. Render a compact summary line so the agent can see
@@ -767,11 +764,6 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     parts.push(`Goal: ${goal}`);
   } else if (goalNeeded) {
     parts.push(`**ACTION NEEDED: Author the version goal.** Emit \`new_version_goal\` in Section 6 problem_model update (a one-sentence statement of what this version is for).`);
-  }
-  if (theme) {
-    parts.push(`Theme: ${theme}`);
-  } else if (themeNeeded) {
-    parts.push(`**ACTION NEEDED: Author the version theme.** Emit \`new_version_theme\` in Section 6 problem_model update (one of: leanness, reliability, performance, feature, mixed, none).`);
   }
 
   if (phaseChangedAt) {
@@ -958,10 +950,9 @@ Only request qualification from the **stabilize** phase — it is ignored in **b
 
 **Do NOT re-request after a dry-run of the same candidate.** If the "Last qualification" line shows \`status=dry_run\`, the qualifier already ran end-to-end (CI, test-erosion, audit, smoketest) on that candidate commit and recorded the result — a dry-run means the candidate would promote but promotion currently ships dark, so the version stays open in \`stabilize\`. Re-emitting \`qualify_request\` for the SAME candidate re-spawns two agent VMs to re-score an identical, already-evaluated commit; the orchestrator's already-dry-run guard ignores it. Only emit \`qualify_request\` again once new work has merged onto the integration branch since that dry-run — i.e. the candidate commit has actually changed. If nothing has merged since the \`dry_run\` line above, do NOT re-request.
 
-**Four distinct version-authoring concepts — keep them separate:**
+**Three distinct version-authoring concepts — keep them separate:**
 - \`intent.purpose\` = enduring PROJECT north star, operator-owned, spans all versions — never change it here.
 - \`version.goal\` = THIS version's frozen objective — a derivative of purpose, authored once per version.
-- \`version.theme\` = the falsifiable DELIVERY SHAPE (leanness | reliability | performance | feature | mixed | none).
 - \`intent.current_focus\` = live "working on now" status — NOT the goal, advances across cycles.
 
 **Authoring the version goal (when none is set):**
@@ -971,17 +962,7 @@ If the open version has no Goal shown above, you may propose one by emitting a \
   "new_version_goal": "One concise sentence stating what this version is for."
 }
 \`\`\`
-Only emit \`new_version_goal\` when the Goal is currently unset — once authored, the goal is frozen and a re-emit is silently ignored. Keep it under 500 characters and avoid placeholder or generic text. \`new_version_goal\` is independent of \`version_phase_decision\` and \`qualify_request\` — you may emit any combination.
-
-**Authoring the version theme (when none is set):**
-If the open version has no Theme shown above, you may propose one by emitting a \`new_version_theme\` field as a top-level sibling in your Section 6 problem_model update:
-\`\`\`json
-{
-  "new_version_theme": "leanness"
-}
-\`\`\`
-Allowed values: \`leanness\` | \`reliability\` | \`performance\` | \`feature\` | \`mixed\` | \`none\`. Any other value is silently ignored.
-Only emit \`new_version_theme\` when the Theme is currently unset — once authored, the theme is frozen and a re-emit is silently ignored. \`new_version_theme\` is independent of all other siblings — you may emit any combination.`);
+Only emit \`new_version_goal\` when the Goal is currently unset — once authored, the goal is frozen and a re-emit is silently ignored. Keep it under 500 characters and avoid placeholder or generic text. \`new_version_goal\` is independent of \`version_phase_decision\` and \`qualify_request\` — you may emit any combination.`);
 
   return parts.join('\n');
 }
