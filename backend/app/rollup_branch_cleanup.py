@@ -288,6 +288,44 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
             # rather than guess (safer than the prior fallback).
             staging = None
         if staging:
+            # Guard 4 (transitive base_branch): keep the branch alive if ANY
+            # non-terminal task — at ANY depth, not just direct children —
+            # targets it via its payload ``base_branch``. Guards 1-3 only see
+            # DIRECT children (parent_task_id), EVALUATING rollups referencing
+            # it via context parent_base/original_base, and open PRs. A QUEUED
+            # grandchild fix task (child of an intermediate audit task) that
+            # targets the staging branch via its payload base_branch and has
+            # not yet opened a PR falls through all three — the branch was
+            # deleted out from under such tasks ("Could not find remote branch
+            # research/<hex> to clone" → permanent failure).
+            base_branch_targeters = (
+                (
+                    await session.execute(
+                        select(Task).where(
+                            Task.payloads[0]["base_branch"].as_string() == staging,
+                            Task.status.notin_(
+                                [
+                                    TaskStatus.COMPLETED,
+                                    TaskStatus.FAILED,
+                                    TaskStatus.CANCELLED,
+                                ]
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if base_branch_targeters:
+                logger.warning(
+                    f"[CLEANUP] Skipping deletion of {staging} — "
+                    f"{len(base_branch_targeters)} non-terminal task(s) target it "
+                    f"via base_branch"
+                )
+                # Short-circuit Guards 1-3 and the deletion append below.
+                staging = None
+
+        if staging:
             # Guard 1: Don't delete if children are still active (they push to this branch)
             active_children = (
                 (

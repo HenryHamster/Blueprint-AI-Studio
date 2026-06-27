@@ -737,6 +737,129 @@ async def test_cleanup_completed_children_do_not_block_staging(cleanup_db, mocke
     )
 
 
+@pytest.mark.asyncio
+async def test_cleanup_guard4_transitive_base_branch_targeter_skips_staging(
+    cleanup_db, mocker
+):
+    """Guard 4 (incident regression): a non-terminal task that targets the
+    staging branch via its payload ``base_branch`` — but is NOT a direct child
+    of the parent (e.g. a grandchild fix task, child of an intermediate audit
+    task) — must block staging deletion.
+
+    Such a task falls through Guards 1-3: it is not a direct child
+    (parent_task_id mismatch), it references the branch via payload base_branch
+    rather than context parent_base/original_base, and it never opened a PR.
+    The branch was deleted out from under these tasks → "Could not find remote
+    branch research/<hex> to clone" → permanent failure.
+    """
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={"research_branch": "research/abc12345"},
+    )
+    # Intermediate audit task (direct child) — terminal, so Guard 1 passes.
+    audit = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="audit",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+    )
+    # Grandchild fix task — QUEUED, child of the audit task (NOT a direct child
+    # of `parent`), targeting the staging branch via payload base_branch.
+    await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.QUEUED,
+        parent_task_id=audit.id,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix the thing",
+                "base_branch": "research/abc12345",
+            }
+        ],
+    )
+
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+
+    await _cleanup_branches(parent, cleanup_db)
+
+    # The grandchild still needs research/abc12345 to clone → must NOT be deleted.
+    mock_delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_guard4_terminal_base_branch_targeter_still_deletes(
+    cleanup_db, mocker
+):
+    """Guard 4 is not over-broad: a base_branch targeter that is TERMINAL
+    (COMPLETED/FAILED/CANCELLED) does not keep the branch alive — with no other
+    blockers the staging branch is still deleted."""
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={"research_branch": "research/def67890"},
+    )
+    audit = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="audit",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+    )
+    # Grandchild fix task targeting the branch but already CANCELLED (terminal).
+    await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.CANCELLED,
+        parent_task_id=audit.id,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix the thing",
+                "base_branch": "research/def67890",
+            }
+        ],
+    )
+
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+
+    await _cleanup_branches(parent, cleanup_db)
+
+    mock_delete.assert_called_once_with(
+        "gh-token", "owner", "repo", "research/def67890"
+    )
+
+
 # ── _verify_pr_merged helpers ─────────────────────────────────────────────────
 
 
