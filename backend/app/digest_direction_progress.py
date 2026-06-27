@@ -263,7 +263,8 @@ def _compute_auto_pause_epidemic_summary(
     """Aggregate auto-pause cycle counts across active directions.
 
     Returns total_cycles, affected_directions count, and top-5 offenders
-    sorted by auto_pause_count descending. All inputs are in-memory dicts
+    sorted by churn_family_pause_count (zombie signal) then
+    auto_pause_count (lifetime) descending. All inputs are in-memory dicts
     already loaded from project.directions — no DB access needed.
     """
     pause_counts = [
@@ -271,19 +272,28 @@ def _compute_auto_pause_epidemic_summary(
             str(d.get("id") or d.get("direction_id") or ""),
             d.get("text") or d.get("description") or "",
             int(d.get("auto_pause_count") or 0),
+            int(d.get("churn_family_pause_count") or 0),
         )
         for d in active_directions
         if d.get("id") or d.get("direction_id")
     ]
-    total_cycles = sum(c for _, _, c in pause_counts)
-    affected_directions = sum(1 for _, _, c in pause_counts if c > 0)
+    total_cycles = sum(c for _, _, c, _ in pause_counts)
+    affected_directions = sum(1 for _, _, c, _ in pause_counts if c > 0)
     top_offenders = sorted(
         [
-            {"direction_id": did, "direction_text": text[:80], "auto_pause_count": count}
-            for did, text, count in pause_counts
+            {
+                "direction_id": did,
+                "direction_text": text[:80],
+                "auto_pause_count": count,
+                "churn_family_pause_count": consec,
+            }
+            for did, text, count, consec in pause_counts
             if count > 0
         ],
-        key=lambda x: x["auto_pause_count"],
+        key=lambda x: (
+            x["churn_family_pause_count"],
+            x["auto_pause_count"],
+        ),
         reverse=True,
     )[:5]
     return {
@@ -1160,6 +1170,7 @@ async def compute_direction_progress(
                     "possibly_complete": bool(d.get("possibly_complete", False)),
                     "auto_paused": bool(d.get("auto_paused", False)),
                     "auto_pause_count": int(d.get("auto_pause_count") or 0),
+                    "churn_family_pause_count": int(d.get("churn_family_pause_count") or 0),
                     "paused_reason": d.get("paused_reason"),
                     "needs_manual_intervention": bool(
                         d.get("needs_manual_intervention", False)

@@ -2972,6 +2972,40 @@ def test_auto_pause_epidemic_summary_uses_direction_id_fallback():
     assert result["top_offenders"][0]["direction_id"] == "d-old-style"
 
 
+def test_auto_pause_epidemic_summary_churn_family_pause_count_is_primary_sort_key():
+    """A direction with higher churn_family_pause_count ranks above one with
+    higher auto_pause_count — proves zombie counter is the primary sort key."""
+    from app.digest_direction_progress import _compute_auto_pause_epidemic_summary
+
+    directions = [
+        # d-zombie: lower auto_pause_count but higher churn_family_pause_count
+        {
+            "id": "d-zombie",
+            "text": "Zombie direction",
+            "auto_pause_count": 2,
+            "churn_family_pause_count": 5,
+        },
+        # d-high-pauses: higher auto_pause_count but zero churn_family_pause_count
+        {
+            "id": "d-high-pauses",
+            "text": "High pause direction",
+            "auto_pause_count": 10,
+            "churn_family_pause_count": 0,
+        },
+    ]
+    result = _compute_auto_pause_epidemic_summary(directions)
+
+    offenders = result["top_offenders"]
+    assert len(offenders) == 2
+    # d-zombie must rank first despite lower auto_pause_count
+    assert offenders[0]["direction_id"] == "d-zombie"
+    assert offenders[0]["churn_family_pause_count"] == 5
+    assert offenders[1]["direction_id"] == "d-high-pauses"
+    # surfaced field is present on each entry
+    for entry in offenders:
+        assert "churn_family_pause_count" in entry
+
+
 # ── Dependency-health observability signals ────────────────────────────────
 
 
