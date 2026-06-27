@@ -561,6 +561,12 @@ async def apply_post_spawn_state(
                     # we don't keep surfacing stale rejected titles after recovery.
                     if len(dir_child_tasks) > 0 and d.get("deadlock_filtered_titles"):
                         del d["deadlock_filtered_titles"]
+                    # Reset the zombie-ladder churn-pause counter on a productive
+                    # cycle: a direction that recovered and shipped work is no
+                    # longer a recycling zombie, so it earns a clean slate before
+                    # the >=2 auto-retire fence (ref bf6d8788).
+                    if len(dir_child_tasks) > 0 and d.get("churn_family_pause_count"):
+                        d["churn_family_pause_count"] = 0
                     # Compact history entry — just counters and a short summary.
                     # Full details available via task API using task_id.
                     titles = finding_titles_by_dir.get(did, [])[:3]

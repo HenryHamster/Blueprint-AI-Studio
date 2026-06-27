@@ -26,6 +26,20 @@ logger = logging.getLogger(__name__)
 
 _MAX_AUTO_PAUSE_CYCLES = 3
 
+# Zombie-direction auto-retire ladder (4th ladder, ref knowledge bf6d8788). A
+# direction the health guardrail keeps churn/unproductive/saturated-pausing
+# (Rules 1, 2, 5) accumulates churn_family_pause_count; once it has been paused
+# this many times for a churn-family reason it is auto-retired, freeing the slot
+# without strategist intervention. "Lifetime burn backstop:" is deliberately
+# EXCLUDED — those pauses set needs_manual_intervention and opt out of auto-
+# recovery, so the operator (not this ladder) must act on them.
+_MAX_CHURN_PAUSE_CYCLES = 2
+_ZOMBIE_FAMILY_PREFIXES = (
+    "Unproductive:",
+    "Churn guardrail:",
+    "Saturated:",
+)
+
 # Remediation monitor window: if a merged remediation happened longer ago than this,
 # a new failure is presumed unrelated and the stale window is cleared instead of
 # triggering escalation.
@@ -780,6 +794,13 @@ async def _process_direction_lifecycle_locked(
             d["paused_at"] = _utcnow().isoformat()
             d["auto_paused"] = True
             d["auto_pause_count"] = d.get("auto_pause_count", 0) + 1
+            # Zombie ladder: count churn/unproductive/saturated re-pauses so a
+            # direction that oscillates between paused and auto-recovered without
+            # ever shipping work can be auto-retired below (ref bf6d8788).
+            if pause_reason.startswith(_ZOMBIE_FAMILY_PREFIXES):
+                d["churn_family_pause_count"] = (
+                    d.get("churn_family_pause_count", 0) + 1
+                )
             d.pop("auto_recovered_at", None)  # Grace period consumed on re-pause
             d.pop(
                 "diagnosis_stall_retry_count", None
@@ -969,6 +990,75 @@ async def _process_direction_lifecycle_locked(
                 logger.warning(
                     f"[NOTIFY] Failed to post direction pause notification: {_notify_exc}"
                 )
+            # Zombie auto-retire ladder (4th ladder, ref bf6d8788): a direction
+            # that has now been churn/unproductive/saturated-paused >= the
+            # threshold has never escaped the recycling-zombie loop — no findings,
+            # no merged PRs, no in-flight tasks (the churn-family rules imply low
+            # throughput). Retire it terminally so the strategic agent can reuse
+            # the slot. Fires on the SAME pause event, before the code-failure
+            # ladder check below.
+            churn_count = d.get("churn_family_pause_count", 0)
+            if churn_count >= _MAX_CHURN_PAUSE_CYCLES:
+                d["status"] = "completed"
+                d["auto_completed"] = True
+                d["auto_completed_reason"] = (
+                    f"Auto-retired: zombie direction paused {churn_count} times for "
+                    f"churn/unproductive/saturated with no findings or merged PRs. "
+                    f"Slot freed for new directions."
+                )
+                d["completed_at"] = _utcnow().isoformat()
+                logger.info(
+                    f"[AUTONOMOUS] Auto-retired zombie direction {did} after "
+                    f"{churn_count} churn-family auto-pause cycles: "
+                    f"{d.get('text', '')[:60]}"
+                )
+                from app.models import Alert, AlertSeverity
+
+                session.add(
+                    Alert(
+                        project_id=project.id,
+                        severity=AlertSeverity.INFO,
+                        title="Direction auto-retired (zombie)",
+                        message=(
+                            f"Direction '{d.get('text', '')[:80]}' was auto-retired after "
+                            f"{churn_count} churn/unproductive/saturated auto-pause cycles. "
+                            f"Slot freed for strategic agent to create a replacement."
+                        ),
+                    )
+                )
+                try:
+                    from app.notification_dispatch import (
+                        post_direction_milestone_message,
+                    )  # noqa: PLC0415
+
+                    await post_direction_milestone_message(
+                        session,
+                        project.id,
+                        direction_text=d.get("text", ""),
+                        milestone="auto-retired-zombie",
+                        reason=d["auto_completed_reason"],
+                        direction_id=did,
+                    )
+                except Exception as _notify_exc:
+                    logger.warning(
+                        f"[NOTIFY] Failed to post zombie retire milestone for {did}: "
+                        f"{_notify_exc}"
+                    )
+                # Gap reconciliation (Direction C, ref 626ec3f5): free the gap this
+                # direction was staffing so it can be re-staffed. Fail-open — a
+                # malformed problem model returns None and the retire still lands.
+                gap_id = d.get("gap_id")
+                if gap_id:
+                    from app.problem_model import reconcile_gap_staffing_raw
+
+                    _reconciled_pm = reconcile_gap_staffing_raw(
+                        project.problem_model, did, None, gap_id
+                    )
+                    if _reconciled_pm is not None:
+                        project.problem_model = _reconciled_pm
+                        flag_modified(project, "problem_model")
+                directions_modified = True
+                continue  # terminal — skip active_directions.append
             MAX_AUTO_PAUSE_CYCLES = _MAX_AUTO_PAUSE_CYCLES
             code_pause_count = d.get("code_failure_pause_count", 0)
             if code_pause_count >= MAX_AUTO_PAUSE_CYCLES:

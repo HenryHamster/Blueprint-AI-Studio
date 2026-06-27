@@ -2351,3 +2351,271 @@ async def test_lifecycle_skips_direction_with_recently_completed_research(
     finally:
         _runtime_config.pop("completed_research_cooldown_minutes", None)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Zombie-direction auto-retire ladder (4th ladder, ref knowledge bf6d8788)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _unproductive_history(now: datetime, cycles: int = 5) -> list[dict]:
+    """research_history that trips Rule 2 (Unproductive: 0 PRs merged).
+
+    Each cycle finishes real work (tasks_completed > 0) but merges nothing, and
+    the last cycle has no tasks in flight, so _check_direction_health returns an
+    'Unproductive:' pause reason.
+    """
+    return [
+        {
+            "timestamp": (now - timedelta(days=cycles - i)).isoformat(),
+            "tasks_created": 2,
+            "tasks_completed": 2,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        }
+        for i in range(cycles)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_auto_retire_stale_churn_paused_direction(db_session, mocker):
+    """Acceptance selector: a churn/unproductive direction already paused once
+    (churn_family_pause_count=1) that re-trips a churn-family pause is terminally
+    auto-retired on the same lifecycle tick, and its gap is reconciled — while a
+    still-productive direction under the same count is left untouched."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+
+    zombie = {
+        "id": "d-zombie",
+        "text": "Recycling zombie direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": _unproductive_history(now),
+        "churn_family_pause_count": 1,  # already paused once before
+        "gap_id": "g-zombie",
+    }
+    # A genuinely productive direction with the same churn count must NOT retire —
+    # last_cycle_productive shields it from the churn-family pause entirely.
+    healthy = {
+        "id": "d-healthy",
+        "text": "Still-productive direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": _unproductive_history(now),
+        "churn_family_pause_count": 1,
+        "last_cycle_productive": True,
+        "consecutive_unproductive_cycles": 0,
+    }
+
+    project = Project(
+        name="Zombie Retire Test",
+        user_id="u-zombie",
+        autonomous_enabled=True,
+        directions=[zombie, healthy],
+        vision={"purpose": "test"},
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-zombie",
+                    "name": "Zombie gap",
+                    "status": "active",
+                    "active_moves": ["d-zombie"],
+                    "past_moves": [],
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    by_id = {d["id"]: d for d in project.directions}
+    z = by_id["d-zombie"]
+    assert z["status"] == "completed", "zombie direction should be auto-retired"
+    assert z.get("auto_completed") is True
+    assert "zombie" in (z.get("auto_completed_reason") or "").lower()
+    assert z.get("completed_at") is not None
+    assert z.get("churn_family_pause_count") == 2, (
+        "churn_family_pause_count should increment on the retiring pause event"
+    )
+
+    # Gap reconciled: direction pruned from active_moves, recorded in past_moves.
+    gap = project.problem_model["gaps"][0]
+    assert "d-zombie" not in gap["active_moves"]
+    assert "d-zombie" in gap["past_moves"]
+
+    h = by_id["d-healthy"]
+    assert h["status"] != "completed", (
+        "a still-productive direction must not be auto-retired by the zombie ladder"
+    )
+    assert not h.get("auto_completed")
+
+
+@pytest.mark.asyncio
+async def test_zombie_not_retired_on_first_churn_pause(db_session, mocker):
+    """A fresh direction's FIRST churn-family pause increments the counter to 1
+    and pauses — but does NOT retire (>=2 fence)."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    direction = {
+        "id": "d-first-pause",
+        "text": "First churn pause",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": _unproductive_history(now),
+    }
+    project = Project(
+        name="First Pause Test",
+        user_id="u-first",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", "first churn pause should pause, not retire"
+    assert d.get("auto_completed") is not True
+    assert d.get("churn_family_pause_count") == 1
+    assert d.get("paused_reason", "").startswith("Unproductive:")
+
+
+@pytest.mark.asyncio
+async def test_code_failure_pause_does_not_increment_churn_count(db_session, mocker):
+    """A code-failure pause (Rules 3/4) increments code_failure_pause_count but
+    leaves churn_family_pause_count untouched — the two ladders are disjoint."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    # 3 recent cycles with >70% code failures → Rule 3 'High code failure rate:'.
+    direction = {
+        "id": "d-codefail",
+        "text": "Code-failing direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [
+            {
+                "timestamp": (now - timedelta(days=i)).isoformat(),
+                "tasks_created": 10,
+                "tasks_completed": 0,
+                "tasks_failed": 9,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            }
+            for i in range(3, 0, -1)
+        ],
+    }
+    project = Project(
+        name="Code Fail Test",
+        user_id="u-codefail",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("paused_reason", "").startswith("High code failure rate:")
+    assert d.get("code_failure_pause_count") == 1
+    assert d.get("churn_family_pause_count", 0) == 0, (
+        "code-failure pause must not feed the zombie/churn ladder"
+    )
+
+
+@pytest.mark.asyncio
+async def test_churn_pause_count_resets_on_productive_cycle(db_session):
+    """apply_post_spawn_state resets churn_family_pause_count to 0 when a
+    direction ships a productive cycle (child tasks created)."""
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-reset"
+    direction = {
+        **_active_direction(direction_id, "Recovered direction"),
+        "churn_family_pause_count": 1,
+    }
+    project = Project(
+        name="Churn Reset Test",
+        user_id="u-reset",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    child = Task(
+        project_id=project.id,
+        title="impl child",
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={"direction_id": direction_id},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],  # findings
+        [child],  # child_tasks — productive cycle
+        [],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        0, 0, 0, 0, 0, 0,
+        "research-branch", "main", 0, None,
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("churn_family_pause_count", 0) == 0, (
+        "a productive cycle should reset the zombie churn-pause counter"
+    )
+
