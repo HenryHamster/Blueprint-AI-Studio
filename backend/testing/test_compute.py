@@ -6612,7 +6612,11 @@ def test_build_compute_result_logs_embeds_command_log_text():
 
 
 def test_build_compute_result_logs_caps_command_log_text():
-    """A noisy command log is truncated to the embed cap so it cannot bloat the JSON."""
+    """A log over the embed cap keeps the HEAD and the TAIL (results live at the end),
+    eliding the middle, so it cannot bloat the JSON yet a downstream verdict still sees
+    the end-of-run summary."""
+    # Distinct head and tail markers so we can prove BOTH ends survive the cap.
+    text = "HEAD_MARKER" + ("x" * 20000) + "TAIL_MARKER"
     job = ComputeJob(
         id=uuid.uuid4(),
         project_id=uuid.uuid4(),
@@ -6623,10 +6627,17 @@ def test_build_compute_result_logs_caps_command_log_text():
         outcome=ComputeJobOutcome.SUCCESS,
         accrued_cost_usd=0.5,
         final_cost_usd=0.5,
-        polling_metadata={"command_log": {"text": "x" * 20000, "truncated": False}},
+        polling_metadata={"command_log": {"text": text, "truncated": False}},
     )
     result = json.loads(compute_jobs.build_compute_result_logs(job))
-    assert len(result["command_log_text"]) == 8000
+    embed = result["command_log_text"]
+    # Bounded: head(4000) + marker + tail(12000) ≈ 16k, never the full 20k.
+    assert len(embed) < len(text)
+    assert len(embed) <= 16200
+    assert embed.startswith("HEAD_MARKER")   # head retained
+    assert embed.endswith("TAIL_MARKER")      # tail (end-of-run results) retained
+    assert "elided" in embed                   # middle marked elided
+    assert result["command_log_truncated"] is True
 
 
 def test_build_compute_result_logs_omits_command_log_when_absent():
