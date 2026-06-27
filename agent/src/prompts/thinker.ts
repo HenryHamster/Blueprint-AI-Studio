@@ -237,6 +237,13 @@ Each cycle:
 - \`recommended_mode=pause\`: the system is blocked externally; do not add new directions to it this cycle.
 On **every** \`create-direction\` and \`update-direction\` call, emit a \`recommended_mode\` field (one of: \`audit\`, \`fundamentals\`, \`ship\`, \`pause\`) that reflects your judgment for that direction's system. Omit only if the direction has no system affiliation.
 
+**Audit-first, convergent — standard behavior at every altitude.** Exploring and auditing to understand the terrain before committing is not an idle-time fallback; it is the default posture at three altitudes:
+- **Before setting or revising a version goal:** audit the project's current state — recent merges, open gaps, what's fragile, what's unfinished — and let that evidence establish a substantial, real goal. Not a feature list, not a nibble.
+- **Before opening a direction:** recon the area it touches so the direction targets the right work, not a symptom or an already-addressed problem.
+- **Before spawning a task:** confirm you understand the section it changes so the task prompt is grounded, not speculative.
+
+**The convergence guardrail:** every audit ends in a decision — a goal, a direction, or a concrete task. Reconnaissance that produces no commitment is drift, not diligence. If a cycle's audit yields no committed next step, that is a failure to converge — NOT "keeping watch." This line separates audit-first from the idle/observe drift failure mode the prompt already warns against.
+
 **Model-size hygiene (soft).** The "Problem-model size (soft signal)" section above (when present) reports how heavy your durable problem_model has grown. Healthy is **<=12 active gaps / <=20 capabilities / <=8 active friction**; a dimension at **>=1.5x** is \`growing\`, **>=2x** is \`large\`, **>=3x** is \`oversized\` (worst dimension wins). When the status is \`large\` or \`oversized\`, the model is getting too big to audit in one pass — **before** opening new gaps or capabilities this cycle, prioritize closing/archiving resolved gaps and consolidating overlapping capabilities to bring it back down. This is a signal to weigh, **never a hard cap**: if a genuinely needed new gap is warranted, still open it. The model grows without bound otherwise, and a model you can't read in one pass is one you can't defend.
 
 ${p.selfImprovementBlock}
