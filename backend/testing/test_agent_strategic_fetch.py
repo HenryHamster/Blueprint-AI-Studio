@@ -2977,3 +2977,239 @@ async def test_agent_fetch_qualification_drift_in_fallback_path(
     drift = body.get("goal_coverage_drift")
     assert drift is not None
     assert drift["signal"] == "no_grade_yet"
+
+
+# ---------------------------------------------------------------------------
+# compute-sweeps recovery endpoints + sweep_id filter on knowledge-documents
+# ---------------------------------------------------------------------------
+
+
+async def _make_sweep_project(db_session, *, vm: str = "agent-vm-sweep"):
+    """Create a project + task and return (project, task, token)."""
+    project = Project(name="Sweep Test", user_id="test-user-sweep")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id=vm)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(str(task.id), vm)
+    return project, task, token
+
+
+async def _add_sweep_docs(db_session, project, sweep_id: str):
+    """Add two compute_experiment docs belonging to the same sweep_id."""
+    from app.models import KnowledgeDocument, SourceKind
+
+    # KnowledgeDocument requires source_task_id (NOT NULL) — create a dummy task.
+    src_task = Task(project_id=project.id, payloads=[{}], vm_instance_id=f"src-{sweep_id[:8]}")
+    db_session.add(src_task)
+    await db_session.commit()
+    await db_session.refresh(src_task)
+
+    docs = []
+    for arm_label in ("arm-a", "arm-b"):
+        doc = KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=src_task.id,
+            title=f"Sweep {sweep_id} {arm_label}",
+            summary=f"Results for {arm_label}",
+            body="body text",
+            source_kind=SourceKind.COMPUTE_EXPERIMENT,
+            sweep_id=sweep_id,
+            arm_label=arm_label,
+            topic="gpu-throughput",
+        )
+        db_session.add(doc)
+        docs.append(doc)
+    await db_session.commit()
+    for d in docs:
+        await db_session.refresh(d)
+    return docs
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_compute_sweeps_returns_grouped_evidence(
+    client: AsyncClient, db_session
+):
+    """GET /projects/{id}/compute-sweeps returns multi-arm sweeps grouped by
+    sweep_id. Lone-arm docs (sweep_id set but only one doc) are excluded by
+    build_compute_sweep_groups (_SWEEP_MIN_DOCS=2). A second sweep with two
+    arms is returned. Docs with no sweep_id are never included."""
+    from app.models import KnowledgeDocument, SourceKind
+
+    project, task, token = await _make_sweep_project(
+        db_session, vm="agent-vm-cs-grouped"
+    )
+
+    # Two-arm sweep — should appear in the response.
+    await _add_sweep_docs(db_session, project, "sweep-multi")
+
+    # Lone-arm doc — excluded by min-docs filter.
+    lone_src = Task(project_id=project.id, payloads=[{}], vm_instance_id="src-lone")
+    db_session.add(lone_src)
+    await db_session.commit()
+    await db_session.refresh(lone_src)
+    lone = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=lone_src.id,
+        title="Lone arm",
+        summary="only one",
+        body="body",
+        source_kind=SourceKind.COMPUTE_EXPERIMENT,
+        sweep_id="sweep-lone",
+        arm_label="arm-only",
+        topic="t",
+    )
+    db_session.add(lone)
+
+    # No-sweep_id doc — never included.
+    nosweep = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=lone_src.id,
+        title="No sweep",
+        summary="no id",
+        body="body",
+        source_kind=SourceKind.COMPUTE_EXPERIMENT,
+        topic="t",
+    )
+    db_session.add(nosweep)
+    await db_session.commit()
+
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/compute-sweeps",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    data = body["data"]
+    # The multi-arm sweep is present.
+    assert "sweep-multi" in data
+    assert len(data["sweep-multi"]) == 2
+    arm_labels = {e["arm_label"] for e in data["sweep-multi"]}
+    assert arm_labels == {"arm-a", "arm-b"}
+    # The lone-arm sweep is excluded.
+    assert "sweep-lone" not in data
+    # Docs with no sweep_id are never present.
+    titles = [e["title"] for entries in data.values() for e in entries]
+    assert "No sweep" not in titles
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_compute_sweep_single_returns_docs_for_that_sweep(
+    client: AsyncClient, db_session
+):
+    """GET /projects/{id}/compute-sweeps/{sweep_id} returns only docs for
+    that sweep, oldest-first."""
+    project, task, token = await _make_sweep_project(
+        db_session, vm="agent-vm-cs-single"
+    )
+    await _add_sweep_docs(db_session, project, "sweep-abc")
+
+    # Add a second sweep — must not appear.
+    await _add_sweep_docs(db_session, project, "sweep-xyz")
+
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/compute-sweeps/sweep-abc",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    entries = body["data"]
+    assert isinstance(entries, list)
+    assert len(entries) == 2
+    sweep_ids = {e["sweep_id"] for e in entries}
+    assert sweep_ids == {"sweep-abc"}
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_compute_sweep_single_missing_returns_404(
+    client: AsyncClient, db_session
+):
+    """GET /projects/{id}/compute-sweeps/{sweep_id} returns 404 for unknown sweep."""
+    project, task, token = await _make_sweep_project(
+        db_session, vm="agent-vm-cs-missing"
+    )
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/compute-sweeps/does-not-exist",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_compute_sweeps_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Agent token for project A cannot fetch compute-sweeps for project B (404)."""
+    project_a = Project(name="CS A", user_id="test-user-csa")
+    project_b = Project(name="CS B", user_id="test-user-csb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-csa")
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-csa")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/compute-sweeps",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_knowledge_documents_sweep_id_filter(
+    client: AsyncClient, db_session
+):
+    """GET /knowledge-documents?sweep_id=X returns only docs for that sweep_id."""
+    from app.models import KnowledgeDocument, SourceKind
+
+    project, task, token = await _make_sweep_project(
+        db_session, vm="agent-vm-kd-sweep"
+    )
+    # Two docs in target sweep.
+    await _add_sweep_docs(db_session, project, "target-sweep")
+
+    # One doc in a different sweep — must not appear in the filtered result.
+    other_src = Task(project_id=project.id, payloads=[{}], vm_instance_id="src-other-kd")
+    db_session.add(other_src)
+    await db_session.commit()
+    await db_session.refresh(other_src)
+    other = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=other_src.id,
+        title="Other sweep",
+        summary="other",
+        body="body",
+        source_kind=SourceKind.COMPUTE_EXPERIMENT,
+        sweep_id="other-sweep",
+        arm_label="arm-x",
+        topic="t",
+    )
+    db_session.add(other)
+    await db_session.commit()
+
+    res = await client.get(
+        "/api/agent/knowledge-documents",
+        params={"sweep_id": "target-sweep"},
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["total"] == 2
+    returned_sweep_ids = {d["sweep_id"] for d in body["documents"]}
+    assert returned_sweep_ids == {"target-sweep"}
+    # Unfiltered call returns all three docs.
+    res_all = await client.get(
+        "/api/agent/knowledge-documents",
+        headers={"x-agent-token": token},
+    )
+    assert res_all.json()["total"] == 3
