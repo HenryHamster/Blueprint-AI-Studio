@@ -10043,6 +10043,49 @@ class TestBuildCycleStartReconciliation:
         assert orphans == {"g-blocked": "blocked"}
         assert out["counts"]["deferred_gaps"] == 1
 
+    def test_staffed_but_deferred_gap_surfaced(self):
+        """A gap that is both staffed (active direction via gap_id) and carries a
+        deferral is a self-contradicting state — it must appear in
+        ``staffed_but_deferred``, not be silently skipped."""
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        deferral = {"rationale": "pending review", "created_at": "2026-01-01"}
+        pm = {
+            "gaps": [
+                # Staffed AND deferred → contradiction, must be surfaced.
+                {
+                    "id": "g-contradiction",
+                    "name": "needs attention",
+                    "status": "active",
+                    "priority": "high",
+                    "deferral": deferral,
+                },
+                # Staffed, no deferral → not a contradiction, not orphaned.
+                {"id": "g-clean", "name": "clean", "status": "active"},
+                # Deferred, not staffed → counted as deferred_gap, not contradiction.
+                {
+                    "id": "g-deferred-only",
+                    "name": "parked",
+                    "status": "active",
+                    "deferral": {"rationale": "later", "created_at": "x"},
+                },
+            ]
+        }
+        direction_stats = [
+            {"id": "d-1", "status": "active", "gap_id": "g-contradiction"},
+            {"id": "d-2", "status": "active", "gap_id": "g-clean"},
+        ]
+        out = _build_cycle_start_reconciliation(direction_stats, pm, {})
+        # The contradiction is surfaced.
+        assert len(out["staffed_but_deferred"]) == 1
+        entry = out["staffed_but_deferred"][0]
+        assert entry["gap_id"] == "g-contradiction"
+        assert entry["deferral"] == deferral
+        assert out["counts"]["staffed_but_deferred"] == 1
+        # Staffed-no-deferral and deferred-unstaffed gaps are NOT in the list.
+        assert out["orphaned_gaps"] == []
+        assert out["counts"]["deferred_gaps"] == 1
+
     def test_ungrounded_directions_by_reason(self):
         from app.strategic_spawning import _build_cycle_start_reconciliation
 

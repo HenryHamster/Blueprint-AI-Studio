@@ -1058,6 +1058,21 @@ async def strategic_operation(
                 )
             new_dir["conflicts_with"] = raw_conflicts_with
         directions.append(new_dir)
+        # Reconcile the problem-model gap this direction staffs, in the same
+        # locked transaction (the project row is already held via
+        # _lock_project_or_429; directions + problem_model are columns on it).
+        # A fresh active direction (not a staged, not-yet-live one) staffs its
+        # gap: add it to active_moves and clear any now-false deferral. Mirrors
+        # the retire-side reconciliation but in the staffing direction.
+        if new_dir.get("gap_id") and not staged_create:
+            from app.problem_model import reconcile_gap_staffing_raw  # noqa: PLC0415
+
+            _reconciled_pm = reconcile_gap_staffing_raw(
+                project.problem_model, new_dir["id"], new_dir["gap_id"], None
+            )
+            if _reconciled_pm is not None:
+                project.problem_model = _reconciled_pm
+                flag_modified(project, "problem_model")
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
@@ -1117,11 +1132,16 @@ async def strategic_operation(
             return _blk
         directions = list(project.directions or [])
         updated = False
+        # Re-ground reconciliation: capture the direction's prior gap_id BEFORE
+        # any change is applied so a gap_id change can prune the old gap. Holds
+        # ``(new_gap_id, prior_gap_id)`` once a gap_id change is observed.
+        _gap_reground: tuple[str | None, str | None] | None = None
         for d in directions:
             if d.get("id") == dir_id:
                 _pre_text = d.get("text")
                 _pre_se = (d.get("context") or {}).get("success_evidence")
                 _pre_rc = (d.get("context") or {}).get("retirement_condition")
+                _pre_gap_id = d.get("gap_id")
                 if "text" in changes:
                     d["text"] = _cap_str(
                         changes["text"],
@@ -1198,6 +1218,7 @@ async def strategic_operation(
                         d["gap_id"] = str(gid)
                     else:
                         d.pop("gap_id", None)
+                    _gap_reground = (d.get("gap_id"), _pre_gap_id)
                 if "conflicts_with" in changes:
                     cw = changes["conflicts_with"]
                     if cw is None or (isinstance(cw, list) and len(cw) == 0):
@@ -1275,6 +1296,20 @@ async def strategic_operation(
                 break
         if not updated:
             raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+        # Re-ground reconciliation, in the same locked transaction: when the
+        # direction's gap_id changed, stage the new gap (active_moves + clear
+        # deferral) and prune the old one. Mirrors create_direction and the
+        # retire-side reconciliation.
+        if _gap_reground is not None:
+            from app.problem_model import reconcile_gap_staffing_raw  # noqa: PLC0415
+
+            _new_gap_id, _prior_gap_id = _gap_reground
+            _reconciled_pm = reconcile_gap_staffing_raw(
+                project.problem_model, str(dir_id), _new_gap_id, _prior_gap_id
+            )
+            if _reconciled_pm is not None:
+                project.problem_model = _reconciled_pm
+                flag_modified(project, "problem_model")
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}

@@ -30,7 +30,7 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +567,106 @@ def archive_closed_gaps(model: ProblemModel) -> ProblemModel:
             still_active.append(gap)
     model.gaps = still_active
     return model
+
+
+def reconcile_gap_staffing(
+    model: ProblemModel,
+    direction_id: str,
+    new_gap_id: str | None,
+    prior_gap_id: str | None = None,
+) -> bool:
+    """Reconcile a gap's ``active_moves`` / ``deferral`` when a direction is
+    created on, or re-grounded onto, a gap.
+
+    The staffing-side mirror of the retire-side reconciliation: where retiring a
+    gap-linked direction prunes it from the gap's ``active_moves`` (and resolves
+    or re-defers the now-unstaffed gap), *staffing* a gap with a direction must
+    record that the gap is being actively worked again.
+
+    Mutates ``model`` in place and returns ``True`` iff something changed (so the
+    caller can skip a no-op write and keep the durable model byte-identical):
+
+    - ``new_gap_id`` set and matching an existing gap — add ``direction_id`` to
+      that gap's ``active_moves`` (no duplicate) and clear any ``deferral`` (set
+      ``None``): the gap is now actively staffed, so a recorded "intentionally
+      unstaffed this cycle" decision is false.
+    - ``prior_gap_id`` set, matching an existing gap, and different from
+      ``new_gap_id`` — the direction re-grounded away from (or cleared) its old
+      gap: prune ``direction_id`` from that gap's ``active_moves`` and record it
+      in ``past_moves`` (the merged/failed move-history convention). Clearing the
+      linkage entirely (``new_gap_id`` falsy) prunes the old gap with no new
+      staffing.
+
+    Proposed-wins compatible and non-destructive: it only adjusts
+    ``active_moves`` / ``past_moves`` / ``deferral`` on gaps that already exist in
+    the model — it never creates a gap or touches any other field, so it cannot
+    fight the strategic agent's own problem-model writes. An ``new_gap_id`` /
+    ``prior_gap_id`` with no matching gap is a safe no-op (mirrors how the
+    retire/respawn paths tolerate a dangling ``gap_id`` linkage). Idempotent:
+    re-running with the same linkage neither duplicates an ``active_moves`` entry
+    nor re-clears an already-cleared deferral.
+    """
+    if not direction_id:
+        return False
+
+    gap_by_id = {gap.id: gap for gap in model.gaps}
+    changed = False
+
+    # Re-ground away from (or clear) the OLD gap: prune the move, archive it in
+    # past_moves. Only when the linkage actually moved to a different gap.
+    if prior_gap_id and prior_gap_id != new_gap_id:
+        old_gap = gap_by_id.get(prior_gap_id)
+        if old_gap is not None:
+            if direction_id in old_gap.active_moves:
+                old_gap.active_moves = [
+                    m for m in old_gap.active_moves if m != direction_id
+                ]
+                changed = True
+            if direction_id not in old_gap.past_moves:
+                old_gap.past_moves.append(direction_id)
+                changed = True
+
+    # Staff the NEW gap: record the active move and drop a now-false deferral.
+    if new_gap_id:
+        new_gap = gap_by_id.get(new_gap_id)
+        if new_gap is not None:
+            if direction_id not in new_gap.active_moves:
+                new_gap.active_moves.append(direction_id)
+                changed = True
+            if new_gap.deferral is not None:
+                new_gap.deferral = None
+                changed = True
+
+    return changed
+
+
+def reconcile_gap_staffing_raw(
+    problem_model_raw: dict | None,
+    direction_id: str,
+    new_gap_id: str | None,
+    prior_gap_id: str | None = None,
+) -> dict | None:
+    """Raw-JSONB adapter for :func:`reconcile_gap_staffing`.
+
+    The direction write paths hold ``project.problem_model`` as a raw JSONB dict
+    on a row already locked alongside ``directions`` (same project row). This
+    parses that dict, reconciles, and returns a fresh ``model_dump()`` dict when
+    something changed — or ``None`` when nothing changed (so the caller skips the
+    write and leaves the column byte-identical) or the model is empty.
+
+    Fail-open: a malformed model returns ``None`` rather than raising, so a bad
+    durable problem model can never block a direction create/update — mirroring
+    how the retire/respawn paths tolerate a model they cannot reconcile.
+    """
+    if not problem_model_raw:
+        return None
+    try:
+        model = parse_problem_model(problem_model_raw)
+    except ValidationError:
+        return None
+    if reconcile_gap_staffing(model, direction_id, new_gap_id, prior_gap_id):
+        return model.model_dump()
+    return None
 
 
 def _archived_gap_recency_key(gap: Gap) -> str:

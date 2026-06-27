@@ -4101,6 +4101,159 @@ async def test_gap_id_updated_on_update_fallback_path(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_gap_reconciled_on_create_fallback_path(db_session, mocker):
+    """The fallback create path stages the problem-model gap a new direction
+    staffs: the direction id joins active_moves and a stale deferral is cleared,
+    in the same locked transaction as the directions write."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="GAPRECON-FB-CREATE",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-metering",
+                    "name": "metering",
+                    "status": "active",
+                    "active_moves": [],
+                    "deferral": {"rationale": "not this cycle"},
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Close the metering gap",
+                    "priority": "high",
+                    "gap_id": "g-metering",
+                    "success_evidence": "Metering accurate",
+                    "retirement_condition": "No open metering bugs",
+                }
+            ],
+        }
+    )
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    created = next(
+        d for d in (project.directions or []) if "metering" in d.get("text", "")
+    )
+    gap = next(g for g in project.problem_model["gaps"] if g["id"] == "g-metering")
+    assert created["id"] in gap["active_moves"]
+    # Deferral cleared — the gap is now actively staffed.
+    assert gap.get("deferral") is None
+
+
+@pytest.mark.asyncio
+async def test_gap_reconciled_on_reground_fallback_path(db_session, mocker):
+    """The fallback update path re-grounds a direction onto a new gap: it joins
+    the new gap's active_moves (deferral cleared) and is pruned from the old
+    gap's active_moves into past_moves."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="GAPRECON-FB-REGROUND",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-fb",
+                "text": "Existing direction",
+                "status": "active",
+                "priority": "medium",
+                "gap_id": "g-old",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-old",
+                    "name": "old",
+                    "status": "active",
+                    "active_moves": ["d-fb"],
+                },
+                {
+                    "id": "g-new",
+                    "name": "new",
+                    "status": "active",
+                    "active_moves": [],
+                    "deferral": {"rationale": "parked"},
+                },
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-fb",
+                    "changes": {"gap_id": "g-new"},
+                }
+            ],
+        }
+    )
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    gaps = {g["id"]: g for g in project.problem_model["gaps"]}
+    # New gap staffed, deferral cleared.
+    assert "d-fb" in gaps["g-new"]["active_moves"]
+    assert gaps["g-new"].get("deferral") is None
+    # Old gap pruned, move archived in past_moves.
+    assert "d-fb" not in gaps["g-old"]["active_moves"]
+    assert "d-fb" in gaps["g-old"]["past_moves"]
+
+
+@pytest.mark.asyncio
 async def test_absent_dedup_reasoning_no_error_on_create(db_session, mocker):
     """Omitting dedup_reasoning entirely causes no error — direction is created normally."""
     import json

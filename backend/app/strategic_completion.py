@@ -4259,6 +4259,11 @@ async def _handle_strategic_completion(
     # project.vision assignment out of this file's ratchet count).
     _pending_rejected_proposals: list = []
     retired_rationales_fb: Dict[str, str] = {}
+    # Gap-staffing reconciliations to apply to project.problem_model after the
+    # op loop. Each entry is ``(direction_id, new_gap_id, prior_gap_id)`` — the
+    # fallback mirror of the HTTP create/update_direction reconciliation. Applied
+    # once after the loop, in the same locked transaction as the directions write.
+    _pending_gap_reconciles: list = []
     if direction_ops and isinstance(direction_ops, list):
         if len(direction_ops) > MAX_DIRECTION_OPS:
             logger.warning(
@@ -4492,6 +4497,14 @@ async def _handle_strategic_completion(
                     )
                     new_dir["paused_at"] = _utcnow().isoformat()
                 directions.append(new_dir)
+                # Stage the gap this fresh active direction staffs (active_moves
+                # + clear deferral). Mirror the HTTP create_direction path: only a
+                # live active direction staffs a gap (a pause-translated direction
+                # is not yet working it). Applied to problem_model after the loop.
+                if new_dir.get("gap_id") and new_dir.get("status") == "active":
+                    _pending_gap_reconciles.append(
+                        (new_dir["id"], new_dir["gap_id"], None)
+                    )
                 ops_applied += 1
                 creates_count += 1
                 created_ids_fb.append(new_dir["id"])
@@ -4529,6 +4542,9 @@ async def _handle_strategic_completion(
                         _pre_ctx = d.get("context") or {}
                         _pre_se = _pre_ctx.get("success_evidence")
                         _pre_rc = _pre_ctx.get("retirement_condition")
+                        # Prior gap_id captured before the change, for re-ground
+                        # reconciliation (prune old gap, stage the new one).
+                        _pre_gap_id_fb = d.get("gap_id")
                         if "text" in changes:
                             new_text = str(changes["text"])
                             if len(new_text) > STRATEGIC_DIRECTION_TEXT_MAX:
@@ -4552,6 +4568,9 @@ async def _handle_strategic_completion(
                                 d["gap_id"] = str(gid)
                             else:
                                 d.pop("gap_id", None)
+                            _pending_gap_reconciles.append(
+                                (str(dir_id), d.get("gap_id"), _pre_gap_id_fb)
+                            )
                         if "system_id" in changes:
                             if changes["system_id"]:
                                 sid_new = str(changes["system_id"])
@@ -5009,6 +5028,31 @@ async def _handle_strategic_completion(
 
             _dirs = list(directions)
             await with_directions_locked(session, task.project_id, lambda _: _dirs)
+
+        # Reconcile problem-model gaps for any create/re-ground that carried a
+        # gap_id, in the same locked transaction as the directions write (the
+        # project row is held for this whole fallback). Parse once, apply the
+        # whole batch, write back only when something changed — mirrors the HTTP
+        # create/update_direction reconciliation. Fail-open on a malformed model.
+        if _pending_gap_reconciles:
+            from app.problem_model import (
+                parse_problem_model,
+                reconcile_gap_staffing,
+            )
+            from pydantic import ValidationError as _PMValidationError
+
+            try:
+                _pm_model = parse_problem_model(project.problem_model)
+            except _PMValidationError:
+                _pm_model = None
+            if _pm_model is not None:
+                _pm_changed = False
+                for _did, _new_g, _prior_g in _pending_gap_reconciles:
+                    if reconcile_gap_staffing(_pm_model, _did, _new_g, _prior_g):
+                        _pm_changed = True
+                if _pm_changed:
+                    project.problem_model = _pm_model.model_dump()
+                    flag_modified(project, "problem_model")
 
         if _pending_retire_memory:
             from app.task_locking import with_vision_locked

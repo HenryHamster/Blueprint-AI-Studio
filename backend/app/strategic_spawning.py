@@ -43,7 +43,7 @@ from app.strategic_payload_compaction import (
     _CONVERSATION_THREAD_KEEP_WHEN_TRIMMED,
     _OUTCOME_DIRECTION_OUTCOMES_KEEP,
     _VERSION_PHASE_RECENT_VERSIONS_CAP,
-    _direction_activity_score,
+    _direction_activity_score,  # noqa: F401 — re-exported for test imports
     _enrich_drift_with_trend,
     _summarize_directions,
     _summarize_drift_signals,
@@ -1441,6 +1441,7 @@ def _build_cycle_start_reconciliation(
     # Blocked gaps are still open problems with no direction working them, so
     # they are orphan-eligible too — just flagged with their status.
     orphaned_gaps: list[dict] = []
+    staffed_but_deferred: list[dict] = []
     deferred_gap_count = 0
     for g in gaps:
         if not isinstance(g, dict) or g.get("status") not in ("active", "blocked"):
@@ -1448,6 +1449,16 @@ def _build_cycle_start_reconciliation(
         gid = str(g.get("id") or "")
         staffed = bool(gid and gid in referenced_gap_ids)
         if staffed:
+            if g.get("deferral"):
+                staffed_but_deferred.append(
+                    {
+                        "gap_id": gid,
+                        "name": _label(g.get("name")),
+                        "priority": g.get("priority"),
+                        "status": g.get("status"),
+                        "deferral": g.get("deferral"),
+                    }
+                )
             continue
         if g.get("deferral"):
             deferred_gap_count += 1
@@ -1679,6 +1690,7 @@ def _build_cycle_start_reconciliation(
         not active_dirs
         and not capability_contradictions
         and not orphaned_gaps
+        and not staffed_but_deferred
         and not deferred_gap_count
         and not stale_active_moves
         and not merge_accounting
@@ -1693,6 +1705,7 @@ def _build_cycle_start_reconciliation(
 
     capped_caps, caps_total = _cap(capability_contradictions)
     capped_orphans, orphans_total = _cap(orphaned_gaps)
+    capped_staffed_deferred, staffed_deferred_total = _cap(staffed_but_deferred)
     capped_ungrounded, ungrounded_total = _cap(ungrounded_directions)
     capped_stale, stale_total = _cap(stale_active_moves)
     capped_pipeline, pipeline_dropped = _cap(direction_pipeline)
@@ -1712,6 +1725,7 @@ def _build_cycle_start_reconciliation(
     return {
         "capability_contradictions": capped_caps,
         "orphaned_gaps": capped_orphans,
+        "staffed_but_deferred": capped_staffed_deferred,
         "ungrounded_directions": capped_ungrounded,
         "stale_active_moves": capped_stale,
         "direction_pipeline": capped_pipeline,
@@ -1721,6 +1735,7 @@ def _build_cycle_start_reconciliation(
             # True totals (shown + overflow) so the renderer can say "+N more".
             "capability_contradictions": len(capped_caps) + caps_total,
             "orphaned_gaps": len(capped_orphans) + orphans_total,
+            "staffed_but_deferred": len(capped_staffed_deferred) + staffed_deferred_total,
             "ungrounded_directions": len(capped_ungrounded) + ungrounded_total,
             "stale_active_moves": len(capped_stale) + stale_total,
             "deferred_gaps": deferred_gap_count,
