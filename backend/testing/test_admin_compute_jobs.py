@@ -1514,3 +1514,98 @@ async def test_sweep_groups_endpoint_non_member_404(client: AsyncClient, db_sess
     # No ProjectMember row — request must be rejected.
     resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups")
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/compute-jobs/{job_id}/ask — grounded Q&A endpoint tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_grounded_answer(client: AsyncClient, db_session):
+    """A member can ask a free-form question and receive a grounded answer with citations."""
+    project = await _make_project(db_session, name="Ask Grounded Project")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 1.5}},
+    )
+
+    canned = {
+        "answer": "The accuracy metric was 0.95, meeting the declared criterion.",
+        "citations": ["gs://bucket/results/exp.json#metric:accuracy=0.95"],
+        "grounded": True,
+    }
+    with patch(
+        "app.knowledge_completion.answer_compute_experiment_question",
+        new=AsyncMock(return_value=canned),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "What accuracy did the experiment achieve?"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["answer"] == "The accuracy metric was 0.95, meeting the declared criterion."
+    assert body["citations"] == ["gs://bucket/results/exp.json#metric:accuracy=0.95"]
+    assert body["grounded"] is True
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_viewer_forbidden(client: AsyncClient, db_session):
+    """Viewers must not be able to use the ask endpoint (member+ only)."""
+    project = await _make_project(db_session, name="Ask Viewer Forbidden")
+    await _add_member(db_session, project.id, "viewer")
+    _task, job = await _make_terminal_job_with_task(db_session, project)
+
+    resp = await client.post(
+        f"/api/admin/compute-jobs/{job.id}/ask",
+        json={"question": "What happened?"},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_nonterminal_returns_409(client: AsyncClient, db_session):
+    """Asking about a running job returns 409 (Q&A requires terminal job)."""
+    project = await _make_project(db_session, name="Ask Running Job")
+    await _add_member(db_session, project.id, "member")
+    _task, job, _artifact = await _make_job(
+        db_session, project, status=ComputeJobStatus.RUNNING
+    )
+
+    resp = await client.post(
+        f"/api/admin/compute-jobs/{job.id}/ask",
+        json={"question": "Is it done?"},
+    )
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_no_evidence_declines_honestly(
+    client: AsyncClient, db_session
+):
+    """When the run has no durable evidence, the endpoint returns a polite decline."""
+    project = await _make_project(db_session, name="Ask No Evidence")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS"}},
+        result_reference=None,
+    )
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test", "DISABLE_LLM_COMPUTE_ANALYSIS": "0"}):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "What metrics were reported?"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "answer" in body
+    assert "citations" in body
+    assert body["grounded"] is False
+    assert isinstance(body["citations"], list)

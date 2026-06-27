@@ -1,5 +1,5 @@
 import { describe, test, expect, vi, afterEach } from 'vitest';
-import { render, waitFor, act } from '@testing-library/react';
+import { render, waitFor, act, fireEvent } from '@testing-library/react';
 import type { ComputeJob, ComputeJobsListResponse } from '../api';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
 import {
@@ -23,6 +23,7 @@ const fetchComputeJobsAggregateSummary = vi.fn();
 const fetchHeldComputeExperiments = vi.fn();
 const fetchComputeSweepGroups = vi.fn();
 const rerunComputeExperiment = vi.fn();
+const askComputeJob = vi.fn();
 
 vi.mock('../api', () => ({
   fetchComputeJobs: (...args: unknown[]) => fetchComputeJobs(...args),
@@ -38,6 +39,7 @@ vi.mock('../api', () => ({
   fetchHeldComputeExperiments: (...args: unknown[]) => fetchHeldComputeExperiments(...args),
   fetchComputeSweepGroups: (...args: unknown[]) => fetchComputeSweepGroups(...args),
   rerunComputeExperiment: (...args: unknown[]) => rerunComputeExperiment(...args),
+  askComputeJob: (...args: unknown[]) => askComputeJob(...args),
 }));
 
 function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
@@ -215,6 +217,7 @@ describe('ComputeJobsPanel render + kill', () => {
     fetchComputeJobsAggregateSummary.mockReset();
     fetchHeldComputeExperiments.mockReset();
     fetchComputeSweepGroups.mockReset();
+    askComputeJob.mockReset();
     vi.restoreAllMocks();
   });
 
@@ -2779,6 +2782,35 @@ describe('ComputeJobsPanel render + kill', () => {
     await findByTestId('arms-comparison');
     // pass/fail chips must NOT render when per_arm is absent
     expect(queryAllByTestId('arm-passfail-chip')).toHaveLength(0);
+  });
+
+  test('renders grounded answer and citations for Ask about this run', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: 'The experiment achieved 92% accuracy on the validation set.',
+      citations: ['gs://artifacts/metrics.json', 'gs://artifacts/eval_log.txt'],
+      grounded: true,
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Ask input is visible for terminal jobs
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'What accuracy did this run achieve?' } });
+    });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+    // Grounded answer renders
+    const result = await findByTestId('compute-ask-result');
+    expect(result.textContent).toContain('92% accuracy');
+    // Citations render inline
+    const citations = await findByTestId('compute-ask-citations');
+    expect(citations.textContent).toContain('gs://artifacts/metrics.json');
+    expect(citations.textContent).toContain('gs://artifacts/eval_log.txt');
+    // Ungrounded disclaimer is absent for a grounded answer
+    expect(result.querySelector('[data-testid="compute-ask-ungrounded"]')).toBeNull();
+    // API called with correct args
+    expect(askComputeJob).toHaveBeenCalledWith('job-1', 'What accuracy did this run achieve?');
   });
 });
 

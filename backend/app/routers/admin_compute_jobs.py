@@ -12,7 +12,7 @@ import uuid
 from datetime import timedelta
 from typing import Any, Dict
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -402,6 +402,59 @@ async def analyze_project_compute_job(
 
     return await analyze_compute_experiment_knowledge(
         task,
+        outcome=outcome,
+        cost=cost,
+        criterion=criterion,
+        result_reference=job.result_reference,
+        session=session,
+        logs=logs,
+    )
+
+
+@router.post("/compute-jobs/{job_id}/ask")
+async def ask_compute_job(
+    job_id: uuid.UUID,
+    question: str = Body(..., embed=True),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Answer a free-form question grounded in a terminal compute job's evidence (member+)."""
+    job = await session.get(ComputeJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Compute job not found")
+    await _get_user_project_with_role(
+        job.project_id, current_user["user_id"], session, "member"
+    )
+    if job.status not in _COMPUTE_JOB_TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Compute job is not terminal (status={job.status}); Q&A requires a terminal job",
+        )
+    if job.task_id is None:
+        raise HTTPException(status_code=409, detail="Compute job has no linked task")
+    task = await session.get(Task, job.task_id)
+    if task is None:
+        raise HTTPException(status_code=409, detail="Linked task not found")
+
+    compute_result = (task.plan_output or {}).get("compute_result") or {}
+    outcome = str(compute_result.get("outcome") or "")
+    if not outcome and job.outcome is not None:
+        outcome = job.outcome.value
+    if not outcome:
+        outcome = "unknown"
+    raw_cost = compute_result.get("final_cost_usd")
+    cost: float | None = float(raw_cost) if raw_cost is not None else None
+    criterion = compute_result.get("criterion")
+    if not isinstance(criterion, dict):
+        criterion = None
+
+    logs = json.dumps({"job_id": str(job.id)})
+
+    from app.knowledge_completion import answer_compute_experiment_question
+
+    return await answer_compute_experiment_question(
+        task,
+        question=question,
         outcome=outcome,
         cost=cost,
         criterion=criterion,

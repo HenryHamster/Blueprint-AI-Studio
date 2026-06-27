@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen } from 'lucide-react';
-import { analyzeComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
+import { analyzeComputeJob, askComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
@@ -679,6 +679,12 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [sweepGroups, setSweepGroups] = useState<ComputeSweepGroupsResponse['sweep_groups']>({});
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [askState, setAskState] = useState<Record<string, {
+    question: string;
+    submitting: boolean;
+    result: { answer: string; citations: string[]; grounded: boolean } | null;
+    error: string | null;
+  }>>({});
 
   const toggleDocExpanded = useCallback((key: string) => {
     setExpandedDocIds((prev) => {
@@ -898,6 +904,21 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
       setRerunState((prev) => prev ? { ...prev, submitting: false, error: e instanceof Error ? e.message : 'Re-run failed' } : prev);
     }
   }, [rerunState, load]);
+
+  const handleAsk = useCallback(async (jobId: string) => {
+    const q = (askState[jobId]?.question ?? '').trim();
+    if (!q) return;
+    setAskState((prev) => ({ ...prev, [jobId]: { ...(prev[jobId] ?? { question: q, submitting: false, result: null, error: null }), submitting: true, error: null, result: null } }));
+    try {
+      const result = await askComputeJob(jobId, q);
+      setAskState((prev) => ({ ...prev, [jobId]: { ...(prev[jobId] ?? { question: q, submitting: false, result: null, error: null }), submitting: false, result } }));
+    } catch (e) {
+      setAskState((prev) => ({
+        ...prev,
+        [jobId]: { ...(prev[jobId] ?? { question: q, submitting: false, result: null, error: null }), submitting: false, error: e instanceof Error ? e.message : 'Ask failed' },
+      }));
+    }
+  }, [askState]);
 
   if (!projectId) {
     return (
@@ -1819,6 +1840,56 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-64 overflow-y-auto">
                       {displayLines.join('\n')}
                     </pre>
+                  </div>
+                );
+              })()}
+              {!active && (() => {
+                const ask = askState[job.id] ?? { question: '', submitting: false, result: null, error: null };
+                return (
+                  <div className="mt-1.5" data-testid="compute-ask-section">
+                    <form
+                      onSubmit={(e) => { e.preventDefault(); void handleAsk(job.id); }}
+                      className="flex gap-1.5"
+                    >
+                      <input
+                        type="text"
+                        value={ask.question}
+                        onChange={(e) => setAskState((prev) => ({
+                          ...prev,
+                          [job.id]: { ...(prev[job.id] ?? { question: '', submitting: false, result: null, error: null }), question: e.target.value },
+                        }))}
+                        placeholder="Ask about this run…"
+                        disabled={ask.submitting}
+                        className="flex-1 min-w-0 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-ui-sm text-neutral-100 placeholder-neutral-600"
+                        data-testid="compute-ask-input"
+                      />
+                      <button
+                        type="submit"
+                        disabled={ask.submitting || !ask.question.trim()}
+                        className="min-h-[44px] rounded bg-indigo-500/20 px-3 text-ui-sm font-semibold text-indigo-200 hover:bg-indigo-500/30 transition-colors disabled:opacity-50"
+                        data-testid="compute-ask-submit"
+                      >
+                        {ask.submitting ? 'Asking…' : 'Ask'}
+                      </button>
+                    </form>
+                    {ask.error && (
+                      <div className="mt-1 text-ui-sm text-red-300" data-testid="compute-ask-error">{ask.error}</div>
+                    )}
+                    {ask.result && (
+                      <div className="mt-1.5 rounded border border-indigo-500/30 bg-indigo-500/10 px-2 py-1.5 text-ui-sm" data-testid="compute-ask-result">
+                        <div className="text-indigo-200 break-words whitespace-pre-wrap">{ask.result.answer}</div>
+                        {ask.result.citations.length > 0 && (
+                          <div className="mt-1 flex flex-col gap-0.5" data-testid="compute-ask-citations">
+                            {ask.result.citations.map((c) => (
+                              <div key={c} className="font-mono text-ui-xs text-indigo-300/80 break-all">{c}</div>
+                            ))}
+                          </div>
+                        )}
+                        {!ask.result.grounded && (
+                          <div className="mt-0.5 text-ui-xs text-indigo-400/70 italic" data-testid="compute-ask-ungrounded">No evidence found for this question</div>
+                        )}
+                      </div>
+                    )}
                   </div>
                 );
               })()}

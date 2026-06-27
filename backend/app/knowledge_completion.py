@@ -2577,6 +2577,138 @@ async def _stamp_compute_analysis_unavailable(
     return envelope
 
 
+_COMPUTE_QA_MAX_TOKENS = 800
+
+
+def _build_compute_qa_prompt(
+    task: Task,
+    *,
+    question: str,
+    outcome: str,
+    cost: float | None,
+    criterion: dict[str, Any] | None,
+    evidence: dict[str, Any],
+) -> str:
+    """Build a grounded Q&A prompt for a single question about a compute run."""
+    payload = task.first_payload or {}
+    identity = (
+        str(payload.get("experiment") or "").strip()
+        or str(payload.get("benchmark") or "").strip()
+        or "compute experiment"
+    )
+    metrics_lines = (
+        "\n".join(f"  - {k} = {v}" for k, v in evidence["metrics"].items())
+        or "  (no reported numeric metrics)"
+    )
+    criterion_line = json.dumps(criterion, sort_keys=True) if criterion else "(none)"
+    log_text = evidence.get("command_log_text") or evidence.get("log_excerpt") or ""
+    log_section = f"Command output (excerpt):\n{log_text}\n" if log_text else ""
+    allowed = "\n".join(f"  - {c}" for c in evidence["citations"])
+    return (
+        "You are answering a question about a completed compute experiment. "
+        "Answer ONLY based on the provided evidence; decline honestly if the "
+        "evidence does not cover the question.\n\n"
+        f"Experiment: {identity}\n"
+        f"Outcome: {outcome}\n"
+        f"Cost (USD): {cost}\n"
+        f"Success criterion: {criterion_line}\n"
+        f"Metrics:\n{metrics_lines}\n"
+        f"{log_section}"
+        f"Question: {question[:500]}\n\n"
+        "Choose citations ONLY from this allowed list (copy verbatim):\n"
+        f"{allowed}\n\n"
+        'Respond with ONLY valid JSON: {"answer": "...", "citations": ["..."]}\n'
+    )
+
+
+async def answer_compute_experiment_question(
+    task: Task,
+    *,
+    question: str,
+    outcome: str,
+    cost: float | None,
+    criterion: dict[str, Any] | None,
+    result_reference: str | None,
+    session: AsyncSession,
+    logs: str | None = None,
+) -> dict[str, Any]:
+    """Answer a free-form question grounded in a completed experiment's durable evidence.
+
+    Returns ``{"answer": ..., "citations": [...], "grounded": bool}``. Declines
+    honestly when evidence is insufficient or the LLM is unavailable. Never
+    persists any data — purely ephemeral Q&A.
+    """
+    if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1":
+        return {"answer": "Analysis is currently disabled.", "citations": [], "grounded": False}
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "answer": "Cannot answer: no LLM credentials are configured.",
+            "citations": [],
+            "grounded": False,
+        }
+    evidence = await _gather_compute_evidence(
+        task,
+        logs=logs,
+        result_reference=result_reference,
+        criterion=criterion,
+        session=session,
+    )
+    if evidence is None:
+        return {
+            "answer": (
+                "The available evidence for this run is not sufficient to answer "
+                "the question; no durable artifacts or metrics were found."
+            ),
+            "citations": [],
+            "grounded": False,
+        }
+    prompt = _build_compute_qa_prompt(
+        task,
+        question=question,
+        outcome=outcome,
+        cost=cost,
+        criterion=criterion,
+        evidence=evidence,
+    )
+    for attempt in range(2):
+        try:
+            import anthropic as _anthropic
+
+            client = _anthropic.AsyncAnthropic(api_key=api_key)
+            resp = await client.messages.create(
+                model=_COMPUTE_LLM_ANALYSIS_MODEL,
+                max_tokens=_COMPUTE_QA_MAX_TOKENS,
+                timeout=_COMPUTE_LLM_ANALYSIS_TIMEOUT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = resp.content[0].text.strip()
+            data = _parse_compute_analysis_json(raw)
+            if not isinstance(data, dict) or "answer" not in data:
+                raise ValueError("QA response missing 'answer'")
+            allowed_set = set(evidence["citations"])
+            raw_cits = data.get("citations") or []
+            grounded_cits = [
+                c.strip()
+                for c in raw_cits
+                if isinstance(c, str) and c.strip() in allowed_set
+            ][:_COMPUTE_MAX_CITATIONS]
+            return {
+                "answer": str(data["answer"])[:4000],
+                "citations": grounded_cits,
+                "grounded": True,
+            }
+        except (json.JSONDecodeError, KeyError, ValueError, IndexError) as exc:
+            if attempt == 0:
+                logger.info("[COMPUTE] QA parse error %s, retrying", exc)
+                continue
+            break
+        except Exception as exc:  # noqa: BLE001
+            logger.info("[COMPUTE] QA LLM call failed (%s)", exc)
+            break
+    return {"answer": "Unable to generate an answer at this time.", "citations": [], "grounded": False}
+
+
 async def _handle_web_research_completion(
     task: Task, logs: str, session: AsyncSession
 ) -> None:

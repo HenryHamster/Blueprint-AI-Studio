@@ -293,6 +293,33 @@ export async function rerunComputeExperiment(
   return res.json();
 }
 
+/** Response from POST /compute-jobs/{job_id}/ask — grounded answer to a free-form question. */
+export interface ComputeJobAskResponse {
+  answer: string;
+  citations: string[];
+  grounded: boolean;
+}
+
+/**
+ * Ask a free-form question about a terminal compute job, grounded in that run's
+ * durable evidence (metrics, artifacts, logs). POST /api/admin/compute-jobs/{id}/ask.
+ */
+export async function askComputeJob(
+  jobId: string,
+  question: string,
+): Promise<ComputeJobAskResponse> {
+  const res = await apiFetch(`/api/admin/compute-jobs/${encodeURIComponent(jobId)}/ask`, {
+    method: 'POST',
+    body: JSON.stringify({ question }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Error ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Error ${res.status}`);
+  }
+  return res.json();
+}
+
 /**
  * Request body for the compute-experiment preflight projection endpoint.
  * Mirrors `ComputeExperimentPreflightPayload` in backend/app/admin.py.
