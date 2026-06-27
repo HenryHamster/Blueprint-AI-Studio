@@ -442,6 +442,32 @@ function countOrLocal(value: unknown, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function metricDirection(operator: unknown): 'higher' | 'lower' | null {
+  const op = strVal(operator);
+  if (op === '>' || op === '>=') return 'higher';
+  if (op === '<' || op === '<=') return 'lower';
+  return null;
+}
+
+function fmtMetricNumber(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(6).replace(/\.?0+$/, '');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function pickOwnVerdict(arm: Record<string, unknown>): Record<string, unknown> | null {
+  const verdicts = arm.per_arm_verdicts;
+  if (!isRecord(verdicts)) return null;
+  const armKey = strVal(arm.arm_label) || strVal(arm.id) || null;
+  if (armKey !== null && isRecord(verdicts[armKey])) return verdicts[armKey];
+  const verdictValues = Object.values(verdicts);
+  return verdictValues.length === 1 && isRecord(verdictValues[0])
+    ? verdictValues[0]
+    : null;
+}
+
 /**
  * Render a mandatory synthesis block for fully-verdicted multi-arm compute-experiment
  * sweeps (all arms MET or NOT MET — no UNMEASURED or unavailable entries). A completed
@@ -490,12 +516,49 @@ export function buildSweepComparisonSection(
   for (const { sweepId, arms } of completed) {
     const winningArms = arms.filter(a => a.criterion_met === true);
     const losingArms = arms.filter(a => a.criterion_met === false);
+    const criterion = arms.find(a => isRecord(a.criterion))?.criterion;
+    const direction = isRecord(criterion) ? metricDirection(criterion.operator) : null;
+    const metric = isRecord(criterion) ? strVal(criterion.metric) : '';
+    const measuredArms = direction && metric ? arms.flatMap((arm) => {
+      const verdict = pickOwnVerdict(arm);
+      const rawValue = verdict?.value;
+      const value = typeof rawValue === 'number' ? rawValue : Number(rawValue);
+      const id = strVal(arm.id);
+      const label = strVal(arm.arm_label) || strVal(arm.id);
+      return Number.isFinite(value) && label ? [{ id, label, value }] : [];
+    }) : [];
+    let metricWinner: { id: string; label: string; value: number } | null = null;
+    if (winningArms.length > 0 && measuredArms.length > 0) {
+      for (const arm of measuredArms) {
+        if (!metricWinner) {
+          metricWinner = arm;
+          continue;
+        }
+        const better = direction === 'higher' ? arm.value > metricWinner.value : arm.value < metricWinner.value;
+        if (better) metricWinner = arm;
+      }
+    }
     const winnerLabel = winningArms.length > 0
-      ? winningArms.map(a => strVal(a.arm_label) || strVal(a.id)).join(', ')
+      ? (metricWinner
+        ? metricWinner.label
+        : winningArms.map(a => strVal(a.arm_label) || strVal(a.id)).join(', '))
       : 'none (all NOT MET)';
+    const runnerUp = metricWinner && measuredArms.length > 1
+      ? measuredArms.filter(arm => arm.id !== metricWinner.id).reduce<{ id: string; label: string; value: number } | null>((best, arm) => {
+        if (best === null) return arm;
+        const better = direction === 'higher' ? arm.value > best.value : arm.value < best.value;
+        return better ? arm : best;
+      }, null)
+      : null;
 
     lines.push(`\n### Sweep ${sweepId}`);
-    lines.push(`Winner: **${winnerLabel}**`);
+    lines.push(`Winner: **${winnerLabel}**${metricWinner ? ` (${metric}=${fmtMetricNumber(metricWinner.value)})` : ''}`);
+    if (metricWinner && runnerUp) {
+      const margin = direction === 'higher'
+        ? metricWinner.value - runnerUp.value
+        : runnerUp.value - metricWinner.value;
+      lines.push(`margin: +${fmtMetricNumber(margin)} ${metric} over ${runnerUp.label}`);
+    }
 
     for (const arm of arms) {
       const armId = strVal(arm.id);
