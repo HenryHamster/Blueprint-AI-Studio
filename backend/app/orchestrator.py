@@ -486,7 +486,17 @@ _RUNNER_LIVENESS_SECONDS = 300
 _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS = 6 * 3600
 
 
-def _runner_handles_task_type(runner: LocalRunner, task_type: str) -> bool:
+class RunnerDispatchSnapshot(NamedTuple):
+    """Session-independent view of a live local runner used during dispatch."""
+
+    id: uuid.UUID
+    project_id: uuid.UUID
+    capabilities: dict
+
+
+def _runner_handles_task_type(
+    runner: LocalRunner | RunnerDispatchSnapshot, task_type: str
+) -> bool:
     """Whether a runner's declared capabilities cover this task type."""
     task_types = (runner.capabilities or {}).get("task_types", "all")
     if task_types == "all":
@@ -497,7 +507,7 @@ def _runner_handles_task_type(runner: LocalRunner, task_type: str) -> bool:
     return False
 
 
-def _runner_active_task_count(runner: LocalRunner) -> int:
+def _runner_active_task_count(runner: LocalRunner | RunnerDispatchSnapshot) -> int:
     """Best-effort current load, from the heartbeat-reported active task ids."""
     active = (runner.capabilities or {}).get("active_task_ids") or []
     try:
@@ -506,7 +516,9 @@ def _runner_active_task_count(runner: LocalRunner) -> int:
         return 0
 
 
-def _runner_at_capacity(runner: LocalRunner, pins_this_cycle: int = 0) -> bool:
+def _runner_at_capacity(
+    runner: LocalRunner | RunnerDispatchSnapshot, pins_this_cycle: int = 0
+) -> bool:
     """True when the runner's EFFECTIVE load has reached its declared max_concurrent.
 
     Effective load = heartbeat-reported active count (tasks the runner has already
@@ -528,38 +540,53 @@ def _runner_at_capacity(runner: LocalRunner, pins_this_cycle: int = 0) -> bool:
 
 async def _load_active_runners_cache(
     session: AsyncSession,
-) -> dict[uuid.UUID, list[LocalRunner]]:
+) -> dict[uuid.UUID, list[RunnerDispatchSnapshot]]:
     """Load live registered runners once per orchestrator cycle, by project.
 
     A runner is live when status='active' AND it heartbeated within the
-    liveness window. Returns ``{project_id: [LocalRunner]}``; an empty dict when
-    no runner is registered (the common case — all existing dispatch paths then
-    run unchanged).
+    liveness window. Returns ``{project_id: [RunnerDispatchSnapshot]}``; an
+    empty dict when no runner is registered (the common case — all existing
+    dispatch paths then run unchanged).
+
+    The cache is deliberately scalar/value-based, not ORM-instance-based. The
+    dispatch cycle performs commits and rollbacks before later candidates reach
+    runner selection; those transaction boundaries can expire attached ORM
+    instances, and reading ``LocalRunner.capabilities`` later would lazy-load
+    under ``AsyncSession`` and raise MissingGreenlet.
     """
     cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
     try:
         rows = (
             await session.execute(
-                select(LocalRunner).where(
+                select(
+                    LocalRunner.id,
+                    LocalRunner.project_id,
+                    LocalRunner.capabilities,
+                ).where(
                     LocalRunner.status == "active",
                     LocalRunner.last_seen_at.is_not(None),
                     LocalRunner.last_seen_at > cutoff,
                 )
             )
-        ).scalars().all()
+        ).all()
     except Exception:
         logger.exception("[RUNNERS] Failed to load active-runner cache")
         return {}
-    by_project: dict[uuid.UUID, list[LocalRunner]] = {}
-    for runner in rows:
-        by_project.setdefault(runner.project_id, []).append(runner)
+    by_project: dict[uuid.UUID, list[RunnerDispatchSnapshot]] = {}
+    for runner_id, project_id, capabilities in rows:
+        snapshot = RunnerDispatchSnapshot(
+            id=runner_id,
+            project_id=project_id,
+            capabilities=dict(capabilities or {}),
+        )
+        by_project.setdefault(project_id, []).append(snapshot)
     return by_project
 
 
 async def _try_runner_dispatch(
     session: AsyncSession,
     task: Task,
-    active_runners_cache: dict[uuid.UUID, list[LocalRunner]],
+    active_runners_cache: dict[uuid.UUID, list[LocalRunner | RunnerDispatchSnapshot]],
     runner_pins_this_cycle: dict[uuid.UUID, int] | None = None,
 ) -> bool:
     """Pin a QUEUED task to an eligible registered runner, if one exists.
@@ -664,12 +691,12 @@ def _num_or_none(value) -> float | None:
 
 
 def _select_eligible_runner(
-    active_runners_cache: dict[uuid.UUID, list[LocalRunner]],
+    active_runners_cache: dict[uuid.UUID, list[LocalRunner | RunnerDispatchSnapshot]],
     project_id: uuid.UUID,
     task_type: str,
     accelerator: str | None,
     runner_pins_this_cycle: dict[uuid.UUID, int],
-) -> "LocalRunner | None":
+) -> "LocalRunner | RunnerDispatchSnapshot | None":
     """Pick the least-loaded eligible runner for a task/job, or None.
 
     Eligibility: the runner handles ``task_type`` (its advertised allowlist) and is
@@ -828,7 +855,7 @@ async def _fail_compute_experiment_task(
 async def _dispatch_compute_experiment_directly(
     session: AsyncSession,
     task: Task,
-    active_runners_cache: dict[uuid.UUID, list[LocalRunner]],
+    active_runners_cache: dict[uuid.UUID, list[LocalRunner | RunnerDispatchSnapshot]],
     runner_pins_this_cycle: dict[uuid.UUID, int],
 ) -> str:
     """Launch a ``compute_experiment``'s ComputeJob and PARK the task — no agent half.

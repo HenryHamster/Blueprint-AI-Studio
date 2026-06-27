@@ -616,6 +616,51 @@ class TestOrchestratorRunnerRouting:
         assert ids == {live.id}
 
     @pytest.mark.asyncio
+    async def test_loaded_runner_cache_survives_session_expiry(self, db_session):
+        """Runner dispatch cache must not lazy-load LocalRunner after rollback/expiry.
+
+        Production crash family: a cached LocalRunner ORM instance survived a
+        dispatch-cycle transaction boundary, then runner selection read expired
+        ``runner.capabilities`` and raised MissingGreenlet. The cache must carry
+        value snapshots instead.
+        """
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 2,
+            },
+        )
+        project_id = project.id
+        runner_id = runner.id
+
+        cache = await orch._load_active_runners_cache(db_session)
+        assert {r.id for r in cache.get(project_id, [])} == {runner_id}
+
+        # Rollback does this in the live dispatch loop; expire_all reproduces the
+        # same hazard without forcing an unrelated DB error in the test.
+        db_session.expire_all()
+
+        task = Task(
+            project_id=project_id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        pinned = await orch._try_runner_dispatch(db_session, task, cache)
+
+        assert pinned is True
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.PROVISIONING
+        assert task.vm_instance_id == f"runner:{runner_id}"
+
+    @pytest.mark.asyncio
     async def test_try_runner_dispatch_pins_task(self, db_session):
         project = await _make_project(db_session)
         runner, _ = await _make_runner(db_session, project.id)
