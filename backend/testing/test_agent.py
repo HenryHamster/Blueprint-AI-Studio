@@ -37,6 +37,7 @@ from app.models import (
 )
 from app.auth import create_agent_token
 from app.schemas import AgentStatusPayload
+from app.routers.agent_status import _is_task_llm_auth_hard_disable
 from app.task_capabilities import TaskType, task_type_catalog
 
 
@@ -9829,14 +9830,96 @@ async def test_blocker_title_like_task_need_dropped_but_still_blocks(
     assert not blocker.get("needs")
 
 
+def test_llm_auth_hard_disable_rejects_github_fetch_auth_for_claude_account():
+    task = Task(
+        context={
+            "llm_provider": "anthropic",
+            "llm_auth_mode": "oauth",
+            "llm_account_id": "claude-account",
+        }
+    )
+    logs = (
+        "Release merge grade aborted: git fetch origin abc failed "
+        "(Command failed: git fetch origin abc\n"
+        "remote: Invalid username or token. Password authentication is not "
+        "supported for Git operations.\n"
+        "fatal: Authentication failed for "
+        "'https://github.com/HenryHamster/BlueprintAIStudio.git/'\n)"
+    )
+
+    assert not _is_task_llm_auth_hard_disable(task, logs)
+
+
+def test_llm_auth_hard_disable_rejects_mismatched_error_report_provider():
+    task = Task(
+        context={
+            "llm_provider": "anthropic",
+            "llm_auth_mode": "oauth",
+            "llm_account_id": "claude-account",
+            "agent_error_report": {
+                "provider": "openai",
+                "auth_mode": "oauth",
+                "classified": "auth_failure",
+                "model_output_seen": False,
+                "result_event_seen": False,
+                "stderr_tail": (
+                    "HTTP 401 Unauthorized: token_invalidated. "
+                    "Your session has ended. Please log in again."
+                ),
+            },
+        }
+    )
+
+    assert not _is_task_llm_auth_hard_disable(task, "OpenAI Codex authentication failed")
+
+
+def test_llm_auth_hard_disable_accepts_matching_error_report_provider():
+    task = Task(
+        context={
+            "llm_provider": "openai",
+            "llm_auth_mode": "oauth",
+            "llm_account_id": "codex-account",
+            "agent_error_report": {
+                "provider": "openai",
+                "auth_mode": "oauth",
+                "classified": "auth_failure",
+                "model_output_seen": False,
+                "result_event_seen": False,
+                "stderr_tail": (
+                    "HTTP 401 Unauthorized: token_invalidated. "
+                    "Your session has ended. Please log in again."
+                ),
+            },
+        }
+    )
+
+    assert _is_task_llm_auth_hard_disable(task, "OpenAI Codex authentication failed")
+
+
+def test_llm_auth_hard_disable_accepts_anthropic_oauth_org_not_allowed():
+    task = Task(
+        context={
+            "llm_provider": "anthropic",
+            "llm_auth_mode": "oauth",
+            "llm_account_id": "claude-account",
+        }
+    )
+
+    assert _is_task_llm_auth_hard_disable(
+        task,
+        "HTTP 403 oauth_org_not_allowed: organization has disabled Claude Code OAuth",
+    )
+
+
 @pytest.mark.asyncio
 async def test_external_api_permanent_auth_failure_does_not_requeue(
     client: AsyncClient, db_session, mocker
 ):
     """
-    EXTERNAL_API failures with permanent auth indicators (token expired, 401, bad credentials)
-    must fail immediately without consuming any retry budget. Requeuing only wastes 30+ minutes
-    of exponential backoff before the task permanently fails with the same error.
+    EXTERNAL_API failures with provider-scoped permanent auth indicators must
+    fail immediately without consuming retry budget. Generic auth text from
+    non-LLM systems, such as GitHub, must not take this path because it would
+    hard-disable the attached LLM account.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
     mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
@@ -9858,20 +9941,30 @@ async def test_external_api_permanent_auth_failure_does_not_requeue(
     await db_session.refresh(project)
 
     permanent_auth_cases = [
-        "GitHub API returned 401 unauthorized",
-        "token expired: please re-authenticate",
-        "token revoked by organization admin",
-        "bad credentials — check your PAT",
-        "401 Unauthorized: access denied",
+        ("anthropic", "HTTP 401 Unauthorized from api.anthropic.com: token expired"),
+        ("anthropic", "authentication_failed: invalid x-api-key"),
+        (
+            "anthropic",
+            "HTTP 403 oauth_org_not_allowed: organization disabled Claude Code OAuth",
+        ),
+        (
+            "openai",
+            "HTTP 401 Unauthorized from chatgpt.com/backend-api/codex: "
+            "token_invalidated",
+        ),
     ]
 
-    for i, logs_msg in enumerate(permanent_auth_cases):
+    for i, (provider, logs_msg) in enumerate(permanent_auth_cases):
         task = Task(
             project_id=project.id,
             payloads=[{"type": "create", "prompt": "do work"}],
             vm_instance_id=f"agent-vm-auth-{i}",
             status=TaskStatus.IN_PROGRESS,
-            context={"_api_failure_retries": 0},
+            context={
+                "_api_failure_retries": 0,
+                "llm_provider": provider,
+                "llm_auth_mode": "oauth",
+            },
         )
         db_session.add(task)
         await db_session.commit()
@@ -9907,6 +10000,69 @@ async def test_external_api_permanent_auth_failure_does_not_requeue(
         ), (
             f"case {i}: status message should mention auth/re-authenticate, got: {task.latest_status_message!r}"
         )
+
+
+@pytest.mark.asyncio
+async def test_external_api_github_auth_failure_does_not_disable_llm_account(
+    client: AsyncClient, db_session, mocker
+):
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=mocker.AsyncMock)
+    mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
+    disable_auth = mocker.patch(
+        "app.routers.agent_status.disable_account_for_auth",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch(
+        "app.routers.agent_status._process_post_commit",
+        new_callable=mocker.AsyncMock,
+        return_value={"status": "accepted"},
+    )
+
+    project = Project(name="GitHub Auth Is Not LLM Auth", user_id="test-user-gh-auth")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "release_merge_grade", "prompt": "grade"}],
+        vm_instance_id="agent-vm-gh-auth",
+        status=TaskStatus.IN_PROGRESS,
+        context={
+            "_api_failure_retries": 0,
+            "llm_provider": "anthropic",
+            "llm_auth_mode": "oauth",
+            "llm_account_id": "claude-account",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-gh-auth")
+    headers = {"x-agent-token": token}
+    payload = {
+        "task_id": str(task.id),
+        "status": "FAILED",
+        "failure_category": "EXTERNAL_API",
+        "logs": (
+            "Release merge grade aborted: git fetch origin abc failed "
+            "(Command failed: git fetch origin abc\n"
+            "remote: Invalid username or token. Password authentication is not "
+            "supported for Git operations.\n"
+            "fatal: Authentication failed for "
+            "'https://github.com/HenryHamster/BlueprintAIStudio.git/'\n)"
+        ),
+    }
+    resp = await client.post("/api/agent/status", json=payload, headers=headers)
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.QUEUED
+    assert (task.context or {}).get("_api_failure_retries") == 1
+    disable_auth.assert_not_awaited()
 
 
 @pytest.mark.asyncio
