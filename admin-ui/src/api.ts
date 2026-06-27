@@ -10,6 +10,7 @@ import type {
   ResourceEnvelopeConfig,
 } from './types/project';
 import type { WarmStartOriginBreakdown } from './hooks/useEfficiencySnapshot';
+import type { Alert, AlertFilters, ProjectAlertDomainsResponse } from './types/alert';
 
 /** Base URL for API requests to the Blueprint backend. Defaults to empty string for same-origin requests. */
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -178,6 +179,55 @@ export async function fetchTaskTypeCatalog(
   if (!res.ok) throw new Error(`Failed to fetch task-type catalog: ${res.status}`);
   const data = await res.json();
   return Array.isArray(data?.task_types) ? data.task_types : [];
+}
+
+export async function fetchAlerts(
+  filters: AlertFilters = {},
+  signal?: AbortSignal,
+): Promise<Alert[]> {
+  const params = new URLSearchParams();
+  if (filters.projectId) params.set('project_id', filters.projectId);
+  if (filters.domain) params.set('domain', filters.domain);
+  if (filters.eventType) params.set('event_type', filters.eventType);
+  if (filters.source) params.set('source', filters.source);
+  const query = params.toString();
+  const res = await apiFetch(`/api/admin/alerts${query ? `?${query}` : ''}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch alerts: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchProjectAlertDomains(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ProjectAlertDomainsResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/alert-domains`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch alert domains: ${res.status}`);
+  return res.json();
+}
+
+export async function updateProjectAlertDomains(
+  projectId: string,
+  domains: Record<string, { enabled: boolean } | null>,
+): Promise<ProjectAlertDomainsResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/alert-domains`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ domains }),
+    },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update alert domains: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update alert domains: ${res.status}`);
+  }
+  return res.json();
 }
 
 /** The closed set of comparison operators a compute success criterion may use.

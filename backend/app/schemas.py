@@ -1096,6 +1096,12 @@ class BuildConfig(BaseModel):
     # Validated by ResourceEnvelope; carried across re-detect by
     # ``apply_operator_build_config_overrides``.
     resource_envelope: "ResourceEnvelope | None" = None
+    # Reusable alert-domain enablement.  Core alerts are always enabled; optional
+    # domains such as release_lifecycle, sr_quality, warm_pool, research_directions,
+    # rollup_lts, migrations, and self_improvement are operator-owned and must
+    # survive detection/save/PATCH round-trips.  Shape:
+    # {"warm_pool": {"enabled": true}, "sr_quality": {"enabled": false}}.
+    alert_domains: Dict[str, Any] | None = None
     # Per-project 24h rolling-window spend ceiling. When set, autonomous spawning
     # is paused (and a deduped operator alert emitted) once the project's window
     # spend meets or exceeds this value. None = disabled (today's behavior).

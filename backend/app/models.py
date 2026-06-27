@@ -2451,6 +2451,21 @@ class Alert(SQLModel, table=True):
     )
     title: str
     message: str
+    domain: str = Field(
+        default="core",
+        sa_column=Column(String, nullable=False, server_default="core"),
+    )
+    event_type: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    source: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    dedupe_key: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    occurrence_count: int = Field(
+        default=1,
+        sa_column=Column(Integer, nullable=False, server_default="1"),
+    )
+    last_seen_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     # Audit 2026-04-29 (M-S3): FK to task.id with ondelete=SET NULL added in
     # migration 0056. Alert messages survive parent-task GC for the admin UI.
     task_id: uuid.UUID | None = Field(
@@ -2473,6 +2488,16 @@ class Alert(SQLModel, table=True):
         Index("ix_alert_project_id_dismissed", "project_id", "dismissed_at"),
         Index("ix_alert_severity", "severity"),
         Index("ix_alert_project_severity", "project_id", "severity"),
+        Index("ix_alert_project_domain", "project_id", "domain"),
+        Index("ix_alert_project_event_type", "project_id", "event_type"),
+        Index(
+            "ux_alert_active_dedupe_key",
+            "project_id",
+            "dedupe_key",
+            unique=True,
+            postgresql_where=text("dedupe_key IS NOT NULL AND dismissed_at IS NULL"),
+            sqlite_where=text("dedupe_key IS NOT NULL AND dismissed_at IS NULL"),
+        ),
     )
 
 

@@ -1,6 +1,7 @@
 import { useState, useCallback } from 'react';
 import { AlertTriangle, X, ExternalLink, ChevronDown, ChevronUp, Search, Loader2, Zap } from 'lucide-react';
 import { apiFetch } from '../api';
+import { timeAgo } from '../utils/time';
 
 export type { Alert } from '../types/alert';
 import type { Alert } from '../types/alert';
@@ -59,6 +60,40 @@ function findingSeverityStyle(sev: string | null | undefined): string {
   if (sev === 'HIGH') return 'text-orange-400';
   if (sev === 'MEDIUM') return 'text-amber-400';
   return 'text-neutral-400';
+}
+
+function formatAlertMetaLabel(value: string): string {
+  return value.replace(/[._]/g, ' ');
+}
+
+function AlertMetadata({ alert }: { alert: Alert }) {
+  const chips: Array<{ key: string; label: string; title?: string }> = [];
+  if (alert.domain) chips.push({ key: 'domain', label: `Domain ${formatAlertMetaLabel(alert.domain)}` });
+  if (alert.event_type) chips.push({ key: 'event_type', label: `Event ${formatAlertMetaLabel(alert.event_type)}` });
+  if (alert.source) chips.push({ key: 'source', label: `Source ${formatAlertMetaLabel(alert.source)}` });
+  if (alert.occurrence_count && alert.occurrence_count > 1) {
+    chips.push({
+      key: 'occurrence_count',
+      label: `${alert.occurrence_count} occurrences`,
+      title: alert.last_seen_at ? `Last seen ${timeAgo(alert.last_seen_at)}` : undefined,
+    });
+  } else if (alert.last_seen_at) {
+    chips.push({ key: 'last_seen_at', label: `Last seen ${timeAgo(alert.last_seen_at)}` });
+  }
+  if (chips.length === 0) return null;
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-1.5">
+      {chips.map(chip => (
+        <span
+          key={chip.key}
+          title={chip.title}
+          className="max-w-full truncate rounded border border-neutral-700/60 bg-neutral-950/30 px-1.5 py-0.5 text-ui-sm text-neutral-400"
+        >
+          {chip.label}
+        </span>
+      ))}
+    </div>
+  );
 }
 
 interface AlertsBannerProps {
@@ -151,6 +186,7 @@ export function AlertsBanner({ alerts, onDismiss, onDismissAll, onViewTask, proj
                 <span className="font-medium">{alert.title}</span>
                 <span className="text-neutral-500 mx-2">&middot;</span>
                 <span className="opacity-80">{alert.message}</span>
+                <AlertMetadata alert={alert} />
               </div>
               {srInfo && srInfo.categories.length > 0 && projectId && (
                 <button

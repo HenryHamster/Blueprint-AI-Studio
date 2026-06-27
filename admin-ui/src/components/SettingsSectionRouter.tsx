@@ -12,6 +12,7 @@ import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
 import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
 import { ProjectAutoReviewSection } from './ProjectAutoReviewSection';
 import { ProjectBranchesSection } from './ProjectBranchesSection';
+import { ProjectAlertDomainsSection } from './ProjectAlertDomainsSection';
 import { SettingsAccountsSection } from './SettingsAccountsSection';
 import { DeploySection } from './SettingsDeploySection';
 import type {
@@ -460,6 +461,13 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
           onDetect={props.onDetectBuildConfig}
           detectAvailable={Boolean(props.selectedProjectOwner && props.selectedProjectRepo)}
           projectId={props.selectedProjectId}
+        />
+      );
+    case 'alert-domains':
+      return (
+        <ProjectAlertDomainsSection
+          projectId={props.selectedProjectId}
+          canSave={props.selectedProjectRole === 'owner'}
         />
       );
     case 'auto-review':

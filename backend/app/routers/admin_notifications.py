@@ -276,6 +276,9 @@ _SEED_ENTRIES: Dict[str, dict] = {
 @router.get("/alerts")
 async def get_alerts(
     project_id: Optional[str] = None,
+    domain: Optional[str] = None,
+    event_type: Optional[str] = None,
+    source: Optional[str] = None,
     include_dismissed: bool = False,
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
@@ -289,6 +292,12 @@ async def get_alerts(
     )
     if project_id:
         query = query.where(Alert.project_id == uuid.UUID(project_id))
+    if domain:
+        query = query.where(Alert.domain == domain)
+    if event_type:
+        query = query.where(Alert.event_type == event_type)
+    if source:
+        query = query.where(Alert.source == source)
     if not include_dismissed:
         query = query.where(Alert.dismissed_at.is_(None))
     query = query.limit(limit).offset(offset)
@@ -301,6 +310,12 @@ async def get_alerts(
             "severity": a.severity,
             "title": a.title,
             "message": a.message,
+            "domain": a.domain,
+            "event_type": a.event_type,
+            "source": a.source,
+            "dedupe_key": a.dedupe_key,
+            "occurrence_count": a.occurrence_count,
+            "last_seen_at": a.last_seen_at.isoformat() if a.last_seen_at else None,
             "task_id": str(a.task_id) if a.task_id else None,
             "created_at": a.created_at.isoformat(),
             "dismissed_at": a.dismissed_at.isoformat() if a.dismissed_at else None,
@@ -338,6 +353,9 @@ async def dismiss_alert(
 @router.post("/alerts/dismiss-all")
 async def dismiss_all_alerts(
     project_id: Optional[str] = None,
+    domain: Optional[str] = None,
+    event_type: Optional[str] = None,
+    source: Optional[str] = None,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -346,7 +364,13 @@ async def dismiss_all_alerts(
         Alert.project_id.in_(_user_project_ids(current_user["user_id"])),
     )
     if project_id:
-        stmt = stmt.where(Alert.project_id == project_id)
+        stmt = stmt.where(Alert.project_id == uuid.UUID(project_id))
+    if domain:
+        stmt = stmt.where(Alert.domain == domain)
+    if event_type:
+        stmt = stmt.where(Alert.event_type == event_type)
+    if source:
+        stmt = stmt.where(Alert.source == source)
     stmt = stmt.values(dismissed_at=_utcnow())
     result = await session.execute(stmt)
     await session.commit()

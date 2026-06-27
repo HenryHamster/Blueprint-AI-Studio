@@ -53,7 +53,7 @@ def apply_operator_build_config_overrides(
     - ``git_user_email`` / ``git_user_name`` — preserved only when truthy.
     - ``env_vars``, reviewer/parallelism toggles, branch namespace/prefixes,
       ``pr_title_prefix``, staging/stale branch prefix lists,
-      ``protected_branches``, ``enable_self_improvement``,
+      ``protected_branches``, ``enable_self_improvement``, ``alert_domains``,
       ``requires_ci_checks`` and the per-project parallelism caps
       (``max_parallel_research``, ``max_total_research``,
       ``max_autonomous_tasks_per_hour``) — preserved whenever the key is
@@ -91,6 +91,8 @@ def apply_operator_build_config_overrides(
         detected["protected_branches"] = existing["protected_branches"]
     if "enable_self_improvement" in existing:
         detected["enable_self_improvement"] = existing["enable_self_improvement"]
+    if "alert_domains" in existing:
+        detected["alert_domains"] = existing["alert_domains"]
     # The no-CI merge policy is operator-owned and never emitted by repo
     # detection; carry an explicit choice (including False) forward so manual
     # re-detect and empty-config auto-refresh do not silently re-gate the repo.

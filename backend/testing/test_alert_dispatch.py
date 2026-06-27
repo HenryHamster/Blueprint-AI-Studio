@@ -25,6 +25,16 @@ from app.models import Alert, AlertSeverity
 from testing.factories import make_project, make_task
 
 
+def make_warm_pool_project(**kwargs):
+    build_config = {
+        "alert_domains": {
+            "warm_pool": {"enabled": True},
+        }
+    }
+    build_config.update(kwargs.pop("build_config", {}) or {})
+    return make_project(build_config=build_config, **kwargs)
+
+
 _SUPPORTING = {
     "pool_origin_share": 0.5,
     "pool_warm_starts": 8,
@@ -49,7 +59,7 @@ async def test_pool_payoff_alert_creates_and_broadcasts(db_session, mocker):
     bcast = mocker.patch(
         "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
     )
-    project = make_project()
+    project = make_warm_pool_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -74,7 +84,7 @@ async def test_pool_payoff_alert_creates_and_broadcasts(db_session, mocker):
 @pytest.mark.asyncio
 async def test_pool_payoff_alert_embeds_supporting_numbers(db_session, mocker):
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
-    project = make_project()
+    project = make_warm_pool_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -98,7 +108,7 @@ async def test_pool_payoff_alert_embeds_supporting_numbers(db_session, mocker):
 @pytest.mark.asyncio
 async def test_pool_payoff_alert_dedups_same_verdict(db_session, mocker):
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
-    project = make_project()
+    project = make_warm_pool_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -118,7 +128,7 @@ async def test_pool_payoff_alert_dedups_same_verdict(db_session, mocker):
 @pytest.mark.asyncio
 async def test_pool_payoff_alert_distinct_verdict_creates_separate(db_session, mocker):
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
-    project = make_project()
+    project = make_warm_pool_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -137,7 +147,7 @@ async def test_pool_payoff_alert_distinct_verdict_creates_separate(db_session, m
         verdict_state="PROVEN",
         supporting=_SUPPORTING,
         recommended_action="Keep the pool — consider widening scope.",
-        severity=AlertSeverity.INFO,
+        severity=AlertSeverity.WARNING,
     )
     alerts = await _payoff_alerts(db_session, project.id)
     assert len(alerts) == 2

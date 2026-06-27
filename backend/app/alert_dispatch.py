@@ -33,6 +33,7 @@ from app.models import (
     Alert,
     AlertSeverity,
 )
+from app.alert_policy import create_project_alert_if_allowed
 from app.notification import _send_webhook_notification
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
@@ -999,7 +1000,7 @@ async def _maybe_create_pool_payoff_alert(
     supporting: "dict",
     recommended_action: str,
     severity: AlertSeverity = AlertSeverity.WARNING,
-) -> None:
+) -> tuple[Alert | None, bool]:
     """Create a deduplicated operator Alert when a scoped project's warm-pool
     payoff verdict crosses a decision boundary.
 
@@ -1015,23 +1016,13 @@ async def _maybe_create_pool_payoff_alert(
     warm-start share, idle-inclusive cost drift vs. baseline) plus the
     recommended action so the operator can act from the alert alone.
 
-    Deduplicated by ``(project_id, title, dismissed_at IS NULL)`` where the title
-    encodes the verdict state — so a verdict that persists across many ticks
+    Deduplicated by active ``warm_pool.payoff`` key where the key encodes the
+    verdict state — so a verdict that persists across many ticks
     raises exactly ONE alert, and a genuinely different verdict gets its own.
     The supporting numbers live in the message so a drifting metric never
     defeats dedup.
     """
     title = f"{_POOL_PAYOFF_ALERT_TITLE_PREFIX}: {verdict_state} on project {str(project_id)[:8]}"
-    existing = await session.execute(
-        select(Alert).where(
-            Alert.project_id == project_id,
-            Alert.task_id.is_(None),
-            Alert.dismissed_at.is_(None),
-            Alert.title == title,
-        )
-    )
-    if existing.scalars().first() is not None:
-        return
     message = (
         f"Warm-pool payoff verdict for project {project_id} is now "
         f"{verdict_state}. Pool hit rate: "
@@ -1045,13 +1036,22 @@ async def _maybe_create_pool_payoff_alert(
         f"baseline {_fmt_metric(supporting.get('cost_baseline'))}). "
         f"{recommended_action}"
     )[:1000]
-    alert = Alert(
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
         project_id=project_id,
+        event_type="warm_pool.payoff",
         severity=severity,
         title=title,
         message=message,
+        source="alert_dispatch",
+        dedupe_key=f"warm_pool.payoff:{project_id}:{verdict_state}",
+        broadcast=False,
     )
-    session.add(alert)
+    if alert is None:
+        return None, False
+    if not created:
+        await session.commit()
+        return alert, False
     await session.commit()
     await broadcast_to_project(
         str(project_id),
@@ -1062,6 +1062,7 @@ async def _maybe_create_pool_payoff_alert(
             "title": alert.title,
         },
     )
+    return alert, True
 
 
 # Stable per-project title for the unpriced-LLM-models coverage alert. The

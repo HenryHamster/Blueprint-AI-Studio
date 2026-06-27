@@ -186,7 +186,7 @@ interface SettingsDropdownProps {
 
 
 
-export type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'auto-remediation' | 'issue-implementation' | 'auto-review' | 'resource-envelope' | 'branches' | 'access';
+export type SectionId = 'general' | 'provider-routing' | 'provider-settings' | 'orchestrator' | 'deploy' | 'accounts' | 'notifications' | 'advanced' | 'build-config' | 'alert-domains' | 'auto-remediation' | 'issue-implementation' | 'auto-review' | 'resource-envelope' | 'branches' | 'access';
 
 type SectionEntry = { id: SectionId; label: string; icon: typeof Settings; adminOnly?: boolean; projectOnly?: boolean };
 
@@ -202,6 +202,7 @@ const SECTION_GROUPS: { group: string; sections: SectionEntry[] }[] = [
     group: 'Project',
     sections: [
       { id: 'build-config', label: 'Build Config', icon: Wrench, projectOnly: true },
+      { id: 'alert-domains', label: 'Alert Domains', icon: Bell, projectOnly: true },
       { id: 'auto-review', label: 'Auto-Review', icon: HelpCircle, projectOnly: true },
       { id: 'resource-envelope', label: 'Resource Envelope', icon: Server, projectOnly: true },
       { id: 'auto-remediation', label: 'Auto-Remediation', icon: Settings, projectOnly: true },

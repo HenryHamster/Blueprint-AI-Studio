@@ -9,6 +9,9 @@ import {
   resolveViewportFailureDownloadUrl,
   fetchImprovementLanes,
   fetchImprovementLaneDetail,
+  fetchAlerts,
+  fetchProjectAlertDomains,
+  updateProjectAlertDomains,
 } from './api';
 
 vi.mock('./firebase', () => ({
@@ -36,6 +39,65 @@ describe('previewOnboardProject', () => {
       github_repo: 'repo',
       preview_only: true,
       build_config_override: { requires_ci_checks: false },
+    });
+  });
+});
+
+describe('fetchAlerts', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('serializes optional alert metadata filters', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify([]), { status: 200 }),
+    );
+
+    await expect(fetchAlerts({
+      projectId: 'proj-1',
+      domain: 'sr_quality',
+      eventType: 'failure_alert',
+      source: 'orchestrator',
+    })).resolves.toEqual([]);
+
+    const url = String(fetchMock.mock.calls[0][0]);
+    expect(url).toContain('/api/admin/alerts?');
+    expect(url).toContain('project_id=proj-1');
+    expect(url).toContain('domain=sr_quality');
+    expect(url).toContain('event_type=failure_alert');
+    expect(url).toContain('source=orchestrator');
+  });
+});
+
+describe('project alert-domain config API', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('fetches alert domains for a project', async () => {
+    const body = { project_id: 'proj-1', domains: [] };
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify(body), { status: 200 }),
+    );
+
+    await expect(fetchProjectAlertDomains('proj-1')).resolves.toEqual(body);
+
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/admin/projects/proj-1/alert-domains');
+  });
+
+  it('patches alert domain enablement', async () => {
+    const body = { project_id: 'proj-1', domains: [] };
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify(body), { status: 200 }),
+    );
+
+    await expect(updateProjectAlertDomains('proj-1', { warm_pool: { enabled: false } })).resolves.toEqual(body);
+
+    const [, init] = fetchMock.mock.calls[0];
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/admin/projects/proj-1/alert-domains');
+    expect((init as RequestInit).method).toBe('PATCH');
+    expect(JSON.parse(String((init as RequestInit).body))).toEqual({
+      domains: { warm_pool: { enabled: false } },
     });
   });
 });
