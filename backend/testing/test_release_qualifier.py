@@ -27141,3 +27141,41 @@ class TestComputeGoalCoverageDrift:
             merges_since_grade=0,
         )
         assert result["biggest_gap"] == "Missing rate limiting"
+
+    def test_no_grade_yet_below_threshold(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status=None,
+            merges_since_grade=4,
+        )
+        assert result["signal"] == "no_grade_yet"
+        assert result["stale"] is False
+        assert result["merges_since_grade"] == 4
+
+    def test_drifting_at_threshold_when_no_grade_yet(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status=None,
+            merges_since_grade=5,
+        )
+        assert result["signal"] == "drifting"
+        assert result["stale"] is True
+        assert result["merges_since_grade"] == 5
+        assert result["coverage"] is None
+
+    def test_drifting_above_threshold_when_no_grade_yet(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status=None,
+            merges_since_grade=10,
+        )
+        assert result["signal"] == "drifting"
+        assert result["stale"] is True
+        assert result["merges_since_grade"] == 10
+        assert result["coverage"] is None

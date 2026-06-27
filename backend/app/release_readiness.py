@@ -1246,10 +1246,21 @@ async def compute_goal_coverage_drift_signal(
         )
 
         if verdict is None:
+            merges_since_open: int = 0
+            if version.opened_at is not None:
+                try:
+                    merges_since_open = await _rv.count_merged_since(
+                        session, project_id, version.opened_at
+                    )
+                except Exception:
+                    logger.exception(
+                        "[DRIFT] count_merged_since(opened_at) failed for project %s",
+                        project_id,
+                    )
             return compute_goal_coverage_drift(
                 goal,
                 merge_grade_status=None,
-                merges_since_grade=0,
+                merges_since_grade=merges_since_open,
             )
 
         merges_since: int = 0

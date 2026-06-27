@@ -197,6 +197,20 @@ def compute_goal_coverage_drift(
         }
 
     if merge_grade_status is None:
+        stale_cold_start = merges_since_grade >= _DRIFT_STALE_MERGE_THRESHOLD
+        if stale_cold_start:
+            return {
+                "signal": "drifting",
+                "coverage": None,
+                "biggest_gap": merge_grade_biggest_gap,
+                "merges_since_grade": merges_since_grade,
+                "stale": True,
+                "detail": (
+                    f"No merge-grade recorded yet, but {merges_since_grade} task(s) "
+                    "have merged since the version opened — goal coverage is unknown "
+                    "with material accumulated work (cold-start drift)."
+                ),
+            }
         return {
             "signal": "no_grade_yet",
             "coverage": None,
