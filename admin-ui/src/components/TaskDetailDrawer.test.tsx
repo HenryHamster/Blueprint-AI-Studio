@@ -142,6 +142,77 @@ describe('TaskDetailDrawer', () => {
     expect(screen.getByText('Approve & Merge')).toBeInTheDocument();
   });
 
+  it('shows spend-approval wording for a compute_experiment approval', () => {
+    render(
+      <TaskDetailDrawer
+        task={makeTask({
+          requires_approval: true,
+          status: 'EVALUATING',
+          task_type: 'compute_experiment',
+          payloads: [{ type: 'compute_experiment', spend_cap_usd: 12.5 }],
+        })}
+        logLines={[]}
+        {...baseHandlers}
+      />
+    );
+    expect(screen.getByText('Approve Spend ($12.50)')).toBeInTheDocument();
+    expect(screen.queryByText('Approve & Merge')).not.toBeInTheDocument();
+  });
+
+  it('shows "Approve Spend" without a cap when compute_experiment has no spend_cap_usd', () => {
+    render(
+      <TaskDetailDrawer
+        task={makeTask({
+          requires_approval: true,
+          status: 'EVALUATING',
+          task_type: 'compute_experiment',
+          payloads: [{ type: 'compute_experiment' }],
+        })}
+        logLines={[]}
+        {...baseHandlers}
+      />
+    );
+    expect(screen.getByText('Approve Spend')).toBeInTheDocument();
+  });
+
+  it('cancel confirmation spells out the consequence (VM terminated, work discarded)', async () => {
+    const user = userEvent.setup();
+    render(
+      <TaskDetailDrawer
+        task={makeTask({ status: 'IN_PROGRESS' })}
+        logLines={[]}
+        {...baseHandlers}
+      />
+    );
+    await user.click(screen.getByText('Cancel Task'));
+    expect(screen.getByText(/terminates its VM/i)).toBeInTheDocument();
+    expect(screen.getByText(/In-progress work is discarded/i)).toBeInTheDocument();
+    // No stranded-dependents warning when nothing depends on this task.
+    expect(screen.queryByTestId('cancel-blast-radius')).not.toBeInTheDocument();
+  });
+
+  it('cancel confirmation warns about stranded waiting dependents (blast radius)', async () => {
+    const user = userEvent.setup();
+    const parent = makeTask({ id: 'parent', status: 'IN_PROGRESS' });
+    const dependents = [
+      makeTask({ id: 'child-1', status: 'QUEUED', depends_on: ['parent'] }),
+      makeTask({ id: 'child-2', status: 'BLOCKED', depends_on: ['parent'] }),
+      // A completed dependent must NOT count toward the blast radius.
+      makeTask({ id: 'child-3', status: 'COMPLETED', depends_on: ['parent'] }),
+    ];
+    render(
+      <TaskDetailDrawer
+        task={parent}
+        tasks={[parent, ...dependents]}
+        logLines={[]}
+        {...baseHandlers}
+      />
+    );
+    await user.click(screen.getByText('Cancel Task'));
+    const blast = screen.getByTestId('cancel-blast-radius');
+    expect(blast).toHaveTextContent('2 waiting tasks depend on this');
+  });
+
   it('shows Retry button when task status is FAILED', () => {
     render(
       <TaskDetailDrawer

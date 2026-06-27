@@ -607,6 +607,19 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
   }, []);
 
   const isChild = !!task.parent_task_id;
+  // Consequence-precise action copy. Cancel terminates the VM; dismiss only
+  // flips a failed task to CANCELLED (kept in history); archive moves it off the
+  // board but is recoverable. The blast-radius hint warns when downstream tasks
+  // depend on this one (blockingCount is the count of tasks with this id in
+  // their depends_on edge).
+  const blockingHint = (blockingCount ?? 0) > 0
+    ? ` — ${blockingCount} task${(blockingCount ?? 0) > 1 ? 's' : ''} waiting on this`
+    : '';
+  const cancelTitle = confirmAction === 'cancel'
+    ? `Confirm cancel (${confirmCountdown}s)`
+    : `Cancel — stops the agent and terminates its VM${blockingHint}`;
+  const dismissTitle = 'Dismiss — marks this failed task cancelled; it stays in history and will not retry';
+  const archiveTitle = 'Archive — moves this task off the board to the archive (recoverable via Unarchive)';
   const heartbeat = getHeartbeatStatus(task.last_heartbeat);
   const isActive = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
 
@@ -750,7 +763,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             )}
             {(task.status === 'IN_PROGRESS' || task.status === 'QUEUED' || task.status === 'PROVISIONING' || task.status === 'BLOCKED') && (
               <button
-                title={confirmAction === 'cancel' ? `Confirm cancel (${confirmCountdown}s)` : 'Cancel'}
+                title={cancelTitle}
                 onClick={(e) => { e.stopPropagation(); handleDestructiveClick('cancel', () => onCancel(task.id)); }}
                 disabled={!!actionLoading}
                 className={`sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100'}`}
@@ -770,7 +783,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
             )}
             {(task.status === 'COMPLETED' || task.status === 'CANCELLED' || task.status === 'FAILED') && (
               <button
-                title={confirmAction === 'archive' ? `Confirm archive (${confirmCountdown}s)` : 'Archive'}
+                title={confirmAction === 'archive' ? `Confirm archive (${confirmCountdown}s)` : archiveTitle}
                 onClick={(e) => { e.stopPropagation(); handleDestructiveClick('archive', () => onArchive(task.id)); }}
                 disabled={!!actionLoading}
                 className={`sm:w-6 sm:h-6 sm:p-0 p-1.5 flex items-center justify-center rounded transition-colors disabled:opacity-50 disabled:cursor-not-allowed min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 hover:bg-amber-500/30' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-400 hover:text-neutral-100'}`}
@@ -1198,7 +1211,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
               <button onClick={() => setShowChangesForm(true)} className="flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-2 min-h-[44px] rounded-md text-xs font-medium transition-colors flex items-center justify-center gap-1.5">
                 <RotateCcw className="w-3.5 h-3.5" /> Request Changes
               </button>
-              <button onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`px-3 py-2 min-h-[44px] rounded-md text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800/50 hover:bg-neutral-700 text-neutral-500 border-neutral-700'}`}>
+              <button title={confirmAction === 'cancel' ? `Confirm (${confirmCountdown}s)` : 'Reject — cancels this task without merging the PR'} onClick={() => handleDestructiveClick('cancel', () => onCancel(task.id))} disabled={!!actionLoading} className={`px-3 py-2 min-h-[44px] rounded-md text-xs font-medium transition-all duration-300 flex items-center justify-center gap-1 border ${confirmAction === 'cancel' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800/50 hover:bg-neutral-700 text-neutral-500 border-neutral-700'}`}>
                 {confirmAction === 'cancel' ? `Confirm (${confirmCountdown}s)` : 'Reject'}
               </button>
             </div>
@@ -1275,10 +1288,10 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                 <button onClick={() => { setEditing(true); setShowOverflowMenu(false); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 min-h-[44px] sm:min-h-auto ${actionLoading ? 'opacity-50 pointer-events-none cursor-not-allowed' : ''}`} title="Edit prompt">
                   <Pencil className="w-3 h-3" />
                 </button>
-                <button onClick={() => { handleDestructiveClick('dismiss', () => { onDismiss(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] sm:min-h-auto ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Dismiss">
+                <button onClick={() => { handleDestructiveClick('dismiss', () => { onDismiss(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] sm:min-h-auto ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title={dismissTitle}>
                   {actionLoading === 'dismiss' ? <Activity className="w-3 h-3 animate-spin" /> : <X className="w-3 h-3" />}{confirmAction === 'dismiss' ? ` (${confirmCountdown}s)` : ''}
                 </button>
-                <button onClick={() => { handleDestructiveClick('archive', () => { onArchive(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] sm:min-h-auto ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Archive">
+                <button onClick={() => { handleDestructiveClick('archive', () => { onArchive(task.id); setShowOverflowMenu(false); }); }} disabled={!!actionLoading} className={`py-1 px-2 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] sm:min-h-auto ${confirmAction === 'archive' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'archive' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title={archiveTitle}>
                   {actionLoading === 'archive' ? <Activity className="w-3 h-3 animate-spin" /> : <Archive className="w-3 h-3" />}{confirmAction === 'archive' ? ` (${confirmCountdown}s)` : ''}
                 </button>
               </div>
@@ -1316,7 +1329,7 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
                   <button onClick={() => setEditing(true)} disabled={!!actionLoading} className={`flex-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 border border-neutral-700 py-1.5 rounded text-xs font-medium transition-colors flex items-center justify-center gap-1.5 min-h-[44px] sm:min-h-auto ${actionLoading ? 'opacity-50 pointer-events-none' : ''}`}>
                     <Pencil className="w-3.5 h-3.5" /> Edit
                   </button>
-                  <button onClick={() => handleDestructiveClick('dismiss', () => onDismiss(task.id))} disabled={!!actionLoading} className={`py-1.5 px-2.5 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title="Dismiss">
+                  <button onClick={() => handleDestructiveClick('dismiss', () => onDismiss(task.id))} disabled={!!actionLoading} className={`py-1.5 px-2.5 rounded text-xs transition-all duration-300 flex items-center justify-center gap-1 border min-h-[44px] min-w-[44px] sm:min-h-auto sm:min-w-auto ${confirmAction === 'dismiss' ? 'bg-amber-500/20 text-amber-400 border-amber-500/40' : 'bg-neutral-800 hover:bg-neutral-700 text-neutral-500 border-neutral-700'} ${actionLoading && actionLoading !== 'dismiss' ? 'opacity-50 pointer-events-none' : ''} ${actionLoading ? 'cursor-not-allowed' : ''}`} title={dismissTitle}>
                     {actionLoading === 'dismiss' ? <Activity className="w-3.5 h-3.5 animate-spin" /> : <X className="w-3.5 h-3.5" />}{confirmAction === 'dismiss' ? ` (${confirmCountdown}s)` : ''}
                   </button>
                 </div>

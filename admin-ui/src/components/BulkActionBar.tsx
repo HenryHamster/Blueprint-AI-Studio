@@ -21,10 +21,17 @@ interface BulkActionBarProps {
   toggleSelectionMode: () => void;
 }
 
-function buildBulkConfirmMessage(tasks: Task[]): string {
+function buildBulkConfirmList(tasks: Task[]): string {
   const titles = tasks.map(t => t.title || t.id.slice(0, 12));
   if (titles.length <= 5) return titles.join('\n');
   return titles.slice(0, 5).join('\n') + `\n...and ${titles.length - 5} more`;
+}
+
+// Prepend a one-line consequence summary above the affected-task list so the
+// operator sees the blast radius before confirming a bulk mutation.
+function buildBulkConfirmMessage(tasks: Task[], consequence?: string): string {
+  const list = buildBulkConfirmList(tasks);
+  return consequence ? `${consequence}\n\n${list}` : list;
 }
 
 export function BulkActionBar({
@@ -66,7 +73,7 @@ export function BulkActionBar({
         <button
           onClick={() => setConfirmDialog({
             title: `Cancel ${cancellableTasks.length} task${cancellableTasks.length !== 1 ? 's' : ''}?`,
-            message: buildBulkConfirmMessage(cancellableTasks),
+            message: buildBulkConfirmMessage(cancellableTasks, 'Stops these tasks and terminates their VMs. In-progress work is discarded.'),
             confirmLabel: `Cancel ${cancellableTasks.length}`,
             onConfirm: () => handleBulkCancel(cancellableTasks.map(t => t.id)),
           })}
@@ -96,7 +103,7 @@ export function BulkActionBar({
         <button
           onClick={() => setConfirmDialog({
             title: `Archive ${terminalTasks.length} task${terminalTasks.length !== 1 ? 's' : ''}?`,
-            message: buildBulkConfirmMessage(terminalTasks),
+            message: buildBulkConfirmMessage(terminalTasks, 'Moves these tasks off the board to the archive. Recoverable via Unarchive.'),
             confirmLabel: `Archive ${terminalTasks.length}`,
             onConfirm: () => {
               handleBulkArchiveColumn(terminalTasks.map(t => t.id));

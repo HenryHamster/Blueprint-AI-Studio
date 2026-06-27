@@ -51,6 +51,31 @@ function hasReviewPr(task: Task): boolean {
 
 type Tab = 'details' | 'logs' | 'changes';
 
+// Approval consequence wording differs by task type: a compute_experiment
+// approval releases real spend (it is NOT a code merge), so the label must say
+// so and surface the spend cap when the payload carries one. Mirrors the
+// TaskCard approval button so the two surfaces never disagree.
+function approveButtonLabel(task: Task): string {
+  if ((task.task_type as string) === 'compute_experiment') {
+    const cap = (task.payloads?.[0] as Record<string, unknown> | undefined)?.spend_cap_usd;
+    return cap != null ? `Approve Spend ($${Number(cap).toFixed(2)})` : 'Approve Spend';
+  }
+  return 'Approve & Merge';
+}
+
+// Blast radius for cancelling an active task: how many other tasks are still
+// waiting on it (depends_on edge) and have not yet reached a terminal state.
+// Those dependents are stranded when this task is cancelled.
+function countWaitingDependents(taskId: string, tasks?: Task[]): number {
+  if (!tasks) return 0;
+  return tasks.filter(
+    t =>
+      t.id !== taskId &&
+      t.depends_on?.includes(taskId) &&
+      (t.status === 'QUEUED' || t.status === 'BLOCKED' || t.status === 'PROVISIONING'),
+  ).length;
+}
+
 function hasMergedPr(task: Task): boolean {
   return !!(task.pr_url || task.artifacts?.some(a => a.pr_url));
 }
@@ -594,7 +619,7 @@ export function TaskDetailDrawer({
                     disabled={!!actionLoading}
                     className="flex-1 px-6 py-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
                   >
-                    {actionLoading === 'approve' ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />} Approve & Merge
+                    {actionLoading === 'approve' ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />} {approveButtonLabel(task)}
                   </button>
                   <button
                     onClick={() => setShowChangesForm(!showChangesForm)}
@@ -648,24 +673,37 @@ export function TaskDetailDrawer({
                 Cancel Task
               </button>
             )}
-            {showCancel && confirmCancel && (
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-neutral-400">Cancel this task?</span>
-                <button
-                  onClick={() => { onCancel(task.id); setConfirmCancel(false); }}
-                  disabled={!!actionLoading}
-                  className="px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
-                >
-                  {actionLoading === 'cancel' && <Loader2 className="w-3 h-3 animate-spin" />}Confirm
-                </button>
-                <button
-                  onClick={() => setConfirmCancel(false)}
-                  className="px-3 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-sm font-medium transition-colors"
-                >
-                  No
-                </button>
-              </div>
-            )}
+            {showCancel && confirmCancel && (() => {
+              const waiting = countWaitingDependents(task.id, tasks);
+              return (
+                <div className="flex flex-col gap-1.5 w-full">
+                  <span className="text-sm text-neutral-300 font-medium">Cancel this task?</span>
+                  <span className="text-xs text-neutral-500">
+                    Stops the agent and terminates its VM. In-progress work is discarded and not saved.
+                  </span>
+                  {waiting > 0 && (
+                    <span className="text-xs text-amber-400" data-testid="cancel-blast-radius">
+                      {waiting} waiting task{waiting > 1 ? 's' : ''} depend{waiting > 1 ? '' : 's'} on this and will be stranded.
+                    </span>
+                  )}
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <button
+                      onClick={() => { onCancel(task.id); setConfirmCancel(false); }}
+                      disabled={!!actionLoading}
+                      className="px-3 py-1.5 min-h-[44px] rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
+                    >
+                      {actionLoading === 'cancel' && <Loader2 className="w-3 h-3 animate-spin" />}Confirm cancel
+                    </button>
+                    <button
+                      onClick={() => setConfirmCancel(false)}
+                      className="px-3 py-1.5 min-h-[44px] rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-sm font-medium transition-colors"
+                    >
+                      Keep running
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
 
             {showFailedActions && (
               <>
