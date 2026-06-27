@@ -314,4 +314,101 @@ describe('TaskDetailDrawer', () => {
     );
     expect(screen.queryByTitle('Panel review this PR')).toBeNull();
   });
+
+  it('resets transient form state when navigating between tasks', async () => {
+    const user = userEvent.setup();
+    const task1 = makeTask({
+      id: 'task-1',
+      title: 'Task One',
+      requires_approval: true,
+      status: 'EVALUATING',
+    });
+    const task2 = makeTask({
+      id: 'task-2',
+      title: 'Task Two',
+      requires_approval: true,
+      status: 'EVALUATING',
+    });
+
+    const { rerender } = render(
+      <TaskDetailDrawer task={task1} logLines={[]} {...baseHandlers} />,
+    );
+
+    // Open Request Changes form on task 1
+    await user.click(screen.getByText('Request Changes'));
+    expect(screen.getByPlaceholderText('Describe what needs to change...')).toBeInTheDocument();
+
+    // Type feedback into the form
+    const feedbackInput = screen.getByPlaceholderText('Describe what needs to change...');
+    await user.type(feedbackInput, 'Please fix this');
+
+    // Verify feedback is in the form
+    expect(feedbackInput).toHaveValue('Please fix this');
+
+    // Navigate to task 2
+    rerender(
+      <TaskDetailDrawer task={task2} logLines={[]} {...baseHandlers} />,
+    );
+
+    // Verify the form is closed and feedback is cleared
+    expect(screen.queryByPlaceholderText('Describe what needs to change...')).not.toBeInTheDocument();
+  });
+
+  it('resets cancel confirmation state when navigating between tasks', async () => {
+    const user = userEvent.setup();
+    const task1 = makeTask({
+      id: 'task-1',
+      title: 'Task One',
+      status: 'IN_PROGRESS',
+    });
+    const task2 = makeTask({
+      id: 'task-2',
+      title: 'Task Two',
+      status: 'IN_PROGRESS',
+    });
+
+    const { rerender } = render(
+      <TaskDetailDrawer task={task1} logLines={[]} {...baseHandlers} />,
+    );
+
+    // Click Cancel Task to show confirmation
+    await user.click(screen.getByText('Cancel Task'));
+    expect(screen.getByText('Cancel this task?')).toBeInTheDocument();
+
+    // Navigate to task 2
+    rerender(
+      <TaskDetailDrawer task={task2} logLines={[]} {...baseHandlers} />,
+    );
+
+    // Verify the confirmation is gone
+    expect(screen.queryByText('Cancel this task?')).not.toBeInTheDocument();
+    // The button should be back to the initial state
+    expect(screen.getByText('Cancel Task')).toBeInTheDocument();
+  });
+
+  it('edit prompt editor seeds from the current payload prompt after a prior edit', async () => {
+    const user = userEvent.setup();
+    const editedPrompt = 'This is the edited prompt from the payload';
+    const originalDescription = 'Original task description';
+    const task = makeTask({
+      status: 'FAILED',
+      description: originalDescription,
+      payloads: [{ prompt: editedPrompt }],
+    });
+
+    render(
+      <TaskDetailDrawer task={task} logLines={[]} {...baseHandlers} />,
+    );
+
+    // Click the Edit button to open the prompt editor
+    await user.click(screen.getByText('Edit'));
+
+    // The input field should be populated with the payload prompt, not the description
+    const input = screen.getByDisplayValue(editedPrompt);
+    expect(input).toBeInTheDocument();
+    expect(input).toHaveValue(editedPrompt);
+
+    // Verify it's not showing the original description
+    expect(input).not.toHaveValue(originalDescription);
+  });
 });

@@ -252,7 +252,10 @@ export function TaskDetailDrawer({
   const [copiedLogs, setCopiedLogs] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [editingPrompt, setEditingPrompt] = useState(false);
-  const [editPromptValue, setEditPromptValue] = useState(task.description);
+  const [editPromptValue, setEditPromptValue] = useState(() => {
+    const payload = task.payloads?.[0] as Record<string, unknown> | undefined;
+    return (payload?.prompt as string) || task.description;
+  });
   const [drawerWidth, setDrawerWidth] = useState(680);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
@@ -303,11 +306,15 @@ export function TaskDetailDrawer({
     setIncludePatch(false);
   }, [task.id]);
 
-  // Reset edit prompt state when task changes
+  // Reset all transient form state when task changes
   useEffect(() => {
     setEditingPrompt(false);
-    setEditPromptValue(task.description);
-  }, [task.id, task.description]);
+    const payload = task.payloads?.[0] as Record<string, unknown> | undefined;
+    setEditPromptValue((payload?.prompt as string) || task.description);
+    setConfirmCancel(false);
+    setShowChangesForm(false);
+    setChangesFeedback('');
+  }, [task.id, task.payloads, task.description]);
 
   const loadPrFiles = async (withPatch: boolean) => {
     setPrFilesLoading(true);
