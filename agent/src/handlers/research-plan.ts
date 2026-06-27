@@ -29,7 +29,6 @@ import { DEFAULT_CLONE_DEPTH } from '../constants.js';
 import {
   describeJsonExtractionResult,
   extractJsonArrayDetailed,
-  extractJsonObjectDetailed,
 } from '../json-extract.js';
 import {
   PLAYBOOK_GUIDANCE, FIRST_TASK_GUIDANCE, DEFAULT_TOOL_GUIDANCE, READ_ONLY_BASH_WRITE_NOTE, readClaudeMd, buildContextPrefix, buildFileTree, isGreenfieldRepo, verifyCloneDelivered, configureAgentPermissions,
@@ -194,56 +193,8 @@ export function aggregateDirectionStats(
 export function buildStrategicCompletionLogs(
   allOutput: string,
   lastResultText: string | null | undefined,
-): { logs: string; warning?: string; missReason?: import('../json-extract.js').JsonExtractionMissReason } {
-  const fallbackLogs = sanitize(lastResultText || allOutput.slice(-50_000));
-
-  // Command-mode signal: presence of strategist `./strategic` commands in the
-  // OUTPUT means no inline JSON is expected. Skip legacy extraction entirely to
-  // avoid false-positive format misses on prose markers.
-  //
-  // NOTE: the marker is assembled from fragments rather than written as a single
-  // literal on purpose. This is an output detector for the strategic handler
-  // (which consumes buildStrategicCompletionLogs), NOT a prompt advertisement —
-  // research/plan share this file but never tell their agent to run that helper.
-  // A contiguous literal would be mis-read as a `./<helper>` advertisement by the
-  // per-handler provisioning-parity invariant (prompt-helper-refs.test.ts) and
-  // wrongly demand research/plan provision a strategist-only helper.
-  const STRATEGIC_COMMAND_MARKER = './' + 'strategic ';
-  if (allOutput.includes(STRATEGIC_COMMAND_MARKER)) {
-    return { logs: fallbackLogs };
-  }
-
-  const hasDirectionOperations = allOutput.includes('"direction_operations"');
-  const hasProblemModel = allOutput.includes('"problem_model"');
-  const hasVision = allOutput.includes('"vision"');
-
-  // Current strategic cycles apply state through ./strategic commands. A final
-  // inline strategic JSON object is a legacy artifact, so its absence should
-  // not warn after a command-based run succeeds.
-  if (!hasDirectionOperations || (!hasProblemModel && !hasVision)) {
-    return { logs: fallbackLogs };
-  }
-
-  const requiredKeys = hasProblemModel
-    ? ['problem_model', 'direction_operations']
-    : ['vision', 'direction_operations'];
-
-  try {
-    const stratObj = extractJsonObjectDetailed(allOutput, ...requiredKeys);
-    if (stratObj.ok) {
-      return { logs: sanitize(JSON.stringify(stratObj.value)) };
-    }
-    return {
-      logs: fallbackLogs,
-      warning: `Could not extract strategic JSON: ${describeJsonExtractionResult(stratObj)}`,
-      missReason: stratObj.reason,
-    };
-  } catch (err: unknown) {
-    return {
-      logs: fallbackLogs,
-      warning: `Could not extract strategic JSON: ${err instanceof Error ? err.message : String(err)}`,
-    };
-  }
+): { logs: string } {
+  return { logs: sanitize(lastResultText || allOutput.slice(-50_000)) };
 }
 
 /** Maps raw agent-reported failure_category to a high-level failure class. */
@@ -963,6 +914,8 @@ When the version is in **stabilize** and you judge it ready for release — hard
 \`\`\`
 Only request qualification from the **stabilize** phase — it is ignored in **build**. If the version is not yet release-ready, do NOT emit \`qualify_request\` — omitting it means "not ready." \`version_phase_decision\` and \`qualify_request\` are independent: you may emit either, both, or neither.
 
+**Hold qualification only for legitimate blockers, and keep work flowing while you wait.** Do NOT rush to qualify — readiness is a real judgment, and shipping a half-hardened version to hit a cadence is its own failure. But the trap this phase actually fell into is the opposite: *stalling* — holding qualification on something that is not a real blocker and that nothing is actively working. A legitimate hold is a genuine must-ship concern (a correctness regression, an unmet acceptance criterion, a broken core path) that is being actively driven to resolution. A straggler you are "waiting to land" from a paused or churn-stalled direction is NOT a legitimate hold — nothing is driving it, so the wait is open-ended. In that state the answer is not to rush-qualify; it is to get honest about the gate: if the pending work is genuinely must-ship, re-activate it as an actively-worked fix; if it is only nice-to-have, stop treating it as a blocker. And never let the phase sit idle while you wait — there is always hardening, cleanup, or test-coverage work to keep flowing.
+
 **Do NOT re-request while a qualification is in flight.** If the "Last qualification" line above shows \`status=pending\`, a qualification is already running for this version — the orchestrator has snapshotted a candidate and spawned the audit + smoketest. Do NOT emit \`qualify_request\` again; wait for the in-flight run to finalize (its status will change to \`promoted\`, \`not_promoted\`, \`dry_run\`, or an error). Re-requesting while \`status=pending\` is wasted work and is ignored.
 
 **Do NOT re-request after a dry-run of the same candidate.** If the "Last qualification" line shows \`status=dry_run\`, the qualifier already ran end-to-end (CI, test-erosion, audit, smoketest) on that candidate commit and recorded the result — a dry-run means the candidate would promote but promotion currently ships dark, so the version stays open in \`stabilize\`. Re-emitting \`qualify_request\` for the SAME candidate re-spawns two agent VMs to re-score an identical, already-evaluated commit; the orchestrator's already-dry-run guard ignores it. Only emit \`qualify_request\` again once new work has merged onto the integration branch since that dry-run — i.e. the candidate commit has actually changed. If nothing has merged since the \`dry_run\` line above, do NOT re-request.
@@ -1299,20 +1252,59 @@ export function buildEfficiencySnapshotSection(efficiencySnapshot: unknown): str
   const peff = snap.panel_review_effectiveness && typeof snap.panel_review_effectiveness === 'object'
     ? snap.panel_review_effectiveness as Record<string, unknown>
     : null;
-  if (peff) {
-    const gh = peff.gate_health && typeof peff.gate_health === 'object'
-      ? peff.gate_health as Record<string, unknown>
+  const peffPd = snap.panel_review_effectiveness_post_deploy && typeof snap.panel_review_effectiveness_post_deploy === 'object'
+    ? snap.panel_review_effectiveness_post_deploy as Record<string, unknown>
+    : null;
+  if (peff || peffPd) {
+    const pdGh = peffPd?.gate_health && typeof peffPd.gate_health === 'object'
+      ? peffPd.gate_health as Record<string, unknown>
       : null;
-    const state = gh && typeof gh.state === 'string' ? gh.state : 'NO_DATA';
-    const failOpenRate = typeof peff.fail_open_rate === 'number'
-      ? `${(peff.fail_open_rate * 100).toFixed(2)}%`
+    const pdState = pdGh && typeof pdGh.state === 'string' ? pdGh.state : null;
+    // Use post-deploy as primary when it has sufficient data.
+    // Fall back for NO_DATA (0 gate invocations) and INSUFFICIENT (<min_sample) — both are
+    // low-sample states. Keep DEGRADED as primary: it fires at >=5% even on tiny samples
+    // and is an intentional alarm, not a data-gap.
+    const usePostDeploy = peffPd !== null && pdState !== null
+      && pdState !== 'INSUFFICIENT' && pdState !== 'NO_DATA';
+    // Within this if-block, at least one of peff/peffPd is non-null.
+    // Prefer post-deploy when it has enough data; fall back to rolling otherwise.
+    let primary: Record<string, unknown>;
+    if (usePostDeploy) {
+      primary = peffPd;
+    } else if (peff) {
+      primary = peff;
+    } else {
+      primary = peffPd as Record<string, unknown>;
+    }
+    const primaryGh = primary.gate_health && typeof primary.gate_health === 'object'
+      ? primary.gate_health as Record<string, unknown>
+      : null;
+    const state = primaryGh && typeof primaryGh.state === 'string' ? primaryGh.state : 'NO_DATA';
+    const failOpenRate = typeof primary.fail_open_rate === 'number'
+      ? `${(primary.fail_open_rate * 100).toFixed(2)}%`
       : 'n/a';
-    const totalChallenged = typeof peff.total_challenged === 'number' ? String(peff.total_challenged) : 'n/a';
-    const coverage = typeof peff.effective_coverage === 'number'
-      ? `${(peff.effective_coverage * 100).toFixed(1)}%`
+    const totalChallenged = typeof primary.total_challenged === 'number' ? String(primary.total_challenged) : 'n/a';
+    const coverage = typeof primary.effective_coverage === 'number'
+      ? `${(primary.effective_coverage * 100).toFixed(1)}%`
       : 'n/a';
+    let label: string;
+    if (usePostDeploy) {
+      label = 'Adversarial gate health (post-deploy)';
+    } else if (peffPd !== null && peff !== null) {
+      // Post-deploy present but low-sample — primary is rolling; annotate accumulation progress.
+      const pdTotal = pdGh && typeof pdGh.total_invocations === 'number' ? pdGh.total_invocations : 0;
+      const pdMinSample = pdGh && typeof pdGh.min_sample === 'number' ? pdGh.min_sample : 30;
+      label = `Adversarial gate health (rolling; post-deploy accumulating ${pdTotal}/${pdMinSample} invocations)`;
+    } else if (peffPd !== null && peff === null) {
+      // No rolling window; post-deploy present but low-sample — label must name the actual source.
+      const pdTotal = pdGh && typeof pdGh.total_invocations === 'number' ? pdGh.total_invocations : 0;
+      const pdMinSample = pdGh && typeof pdGh.min_sample === 'number' ? pdGh.min_sample : 30;
+      label = `Adversarial gate health (post-deploy low-sample: ${pdTotal}/${pdMinSample} invocations)`;
+    } else {
+      label = 'Adversarial gate health';
+    }
     lines.push('');
-    lines.push(`**Adversarial gate health:** ${state} — fail_open_rate ${failOpenRate} (n=${totalChallenged}, coverage ${coverage})`);
+    lines.push(`**${label}:** ${state} — fail_open_rate ${failOpenRate} (n=${totalChallenged}, coverage ${coverage})`);
   }
 
   return lines.join('\n') + '\n';
@@ -1488,10 +1480,10 @@ export function buildCapabilityVerificationSection(
   for (const capName of Object.keys(capVerif).sort()) {
     if (capName.startsWith('_')) continue;
     const v = capVerif[capName];
-    const status = strVal(v.status as string);
+    const status = strVal(v.status);
     const missing = Array.isArray(v.missing) ? v.missing as string[] : [];
     const present = Array.isArray(v.present) ? v.present as string[] : [];
-    const claimed = strVal(v.claimed_status as string);
+    const claimed = strVal(v.claimed_status);
     const claimedNote = claimed ? ` (design-doc status: ${claimed})` : '';
     if (status === 'claimed_absent') {
       absent.push(`- **${capName}**${claimedNote}: CLAIMED-BUT-ABSENT — all ${missing.length} declared backing path(s) missing: ${missing.join(', ')}`);
@@ -1898,7 +1890,7 @@ export async function handleResearch(
   const researchProjectId = ((task.project_metadata as Record<string, unknown> | undefined)?.project_id as string | undefined) ?? '';
   if (researchProjectId) writeFetchHelper(taskId, researchProjectId, WORKSPACE, { verbs: RESEARCH_FETCH_VERBS });
   const researchFetchGuidance = researchProjectId ? buildFetchGuidance(RESEARCH_FETCH_VERBS) : '';
-  const researchMode = strVal(payload.research_mode as string, 'research');
+  const researchMode = strVal(payload.research_mode, 'research');
   const disallowedTools = configureAgentPermissions(researchMode);
   const promptFingerprint = computeResearchPlanPromptFingerprint('research');
   const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
@@ -2089,23 +2081,23 @@ ${hotspotsSection}
     // mature" branch never fires on code that does not exist.
     const sys = reconcileSystemEntry(dirDesignCtx.system as Record<string, unknown> | undefined, WORKSPACE);
     if (sys) {
-      lines.push(`System: ${strVal(sys.name as string)} (${strVal(sys.id as string)}) — status: **${strVal(sys.status as string)}**`);
-      if (sys.description) lines.push(`Description: ${strVal(sys.description as string)}`);
+      lines.push(`System: ${strVal(sys.name)} (${strVal(sys.id)}) — status: **${strVal(sys.status)}**`);
+      if (sys.description) lines.push(`Description: ${strVal(sys.description)}`);
       if (sys.spec) {
         const spec = sys.spec as Record<string, unknown>;
         lines.push('Architectural spec (use this as your blueprint):');
-        if (spec.approach) lines.push(`  Approach: ${strVal(spec.approach as string)}`);
+        if (spec.approach) lines.push(`  Approach: ${strVal(spec.approach)}`);
         if (Array.isArray(spec.technology)) lines.push(`  Technology: ${(spec.technology as string[]).join(', ')}`);
         if (Array.isArray(spec.interfaces)) lines.push(`  Interfaces: ${(spec.interfaces as string[]).join('; ')}`);
         if (Array.isArray(spec.integration_points)) lines.push(`  Integration: ${(spec.integration_points as string[]).join('; ')}`);
-        if (spec.notes) lines.push(`  Notes: ${strVal(spec.notes as string)}`);
+        if (spec.notes) lines.push(`  Notes: ${strVal(spec.notes)}`);
       }
     } else {
-      lines.push(`System ${strVal(dirDesignCtx.system_id as string)}: not yet documented in design doc`);
+      lines.push(`System ${strVal(dirDesignCtx.system_id)}: not yet documented in design doc`);
     }
     const dirVerif = dirDesignCtx.verification as Record<string, unknown> | undefined;
     if (dirVerif) {
-      const vstatus = strVal(dirVerif.status as string);
+      const vstatus = strVal(dirVerif.status);
       const missing = Array.isArray(dirVerif.missing) ? dirVerif.missing as string[] : [];
       const present = Array.isArray(dirVerif.present) ? dirVerif.present as string[] : [];
       if (vstatus === 'claimed_absent') {
@@ -2163,10 +2155,10 @@ ${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
     for (const sysId of Object.keys(sysVerif).sort()) {
       if (sysId.startsWith('_')) continue;
       const v = sysVerif[sysId];
-      const status = strVal(v.status as string);
+      const status = strVal(v.status);
       const missing = Array.isArray(v.missing) ? v.missing as string[] : [];
       const present = Array.isArray(v.present) ? v.present as string[] : [];
-      const claimed = strVal(v.claimed_status as string);
+      const claimed = strVal(v.claimed_status);
       const claimedNote = claimed ? ` (design-doc status: ${claimed})` : '';
       if (status === 'claimed_absent') {
         absent.push(`- **${sysId}**${claimedNote}: CLAIMED-BUT-ABSENT — all ${missing.length} declared module(s) missing: ${missing.join(', ')}`);
@@ -2214,6 +2206,25 @@ ${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
   const researchAvailableCapabilitiesSection = buildAvailableCapabilitiesSection(
     payload.available_capabilities,
   );
+
+  // Local-GPU-runner availability — thread the project's live operator-owned
+  // runner status into compute_experiment authoring so the model doesn't burn
+  // billable cloud GPU when the operator's machine is offline. The backend ships
+  // `local_runner_status` (top-level on the strategic payload, same shape as the
+  // other payload fields read above) ONLY when the project has ever registered a
+  // runner; when absent there is no local hardware → append nothing (author for
+  // cloud normally).
+  let localRunnerNote = '';
+  const localRunnerStatus = payload.local_runner_status as
+    { ever_registered?: boolean; active_total?: number; active_gpu?: number } | undefined;
+  if (localRunnerStatus && typeof localRunnerStatus === 'object' && !Array.isArray(localRunnerStatus)) {
+    const activeGpu = typeof localRunnerStatus.active_gpu === 'number' ? localRunnerStatus.active_gpu : 0;
+    if (activeGpu > 0) {
+      localRunnerNote = `\n    Local GPU available: ${activeGpu} live GPU-capable runner(s) registered for this project. GPU compute_experiments will run on operator-owned hardware (free) rather than billable cloud GPU — prefer authoring GPU experiments now while a runner is live.`;
+    } else if (localRunnerStatus.ever_registered) {
+      localRunnerNote = `\n    This project relies on operator-owned local GPU hardware which is CURRENTLY OFFLINE (0 live GPU runners). Do NOT author GPU compute_experiment findings right now — with no live runner they fall back to BILLABLE cloud GPU. Defer GPU experiments until a runner is live (or author CPU-only work).`;
+    }
+  }
 
   const researchRetryContext = buildRetryContext(task);
   const researchFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
@@ -2350,12 +2361,15 @@ ALSO write /tmp/research_progress_${taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — 
     \`spend_cap_usd\` (a positive USD cap — keep it conservative), and
     \`deadline_seconds\` (a positive wall-clock timeout). Optionally add \`success_criterion\`
     — a numeric goal of {"metric": "<name>", "operator": ">=|<=|>|<|==|!=", "threshold": <number>}
-    — to make the result machine-checkable. To make a declared metric available, the command must
-    write {metric: value} JSON to the \`$BLUEPRINT_RESULT_FILE\` path OR print a JSON object
-    containing it to stdout (e.g. \`echo "{\\"accuracy\\": 0.93}" > "$BLUEPRINT_RESULT_FILE"\`); the
-    criterion reads THAT value. A measured-but-missed goal is recorded as honest negative evidence
-    (the dependent still runs), but a declared metric the run never produces a numeric value for
-    fails loud (compute_unmeasured_criterion) — a job that ran cannot pass as a hypothesis that was
+    — to make the result machine-checkable. Metric capture is MANDATORY: the command MUST
+    write {metric: value} JSON to the file at \`$BLUEPRINT_RESULT_FILE\` as its final step OR print a
+    JSON object containing it as the LAST line of stdout — e.g.
+    \`... && python -c "import json,os; json.dump({'<metric>': <value>}, open(os.environ['BLUEPRINT_RESULT_FILE'],'w'))"\`
+    or \`echo "{\\"<metric>\\": <value>}" > "$BLUEPRINT_RESULT_FILE"\` (use your real declared-metric
+    key in place of \`<metric>\`); the criterion reads THAT value. A measured-but-missed goal is
+    recorded as honest negative evidence (the dependent still runs), but a declared metric the run
+    never produces a numeric value for is silently lost — the criterion is then evaluated UNMEASURED
+    and fails loud (compute_unmeasured_criterion) — a job that ran cannot pass as a hypothesis that was
     measured. Put the launch fields either flat on the finding or nested under a
     \`compute_experiment\` object. Above a configured spend threshold the launch holds for operator
     approval; below it, it runs autonomously.
@@ -2374,7 +2388,7 @@ ALSO write /tmp/research_progress_${taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — 
     A timeout (exit_code=124) with startup_ok=true is acceptable — slow first iteration is fine.
     If the command genuinely cannot be smoked at all (requires hardware or resources unavailable
     here): set smoke_sample={"unsmokable":true,"unsmokable_reason":"<why>"} and the finding will
-    be held explicitly for operator review rather than dispatching silently.
+    be held explicitly for operator review rather than dispatching silently.${localRunnerNote}
 
 **Sub-research** — spawns another research cycle (use sparingly):
   research
@@ -2426,7 +2440,7 @@ implementation findings. Add metadata alongside them when relevant.
   "provides_capability": null,
   "direction_id": "d-xxx or null",
   "effort": "high|medium|low|null",
-  "compute_experiment": {"command": "command run inside a clone of this repo at cwd, e.g. 'python3 -m pkg.eval --episodes 1000'", "spend_cap_usd": 5.0, "deadline_seconds": 1800, "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}, "accelerator": "T4"},
+  "compute_experiment": {"command": "command run inside a clone of this repo at cwd, e.g. 'python3 -m pkg.eval --episodes 1000'", "spend_cap_usd": 5.0, "deadline_seconds": 1800, "success_criterion": {"metric": "accuracy", "operator": ">=", "threshold": 0.9}, "accelerator": "T4", "container_image": "optional — e.g. 'nvcr.io/nvidia/tensorflow:25.01'; runs command INSIDE this docker image (needed for GPU/CUDA stacks the repo can't pip-install natively)", "setup_step": "optional — host-level prep run BEFORE/OUTSIDE the container; put container-dependent installs in command, NOT here"},
   "smoke_sample": {"exit_code": 0, "startup_ok": true, "metric_captured": true, "timed_out": false, "error_excerpt": ""},
   "claims": ["short factual assertion backed by your investigation (omit when synthesizing)"],
   "sources": [{"type": "file|pr|log|message", "ref": "path/to/file.<ext> or pr#123 or msg_id", "excerpt": "optional short quote"}]
@@ -2439,7 +2453,7 @@ implementation findings. Add metadata alongside them when relevant.
 
 **prerequisite** (optional, default null): Declare a FOUNDATION this finding depends on that is being (or was) built OUTSIDE this batch — an earlier or concurrently-in-flight cycle, or a named capability. Shape: \`{"kind": "task", "ref": "<task-id or finding-hash>"}\` to gate on a specific in-flight/queued task, or \`{"kind": "capability", "ref": "<capability-name>"}\` to gate on whichever task advertises that capability. For a capability ref, DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above so it resolves to the registry's canonical string (the matcher is EXACT, never fuzzy). When it resolves to a real foundation the dependent is structurally gated (depends_on edge) so it does not run against a base missing the foundation or duplicate it; when it does not resolve the dependent enters a BLOCKED state with the unmet prerequisite recorded as a machine-resolvable need, and is resumed when the foundation appears or escalated to the operator after a timeout. Use ONLY for cross-cycle / cross-batch foundations or named capabilities — for ordering findings WITHIN this batch, use depends_on_indices instead (NOT prerequisite). Omit (or null) when there is no external foundation.
 
-**compute_experiment** (optional, default null): Present ONLY on a compute_experiment/measurement/benchmark finding — the launch contract for the budgeted compute job. Required keys \`command\`, \`spend_cap_usd\` (positive), \`deadline_seconds\` (positive); optional \`success_criterion\` (numeric metric/operator/threshold goal) and benchmark metadata (\`machine_type\`, \`accelerator\`, \`experiment\`, \`benchmark\`, \`metric\`, \`cwd\`, \`env\`). The \`accelerator\` field (one of \`T4\`, \`L4\`, \`V100\`) is **sufficient on its own** to request a single GPU — you do NOT need to specify \`machine_type\` when requesting a single GPU by accelerator name; the system resolves the correct GPU machine type automatically. Omit entirely on non-experiment findings.
+**compute_experiment** (optional, default null): Present ONLY on a compute_experiment/measurement/benchmark finding — the launch contract for the budgeted compute job. Required keys \`command\`, \`spend_cap_usd\` (positive), \`deadline_seconds\` (positive); optional \`success_criterion\` (numeric metric/operator/threshold goal) and benchmark metadata (\`machine_type\`, \`accelerator\`, \`experiment\`, \`benchmark\`, \`metric\`, \`cwd\`, \`env\`). The \`accelerator\` field (one of \`T4\`, \`L4\`, \`V100\`) is **sufficient on its own** to request a single GPU — you do NOT need to specify \`machine_type\` when requesting a single GPU by accelerator name; the system resolves the correct GPU machine type automatically. Optional \`container_image\`: runs \`command\` INSIDE the given docker image (e.g. an NVIDIA NGC image such as \`nvcr.io/nvidia/tensorflow:25.01\`) — REQUIRED when the experiment needs a runtime the repo cannot \`pip install\` natively, e.g. a CUDA/cuDNN/framework stack; without it the command runs BARE and dies with ModuleNotFoundError. Optional \`setup_step\`: runs as bare \`bash -lc\` on the HOST, BEFORE and OUTSIDE the container — use it ONLY for host-level pre-container prep. Anything that needs the container's environment (pip installs into the experiment's interpreter, importing the container's libraries) MUST go in \`command\`, NOT \`setup_step\`. Omit entirely on non-experiment findings.
 
 **provides_capability** (optional, default null): A short kebab-case capability name this finding's task advertises (e.g. "<feature>-core"), so a sibling finding (or another lane) declaring \`{"kind": "capability", "ref": "<feature>-core"}\` can depend on it. DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above when one fits; propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability not already listed. Omit unless another task needs to gate on this one by capability. ${CAPABILITY_DECLARATION_DOC}
 

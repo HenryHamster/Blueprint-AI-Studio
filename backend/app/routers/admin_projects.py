@@ -8,7 +8,7 @@ self-improvement flags.
 """
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, delete
 from sqlalchemy import update
@@ -485,6 +485,24 @@ async def update_project(
         doc = dict(payload.design_doc)
         # Remove the divergent top-level "revision" key; canonical counter is _meta.revision
         doc.pop("revision", None)
+        # Preserve system/operator-owned underscore-prefixed keys that the
+        # design-doc editor never surfaces.  The agent list/get endpoint filters
+        # out ``_``-prefixed keys (admin_agent_ops.update_design_doc) and blocks
+        # writing them, so a UI round-trip carries only the public keys — a
+        # wholesale replace from the editor would otherwise silently DROP durable
+        # config such as ``_auto_remediation`` / ``_issue_implementation`` /
+        # ``_auto_review`` / ``_file_to_system`` (this is exactly how an operator's
+        # enabled auto-remediation setting disappears after a later doc edit).
+        # An incoming payload that DOES include a given underscore key still wins
+        # (explicit operator intent).  ``_meta`` is rebuilt below, so skip it here.
+        for _sys_key, _sys_val in (project.design_doc or {}).items():
+            if (
+                isinstance(_sys_key, str)
+                and _sys_key.startswith("_")
+                and _sys_key != "_meta"
+                and _sys_key not in doc
+            ):
+                doc[_sys_key] = _sys_val
         meta = dict(stored_meta)
         meta["revision"] = stored_rev + 1
         meta["last_updated"] = _utcnow().isoformat()
@@ -772,12 +790,18 @@ async def edit_running_update(
     }
 
 
+class _DismissPendingBody(BaseModel):
+    note: str | None = Field(None, max_length=5000)
+    """Optional operator note to record in the revision log alongside the dismissal."""
+
+
 @router.post("/projects/{project_id}/pending-confirm/{pending_id}/dismiss")
 @limiter.limit("30/minute")
 async def dismiss_pending_confirmation(
     request: Request,
     project_id: uuid.UUID,
     pending_id: str,
+    payload: _DismissPendingBody = _DismissPendingBody(),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -787,30 +811,126 @@ async def dismiss_pending_confirmation(
     (credentials needed, access needed, major decisions). Once the operator
     takes action they can dismiss the item here rather than waiting for the
     next autonomous strategic cycle to clear it.
+
+    An optional ``note`` in the request body is recorded in the revision log
+    so the strategist can see the operator's response on its next cycle.
     """
-    from app.problem_model import parse_problem_model
+    from app.problem_model import append_revision_log, parse_problem_model
     from app.time_utils import _utcnow
 
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
     current_model = parse_problem_model(project.problem_model)
-    before = len(current_model.pending_user_confirmation)
-    current_model.pending_user_confirmation = [
-        p for p in current_model.pending_user_confirmation if p.id != pending_id
-    ]
-    if len(current_model.pending_user_confirmation) == before:
+    matched = next(
+        (p for p in current_model.pending_user_confirmation if p.id == pending_id),
+        None,
+    )
+    if matched is None:
         raise HTTPException(
             status_code=404, detail=f"Pending confirmation '{pending_id}' not found"
         )
+    current_model.pending_user_confirmation = [
+        p for p in current_model.pending_user_confirmation if p.id != pending_id
+    ]
     current_model.revision += 1
     current_model.last_updated = _utcnow().isoformat()
     current_model.last_updated_by = "user"
+    if payload.note:
+        changes: dict = {
+            "dismissed_proposal": matched.proposal,
+            "dismissal_note": payload.note,
+        }
+        append_revision_log(current_model, f"operator dismissed {matched.type}", changes)
     project.problem_model = current_model.model_dump()
     flag_modified(project, "problem_model")
     session.add(project)
     await session.commit()
     return {"status": "dismissed", "pending_id": pending_id}
+
+
+class _AcceptPendingBody(BaseModel):
+    answer: str | None = Field(None, max_length=5000)
+    """For major_decision: the operator's answer text to record."""
+
+
+@router.post("/projects/{project_id}/pending-confirm/{pending_id}/accept")
+@limiter.limit("30/minute")
+async def accept_pending_confirmation(
+    request: Request,
+    project_id: uuid.UUID,
+    pending_id: str,
+    payload: _AcceptPendingBody,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Accept a pending_user_confirmation item with a type-specific action.
+
+    - intent_change: applies the proposed text as the new intent.purpose and clears the item.
+    - major_decision: records the operator's answer in the revision log and clears the item.
+    - credentials_needed / access_needed: signals provided and clears the item.
+    """
+    from app.problem_model import (
+        apply_user_intent_patch,
+        append_revision_log,
+        parse_problem_model,
+    )
+    from app.time_utils import _utcnow
+
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    current_model = parse_problem_model(project.problem_model)
+
+    matched = next(
+        (p for p in current_model.pending_user_confirmation if p.id == pending_id),
+        None,
+    )
+    if matched is None:
+        raise HTTPException(
+            status_code=404, detail=f"Pending confirmation '{pending_id}' not found"
+        )
+
+    now = _utcnow().isoformat()
+
+    if matched.type == "intent_change":
+        # Apply the proposed text as the new operator-set intent.purpose.
+        current_model = apply_user_intent_patch(
+            project.problem_model,
+            {"intent": {"purpose": matched.proposal}},
+            now,
+        )
+        # Remove the pending item after applying the intent change.
+        current_model.pending_user_confirmation = [
+            p for p in current_model.pending_user_confirmation if p.id != pending_id
+        ]
+        if payload.answer:
+            changes: dict = {
+                "pending_accepted": {"id": pending_id, "type": matched.type},
+                "accepted_proposal": matched.proposal,
+                "operator_note": payload.answer,
+            }
+            append_revision_log(current_model, "operator accepted intent_change", changes)
+    else:
+        # For major_decision, credentials_needed, access_needed:
+        # remove the item and record a revision log entry with any answer.
+        current_model.pending_user_confirmation = [
+            p for p in current_model.pending_user_confirmation if p.id != pending_id
+        ]
+        current_model.revision += 1
+        current_model.last_updated = now
+        current_model.last_updated_by = "user"
+        changes: dict = {"pending_accepted": {"id": pending_id, "type": matched.type}}
+        if payload.answer:
+            changes["decision_answer"] = payload.answer
+            changes["decision_question"] = matched.proposal
+        append_revision_log(current_model, f"operator accepted {matched.type}", changes)
+
+    project.problem_model = current_model.model_dump()
+    flag_modified(project, "problem_model")
+    session.add(project)
+    await session.commit()
+    return {"status": "accepted", "pending_id": pending_id, "type": matched.type}
 
 
 @router.delete("/projects/{project_id}")

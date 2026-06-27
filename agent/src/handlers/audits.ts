@@ -111,6 +111,136 @@ export function resolveCandidateSha(
   return null;
 }
 
+// ── Candidate-commit fetch + diff-range pre-flight (shared) ───────────────────
+//
+// handleReleaseAudit, handleReleaseAuditChallenge, and handleReleaseMergeGrade
+// all clone the base branch with FULL history, fetch the EXACT pinned candidate
+// commit object, then refuse to score an unresolvable three-dot diff range. The
+// fetch + pre-flight verify logic is identical across all three, so it lives
+// here and is imported by the other two handlers.
+
+/** Outcome of fetching the pinned candidate commit + verifying the diff range. */
+export interface CandidateDiffRangeResult {
+  /** True when the candidate object was fetched into the local clone. */
+  fetchOk: boolean;
+  /** Last `git fetch` error message (empty when fetchOk). */
+  fetchFailDetail: string;
+  /** True when `${baseBranch}...<sha>` resolves (merge-base reachable). */
+  diffRangeResolves: boolean;
+  /** Why the range did not resolve (empty when diffRangeResolves). */
+  diffRangeFailDetail: string;
+}
+
+// Bounded retry-with-backoff for the single network fetch of the pinned
+// candidate commit. A qualification attempt is expensive and TERMINAL, so a
+// transient GitHub I/O blip on this one fetch must NOT torch the whole attempt.
+// Production 2026-06-26: an attempt finalized infra_failure with
+// `audit_challenge_task_failed_diff_range_unresolvable`, yet the SAME candidate
+// re-fetched and COMPLETED ~9 min later — the commit was always reachable; one
+// fetch blip burned it. The candidate SHA is `automain` HEAD at snapshot time,
+// reachable from a ref, so the fetch is deterministically retryable.
+const CANDIDATE_FETCH_MAX_ATTEMPTS = 3;
+// Linear backoff base (ms): waits 500ms then 1000ms between the three attempts.
+const CANDIDATE_FETCH_BACKOFF_BASE_MS = 500;
+
+function defaultFetchSleep(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Fetch the EXACT pinned candidate commit (a real object, not just FETCH_HEAD)
+ * with a bounded retry-with-backoff, then pre-flight-verify that the three-dot
+ * diff range `${baseBranch}...<candidateSha>` resolves.
+ *
+ * Retry rationale: the fetch is a single network call. A transient failure used
+ * to fail loud IMMEDIATELY with `diff_range_unresolvable`, terminally burning a
+ * qualification attempt for an I/O blip. We retry ONLY the fetch — an
+ * unresolvable range after a clean fetch is a genuine condition that MUST fail
+ * loud (never retried/masked). After retries are exhausted the caller still
+ * posts the fail-loud `diff_range_unresolvable` status (the safety property:
+ * never audit/grade an unresolvable range).
+ *
+ * Pure of the fail-loud decision: returns a structured result; each caller posts
+ * its own handler-specific FAILED status when `diffRangeResolves` is false.
+ *
+ * `opts` exists for tests (inject a no-op sleep, a fake fetch/verify, fewer
+ * attempts); production callers pass none and get the real `execFileSync` git
+ * fetch + the shared retry/backoff constants.
+ */
+export async function fetchCandidateCommitWithRetry(
+  candidateSha: string,
+  diffRange: string,
+  ws: WebSocket | null,
+  opts: {
+    maxAttempts?: number;
+    backoffBaseMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+    fetchOnce?: (sha: string) => void;
+    verifyDiffRange?: (sha: string, range: string) => void;
+  } = {},
+): Promise<CandidateDiffRangeResult> {
+  const maxAttempts = Math.max(1, opts.maxAttempts ?? CANDIDATE_FETCH_MAX_ATTEMPTS);
+  const backoffBaseMs = opts.backoffBaseMs ?? CANDIDATE_FETCH_BACKOFF_BASE_MS;
+  const sleep = opts.sleep ?? defaultFetchSleep;
+  // A SHA fetch leaves a real commit object behind, which `main...<sha>` can
+  // resolve. A bare-branch fetch (`git fetch origin automain`) only updates
+  // FETCH_HEAD and never a local ref — that is the original bug this guards.
+  const fetchOnce = opts.fetchOnce ?? ((sha: string): void => {
+    execFileSync('git', ['fetch', 'origin', sha], { cwd: WORKSPACE, stdio: ['ignore', 'pipe', 'pipe'] });
+  });
+  // `git rev-parse --verify <sha>^{commit}` errors when the SHA is not a
+  // reachable commit object; `git rev-list --count <base>...<sha>` errors when
+  // either endpoint or the merge-base is unreachable. Run both so a genuinely
+  // unresolvable range fails loud, while a clean exit proves the symmetric-
+  // difference range is fully resolvable.
+  const verifyDiffRange = opts.verifyDiffRange ?? ((sha: string, range: string): void => {
+    git(['rev-parse', '--verify', `${sha}^{commit}`]);
+    git(['rev-list', '--count', range]);
+  });
+
+  let fetchOk = false;
+  let fetchFailDetail = '';
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      fetchOnce(candidateSha);
+      fetchOk = true;
+      fetchFailDetail = '';
+      sendLog(ws, attempt > 1
+        ? `Fetched candidate commit ${candidateSha.slice(0, 12)} successfully (attempt ${attempt}/${maxAttempts}).\n`
+        : `Fetched candidate commit ${candidateSha.slice(0, 12)} successfully.\n`);
+      break;
+    } catch (e) {
+      fetchFailDetail = e instanceof Error ? e.message : String(e);
+      const willRetry = attempt < maxAttempts;
+      sendLog(
+        ws,
+        `[WARNING] git fetch origin ${candidateSha.slice(0, 12)} failed ` +
+        `(attempt ${attempt}/${maxAttempts})${willRetry ? ' — retrying' : ''}: ${fetchFailDetail}\n`,
+      );
+      if (willRetry) await sleep(backoffBaseMs * attempt);
+    }
+  }
+
+  let diffRangeResolves = false;
+  let diffRangeFailDetail = '';
+  if (fetchOk) {
+    try {
+      verifyDiffRange(candidateSha, diffRange);
+      diffRangeResolves = true;
+      sendLog(ws, `Diff range ${diffRange} resolves — merge-base is reachable.\n`);
+    } catch (e) {
+      diffRangeFailDetail = e instanceof Error ? e.message : String(e);
+      sendLog(ws, `[ERROR] Diff range ${diffRange} does not resolve: ${diffRangeFailDetail}\n`);
+    }
+  } else {
+    diffRangeFailDetail =
+      `git fetch origin ${candidateSha} failed after ${maxAttempts} attempt(s) ` +
+      `(${fetchFailDetail || 'no detail'}); ${diffRange} cannot be resolved`;
+  }
+
+  return { fetchOk, fetchFailDetail, diffRangeResolves, diffRangeFailDetail };
+}
+
 // Read the audit progress markdown the agent writes for retry context.
 // Returns the content prefixed with the standard analysis header so the reopen
 // prompt includes prior analysis, or undefined when the file is missing/empty.
@@ -491,43 +621,17 @@ export async function handleReleaseAudit(
   // resolves. (`git fetch origin <sha>` works where `git fetch origin
   // automain` does not: a SHA fetch leaves a real commit object behind, a
   // bare-branch fetch only updates FETCH_HEAD.)
-  let fetchOk = false;
-  let fetchFailDetail = '';
-  sendLog(ws, `Fetching candidate commit ${candidateSha.slice(0, 12)} (full history) for diff computation (staying on ${baseBranch})...\n`);
-  try {
-    execFileSync('git', ['fetch', 'origin', candidateSha], { cwd: WORKSPACE, stdio: ['ignore', 'pipe', 'pipe'] });
-    fetchOk = true;
-    sendLog(ws, `Fetched candidate commit ${candidateSha.slice(0, 12)} successfully.\n`);
-  } catch (e) {
-    fetchFailDetail = e instanceof Error ? e.message : String(e);
-    sendLog(ws, `[WARNING] git fetch origin ${candidateSha.slice(0, 12)} failed: ${fetchFailDetail}\n`);
-  }
-
-  // Pre-flight: verify the diff range actually resolves before invoking the
+  // Fetch the EXACT candidate commit (bounded retry-with-backoff) and
+  // pre-flight-verify the three-dot diff range resolves before invoking the
   // agent. A successful-but-incomplete fetch can still leave the merge-base
   // unreachable; if it is, `git diff ${diffRange}` errors and the agent can
   // misread that as an "empty diff" and emit audit_score: 1.0 — a FALSE
-  // strong-promote signal to the release qualifier. Fail loud instead.
-  let diffRangeResolves = false;
-  let diffRangeFailDetail = '';
-  if (fetchOk) {
-    try {
-      // `git rev-parse --verify <sha>^{commit}` errors when the SHA is not a
-      // reachable commit object; `git rev-list --count main...<sha>` errors
-      // when either endpoint or the merge-base is unreachable. Run both so a
-      // genuinely unresolvable range fails loud, while a clean exit proves the
-      // symmetric-difference range is fully resolvable.
-      git(['rev-parse', '--verify', `${candidateSha}^{commit}`]);
-      git(['rev-list', '--count', diffRange]);
-      diffRangeResolves = true;
-      sendLog(ws, `Diff range ${diffRange} resolves — merge-base is reachable.\n`);
-    } catch (e) {
-      diffRangeFailDetail = e instanceof Error ? e.message : String(e);
-      sendLog(ws, `[ERROR] Diff range ${diffRange} does not resolve: ${diffRangeFailDetail}\n`);
-    }
-  } else {
-    diffRangeFailDetail = `git fetch origin ${candidateSha} failed (${fetchFailDetail || 'no detail'}); ${diffRange} cannot be resolved`;
-  }
+  // strong-promote signal to the release qualifier. The retry stops a transient
+  // GitHub I/O blip from torching the whole qualification attempt; an
+  // unresolvable range after a clean fetch still fails loud below.
+  sendLog(ws, `Fetching candidate commit ${candidateSha.slice(0, 12)} (full history) for diff computation (staying on ${baseBranch})...\n`);
+  const { diffRangeResolves, diffRangeFailDetail } =
+    await fetchCandidateCommitWithRetry(candidateSha, diffRange, ws);
 
   if (!diffRangeResolves) {
     // Never let the agent run an unaudited audit. A diff range that does not

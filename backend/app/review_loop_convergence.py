@@ -335,6 +335,8 @@ async def _pr_is_preservable_on_cap(
     orig: Task,
     pr_number: int,
     session: AsyncSession,
+    *,
+    after_approve: bool = False,
 ) -> bool:
     """FIX #3b: decide whether a capped PR is worth PRESERVING (left open for
     hand-merge) rather than destroyed (closed + FAILED + CODE_ERROR).
@@ -350,12 +352,17 @@ async def _pr_is_preservable_on_cap(
         nothing to hand-merge), AND
       • it is not a genuine merge conflict (``mergeable_state != 'dirty'``).
 
-    GUARDRAIL — rollups (UNCHANGED): a broken/empty/conflicted rollup PR returns
-    False so the caller keeps today's close+FAIL path; ``'dirty'`` (conflict),
-    ``''``/``'unknown'`` (not-yet-computed) and any GitHub lookup failure all
-    return False — when in doubt, fall back to the safe destructive path. Every
-    other state (``clean`` / ``unstable`` / ``blocked`` / ``behind``) is treated
-    as hand-mergeable exactly as before.
+    GUARDRAIL — rollups: a broken/empty rollup PR returns False so the caller
+    keeps today's close+FAIL path; ``''``/``'unknown'`` (not-yet-computed) and
+    any GitHub lookup failure all return False — when in doubt, fall back to the
+    safe destructive path.  ``'dirty'`` (conflict) is NOT preservable when
+    called from the non-approved path (default ``after_approve=False``) because a
+    non-approved conflicted PR is a genuine non-convergence.  When
+    ``after_approve=True`` (the PR was signed off before the cap was hit),
+    ``'dirty'`` IS preservable — the conflict is a mechanical blocker, not a
+    rejection, and a human can resolve it for hand-merge.  Every other state
+    (``clean`` / ``unstable`` / ``blocked`` / ``behind``) is treated as
+    hand-mergeable regardless of ``after_approve``.
 
     Back-merge resolvers are stricter on CI but more conservative on ambiguity:
       • CI-RED: ``mergeable_state == 'unstable'`` (mergeable but a status check
@@ -408,11 +415,17 @@ async def _pr_is_preservable_on_cap(
         # state — INCLUDING the unknown/not-yet-computed case — is preservable;
         # prefer preserve-over-destroy for sync-critical resolver work.
         return mergeable_state not in ("dirty", "unstable")
-    # Rollup (UNCHANGED): 'dirty' = genuine merge conflict per GitHub. Any other
-    # state (clean, unstable, blocked, behind) is hand-mergeable. 'unknown'/None
-    # means GitHub hasn't computed it yet — treat conservatively as NOT
-    # preservable so we don't leave a possibly-conflicted PR dangling open.
-    return mergeable_state not in ("dirty", "", "unknown")
+    # Rollup: 'unknown'/'' means GitHub hasn't computed the state yet — treat
+    # conservatively as NOT preservable regardless of after_approve.  'dirty'
+    # (genuine merge conflict): non-approved PRs close as before; approved PRs
+    # preserve — the conflict is mechanical and a human can resolve it for
+    # hand-merge.  All other states (clean, unstable, blocked, behind) are
+    # hand-mergeable in both modes.
+    if mergeable_state in ("", "unknown"):
+        return False
+    if mergeable_state == "dirty":
+        return after_approve
+    return True
 
 
 async def _handle_cap_exhaustion(
@@ -512,14 +525,17 @@ async def _handle_cap_exhaustion(
         # salvageable, signed-off work. Leave it open for hand-merge and
         # keep the APPROVED_CAP_PR_CLOSED labeling (approval changes the
         # label, never whether the PR is destroyed). Non-preservable approved
-        # PRs (empty, conflicted, non-rollup) keep the close+CANCEL path.
-        if await _pr_is_preservable_on_cap(orig, pr_number, session):
+        # PRs (empty, non-rollup) keep the close+CANCEL path.  Conflicted
+        # (dirty) rollup/back-merge PRs are also preserved here: the conflict
+        # is a mechanical, recoverable blocker on an APPROVED PR — a human can
+        # resolve it for hand-merge (after_approve=True loosens the dirty guard).
+        if await _pr_is_preservable_on_cap(orig, pr_number, session, after_approve=True):
             _preserve_kind = (
                 "back-merge resolver" if _is_backmerge_resolver(orig) else "rollup"
             )
             logger.info(
                 f"[PIPELINE] Cap reached for PR #{pr_number} on an APPROVED, "
-                f"non-empty, conflict-free {_preserve_kind} — PRESERVING: leaving "
+                f"non-empty {_preserve_kind} — PRESERVING: leaving "
                 f"PR open + flagging orig {resolved_original_id[:8]} "
                 f"requires_approval for hand-merge "
                 f"(APPROVED_CAP_PR_CLOSED, no CODE_ERROR, no PR close)"

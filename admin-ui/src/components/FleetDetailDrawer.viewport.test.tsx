@@ -35,6 +35,12 @@ vi.mock('../api', () => ({
   })),
   setWarmPoolTargetForProject: vi.fn(async () => ({})),
   fetchEfficiencyAxes: vi.fn(async () => ({ axes: {} })),
+  // FleetRunnersPanel (rendered in the drawer) statically imports these from
+  // '../api'; browser-mode ESM requires the mock factory to expose every named
+  // export the subtree imports or the linker fails at import time.
+  listFleetRunners: vi.fn(async () => []),
+  registerFleetRunner: vi.fn(async () => ({})),
+  revokeFleetRunner: vi.fn(async () => ({})),
   API_BASE_URL: 'http://localhost:8000',
 }));
 

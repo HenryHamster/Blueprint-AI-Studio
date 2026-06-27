@@ -353,7 +353,7 @@ ${migrateFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
     baseBranch,
     owner,
     repo,
-    testsOnMainBranch: baseBranch === (migratePromotionTarget ?? resolveBaseBranch({} as Record<string, unknown>, task)),
+    testsOnMainBranch: baseBranch === (migratePromotionTarget ?? resolveBaseBranch({}, task)),
     baseCommit: migrateBaseCommit,
     model,
     effort,

@@ -24,16 +24,23 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
 from app.compute_backends import (
-    LOCAL_BACKEND_NAME,
+    GCP_BACKEND_NAME,
+    LOCAL_GPU_BACKEND_NAME,
+    RUNNER_SUBPROCESS_BACKEND_NAME,
     ComputeLaunchSpec,
     ComputeStatusResult,
+    PreflightSmokeResult,
     collect_terminal_artifact_reference,
     default_compute_backend_name,
+    detect_local_gpu,
     get_compute_backend,
+    is_zero_cost_backend,
+    run_preflight_smoke,
     validate_backend_name,
 )
 from app.resource_envelope import (
     resolve_project_hardware_policy,
+    resolve_project_require_local_runner,
     resolve_project_spend_ceiling,
     resolve_project_spend_window_days,
 )
@@ -164,6 +171,7 @@ _COMPUTE_OUTCOME_DISPOSITION: dict[ComputeJobOutcome, tuple[bool, str | None]] =
     ComputeJobOutcome.TIMED_OUT: (True, "deadline"),
     ComputeJobOutcome.SPEND_CAP_EXCEEDED: (True, "budget"),
     ComputeJobOutcome.FAILURE: (False, None),
+    ComputeJobOutcome.SMOKE_FAILED: (False, None),
 }
 
 
@@ -212,13 +220,10 @@ async def _assert_compute_spend_not_gated(
     if task_type != "compute_experiment":
         return
     project = await session.get(Project, task.project_id)
-    # Start from the global runtime_config (same source as the four spawn sites),
-    # then layer any per-project overrides on top so project-level config wins.
+    # Use the global runtime_config which already includes deployment-state settings.
     runtime_config: dict = dict(_global_runtime_config)
     direction: dict | None = None
     if project is not None:
-        project_overrides = dict(getattr(project, "runtime_config_json", None) or {})
-        runtime_config.update(project_overrides)
         direction_id = str((task.context or {}).get("direction_id") or "")
         if direction_id:
             direction = next(
@@ -266,6 +271,9 @@ async def create_compute_job(
     accelerator_count: int = 1,
     live_proof: Any | None = None,
     live_proof_marker: Any | None = None,
+    setup_step: str | None = None,
+    container_image: str | None = None,
+    container_registry_auth: dict | None = None,
 ) -> ComputeJob:
     if not command.strip():
         raise ValueError("command must be non-empty")
@@ -283,15 +291,30 @@ async def create_compute_job(
     if reject_reason is not None:
         raise ValueError(reject_reason)
 
-    normalized_backend = backend_name or default_compute_backend_name()
+    if backend_name is not None:
+        normalized_backend = backend_name
+    elif accel_spec is not None:
+        # GPU job: route to local GPU when present, fall back to cloud.
+        normalized_backend = (
+            LOCAL_GPU_BACKEND_NAME
+            if detect_local_gpu() is not None
+            else GCP_BACKEND_NAME
+        )
+    else:
+        normalized_backend = default_compute_backend_name()
     # Validate BEFORE persisting: an unknown / mode-incompatible backend would
     # otherwise wedge the row in QUEUED forever (monitor raises every pass).
     validate_backend_name(normalized_backend)
-    # A GPU can never be provisioned by the local-subprocess backend — reject
-    # loudly at create time rather than silently running the command CPU-only.
-    if accel_spec is not None and normalized_backend == LOCAL_BACKEND_NAME:
+    # A GPU can never be provisioned by the CPU-only local-subprocess backend —
+    # reject loudly at create time rather than silently running the command CPU-only.
+    # runner-subprocess is allowed: GPU is on the operator's own hardware.
+    if accel_spec is not None and normalized_backend not in (
+        LOCAL_GPU_BACKEND_NAME,
+        GCP_BACKEND_NAME,
+        RUNNER_SUBPROCESS_BACKEND_NAME,
+    ):
         raise ValueError(
-            "GPU compute jobs are unavailable on the local-subprocess backend"
+            f"GPU compute jobs require the local-gpu, gcp, or runner-subprocess backend (got {normalized_backend!r})"
         )
     normalized_provisioning = normalize_provisioning_model(provisioning_model)
     capped_spend = clamp_spend_cap_usd(spend_cap_usd)
@@ -305,6 +328,38 @@ async def create_compute_job(
         raise ValueError("task not found")
     if locked_task.status in _TASK_TERMINAL_STATUSES:
         raise ValueError("cannot launch a compute job for a terminal task")
+    # Runner-pinned tasks route to the runner-subprocess backend so execution
+    # happens on operator hardware via the pull protocol. Override unconditionally
+    # (the runner's GPU capability gate in _try_runner_dispatch already validated
+    # that the runner can handle any GPU accelerator declared in the payload).
+    runner_target_id: str | None = (locked_task.context or {}).get("runner_target_id") or None
+    if runner_target_id is not None:
+        normalized_backend = RUNNER_SUBPROCESS_BACKEND_NAME
+    # Enforce-local policy: when a project requires its compute_experiment work to run
+    # on a registered self-hosted local runner, a job that is NOT runner-pinned (no live
+    # runner claimed the task → it would provision billable cloud compute) must be
+    # rejected loudly. Pairs with the orchestrator's graceful dispatch hold (which keeps
+    # such tasks QUEUED until a runner appears); this is the defense-in-depth guarantee
+    # that no billable cloud GPU/VM is ever created for a require-local project.
+    _policy_project = await session.get(Project, locked_task.project_id)
+    _is_compute_experiment = str((locked_task.first_payload or {}).get("type") or "") == "compute_experiment"
+    if (
+        _policy_project is not None
+        and _is_compute_experiment
+        and resolve_project_require_local_runner(_policy_project)
+        and normalized_backend != RUNNER_SUBPROCESS_BACKEND_NAME
+    ):
+        raise ComputeLaunchPreconditionFailed(
+            {
+                "error": "local_runner_required",
+                "message": (
+                    "project policy require_local_runner is set: this compute_experiment "
+                    "must run on a registered self-hosted local runner, but no live runner "
+                    "claimed the task — refusing to provision billable cloud compute."
+                ),
+                "backend": normalized_backend,
+            }
+        )
     await _assert_compute_spend_not_gated(session, locked_task, capped_spend)
     live_proof_requirement = _resolve_live_proof_requirement(
         locked_task,
@@ -329,6 +384,7 @@ async def create_compute_job(
         accelerator=persisted_accelerator,
         accelerator_count=persisted_accelerator_count,
         live_proof_requirement=live_proof_requirement,
+        container_image=container_image,
     )
     existing = await _get_active_compute_job_for_task(session, task_id=locked_task.id)
     if existing is not None:
@@ -379,14 +435,18 @@ async def create_compute_job(
         _utcnow() + timedelta(seconds=provisioning_budget_seconds),
         deadline_at,
     )
-    # Accelerator-aware rate: base machine + GPU surcharge (N1+T4/V100) or the
-    # bundled G2 rate (L4); falls through to the plain VM rate for CPU jobs.
-    rate = get_compute_rate_per_second(
-        machine_type=resolved_machine_type,
-        accelerator=persisted_accelerator,
-        count=accelerator_count,
-        spot=normalized_provisioning == "SPOT",
-    )
+    # Operator/local backends (local-subprocess, local-gpu) run on hardware Blueprint
+    # does not pay cloud rates for — persist $0 so accrual is genuinely zero.
+    # GCP retains the full accelerator-aware rate (base + GPU surcharge).
+    if is_zero_cost_backend(normalized_backend):
+        rate = 0.0
+    else:
+        rate = get_compute_rate_per_second(
+            machine_type=resolved_machine_type,
+            accelerator=persisted_accelerator,
+            count=accelerator_count,
+            spot=normalized_provisioning == "SPOT",
+        )
     # Park deadline: worst-case window (declared runtime + provisioning allowance)
     # plus grace. Stored in polling_metadata so the agent can read it from the
     # job response instead of recomputing from the declared deadline alone.
@@ -404,8 +464,48 @@ async def create_compute_job(
         "status_message": "queued for compute-job launch",
         "park_deadline_seconds": park_deadline_seconds,
     }
+    if setup_step is not None:
+        polling_metadata["setup_step"] = setup_step
+    if container_image:
+        polling_metadata["container_image"] = container_image
+        if container_registry_auth and isinstance(container_registry_auth, dict):
+            if container_registry_auth.get("password"):
+                if normalized_backend != RUNNER_SUBPROCESS_BACKEND_NAME:
+                    raise ValueError(
+                        "container_registry_auth.password cannot be delivered to the "
+                        "compute backend in the orchestrated path — the password is "
+                        "never persisted, and there is no re-attachment channel at "
+                        "launch time (unlike repo tokens, which are freshly minted). "
+                        "Use a container image in a public registry or one accessible "
+                        "via the VM's service-account identity (e.g. Artifact Registry "
+                        "with Workload Identity). Omit the password field or use a "
+                        "public image to proceed."
+                    )
+                # Runner-subprocess backend: persist full auth (server + username +
+                # password) so the runner can docker login before pulling the image.
+                # The password lives only in this row's JSONB and is scoped to the
+                # runner-subprocess pull path — never sent to GCP or logged.
+                registry_meta: dict[str, str] = {}
+                if container_registry_auth.get("server"):
+                    registry_meta["server"] = str(container_registry_auth["server"])
+                if container_registry_auth.get("username"):
+                    registry_meta["username"] = str(container_registry_auth["username"])
+                registry_meta["password"] = str(container_registry_auth["password"])
+                polling_metadata["container_registry_auth"] = registry_meta
+            else:
+                # No password: persist only server + username — password is never
+                # written to the row for non-runner backends.
+                registry_meta = {}
+                if container_registry_auth.get("server"):
+                    registry_meta["server"] = str(container_registry_auth["server"])
+                if container_registry_auth.get("username"):
+                    registry_meta["username"] = str(container_registry_auth["username"])
+                if registry_meta:
+                    polling_metadata["container_registry_auth"] = registry_meta
     if live_release_evidence is not None:
         polling_metadata[_LIVE_PROOF_METADATA_KEY] = live_release_evidence
+    if runner_target_id is not None:
+        polling_metadata["runner_target_id"] = runner_target_id
     job = ComputeJob(
         task_id=locked_task.id,
         project_id=locked_task.project_id,
@@ -744,12 +844,14 @@ def _build_launch_request_fingerprint(
     accelerator: str | None = None,
     accelerator_count: int | None = None,
     live_proof_requirement: dict[str, str] | None = None,
+    container_image: str | None = None,
 ) -> str:
     payload = {
         "accelerator": accelerator,
         "accelerator_count": accelerator_count,
         "backend": backend_name,
         "command": command,
+        "container_image": container_image,
         "cwd": cwd,
         "deadline_seconds": deadline_seconds,
         "env": {str(k): str(v) for k, v in (env or {}).items()},
@@ -1160,6 +1262,145 @@ async def compute_job_monitor_service(session_factory=AsyncSessionLocal) -> None
         await asyncio.sleep(COMPUTE_JOB_MONITOR_INTERVAL_SECONDS)
 
 
+def _smoke_fail_reason(smoke: PreflightSmokeResult, declared_metric: str | None) -> str:
+    if not smoke.startup_ok:
+        excerpt = (smoke.error_excerpt or "")[:300]
+        return (
+            f"compute_preflight_smoke_failed: command exited {smoke.exit_code} on "
+            f"DB-less substrate before full VM provisioned; stderr: {excerpt}"
+        )[:500]
+    # startup_ok but metric missing
+    return (
+        f"compute_preflight_smoke_failed: command ran but declared metric "
+        f"{declared_metric!r} not found in result file (no full VM provisioned)"
+    )[:500]
+
+
+async def _run_and_apply_preflight_smoke(
+    session_factory,
+    job: ComputeJob,
+    task: Task | None,
+) -> None:
+    """Run a pre-flight smoke on the job's command and persist the result.
+
+    On PASS: stamps ``preflight_smoke_done=True`` so the next monitor tick
+    proceeds to the normal provisioning path.
+    On FAIL: finalizes the job as FAILED/SMOKE_FAILED and fires the task wake.
+    """
+    meta = job.polling_metadata or {}
+    command = str(meta.get("command") or "")
+    env = {str(k): str(v) for k, v in (meta.get("env") or {}).items()}
+    cwd = meta.get("cwd") or None
+    setup_step = meta.get("setup_step") or None
+    # Containerize the smoke when the experiment spec declared an image, mirroring
+    # the launch path's reconstruction (see _build_launch_spec / create_compute_job).
+    # The persisted auth carries ONLY server/username — the password is stripped at
+    # create time (see create_compute_job), so docker login is skipped and
+    # gated-registry pulls may fail at smoke; public images are still validated.
+    container_image = meta.get("container_image") or None
+    registry_auth_meta = meta.get("container_registry_auth")
+    container_registry_auth = (
+        dict(registry_auth_meta) if isinstance(registry_auth_meta, dict) else None
+    )
+
+    payload = task.first_payload if task is not None else {}
+    criterion = (payload or {}).get("success_criterion") or {}
+    declared_metric: str | None = (
+        (payload or {}).get("declared_metric")
+        or (criterion.get("metric") if isinstance(criterion, dict) else None)
+        or None
+    )
+    # Arms-synthesized contracts write {"arms": {name: {metric: value}}} to the
+    # result file, not a flat top-level key.  The original task spec requires
+    # arms jobs to check startup_ok only; skip the metric assertion for them.
+    is_arms = bool((payload or {}).get("arms"))
+    declared_metric_for_smoke = None if is_arms else declared_metric
+
+    smoke = await run_preflight_smoke(
+        command,
+        declared_metric=declared_metric_for_smoke,
+        env=env,
+        cwd=cwd,
+        setup_step=setup_step,
+        container_image=container_image,
+        container_registry_auth=container_registry_auth,
+    )
+
+    now = _utcnow()
+    # A timeout (exit_code is None) means the command is still alive = startup OK.
+    # Only enforce the metric check when the command EXITED CLEANLY (exit_code == 0).
+    # Rejecting on timeout would false-reject GPU training commands that declare a
+    # metric but cannot finish within the short smoke window.
+    smoke_passed = smoke.startup_ok and (
+        smoke.exit_code is None or declared_metric_for_smoke is None or smoke.metric_captured
+    )
+    # When a container_image was declared but Docker was unavailable on the
+    # orchestrator host, the smoke ran bare bash — not a faithful test of the
+    # containerized command.  A bare-run failure MUST NOT gate the job: the
+    # command may legitimately depend on in-container libs not present on the
+    # host.  Treat the degraded smoke as a non-binding pass so the job
+    # proceeds to the real VM where the container will be available.
+    if smoke.degraded_no_docker and not smoke_passed:
+        smoke_passed = True
+
+    async with session_factory() as session:
+        live = await _lock_compute_job(session, job.id)
+        if live is None or live.status in _COMPUTE_JOB_TERMINAL_STATUSES:
+            return
+        if smoke_passed:
+            _set_meta(
+                live,
+                preflight_smoke_done=True,
+                preflight_smoke_status="passed",
+                preflight_smoke_containerized=smoke.ran_containerized,
+                preflight_smoke_degraded_no_docker=smoke.degraded_no_docker,
+            )
+            live.updated_at = now
+            session.add(live)
+            await session.commit()
+            return
+        # Smoke failed: finalize immediately — no full VM will be provisioned.
+        reason = _smoke_fail_reason(smoke, declared_metric)
+        diagnostic: dict[str, Any] = {
+            "startup_ok": smoke.startup_ok,
+            "exit_code": smoke.exit_code,
+            "metric_captured": smoke.metric_captured,
+            "error_excerpt": (smoke.error_excerpt or "")[:500],
+            "containerized": smoke.ran_containerized,
+            "degraded_no_docker": smoke.degraded_no_docker,
+        }
+        if declared_metric:
+            diagnostic["declared_metric"] = declared_metric
+        _set_meta(
+            live,
+            preflight_smoke_done=True,
+            preflight_smoke_status="failed",
+            preflight_smoke_diagnostic=diagnostic,
+        )
+        _finalize_terminal_job(
+            live,
+            status=ComputeJobStatus.FAILED,
+            outcome=ComputeJobOutcome.SMOKE_FAILED,
+            terminal_reason=reason,
+            now=now,
+        )
+        await _link_terminal_artifact(session, live)
+        if live.task_id is not None:
+            from app.task_lifecycle import fire_task_wakes  # noqa: PLC0415
+
+            await fire_task_wakes(
+                session,
+                wake_source_kind=COMPUTE_JOB_TERMINAL_WAKE_KIND,
+                wake_source_ref=str(live.id),
+            )
+        await session.commit()
+    logger.info(
+        "[COMPUTE_JOB] pre-flight smoke FAILED for job=%s: %s",
+        job.id,
+        reason,
+    )
+
+
 async def _process_single_compute_job(
     job: ComputeJob, *, session_factory=AsyncSessionLocal
 ) -> None:
@@ -1207,6 +1448,17 @@ async def _process_single_compute_job(
         return
 
     if job.status in _COMPUTE_JOB_PRELAUNCH_STATUSES:
+        # Pre-flight smoke: run ONCE on QUEUED jobs before reserving the full launch.
+        # Idempotent: the flag in polling_metadata guards against re-running on restart.
+        # Skip for runner-subprocess: the command must run on operator hardware
+        # (may need local GPU/CUDA/data) — a leader-local smoke is wrong and would
+        # always validate a different substrate than the real execution environment.
+        if job.status == ComputeJobStatus.QUEUED and not (
+            job.polling_metadata or {}
+        ).get("preflight_smoke_done") and job.backend != RUNNER_SUBPROCESS_BACKEND_NAME:
+            await _run_and_apply_preflight_smoke(session_factory, job, task)
+            return  # next tick picks up STARTING (pass) or FAILED/SMOKE_FAILED (fail)
+
         reserved = await _reserve_compute_job_launch(
             session_factory, job.id, backend, now
         )
@@ -1379,12 +1631,25 @@ async def _process_single_compute_job(
                 + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
             )
             return
-        await _apply_launch_result(
-            session_factory,
-            job.id,
-            result,
-            now=now,
-        )
+        # For runner-subprocess, the STARTING→RUNNING transition is performed by
+        # the runner when it claims the job via /api/runner/next-compute-job.
+        # Calling _apply_launch_result here would move the job to RUNNING before
+        # the runner has a chance to claim it, making /next-compute-job miss it.
+        if job.backend != RUNNER_SUBPROCESS_BACKEND_NAME:
+            await _apply_launch_result(
+                session_factory,
+                job.id,
+                result,
+                now=now,
+            )
+        elif result.metadata:
+            # Persist launch metadata (e.g. repo_clone) without transitioning
+            # to RUNNING — the runner does that when it claims the job.
+            async with session_factory() as session:
+                live = await _lock_compute_job(session, job.id)
+                if live is not None and live.status in _COMPUTE_JOB_PRELAUNCH_STATUSES:
+                    _set_meta(live, **result.metadata)
+                    await session.commit()
         return
 
     # ── Running: poll STATUS first, then cost. A job that finished just before
@@ -1818,6 +2083,10 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
     effective_provisioning_deadline = (
         prov_deadline if prov_deadline is not None else job.wall_clock_deadline
     )
+    registry_auth_meta = meta.get("container_registry_auth")
+    container_registry_auth = (
+        dict(registry_auth_meta) if isinstance(registry_auth_meta, dict) else None
+    )
     return ComputeLaunchSpec(
         job_id=job.id,
         external_id=job.external_compute_id,
@@ -1833,6 +2102,9 @@ def _build_launch_spec(job: ComputeJob) -> ComputeLaunchSpec:
         provisioning_model=str(meta.get("provisioning_model") or "STANDARD"),
         accelerator=job.accelerator_type,
         accelerator_count=int(job.accelerator_count or 1),
+        setup_step=meta.get("setup_step") or None,
+        container_image=meta.get("container_image") or None,
+        container_registry_auth=container_registry_auth,
     )
 
 
@@ -2086,6 +2358,15 @@ def _finalize_terminal_job(
         # The immediate delete retries failed; the orphan sweep is the safety net.
         extra["terminate_failed"] = True
     _set_meta(job, status_message=terminal_reason, **extra)
+    # Erase the registry password the moment the job reaches a terminal state.
+    # The runner only needed it once (at docker-login time); keeping it in the
+    # DB row beyond that is an unnecessary plaintext secret at rest.
+    meta = dict(job.polling_metadata or {})
+    if isinstance(meta.get("container_registry_auth"), dict):
+        auth = dict(meta["container_registry_auth"])
+        auth.pop("password", None)
+        meta["container_registry_auth"] = auth
+        job.polling_metadata = meta
 
 
 def _is_durable_artifact_uri(reference: str) -> bool:
@@ -2251,6 +2532,12 @@ def build_compute_result_logs(job: ComputeJob) -> str:
             num = _coerce_metric_number(value)
             if num is not None:
                 result[name] = num
+        # Preserve the arms block intact so the success-criterion evaluator can
+        # read per-arm metrics using best-arm semantics. The numeric loop above
+        # drops non-numeric values; the arms block (a nested dict) must survive
+        # as-is for multi-arm experiments.
+        if isinstance(reported.get("arms"), dict) and "arms" not in result:
+            result["arms"] = reported["arms"]
     # Embed the bounded command log text so downstream analysis (knowledge doc,
     # LLM analysis prompt) can find results that live in stdout/stderr rather
     # than in $BLUEPRINT_RESULT_FILE. Capped at _COMMAND_LOG_EMBED_CHARS so a

@@ -295,6 +295,7 @@ interface KanbanColumnProps {
   maxRetries: number;
   actionLoadingMap: Record<string, string>;
   searchQuery?: string;
+  hasActiveFilters?: boolean;
   onBulkToggle: (taskIds: string[], selected: boolean) => void;
   onShiftSelect?: (taskId: string, orderedTaskIds: string[]) => void;
   onApprove: (id: string) => void;
@@ -335,6 +336,7 @@ export function KanbanColumn({
   maxRetries,
   actionLoadingMap,
   searchQuery,
+  hasActiveFilters,
   onBulkToggle,
   onShiftSelect,
   onApprove,
@@ -403,7 +405,7 @@ export function KanbanColumn({
       </SortableContext>
       {columnTasks.length === 0 && !loading && (
         <div className="text-center text-neutral-600 text-xs py-8 border border-dashed border-neutral-800 rounded-xl bg-neutral-900/20">
-          No tasks
+          {hasActiveFilters ? 'No tasks match filters' : 'No tasks'}
         </div>
       )}
     </div>

@@ -8,17 +8,28 @@ export interface DirectionsAddFormProps {
   // the "Stage for next version" control is disabled (the backend rejects an
   // atomic staged create with no open version), mirroring the edit-form option.
   stageTargetVersion?: number | null;
+  // When set, show a badge indicating this direction is being created to address
+  // a specific problem model gap (populated via "Spawn direction" on a gap card).
+  linkedGapId?: string | null;
 }
 
 /**
  * Add-direction form: text input, priority/category selects, path-tag editor,
  * and completion-criteria textarea. Extracted verbatim from DirectionsPanel.
  */
-export function DirectionsAddForm({ form, addDirection, stageTargetVersion }: DirectionsAddFormProps) {
+export function DirectionsAddForm({ form, addDirection, stageTargetVersion, linkedGapId }: DirectionsAddFormProps) {
   const canStage = stageTargetVersion != null;
   const staged = canStage && form.newStaged;
   return (
     <div className="px-5 py-3 border-b border-neutral-800 shrink-0">
+      {linkedGapId && (
+        <div className="mb-1.5 flex items-center gap-1.5 text-xs">
+          <span className="text-neutral-500">For gap:</span>
+          <span className="px-1.5 py-0.5 rounded bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 font-mono">
+            {linkedGapId}
+          </span>
+        </div>
+      )}
       <div className="flex flex-wrap gap-2">
         <input
           value={form.newText}

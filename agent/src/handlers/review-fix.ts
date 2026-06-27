@@ -515,7 +515,7 @@ export async function handleReview(
   const viewportShotEntries = (payload.viewport_shot_entries as Array<{ name: string }> | undefined) ?? [];
   const viewportSourceTaskId = strVal(payload.viewport_source_task_id);
   const reviewProjectMetaEarly = task.project_metadata as Record<string, unknown> | undefined;
-  const reviewProjectIdEarly = strVal(reviewProjectMetaEarly?.project_id as string | undefined);
+  const reviewProjectIdEarly = strVal(reviewProjectMetaEarly?.project_id);
   const reviewOrchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
   let downloadedShotPaths: string[] = [];
   if (viewportShotEntries.length > 0 && viewportSourceTaskId && reviewProjectIdEarly) {
@@ -902,7 +902,7 @@ export async function handleFix(
   const viewportShotEntries = (payload.viewport_shot_entries as Array<{ name: string }> | undefined) ?? [];
   const viewportSourceTaskId = strVal(payload.viewport_source_task_id);
   const fixViewportProjectMeta = task.project_metadata as Record<string, unknown> | undefined;
-  const fixViewportProjectId = strVal(fixViewportProjectMeta?.project_id as string | undefined);
+  const fixViewportProjectId = strVal(fixViewportProjectMeta?.project_id);
   const fixViewportOrchestratorUrl = process.env.ORCHESTRATOR_URL || 'http://localhost:8080';
   let downloadedFixShotPaths: string[] = [];
   if (viewportShotEntries.length > 0 && viewportSourceTaskId && fixViewportProjectId) {

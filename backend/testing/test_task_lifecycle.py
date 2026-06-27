@@ -8582,6 +8582,58 @@ async def test_second_opinion_unparseable_challenge_escalates(tl_db, mocker):
 
 
 @pytest.mark.asyncio
+async def test_second_opinion_unparseable_challenge_gates_off_no_requires_approval(
+    tl_db, mocker
+):
+    """With require_approval_gates OFF, the fail-closed second-opinion escalation
+    must NOT set requires_approval on the original task — the advisory status
+    message still carries the signal but gates are intentionally off."""
+    mocker.patch.dict(
+        "app.task_lifecycle._runtime_config",
+        {"require_approval_gates": False},
+    )
+    (
+        session,
+        factory,
+        project,
+        original,
+        review_task,
+        merge_mock,
+        captured_spawn,
+    ) = await _setup_review_gate(tl_db, mocker, pr_number=7789)
+
+    payload = AgentStatusPayload(
+        task_id=review_task.id,
+        status=TaskStatus.COMPLETED,
+        verdict_json='{"verdict": "APPROVE", "issues": []}',
+    )
+    await _process_post_commit(review_task.id, payload, _session_factory=factory)
+    challenger = await _find_challenger(session, project.id, review_task.id)
+    assert challenger is not None
+
+    chal_payload = AgentStatusPayload(
+        task_id=challenger.id,
+        status=TaskStatus.COMPLETED,
+        logs="the panel crashed and produced no structured verdict",
+    )
+    await _process_post_commit(challenger.id, chal_payload, _session_factory=factory)
+
+    await session.refresh(review_task)
+    await session.refresh(original)
+    rec = (review_task.context or {}).get("review_second_opinion")
+    assert rec is not None and rec.get("escalated") is True
+    assert review_task.status == TaskStatus.COMPLETED
+    assert not merge_mock.called, "unparseable challenge must not merge even with gates off"
+    assert not captured_spawn, "unparseable challenge must not spawn fix even with gates off"
+    assert not original.requires_approval, (
+        "with require_approval_gates OFF, fail-closed escalation must NOT set requires_approval"
+    )
+    assert "manual review required" in (original.latest_status_message or ""), (
+        "advisory status message must still be set even with gates off"
+    )
+
+
+@pytest.mark.asyncio
 async def test_second_opinion_model_unavailable_fails_open(tl_db, mocker):
     """A FAILED challenge caused by a provider model-config rejection (model
     inaccessible) must degrade gracefully: the primary verdict is preserved,

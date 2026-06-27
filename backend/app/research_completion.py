@@ -1643,6 +1643,50 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             "[RESEARCH] Task %s: resuming interrupted spawn from stored plan_output",
             task.id,
         )
+    # Stranded-resume backstop (cause B). A research task can reach this handler
+    # with no parseable findings in the (possibly stale/re-dispatched) logs while
+    # task.plan_output STILL holds the findings a prior pass committed AND zero
+    # children were ever spawned. This is the "completed/redispatched but
+    # stranded" state: the spawn errored mid-flight on the first pass and the
+    # _research_spawn_pending marker was never set (or was cleared) — so neither
+    # resume guard above fires, and the branch below would clobber plan_output to
+    # [] and report "no actionable findings" despite real undispatched work
+    # sitting in plan_output. Detect it explicitly and resume the spawn from the
+    # stored findings instead of burying them. Idempotent: if children already
+    # exist this guard is skipped, and the downstream duplicate-spawn guard makes
+    # any genuine re-run a no-op.
+    if (
+        not findings
+        and isinstance(task.plan_output, list)
+        and task.plan_output
+    ):
+        _stored_findings = [f for f in task.plan_output if isinstance(f, dict)]
+        if _stored_findings:
+            _existing_child_id = (
+                (
+                    await session.execute(
+                        select(Task.id)
+                        .where(Task.parent_task_id == task.id)
+                        .limit(1)
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if _existing_child_id is None:
+                findings = _stored_findings
+                logger.warning(
+                    "[RESEARCH] Task %s: STRANDED research detected — %d finding(s) "
+                    "in plan_output but 0 children spawned and logs no longer parse; "
+                    "resuming spawn from stored findings (was previously buried as "
+                    "'no actionable findings')",
+                    task.id,
+                    len(_stored_findings),
+                )
+                task.latest_status_message = (
+                    f"Recovering stranded research: resuming spawn of "
+                    f"{len(_stored_findings)} stored finding(s)"
+                )[:500]
     if not findings:
         task.latest_status_message = "Research completed with no actionable findings"
         task.plan_output = []
@@ -4396,6 +4440,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                             "live_release_proof_marker",
                             "requires_live_release",
                             "require_durable_artifact",
+                            "sweep_id",
+                            "setup_step",
+                            "container_image",
+                            "container_registry_auth",
+                            "declared_metric",
+                            "arms",
+                            "smoke_sample",
                         )
                         if _cc.get(k) is not None
                     },

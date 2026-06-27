@@ -6464,6 +6464,115 @@ async def test_run_qualification_managed_check_wait_is_noop(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_refreshes_stale_check_wait_under_lock(
+    db_session, mocker
+):
+    """Regression (re-qual serialization): a re-qualify must no-op even when the
+    caller passes a STALE in-memory version whose last_qualification predates the
+    promote() that set managed_check_wait in another session.
+
+    This reproduces the redundant-audit incident: the strategic qualify_request
+    path loads the open version via current_open_version() and may hold a copy
+    cached BEFORE promote() committed the managed check_wait.  Without
+    populate_existing on the under-lock FOR UPDATE re-select, that SELECT acquires
+    the row lock but returns the SAME stale identity-map instance, so the
+    promotion-in-flight guard reads non-blocking state and spawns a fresh audit +
+    merge-grade while the promotion PR is genuinely open.  With the fix the
+    re-select overwrites the cached attributes, so the guard sees the committed
+    check_wait and no-ops."""
+    from sqlalchemy import update as _sa_update
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-done",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-stale",
+        status=TaskStatus.COMPLETED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    # The caller's in-memory version: a NON-blocking 'pending' (audit done, no
+    # promotion_pending) — on its own this would spawn a fresh qualification
+    # (cf. test_run_qualification_pending_but_children_terminal_runs_fresh).
+    stale_state = {
+        "status": "pending",
+        "candidate_sha": "feed" * 10,
+        "ci_green": True,
+        "started_at": "2026-05-20T00:00:00",
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "smoketest_enabled": False,
+    }
+    version.last_qualification = stale_state
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    attempts_before = version.qualification_attempts
+
+    # Simulate another session committing the managed check_wait AFTER this
+    # session cached `version`: write it straight to the row with
+    # synchronize_session=False so the in-memory instance stays stale.
+    db_managed_state = {
+        **stale_state,
+        "promotion_pending": {
+            "pr_number": 909,
+            "pr_url": "https://github.com/o/r/pull/909",
+            "auto_merge_enabled": False,
+            "migration_carrying": True,
+            "managed_check_wait": True,
+        },
+    }
+    await db_session.execute(
+        _sa_update(rv.ReleaseVersion)
+        .where(rv.ReleaseVersion.id == version.id)
+        .values(last_qualification=db_managed_state)
+        .execution_options(synchronize_session=False)
+    )
+    # The in-memory copy is still the stale, non-blocking state.
+    assert "promotion_pending" not in version.last_qualification
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="cafe" * 10),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # The under-lock re-select refreshed the stale instance, so the
+    # promotion-in-flight guard caught the managed check_wait — no fresh spawn.
+    assert result["status"] == "promotion_check_wait"
+    assert result["promotion_pr_number"] == 909
+
+    await db_session.refresh(version)
+    assert version.last_qualification["promotion_pending"]["pr_number"] == 909
+    assert version.qualification_attempts == attempts_before
+
+    # Still exactly the one original audit child — no fresh audit/smoketest pair.
+    from sqlmodel import select as _select
+
+    tasks = (
+        (await db_session.execute(_select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(tasks) == 1
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_pending_but_children_terminal_runs_fresh(
     db_session, mocker
 ):
@@ -8838,6 +8947,404 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
 
     promote_c.assert_called_once()
     assert result_c == {"status": "promoted"}
+
+
+@pytest.mark.asyncio
+async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
+    db_session, mocker
+):
+    """Already-promoted exemption: when the previous qualification was
+    qualification_superseded (force-promoted out-of-band), the merge-grade block
+    is suppressed even when covers_goal=False.  A fresh version that never had
+    qualification_superseded still blocks.
+
+    Scenarios:
+      (a) prior_superseded=True + failing merge-grade -> NOT blocked, promote proceeds
+      (b) prior_superseded absent/False + failing merge-grade -> hard block (gate
+          remains load-bearing for never-promoted versions)
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    clean_audit = {
+        "audit_score": 1.0,
+        "test_erosion": {
+            "deleted_test_files": [],
+            "assertion_delta": 5,
+            "test_count_delta": 2,
+        },
+    }
+    clean_smoke = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+    failing_merge_grade = {
+        "covers_goal": False,
+        "coverage_score": 0.05,
+        "biggest_gap": "Stabilization-only tail commits; feature content already on main.",
+        "candidate_sha": "feed" * 10,
+    }
+    goal = "Deliver the already-promoted merge-grade exemption"
+
+    # --- (a) prior_superseded=True -> merge-grade block suppressed, promote proceeds
+    project_a, version_a = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_a,
+        version_a,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    # Stamp prior_superseded=True directly on last_qualification (simulates
+    # run_qualification carrying forward the qualification_superseded blocker).
+    version_a.last_qualification = {
+        **version_a.last_qualification,
+        "prior_superseded": True,
+    }
+    db_session.add(version_a)
+    await db_session.commit()
+    await db_session.refresh(version_a)
+
+    promote_a = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+    result_a = await rq._finalize_qualification(db_session, version_a)
+    await db_session.commit()
+
+    promote_a.assert_called_once()
+    assert result_a == {"status": "promoted"}, (
+        f"Expected promotion for superseded version but got: {result_a}"
+    )
+
+    # --- (b) prior_superseded absent -> gate still fires for a fresh version ---
+    project_b, version_b = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_b,
+        version_b,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    # Do NOT set prior_superseded — version_b is a never-promoted fresh version.
+    promote_b = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    result_b = await rq._finalize_qualification(db_session, version_b)
+    await db_session.commit()
+
+    assert result_b["status"] == "not_promoted"
+    assert result_b["blocker"] == "merge_grade_goal_coverage"
+    promote_b.assert_not_called()
+    await db_session.refresh(version_b)
+    assert version_b.last_qualification["status"] == "not_promoted"
+    assert version_b.last_qualification["blocker"] == "merge_grade_goal_coverage"
+
+
+@pytest.mark.asyncio
+async def test_finalize_merge_grade_suppressed_via_direct_on_main_check(
+    db_session, mocker
+):
+    """Direct GitHub ancestry fallback: when prior_superseded is NOT set (e.g.
+    GitHub-cred outage let the 6h timeout beat the supersession reconciler),
+    the merge-grade block is still suppressed when _candidate_already_on_main
+    returns True.
+
+    Scenarios:
+      (a) _candidate_already_on_main=True + prior_superseded absent -> suppressed,
+          promote proceeds
+      (b) _candidate_already_on_main=False + prior_superseded absent -> gate fires,
+          merge_grade_goal_coverage blocker set
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    clean_audit = {
+        "audit_score": 1.0,
+        "test_erosion": {
+            "deleted_test_files": [],
+            "assertion_delta": 5,
+            "test_count_delta": 2,
+        },
+    }
+    clean_smoke = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+    failing_merge_grade = {
+        "covers_goal": False,
+        "coverage_score": 0.05,
+        "biggest_gap": "Stabilization-only tail commits; feature content already on main.",
+        "candidate_sha": "feed" * 10,
+    }
+    goal = "Deliver the direct on-main ancestry exemption"
+
+    # --- (a) _candidate_already_on_main=True -> block suppressed, promote ---
+    project_a, version_a = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_a,
+        version_a,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    # Stamp blocker='qualification_timeout' WITHOUT prior_superseded (simulates
+    # cred-outage timeout race winning over the supersession reconciler).
+    version_a.last_qualification = {
+        **version_a.last_qualification,
+        "blocker": "qualification_timeout",
+        # prior_superseded intentionally absent
+    }
+    db_session.add(version_a)
+    await db_session.commit()
+    await db_session.refresh(version_a)
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.release_qualifier._candidate_already_on_main",
+        new=AsyncMock(return_value=True),
+    )
+    promote_a = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+    result_a = await rq._finalize_qualification(db_session, version_a)
+    await db_session.commit()
+
+    promote_a.assert_called_once()
+    assert result_a == {"status": "promoted"}, (
+        f"Expected promotion via direct on-main check but got: {result_a}"
+    )
+
+    # --- (b) _candidate_already_on_main=False -> gate still fires ---
+    project_b, version_b = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_b,
+        version_b,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.release_qualifier._candidate_already_on_main",
+        new=AsyncMock(return_value=False),
+    )
+    promote_b = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    result_b = await rq._finalize_qualification(db_session, version_b)
+    await db_session.commit()
+
+    assert result_b["status"] == "not_promoted"
+    assert result_b["blocker"] == "merge_grade_goal_coverage"
+    promote_b.assert_not_called()
+    await db_session.refresh(version_b)
+    assert version_b.last_qualification["blocker"] == "merge_grade_goal_coverage"
+
+
+@pytest.mark.asyncio
+async def test_finalize_already_on_main_resolved_pre_lock(db_session, mocker):
+    """_candidate_already_on_main is resolved BEFORE the FOR UPDATE lock.
+
+    Verifies the pre-gates refactor: the direct already-on-main ancestry check
+    (merge-grade exemption fallback) is hoisted out of _finalize_qualification
+    (which runs under the lock) into the pre-lock block in _finalize_locked_version.
+
+    Scenarios tested:
+      (a) pre_merge_grade_already_on_main=True in _pre_gates → block suppressed,
+          no second call to _candidate_already_on_main under the lock.
+      (b) pre_merge_grade_already_on_main=False in _pre_gates → gate still fires,
+          merge_grade_goal_coverage blocker set.
+      (c) Direct call with _pre_gates=None → inline fallback path still works
+          (fail-closed preserved for direct/timeout callers).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    clean_audit = {
+        "audit_score": 1.0,
+        "test_erosion": {
+            "deleted_test_files": [],
+            "assertion_delta": 5,
+            "test_count_delta": 2,
+        },
+    }
+    clean_smoke = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+    failing_merge_grade = {
+        "covers_goal": False,
+        "coverage_score": 0.05,
+        "biggest_gap": "Feature content already on main.",
+        "candidate_sha": "feed" * 10,
+    }
+    goal = "Deliver the pre-lock ancestry refactor"
+
+    # ── (a) Pre-gates path: _candidate_already_on_main called before lock, ──
+    #        block suppressed, NOT re-called inside _finalize_qualification.
+    project_a, version_a = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_a,
+        version_a,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    await db_session.commit()
+    await db_session.refresh(version_a)
+
+    call_log: list[str] = []
+    fq_entered = [False]
+    orig_fq = rq._finalize_qualification
+
+    async def tracking_fq_a(session, version, *, _pre_gates=None):
+        fq_entered[0] = True
+        call_log.append("finalize_qualification")
+        return await orig_fq(session, version, _pre_gates=_pre_gates)
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+
+    ancestry_call_count = [0]
+
+    async def tracked_already_on_main(*args, **kwargs):
+        if fq_entered[0]:
+            raise AssertionError(
+                "_candidate_already_on_main called inside _finalize_qualification "
+                "(under the lock) — must be called pre-lock only"
+            )
+        ancestry_call_count[0] += 1
+        call_log.append("already_on_main")
+        return True
+
+    mocker.patch(
+        "app.release_qualifier._candidate_already_on_main",
+        side_effect=tracked_already_on_main,
+    )
+    mocker.patch(
+        "app.release_qualifier._finalize_qualification",
+        side_effect=tracking_fq_a,
+    )
+    promote_a = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    factory = _shared_session_factory(db_session)
+    result_a = await rq._finalize_in_dedicated_session(
+        version_a.id, timeout_now=None, session_factory=factory
+    )
+    await db_session.commit()
+
+    assert "already_on_main" in call_log, (
+        "_candidate_already_on_main was not called pre-lock"
+    )
+    assert "finalize_qualification" in call_log, (
+        "_finalize_qualification was not called"
+    )
+    assert call_log.index("already_on_main") < call_log.index("finalize_qualification"), (
+        f"_candidate_already_on_main called AFTER _finalize_qualification: {call_log}"
+    )
+    promote_a.assert_called_once()
+    assert result_a == {"status": "promoted"}, (
+        f"Expected promotion via pre-lock ancestry check but got: {result_a}"
+    )
+
+    # ── (b) Pre-gates path: _candidate_already_on_main=False → gate fires ──
+    project_b, version_b = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_b,
+        version_b,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    await db_session.commit()
+    await db_session.refresh(version_b)
+
+    fq_entered[0] = False
+
+    mocker.patch(
+        "app.release_qualifier._candidate_already_on_main",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.release_qualifier._finalize_qualification",
+        side_effect=tracking_fq_a,
+    )
+    promote_b = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result_b = await rq._finalize_in_dedicated_session(
+        version_b.id, timeout_now=None, session_factory=factory
+    )
+    await db_session.commit()
+
+    assert result_b is not None and result_b.get("blocker") == "merge_grade_goal_coverage", (
+        f"Expected merge_grade_goal_coverage blocker when already_on_main=False, got: {result_b}"
+    )
+    promote_b.assert_not_called()
+
+    # ── (c) Direct call with _pre_gates=None → inline fallback path still works ──
+    project_c, version_c = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_c,
+        version_c,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    await db_session.commit()
+    await db_session.refresh(version_c)
+
+    mocker.patch(
+        "app.release_qualifier._candidate_already_on_main",
+        new=AsyncMock(return_value=True),
+    )
+    promote_c = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+
+    result_c = await rq._finalize_qualification(db_session, version_c, _pre_gates=None)
+    await db_session.commit()
+
+    promote_c.assert_called_once()
+    assert result_c == {"status": "promoted"}, (
+        f"Direct call with _pre_gates=None: expected promotion via inline fallback, got: {result_c}"
+    )
 
 
 @pytest.mark.asyncio
@@ -13325,6 +13832,7 @@ async def _seed_pending_qualification(
     audit_status: TaskStatus = TaskStatus.COMPLETED,
     smoke_status: TaskStatus = TaskStatus.COMPLETED,
     started_at: str | None = None,
+    candidate_sha: str | None = None,
 ) -> tuple[Task, Task]:
     """Create the two child tasks in the requested statuses and stamp
     version.last_qualification as 'pending' pointing to them.
@@ -13337,6 +13845,8 @@ async def _seed_pending_qualification(
     qualification-timeout window — sweep tests for the both-children-terminal
     path must not accidentally trip the age-bound timeout.  Pass an explicit
     old timestamp to exercise the timeout path.
+
+    ``candidate_sha`` defaults to a dummy value; override for testing specific SHAs.
     """
     from app.time_utils import _utcnow
 
@@ -13364,7 +13874,7 @@ async def _seed_pending_qualification(
 
     version.last_qualification = {
         "status": "pending",
-        "candidate_sha": "abcd" * 10,
+        "candidate_sha": candidate_sha or "abcd" * 10,
         "ci_green": True,
         "smoketest_enabled": True,
         "started_at": started_at or _utcnow().isoformat(),
@@ -15489,6 +15999,216 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
     )
     assert len(alerts) == 1
     assert "timed out" in alerts[0].title.lower()
+
+
+@pytest.mark.asyncio
+async def test_timed_out_already_promoted_uses_qualification_superseded(db_session, mocker):
+    """When a qualification times out but the candidate is already reachable
+    from the promotion target (out-of-band force-promotion), record
+    qualification_superseded blocker instead of the generic qualification_timeout.
+    This allows the already-promoted exemption to engage on re-qualification."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "abc123def456"
+
+    # Seed a pending qualification that is well past the timeout.
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+        started_at=old_started,
+        candidate_sha=candidate_sha,
+    )
+
+    # Mock GitHub to report that the candidate is already on the promotion target.
+    mocker.patch(
+        "app.release_qualifier_sweep._resolve_github_with_session",
+        new=AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.release_promotion._candidate_already_on_main",
+        new=AsyncMock(return_value=True),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 1
+
+    await db_session.refresh(version)
+    # Should record qualification_superseded, not qualification_timeout.
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["blocker"] == "qualification_superseded"
+    assert "already reachable" in version.last_qualification["detail"]
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+
+
+@pytest.mark.asyncio
+async def test_timed_out_not_promoted_uses_qualification_timeout(db_session, mocker):
+    """When a qualification times out and the candidate is NOT reachable from
+    the promotion target, record the generic qualification_timeout blocker."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "notpromoted123"
+
+    # Seed a pending qualification that is well past the timeout.
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+        started_at=old_started,
+        candidate_sha=candidate_sha,
+    )
+
+    # Mock GitHub to report that the candidate is NOT on the promotion target.
+    mocker.patch(
+        "app.release_qualifier_sweep._resolve_github_with_session",
+        new=AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.release_promotion._candidate_already_on_main",
+        new=AsyncMock(return_value=False),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 1
+
+    await db_session.refresh(version)
+    # Should record the generic qualification_timeout blocker.
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["blocker"] == "qualification_timeout"
+    assert "qualifier child never reached" in version.last_qualification["detail"]
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+
+
+@pytest.mark.asyncio
+async def test_timed_out_supersession_check_exception_falls_back_to_qualification_timeout(
+    db_session, mocker
+):
+    """When _candidate_already_on_main raises an exception, the sweep falls back
+    to qualification_timeout (fail-closed), never fabricating a supersession."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "deadbeef1234"
+
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+        started_at=old_started,
+        candidate_sha=candidate_sha,
+    )
+
+    mocker.patch(
+        "app.release_qualifier_sweep._resolve_github_with_session",
+        new=AsyncMock(return_value=("token", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.release_promotion._candidate_already_on_main",
+        new=AsyncMock(side_effect=RuntimeError("github 503")),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 1
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["blocker"] == "qualification_timeout"
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+
+
+@pytest.mark.asyncio
+async def test_timed_out_cred_missing_falls_back_to_qualification_timeout(
+    db_session, mocker
+):
+    """When _resolve_github_with_session returns None (no credentials), the sweep
+    falls back to qualification_timeout without fabricating a supersession."""
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(return_value=None),
+    )
+    from datetime import timedelta
+
+    from app.time_utils import _utcnow
+
+    project, version = await _make_project_and_version(db_session)
+    candidate_sha = "nocreds999abc"
+
+    old_started = (
+        _utcnow() - timedelta(seconds=rq._MAX_QUALIFICATION_DURATION_SECONDS + 3600)
+    ).isoformat()
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.IN_PROGRESS,
+        started_at=old_started,
+        candidate_sha=candidate_sha,
+    )
+
+    mocker.patch(
+        "app.release_qualifier_sweep._resolve_github_with_session",
+        new=AsyncMock(return_value=None),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert count == 1
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+    assert version.last_qualification["blocker"] == "qualification_timeout"
+    assert version.status == "open"
+    assert version.phase == "stabilize"
 
 
 # ===========================================================================

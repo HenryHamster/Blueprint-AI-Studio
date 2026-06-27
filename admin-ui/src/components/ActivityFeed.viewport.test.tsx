@@ -33,7 +33,6 @@ vi.mock('../api', () => ({
           scope: 'medium',
           direction_id: 'dir-abc123',
           review_iterations: 2,
-          status: 'NEEDS_REVIEW',
         },
         {
           id: 'evt-2',
@@ -45,6 +44,7 @@ vi.mock('../api', () => ({
           taxonomy: 'correctness',
           error_summary:
             'Error: Connection pool exhausted after 30s\n  at Database.connect (/app/db.ts:42:11)\n  at retryWithBackoff (/app/utils.ts:89:5)',
+          investigation_summary: 'Root cause: max_connections exceeded during peak load. Recommended fix: increase pool size.',
           duration_seconds: 1800,
         },
         {
@@ -53,14 +53,25 @@ vi.mock('../api', () => ({
           title: 'Research: Authentication patterns in microservices',
           timestamp: new Date(Date.now() - 1000 * 60 * 30).toISOString(),
           finding_count: 7,
-          status: 'NEEDS_REVIEW',
         },
         {
           id: 'evt-4',
           type: 'DEPLOY_EVENT',
-          title: 'Deployed v2.4.1 to production',
+          title: 'Deploy abc1234 — ROLLED_BACK',
           timestamp: new Date(Date.now() - 1000 * 60 * 60).toISOString(),
-          deploy_status: 'STABLE',
+          deploy_status: 'ROLLED_BACK',
+          commit_hash: 'abc1234',
+          rolled_back_from_sha: 'def5678',
+          rollback_count: 1,
+        },
+        {
+          id: 'evt-5',
+          type: 'TASK_IN_PROGRESS',
+          title: 'Running: migrate user sessions to Redis',
+          timestamp: new Date(Date.now() - 1000 * 60 * 2).toISOString(),
+          task_id: 'task-5',
+          task_type: 'create',
+          latest_status_message: 'Writing migration file…',
         },
       ]),
       { status: 200 },
@@ -175,7 +186,7 @@ describe('ActivityFeed — viewport regression', () => {
     if (!initialText.includes('connection pool exhaustion')) {
       throw new Error('Expected connection-pool event in initial render');
     }
-    if (!initialText.includes('Deployed v2.4.1')) {
+    if (!initialText.includes('Deploy abc1234')) {
       throw new Error('Expected deploy event in initial render');
     }
 
@@ -198,7 +209,7 @@ describe('ActivityFeed — viewport regression', () => {
     if (filteredText.includes('connection pool exhaustion')) {
       throw new Error('Non-matching event "connection pool exhaustion" should be filtered out');
     }
-    if (filteredText.includes('Deployed v2.4.1')) {
+    if (filteredText.includes('Deploy abc1234')) {
       throw new Error('Non-matching deploy event should be filtered out');
     }
     if (filteredText.includes('Authentication patterns in microservices')) {
@@ -232,7 +243,7 @@ describe('ActivityFeed — viewport regression', () => {
     }
   });
 
-  test('pending approval pill filters events by status === NEEDS_REVIEW', async () => {
+  test('Running pill filters feed to TASK_IN_PROGRESS events only', async () => {
     host = document.createElement('div');
     host.style.width = '800px';
     host.style.height = '600px';
@@ -251,56 +262,47 @@ describe('ActivityFeed — viewport regression', () => {
       );
     });
 
-    // Wait for events to load
     await act(async () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
     });
 
-    // Baseline: both TASK_COMPLETED and RESEARCH_FINDINGS events with status='NEEDS_REVIEW'
-    // plus TASK_FAILED and DEPLOY_EVENT without that status should all be visible
+    // All events visible initially
     const initialText = host?.textContent ?? '';
     if (!initialText.includes('OAuth2 PKCE')) {
       throw new Error('Expected OAuth event in initial render');
     }
-    if (!initialText.includes('connection pool exhaustion')) {
-      throw new Error('Expected connection-pool event in initial render');
-    }
-    if (!initialText.includes('Deployed v2.4.1')) {
-      throw new Error('Expected deploy event in initial render');
+    if (!initialText.includes('migrate user sessions')) {
+      throw new Error('Expected in-progress event in initial render');
     }
 
-    // Click "Pending Approval" pill to filter to NEEDS_REVIEW events
-    const pendingPill = Array.from(host?.querySelectorAll('button') ?? []).find(btn =>
-      btn.textContent?.includes('Pending Approval'),
+    // Click "Running" pill
+    const runningPill = Array.from(host?.querySelectorAll('button') ?? []).find(btn =>
+      btn.textContent?.trim() === 'Running',
     ) as HTMLButtonElement | null;
-    if (!pendingPill) {
-      throw new Error('Pending Approval pill not found');
+    if (!runningPill) {
+      throw new Error('Running pill not found');
     }
 
     await act(async () => {
-      fireEvent.click(pendingPill);
+      fireEvent.click(runningPill);
       await new Promise((resolve) => setTimeout(resolve, 50));
     });
 
-    // After filtering: only OAuth (evt-1, status=NEEDS_REVIEW) and Research (evt-3, status=NEEDS_REVIEW)
-    // should be visible. connection pool (evt-2) and deploy (evt-4) should not be shown.
+    // Only in-progress task should be visible
     const filteredText = host?.textContent ?? '';
-    if (!filteredText.includes('OAuth2 PKCE')) {
-      throw new Error('OAuth event (NEEDS_REVIEW) should be visible after filtering');
+    if (!filteredText.includes('migrate user sessions')) {
+      throw new Error('In-progress event should be visible after Running filter');
     }
-    if (!filteredText.includes('Authentication patterns in microservices')) {
-      throw new Error('Research event (NEEDS_REVIEW) should be visible after filtering');
+    if (filteredText.includes('OAuth2 PKCE')) {
+      throw new Error('Completed event should be hidden after Running filter');
     }
     if (filteredText.includes('connection pool exhaustion')) {
-      throw new Error('Non-NEEDS_REVIEW event "connection pool" should be filtered out');
-    }
-    if (filteredText.includes('Deployed v2.4.1')) {
-      throw new Error('Non-NEEDS_REVIEW deploy event should be filtered out');
+      throw new Error('Failed event should be hidden after Running filter');
     }
 
-    // Click "All" pill to restore all events
+    // Click "All" to restore
     const allPill = Array.from(host?.querySelectorAll('button') ?? []).find(btn =>
-      btn.textContent?.includes('All') && !btn.textContent?.includes('Pending'),
+      btn.textContent?.trim() === 'All',
     ) as HTMLButtonElement | null;
     if (!allPill) {
       throw new Error('All pill not found');
@@ -311,16 +313,105 @@ describe('ActivityFeed — viewport regression', () => {
       await new Promise((resolve) => setTimeout(resolve, 50));
     });
 
-    // After clicking All, all events should be visible again
     const restoredText = host?.textContent ?? '';
     if (!restoredText.includes('OAuth2 PKCE')) {
       throw new Error('OAuth event should be restored after clearing filter');
     }
-    if (!restoredText.includes('connection pool exhaustion')) {
-      throw new Error('connection pool event should be restored after clearing filter');
+    if (!restoredText.includes('migrate user sessions')) {
+      throw new Error('In-progress event should be restored after clearing filter');
     }
-    if (!restoredText.includes('Deployed v2.4.1')) {
-      throw new Error('Deploy event should be restored after clearing filter');
+  });
+
+  test('deploy rollback SHA indicator renders for ROLLED_BACK events', async () => {
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    await act(async () => {
+      r.render(
+        <ActivityFeed
+          selectedProjectId={null}
+          refreshInterval={0}
+          onSelectTask={() => {}}
+          onClose={() => {}}
+        />,
+      );
+    });
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    });
+
+    const text = host?.textContent ?? '';
+    // The deploy event with rolled_back_from_sha='def5678' should render a rollback indicator
+    if (!text.includes('rolled back from def5678')) {
+      throw new Error('Expected "rolled back from def5678" rollback indicator');
+    }
+  });
+
+  test('failed task shows investigation summary when present', async () => {
+    host = document.createElement('div');
+    host.style.width = '800px';
+    host.style.height = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    await act(async () => {
+      r.render(
+        <ActivityFeed
+          selectedProjectId={null}
+          refreshInterval={0}
+          onSelectTask={() => {}}
+          onClose={() => {}}
+        />,
+      );
+    });
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    });
+
+    // Filter to failed tasks so the event is definitely visible
+    const failedPill = Array.from(host?.querySelectorAll('button') ?? []).find(btn =>
+      btn.textContent?.trim() === 'Failed',
+    ) as HTMLButtonElement | null;
+    if (!failedPill) {
+      throw new Error('Failed pill not found');
+    }
+
+    await act(async () => {
+      fireEvent.click(failedPill);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const text = host?.textContent ?? '';
+    if (!text.includes('fix(db): resolve connection pool exhaustion')) {
+      throw new Error('Expected failed task title to be visible');
+    }
+    if (!text.includes('connection pool exhaustion')) {
+      throw new Error('Expected error_summary to be visible on the failed task card');
+    }
+
+    // When both error_summary and investigation_summary are present, investigation_summary
+    // is revealed by expanding the card. Click the expand button and verify it renders.
+    const expandBtn = Array.from(host?.querySelectorAll('button') ?? []).find(
+      btn => btn.getAttribute('title') === 'Expand error',
+    ) as HTMLButtonElement | null;
+    if (!expandBtn) {
+      throw new Error('Expand error button not found on failed task card');
+    }
+    await act(async () => {
+      fireEvent.click(expandBtn);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+
+    const expandedText = host?.textContent ?? '';
+    if (!expandedText.includes('Root cause: max_connections exceeded during peak load')) {
+      throw new Error('Expected investigation_summary text to be rendered after expanding the card');
     }
   });
 });

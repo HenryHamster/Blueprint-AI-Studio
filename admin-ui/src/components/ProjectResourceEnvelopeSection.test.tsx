@@ -195,6 +195,7 @@ describe('ProjectResourceEnvelopeSection', () => {
       spend_warning_fraction: null,
       allowed_machine_types: null,
       allowed_accelerator_types: null,
+      require_local_runner: false,
     });
   });
 
@@ -336,6 +337,7 @@ describe('ProjectResourceEnvelopeSection', () => {
       spend_warning_fraction: null,
       allowed_machine_types: ['e2-standard-4'],
       allowed_accelerator_types: ['L4'],
+      require_local_runner: false,
     });
   });
 
@@ -375,6 +377,7 @@ describe('ProjectResourceEnvelopeSection', () => {
       spend_warning_fraction: null,
       allowed_machine_types: null,
       allowed_accelerator_types: [],
+      require_local_runner: false,
     });
   });
 
@@ -417,6 +420,7 @@ describe('ProjectResourceEnvelopeSection', () => {
       spend_warning_fraction: null,
       allowed_machine_types: null,
       allowed_accelerator_types: null,
+      require_local_runner: false,
     });
   });
 });

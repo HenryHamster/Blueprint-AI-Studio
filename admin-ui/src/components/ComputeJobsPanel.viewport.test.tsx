@@ -149,6 +149,90 @@ const commandLogJobs: ComputeJob[] = [
   },
 ];
 
+const fusedVerdictJobs: ComputeJob[] = [
+  {
+    id: 'job-held',
+    project_id: 'proj-1',
+    task_id: 'task-held',
+    backend: 'gcp_compute_engine',
+    external_compute_id: null,
+    machine_type: 'e2-standard-2',
+    status: 'SUCCEEDED',
+    terminal_reason: 'experiment completed',
+    outcome: 'SUCCESS',
+    spend_cap_usd: 5.0,
+    wall_clock_deadline: null,
+    created_at: new Date(Date.now() - 900_000).toISOString(),
+    updated_at: new Date(Date.now() - 300_000).toISOString(),
+    started_at: new Date(Date.now() - 890_000).toISOString(),
+    completed_at: new Date(Date.now() - 300_000).toISOString(),
+    last_polled_at: new Date(Date.now() - 300_000).toISOString(),
+    accrued_cost_usd: 1.5,
+    final_cost_usd: 1.5,
+    result_reference: null,
+    task_title: 'Hypothesis-HELD: accuracy improves with augmentation',
+    task_type: 'compute_experiment',
+    experiment: 'aug-accuracy-v1',
+    hypothesis: 'Data augmentation will raise accuracy above 0.9 on the held-out set.',
+    success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+    criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.94, met: true, measurable: true },
+  },
+  {
+    id: 'job-refuted',
+    project_id: 'proj-1',
+    task_id: 'task-refuted',
+    backend: 'gcp_compute_engine',
+    external_compute_id: null,
+    machine_type: 'e2-standard-2',
+    status: 'SUCCEEDED',
+    terminal_reason: 'experiment completed',
+    outcome: 'SUCCESS',
+    spend_cap_usd: 5.0,
+    wall_clock_deadline: null,
+    created_at: new Date(Date.now() - 800_000).toISOString(),
+    updated_at: new Date(Date.now() - 400_000).toISOString(),
+    started_at: new Date(Date.now() - 790_000).toISOString(),
+    completed_at: new Date(Date.now() - 400_000).toISOString(),
+    last_polled_at: new Date(Date.now() - 400_000).toISOString(),
+    accrued_cost_usd: 2.0,
+    final_cost_usd: 2.0,
+    result_reference: null,
+    task_title: 'Hypothesis-REFUTED: latency within budget',
+    task_type: 'compute_experiment',
+    experiment: 'latency-budget-v1',
+    hypothesis: 'The optimized inference path will keep latency under 100ms.',
+    success_criterion: { metric: 'latency_ms', operator: '<=', threshold: 100 },
+    criterion_verdict: { metric: 'latency_ms', operator: '<=', threshold: 100, value: 145, met: false, measurable: true },
+  },
+  {
+    id: 'job-inconclusive',
+    project_id: 'proj-1',
+    task_id: 'task-inconclusive',
+    backend: 'gcp_compute_engine',
+    external_compute_id: null,
+    machine_type: 'e2-standard-2',
+    status: 'SUCCEEDED',
+    terminal_reason: 'experiment completed',
+    outcome: 'SUCCESS',
+    spend_cap_usd: 5.0,
+    wall_clock_deadline: null,
+    created_at: new Date(Date.now() - 700_000).toISOString(),
+    updated_at: new Date(Date.now() - 500_000).toISOString(),
+    started_at: new Date(Date.now() - 690_000).toISOString(),
+    completed_at: new Date(Date.now() - 500_000).toISOString(),
+    last_polled_at: new Date(Date.now() - 500_000).toISOString(),
+    accrued_cost_usd: 1.0,
+    final_cost_usd: 1.0,
+    result_reference: null,
+    task_title: 'Hypothesis-INCONCLUSIVE: f1 improvement',
+    task_type: 'compute_experiment',
+    experiment: 'f1-improvement-v1',
+    hypothesis: 'The new loss weighting scheme will improve F1 above 0.8.',
+    success_criterion: { metric: 'f1', operator: '>=', threshold: 0.8 },
+    criterion_verdict: { metric: 'f1', operator: '>=', threshold: 0.8, value: null, met: false, measurable: false },
+  },
+];
+
 const armsJobs: ComputeJob[] = [
   {
     id: 'job-arms-vp',
@@ -277,6 +361,31 @@ describe('ComputeJobsPanel — viewport regression', () => {
     );
   });
 
+  test('renders HELD/REFUTED/INCONCLUSIVE fused verdict cards at 1280px', async () => {
+    jobsToReturn = fusedVerdictJobs;
+    await expectFullViewportAt(
+      1280,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+        const text = host.textContent ?? '';
+        if (!text.includes('HELD')) throw new Error('HELD verdict badge not rendered');
+        if (!text.includes('REFUTED')) throw new Error('REFUTED verdict badge not rendered');
+        if (!text.includes('INCONCLUSIVE')) throw new Error('INCONCLUSIVE verdict badge not rendered');
+        const held = host.querySelector('[data-testid="verdict-label"]');
+        if (!held) throw new Error('verdict-label testid not found');
+      },
+      { waitMs: 60 },
+    );
+  });
+
   test('renders terminal job with per-arm breakdown without overflow at 1024px', async () => {
     jobsToReturn = armsJobs;
     await expectFullViewportAt(
@@ -294,6 +403,56 @@ describe('ComputeJobsPanel — viewport regression', () => {
         const text = host.textContent ?? '';
         if (!text.includes('arm-lr-0.01')) throw new Error('arms breakdown not rendered');
         if (text.includes('[object Object]')) throw new Error('[object Object] still rendered');
+      },
+      { waitMs: 60 },
+    );
+  });
+
+  test('renders re-run button disabled when job has no source task at 1024px', async () => {
+    const jobWithoutTaskId: ComputeJob = {
+      id: 'job-no-task',
+      project_id: 'proj-1',
+      task_id: null,
+      backend: 'gcp_compute_engine',
+      external_compute_id: null,
+      machine_type: 'e2-standard-2',
+      status: 'SUCCEEDED',
+      terminal_reason: 'experiment completed',
+      outcome: 'SUCCESS',
+      spend_cap_usd: 5.0,
+      wall_clock_deadline: null,
+      created_at: new Date(Date.now() - 900_000).toISOString(),
+      updated_at: new Date(Date.now() - 300_000).toISOString(),
+      started_at: new Date(Date.now() - 890_000).toISOString(),
+      completed_at: new Date(Date.now() - 300_000).toISOString(),
+      last_polled_at: new Date(Date.now() - 300_000).toISOString(),
+      accrued_cost_usd: 1.5,
+      final_cost_usd: 1.5,
+      result_reference: null,
+      task_title: 'compute_experiment: no source task',
+      task_type: 'compute_experiment',
+    };
+    jobsToReturn = [jobWithoutTaskId];
+    await expectFullViewportAt(
+      1024,
+      async () => {
+        host = document.createElement('div');
+        host.style.padding = '12px';
+        document.body.appendChild(host);
+        const r = createRoot(host);
+        root = r;
+        await act(async () => {
+          r.render(<ComputeJobsPanel projectId="proj-1" onDuplicateTask={async () => {}} />);
+        });
+        await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+        const text = host.textContent ?? '';
+        if (!text.includes('no source task')) throw new Error('job title not rendered');
+        if (!text.includes('Run analysis')) throw new Error('Run analysis button not rendered');
+        if (!text.includes('Re-run')) throw new Error('Re-run button not rendered');
+        const allBtns = Array.from(host.querySelectorAll('button'));
+        const rerunBtn = allBtns.find(btn => (btn.textContent ?? '').includes('Re-run'));
+        if (!rerunBtn) throw new Error('Re-run button element not found');
+        if (!rerunBtn.disabled) throw new Error('Re-run button should be disabled');
       },
       { waitMs: 60 },
     );

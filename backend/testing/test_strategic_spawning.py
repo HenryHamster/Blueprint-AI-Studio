@@ -740,6 +740,8 @@ async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session)
         "compute_acceptance_reason",
         "unavailable_cause",
         "origin_provenance",
+        "sweep_id",
+        "arm_label",
     }
 
 
@@ -761,6 +763,105 @@ async def test_spawn_review_omits_knowledge_index_when_none(db_session):
         if t.payloads[0]["type"] == "strategic_review"
     )
     assert "knowledge_index" not in payload
+
+
+# ── compute_experiment_sweeps in strategic payloads ──────────────────────────
+
+
+async def _seed_sweep_arm(
+    session, project, *, sweep_id, arm_label, title="Arm doc"
+):
+    """Persist one compute_experiment KnowledgeDocument carrying sweep identity."""
+    from app.models import KnowledgeDocument
+
+    task = Task(
+        project_id=project.id,
+        title="compute src",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=task.id,
+        title=title,
+        summary="Arm measured summary.",
+        body="# Body\n\n" + ("x" * 50),
+        topic="perf",
+        source_kind="compute_experiment",
+        sweep_id=sweep_id,
+        arm_label=arm_label,
+    )
+    session.add(doc)
+    await session.commit()
+    await session.refresh(doc)
+    return doc
+
+
+def test_compute_experiment_sweeps_registered_in_both_schemas():
+    """The packer must know about compute_experiment_sweeps so it never warns /
+    drops it as an unregistered key."""
+    assert "compute_experiment_sweeps" in _STRATEGIC_REVIEW_SCHEMA
+    assert "compute_experiment_sweeps" in _DESIGN_DOC_UPDATE_SCHEMA
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_includes_sweep_groups_when_multi_arm_sweep_exists(
+    db_session,
+):
+    """strategic_review carries the per-sweep comparative grouping when a sweep
+    has at least two completed arms."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+    await _seed_sweep_arm(
+        db_session, project, sweep_id="sw-aaaa", arm_label="baseline"
+    )
+    await _seed_sweep_arm(
+        db_session, project, sweep_id="sw-aaaa", arm_label="treatment"
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "strategic_review"
+    )
+    assert "compute_experiment_sweeps" in payload
+    groups = payload["compute_experiment_sweeps"]
+    # build_compute_sweep_groups returns {sweep_id: [_knowledge_index_entry, ...]}
+    assert "sw-aaaa" in groups
+    assert {entry["arm_label"] for entry in groups["sw-aaaa"]} == {"baseline", "treatment"}
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_omits_sweep_groups_when_none(db_session):
+    """strategic_review omits compute_experiment_sweeps entirely when no
+    multi-arm sweeps have completed."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+    # A single-arm sweep is not comparative → no group emitted.
+    await _seed_sweep_arm(db_session, project, sweep_id="sw-solo", arm_label="only")
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "strategic_review"
+    )
+    assert "compute_experiment_sweeps" not in payload
 
 
 @pytest.mark.asyncio
@@ -13470,6 +13571,57 @@ def test_summarize_efficiency_snapshot_forwards_gate_health():
     assert peff["challenged_degraded"] == 1
     assert peff["effective_coverage"] == 0.85
     assert "history" not in peff, "history array must be stripped from summarized payload"
+
+
+def test_summarize_efficiency_snapshot_forwards_post_deploy_gate_health():
+    """panel_review_effectiveness_post_deploy is forwarded by _summarize_efficiency_snapshot.
+
+    The deploy-scoped gate-health block lets the strategist see post-deploy
+    adversarial coverage that resets every deploy, without having to fetch it
+    separately.
+    """
+    from app.strategic_spawning import _summarize_efficiency_snapshot
+
+    gate_health_pd = {
+        "state": "HEALTHY",
+        "fail_open_rate": 0.01,
+        "total_invocations": 35,
+        "min_sample": 30,
+    }
+    snapshot = {
+        "axes": {
+            "cost_per_merged_pr": {
+                "current": 1.5,
+                "baseline": 2.0,
+                "drift_pct": -25.0,
+                "history": [],
+            }
+        },
+        "baseline_captured_at": "2026-04-05T00:00:00",
+        "last_snapshot_at": "2026-05-01T00:00:00",
+        "panel_review_effectiveness_post_deploy": {
+            "gate_health": gate_health_pd,
+            "fail_open_rate": 0.01,
+            "total_challenged": 34,
+            "challenged_degraded": 0,
+            "effective_coverage": 0.90,
+            # history stripped by summarize
+            "history": [{"captured_at": "2026-05-01", "value": 0.01}],
+        },
+    }
+    result = _summarize_efficiency_snapshot(snapshot)
+    assert "panel_review_effectiveness_post_deploy" in result, (
+        "panel_review_effectiveness_post_deploy missing from summarized snapshot"
+    )
+    peff_pd = result["panel_review_effectiveness_post_deploy"]
+    assert peff_pd["gate_health"] == gate_health_pd, (
+        "gate_health verdict not forwarded faithfully"
+    )
+    assert peff_pd["fail_open_rate"] == 0.01
+    assert peff_pd["total_challenged"] == 34
+    assert peff_pd["challenged_degraded"] == 0
+    assert peff_pd["effective_coverage"] == 0.90
+    assert "history" not in peff_pd, "history array must be stripped from summarized payload"
 
 
 def test_summarize_efficiency_snapshot_forwards_format_miss_attribution():

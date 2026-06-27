@@ -41,7 +41,10 @@ from app.review_pipeline import (
 )
 from app.rollup_branch_cleanup import (  # noqa: F401 — re-exported for callers/tests
     _branch_task_id_prefix,
+    _classify_prs_authoritative,
     _cleanup_branches,
+    _extract_task_pr_numbers,
+    _is_owner_chain_live,
     _partition_orphan_prs,
 )
 from app.rollup_migration_validation import (  # noqa: F401 - re-exported for callers/tests
@@ -421,6 +424,67 @@ def _propagate_landed_to_rollup_children(
         if has_merge_unblock_signal(child) and not has_landed_signal(child):
             mark_landed_on_integration(child)
             session.add(child)
+
+
+async def _propagate_landed_to_staging_merged_descendants(
+    parent_task_id, session: AsyncSession
+) -> None:
+    """Recursively stamp landed_on_integration on all staging-merged descendants.
+
+    ``_propagate_landed_to_rollup_children`` only touches the direct children
+    present in ``completed_children``.  When a lineage contains nested
+    research/rollup sub-tasks, code tasks at deeper levels (grandchildren of
+    the top-level rollup, etc.) were merged to an intermediate staging branch
+    — not directly to integration — and would otherwise be left with
+    ``landed_on_integration=False`` even though their code reached the
+    integration trunk via the ancestor rollup merge.
+
+    This function walks the full subtree rooted at *parent_task_id* via BFS
+    and stamps ``landed_on_integration=True`` on every descendant that carries
+    ``has_merge_unblock_signal=True`` (pr_merged=True) but not yet
+    ``has_landed_signal``, skipping force-dropped children exactly as the sync
+    helper does.  Idempotent: descendants that already carry the landed signal
+    are skipped.
+    """
+    from app.landed_signal import (
+        NON_MERGE_UNBLOCK_REASON_KEY,
+        has_landed_signal,
+        has_merge_unblock_signal,
+        mark_landed_on_integration,
+    )
+
+    visited: set = {parent_task_id}
+    queue: list = [parent_task_id]
+
+    while queue:
+        rows = (
+            (
+                await session.execute(
+                    select(Task).where(Task.parent_task_id.in_(queue))
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+        next_queue: list = []
+        for row in rows:
+            if row.id in visited:
+                continue
+            visited.add(row.id)
+
+            ctx = row.context or {}
+            if (
+                ctx.get(NON_MERGE_UNBLOCK_REASON_KEY) not in _FORCE_DROP_REASONS
+                and has_merge_unblock_signal(row)
+                and not has_landed_signal(row)
+            ):
+                mark_landed_on_integration(row)
+                session.add(row)
+
+            next_queue.append(row.id)
+
+        queue = next_queue
 
 
 async def _hold_rollup_for_branch_safety(
@@ -2072,38 +2136,52 @@ async def _check_and_trigger_rollup(
                         raise
 
                 # ── Drop orphan PRs left by CANCELLED children ──
-                # A child task that was cancelled (e.g. requeue-replaced after a
-                # timeout, or SCOPE_EMPTY pre-empted) can leave its PR open: no
-                # live task will ever drive it to merge, so blocking the rollup
-                # on it strands the parent in EVALUATING forever (incident
-                # 2026-05-28). The cancel path can't always close it — the PR ref
-                # may live under a non-canonical context key (e.g. a safeguard
-                # PR) so close_orphan_pr_if_any finds nothing. Attribute each
-                # open PR to its owning child by work-branch id-prefix and close
-                # the ones owned by a cancelled child, then block only on the
-                # rest. This runs in the lock-released window: the child query is
-                # read-only and the GitHub close is independent of the DB lock.
+                # Attribution uses the authoritative task↔PR link (pr_number recorded
+                # in context) rather than branch-name regex, so staging-branch-headed
+                # sub-rollup PRs (plan/8hex, research/8hex) are handled correctly.
+                # A PR is orphaned only when EVERY recorded owner is terminal-and-dead-
+                # ended (no live _replaced_by_task_id chain). PRs with no recorded owner
+                # stay blocking — we never auto-close a PR we can't attribute to a task.
+                # Race guard: we re-classify the initially-orphaned PRs with fresh DB
+                # data immediately before closing — if any owner went live in the
+                # interim, we abort the close for that PR and defer to next cycle.
+                # The Phase B3 relock below provides additional protection: if the
+                # parent was mutated (new task spawned), that cycle aborts entirely.
                 if open_prs:
                     try:
-                        _child_rows = (
+                        _child_tasks = (
                             await session.execute(
-                                select(Task.id, Task.status).where(
+                                select(Task).where(
                                     Task.parent_task_id == parent_id_local
                                 )
                             )
-                        ).all()
-                        _cancelled_prefixes = {
-                            str(_cid).replace("-", "")[:8].lower()
-                            for _cid, _cstatus in _child_rows
-                            if _cstatus == TaskStatus.CANCELLED
-                        }
-                        _live_prs, _orphan_prs = _partition_orphan_prs(
-                            open_prs, _cancelled_prefixes
+                        ).scalars().all()
+                        _live_prs, _orphan_prs = _classify_prs_authoritative(
+                            open_prs, _child_tasks
                         )
                         if _orphan_prs:
                             from app.github import close_pull_request
 
-                            for _opr in _orphan_prs:
+                            # Re-check with fresh data immediately before closing —
+                            # a retry/respawn between list-time and close-time could
+                            # adopt one of the identified orphan PRs.
+                            # populate_existing=True forces the ORM to re-read
+                            # already-loaded rows from the DB rather than returning
+                            # stale identity-mapped instances — detects concurrent
+                            # owner-status changes committed since the first query.
+                            _fresh_child_tasks = (
+                                await session.execute(
+                                    select(Task).where(
+                                        Task.parent_task_id == parent_id_local
+                                    ).execution_options(populate_existing=True)
+                                )
+                            ).scalars().all()
+                            _still_live, _confirmed_orphans = _classify_prs_authoritative(
+                                _orphan_prs, _fresh_child_tasks
+                            )
+                            _live_prs.extend(_still_live)
+
+                            for _opr in _confirmed_orphans:
                                 _onum = _opr.get("number")
                                 _oref = (_opr.get("head") or {}).get("ref", "")
                                 try:
@@ -2116,8 +2194,8 @@ async def _check_and_trigger_rollup(
                                     )
                                     logger.info(
                                         f"[ROLLUP] Closed orphan PR #{_onum} (head "
-                                        f"'{_oref}') from a cancelled child — was "
-                                        f"blocking rollup of {parent_id_local}"
+                                        f"'{_oref}') — all owners terminal-and-dead-ended, "
+                                        f"was blocking rollup of {parent_id_local}"
                                     )
                                 except Exception as _oerr:
                                     logger.warning(
@@ -2355,6 +2433,9 @@ async def _check_and_trigger_rollup(
                                 )
                                 _propagate_landed_to_rollup_children(
                                     completed_children, session
+                                )
+                                await _propagate_landed_to_staging_merged_descendants(
+                                    parent.id, session
                                 )
                             if _terminal_rollup_merge:
                                 parent.latest_status_message = (
@@ -2762,6 +2843,9 @@ async def _check_and_trigger_rollup(
                         )
                         _propagate_landed_to_rollup_children(
                             completed_children, session
+                        )
+                        await _propagate_landed_to_staging_merged_descendants(
+                            parent.id, session
                         )
                     session.add(parent)
                     await session.commit()
@@ -3186,6 +3270,9 @@ async def _check_and_trigger_rollup(
                             )
                             _propagate_landed_to_rollup_children(
                                 completed_children, session
+                            )
+                            await _propagate_landed_to_staging_merged_descendants(
+                                parent.id, session
                             )
                         if _terminal_rollup_merge:
                             parent.latest_status_message = (
@@ -3667,6 +3754,9 @@ async def _check_and_trigger_rollup(
                                         _propagate_landed_to_rollup_children(
                                             completed_children, session
                                         )
+                                        await _propagate_landed_to_staging_merged_descendants(
+                                            parent.id, session
+                                        )
                                     if _rp_terminal:
                                         parent.latest_status_message = (
                                             f"All {completed_count} subtasks merged, "
@@ -3936,6 +4026,9 @@ async def _check_and_trigger_rollup(
                                             )
                                             _propagate_landed_to_rollup_children(
                                                 completed_children, session
+                                            )
+                                            await _propagate_landed_to_staging_merged_descendants(
+                                                parent.id, session
                                             )
                                         if _esc_terminal:
                                             parent.latest_status_message = (

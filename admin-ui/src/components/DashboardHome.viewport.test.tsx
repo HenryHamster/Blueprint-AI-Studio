@@ -263,6 +263,11 @@ vi.mock('../api', () => ({
     goal_updated_at: '2026-05-20T12:00:00Z',
     goal_editor_info: '[operator:test]',
   })),
+  setVersionTheme: vi.fn(async () => ({
+    version_number: 42,
+    theme: 'leanness',
+    theme_updated_at: '2026-05-20T12:00:00Z',
+  })),
   triggerQualify: vi.fn(async () => ({ status: 'dry_run' })),
   cutVersion: vi.fn(async () => ({
     abandoned_version: { version_number: 42, status: 'abandoned' },

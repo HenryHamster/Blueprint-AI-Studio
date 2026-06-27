@@ -6973,6 +6973,54 @@ def test_classify_orphan_provisioning_silent_preclaim_death():
     assert _classify_orphan(t, now, has_open_pr=False) is True
 
 
+def test_classify_orphan_runner_pin_awaiting_pull_not_preclaim_reaped():
+    now = datetime.utcnow()
+    # Pinned to a self-hosted runner (vm_instance_id='runner:{id}') and not yet
+    # pulled (started_at IS NULL). vm_provisioned_at is well past the small-scope
+    # 6min preclaim cutoff and there is no heartbeat — the EXACT shape the
+    # pre-claim VM-death branch would otherwise reap. But no GCE VM ever existed;
+    # the task is waiting for the operator's runner to poll, so it must NOT be
+    # classified as a pre-claim orphan (the M2 over-pin churn fix).
+    t = _FakeClassifyTask(
+        status=TaskStatus.PROVISIONING,
+        vm_provisioned_at=now - timedelta(minutes=30),
+        last_heartbeat=None,
+        started_at=None,
+        vm_instance_id="runner:11111111-1111-1111-1111-111111111111",
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is False
+
+
+def test_classify_orphan_runner_pin_after_pull_still_reaped_at_ceiling():
+    now = datetime.utcnow()
+    # Once the runner pulls a pin it stamps started_at (runner.py next-task). A
+    # pulled runner task that then blows the 15min absolute provisioning ceiling
+    # is genuinely stuck and must still be reaped — the exclusion only covers the
+    # awaiting-pull window (started_at IS NULL), not pulled work.
+    t = _FakeClassifyTask(
+        status=TaskStatus.PROVISIONING,
+        started_at=now - timedelta(minutes=16),
+        vm_instance_id="runner:11111111-1111-1111-1111-111111111111",
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+
+
+def test_classify_orphan_non_runner_preclaim_still_reaped_with_null_started_at():
+    now = datetime.utcnow()
+    # A cloud/GCE pin (non-'runner:' vm id) with the same started_at IS NULL +
+    # stale vm_provisioned_at + no heartbeat shape IS a silent pre-claim death and
+    # must still be reaped — the runner exclusion is scoped strictly to the
+    # 'runner:' prefix and changes nothing for cloud VMs.
+    t = _FakeClassifyTask(
+        status=TaskStatus.PROVISIONING,
+        vm_provisioned_at=now - timedelta(minutes=7),
+        last_heartbeat=None,
+        started_at=None,
+        vm_instance_id="agent-vm-abc123",
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+
+
 def test_classify_orphan_in_progress_heartbeat_stale():
     now = datetime.utcnow()
     t = _FakeClassifyTask(

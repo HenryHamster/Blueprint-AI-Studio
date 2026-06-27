@@ -119,8 +119,7 @@ export default function ArchiveView({
         <div className="flex items-center gap-2">
           {onPurgeArchive && (
             <div className="relative group">
-              {/* eslint-disable-next-line viewport/min-touch-target -- dense UI */}
-              <button
+                  <button
                 className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-neutral-800 text-red-400 hover:bg-red-900/30 hover:text-red-300 border border-neutral-700 hover:border-red-800 transition-colors"
                 title="Permanently delete archived tasks"
               >

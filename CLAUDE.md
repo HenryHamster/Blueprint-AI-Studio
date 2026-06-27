@@ -13,7 +13,7 @@
 - Backend, targeted — **the default for task work**: `bash scripts/test-backend.sh testing/test_<module>.py [more files]` — run the test files covering what you changed.
 - Backend, standalone smoke (no DB): `bash scripts/test-backend.sh --standalone --no-postgres` — invariant/security/pipeline files; this is what `./check test` runs.
 - Backend, FULL suite: `bash scripts/test-backend.sh` with no test-file arguments — **never run this on an agent VM.** It builds the Docker image and runs the entire DB-backed suite: 45–60+ min on a 2-vCPU/8 GB VM (OOM-prone), and redundant — CI runs the same suite sharded once at the automain→main promotion PR (which targets `main`). The bare invocation exists for developer machines, not task VMs.
-- Frontend: `cd admin-ui && npm run build && npx eslint .`
+- Frontend (agent VM): `cd admin-ui && npm run typecheck && npx eslint .` — `npm run build` (vite bundle) OOMs on agent VMs; typecheck catches type errors; the full vite build runs in CI.
 - Agent: `cd agent && npx tsc --noEmit`
 
 ## Test Guidelines
@@ -25,7 +25,7 @@
 
 ## Common Patterns
 - `task.first_payload` is the standard accessor for the first payload element (not `(task.payloads or [{}])[0]`)
-- Verify before finishing with TARGETED tests: run the backend test files covering your change (`bash scripts/test-backend.sh testing/test_<module>.py`), plus `cd admin-ui && npm run build` if you touched frontend. Do NOT run the full backend suite on an agent VM — your task PR gets targeted/per-change CI; the full sharded matrix runs once at the automain→main promotion PR.
+- Verify before finishing with TARGETED tests: run the backend test files covering your change (`bash scripts/test-backend.sh testing/test_<module>.py`), plus `cd admin-ui && npm run typecheck` if you touched frontend (use this on agent VMs — `npm run build` OOMs there; CI runs the full vite build). Do NOT run the full backend suite on an agent VM — your task PR gets targeted/per-change CI; the full sharded matrix runs once at the automain→main promotion PR.
 - New admin endpoints need `@require_project_access` or `@require_role` decorators
 
 ## Generating Code for One Language From Another

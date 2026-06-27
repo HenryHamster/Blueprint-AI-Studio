@@ -177,6 +177,39 @@ def _build_retired_directions_summary(
         if len(results) >= max_count:
             break
 
+    # Augment with durable retired-direction memory for directions pruned from
+    # the live list. The lifecycle pass removes terminal directions from
+    # project.directions, so directions retired a cycle ago are invisible to the
+    # loop above. vision['_recently_retired_directions'] survives pruning and
+    # stores compact entries (id, text_tokens, retired_at, reason, gap_id).
+    # Adding them here ensures the agent sees cross-cycle retirements and can
+    # avoid re-proposing work for the same gaps.
+    vision = project.vision or {}
+    recently_retired_memory = vision.get("_recently_retired_directions") or []
+    if recently_retired_memory and len(results) < max_count:
+        existing_ids = {r.get("id") for r in results if r.get("id")}
+        for mem_entry in reversed(recently_retired_memory):  # newest first
+            if len(results) >= max_count:
+                break
+            entry_id = mem_entry.get("id", "")
+            if not entry_id or entry_id in existing_ids:
+                continue
+            retired_at = mem_entry.get("retired_at", "")
+            if retired_at and retired_at < cutoff_iso:
+                continue
+            text = " ".join(mem_entry.get("text_tokens") or [])
+            mem_result: dict = {
+                "id": entry_id,
+                "text": text[:200],
+                "status": "retired",
+                "cycles": 0,
+                "prs_merged": 0,
+            }
+            if mem_entry.get("reason"):
+                mem_result["retirement_reason"] = str(mem_entry["reason"])[:200]
+            results.append(mem_result)
+            existing_ids.add(entry_id)
+
     # Newest retired first (best proxy: sort by id descending is unreliable;
     # use retired_at / last history timestamp via original iteration order, or
     # sort by prs_merged descending as a stable tiebreak — not time-ordered

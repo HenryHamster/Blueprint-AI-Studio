@@ -321,6 +321,34 @@ async def kill_project_compute_job(
     return {"compute_job": serialize_compute_job_response_safe(killed)}
 
 
+@router.get("/projects/{project_id}/compute-jobs/sweep-groups")
+async def get_project_compute_sweep_groups(
+    project_id: uuid.UUID,
+    direction_id: str | None = Query(None),
+    limit: int = Query(10, ge=1, le=50),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return durable sweep-grouped knowledge docs for a project (viewer+).
+
+    Delegates to ``build_compute_sweep_groups`` which groups completed
+    compute_experiment knowledge documents by ``sweep_id``.  Only sweeps with
+    at least two docs are returned so the operator sees meaningful comparisons.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+    from app.knowledge_query import build_compute_sweep_groups
+
+    sweep_groups = await build_compute_sweep_groups(
+        session,
+        project_id,
+        direction_id=direction_id,
+        limit=limit,
+    )
+    return {"sweep_groups": sweep_groups}
+
+
 @router.post("/compute-jobs/{job_id}/analyze")
 async def analyze_project_compute_job(
     job_id: uuid.UUID,

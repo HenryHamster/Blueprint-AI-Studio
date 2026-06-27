@@ -331,6 +331,8 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
         "unavailable_cause": verdict.get("unavailable_cause"),
         "authoring_branch": doc.authoring_branch,
         "head_sha": doc.head_sha,
+        "sweep_id": doc.sweep_id,
+        "arm_label": doc.arm_label,
         "origin_provenance": serialize_origin_provenance(doc),
     }
     if include_body:
@@ -349,6 +351,7 @@ def build_knowledge_documents_stmt(
     origin_state: str | None = None,
     challenge_state: str | None = None,
     finding_hash: str | None = None,
+    sweep_id: str | None = None,
 ):
     """Build the project-scoped ``select`` for knowledge documents.
 
@@ -400,6 +403,8 @@ def build_knowledge_documents_stmt(
             )
     if finding_hash:
         stmt = stmt.where(KnowledgeDocument.origin_finding_hash == finding_hash)
+    if sweep_id:
+        stmt = stmt.where(KnowledgeDocument.sweep_id == sweep_id)
     if tag:
         # tags is a JSON list; match the exact element via a cast-to-text scan
         # so it works on both Postgres (JSONB) and the SQLite test backend.
@@ -430,6 +435,7 @@ async def list_knowledge_documents(
     origin_state: str | None = None,
     challenge_state: str | None = None,
     finding_hash: str | None = None,
+    sweep_id: str | None = None,
     limit: int = 50,
     offset: int = 0,
 ) -> dict:
@@ -448,6 +454,7 @@ async def list_knowledge_documents(
         origin_state=origin_state,
         challenge_state=challenge_state,
         finding_hash=finding_hash,
+        sweep_id=sweep_id,
     )
 
     total = (
@@ -515,6 +522,8 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
         "topic": doc.topic,
         "direction_id": doc.direction_id,
         "source_kind": doc.source_kind,
+        "sweep_id": doc.sweep_id,
+        "arm_label": doc.arm_label,
         "analysis_fallback_reason": (
             verdict.get("fallback_reason")
             if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
@@ -637,3 +646,76 @@ async def get_knowledge_document(
             )
         )
     ).scalar_one_or_none()
+
+
+async def build_sweep_knowledge_index(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    sweep_id: str,
+    *,
+    summary_chars: int = _KNOWLEDGE_INDEX_SUMMARY_CHARS,
+) -> list[dict]:
+    """Return all compute_experiment knowledge docs for a sweep, oldest-first.
+
+    Covers both per-arm docs (arm_label set) and the sweep-aggregate doc
+    (arm_label null), ordered by created_at ascending so arms precede aggregate.
+    """
+    stmt = (
+        build_knowledge_documents_stmt(
+            project_id,
+            source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+            sweep_id=sweep_id,
+        )
+        .order_by(KnowledgeDocument.created_at.asc())
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    return [_knowledge_index_entry(doc, summary_chars) for doc in rows]
+
+
+_SWEEP_GROUPS_LIMIT = 10
+_SWEEP_MIN_DOCS = 2
+
+
+async def build_compute_sweep_groups(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    direction_id: str | None = None,
+    limit: int = _SWEEP_GROUPS_LIMIT,
+    summary_chars: int = _KNOWLEDGE_INDEX_SUMMARY_CHARS,
+) -> dict[str, list[dict]]:
+    """Group compute_experiment docs by sweep_id for the strategist payload.
+
+    Returns ``{sweep_id: [entry, ...]}`` for sweeps that have at least
+    ``_SWEEP_MIN_DOCS`` docs (lone-arm sweeps already appear in the flat
+    knowledge_index). Bounded to ``limit`` distinct sweeps, newest-first.
+    Sweeps with no sweep_id are excluded.
+    """
+    stmt = build_knowledge_documents_stmt(
+        project_id,
+        source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+        **({"direction": direction_id} if direction_id else {}),
+    ).where(KnowledgeDocument.sweep_id.is_not(None)).order_by(
+        KnowledgeDocument.sweep_id,
+        KnowledgeDocument.created_at.desc(),
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+
+    by_sweep: dict[str, list[dict]] = {}
+    for doc in rows:
+        sid = doc.sweep_id
+        if sid is None:
+            continue
+        by_sweep.setdefault(sid, []).append(_knowledge_index_entry(doc, summary_chars))
+
+    # Keep only sweeps with at least _SWEEP_MIN_DOCS, then cap at limit (newest sweep wins).
+    multi = {sid: entries for sid, entries in by_sweep.items() if len(entries) >= _SWEEP_MIN_DOCS}
+    if not multi:
+        return {}
+    # Sort sweeps by the created_at of their newest entry (descending).
+    ordered = sorted(
+        multi.items(),
+        key=lambda kv: (kv[1][0].get("created_at") or ""),
+        reverse=True,
+    )
+    return dict(ordered[:limit])

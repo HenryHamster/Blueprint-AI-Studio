@@ -333,7 +333,7 @@ async function runStandardHandler(opts: StandardHandlerOpts): Promise<void> {
     strVal(payload.base_branch)
     || strVal(ctx.research_branch)
     || strVal(ctx.original_base)
-    || resolveBaseBranch({} as Record<string, unknown>, task);
+    || resolveBaseBranch({}, task);
   const baseBranch = validateBranchName(rawBaseBranch, 'base_branch');
   const projectMetaForPromotion = task.project_metadata as Record<string, unknown> | undefined;
   const promotionTarget =

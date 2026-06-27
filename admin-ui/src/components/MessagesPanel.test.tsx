@@ -2224,6 +2224,10 @@ describe('MessagesPanel saved views', () => {
       Object.getOwnPropertyDescriptor(proto, 'value')?.set?.call(searchInput, 'urgent');
       searchInput.dispatchEvent(new Event('input', { bubbles: true }));
     });
+    // The search box debounces onSearchChange by 300ms (MessagesPanelHeader),
+    // so wait for it to propagate to the panel's searchQuery before saving —
+    // otherwise the view is captured with the still-empty pre-debounce query.
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 350)); });
     // Open save dialog
     const openBtn = [...el.querySelectorAll('button')].find(b => b.title?.includes('Save current filters'));
     await act(async () => { (openBtn as HTMLButtonElement).click(); });
@@ -3787,17 +3791,29 @@ describe('MessagesPanel handleCreateDirection idempotency', () => {
     return host as HTMLDivElement;
   }
 
+  // Returns the button that opens the convert-to-direction modal.
   function createDirectionButton(el: HTMLElement): HTMLButtonElement {
     const btn = el.querySelector('button[title="Create Direction"]') as HTMLButtonElement | null;
     if (!btn) throw new Error('test setup: expected a Create Direction button on the feedback message');
     return btn;
   }
 
+  // Opens the convert-to-direction modal by clicking the icon button, then
+  // returns the modal's "Create direction" submit button.
+  async function openModalAndGetSubmitButton(el: HTMLElement): Promise<HTMLButtonElement> {
+    const iconBtn = createDirectionButton(el);
+    await act(async () => { iconBtn.click(); });
+    await act(async () => {});
+    const submitBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Create direction') as HTMLButtonElement | undefined;
+    if (!submitBtn) throw new Error('test setup: expected a "Create direction" submit button in the modal');
+    return submitBtn;
+  }
+
   test('sends an idempotency_key with the direction create POST', async () => {
     const { postBodies } = _setupDirectionMock();
     const el = await renderPanel();
-    const btn = createDirectionButton(el);
-    await act(async () => { btn.click(); });
+    const submitBtn = await openModalAndGetSubmitButton(el);
+    await act(async () => { submitBtn.click(); });
     await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
 
     expect(postBodies.length).toBe(1);
@@ -3808,11 +3824,12 @@ describe('MessagesPanel handleCreateDirection idempotency', () => {
   test('reuses one idempotency_key per message id when a failed conversion is retried', async () => {
     const { postBodies } = _setupDirectionMock({ failFirstPost: true });
     const el = await renderPanel();
-    const btn = createDirectionButton(el);
-
-    await act(async () => { btn.click(); }); // first attempt fails — key retained
+    // Open modal; first submit fails (POST 500) → modal stays open
+    const submitBtn = await openModalAndGetSubmitButton(el);
+    await act(async () => { submitBtn.click(); }); // first attempt fails — key retained
     await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
-    await act(async () => { btn.click(); }); // retry — same message id, same key
+    // Modal stays open after failure — submit again with the same key
+    await act(async () => { submitBtn.click(); }); // retry — same message id, same key
     await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
 
     expect(postBodies.length).toBe(2);
@@ -3824,11 +3841,12 @@ describe('MessagesPanel handleCreateDirection idempotency', () => {
     const addToast = vi.fn();
     const { postBodies, patchBodies } = _setupDirectionMock({ failFirstPatch: true, duplicate: true });
     const el = await renderPanel(addToast);
-    const btn = createDirectionButton(el);
-
-    await act(async () => { btn.click(); }); // create succeeds, resolution PATCH fails
+    // Open modal; first submit: POST succeeds but PATCH fails → modal stays open
+    const submitBtn = await openModalAndGetSubmitButton(el);
+    await act(async () => { submitBtn.click(); }); // create succeeds, resolution PATCH fails
     await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
-    await act(async () => { btn.click(); }); // retry replays the same create idempotency key
+    // Modal stays open; retry replays same idempotency key
+    await act(async () => { submitBtn.click(); }); // retry replays the same create idempotency key
     await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
 
     expect(postBodies.length).toBe(2);
@@ -3845,8 +3863,8 @@ describe('MessagesPanel handleCreateDirection idempotency', () => {
   test('treats a status:"duplicate" create response as a clean success', async () => {
     const { postBodies } = _setupDirectionMock({ duplicate: true });
     const el = await renderPanel();
-    const btn = createDirectionButton(el);
-    await act(async () => { btn.click(); });
+    const submitBtn = await openModalAndGetSubmitButton(el);
+    await act(async () => { submitBtn.click(); });
     await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
 
     // One create, and the message was resolved (PATCH) — the duplicate replay
@@ -4484,5 +4502,265 @@ describe('MessagesPanel strategic cycle progress indicators', () => {
     // Pre-challenge cycles carry no summary → no chip rendered at all.
     expect(el.querySelector('[aria-label*="Strategic judgment challenge"]')).toBeNull();
     expect(el.textContent).not.toContain('challenge:');
+  });
+});
+
+// ── convert-to-direction modal ────────────────────────────────────────────────
+
+describe('MessagesPanel convert-to-direction modal', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => {
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  function makeApiFetchWithConvertSupport(feedbackMsg: ProjectMessage, opts: { directionsOk?: boolean; resolveOk?: boolean } = {}) {
+    const { directionsOk = true, resolveOk = true } = opts;
+    return async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const initObj = init as RequestInit | undefined;
+      const method = initObj?.method ?? 'GET';
+
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [feedbackMsg] }), { status: 200 });
+      }
+      if (method === 'GET' && (
+        urlStr.includes('/api/admin/messages/noise-prefs') ||
+        urlStr.includes('/api/admin/messages/saved-views') ||
+        urlStr.includes('/api/admin/messages/temp-mutes') ||
+        urlStr.includes('/api/admin/messages/mute-window')
+      )) {
+        return new Response('', { status: 404 });
+      }
+      if (urlStr.includes('/directions') && method === 'POST') {
+        if (!directionsOk) return new Response('', { status: 500 });
+        return new Response(JSON.stringify({ direction: { id: 'dir-new-111' } }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages\/fb-msg-1/.test(urlStr) && method === 'PATCH') {
+        if (!resolveOk) return new Response('', { status: 500 });
+        return new Response(JSON.stringify({}), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    };
+  }
+
+  test('handleOpenConvertModal seeds the modal with the message content', async () => {
+    const feedbackContent = 'Please add GPU support to the runner fleet';
+    const feedback = makeMsg({
+      id: 'fb-msg-1', project_id: 'proj-convert-1',
+      message_type: 'FEEDBACK', from_type: 'agent', content: feedbackContent,
+    });
+    _suppressSinceLastVisit('test-user@example.com', 'proj-convert-1');
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(makeApiFetchWithConvertSupport(feedback));
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-convert-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    const el = host as HTMLDivElement;
+
+    // Click the "Create Direction" button (PlusCircle, title="Create Direction")
+    const createDirBtn = [...el.querySelectorAll('button')].find(b => b.getAttribute('title') === 'Create Direction');
+    expect(createDirBtn).not.toBeNull();
+    await act(async () => { (createDirBtn as HTMLButtonElement).click(); });
+
+    // Modal should open with the message content seeded in the text input
+    const dialog = el.querySelector('[role="dialog"]');
+    expect(dialog).not.toBeNull();
+    expect(dialog!.textContent).toContain('Create direction from message');
+
+    // DirectionsAddForm uses an <input> (not <textarea>) for the main direction text.
+    // Verify it is seeded with the feedback message content.
+    const textInput = el.querySelector('input[placeholder="New direction..."]') as HTMLInputElement | null;
+    expect(textInput).not.toBeNull();
+    expect(textInput!.value).toBe(feedbackContent);
+  });
+
+  test('handleSubmitConvertForm success: POSTs direction, PATCHes resolution, closes modal', async () => {
+    const feedbackContent = 'Add better error messages to the compute job runner';
+    const feedback = makeMsg({
+      id: 'fb-msg-1', project_id: 'proj-convert-1',
+      message_type: 'FEEDBACK', from_type: 'agent', content: feedbackContent,
+    });
+    _suppressSinceLastVisit('test-user@example.com', 'proj-convert-1');
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(makeApiFetchWithConvertSupport(feedback));
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-convert-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    const el = host as HTMLDivElement;
+
+    // Open the modal
+    const createDirBtn = [...el.querySelectorAll('button')].find(b => b.getAttribute('title') === 'Create Direction');
+    await act(async () => { (createDirBtn as HTMLButtonElement).click(); });
+
+    // Submit the form via the "Create direction" button in the modal footer
+    const submitBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Create direction');
+    expect(submitBtn).not.toBeNull();
+    await act(async () => { (submitBtn as HTMLButtonElement).click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+    // Verify the direction POST was called
+    const postCalls = vi.mocked(apiFetch).mock.calls.filter(c =>
+      String(c[0]).includes('/directions') && (c[1] as RequestInit | undefined)?.method === 'POST'
+    );
+    expect(postCalls).toHaveLength(1);
+    const postedBody = JSON.parse((postCalls[0][1] as RequestInit).body as string);
+    expect(postedBody.text).toBe(feedbackContent);
+
+    // Verify the PATCH to resolve the message was called
+    const patchCalls = vi.mocked(apiFetch).mock.calls.filter(c =>
+      String(c[0]).includes('/api/admin/messages/fb-msg-1') && (c[1] as RequestInit | undefined)?.method === 'PATCH'
+    );
+    expect(patchCalls).toHaveLength(1);
+    const patchBody = JSON.parse((patchCalls[0][1] as RequestInit).body as string);
+    expect(patchBody.resolution).toContain('dir-new-111');
+
+    // Modal should be closed after success
+    expect(el.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  test('handleSubmitConvertForm error: markAddAttemptFailed is called and modal stays open', async () => {
+    const feedbackContent = 'Improve task scheduling fairness';
+    const feedback = makeMsg({
+      id: 'fb-msg-1', project_id: 'proj-convert-1',
+      message_type: 'FEEDBACK', from_type: 'agent', content: feedbackContent,
+    });
+    _suppressSinceLastVisit('test-user@example.com', 'proj-convert-1');
+    // Directions POST fails with 500
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(
+      makeApiFetchWithConvertSupport(feedback, { directionsOk: false })
+    );
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-convert-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    const el = host as HTMLDivElement;
+
+    // Open the modal
+    const createDirBtn = [...el.querySelectorAll('button')].find(b => b.getAttribute('title') === 'Create Direction');
+    await act(async () => { (createDirBtn as HTMLButtonElement).click(); });
+
+    // Submit the form
+    const submitBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Create direction');
+    await act(async () => { (submitBtn as HTMLButtonElement).click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+    // Modal should stay open on failure
+    const dialog = el.querySelector('[role="dialog"]');
+    expect(dialog).not.toBeNull();
+    expect(dialog!.textContent).toContain('Create direction from message');
+
+    // Verify the direction POST was attempted
+    const postCalls = vi.mocked(apiFetch).mock.calls.filter(c =>
+      String(c[0]).includes('/directions') && (c[1] as RequestInit | undefined)?.method === 'POST'
+    );
+    expect(postCalls).toHaveLength(1);
+
+    // Idempotency key should be retained for retry: submitting again should reuse the same key
+    // Re-enable successful responses for the retry
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(makeApiFetchWithConvertSupport(feedback));
+    await act(async () => { (submitBtn as HTMLButtonElement).click(); });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+    const allPostCalls = vi.mocked(apiFetch).mock.calls.filter(c =>
+      String(c[0]).includes('/directions') && (c[1] as RequestInit | undefined)?.method === 'POST'
+    );
+    // Two POST attempts total
+    expect(allPostCalls).toHaveLength(2);
+    const firstKey = JSON.parse((allPostCalls[0][1] as RequestInit).body as string).idempotency_key;
+    const secondKey = JSON.parse((allPostCalls[1][1] as RequestInit).body as string).idempotency_key;
+    // Retry must reuse the same key (idempotency key is retained on failure)
+    expect(firstKey).toBe(secondKey);
+  });
+
+  test('closing the modal via Cancel resets the form', async () => {
+    const feedbackContent = 'Fix memory leak in worker threads';
+    const feedback = makeMsg({
+      id: 'fb-msg-1', project_id: 'proj-convert-1',
+      message_type: 'FEEDBACK', from_type: 'agent', content: feedbackContent,
+    });
+    _suppressSinceLastVisit('test-user@example.com', 'proj-convert-1');
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(makeApiFetchWithConvertSupport(feedback));
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-convert-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+        />
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    const el = host as HTMLDivElement;
+
+    // Open the modal
+    const createDirBtn = [...el.querySelectorAll('button')].find(b => b.getAttribute('title') === 'Create Direction');
+    await act(async () => { (createDirBtn as HTMLButtonElement).click(); });
+    expect(el.querySelector('[role="dialog"]')).not.toBeNull();
+
+    // Cancel the modal
+    const cancelBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.trim() === 'Cancel');
+    expect(cancelBtn).not.toBeNull();
+    await act(async () => { (cancelBtn as HTMLButtonElement).click(); });
+
+    // Modal should be closed
+    expect(el.querySelector('[role="dialog"]')).toBeNull();
   });
 });

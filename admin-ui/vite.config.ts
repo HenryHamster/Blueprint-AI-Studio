@@ -6,6 +6,12 @@ import tailwindcss from '@tailwindcss/vite'
 export default defineConfig({
   base: '/',
   plugins: [react(), tailwindcss()],
+  build: {
+    reportCompressedSize: false,
+    rollupOptions: {
+      maxParallelFileOps: 3,
+    },
+  },
   server: {
     allowedHosts: true,
     proxy: {

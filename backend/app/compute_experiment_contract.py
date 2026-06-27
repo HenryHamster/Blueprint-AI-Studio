@@ -7,7 +7,28 @@ same compute_experiment payload shape without importing each other.
 from __future__ import annotations
 
 import base64
+import logging
+import re
+from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# Safe identifier charset for arm names: no shell metacharacters, no colons
+# (colon is the delimiter in the NAME:PATH aggregator spec), no slashes/dots
+# (would escape per-arm result directories).
+_ARM_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+# Safe charset for metric keys: allows common patterns like val/loss, top-1
+# while excluding shell metacharacters (", $, ;, backticks, spaces).
+_METRIC_KEY_RE = re.compile(r"^[A-Za-z0-9_./-]+$")
+
+# Read and encode the aggregator script at module-load time.  The blob is then
+# embedded in generated per-arm bash wrappers so the aggregator runs on the
+# remote compute node without a separate deploy step.
+_AGGREGATOR_B64 = base64.b64encode(
+    (Path(__file__).parent / "compute_arm_aggregator.py").read_bytes()
+).decode()
 
 
 COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY = (
@@ -60,6 +81,10 @@ def _author_compute_launch_contract(finding: dict[str, Any]) -> dict[str, Any]:
         "smoke_sample",
         "arms",
         "declared_metric",
+        "sweep_id",
+        "setup_step",
+        "container_image",
+        "container_registry_auth",
     ):
         val = _pick(opt_key)
         if val is not None:
@@ -74,10 +99,20 @@ def _validate_compute_launch_contract(
 ) -> tuple[bool, str]:
     """Return ``(ok, reason)`` for a proposed compute_experiment launch contract.
 
-    ``require_smoke=True`` (the default for author-generated contracts) requires a
-    ``smoke_sample`` proving the command starts and, when a ``success_criterion``
-    is declared, emits a numeric metric.  Operator-triggered launches may pass
-    ``require_smoke=False`` to skip that check.
+    ``require_smoke=True`` (the legacy default for author-generated contracts)
+    previously hard-rejected contracts whose ``smoke_sample`` was missing or
+    reported failure.  This check is now ADVISORY ONLY: the platform executes a
+    real pre-flight smoke (capability ``platform-preflight-smoke``) before any
+    full VM is billed, which is the binding gate.  That smoke runs the command
+    CONTAINERIZED — on the same substrate class as the full run (``docker pull``
+    + ``docker run`` of the declared image) — when ``container_image`` is set AND
+    Docker is available on the orchestrator host; it degrades to a bare-host
+    ``bash -lc`` smoke when no ``container_image`` is declared or Docker is absent
+    on the orchestrator (see ``run_preflight_smoke`` in compute_backends.py; this
+    closes the substrate-fidelity gap tracked as bug a58156be).
+    A missing or self-reported-failing author smoke_sample is logged as a warning
+    but no longer blocks the contract.  Operator-triggered launches may pass
+    ``require_smoke=False`` to silence even the advisory log.
     """
     arms = contract.get("arms")
     command = contract.get("command")
@@ -86,6 +121,7 @@ def _validate_compute_launch_contract(
         # Arms-based multi-arm experiment: validate each arm and synthesize command.
         if not isinstance(arms, list) or len(arms) == 0:
             return False, "arms must be a non-empty list of {name, command} objects"
+        seen_names: set[str] = set()
         for i, arm in enumerate(arms):
             if not isinstance(arm, dict):
                 return False, f"arms[{i}] must be a dict with 'name' and 'command' fields"
@@ -93,24 +129,87 @@ def _validate_compute_launch_contract(
             arm_cmd = arm.get("command")
             if not (isinstance(arm_name, str) and arm_name.strip()):
                 return False, f"arms[{i}].name is missing or empty"
+            if not _ARM_NAME_RE.match(arm_name):
+                return (
+                    False,
+                    f"arms[{i}].name {arm_name!r} contains invalid characters — "
+                    "arm names must match ^[A-Za-z0-9_-]+$",
+                )
+            if arm_name in seen_names:
+                return False, f"duplicate arm name {arm_name!r} — arm names must be unique"
+            seen_names.add(arm_name)
             if not (isinstance(arm_cmd, str) and arm_cmd.strip()):
                 return False, f"arms[{i}].command (arm '{arm_name}') is missing or empty"
         declared_metric = contract.get("declared_metric")
         if not (isinstance(declared_metric, str) and declared_metric.strip()):
             return False, "declared_metric is required and must be a non-empty string when arms are specified"
+        if not _METRIC_KEY_RE.match(declared_metric):
+            return (
+                False,
+                f"declared_metric {declared_metric!r} contains invalid characters — "
+                "metric keys must match ^[A-Za-z0-9_./-]+$",
+            )
         if not (isinstance(command, str) and command.strip()):
-            # Synthesize a sequential shell script from arms. Base64-encode the script
-            # so single quotes, double quotes, and other shell metacharacters in arm
-            # commands cannot break the outer shell invocation.
-            script = "set -e\n" + "\n".join(arm["command"].strip() for arm in arms)
+            # Synthesize a per-arm isolation script. Each arm runs in its own
+            # subshell with BLUEPRINT_RESULT_FILE pointed to a private path so
+            # arms cannot overwrite each other's metric (no last-arm-wins).
+            # A subshell failure is captured as an exit_code file and does NOT
+            # abort the remaining arms.  After all arms finish, the aggregator
+            # script (embedded as a base64 blob) combines each arm's result into
+            # the canonical {"arms": {name: {declared_metric: value}}} block and
+            # writes it to the real BLUEPRINT_RESULT_FILE.
+            lines: list[str] = [
+                '_BRF_MAIN="${BLUEPRINT_RESULT_FILE:-/tmp/blueprint_result.json}"',
+                '_BRF_BASE="$(dirname "${_BRF_MAIN}")/.blueprint_arm_results"',
+                'mkdir -p "${_BRF_BASE}"',
+            ]
+            arm_result_specs: list[str] = []
+            arm_exit_specs: list[str] = []
+            arm_stderr_specs: list[str] = []
+            arm_duration_specs: list[str] = []
+            for arm in arms:
+                aname = arm["name"]
+                acmd = arm["command"].strip()
+                lines += [
+                    f'mkdir -p "${{_BRF_BASE}}/{aname}"',
+                    '_BRF_T1=$(date +%s)',
+                    f'(export BLUEPRINT_RESULT_FILE="${{_BRF_BASE}}/{aname}/result.json"; {acmd})'
+                    f' 2>"${{_BRF_BASE}}/{aname}/stderr"',
+                    f'echo $? > "${{_BRF_BASE}}/{aname}/exit_code"',
+                    f'echo $(($(date +%s) - _BRF_T1)) > "${{_BRF_BASE}}/{aname}/elapsed"',
+                ]
+                arm_result_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/result.json"')
+                arm_exit_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/exit_code"')
+                arm_stderr_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/stderr"')
+                arm_duration_specs.append(f'"{aname}:${{_BRF_BASE}}/{aname}/elapsed"')
+            arm_specs_arg = " ".join(arm_result_specs)
+            exit_specs_arg = " ".join(arm_exit_specs)
+            stderr_specs_arg = " ".join(arm_stderr_specs)
+            duration_specs_arg = " ".join(arm_duration_specs)
+            lines += [
+                f"echo {_AGGREGATOR_B64} | base64 -d > /tmp/blueprint_arm_agg.py",
+                f'python3 /tmp/blueprint_arm_agg.py --arms {arm_specs_arg}'
+                f' --declared-metric "{declared_metric}" --output "${{_BRF_MAIN}}"'
+                f' --exit-codes {exit_specs_arg}'
+                f' --stderr {stderr_specs_arg}'
+                f' --durations {duration_specs_arg}',
+            ]
+            script = "\n".join(lines)
             encoded = base64.b64encode(script.encode()).decode()
             contract["command"] = f"echo {encoded} | base64 -d | bash"
     elif not (isinstance(command, str) and command.strip()):
         return False, "missing or empty command"
 
     declared_metric = contract.get("declared_metric")
-    if declared_metric is not None and not (isinstance(declared_metric, str) and declared_metric.strip()):
-        return False, "declared_metric must be a non-empty string"
+    if declared_metric is not None:
+        if not (isinstance(declared_metric, str) and declared_metric.strip()):
+            return False, "declared_metric must be a non-empty string"
+        if not _METRIC_KEY_RE.match(declared_metric):
+            return (
+                False,
+                f"declared_metric {declared_metric!r} contains invalid characters — "
+                "metric keys must match ^[A-Za-z0-9_./-]+$",
+            )
     try:
         spend = float(contract.get("spend_cap_usd"))
     except (TypeError, ValueError):
@@ -130,32 +229,53 @@ def _validate_compute_launch_contract(
     if not deadline > 0:
         return False, f"deadline_seconds must be positive (got {deadline})"
 
+    container_image = contract.get("container_image")
+    if container_image is not None:
+        if not isinstance(container_image, str) or not container_image.strip():
+            return False, "container_image must be a non-empty string URI when specified"
+        registry_auth = contract.get("container_registry_auth")
+        if registry_auth is not None:
+            if not isinstance(registry_auth, dict):
+                return False, "container_registry_auth must be an object with server/username/password"
+            for req_key in ("server", "username", "password"):
+                val = registry_auth.get(req_key)
+                if val is not None and not isinstance(val, str):
+                    return False, f"container_registry_auth.{req_key} must be a string"
+
     if require_smoke:
+        # Author-attested smoke is now ADVISORY ONLY.  The platform-executed
+        # pre-flight smoke (capability `platform-preflight-smoke`) runs the
+        # command before provisioning the full VM and is the binding gate — it
+        # runs CONTAINERIZED on the same substrate class (docker pull + docker
+        # run of the declared container_image) when container_image is set AND
+        # Docker is present on the orchestrator, and degrades to a bare-host
+        # bash -lc smoke otherwise (no container_image, or Docker absent).  A
+        # missing or self-reported-failing author smoke_sample is logged here for
+        # observability but does NOT reject the contract.
         smoke = contract.get("smoke_sample")
         if not smoke or not isinstance(smoke, dict):
-            return (
-                False,
-                "missing smoke_sample: author must smoke-test the command before "
-                "dispatch — run a short variant, capture startup_ok + metric_captured, "
-                "add smoke_sample to the finding",
+            logger.warning(
+                "compute_experiment contract has no author smoke_sample — "
+                "platform-preflight-smoke will gate at launch"
             )
-        if smoke.get("unsmokable"):
+        elif smoke.get("unsmokable"):
             reason = str(smoke.get("unsmokable_reason") or "cannot be smoked cheaply")
-            return (
-                False,
-                f"un-smokable command requires explicit operator review: {reason}",
+            logger.warning(
+                "compute_experiment author smoke_sample marked un-smokable: %s — "
+                "platform-preflight-smoke will gate at launch",
+                reason,
             )
-        if not smoke.get("startup_ok"):
+        elif not smoke.get("startup_ok"):
             error_excerpt = str(smoke.get("error_excerpt") or "unknown error")[:200]
-            return (
-                False,
-                f"smoke failed — command did not start cleanly: {error_excerpt}",
+            logger.warning(
+                "compute_experiment author smoke_sample reports startup failure: %s — "
+                "platform-preflight-smoke will gate at launch",
+                error_excerpt,
             )
-        if contract.get("success_criterion") and not smoke.get("metric_captured"):
-            return (
-                False,
-                "smoke did not capture declared metric — verify command writes "
-                "{metric: value} to $BLUEPRINT_RESULT_FILE",
+        elif contract.get("success_criterion") and not smoke.get("metric_captured"):
+            logger.warning(
+                "compute_experiment author smoke_sample did not capture declared metric — "
+                "platform-preflight-smoke will gate at launch"
             )
 
     return True, ""
@@ -168,8 +288,10 @@ def resolve_compute_spend_threshold(
     """Resolve the compute_experiment approval threshold (USD).
 
     A positive per-direction ``compute_experiment_spend_threshold_usd`` override
-    wins; otherwise the global runtime-config default applies. Malformed config
-    degrades to ``0.0`` so any positive proposed spend requires approval.
+    wins; otherwise the global runtime-config default applies. Per-project threshold
+    overrides were removed in v19 — threshold never comes from Project fields.
+    Malformed config degrades to ``0.0`` so any positive proposed spend requires
+    approval.
     """
     if direction:
         override = direction.get("compute_experiment_spend_threshold_usd")

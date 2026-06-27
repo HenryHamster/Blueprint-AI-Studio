@@ -284,6 +284,44 @@ APPROVED_CAP_PR_CLOSED = "APPROVED_CAP_PR_CLOSED"
 # (which stay clean terminal outcomes).
 COMPUTE_UNMEASURED_CRITERION = "compute_unmeasured_criterion"
 
+# Command died on the local DB-less pre-flight smoke before any full VM was
+# provisioned. A genuine work defect (the command must be fixed to run on the
+# substrate), so it routes to CODE_ERROR and burns the retry budget.
+COMPUTE_PREFLIGHT_SMOKE_FAILED = "compute_preflight_smoke_failed"
+
+
+def classify_compute_terminal_reason(
+    terminal_reason: "str | None",
+    vm_phase: "str | None",
+) -> str:
+    """Map a ComputeJob terminal_reason + vm_phase to a canonical failure class.
+
+    Pure function — no I/O, no Task object required. Used by
+    task_completion._handle_compute_experiment_completion to classify pre-metric
+    failures so they don't all collapse to CODE_ERROR.
+
+    Mapping rules (first match wins):
+    - vm_phase == "provisioning" → PROVISION_FAILURE (VM never started)
+    - reason contains "provisioning" → PROVISION_FAILURE (launch/RPC failure)
+    - reason contains "runtime deadline" or "spend cap" → AGENT_TIMEOUT
+      (intentional platform kills; these should normally PASS the gate, but if
+      they somehow reach a failure branch the class must be AGENT_TIMEOUT, not
+      CODE_ERROR)
+    - reason contains "cancelled" or "operator" → ADMIN_CANCEL
+    - default → CODE_ERROR (genuine command/work defect)
+    """
+    if vm_phase == "provisioning":
+        return PROVISION_FAILURE
+    if terminal_reason:
+        lower = terminal_reason.lower()
+        if "provisioning" in lower:
+            return PROVISION_FAILURE
+        if "runtime deadline" in lower or "spend cap" in lower:
+            return AGENT_TIMEOUT
+        if "cancelled" in lower or "operator" in lower:
+            return ADMIN_CANCEL
+    return CODE_ERROR
+
 # Administrative cancellation — orchestrator or operator terminated the task before
 # it ran meaningful work: cascade cancels ("Cancelled: dependency task failed"),
 # parent-dependency cancels ("Cancelled: parent evaluation timeout"), or system
@@ -795,6 +833,18 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # eligibility instead of burning the code-error retry budget on something
     # the agent can't fix by editing code.
     "build_failed": PROVISION_FAILURE,
+    # ``diff_range_unresolvable`` — a release audit / audit-challenge / merge-grade
+    # handler could not fetch the pinned candidate commit (or verify the three-dot
+    # diff range) before invoking the agent. Same family as clone_failed /
+    # build_failed / vm_config_missing: a workspace candidate-fetch transient
+    # (a single GitHub I/O blip on `git fetch origin <sha>`), NOT a code defect.
+    # Routing to PROVISION_FAILURE lets the release qualifier respawn the audit /
+    # challenge leg under _MAX_AUDIT_RL_RESPAWNS instead of finalizing the whole
+    # attempt infra_failure. (The agent-side fetch now retries with backoff; this
+    # is defense-in-depth for the residual case where all retries blip out.)
+    # Production 2026-06-26: an attempt died on this category, yet the SAME
+    # candidate re-fetched and COMPLETED ~9 min later — proving it transient.
+    "diff_range_unresolvable": PROVISION_FAILURE,
     "test_failed": CODE_ERROR,
     "lint_failed": CODE_ERROR,
     "pr_creation_failed": EXTERNAL_API,
@@ -881,6 +931,7 @@ _AGENT_CATEGORY_TO_CLASS: dict[str, str] = {
     # distinct failure_category literal stays visible on task.context for the
     # spawning agent and operator panels.
     "compute_unmeasured_criterion": CODE_ERROR,
+    "compute_preflight_smoke_failed": CODE_ERROR,
     # ``panel_review_lens_failed`` — the panel_review task posted a failure because
     # a lens subprocess exited non-zero. Normally an infra-level failure (→
     # PROVISION_FAILURE) but requires a dead-auth text check first: when a Codex

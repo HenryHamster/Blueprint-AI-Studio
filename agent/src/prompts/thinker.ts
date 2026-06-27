@@ -118,6 +118,21 @@ export interface ThinkerPromptParams {
    * so existing constructions/tests that omit it still compile; '' renders nothing.
    */
   availableCapabilitiesSection?: string;
+  /**
+   * Comparative sweep results rendered per completed compute-experiment sweep.
+   * Built from the strategic payload's `compute_experiment_sweeps` field. Optional
+   * so existing constructions/tests that omit it still compile; '' renders nothing.
+   */
+  sweepComparisonSection?: string;
+  /**
+   * Live self-hosted local-runner availability note. Built from the strategic
+   * payload's `local_runner_status` field ({ever_registered, active_total,
+   * active_gpu, require_local_runner}) so the strategist avoids authoring GPU
+   * compute_experiments while the operator's hardware is offline (they would
+   * hold then fail, or fall back to billable cloud GPU). Optional so existing
+   * constructions/tests that omit it still compile; '' renders nothing.
+   */
+  localRunnerSection?: string;
 }
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
@@ -184,7 +199,7 @@ ${p.dirHealthSummary}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
-${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}
+${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}
 ${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
@@ -267,7 +282,15 @@ Directions to retire (one-sentence reason each) and to create (name the gap_id e
 
 **Knowledge commissions.** You can also direct the Executor to spawn a \`web_research\` or \`design\` knowledge task (it has the spawn-task command). These are HIGH-ROI and chronically under-used: one durable, citation-grounded document de-risks every later task in its area and compounds across cycles. Plan one when a direction hinges on external facts nobody has documented (APIs, vendors, pricing/quotas, standards, how mature OSS solves the same problem), when an area keeps producing failed or churning implementation work (settle the structure once in a design doc instead of re-deriving it per task), or when the knowledge index is thin for a direction you are actively advancing. Name the task type, title, and what the document must answer.
 
-**Experiment commissions.** When you hold a MEASURABLE conjecture — a hypothesis that can be settled empirically by running a command and observing a declared metric, rather than by reading code or the web — you can commission a budget-gated \`compute_experiment\` directly (the Executor has the spawn-task command for it). Use this move when all four conditions hold: (1) the conjecture is falsifiable (there is a clear success criterion expressible as a metric + comparator + threshold), (2) the only way to resolve it is to run compute and measure an output, (3) a reasonable spend cap and deadline can be stated up front, and (4) no cheaper read-only research would settle it first. The launch contract the Executor sends requires: a \`command\` string to execute, a positive \`spend_cap_usd\`, a positive \`deadline_seconds\`, and an OPTIONAL \`success_criterion\` of \`{metric, operator, threshold}\` (where \`operator\` is one of \`<\`, \`>\`, \`<=\`, \`>=\`). For multi-arm (A/B) comparisons, use \`arms: [{name, command}]\` instead of a single \`command\`, and supply \`declared_metric\` (the exact key each arm's command writes to \`$BLUEPRINT_RESULT_FILE\`); \`declared_metric\` is required when \`arms\` is present. A free-text \`prompt\` is optional because \`hypothesis\` serves as the description. Note: experiments above the configured per-experiment spend threshold require operator spend-approval — the backend gates this automatically and will pause the task for approval if needed. Name the hypothesis, the command (or arms), the metric being measured, and what the outcome changes.
+**Experiment commissions.** When you hold a MEASURABLE conjecture — a hypothesis that can be settled empirically by running a command and observing a declared metric, rather than by reading code or the web — you can commission a budget-gated \`compute_experiment\` directly (the Executor has the spawn-task command for it). Use this move when all four conditions hold: (1) the conjecture is falsifiable (there is a clear success criterion expressible as a metric + comparator + threshold), (2) the only way to resolve it is to run compute and measure an output, (3) a reasonable spend cap and deadline can be stated up front, and (4) no cheaper read-only research would settle it first. The launch contract the Executor sends requires: a \`command\` string to execute, a positive \`spend_cap_usd\`, a positive \`deadline_seconds\`, and an OPTIONAL \`success_criterion\` of \`{metric, operator, threshold}\` (where \`operator\` is one of \`<\`, \`>\`, \`<=\`, \`>=\`). For multi-arm (A/B) comparisons, use \`arms: [{name, command}]\` instead of a single \`command\`, and supply \`declared_metric\` (the exact key each arm's command writes to \`$BLUEPRINT_RESULT_FILE\`); \`declared_metric\` is required when \`arms\` is present. The platform runs each arm with an isolated result path and assembles the \`{"arms": {name: {metric: value}}}\` comparison block automatically — arm commands simply write their metric as usual. A free-text \`prompt\` is optional because \`hypothesis\` serves as the description. Note: experiments above the configured per-experiment spend threshold require operator spend-approval — the backend gates this automatically and will pause the task for approval if needed.
+
+**Metric capture is MANDATORY.** The \`command\` (and each arm's command) MUST write the declared metric as a JSON object to the file at \`$BLUEPRINT_RESULT_FILE\` — e.g. \`... && python -c "import json,os; json.dump({'<metric>': <value>}, open(os.environ['BLUEPRINT_RESULT_FILE'],'w'))"\` — or print that JSON object as the LAST line of stdout. Use your real declared-metric key in place of \`<metric>\`. A command that exits 0 but never emits the value silently loses the metric: the \`success_criterion\` is then evaluated unmeasured and FAILS (\`compute_unmeasured_criterion\`) — a run that finished cannot pass as a hypothesis that was measured. State this contract explicitly in the command you commission.
+
+**Containerized / GPU runtimes.** When the experiment needs a runtime the repo cannot \`pip install\` natively (a CUDA / cuDNN / NGC framework stack), the commission MUST carry \`container_image\` (an image URI, e.g. an NVIDIA NGC image such as \`nvcr.io/nvidia/tensorflow:25.01\`) — the command then runs INSIDE that image; WITHOUT it the command runs BARE and dies with ModuleNotFoundError. Add \`container_registry_auth\` (\`{server, username, password}\`) only for a private/gated registry. \`accelerator\` (e.g. \`T4\`, \`L4\`, \`V100\`) alone requests a single GPU — you do NOT also need \`machine_type\`. \`setup_step\` runs as bare \`bash -lc\` on the HOST, OUTSIDE the container, for host-level pre-container prep only — anything that needs the container's environment (pip installs into the experiment's interpreter, importing the image's libraries) MUST go in \`command\`, not \`setup_step\`. Before authoring a GPU experiment, heed the local-runner availability note above (when present): if no GPU runner is live, hold the experiment rather than author it.
+
+Name the hypothesis, the command (or arms), the metric being measured, and what the outcome changes.
+
+**Sweep synthesis.** When the "Completed experiment sweeps" section above lists a sweep where every arm shows a verdict (MET or NOT MET), synthesize a comparative conclusion before proposing a follow-on move: which arm won, by how much, and what it implies. Then propose exactly one concrete next step — adopt the winning arm in an implementation direction, commission a deeper follow-on experiment to resolve ambiguity, or retire the hypothesis as settled if the answer is conclusive. Use \`./fetch knowledge <id>\` to read an arm's full analysis body before concluding. Do not leave a complete sweep without a move.
 
 **Pick the right dispatch — does the work need ONGOING steering, or does it finish once built?**
 - **\`create-direction\`** — work that needs SUSTAINED building and improvement across many cycles: you develop, refine, and extend it over time rather than finishing it in one pass. Directions are the project's spine — a healthy portfolio of several genuine ones is expected; keep it. Each carries a real \`success_evidence\` / \`retirement_condition\` and retires when it's played out.
@@ -280,6 +303,8 @@ Directions to retire (one-sentence reason each) and to create (name the gap_id e
 Staging is NOT deferral, and it is not an escape from the "you're not allowed to defer" rule. Staging is itself a DECISION — a hard call that the work genuinely belongs to the NEXT version's scope, not this one. The natural case: the project is in its stabilize/hardening phase (see the version-phase section, when present) and a strong *build-phase* idea appears that would pollute the current version's scope if started now — stage it so it activates cleanly when the next build phase opens. Use it for genuinely next-version-scoped work. Do NOT use it to dodge a within-cycle call: if work belongs to THIS version, create it active now; if it's not worth doing, retire/don't-create it. "I'm not sure, I'll stage it" is deferral wearing staging's clothes — make the call instead.
 
 To stage a genuinely new next-version idea, create it with the staged flag (a single atomic op — the Executor passes \`"staged": true\` on create-direction, so the direction is born staged and never passes through a research-eligible active state). To stage an existing active direction whose work you've decided belongs to the next version, stage it by id.
+
+**Stabilize is hardening time, not idle time.** When the version-phase section shows the current version in its **stabilize** phase, the restraint is narrow: don't *start* new feature/build directions that would pollute this version's scope — stage those instead (per the Staging block above). That restraint is NOT license to stop opening directions. Stabilize is exactly when quality work earns its keep: hardening, test coverage, error handling, cleanup, dead-code removal, risk-reducing refactors, and closing carried audit findings. Keep the lanes full with that work. A stabilize cycle that opens zero directions and writes "holding / nothing to start / do not manufacture lanes" is the single failure mode this phase most invites — and it is wrong. "No gap in hand" is never a reason to idle; it is a reason to **go find one**. Commission an audit — a read-only \`research\`/\`web_research\` pass, or an \`audit\`/\`fundamentals\`-mode direction — that surfaces the concrete hardening work, then drive those findings to merged PRs. If you cannot name one thing worth hardening, polishing, or cleaning in the system you're stabilizing, you have not looked yet — looking is the move.
 
 ## 3.5. Retired-direction critique (REQUIRED)
 
@@ -364,16 +389,16 @@ Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_W
 
 **Version goal (only when the Goal shown in Version Phase is unset):**
 
-**Skip if the version already has a goal** — the goal is frozen once set; re-emitting is silently ignored.
+**Skip if the version already has a goal** — the goal is frozen once set; re-emitting is a non-fatal no-op.
 
-**Only when the goal is currently unset:** write one concise version objective to \`/tmp/new_version_goal_${p.taskId}.txt\` ${READ_ONLY_BASH_WRITE_NOTE}. Single line, under 500 characters.
+**Only when the goal is currently unset:** include a \`new_version_goal\` key at the **top level** of your problem_model JSON (a peer of \`intent\`, \`context\`, \`constraints\`, etc.) with the objective text as its value. Single line, under 500 characters. The backend lifts this field before ProblemModel validation and applies it — it does not persist in the stored model.
 
 The goal must be SUBSTANTIVE and DIRECTIONAL — a concrete deliverable statement that orients a new contributor reading it cold. It becomes the frozen scoring target for every merge in this version.
 
 Bad: "Fix CI, improve quality, pass audit." — feature list / status echo, rejected by the contentless-goal guard.
 Good: a concrete deliverable paired with a measurable success bar a new contributor could verify cold — outcome-framed, not a feature list or status echo.
 
-Write only the goal text — no JSON, no label, no quotes. Omit the file entirely if the goal is already set.
+Omit the \`new_version_goal\` key entirely if the goal is already set.
 
 **Version theme (only when the Theme shown in Version Phase is unset):**
 
@@ -630,15 +655,29 @@ export async function runThinkerWithGate(
     }
   }
 
-  // Read the optional Section 7 version-goal file if the thinker wrote it.
-  const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
+  // Extract the optional new_version_goal — primary: first-class field in the
+  // problem_model JSON (the authoritative handoff file the gate already validated);
+  // fallback: legacy tmp file written by older thinker agents for backward compat.
   let newVersionGoal: string | undefined;
-  if (fs.existsSync(newVersionGoalPath)) {
-    try {
-      const raw = fs.readFileSync(newVersionGoalPath, 'utf8').trim();
-      if (raw) newVersionGoal = raw;
-    } catch (e) {
-      sendLog(ws, `[WARNING] Failed to read ${newVersionGoalPath}: ${String(e)}\n`);
+  try {
+    const pmRaw = fs.readFileSync(problemModelPath, 'utf8');
+    const pm = JSON.parse(pmRaw) as Record<string, unknown>;
+    if (typeof pm.new_version_goal === 'string') {
+      const trimmed = pm.new_version_goal.trim();
+      if (trimmed) newVersionGoal = trimmed;
+    }
+  } catch {
+    // problem_model JSON unreadable at this point — fall through to tmp-file fallback.
+  }
+  if (!newVersionGoal) {
+    const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
+    if (fs.existsSync(newVersionGoalPath)) {
+      try {
+        const raw = fs.readFileSync(newVersionGoalPath, 'utf8').trim();
+        if (raw) newVersionGoal = raw;
+      } catch (e) {
+        sendLog(ws, `[WARNING] Failed to read ${newVersionGoalPath}: ${String(e)}\n`);
+      }
     }
   }
 

@@ -2203,6 +2203,10 @@ async def _make_knowledge_doc(
     direction_id=None,
     source_kind="web_research",
     created_at=None,
+    sweep_id=None,
+    arm_label=None,
+    forward_quality_verdict=None,
+    source_citations=None,
 ):
     """Persist one KnowledgeDocument for index tests, with optional explicit
     created_at so ordering is deterministic within a single transaction."""
@@ -2215,6 +2219,10 @@ async def _make_knowledge_doc(
         topic=topic,
         direction_id=direction_id,
         source_kind=source_kind,
+        sweep_id=sweep_id,
+        arm_label=arm_label,
+        forward_quality_verdict=forward_quality_verdict,
+        source_citations=source_citations,
     )
     if created_at is not None:
         doc.created_at = created_at
@@ -2225,8 +2233,8 @@ async def _make_knowledge_doc(
 
 
 @pytest.mark.asyncio
-async def test_build_knowledge_index_compact_fields_no_body(db_session):
-    """The index carries only the compact navigation fields and never the body."""
+async def test_knowledge_index_entry_shape(db_session):
+    """The index entry carries exactly the expected navigation fields (including sweep_id and arm_label) and never the body."""
     from app.knowledge_query import build_knowledge_index
 
     project, task = await _make_web_research_task(db_session, project_name="KI1")
@@ -2258,6 +2266,8 @@ async def test_build_knowledge_index_compact_fields_no_body(db_session):
         "compute_acceptance_reason",
         "unavailable_cause",
         "origin_provenance",
+        "sweep_id",
+        "arm_label",
     }
     assert "body" not in entry
     assert entry["knowledge_acceptance_evidence"] is True
@@ -2416,6 +2426,142 @@ async def test_build_knowledge_index_excludes_cross_project(db_session):
     )
     index_a = await build_knowledge_index(db_session, project_a.id)
     assert [e["title"] for e in index_a] == ["A doc"]
+
+
+# ── build_compute_sweep_groups: per-sweep comparative arm grouping ───────────
+def _acceptance_verdict():
+    """forward_quality_verdict that classifies a compute doc as acceptance."""
+    return {
+        "analysis_mode": "llm",
+        "probes": {"grounding": {"grounded": 1}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_groups_arms_by_sweep_id(db_session):
+    """Compute docs sharing a sweep_id group into one comparative block, with
+    criterion_met derived from the acceptance grade."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, task = await _make_web_research_task(db_session, project_name="SWG1")
+    # Two arms in one sweep: one accepted (criterion met), one measured-only.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="arm baseline",
+        source_kind="compute_experiment",
+        sweep_id="sw-1111",
+        arm_label="baseline",
+        forward_quality_verdict=None,  # not llm → measured_only → not met
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="arm treatment",
+        source_kind="compute_experiment",
+        sweep_id="sw-1111",
+        arm_label="treatment",
+        forward_quality_verdict=_acceptance_verdict(),
+        source_citations=["gs://bucket/result.json"],
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    # Returns {sweep_id: [_knowledge_index_entry, ...]}
+    assert "sw-1111" in groups
+    assert len(groups) == 1
+    entries = groups["sw-1111"]
+    assert len(entries) == 2
+    by_label = {e["arm_label"]: e for e in entries}
+    # baseline has no forward_quality_verdict → measured_only → not acceptance
+    assert by_label["baseline"]["compute_acceptance_grade"] != "acceptance"
+    # treatment has acceptance verdict → grade 'acceptance'
+    assert by_label["treatment"]["compute_acceptance_grade"] == "acceptance"
+    assert by_label["treatment"]["id"]
+    assert by_label["treatment"]["title"] == "arm treatment"
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_excludes_null_sweep_and_single_arm(
+    db_session,
+):
+    """Docs with no sweep_id are excluded; single-arm sweeps are not comparative."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, task = await _make_web_research_task(db_session, project_name="SWG2")
+    # Null-sweep compute doc — excluded.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="no-sweep",
+        source_kind="compute_experiment",
+        sweep_id=None,
+        arm_label="lonely",
+    )
+    # Single-arm sweep — excluded (not comparative).
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="solo arm",
+        source_kind="compute_experiment",
+        sweep_id="sw-solo",
+        arm_label="only-arm",
+    )
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert groups == {}
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_newest_first_and_bounded(db_session):
+    """Sweep groups are newest-first by latest arm and capped at the limit."""
+    from datetime import datetime, timedelta
+
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, task = await _make_web_research_task(db_session, project_name="SWG3")
+    base = datetime(2026, 1, 1, 12, 0, 0)
+    # Three sweeps, each with two arms, at increasing timestamps.
+    for i in range(3):
+        for arm in ("a", "b"):
+            await _make_knowledge_doc(
+                db_session,
+                project_id=project.id,
+                source_task_id=task.id,
+                title=f"sweep{i}-{arm}",
+                source_kind="compute_experiment",
+                sweep_id=f"sw-{i}",
+                arm_label=arm,
+                created_at=base + timedelta(hours=i),
+            )
+    groups = await build_compute_sweep_groups(db_session, project.id, limit=2)
+    # Returns {sweep_id: [entries]}; capped at 2, newest sweep first (sw-2 has the latest arm).
+    assert len(groups) == 2
+    sweep_ids = list(groups.keys())
+    assert sweep_ids[0] == "sw-2"
+    assert sweep_ids[1] == "sw-1"
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_excludes_cross_project(db_session):
+    """Sweep docs from other projects are never included."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project_a, task_a = await _make_web_research_task(db_session, project_name="SWGA")
+    project_b, task_b = await _make_web_research_task(db_session, project_name="SWGB")
+    for arm in ("a", "b"):
+        await _make_knowledge_doc(
+            db_session,
+            project_id=project_b.id,
+            source_task_id=task_b.id,
+            title=f"b-{arm}",
+            source_kind="compute_experiment",
+            sweep_id="sw-b",
+            arm_label=arm,
+        )
+    assert await build_compute_sweep_groups(db_session, project_a.id) == {}
 
 
 @pytest.mark.asyncio
@@ -2623,3 +2769,125 @@ async def test_fetch_direction_knowledge_index_empty_direction_list(db_session):
     project, _ = await _make_web_research_task(db_session, project_name="FDK3")
     result = await fetch_direction_knowledge_index(db_session, project.id, [])
     assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_sweep_id_filter_scopes_to_sweep(client: AsyncClient, db_session):
+    """?sweep_id=<id> returns only documents for that sweep, excluding others."""
+    proj = await _seed_project_with_membership(db_session, "SweepFilter")
+    task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await _seed_doc(
+        db_session, proj.id, task.id,
+        title="Arm alpha result",
+        source_kind="compute_experiment",
+        sweep_id="swp-aaa",
+        arm_label="alpha",
+    )
+    await _seed_doc(
+        db_session, proj.id, task.id,
+        title="Arm beta result",
+        source_kind="compute_experiment",
+        sweep_id="swp-aaa",
+        arm_label="beta",
+    )
+    await _seed_doc(
+        db_session, proj.id, task.id,
+        title="Different sweep doc",
+        source_kind="compute_experiment",
+        sweep_id="swp-bbb",
+        arm_label="gamma",
+    )
+
+    resp = await client.get(
+        f"/api/admin/projects/{proj.id}/knowledge-documents",
+        params={"sweep_id": "swp-aaa"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["total"] == 2
+    titles = {d["title"] for d in body["documents"]}
+    assert titles == {"Arm alpha result", "Arm beta result"}
+    # sweep_id and arm_label must appear in the serialized documents
+    for doc in body["documents"]:
+        assert doc["sweep_id"] == "swp-aaa"
+        assert doc["arm_label"] in {"alpha", "beta"}
+
+
+# ── _build_compute_experiment_document failed-arms section ───────────────────
+
+
+def test_build_compute_experiment_document_failed_arms_dict():
+    """Dict-shaped arms: ### Failed arms section appears for arms with exit_code != 0 or error."""
+    from app.knowledge_completion import _build_compute_experiment_document
+
+    task = make_task(
+        title="compute_experiment: exp-fail",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "experiment": "exp-fail"}],
+    )
+
+    arms = {
+        "adam": {
+            "val_loss": 0.42,
+            "exit_code": 1,
+            "error": "RuntimeError: CUDA OOM",
+            "stderr_excerpt": "Traceback (most recent call last): ...",
+        },
+        "sgd": {"val_loss": 0.61},
+    }
+
+    result = _build_compute_experiment_document(
+        task,
+        outcome="FAILED",
+        cost=0.10,
+        criterion=None,
+        result_reference=None,
+        arms=arms,
+    )
+
+    body = result["body"]
+    assert "### Failed arms" in body
+    assert "adam" in body
+    failed_section = body.split("### Failed arms")[-1]
+    assert "FAILED" in failed_section
+    assert "RuntimeError: CUDA OOM" in failed_section
+    assert "Traceback" in failed_section
+    # sgd succeeded — must not appear in the failed section
+    assert "sgd" not in failed_section
+
+
+def test_build_compute_experiment_document_failed_arms_list():
+    """List-shaped arms: ### Failed arms section appears for arms using 'reason' field."""
+    from app.knowledge_completion import _build_compute_experiment_document
+
+    task = make_task(
+        title="compute_experiment: exp-list",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "experiment": "exp-list"}],
+    )
+
+    arms = [
+        {"name": "arm_a", "reason": "result file not written"},
+        {"name": "arm_b", "val_loss": 0.55},
+    ]
+
+    result = _build_compute_experiment_document(
+        task,
+        outcome="FAILED",
+        cost=0.05,
+        criterion=None,
+        result_reference=None,
+        arms=arms,
+    )
+
+    body = result["body"]
+    assert "### Failed arms" in body
+    failed_section = body.split("### Failed arms")[-1]
+    assert "arm_a" in failed_section
+    assert "result file not written" in failed_section
+    # arm_b succeeded — must not appear in the failed section
+    assert "arm_b" not in failed_section

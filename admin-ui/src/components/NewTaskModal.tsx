@@ -4,6 +4,7 @@ import type { LaunchableTaskTypeOption } from '../taskCapabilities';
 import type { ComputeExperimentForm } from '../hooks/useTaskModal';
 import { COMPUTE_ACCELERATOR_OPTIONS, COMPUTE_EXPERIMENT_TASK_TYPE, canonicalMachineTypeForAccelerator } from '../hooks/useTaskModal';
 import type { ComputeSuccessOperator, ComputeExperimentPreflightResponse } from '../api';
+import { draftComputeExperiment } from '../api';
 
 const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
   create: Plus,
@@ -120,7 +121,56 @@ export function NewTaskModal({
   const [submitAttempted, setSubmitAttempted] = useState(false);
   const [prNumberError, setPrNumberError] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [registryAuthOpen, setRegistryAuthOpen] = useState(false);
   const prNumberRef = useRef<HTMLInputElement>(null);
+
+  const [ideaText, setIdeaText] = useState('');
+  const [draftLoading, setDraftLoading] = useState(false);
+  const [draftError, setDraftError] = useState<string | null>(null);
+
+  const handleDraftContract = async () => {
+    if (!ideaText.trim()) return;
+    setDraftLoading(true);
+    setDraftError(null);
+    try {
+      const draft = await draftComputeExperiment({
+        idea: ideaText.trim(),
+        ...(newTaskRepo ? { github_repo: newTaskRepo } : {}),
+        ...(newTaskBranch ? { base_branch: newTaskBranch } : {}),
+      });
+      if (!draft.draft_available) {
+        setDraftError('Draft not available — fill the form manually.');
+        return;
+      }
+      const hasArms = Array.isArray(draft.arms) && draft.arms.length >= 2;
+      setComputeExperiment(f => ({
+        ...f,
+        useArmsMode: hasArms,
+        arms: hasArms ? (draft.arms ?? f.arms) : f.arms,
+        declaredMetric: draft.declared_metric ?? f.declaredMetric,
+        command: !hasArms ? (draft.command ?? f.command) : f.command,
+        accelerator: draft.accelerator ?? f.accelerator,
+        machineType: draft.machine_type ?? f.machineType,
+        spendCapUsd: draft.spend_cap_usd != null ? String(draft.spend_cap_usd) : f.spendCapUsd,
+        deadlineSeconds: draft.deadline_seconds != null ? String(draft.deadline_seconds) : f.deadlineSeconds,
+        experiment: draft.experiment ?? f.experiment,
+        benchmark: draft.benchmark ?? f.benchmark,
+        hypothesis: draft.hypothesis ?? f.hypothesis,
+        metric: draft.metric ?? f.metric,
+        successMetric: draft.success_criterion?.metric ?? f.successMetric,
+        successOperator: draft.success_criterion?.operator ?? f.successOperator,
+        successThreshold: draft.success_criterion?.threshold != null
+          ? String(draft.success_criterion.threshold)
+          : f.successThreshold,
+      }));
+      if (draft.title) setNewTaskTitle(draft.title);
+      if (draft.prompt) setNewTaskPrompt(draft.prompt);
+    } catch (err) {
+      setDraftError(err instanceof Error ? err.message : 'Draft failed');
+    } finally {
+      setDraftLoading(false);
+    }
+  };
 
   const handleTaskTypeChange = (value: string) => {
     setNewTaskType(value);
@@ -147,9 +197,21 @@ export function NewTaskModal({
       };
     });
   };
+  const updateArm = (idx: number, field: 'name' | 'command', value: string) =>
+    setComputeExperiment(f => {
+      const next = f.arms.map((a, i) => i === idx ? { ...a, [field]: value } : a);
+      return { ...f, arms: next };
+    });
+  const addArm = () =>
+    setComputeExperiment(f => ({ ...f, arms: [...f.arms, { name: '', command: '' }] }));
+  const removeArm = (idx: number) =>
+    setComputeExperiment(f => ({ ...f, arms: f.arms.filter((_, i) => i !== idx) }));
+
   // Client-side mirror of the backend launch-contract rules (non-empty command,
   // positive spend cap + deadline). Surfaced inline once a submit is attempted.
-  const computeCommandInvalid = !computeExperiment.command.trim();
+  const hasValidArms = computeExperiment.useArmsMode &&
+    computeExperiment.arms.filter(a => a.name.trim() && a.command.trim()).length >= 2;
+  const computeCommandInvalid = !computeExperiment.useArmsMode && !computeExperiment.command.trim();
   const computeSpendCap = Number(computeExperiment.spendCapUsd);
   const computeSpendInvalid = !(Number.isFinite(computeSpendCap) && computeSpendCap > 0);
   const computeDeadline = Number(computeExperiment.deadlineSeconds);
@@ -172,6 +234,9 @@ export function NewTaskModal({
     }
     if (isComputeExperiment && (computeCommandInvalid || computeSpendInvalid || computeDeadlineInvalid)) {
       // Inline errors render via submitAttempted; don't round-trip a doomed launch.
+      return;
+    }
+    if (isComputeExperiment && computeExperiment.useArmsMode && !hasValidArms) {
       return;
     }
     if (isComputeExperiment && isPreflightBlocking) {
@@ -340,20 +405,114 @@ export function NewTaskModal({
           </div>
           {isComputeExperiment && (
             <div className="mb-4 rounded-lg border border-neutral-800 bg-neutral-950/50 p-3">
-              <div className="flex items-center gap-1.5 mb-3 text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">
-                <Cpu className="w-3.5 h-3.5 text-neutral-500" />
-                Compute Experiment Contract
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-1.5 text-ui-md font-semibold text-neutral-400 uppercase tracking-wider">
+                  <Cpu className="w-3.5 h-3.5 text-neutral-500" />
+                  Compute Experiment Contract
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setComputeExperiment(f => ({ ...f, useArmsMode: !f.useArmsMode }))}
+                  className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors min-h-[44px] sm:min-h-0"
+                >
+                  {computeExperiment.useArmsMode ? 'Single command' : 'Multi-arm sweep'}
+                </button>
               </div>
               <div className="mb-3">
-                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Command</label>
-                <textarea
-                  value={computeExperiment.command}
-                  onChange={e => updateCompute('command', e.target.value)}
-                  className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[64px] transition-all placeholder:text-neutral-600 ${submitAttempted && computeCommandInvalid ? 'border-red-500' : 'border-neutral-800'}`}
-                  placeholder="python train.py --epochs 3"
-                />
-                {submitAttempted && computeCommandInvalid && <p className="text-ui-sm text-red-500 mt-1">Command is required.</p>}
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">
+                  Research Idea <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional — auto-fill form)</span>
+                </label>
+                <div className="flex gap-2 items-start">
+                  <textarea
+                    value={ideaText}
+                    onChange={e => setIdeaText(e.target.value)}
+                    className="flex-1 bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[64px] transition-all placeholder:text-neutral-600"
+                    placeholder="Describe your experiment in plain English…"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleDraftContract}
+                    disabled={draftLoading || !ideaText.trim()}
+                    className="min-h-[44px] sm:min-h-0 px-3 py-2 rounded-lg border border-neutral-700 text-xs font-medium text-neutral-300 hover:bg-white/5 disabled:opacity-40 disabled:cursor-not-allowed transition-all flex items-center gap-1.5 whitespace-nowrap"
+                  >
+                    {draftLoading && <Loader2 className="w-3 h-3 animate-spin" />}
+                    Draft contract
+                  </button>
+                </div>
+                {draftError && <p className="text-ui-sm text-red-400 mt-1">{draftError}</p>}
               </div>
+              {computeExperiment.useArmsMode ? (
+                <div className="mb-3">
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">
+                    Arms <span className="text-neutral-600 normal-case font-normal tracking-normal">(name + command per arm)</span>
+                  </label>
+                  {computeExperiment.arms.map((arm, idx) => (
+                    <div key={idx} className="flex gap-2 mb-2 items-start">
+                      <input
+                        type="text"
+                        value={arm.name}
+                        onChange={e => updateArm(idx, 'name', e.target.value)}
+                        className="w-24 flex-shrink-0 bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-2 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                        placeholder="arm-A"
+                      />
+                      <textarea
+                        value={arm.command}
+                        onChange={e => updateArm(idx, 'command', e.target.value)}
+                        className="flex-1 bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-2 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[40px] transition-all placeholder:text-neutral-600"
+                        placeholder="python train.py --lr 0.01"
+                      />
+                      {computeExperiment.arms.length > 2 && (
+                        <button
+                          type="button"
+                          onClick={() => removeArm(idx)}
+                          className="text-neutral-600 hover:text-red-400 transition-colors mt-2 min-h-[44px] sm:min-h-0"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={addArm}
+                    className="text-xs text-neutral-500 hover:text-neutral-300 transition-colors flex items-center gap-1 mt-1 min-h-[44px] sm:min-h-0"
+                  >
+                    <Plus className="w-3 h-3" /> Add arm
+                  </button>
+                  {submitAttempted && !hasValidArms && (
+                    <p className="text-ui-sm text-red-500 mt-1">At least two arms with name and command are required.</p>
+                  )}
+                  <div className="mt-2">
+                    <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">
+                      Declared Metric <span className="text-neutral-600 normal-case font-normal tracking-normal">(metric key all arms emit)</span>
+                    </label>
+                    <input
+                      type="text"
+                      value={computeExperiment.declaredMetric}
+                      onChange={e => updateCompute('declaredMetric', e.target.value)}
+                      className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600 ${submitAttempted && computeExperiment.useArmsMode && !computeExperiment.declaredMetric.trim() ? 'border-red-500' : 'border-neutral-800'}`}
+                      placeholder="val/accuracy"
+                    />
+                    {submitAttempted && computeExperiment.useArmsMode && !computeExperiment.declaredMetric.trim() && (
+                      <p className="text-ui-sm text-red-500 mt-1">Declared metric is required for multi-arm experiments.</p>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div className="mb-3">
+                  <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Command</label>
+                  <textarea
+                    value={computeExperiment.command}
+                    onChange={e => updateCompute('command', e.target.value)}
+                    className={`w-full bg-neutral-950 border text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 resize-y min-h-[64px] transition-all placeholder:text-neutral-600 ${submitAttempted && computeCommandInvalid ? 'border-red-500' : 'border-neutral-800'}`}
+                    placeholder="python train.py --epochs 3"
+                  />
+                  {submitAttempted && computeCommandInvalid && <p className="text-ui-sm text-red-500 mt-1">Command is required.</p>}
+                </div>
+              )}
+              <p className="text-ui-sm text-neutral-500 mb-3">
+                The command must write the declared metric as JSON to <code className="text-neutral-400 font-mono">$BLUEPRINT_RESULT_FILE</code> — otherwise the result is lost.
+              </p>
               <div className="grid grid-cols-2 gap-3 mb-3">
                 <div>
                   <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Working Dir <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
@@ -413,6 +572,63 @@ export function NewTaskModal({
                 )}
               </div>
               <div className="mb-3">
+                <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Container Image <span className="text-neutral-600 normal-case font-normal tracking-normal">(optional)</span></label>
+                <input
+                  type="text"
+                  value={computeExperiment.containerImage}
+                  onChange={e => updateCompute('containerImage', e.target.value)}
+                  className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                  placeholder="nvcr.io/nvidia/tensorflow:25.01"
+                />
+                <p className="text-ui-sm text-neutral-600 mt-1">Container image to run the experiment in (required for CUDA/NGC stacks; without it the command runs bare).</p>
+                <button
+                  type="button"
+                  onClick={() => setRegistryAuthOpen(o => !o)}
+                  className="min-h-[44px] sm:min-h-0 mt-2 flex items-center gap-1 text-ui-sm font-medium text-neutral-500 hover:text-neutral-300 transition-colors"
+                >
+                  <ChevronDown className={`w-3 h-3 transition-transform ${registryAuthOpen ? 'rotate-180' : ''}`} />
+                  Registry credentials <span className="text-neutral-600 font-normal normal-case">(optional — private/gated registries)</span>
+                </button>
+                {registryAuthOpen && (
+                  <div className="mt-2 grid grid-cols-1 gap-2 rounded-md border border-neutral-800 bg-neutral-950/50 p-2.5">
+                    <div className="grid grid-cols-2 gap-2">
+                      <div>
+                        <label className="block text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider mb-1">Server</label>
+                        <input
+                          type="text"
+                          value={computeExperiment.containerRegistryServer}
+                          onChange={e => updateCompute('containerRegistryServer', e.target.value)}
+                          className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                          placeholder="nvcr.io"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider mb-1">Username</label>
+                        <input
+                          type="text"
+                          value={computeExperiment.containerRegistryUsername}
+                          onChange={e => updateCompute('containerRegistryUsername', e.target.value)}
+                          className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                          placeholder="$oauthtoken"
+                        />
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-ui-sm font-semibold text-neutral-500 uppercase tracking-wider mb-1">Password / API key</label>
+                      <input
+                        type="password"
+                        autoComplete="new-password"
+                        value={computeExperiment.containerRegistryPassword}
+                        onChange={e => updateCompute('containerRegistryPassword', e.target.value)}
+                        className="w-full bg-neutral-950 border border-neutral-800 text-neutral-100 rounded-lg px-3 py-2 text-base md:text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-700 focus:border-neutral-600 transition-all placeholder:text-neutral-600"
+                        placeholder="NGC API key (write-only — never echoed back)"
+                      />
+                      <p className="text-ui-sm text-neutral-600 mt-1">Set a password to enable <code className="font-mono">docker login</code>; server and username are then required.</p>
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="mb-3">
                 <label className="block text-ui-md font-semibold text-neutral-400 uppercase tracking-wider mb-1.5">Provisioning <span className="text-neutral-600 normal-case font-normal tracking-normal">(SPOT saves ~60–90% for preemption-tolerant workloads)</span></label>
                 <select
                   value={computeExperiment.provisioningModel}
@@ -452,16 +668,34 @@ export function NewTaskModal({
                 </div>
               </div>
               {/* Preflight cost & policy panel */}
-              {isComputeExperiment && (preflightLoading || preflightResult || (preflightError && false)) && (
-                <div className={`mb-3 rounded-md px-3 py-2 text-ui-sm border ${isPreflightBlocking ? 'bg-red-950/40 border-red-800/60' : 'bg-neutral-900 border-neutral-800'}`}>
+              {isComputeExperiment && (preflightLoading || preflightResult || preflightError) && (
+                <div className={`mb-3 rounded-md px-3 py-2 text-ui-sm border ${preflightError || isPreflightBlocking ? 'bg-red-950/40 border-red-800/60' : 'bg-neutral-900 border-neutral-800'}`}>
                   {preflightLoading && (
                     <span className="flex items-center gap-1.5 text-neutral-500">
                       <Loader2 className="animate-spin" style={{ width: 11, height: 11 }} />
                       Checking rates…
                     </span>
                   )}
+                  {!preflightLoading && preflightError && (
+                    <div className="text-red-400">
+                      <span className="font-semibold">Couldn't estimate cost — </span>
+                      {preflightError}
+                    </div>
+                  )}
                   {!preflightLoading && preflightResult && (
                     <div className="space-y-1">
+                      {preflightResult.effective_spend_cap_usd != null && preflightResult.effective_spend_cap_usd !== computeSpendCap && computeSpendCap > 0 && (
+                        <div className="flex justify-between text-amber-400">
+                          <span>Effective cap (clamped)</span>
+                          <span className="font-mono">${preflightResult.effective_spend_cap_usd.toFixed(2)}</span>
+                        </div>
+                      )}
+                      {preflightResult.effective_deadline_seconds != null && preflightResult.effective_deadline_seconds !== computeDeadline && computeDeadline > 0 && (
+                        <div className="flex justify-between text-amber-400">
+                          <span>Effective deadline (clamped)</span>
+                          <span className="font-mono">{preflightResult.effective_deadline_seconds}s</span>
+                        </div>
+                      )}
                       {preflightResult.rate_per_hour != null && (
                         <div className="flex justify-between text-neutral-400">
                           <span>Rate</span>
@@ -469,9 +703,9 @@ export function NewTaskModal({
                         </div>
                       )}
                       {preflightResult.projected_cost_usd != null && (
-                        <div className={`flex justify-between ${preflightResult.projected_cost_usd > computeSpendCap && computeSpendCap > 0 ? 'text-amber-400' : 'text-neutral-400'}`}>
+                        <div className={`flex justify-between ${preflightResult.projected_cost_usd > (preflightResult.effective_spend_cap_usd ?? computeSpendCap) && computeSpendCap > 0 ? 'text-amber-400' : 'text-neutral-400'}`}>
                           <span>Full-deadline cost</span>
-                          <span className="font-mono">${preflightResult.projected_cost_usd.toFixed(3)}{preflightResult.projected_cost_usd > computeSpendCap && computeSpendCap > 0 ? ' ⚠ exceeds cap' : ''}</span>
+                          <span className="font-mono">${preflightResult.projected_cost_usd.toFixed(3)}{preflightResult.projected_cost_usd > (preflightResult.effective_spend_cap_usd ?? computeSpendCap) && computeSpendCap > 0 ? ' ⚠ exceeds cap' : ''}</span>
                         </div>
                       )}
                       {preflightResult.max_runtime_seconds != null && (

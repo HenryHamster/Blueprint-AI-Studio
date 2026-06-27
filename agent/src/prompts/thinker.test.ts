@@ -102,6 +102,17 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('## 6. Problem model');
   });
 
+  it('includes sweep synthesis guidance for reading back completed experiments', () => {
+    const prompt = buildThinkerPrompt(base);
+    expect(prompt).toContain('Sweep synthesis');
+    // The guidance references the rendered "Completed experiment sweeps" section
+    // (built from the strategic payload's compute_experiment_sweeps field). The
+    // snake_case field name itself is internal plumbing and is deliberately not
+    // surfaced in the operator-facing prompt body.
+    expect(prompt).toContain('Completed experiment sweeps');
+    expect(prompt).toContain('MET or NOT MET');
+  });
+
   it('documents the gap deferral shape and the direction→gap linkage', () => {
     const prompt = buildThinkerPrompt(base);
     // Gap quick-reference lists the optional deferral field.
@@ -328,6 +339,30 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('some data');
   });
 
+  it('sweepComparisonSection rendered when non-empty', () => {
+    const section = '## Completed experiment sweeps\nArm A: MET, Arm B: NOT MET\n';
+    const prompt = buildThinkerPrompt({ ...base, sweepComparisonSection: section });
+    expect(prompt).toContain('## Completed experiment sweeps');
+    expect(prompt).toContain('Arm A: MET, Arm B: NOT MET');
+  });
+
+  it('sweepComparisonSection omitted when absent or empty', () => {
+    const withoutField = buildThinkerPrompt(base);
+    expect(withoutField).not.toContain('## Completed experiment sweeps');
+
+    const withEmpty = buildThinkerPrompt({ ...base, sweepComparisonSection: '' });
+    expect(withEmpty).not.toContain('## Completed experiment sweeps');
+  });
+
+  it('sweepComparisonSection appears after efficiencySnapshotSection and before # Your job', () => {
+    const efficiency = '\n## Pipeline Efficiency Axes\ndata\n';
+    const sweep = '## Completed experiment sweeps\nArm A: MET\n';
+    const prompt = buildThinkerPrompt({ ...base, efficiencySnapshotSection: efficiency, sweepComparisonSection: sweep });
+    const idx = (s: string) => prompt.indexOf(s);
+    expect(idx('## Pipeline Efficiency Axes')).toBeLessThan(idx('## Completed experiment sweeps'));
+    expect(idx('## Completed experiment sweeps')).toBeLessThan(idx('# Your job'));
+  });
+
   it('self-improvement block rendered when selfImprovementBlock is non-empty', () => {
     const selfRepoPrompt = buildThinkerPrompt({
       ...base,
@@ -459,16 +494,18 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('/tmp/problem_model_abc-456.json');
     expect(prompt).toContain('/tmp/running_update_abc-456.md');
     expect(prompt).toContain('/tmp/research_progress_abc-456.md');
-    expect(prompt).toContain('/tmp/new_version_goal_abc-456.txt');
+    // new_version_goal is a first-class JSON field — no separate tmp file
+    expect(prompt).not.toContain('/tmp/new_version_goal_abc-456.txt');
   });
 
   it('includes READ_ONLY_BASH_WRITE_NOTE next to each /tmp output path', () => {
     const prompt = buildThinkerPrompt({ ...base, taskId: 'abc-789' });
     expect(prompt).toContain(READ_ONLY_BASH_WRITE_NOTE);
     // Note should appear multiple times (once per output file path):
-    // running_update, problem_model, research_progress, new_version_goal
+    // running_update, problem_model, research_progress, new_version_theme
+    // (new_version_goal is now a first-class JSON field, not a separate file)
     const count = prompt.split(READ_ONLY_BASH_WRITE_NOTE).length - 1;
-    expect(count).toBeGreaterThanOrEqual(4);
+    expect(count).toBeGreaterThanOrEqual(3);
   });
 
   it('includes PLAYBOOK_GUIDANCE (structural invariant: strategic_review class)', () => {
@@ -501,8 +538,12 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('new_version_goal');
     // Section 7 is the dedicated output section for the version goal and theme
     expect(prompt).toContain('## 7. Version goal');
-    // Must reference the dedicated handoff file
-    expect(prompt).toContain('/tmp/new_version_goal_');
+    // new_version_goal is now a first-class JSON field, not a separate tmp file
+    expect(prompt).not.toContain('/tmp/new_version_goal_');
+    // Must instruct the thinker to include it as a top-level JSON field
+    expect(prompt).toContain('top level');
+    // Must note it does not persist in the stored model
+    expect(prompt).toContain('does not persist in the stored model');
     // Must explain when to write it (only when goal is unset)
     expect(prompt).toContain('goal is currently unset');
     // Must note that once set, it is frozen (skip if already set)
@@ -860,6 +901,58 @@ describe('runThinkerWithGate', () => {
       expect(result.newVersionTheme).toBeUndefined();
     }
   });
+
+  it('(m) new_version_goal first-class: JSON field present, no tmp file → returned in newVersionGoal', async () => {
+    // First-class path: the thinker embeds new_version_goal directly in the
+    // problem_model JSON rather than writing a separate tmp file.
+    const goalText = 'Deliver autonomous cross-project coordination with zero operator interventions per day.';
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    // No new_version_goal_<taskId>.txt in presentFiles (tmp file absent)
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => {
+        if (path === problemModelPath) {
+          return JSON.stringify({ intent: { purpose: 'ok' }, gaps: [], new_version_goal: goalText });
+        }
+        return '';
+      },
+    );
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionGoal).toBe(goalText);
+    }
+  });
+
+  it('(n) new_version_goal first-class: JSON field takes precedence over tmp file', async () => {
+    // When both sources are present, the JSON field (first-class) wins.
+    const goalInJson = 'Primary goal from problem_model JSON field.';
+    const goalInFile = 'Secondary goal from legacy tmp file.';
+    const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.presentFiles.add(newVersionGoalPath);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => {
+        if (path === problemModelPath) {
+          return JSON.stringify({ intent: { purpose: 'ok' }, gaps: [], new_version_goal: goalInJson });
+        }
+        if (path === newVersionGoalPath) return goalInFile;
+        return '';
+      },
+    );
+    mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.newVersionGoal).toBe(goalInJson);
+    }
+  });
 });
 
 // ── runThinkerWithGate validateParsedValue guard ──────────────────────────────
@@ -1191,5 +1284,55 @@ describe('spawn-fix allowlist sync', () => {
     expect(prompt).toContain("types `create`/`refactor`/`qa`");
     // 'fix' must not appear as an advertised spawn-fix type
     expect(prompt).not.toMatch(/`spawn-fix`[^)]*types[^)]*`fix`/);
+  });
+});
+
+describe('buildThinkerPrompt stabilize-hardening guidance', () => {
+  const base: ThinkerPromptParams = {
+    contextPrefix: '',
+    projectName: 'Test Project',
+    clockHeader: '',
+    isSelfRepo: false,
+    userStateLine: '',
+    packerMetaSection: '',
+    strategicContext: '',
+    problemModelSection: '',
+    problemModelRecovery: 'empty',
+    reflectionSection: '',
+    selfImprovementBlock: '',
+    runningUpdateSection: '',
+    designDocJson: '',
+    visionJson: '',
+    outcomeSection: '',
+    previousDecisionOutcomes: '',
+    pastRetirementCritiquesSection: '',
+    retiredDirectionsSummarySection: '',
+    dirSummaryText: '',
+    dirHealthSummary: '',
+    userPausedSection: '',
+    rejectedProposalsSection: '',
+    operatorOverridesSection: '',
+    portfolioCompositionText: '',
+    modelHealthSection: '',
+    systemMaturitySection: '',
+    driftSection: '',
+    recentWorkSection: '',
+    feedbackSection: '',
+    questionSection: '',
+    threadSection: '',
+    taskId: 'test-task',
+    versionPhaseSection: '',
+    memoCitationsSection: '',
+    efficiencySnapshotSection: '',
+  };
+
+  it('instructs that stabilize is hardening time (not idle) and to commission an audit rather than hold', () => {
+    const prompt = buildThinkerPrompt(base);
+    // Stabilize must be framed as active hardening, not idling.
+    expect(prompt).toContain('Stabilize is hardening time, not idle time');
+    expect(prompt).toContain('NOT license to stop opening directions');
+    // The fix steers the strategist to go find work via an audit instead of holding.
+    expect(prompt).toContain('Commission an audit');
+    expect(prompt).toContain('do not manufacture lanes');
   });
 });

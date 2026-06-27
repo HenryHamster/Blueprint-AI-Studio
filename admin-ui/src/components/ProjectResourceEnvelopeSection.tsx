@@ -76,6 +76,9 @@ export function ProjectResourceEnvelopeSection({
   // Distinct from "no accelerators selected": when true we save an explicit
   // empty list (`[]`) that blocks all GPU jobs, rather than `null` (unlimited).
   const [blockAllGpu, setBlockAllGpu] = useState(false);
+  // When true, compute experiments only run on registered self-hosted runners
+  // and never fall back to billable cloud compute.
+  const [requireLocalRunner, setRequireLocalRunner] = useState(false);
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
@@ -90,6 +93,7 @@ export function ProjectResourceEnvelopeSection({
     // whitelist; null/absent means unrestricted.
     setBlockAllGpu(Array.isArray(accel) && accel.length === 0);
     setAcceleratorTypes(accel != null ? [...accel] : []);
+    setRequireLocalRunner(data?.require_local_runner ?? false);
   }, [data]);
 
   const parsedMaxConcurrent = useMemo(() => {
@@ -130,6 +134,7 @@ export function ProjectResourceEnvelopeSection({
     max_concurrent_compute_jobs: null,
     allowed_machine_types: null,
     allowed_accelerator_types: null,
+    require_local_runner: false,
     active_vm_count: 0,
     recent_spend_usd: 0,
     recent_spend_compute_usd: 0,
@@ -178,6 +183,7 @@ export function ProjectResourceEnvelopeSection({
       : current.max_concurrent_compute_jobs !== null;
     const machineTypesChanged = !policyEquals(current.allowed_machine_types ?? null, machineTypesToSave);
     const acceleratorTypesChanged = !policyEquals(current.allowed_accelerator_types ?? null, acceleratorTypesToSave);
+    const requireLocalRunnerChanged = (current.require_local_runner ?? false) !== requireLocalRunner;
     return (
       maxChanged ||
       spendChanged ||
@@ -185,7 +191,8 @@ export function ProjectResourceEnvelopeSection({
       warningChanged ||
       computeJobsChanged ||
       machineTypesChanged ||
-      acceleratorTypesChanged
+      acceleratorTypesChanged ||
+      requireLocalRunnerChanged
     );
   }, [
     current.max_concurrent_vms,
@@ -195,6 +202,7 @@ export function ProjectResourceEnvelopeSection({
     current.max_concurrent_compute_jobs,
     current.allowed_machine_types,
     current.allowed_accelerator_types,
+    current.require_local_runner,
     maxConcurrentVmsInput,
     spendCeilingUsdInput,
     spendWindowDaysInput,
@@ -202,6 +210,7 @@ export function ProjectResourceEnvelopeSection({
     maxConcurrentComputeJobsInput,
     machineTypesToSave,
     acceleratorTypesToSave,
+    requireLocalRunner,
   ]);
 
   const handleSave = async () => {
@@ -218,6 +227,7 @@ export function ProjectResourceEnvelopeSection({
         max_concurrent_compute_jobs: parsedMaxConcurrentComputeJobs,
         allowed_machine_types: machineTypesToSave,
         allowed_accelerator_types: acceleratorTypesToSave,
+        require_local_runner: requireLocalRunner,
       });
     } finally {
       setSaving(false);
@@ -489,6 +499,28 @@ export function ProjectResourceEnvelopeSection({
             </p>
           </fieldset>
         </div>
+      </div>
+
+      <div>
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Compute Runner</h3>
+        <label className="flex items-start gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={requireLocalRunner}
+            disabled={inputDisabled}
+            onChange={() => setRequireLocalRunner(prev => !prev)}
+            className="h-4 w-4 mt-0.5 rounded border-neutral-700 bg-neutral-950 disabled:opacity-60"
+          />
+          <span className="text-xs text-neutral-200">
+            Require local runner for compute experiments
+            <span className="block text-ui-md text-neutral-600 mt-1">
+              When on, this project's compute experiments only run on registered self-hosted
+              runners and never fall back to billable cloud compute. With no live runner,
+              experiments are held until one comes online (and time out after a few hours
+              rather than wedging).
+            </span>
+          </span>
+        </label>
       </div>
 
       <div className="flex justify-end pt-2">

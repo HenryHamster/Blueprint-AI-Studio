@@ -23,6 +23,7 @@ export interface Source {
 export interface Intent {
   purpose: string;
   current_focus: string;
+  user_purpose?: string | null;
   source?: Source | null;
 }
 

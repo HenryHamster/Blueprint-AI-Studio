@@ -1293,6 +1293,38 @@ async def _reconcile_if_pending_auto_merge_landed(
             return False
 
 
+def promotion_ci_selfheal_enabled(project: Project) -> bool:
+    """Whether the engine self-heals THIS project's release-promotion CI failures.
+
+    This governs the promotion-CI harvest (``_harvest_promotion_ci_failures``) —
+    the engine repairing its OWN release pipeline when a promotion PR's full CI
+    matrix goes red.  It is a release-pipeline concern and is deliberately
+    DECOUPLED from the generic protected-branch auto-remediation gate
+    (``design_doc._auto_remediation.enabled``), which the strategist rewrites
+    every cycle and which therefore does not durably persist an operator's
+    intent.
+
+    Resolution (durable + strategist-proof + project-agnostic):
+
+    * An explicit operator choice in operator-owned ``build_config``
+      (``promotion_ci_selfheal_enabled``) wins.  ``build_config`` is never
+      written by the strategist (it writes ``design_doc`` / ``problem_model``),
+      so an operator opt-out/opt-in survives every strategic cycle, and the
+      ``BuildConfig`` schema + ``apply_operator_build_config_overrides`` carry it
+      through onboard / PATCH / re-detect.
+    * Otherwise it defaults ON.  No self-repo flag, no repo-name special-casing:
+      the harvest only ever runs when a promotion PR's CI fails (i.e. the project
+      is actively promoting releases), so a blanket default is self-limiting and
+      correct for any project.  The existing safety guards (infra-flake
+      detection, per-hour / concurrent rate limits, branch suspension,
+      require-review) still apply to whatever fix it spawns.
+    """
+    val = (project.build_config or {}).get("promotion_ci_selfheal_enabled")
+    if isinstance(val, bool):
+        return val
+    return True
+
+
 async def _harvest_promotion_ci_failures(
     *,
     project_id: uuid.UUID,
@@ -1303,6 +1335,7 @@ async def _harvest_promotion_ci_failures(
     ci_source_sha: str,
     integration_branch: str,
     auto_remediation_config: dict[str, Any],
+    selfheal_enabled: bool,
 ) -> None:
     """Spawn a CI auto-remediation fix task — on the integration branch — for a
     just-failed promotion PR's CI failures.
@@ -1319,6 +1352,14 @@ async def _harvest_promotion_ci_failures(
     but target the fix at ``integration_branch`` so it lands where the next
     qualification will pick it up.
 
+    ``selfheal_enabled`` is the release-level gate
+    (``promotion_ci_selfheal_enabled(project)``), resolved by the caller from
+    durable operator-owned ``build_config`` — NOT from the strategist-clobbered
+    ``design_doc._auto_remediation.enabled``.  ``auto_remediation_config`` is
+    still threaded through to ``_handle_main_branch_ci_failure`` for the SPAWN
+    MECHANICS only (per-hour / concurrent caps, branch suspension), and it safely
+    falls back to built-in defaults when the project never customized it.
+
     Best-effort: the promotion failure is already recorded and committed by the
     caller, so any error here is logged and swallowed — a harvest failure must
     never turn a recorded promotion failure into an unhandled exception.  The
@@ -1326,10 +1367,11 @@ async def _harvest_promotion_ci_failures(
     no-ops, so calling this on a non-CI promotion failure is harmless.
     """
     try:
-        if not auto_remediation_config.get("enabled", False):
+        if not selfheal_enabled:
             logger.info(
-                "[RELEASE_QUALIFIER] promotion-CI harvest: auto-remediation "
-                "disabled for project %s — not spawning a fix for v%d CI failures",
+                "[RELEASE_QUALIFIER] promotion-CI harvest: self-heal disabled "
+                "(build_config.promotion_ci_selfheal_enabled=False) for project "
+                "%s — not spawning a fix for v%d CI failures",
                 project_id,
                 version_number,
             )
@@ -1536,6 +1578,12 @@ async def _reconcile_if_managed_check_wait(
             _harvest_project_id = project.id
             _harvest_version_id = version.id
             _harvest_version_number = version.version_number
+            # The promotion-CI self-heal gate is resolved from durable,
+            # operator-owned build_config (NOT design_doc._auto_remediation, which
+            # the strategist rewrites every cycle).  auto_remediation_config is
+            # still snapshotted for the SPAWN MECHANICS (rate limits / suspension)
+            # and falls back to defaults when the project never customized it.
+            _harvest_selfheal_enabled = promotion_ci_selfheal_enabled(project)
             _harvest_ar_config = dict(
                 (project.design_doc or {}).get("_auto_remediation", {}) or {}
             )
@@ -1709,6 +1757,7 @@ async def _reconcile_if_managed_check_wait(
                     ci_source_sha=candidate_sha,
                     integration_branch=integration_branch,
                     auto_remediation_config=_harvest_ar_config,
+                    selfheal_enabled=_harvest_selfheal_enabled,
                 )
                 return True
 
@@ -1868,6 +1917,7 @@ async def _reconcile_if_managed_check_wait(
                     ci_source_sha=candidate_sha,
                     integration_branch=integration_branch,
                     auto_remediation_config=_harvest_ar_config,
+                    selfheal_enabled=_harvest_selfheal_enabled,
                 )
                 return True
 
@@ -2612,6 +2662,18 @@ async def _reconcile_if_promotion_pending_timed_out(
             age_hours = age_seconds / 3600.0
             pr_number = pending.get("pr_number")
             pr_url: str | None = pending.get("pr_url")
+            # A migration-carrying promotion held in managed_check_wait is owned
+            # by _reconcile_if_managed_check_wait, but that reconciler has no hard
+            # timeout of its own, so this pure-DB backstop is its only escape from
+            # a promotion that never reaches a terminal CI/merge signal.  Unlike
+            # the managed reconciler's red/closed paths, this backstop does NOT
+            # close the PR — so after it clears promotion_pending the promotion PR
+            # is left OPEN, and the promotion_failed re-driver would then open a
+            # FRESH promotion PR that races the orphan (wasting a full audit +
+            # merge-grade on the duplicate).  Remember whether this is a managed
+            # record so we can best-effort tear the orphan down after the lock is
+            # released.
+            _managed_check_wait = bool(pending.get("managed_check_wait"))
             # base_record drops promotion_pending (mirrors
             # _reconcile_if_pending_auto_merge_landed) so the recorded failure
             # CLEARS the sub-state and re-arms the qualification-timeout backstop.
@@ -2642,6 +2704,51 @@ async def _reconcile_if_promotion_pending_timed_out(
                 lock_released=False,
             )
             await session.commit()
+
+            # Best-effort: close the orphaned managed-check-wait promotion PR and
+            # delete its release branch now that the row lock is released (no
+            # GitHub I/O is held under the lock).  Fresh PK reloads avoid touching
+            # the commit-expired ORM instances (MissingGreenlet).  Fail-open: any
+            # error leaves today's behavior (PR closed by a later sweep / operator)
+            # and never turns the recorded timeout into an exception.
+            if _managed_check_wait and pr_number:
+                try:
+                    _ver = await session.get(
+                        release_version.ReleaseVersion, version_id
+                    )
+                    _proj = (
+                        await session.get(Project, _ver.project_id)
+                        if _ver is not None
+                        else None
+                    )
+                    if _ver is not None and _proj is not None:
+                        _resolved = await _resolve_github_with_session(session, _proj)
+                        if _resolved is not None:
+                            _token, _owner, _repo = _resolved
+                            await _cleanup_managed_check_wait_failure_artifacts(
+                                _token,
+                                _owner,
+                                _repo,
+                                f"release-v{_ver.version_number}",
+                                _ver,
+                                int(pr_number),
+                            )
+                            logger.info(
+                                "[RELEASE_QUALIFIER] reconcile "
+                                "promotion_pending_timeout: closed orphaned "
+                                "managed_check_wait promotion PR #%s and deleted "
+                                "release-v%d so the re-qualify does not race it",
+                                pr_number,
+                                _ver.version_number,
+                            )
+                except Exception:
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] reconcile promotion_pending_timeout: "
+                        "best-effort cleanup of orphaned managed_check_wait PR #%s "
+                        "failed — leaving it for a later sweep / operator",
+                        pr_number,
+                        exc_info=True,
+                    )
             return True
         except Exception:
             logger.exception(

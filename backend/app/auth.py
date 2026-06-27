@@ -19,12 +19,14 @@ import os
 import logging
 import jwt
 import secrets
+import hashlib
+import uuid
 from datetime import datetime, timedelta, timezone
 import firebase_admin
 from firebase_admin import auth as firebase_auth
 
 from app.database import get_session, resolve_dialect_name
-from app.models import AllowedUser, _utcnow
+from app.models import AllowedUser, LocalRunner, _utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +198,78 @@ def verify_agent_jwt(token: str) -> dict:
         raise HTTPException(status_code=401, detail="Agent token expired") from None
     except jwt.PyJWTError:
         raise HTTPException(status_code=401, detail="Invalid agent token") from None
+
+
+# ---------------------------------------------------------------------------
+# Pull-based fleet runner authentication
+# ---------------------------------------------------------------------------
+#
+# A LocalRunner enrolls on operator hardware and authenticates its polling
+# (/api/runner/*) calls with a long-lived bearer secret. Only the SHA256 hash
+# of that secret is ever persisted (LocalRunner.token_hash) — the plaintext is
+# shown exactly once at registration and never stored.
+
+
+def hash_runner_token(token: str) -> str:
+    """Return the SHA256 hex digest used to store/look up a runner token."""
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def create_runner_token(runner_id: uuid.UUID) -> str:
+    """Mint a cryptographically secure secret token for a fleet runner.
+
+    The CALLER is responsible for storing only the hash
+    (``hash_runner_token(token)``) on the LocalRunner row; this function returns
+    the plaintext token, which is surfaced to the operator exactly once.
+    ``runner_id`` is accepted for call-site clarity/auditing; the token itself
+    is an opaque random secret (no runner identity is encoded in it).
+    """
+    return secrets.token_urlsafe(32)
+
+
+async def verify_runner_token(
+    token: str, session: AsyncSession
+) -> "LocalRunner | None":
+    """Resolve a non-deleted LocalRunner by its bearer token, or None.
+
+    Looks up the row whose ``token_hash`` matches SHA256(token) and whose
+    ``status`` is anything other than ``"deleted"``.  An ``inactive`` runner
+    (one the stale-runner sweep flipped off after a single missed heartbeat
+    window — e.g. a slept or network-dropped laptop) MUST still authenticate so
+    its heartbeat can re-arm it (set status back to ``"active"``); resolving only
+    ``"active"`` rows permanently locked such runners out.  Deleted runners and
+    unknown tokens never authenticate.
+
+    Dispatch safety is unaffected: pinning targets runners filtered on a recent
+    ``last_seen_at`` (orchestrator side), so authenticating an inactive runner
+    here does not make it eligible for work until it heartbeats again.
+    """
+    token_hash = hash_runner_token(token)
+    result = await session.execute(
+        select(LocalRunner).where(
+            LocalRunner.token_hash == token_hash,
+            LocalRunner.status != "deleted",
+        )
+    )
+    return result.scalars().first()
+
+
+async def get_current_runner(
+    credentials: HTTPAuthorizationCredentials = Security(security),
+    session: AsyncSession = Depends(get_session),
+) -> LocalRunner:
+    """FastAPI dependency authenticating a pull-based fleet runner.
+
+    Raises 401 when the bearer token does not resolve to a non-deleted runner.
+    """
+    runner = await verify_runner_token(credentials.credentials, session)
+    if runner is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid runner token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return runner
 
 
 # How stale ``last_login_at`` may get before we refresh it. The timestamp is

@@ -302,8 +302,8 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
       {/* Fleet Capacity — global slot utilization and saturation */}
       <FleetCapacityCard data={fleetUtilization} agentServingShas={agentServingShas} loading={loading} />
 
-      {/* Viewport Debt */}
-      {selectedProjectId && <ViewportDebtPanel projectId={selectedProjectId} />}
+      {/* Viewport Debt — only relevant for the self-repo; backend always scans Blueprint's own admin-ui */}
+      {selectedProjectId && selectedProject?.is_self_repo && <ViewportDebtPanel projectId={selectedProjectId} />}
 
       {/* Version Lifecycle */}
       {selectedProjectId && (
@@ -354,11 +354,11 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
               <MetricCard label="Active" value={activeCount} color="emerald" spark={sparkData} dataKey="active" loading={loading} />
               <MetricCard label="Queued" value={queuedCount} color="blue" spark={sparkData} dataKey="queued" loading={loading} />
               <MetricCard label="Completed" value={digest?.completed_count ?? 0} color="violet" spark={[]} dataKey="active" loading={loading} />
-              <FailedCard value={failedCount} groups={digest?.failure_groups} spark={sparkData} loading={loading} />
+              <FailedCard value={failedCount} groups={digest?.failure_groups} spark={sparkData} loading={loading} windowHours={windowHours} />
               <SuccessRateCard rate={successRate} trend={digest?.trend} trendHistory={digest?.trend_history} loading={loading} />
               <ConversionRateCard rate={digest?.pipeline_conversion_rate} loading={loading} />
               <AcceptanceRateCard rate={digest?.pipeline_acceptance_rate} loading={loading} />
-              <CostCard totalCost={digest?.total_estimated_cost_usd} trendHistory={digest?.trend_history} loading={loading} />
+              <CostCard totalCost={digest?.total_estimated_cost_usd} trendHistory={digest?.trend_history} loading={loading} windowHours={windowHours} />
               <SrCatchRateCard rate={digest?.self_review_prediction_accuracy?.prediction_hit_rate} trends={digest?.self_review_prediction_accuracy_trends} loading={loading} onScrollToReviewQuality={handleScrollToReviewQuality} />
             </div>
           </section>

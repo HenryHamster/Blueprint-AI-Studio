@@ -85,6 +85,19 @@ def resolve_project_hardware_policy(
     return allowed_machines, allowed_accels
 
 
+def resolve_project_require_local_runner(project: Project) -> bool:
+    """Return True when this project's compute_experiment tasks must run on a
+    registered self-hosted local runner (never billable cloud fallback).
+
+    Reads ``project.build_config["resource_envelope"]["require_local_runner"]``.
+    Returns False when absent, null, or not a bool — i.e. cloud fallback is
+    permitted by default (legacy/hand-edited config cannot accidentally enable
+    a hold-the-project policy).
+    """
+    raw = _get_envelope(project).get("require_local_runner")
+    return raw is True
+
+
 def resolve_project_spend_warning_fraction(project: Project) -> float:
     """Return the warning fraction of the spend ceiling, defaulting to 0.8.
 

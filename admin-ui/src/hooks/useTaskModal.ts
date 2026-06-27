@@ -20,7 +20,15 @@ export const COMPUTE_EXPERIMENT_TASK_TYPE = 'compute_experiment';
 // as strings (raw input) and validated/coerced at submit time, mirroring how
 // the PR-number field is kept as a string. The success-criterion sub-fields are
 // all-or-nothing: leave them blank to launch without a machine-checkable goal.
+export interface ComputeExperimentArm {
+  name: string;
+  command: string;
+}
+
 export interface ComputeExperimentForm {
+  useArmsMode: boolean;
+  arms: ComputeExperimentArm[];
+  declaredMetric: string;
   command: string;
   cwd: string;
   envVars: string;
@@ -38,6 +46,13 @@ export interface ComputeExperimentForm {
   requireLiveRelease: boolean;
   requireDurableArtifact: boolean;
   provisioningModel: 'STANDARD' | 'SPOT';
+  // Optional container image the experiment runs inside (e.g. nvcr.io/nvidia/...).
+  containerImage: string;
+  // Optional private-registry credentials. password is write-only — never
+  // prefilled from a stored payload (see openDuplicateTaskModal).
+  containerRegistryServer: string;
+  containerRegistryUsername: string;
+  containerRegistryPassword: string;
 }
 
 export const COMPUTE_ACCELERATOR_OPTIONS = [
@@ -53,6 +68,9 @@ export function canonicalMachineTypeForAccelerator(accelerator: string): string 
 
 export function defaultComputeExperimentForm(): ComputeExperimentForm {
   return {
+    useArmsMode: false,
+    arms: [{ name: '', command: '' }, { name: '', command: '' }],
+    declaredMetric: '',
     command: '',
     cwd: '',
     envVars: '',
@@ -70,6 +88,10 @@ export function defaultComputeExperimentForm(): ComputeExperimentForm {
     requireLiveRelease: false,
     requireDurableArtifact: false,
     provisioningModel: 'STANDARD',
+    containerImage: '',
+    containerRegistryServer: '',
+    containerRegistryUsername: '',
+    containerRegistryPassword: '',
   };
 }
 
@@ -219,7 +241,6 @@ export function useTaskModal(
       clearTimeout(timer);
       controller.abort();
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [newTaskType, newTaskRepo, computeExperiment.accelerator, computeExperiment.machineType, computeExperiment.spendCapUsd, computeExperiment.deadlineSeconds, computeExperiment.provisioningModel]);
 
   const getDefaultBranchForRepo = (repo: string) => {
@@ -383,9 +404,21 @@ export function useTaskModal(
       return;
     }
     const command = computeExperiment.command.trim();
-    if (!command) {
+    const usingArms = computeExperiment.useArmsMode;
+    if (!usingArms && !command) {
       addToast('Command is required for compute experiments', 'error');
       return;
+    }
+    if (usingArms) {
+      const validArms = computeExperiment.arms.filter(a => a.name.trim() && a.command.trim());
+      if (validArms.length < 2) {
+        addToast('At least two arms with name and command are required for multi-arm experiments', 'error');
+        return;
+      }
+      if (!computeExperiment.declaredMetric.trim()) {
+        addToast('Declared metric is required for multi-arm experiments', 'error');
+        return;
+      }
     }
     const spendCap = Number(computeExperiment.spendCapUsd);
     if (!Number.isFinite(spendCap) || spendCap <= 0) {
@@ -426,6 +459,26 @@ export function useTaskModal(
     const hypothesis = computeExperiment.hypothesis.trim();
     const metric = computeExperiment.metric.trim();
     const cwd = computeExperiment.cwd.trim();
+    // Optional container image + private-registry credentials. The runner runs
+    // the command inside container_image (docker run) and, when a password is
+    // supplied, performs `docker login` first. Only send container_registry_auth
+    // when a password is present; password requires server + username.
+    const containerImage = computeExperiment.containerImage.trim();
+    const registryServer = computeExperiment.containerRegistryServer.trim();
+    const registryUsername = computeExperiment.containerRegistryUsername.trim();
+    const registryPassword = computeExperiment.containerRegistryPassword;
+    let containerRegistryAuth: { server: string; username: string; password: string } | undefined;
+    if (registryPassword) {
+      if (!registryServer || !registryUsername) {
+        addToast('Registry credentials need a server and username when a password is set', 'error');
+        return;
+      }
+      containerRegistryAuth = {
+        server: registryServer,
+        username: registryUsername,
+        password: registryPassword,
+      };
+    }
     // Parse KEY=VALUE lines into an env record; skip blank lines and comments.
     const envRecord: Record<string, string> = {};
     for (const line of computeExperiment.envVars.split('\n')) {
@@ -436,14 +489,22 @@ export function useTaskModal(
       envRecord[trimmed.slice(0, eqIdx)] = trimmed.slice(eqIdx + 1);
     }
     const hasEnv = Object.keys(envRecord).length > 0;
-    const title = newTaskTitle.trim() || `Compute experiment: ${command.slice(0, 60)}`;
-    const prompt = newTaskPrompt.trim() || hypothesis || `Run compute experiment: ${command}`;
+    const validArms = computeExperiment.arms.filter(a => a.name.trim() && a.command.trim());
+    const armsLabel = usingArms ? validArms.map(a => a.name).join(' vs ') : '';
+    const title = newTaskTitle.trim() || (usingArms
+      ? `Compute sweep: ${armsLabel.slice(0, 60)}`
+      : `Compute experiment: ${command.slice(0, 60)}`);
+    const prompt = newTaskPrompt.trim() || hypothesis || (usingArms
+      ? `Run multi-arm compute experiment: ${armsLabel}`
+      : `Run compute experiment: ${command}`);
     const body: ComputeExperimentLaunchRequest = {
       github_repo: newTaskRepo,
       base_branch: newTaskBranch,
       title,
       prompt,
-      command,
+      ...(usingArms
+        ? { arms: validArms.map(a => ({ name: a.name.trim(), command: a.command.trim() })), declared_metric: computeExperiment.declaredMetric.trim() }
+        : { command }),
       spend_cap_usd: spendCap,
       deadline_seconds: deadline,
       ...(accelerator ? { accelerator } : {}),
@@ -454,6 +515,8 @@ export function useTaskModal(
       ...(benchmark ? { benchmark } : {}),
       ...(hypothesis ? { hypothesis } : {}),
       ...(metric ? { metric } : {}),
+      ...(containerImage ? { container_image: containerImage } : {}),
+      ...(containerRegistryAuth ? { container_registry_auth: containerRegistryAuth } : {}),
       ...(successCriterion ? { success_criterion: successCriterion } : {}),
       ...(computeExperiment.requireLiveRelease ? { require_live_release: true } : {}),
       ...(computeExperiment.requireDurableArtifact
@@ -637,7 +700,12 @@ export function useTaskModal(
 
     // For compute_experiment tasks, prefill the compute experiment form from the payload.
     if ((task.task_type as string) === COMPUTE_EXPERIMENT_TASK_TYPE) {
+      const payloadArms = payload.arms as Array<{ name: string; command: string }> | undefined;
+      const hasArms = Array.isArray(payloadArms) && payloadArms.length > 0;
       setComputeExperiment({
+        useArmsMode: hasArms,
+        arms: hasArms ? payloadArms : [{ name: '', command: '' }, { name: '', command: '' }],
+        declaredMetric: (payload.declared_metric as string) || '',
         command: (payload.command as string) || '',
         cwd: (payload.cwd as string) || '',
         envVars: (() => {
@@ -668,6 +736,17 @@ export function useTaskModal(
         requireLiveRelease: (payload.require_live_release as boolean) || false,
         requireDurableArtifact: (payload.require_durable_artifact as boolean) || false,
         provisioningModel: ((payload.provisioning_model as 'STANDARD' | 'SPOT') || 'STANDARD'),
+        containerImage: (payload.container_image as string) || '',
+        containerRegistryServer: (() => {
+          const auth = payload.container_registry_auth as { server?: string } | undefined;
+          return auth?.server || '';
+        })(),
+        containerRegistryUsername: (() => {
+          const auth = payload.container_registry_auth as { username?: string } | undefined;
+          return auth?.username || '';
+        })(),
+        // Never prefill the registry password — it is a write-only secret.
+        containerRegistryPassword: '',
       });
     } else {
       setComputeExperiment(defaultComputeExperimentForm());

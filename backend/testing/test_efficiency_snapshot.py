@@ -7232,6 +7232,90 @@ def test_gate_health_verdict_degraded_priority_over_insufficient_at_boundary():
     assert custom["min_sample"] == 5
 
 
+def test_gate_health_verdict_on_post_deploy_effectiveness():
+    """Gate health verdict applied to post-deploy panel_review_effectiveness.
+
+    Validates that assess_post_deploy_gate_health correctly classifies verdicts
+    when applied to scoped post-deploy effectiveness windows. Tests the
+    integration of post-deploy boundary filtering with verdict computation.
+
+    Setup: mix of pre-deploy and post-deploy tasks.
+      Pre-deploy (before boundary): 4 total, 1 degraded → 20% fail-open
+      Post-deploy (after boundary): 5 total, 1 degraded → 20% fail-open (DEGRADED)
+
+    Expected: post-deploy verdict should be DEGRADED due to 20% rate >= 5%.
+    """
+    from app.efficiency_snapshot import (
+        assess_post_deploy_gate_health,
+        compute_panel_review_effectiveness,
+    )
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+    deploy_boundary = now - timedelta(days=2)
+    pre_deploy = now - timedelta(days=5)
+
+    def _task(recon, updated_at):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: recon},
+            vm_provisioned_at=updated_at - timedelta(minutes=5),
+            vm_stopped_at=updated_at,
+            updated_at=updated_at,
+        )
+
+    # Pre-deploy tasks
+    pre_tasks = [
+        _task({"state": "challenged_confirmed"}, pre_deploy),
+        _task({"state": "challenged_confirmed"}, pre_deploy),
+        _task({"state": "challenged_confirmed"}, pre_deploy),
+        _task({"state": "degraded_model_unavailable"}, pre_deploy),
+    ]
+
+    # Post-deploy tasks (enough for INSUFFICIENT check to pass)
+    post_tasks = [
+        _task({"state": "challenged_confirmed"}, now - timedelta(hours=12)),
+        _task({"state": "challenged_confirmed"}, now - timedelta(hours=6)),
+        _task({"state": "challenged_confirmed"}, now - timedelta(hours=3)),
+        _task({"state": "challenged_confirmed"}, now - timedelta(hours=2)),
+        _task({"state": "degraded_model_unavailable"}, now - timedelta(hours=1)),
+    ]
+    all_tasks = pre_tasks + post_tasks
+
+    # Post-deploy only: filter using deploy_boundary
+    post_deploy_effectiveness = compute_panel_review_effectiveness(
+        all_tasks, since_dt=deploy_boundary
+    )
+    assert post_deploy_effectiveness is not None
+    assert post_deploy_effectiveness["total_challenged"] == 4
+    assert post_deploy_effectiveness["challenged_degraded"] == 1
+
+    # Apply assess_post_deploy_gate_health to the post-deploy effectiveness
+    # 1 degraded / (4 + 1) = 0.2 = 20% → exceeds 5% degraded threshold
+    verdict = assess_post_deploy_gate_health(post_deploy_effectiveness)
+    assert verdict["state"] == "DEGRADED", (
+        f"20% fail-open on 5 invocations must be DEGRADED, got {verdict['state']}"
+    )
+    assert verdict["total_invocations"] == 5
+    assert verdict["fail_open_rate"] == 0.2
+
+    # Test a healthy post-deploy scenario: 30+ invocations with 0% fail-open
+    healthy_tasks = [
+        _task({"state": "challenged_confirmed"}, now - timedelta(hours=i))
+        for i in range(35)
+    ]
+    healthy_effectiveness = compute_panel_review_effectiveness(
+        healthy_tasks, since_dt=deploy_boundary
+    )
+    healthy_verdict = assess_post_deploy_gate_health(healthy_effectiveness)
+    assert healthy_verdict["state"] == "HEALTHY", (
+        f"zero fail-open on 35 invocations must be HEALTHY, got {healthy_verdict['state']}"
+    )
+    assert healthy_verdict["fail_open_rate"] == 0.0
+    assert healthy_verdict["total_invocations"] == 35
+
+
 def test_panel_review_effectiveness_cost_per_challenge_usd():
     """compute_panel_review_effectiveness includes cost_per_challenge_usd.
 

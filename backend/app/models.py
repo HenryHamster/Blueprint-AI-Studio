@@ -100,6 +100,27 @@ def _coerce_provider_context_values(raw: object) -> list[str]:
     return values
 
 
+def check_model_kwargs(model_cls: type, kwargs: dict) -> None:
+    """Raise TypeError if any key in *kwargs* is not a declared field of *model_cls*.
+
+    SQLModel table=True models silently discard unknown constructor keywords,
+    which lets stale tests reference removed columns without failing.  Call this
+    helper in tests that construct model instances to surface that staleness
+    immediately rather than at the next schema migration.
+
+    Usage::
+        check_model_kwargs(Project, {"name": "my-proj"})         # OK
+        check_model_kwargs(Project, {"removed_column": "value"}) # TypeError
+    """
+    known = set(model_cls.model_fields.keys())
+    unknown = set(kwargs.keys()) - known
+    if unknown:
+        raise TypeError(
+            f"{model_cls.__name__}() received unknown field(s): "
+            f"{sorted(unknown)}.  Known fields: {sorted(known)}."
+        )
+
+
 class ProjectStatus(str, Enum):
     DRAFT = "DRAFT"
     DEPLOYING = "DEPLOYING"
@@ -207,6 +228,7 @@ class ComputeJobOutcome(str, Enum):
     CANCELLED = "CANCELLED"
     TIMED_OUT = "TIMED_OUT"
     SPEND_CAP_EXCEEDED = "SPEND_CAP_EXCEEDED"
+    SMOKE_FAILED = "SMOKE_FAILED"
 
 
 class ArtifactType(str, Enum):
@@ -3309,6 +3331,17 @@ class KnowledgeDocument(SQLModel, table=True):
         default=None, sa_column=Column(String, nullable=True)
     )
 
+    # Sweep identity for compute_experiment docs. Populated when the task belongs
+    # to a multi-task sweep (task.first_payload["sweep_id"]). Indexed for
+    # per-sweep grouping queries. arm_label carries the human-readable arm name
+    # (first_payload["experiment"] or ["arm_label"]); null for sweep-aggregate docs.
+    sweep_id: str | None = Field(
+        default=None, sa_column=Column(String(128), nullable=True)
+    )
+    arm_label: str | None = Field(
+        default=None, sa_column=Column(String(256), nullable=True)
+    )
+
     # Free-form tag list and citation list (web URLs plus any file refs).
     tags: List[str] = Field(
         default_factory=list,
@@ -3397,6 +3430,7 @@ class KnowledgeDocument(SQLModel, table=True):
         Index("ix_knowledge_document_origin_state", "origin_state"),
         Index("ix_knowledge_document_origin_challenge_state", "origin_challenge_state"),
         Index("ix_knowledge_document_origin_finding_hash", "origin_finding_hash"),
+        Index("ix_knowledge_document_sweep_id", "sweep_id"),
     )
 
 
@@ -4928,5 +4962,70 @@ class EvergreenFillDecisionLog(SQLModel, table=True):
             "ix_evergreenfilldecisionlog_project_ts",
             "project_id",
             "ts",
+        ),
+    )
+
+
+class LocalRunner(SQLModel, table=True):
+    """A pull-based fleet runner registered on operator hardware.
+
+    A runner enrolls via ``POST /api/admin/projects/{id}/runners/register`` (which
+    returns a one-time secret token), then polls ``POST /api/runner/next-task`` with
+    that token to receive tasks the orchestrator has pinned to it. The orchestrator
+    pins QUEUED tasks to an active registered runner BEFORE the warm-pool/GCP dispatch
+    paths, so operator hardware becomes a first-class fleet member with no LOCAL_MODE
+    flag. Only the SHA256 hash of the token is ever stored.
+    """
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    # Deleted with the project so a runner can't outlive its owning project.
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+            index=True,
+        ),
+    )
+    # SHA256 hex digest of the runner's secret token (never the plaintext).
+    token_hash: str = Field(sa_column=Column(String(64), nullable=False, index=True))
+    hostname: str | None = Field(
+        default=None, sa_column=Column(String(255), nullable=True)
+    )
+    version: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    # "active" | "inactive" | "deleted"
+    status: str = Field(
+        default="active",
+        sa_column=Column(String(16), nullable=False, server_default=text("'active'")),
+    )
+    # {"task_types": "all" | [str], "has_gpu": bool (heartbeat-reported ground truth),
+    #  "gpu_count": int, "gpu_names": [str], "max_concurrent": int,
+    #  "active_task_ids": [str]}  — has_gpu et al. are overwritten at first heartbeat.
+    capabilities: Dict[str, Any] = Field(
+        default_factory=lambda: {
+            "task_types": "all",
+            "has_gpu": False,
+            "max_concurrent": 2,
+        },
+        sa_column=Column(JSONB, nullable=False, server_default=text("'{}'")),
+    )
+    last_seen_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    __table_args__ = (
+        # Dispatch-cache hot path: per-project active-runner scans filtered on
+        # status + last_seen_at recency.
+        Index(
+            "ix_localrunner_project_status",
+            "project_id",
+            "status",
         ),
     )

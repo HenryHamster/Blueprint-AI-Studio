@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { apiFetch, fetchVersionLifecycle } from '../api';
+import type { CurrentVersion } from '../api';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { useDirectionForm } from './useDirectionForm';
 import { useAutonomousConfig } from './useAutonomousConfig';
@@ -41,6 +42,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
   // version" affordance: staging requires an open version (the backend stamps
   // staged_for_version from it and 404s when none is open).
   const [openVersionNumber, setOpenVersionNumber] = useState<number | null>(null);
+  const [currentVersion, setCurrentVersion] = useState<CurrentVersion | null>(null);
 
   // Error feedback
   const [error, setError] = useState<string | null>(null);
@@ -73,10 +75,12 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
 
   // Periodically refresh directions to keep time-derived badges (cooldown countdown,
   // hold auto-recovery countdown, staged waiting age) live while the panel is open.
+  // Uses lite=true to skip heavy stable fields (problem_model, design_doc, etc.)
+  // that don't change on a 10-second cadence.
   usePoller(
     () => {
       if (selectedProjectId) {
-        return fetchDirectionsLatestRef.current();
+        return fetchDirectionsLatestRef.current({ lite: true });
       }
     },
     {
@@ -102,43 +106,52 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     };
   }, [fetchDirectionsRef]);
 
-  async function fetchDirections() {
+  async function fetchDirections({ lite = false }: { lite?: boolean } = {}) {
     setLoading(true);
     try {
+      const baseUrl = `/api/admin/projects/${selectedProjectId}/directions`;
+      const directionsUrl = lite ? `${baseUrl}?lite=1` : baseUrl;
+
+      // On the initial (full) load, kick off all three requests in parallel:
+      // directions, task-counts, and version-lifecycle. On lite poll ticks,
+      // skip version-lifecycle since staging availability doesn't change at 10s.
+      const versionLifecyclePromise = !lite && selectedProjectId
+        ? fetchVersionLifecycle(selectedProjectId).catch(() => null)
+        : null;
+
       const [res, countsRes] = await Promise.all([
-        apiFetch(`/api/admin/projects/${selectedProjectId}/directions`),
-        apiFetch(`/api/admin/projects/${selectedProjectId}/directions/task-counts`),
+        apiFetch(directionsUrl),
+        apiFetch(`${baseUrl}/task-counts`),
       ]);
       if (!res.ok) throw new Error('Failed to fetch directions');
       const data = await res.json();
       setDirections(data.directions ?? []);
       setAutonomousEnabled(data.autonomous_enabled ?? false);
-      setDesignDoc(data.design_doc ?? {});
-      setProblemModel(data.problem_model ?? {});
-      setProblemModelSizeHealth(data.problem_model_size_health ?? null);
       setRunningUpdate(typeof data.running_update === 'string' ? data.running_update : null);
       setRunningUpdateAckAt(data.running_update_acknowledged_at ?? null);
-      setRunningUpdateReconciliation(data.running_update_reconciliation ?? null);
-      setSelfReflectionLog(data.self_reflection_log ?? []);
+      // Heavy stable fields are only present on full (non-lite) fetches; don't
+      // overwrite existing state on poll ticks that intentionally omit them.
+      if (!lite) {
+        setDesignDoc(data.design_doc ?? {});
+        setProblemModel(data.problem_model ?? {});
+        setProblemModelSizeHealth(data.problem_model_size_health ?? null);
+        setRunningUpdateReconciliation(data.running_update_reconciliation ?? null);
+        setSelfReflectionLog(data.self_reflection_log ?? []);
+      }
       if (countsRes.ok) {
         const countsData = await countsRes.json();
         setTaskCounts(countsData.counts ?? {});
         setActiveTasks(countsData.active_tasks ?? {});
       }
+      // Await the version lifecycle that was already running in parallel (full load only).
+      if (versionLifecyclePromise) {
+        const lifecycle = await versionLifecyclePromise;
+        setOpenVersionNumber(lifecycle?.current_version?.version_number ?? null);
+        setCurrentVersion(lifecycle?.current_version ?? null);
+      }
     } catch (err) {
       console.error('Failed to fetch directions:', err);
       addToast('Failed to load directions', 'error');
-    }
-    // Fetch the open version separately so a version-lifecycle failure never
-    // blocks the directions list. A null result simply disables staging in the UI.
-    if (selectedProjectId) {
-      try {
-        const lifecycle = await fetchVersionLifecycle(selectedProjectId);
-        setOpenVersionNumber(lifecycle.current_version?.version_number ?? null);
-      } catch (err) {
-        console.error('Failed to fetch version lifecycle:', err);
-        setOpenVersionNumber(null);
-      }
     }
     setLoading(false);
   }
@@ -183,6 +196,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       // single create call (404s if none is open), so the direction never passes
       // through a research-eligible active state (no create-then-edit race).
       if (form.newStaged && openVersionNumber != null) body.staged = true;
+      if (form.newLinkedGapId) body.gap_id = form.newLinkedGapId;
       // Reuse one client idempotency identity across double-clicks / failed
       // retries / lost-response replays so the backend collapses them into a
       // single direction. The key is minted lazily here and held until the add
@@ -209,9 +223,10 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
   async function updateDirection(id: string) {
     setError(null);
     try {
+      const costBudget = form.editCostBudget.trim() !== '' ? parseFloat(form.editCostBudget) : null;
       const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${id}`, {
         method: 'PATCH',
-        body: JSON.stringify({ text: form.editText, priority: form.editPriority, status: form.editStatus, paths: form.editPathTags, category: form.editCategory ?? null, completion_criteria: form.editCompletionCriteria.trim() || null, success_evidence: form.editSuccessEvidence.trim() || null, retirement_condition: form.editRetirementCondition.trim() || null }),
+        body: JSON.stringify({ text: form.editText, priority: form.editPriority, status: form.editStatus, paths: form.editPathTags, category: form.editCategory ?? null, completion_criteria: form.editCompletionCriteria.trim() || null, success_evidence: form.editSuccessEvidence.trim() || null, retirement_condition: form.editRetirementCondition.trim() || null, cost_budget_usd: (costBudget != null && !Number.isNaN(costBudget)) ? costBudget : null }),
       });
       if (!res.ok) throw new Error('Failed to update direction');
       form.setEditingId(null);
@@ -457,6 +472,22 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     }
   }
 
+  async function linkDirectionToGap(directionId: string, gapId: string) {
+    if (!selectedProjectId) return;
+    setError(null);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${selectedProjectId}/directions/${directionId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ gap_id: gapId }),
+      });
+      if (!res.ok) throw new Error('Failed to link direction to gap');
+      addToast('Direction linked to gap', 'success');
+      fetchDirections();
+    } catch {
+      setError('Failed to link direction to gap. Please try again.');
+    }
+  }
+
   async function triggerResearch(id: string, bypass = false) {
     setResearchingIds(prev => ({ ...prev, [id]: true }));
     setForceConfirmId(null);
@@ -491,6 +522,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     runningUpdateReconciliation,
     selfReflectionLog,
     openVersionNumber,
+    currentVersion,
     error,
     setError,
     researchingIds,
@@ -521,5 +553,6 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     toggleAutonomous,
     reorderDirections,
     triggerResearch,
+    linkDirectionToGap,
   };
 }

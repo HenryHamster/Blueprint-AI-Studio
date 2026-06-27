@@ -17,13 +17,10 @@ vi.mock('../firebase', () => ({
   signOut: vi.fn(),
 }));
 
-// AutonomousStatus, MetricsBar, and SettingsDropdown are complex sub-trees;
+// AutonomousStatus and SettingsDropdown are complex sub-trees;
 // stub them to keep the test focused on HeaderBar's own mobile layout.
 vi.mock('./AutonomousStatus', () => ({
   AutonomousStatus: () => <div data-testid="autonomous-status" />,
-}));
-vi.mock('./MetricsBar', () => ({
-  MetricsBar: () => <div data-testid="metrics-bar" />,
 }));
 vi.mock('./SettingsDropdown', () => ({
   SettingsDropdown: () => <div data-testid="settings-dropdown" />,
@@ -47,13 +44,14 @@ function makeProps() {
     onSetViewMode: noop,
     showResearchBrowser: false,
     onToggleResearchBrowser: noop,
+    showKnowledgeBrowser: false,
+    onToggleKnowledgeBrowser: noop,
     showArchive: false,
     onToggleArchive: noop,
     showMessages: false,
     onToggleMessages: noop,
     openMessageCount: 0,
     onOpenNewTaskModal: noop,
-    onShowDirections: noop,
     onSignOut: noop,
     userEmail: 'test@example.com',
     wsRef: { current: null },
@@ -70,6 +68,8 @@ function makeProps() {
     onUpdateNotifyOnApprovalNeeded: noop,
     soundOnComplete: false,
     onUpdateSoundOnComplete: noop,
+    notifyOnHighSignalMessage: false,
+    onUpdateNotifyOnHighSignalMessage: noop,
     maxRetries: 3,
     maxAutonomousTasksPerHour: 10,
     requireApprovalGates: false,
@@ -199,6 +199,16 @@ function makeProps() {
     resourceEnvelopeLoading: false,
     resourceEnvelopeError: null,
     onUpdateResourceEnvelope: noopAsync,
+    integrationBranchData: null,
+    onUpdateIntegrationBranch: noopAsync,
+    promotionTargetData: null,
+    onUpdatePromotionTarget: noopAsync,
+    projects: [],
+    onSelectProject: noop,
+    activeTab: 'home' as const,
+    onTabChange: noop,
+    health: null,
+    detailedHealth: null,
   };
 }
 

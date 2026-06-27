@@ -23,6 +23,7 @@ import logging
 import math
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import tarfile
@@ -32,6 +33,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Protocol
+
+from google.cloud import storage as gcs_storage
 
 from app import compute
 from app import storage
@@ -109,6 +112,53 @@ _MAX_COMMAND_LOG_DECODED_BYTES = 65536
 
 LOCAL_BACKEND_NAME = "local-subprocess"
 GCP_BACKEND_NAME = "gcp"
+LOCAL_GPU_BACKEND_NAME = "local-gpu"
+RUNNER_SUBPROCESS_BACKEND_NAME = "runner-subprocess"
+
+
+def is_zero_cost_backend(name: str) -> bool:
+    """Return True for backends that run on operator/local hardware Blueprint does not pay for."""
+    return name in (LOCAL_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME)
+
+# Fixed in-container path where the job's state directory is mounted.
+# The command writes result.json and artifacts/ here; the host-side mount makes
+# them visible at the job's state dir path without any post-run copy step.
+_CONTAINER_OUT_DIR = "/tmp/blueprint_out"
+
+_DETECT_LOCAL_GPU_UNSET = object()
+_detect_local_gpu_cache: object = _DETECT_LOCAL_GPU_UNSET
+
+
+def detect_local_gpu() -> dict | None:
+    """Detect a local GPU via nvidia-smi. Cached for process lifetime. Never raises."""
+    global _detect_local_gpu_cache
+    if _detect_local_gpu_cache is not _DETECT_LOCAL_GPU_UNSET:
+        return _detect_local_gpu_cache  # type: ignore[return-value]
+    result: dict | None = None
+    try:
+        if shutil.which("nvidia-smi") is not None:
+            proc = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=name,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if proc.returncode == 0:
+                line = proc.stdout.strip().split("\n")[0]
+                parts = [p.strip() for p in line.split(",", 1)]
+                if len(parts) == 2:
+                    name, mem_str = parts
+                    result = {"name": name, "memory_mib": int(mem_str)}
+    except Exception:
+        pass
+    _detect_local_gpu_cache = result
+    return result
+
+
 _LOCAL_STATE_ROOT = os.path.join(tempfile.gettempdir(), "blueprint-compute-jobs")
 _LOCAL_PID_FILENAME = "pid"
 _LOCAL_STARTED_AT_FILENAME = "started_at"
@@ -147,6 +197,19 @@ class ComputeLaunchSpec:
     # is never persisted on the job row. Absent ⇒ no checkout (legacy behavior).
     repo_clone: dict[str, str] | None = None
     repo_token: str | None = None
+    # Optional setup step executed as `bash -lc <setup_step>` AFTER the repo clone
+    # and BEFORE the main command. A non-zero exit fails the job immediately with
+    # reason `setup_step_failed`; the setup output is captured to setup_step.log in
+    # the artifact dir for diagnosis. Absent ⇒ no setup step (legacy behavior).
+    setup_step: str | None = None
+    # Optional container image URI (e.g. "nvcr.io/nvidia/tensorflow:25.01-tf2-py3").
+    # When set, the execution backend wraps the command in `docker run` with the
+    # result-file directory volume-mounted so output lands on the host unchanged.
+    # Absent ⇒ existing bare bash -lc path (byte-for-byte unchanged).
+    container_image: str | None = None
+    # Registry credentials for private/gated registries.  Only {server, username}
+    # survive to the persisted launch spec; password is never written to the DB.
+    container_registry_auth: dict | None = None
 
 
 @dataclass(slots=True)
@@ -157,6 +220,199 @@ class ComputeLaunchResult:
     message: str | None = None
     # Extra fields merged into the job's polling_metadata (e.g. GCP zone, pid).
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Pre-flight smoke
+# ---------------------------------------------------------------------------
+
+PREFLIGHT_SMOKE_TIMEOUT_SECONDS = int(
+    os.getenv("COMPUTE_PREFLIGHT_SMOKE_TIMEOUT_SECONDS", "30")
+)
+_PREFLIGHT_STDERR_MAX_BYTES = 2000
+
+
+@dataclass(slots=True)
+class PreflightSmokeResult:
+    startup_ok: bool
+    exit_code: int | None  # None = timed out (still running = startup OK)
+    metric_captured: bool
+    declared_metric_value: float | None
+    error_excerpt: str
+    # True when a container_image was declared but Docker was NOT available on the
+    # orchestrator host, so the smoke degraded to a bare-host ``bash -lc`` run
+    # instead of the substrate-faithful containerized path.  Visible to the caller
+    # and diagnostics so a degraded smoke is never mistaken for a containerized one.
+    degraded_no_docker: bool = False
+    # True when the smoke actually wrapped the command in ``docker pull`` +
+    # ``docker run`` (container_image declared AND Docker present).
+    ran_containerized: bool = False
+
+
+async def run_preflight_smoke(
+    command: str,
+    *,
+    declared_metric: str | None = None,
+    timeout_seconds: int = PREFLIGHT_SMOKE_TIMEOUT_SECONDS,
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+    setup_step: str | None = None,
+    container_image: str | None = None,
+    container_registry_auth: dict | None = None,
+) -> PreflightSmokeResult:
+    """Run a cheap local pre-flight smoke to catch commands that die on a DB-less substrate.
+
+    Runs `command` (and optionally `setup_step`) locally with no DB credentials
+    injected.  A non-zero exit before the timeout is a FAIL; a zero exit or a
+    timeout (command still alive) is a PASS (plus optional metric check).
+
+    When ``container_image`` is set AND Docker is available on the orchestrator
+    host (``shutil.which("docker")``), the *main* command is wrapped in the SAME
+    ``docker login`` (optional) → ``docker pull`` → ``docker run`` path the real
+    local-subprocess backend uses (see ``_build_local_wrapper_command``), so the
+    smoke is substrate-faithful: it catches image-pull failures, in-container
+    import errors, and missing CUDA/GPU libraries before a full VM is billed.
+    The smoke's ``tmpdir`` is bind-mounted as the container out dir so the
+    ``result.json`` written *inside* the container lands at the host path this
+    function already reads, and ``RESULT_FILE_ENV`` is set inside the container by
+    the run prefix (not via ``run_env``).  ``gpus`` is enabled when a local GPU is
+    detected, matching the real local path.
+
+    The ``setup_step`` (if any) always runs OUTSIDE the container as a bare
+    ``bash -lc`` — consistent with the real local-subprocess backend, which runs
+    ``setup_step_block`` before the ``docker run`` line (dependency install happens
+    on the host/VM, not in the experiment image).
+
+    GRACEFUL DEGRADATION: when ``container_image`` is set but Docker is NOT
+    available on the orchestrator host, the smoke does NOT hard-fail — it falls
+    back to the existing bare-host ``bash -lc`` path (so the gate still catches
+    bare import/crash failures) and flags ``degraded_no_docker=True`` on the
+    result so the caller and diagnostics can see the smoke was not substrate-
+    faithful.  In that degraded mode the gate is NOT image-pull/in-container/CUDA
+    faithful.  The absent-``container_image`` path is byte-for-byte unchanged.
+    """
+    run_env: dict[str, str] = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
+    # Mirror the GCP startup script: put the repo root on PYTHONPATH so commands
+    # that import project packages work the same way they do on the compute VM.
+    # Path(__file__) is backend/app/compute_backends.py; three levels up is the
+    # repo root (the equivalent of /tmp/blueprint_repo on the GCP VM).
+    _repo_root = str(Path(__file__).parent.parent.parent)
+    _existing_pp = os.environ.get("PYTHONPATH", "")
+    run_env["PYTHONPATH"] = f"{_repo_root}:{_existing_pp}" if _existing_pp else _repo_root
+    run_env.update(env or {})
+
+    tmpdir = tempfile.mkdtemp(prefix="bp_smoke_")
+    try:
+        result_path = os.path.join(tmpdir, "result.json")
+        run_env[RESULT_FILE_ENV] = result_path
+
+        # When a container image is declared, wrap the MAIN command in the same
+        # docker login/pull/run path the real local backend uses — but only if
+        # Docker is actually available on this orchestrator host.  Otherwise
+        # degrade gracefully to the bare-host smoke (current behavior) rather than
+        # hard-failing the job for a missing orchestrator-side dependency.
+        degraded_no_docker = False
+        ran_containerized = False
+        effective_command = command
+        if container_image:
+            if shutil.which("docker") is not None:
+                ran_containerized = True
+                prefix = _build_container_run_prefix(
+                    container_image,
+                    host_out_dir=tmpdir,  # -> result.json lands at result_path
+                    gpus=detect_local_gpu() is not None,
+                )
+                docker_parts: list[str] = []
+                auth = container_registry_auth or {}
+                pwd = str(auth.get("password") or "")
+                # The persisted auth carries only server/username (the password is
+                # stripped at create time), so for orchestrated jobs this login
+                # branch is dormant and password-gated pulls may fail at smoke —
+                # acceptable: public images and host-identity pulls still validate.
+                if pwd:
+                    server_q = shlex.quote(str(auth.get("server") or ""))
+                    user_q = shlex.quote(str(auth.get("username") or ""))
+                    docker_parts.append(
+                        f"printf '%s' {shlex.quote(pwd)} | "
+                        f"docker login {server_q} -u {user_q} --password-stdin "
+                        ">/dev/null 2>&1 &&"
+                    )
+                docker_parts.append(f"docker pull {shlex.quote(container_image)} &&")
+                docker_parts.append(f"{prefix} bash -lc {shlex.quote(command)}")
+                effective_command = " ".join(docker_parts)
+            else:
+                # Docker absent on the orchestrator: degrade, do not hard-fail.
+                degraded_no_docker = True
+
+        async def _run_bash(cmd: str, t: int) -> tuple[int | None, str]:
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "bash", "-lc", cmd,
+                    env=run_env,
+                    cwd=cwd or None,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                try:
+                    _, raw_err = await asyncio.wait_for(proc.communicate(), timeout=t)
+                    excerpt = raw_err[-_PREFLIGHT_STDERR_MAX_BYTES:].decode("utf-8", "replace")
+                    return proc.returncode, excerpt
+                except asyncio.TimeoutError:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except ProcessLookupError:
+                        pass
+                    return None, ""
+            except Exception as exc:  # pragma: no cover
+                return -1, str(exc)[:_PREFLIGHT_STDERR_MAX_BYTES]
+
+        # Run setup_step first if present; a non-zero (non-timeout) exit is a FAIL.
+        # setup_step always runs OUTSIDE the container (bare bash -lc), consistent
+        # with the real local-subprocess backend which runs setup before docker run.
+        if setup_step:
+            setup_t = max(10, timeout_seconds // 3)
+            setup_exit, setup_err = await _run_bash(setup_step, setup_t)
+            if setup_exit is not None and setup_exit != 0:
+                return PreflightSmokeResult(
+                    startup_ok=False,
+                    exit_code=setup_exit,
+                    metric_captured=False,
+                    declared_metric_value=None,
+                    error_excerpt=f"setup_step failed (exit {setup_exit}): {setup_err}",
+                    degraded_no_docker=degraded_no_docker,
+                    ran_containerized=ran_containerized,
+                )
+
+        exit_code, stderr_text = await _run_bash(effective_command, timeout_seconds)
+        # Timed out (still running) counts as startup OK.
+        startup_ok = exit_code is None or exit_code == 0
+
+        # Check declared metric in result file when the command exited cleanly.
+        metric_captured = declared_metric is None  # no metric required = always captured
+        declared_metric_value: float | None = None
+        if declared_metric and os.path.exists(result_path):
+            try:
+                parsed = json.loads(Path(result_path).read_text(encoding="utf-8"))
+                if isinstance(parsed, dict):
+                    val = parsed.get(declared_metric)
+                    if isinstance(val, (int, float)) and not isinstance(val, bool):
+                        metric_captured = True
+                        declared_metric_value = float(val)
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+
+        return PreflightSmokeResult(
+            startup_ok=startup_ok,
+            exit_code=exit_code,
+            metric_captured=metric_captured,
+            declared_metric_value=declared_metric_value,
+            error_excerpt=stderr_text,
+            degraded_no_docker=degraded_no_docker,
+            ran_containerized=ran_containerized,
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 @dataclass(slots=True)
@@ -290,6 +546,12 @@ class LocalSubprocessComputeBackend:
                 _build_local_wrapper_command(
                     spec.command,
                     external_id=external_id,
+                    setup_step=spec.setup_step,
+                    container_image=spec.container_image,
+                    container_registry_auth=spec.container_registry_auth,
+                    cwd=spec.cwd,
+                    env=spec.env,
+                    repo_clone=spec.repo_clone,
                 ),
             ],
             cwd=spec.cwd or None,
@@ -521,8 +783,132 @@ class GcpComputeBackend:
         return await _ensure_vm_deleted(external_id, reason=f"compute_job_{reason}")
 
 
+class LocalGPUComputeBackend:
+    """Local subprocess backend that injects GPU metadata into launch results.
+
+    Delegates all execution to LocalSubprocessComputeBackend; the only
+    difference is that detect_local_gpu() output is stamped into the
+    launch result metadata so callers can see what GPU substrate was used.
+    """
+
+    name = LOCAL_GPU_BACKEND_NAME
+
+    def __init__(self) -> None:
+        self._delegate = LocalSubprocessComputeBackend()
+
+    def external_id_for(self, job: ComputeJob) -> str:
+        return self._delegate.external_id_for(job)
+
+    async def launch(self, spec: ComputeLaunchSpec) -> ComputeLaunchResult:
+        result = await self._delegate.launch(spec)
+        gpu_info = detect_local_gpu()
+        if gpu_info is not None:
+            result.metadata["local_gpu"] = gpu_info
+        return result
+
+    async def poll_status(self, job: ComputeJob) -> ComputeStatusResult:
+        return await self._delegate.poll_status(job)
+
+    async def poll_cost(
+        self, job: ComputeJob, *, as_of: datetime
+    ) -> ComputeCostResult:
+        return await self._delegate.poll_cost(job, as_of=as_of)
+
+    async def terminate(self, job: ComputeJob, *, reason: str) -> bool:
+        return await self._delegate.terminate(job, reason=reason)
+
+
+class RunnerSubprocessBackend:
+    """Passthrough backend for compute jobs running on operator hardware.
+
+    ``launch()`` is a no-op: the job enters STARTING and waits for a runner
+    to claim it via ``POST /api/runner/next-compute-job``.  ``poll_status()``
+    reads runner-reported execution state from ``polling_metadata``, stamped
+    by ``POST /api/runner/compute-job/{id}/report``.  ``poll_cost()`` returns
+    zero (operator hardware has no cloud billing).  ``terminate()`` returns
+    True; the job is finalized by ``_apply_task_terminal_cancellation`` and the
+    runner observes the terminal state on its next report.
+    """
+
+    name = RUNNER_SUBPROCESS_BACKEND_NAME
+
+    def external_id_for(self, job: ComputeJob) -> str:
+        return f"runner-{job.id}"
+
+    async def launch(self, spec: ComputeLaunchSpec) -> ComputeLaunchResult:
+        metadata: dict = {}
+        if spec.repo_clone:
+            # Persist owner/repo/ref so /next-compute-job can return it to the
+            # runner for git clone.  The token is NOT stored here — it is minted
+            # fresh at claim time to avoid persisting a short-lived secret.
+            metadata["repo_clone"] = spec.repo_clone
+        return ComputeLaunchResult(
+            external_id=spec.external_id or f"runner-{spec.job_id}",
+            started_at=_utcnow(),
+            cost_rate_per_second=0.0,
+            message="runner-subprocess: awaiting runner claim",
+            metadata=metadata,
+        )
+
+    async def poll_status(self, job: ComputeJob) -> ComputeStatusResult:
+        meta = job.polling_metadata or {}
+        runner_exec_status = meta.get("runner_exec_status")
+        if runner_exec_status is None:
+            # Runner has not yet reported — still waiting for claim/first report.
+            return ComputeStatusResult(status=ComputeJobStatus.STARTING)
+        if runner_exec_status == "running":
+            return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+        if runner_exec_status in ("succeeded", "failed"):
+            raw_code = meta.get("runner_exit_code")
+            exit_code = (
+                raw_code
+                if isinstance(raw_code, int) and not isinstance(raw_code, bool)
+                else None
+            )
+            raw_metrics = meta.get("runner_result_metrics")
+            metrics = raw_metrics if isinstance(raw_metrics, dict) else None
+            raw_log = meta.get("runner_command_log")
+            command_log = raw_log if isinstance(raw_log, dict) else None
+            raw_ts = meta.get("runner_finished_at")
+            finished_at = None
+            if isinstance(raw_ts, str):
+                try:
+                    from datetime import datetime as _dt
+                    finished_at = _dt.fromisoformat(
+                        raw_ts.replace("Z", "+00:00")
+                    ).replace(tzinfo=None)
+                except (ValueError, AttributeError):
+                    pass
+            cjs = (
+                ComputeJobStatus.SUCCEEDED
+                if runner_exec_status == "succeeded"
+                else ComputeJobStatus.FAILED
+            )
+            return ComputeStatusResult(
+                status=cjs,
+                exit_code=exit_code if exit_code is not None else (0 if cjs == ComputeJobStatus.SUCCEEDED else None),
+                finished_at=finished_at or _utcnow(),
+                metrics=metrics,
+                command_log=command_log,
+            )
+        # Unknown status string — treat as still running.
+        return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+
+    async def poll_cost(
+        self, job: ComputeJob, *, as_of: datetime
+    ) -> ComputeCostResult:
+        return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+    async def terminate(self, job: ComputeJob, *, reason: str) -> bool:
+        # The runner observes the cancel signal when it gets back cancel_requested=True
+        # from the /report endpoint (job is CANCELLED after _apply_task_terminal_cancellation).
+        return True
+
+
 _LOCAL_BACKEND = LocalSubprocessComputeBackend()
 _GCP_BACKEND = GcpComputeBackend()
+_LOCAL_GPU_BACKEND = LocalGPUComputeBackend()
+_RUNNER_SUBPROCESS_BACKEND = RunnerSubprocessBackend()
 
 
 def get_compute_backend(name: str) -> ComputeBackend:
@@ -530,6 +916,10 @@ def get_compute_backend(name: str) -> ComputeBackend:
         return _LOCAL_BACKEND
     if name == _GCP_BACKEND.name:
         return _GCP_BACKEND
+    if name == _LOCAL_GPU_BACKEND.name:
+        return _LOCAL_GPU_BACKEND
+    if name == _RUNNER_SUBPROCESS_BACKEND.name:
+        return _RUNNER_SUBPROCESS_BACKEND
     raise ValueError(f"unknown compute backend: {name}")
 
 
@@ -550,6 +940,13 @@ def validate_backend_name(name: str) -> str:
         raise ValueError("gcp backend is unavailable in LOCAL_MODE")
     if not compute.LOCAL_MODE and backend is _LOCAL_BACKEND:
         raise ValueError("local-subprocess backend is unavailable outside LOCAL_MODE")
+    if backend is _LOCAL_GPU_BACKEND:
+        if detect_local_gpu() is None:
+            raise ValueError(
+                "local-gpu backend is unavailable: no local GPU detected"
+            )
+    # runner-subprocess is available in both LOCAL_MODE and cloud mode — its
+    # availability depends on runner registration, not the leader's deploy mode.
     return name
 
 
@@ -639,6 +1036,7 @@ def _read_local_terminal_status_for_external_id(
             finished_at = parsed
         except ValueError:
             finished_at = _utcnow()
+    reason = data.get("REASON") or None
     metrics = _decode_result_metrics(data.get("METRICS"))
     command_log = _decode_command_log(data.get("COMMAND_LOG"))
     echoed_release_sha = _decode_release_echo_sha(data.get("RELEASE_ECHO"))
@@ -655,7 +1053,7 @@ def _read_local_terminal_status_for_external_id(
     if exit_code is None:
         return ComputeStatusResult(
             status=ComputeJobStatus.FAILED,
-            message="local subprocess exited with unknown code",
+            message=reason or "local subprocess exited with unknown code",
             finished_at=finished_at,
             metrics=metrics,
             command_log=command_log,
@@ -663,7 +1061,7 @@ def _read_local_terminal_status_for_external_id(
         )
     return ComputeStatusResult(
         status=ComputeJobStatus.FAILED,
-        message=f"local subprocess exited with code {exit_code}",
+        message=reason or f"local subprocess exited with code {exit_code}",
         exit_code=exit_code,
         finished_at=finished_at,
         metrics=metrics,
@@ -672,7 +1070,56 @@ def _read_local_terminal_status_for_external_id(
     )
 
 
-def _build_local_wrapper_command(command: str, *, external_id: str) -> str:
+def _build_container_run_prefix(
+    image: str,
+    *,
+    host_out_dir: str,
+    container_out_dir: str = _CONTAINER_OUT_DIR,
+    gpus: bool = False,
+    extra_env: dict[str, str] | None = None,
+    extra_mounts: list[tuple[str, str]] | None = None,
+    workdir: str | None = None,
+) -> str:
+    """Return a shell prefix: ``docker run --rm [--gpus all] -v … -e … IMAGE``.
+
+    The caller appends ``bash -lc <quoted-command>`` after this prefix.
+    ``host_out_dir`` must exist on the host before docker run is called;
+    it is bind-mounted at ``container_out_dir`` so the command's
+    result.json and artifacts land at the same host paths the terminal-status
+    reader already uses. ``extra_mounts`` adds further ``host:container`` bind
+    mounts (e.g. the cloned repo) and ``workdir`` sets the in-container cwd.
+    """
+    result_file = f"{container_out_dir}/result.json"
+    artifact_dir = f"{container_out_dir}/artifacts"
+    parts = ["docker", "run", "--rm"]
+    if gpus:
+        parts += ["--gpus", "all"]
+    parts += [
+        "-v", shlex.quote(f"{host_out_dir}:{container_out_dir}"),
+        "-e", shlex.quote(f"{RESULT_FILE_ENV}={result_file}"),
+        "-e", shlex.quote(f"{ARTIFACT_DIR_ENV}={artifact_dir}"),
+    ]
+    for host_path, container_path in extra_mounts or []:
+        parts += ["-v", shlex.quote(f"{host_path}:{container_path}")]
+    for k, v in (extra_env or {}).items():
+        parts += ["-e", shlex.quote(f"{k}={v}")]
+    if workdir:
+        parts += ["-w", shlex.quote(workdir)]
+    parts.append(shlex.quote(image))
+    return " ".join(parts)
+
+
+def _build_local_wrapper_command(
+    command: str,
+    *,
+    external_id: str,
+    setup_step: str | None = None,
+    container_image: str | None = None,
+    container_registry_auth: dict | None = None,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    repo_clone: dict | None = None,
+) -> str:
     state_dir = shlex.quote(_local_state_dir_for_external_id(external_id))
     pid_path = shlex.quote(_local_pid_path_for_external_id(external_id))
     terminal_path = shlex.quote(_local_terminal_path_for_external_id(external_id))
@@ -690,7 +1137,94 @@ def _build_local_wrapper_command(command: str, *, external_id: str) -> str:
             "live_tail.b64",
         )
     )
-    command_literal = shlex.quote(command)
+    # Block emitted before the python runner that handles docker login + pull.
+    # Separated from the run command so pull failure can write a typed terminal
+    # reason (container_image_pull_failed) instead of falling through as a
+    # generic command failure.
+    container_setup_block = ""
+    if container_image:
+        host_out_dir = _local_state_dir_for_external_id(external_id)
+        gpus = detect_local_gpu() is not None
+        # When the contract includes a repo checkout, bind-mount the repo root
+        # (the running deployment's checkout) into the container as /workspace so
+        # in-container imports resolve the same way they do on the bare substrate.
+        _container_extra_mounts: list[tuple[str, str]] | None = None
+        _container_workdir: str | None = None
+        _container_extra_env: dict[str, str] | None = None
+        if repo_clone:
+            _repo_root = str(Path(__file__).parent.parent.parent)
+            _container_extra_mounts = [(_repo_root, "/workspace")]
+            _container_workdir = "/workspace"
+            _container_extra_env = {"PYTHONPATH": "/workspace"}
+            if env:
+                _container_extra_env.update(env)
+        else:
+            _container_extra_env = dict(env) if env else None
+            if cwd:
+                _container_workdir = cwd
+        prefix = _build_container_run_prefix(
+            container_image,
+            host_out_dir=host_out_dir,
+            gpus=gpus,
+            extra_env=_container_extra_env,
+            extra_mounts=_container_extra_mounts,
+            workdir=_container_workdir,
+        )
+        effective_command = f"{prefix} bash -lc {shlex.quote(command)}"
+        auth = container_registry_auth or {}
+        pwd = str(auth.get("password") or "")
+        login_line = ""
+        if pwd:
+            server_q = shlex.quote(str(auth.get("server") or ""))
+            user_q = shlex.quote(str(auth.get("username") or ""))
+            login_line = (
+                f"printf '%s' {shlex.quote(pwd)} | "
+                f"docker login {server_q} -u {user_q} --password-stdin >/dev/null 2>&1\n"
+            )
+        image_q = shlex.quote(container_image)
+        container_setup_block = (
+            login_line
+            + f"if ! docker pull {image_q} >/dev/null 2>&1; then\n"
+            + "  FINISHED_AT=$(date -u +'%Y-%m-%dT%H:%M:%SZ')\n"
+            + f"  cat > {terminal_path} <<PULL_EOF\n"
+            + "STATUS=FAILED\n"
+            + "EXIT_CODE=1\n"
+            + "FINISHED_AT=$FINISHED_AT\n"
+            + "REASON=container_image_pull_failed\n"
+            + "METRICS=\n"
+            + "COMMAND_LOG=\n"
+            + "RELEASE_ECHO=\n"
+            + "PULL_EOF\n"
+            + "  exit 1\n"
+            + "fi"
+        )
+    else:
+        effective_command = command
+    command_literal = shlex.quote(effective_command)
+    # Optional setup step: run before the main command; on failure write the
+    # terminal file and exit so the main command never starts.
+    setup_step_block = ""
+    if setup_step:
+        setup_step_log = shlex.quote(
+            os.path.join(
+                _local_artifact_dir_for_external_id(external_id),
+                "setup_step.log",
+            )
+        )
+        setup_step_q = shlex.quote(setup_step)
+        setup_step_block = f"""bash -lc {setup_step_q} >> {setup_step_log} 2>&1; SETUP_EXIT=$?
+if [ "$SETUP_EXIT" -ne 0 ]; then
+  FINISHED_AT=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  cat > {terminal_path} <<SETUP_EOF
+STATUS=FAILED
+EXIT_CODE=$SETUP_EXIT
+FINISHED_AT=$FINISHED_AT
+METRICS=
+COMMAND_LOG=
+RELEASE_ECHO=
+SETUP_EOF
+  exit "$SETUP_EXIT"
+fi"""
     # The artifact dir is created but NOT removed: its contents are the durable
     # output channel and must survive the subprocess (and an idempotent relaunch).
     return f"""mkdir -p {state_dir}
@@ -701,6 +1235,8 @@ rm -f {result_path}
 rm -f {command_log_path}
 export {RESULT_FILE_ENV}={result_path}
 export {ARTIFACT_DIR_ENV}={artifact_dir}
+{setup_step_block}
+{container_setup_block}
 EXIT_CODE=0
 if python3 - \
   {command_literal} \
@@ -890,7 +1426,9 @@ async def collect_terminal_artifact_reference(
     holds at least one object, else ``None``. The detection is backend-aware:
     the local backend inspects the on-disk artifact directory that survives the
     subprocess; the GCP backend lists the per-job object prefix the startup
-    script uploaded to before poweroff.
+    script uploaded to before poweroff; the runner-subprocess backend rehydrates
+    the ``runner_artifact`` stamp the receiving endpoint wrote from
+    :func:`store_runner_artifact`.
 
     Fail-soft by contract: an empty artifact directory, a missing location, or
     ANY detection error degrades to ``None`` (interpreted upstream as 'no
@@ -898,10 +1436,12 @@ async def collect_terminal_artifact_reference(
     terminal completion.
     """
     try:
-        if job.backend == LOCAL_BACKEND_NAME:
+        if job.backend in (LOCAL_BACKEND_NAME, LOCAL_GPU_BACKEND_NAME):
             return _collect_local_artifact_reference(job)
         if job.backend == GCP_BACKEND_NAME:
             return await _collect_gcp_artifact_reference(job)
+        if job.backend == RUNNER_SUBPROCESS_BACKEND_NAME:
+            return _collect_runner_artifact_reference(job)
     except Exception:
         logger.warning(
             "Durable-artifact detection failed for compute job %s",
@@ -924,7 +1464,7 @@ def _collect_local_artifact_reference(
     uri = str(meta.get("artifact_uri") or "").strip() or f"file://{artifact_dir}"
     return TerminalArtifactReference(
         uri=uri,
-        backend=LOCAL_BACKEND_NAME,
+        backend=job.backend,
         file_count=file_count,
         total_size_bytes=_compute_tree_size_bytes(artifact_dir),
     )
@@ -947,6 +1487,129 @@ async def _collect_gcp_artifact_reference(
         file_count=file_count,
         total_size_bytes=total_size_bytes,
     )
+
+
+def _collect_runner_artifact_reference(
+    job: ComputeJob,
+) -> TerminalArtifactReference | None:
+    """Build a terminal-artifact reference for a runner-subprocess job.
+
+    Unlike the local/GCP branches, the runner has no in-process or VM-side
+    location for the orchestrator to inspect: the runner tars its artifact dir
+    and POSTs the bytes to the receiving endpoint, which calls
+    :func:`store_runner_artifact` and stamps the returned dict onto
+    ``polling_metadata["runner_artifact"]``. This branch simply rehydrates that
+    stamp into the shared :class:`TerminalArtifactReference` shape the other
+    branches return.
+
+    Mirrors the other branches' emptiness contract: a reference is produced ONLY
+    for a non-empty bundle (``file_count >= 1``); an absent stamp or an empty
+    bundle degrades to ``None`` ('no artifact'). ``uri`` is the durable
+    ``gs://`` location when the upload succeeded, or ``None`` in the degraded
+    no-store path (the durable file-count/byte metrics are still surfaced so the
+    job's terminal completion and metric-based criteria are unaffected, while a
+    ``require_durable_artifact`` gate correctly stays unmet without a durable
+    location).
+    """
+    meta = job.polling_metadata or {}
+    ref = meta.get("runner_artifact")
+    if not isinstance(ref, dict):
+        return None
+    try:
+        file_count = int(ref.get("file_count") or 0)
+        total_size_bytes = int(ref.get("total_bytes") or 0)
+    except (TypeError, ValueError):
+        return None
+    if file_count <= 0:
+        return None
+    uri = ref.get("uri")
+    return TerminalArtifactReference(
+        uri=uri if isinstance(uri, str) and uri.strip() else None,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        file_count=file_count,
+        total_size_bytes=total_size_bytes,
+    )
+
+
+async def store_runner_artifact(
+    session,
+    job: ComputeJob,
+    archive_bytes: bytes,
+    file_count: int,
+    total_bytes: int,
+) -> dict[str, Any]:
+    """Durably persist a runner-subprocess job's artifact tarball.
+
+    Mirrors the GCP backend's durable-artifact store exactly: the gzip tarball
+    the runner uploaded is written to the SAME per-job object the GCE startup
+    script uploads to before poweroff —
+    ``compute-jobs/<job_id>/artifacts/bundle.tar.gz`` in the shared artifact
+    bucket (:data:`storage.ARTIFACT_BUCKET_NAME`). Reusing
+    :func:`storage.compute_job_artifact_object_name` /
+    :func:`storage.compute_job_artifact_uri` means the bundle is retrievable
+    through the identical helpers the GCP path already uses
+    (``storage.download_compute_job_artifact_bundle``); no new store, bucket, or
+    path convention is introduced.
+
+    The orchestrator (Cloud Run) writes with its own ADC — the same credential
+    the GCP path already uses to list/download/IAM the bucket — so this works
+    from the request context that receives the runner upload (the VM-side signed
+    URL is unnecessary here).
+
+    ``session`` is accepted for caller-contract symmetry; this function does not
+    touch the DB. The caller stamps the returned dict onto
+    ``job.polling_metadata["runner_artifact"]``.
+
+    Returns a reference dict::
+
+        {"kind": "runner_artifact", "uri": <gs://...|None>,
+         "file_count": int, "total_bytes": int, "stored": bool}
+
+    Graceful degradation: when no durable object store is reachable (local dev
+    without GCS credentials, or any network/permission/decode error), the upload
+    is skipped best-effort and the dict carries ``uri=None, stored=False``. The
+    job still completes and its durable metrics are still stamped from
+    ``file_count``/``total_bytes``. NEVER raises — durable-artifact storage must
+    not block a runner job's terminal completion.
+    """
+    file_count = max(int(file_count or 0), 0)
+    total_bytes = max(int(total_bytes or 0), 0)
+    reference: dict[str, Any] = {
+        "kind": "runner_artifact",
+        "uri": None,
+        "file_count": file_count,
+        "total_bytes": total_bytes,
+        "stored": False,
+    }
+    if not archive_bytes:
+        return reference
+
+    object_name = storage.compute_job_artifact_object_name(job.id)
+    bucket_name = storage.ARTIFACT_BUCKET_NAME
+    project_id = storage.GCP_PROJECT_ID
+
+    def _upload() -> None:
+        client = gcs_storage.Client(project=project_id)
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(object_name)
+        # upload_from_string streams the already-in-memory bytes once; it does
+        # not duplicate the buffer, so a large (within-cap) bundle stays bounded.
+        blob.upload_from_string(archive_bytes, content_type="application/gzip")
+
+    try:
+        await asyncio.to_thread(_upload)
+    except Exception:
+        logger.warning(
+            "Durable runner-artifact upload failed for compute job %s; "
+            "completing with no durable store (uri=None)",
+            getattr(job, "id", None),
+            exc_info=True,
+        )
+        return reference
+
+    reference["uri"] = storage.compute_job_artifact_uri(job.id)
+    reference["stored"] = True
+    return reference
 
 
 def _count_files_in_tree(path: str) -> int:
@@ -1047,6 +1710,45 @@ def _build_gcp_startup_script(
     # both reference, so assign them before repo_setup_block is built below.
     result_file = shlex.quote(_GCP_RESULT_FILE_PATH)
     artifact_dir = shlex.quote(_GCP_ARTIFACT_DIR_PATH)
+    # Container mode: when the contract declares a runtime image, the command runs
+    # inside `docker run` instead of a bare `bash -lc`. The VM artifact dir is
+    # bind-mounted into the container so result.json and artifacts written inside
+    # land on the host where the terminal-record reader and artifact upload already
+    # look. result.json therefore moves from the standalone _GCP_RESULT_FILE_PATH
+    # to a sibling of the mounted artifact dir; every host reference below uses the
+    # `result_file` variable, so reassigning it here keeps the boot-beacon, TTL, and
+    # completion records pointed at the real file. Absent container_image ⇒ this
+    # whole block is skipped and the generated script is byte-for-byte unchanged.
+    container_run_prefix = ""
+    if spec.container_image:
+        container_result_host_path = os.path.join(
+            _GCP_ARTIFACT_DIR_PATH, "result.json"
+        )
+        result_file = shlex.quote(container_result_host_path)
+        _container_extra_mounts: list[tuple[str, str]] | None = None
+        _container_workdir: str | None = None
+        _container_extra_env: dict[str, str] | None = None
+        if spec.repo_clone:
+            # The repo is cloned to /tmp/blueprint_repo on the VM (see
+            # repo_setup_block); mount it into the container and run there so the
+            # command's imports resolve exactly as they do on the bare substrate.
+            _container_extra_mounts = [("/tmp/blueprint_repo", "/workspace")]
+            _container_workdir = "/workspace"
+            _container_extra_env = {"PYTHONPATH": "/workspace"}
+            if spec.env:
+                _container_extra_env.update(spec.env)
+        else:
+            _container_extra_env = dict(spec.env) if spec.env else None
+            _container_workdir = spec.cwd or None
+        container_run_prefix = _build_container_run_prefix(
+            spec.container_image,
+            host_out_dir=_GCP_ARTIFACT_DIR_PATH,
+            container_out_dir=_GCP_ARTIFACT_DIR_PATH,
+            gpus=spec.accelerator is not None,
+            extra_mounts=_container_extra_mounts,
+            extra_env=_container_extra_env,
+            workdir=_container_workdir,
+        )
     command_log_path = shlex.quote(
         os.path.join(_GCP_ARTIFACT_DIR_PATH, "command.log.json")
     )
@@ -1131,7 +1833,81 @@ def _build_gcp_startup_script(
     # terminal marker" FAILURE that uploaded nothing. Every later phase
     # (clone-fail / runtime-TTL / completion) OVERWRITES this record with the true
     # outcome, so it only survives a death that writes nothing else.
-    command = shlex.quote(spec.command)
+    # Optional setup step: run AFTER the repo clone, BEFORE cwd + main command.
+    # On failure, emit a typed serial reason and poweroff — no main command runs.
+    # Setup stdout+stderr are captured to setup_step.log in the artifact dir so
+    # they land in the durable GCS bundle for post-hoc diagnosis.
+    setup_step_block = ""
+    if spec.setup_step:
+        _setup_log_q = shlex.quote(os.path.join(_GCP_ARTIFACT_DIR_PATH, "setup_step.log"))
+        _setup_step_q = shlex.quote(spec.setup_step)
+        setup_step_block = (
+            f"if ! bash -lc {_setup_step_q} >{_setup_log_q} 2>&1; then\n"
+            f'  echo "{_SERIAL_REASON_PREFIX}setup_step_failed"\n'
+            f'  echo "{_SERIAL_STATUS_PREFIX}FAILED"\n'
+            f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
+            f"  python3 /tmp/blueprint_terminal_record.py "
+            f"{artifact_dir} FAILED 1 setup_step_failed "
+            f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            f"  upload_artifacts\n"
+            f'  kill "$TTL_PID" 2>/dev/null || true\n'
+            f"  poweroff || shutdown -h now || true\n"
+            f"  exit 1\n"
+            f"fi"
+        )
+    # In container mode the command runner still runs `bash -lc <command>`, but
+    # <command> is now the full `docker run … bash -lc <inner>` invocation, so the
+    # log-capture / live-tail machinery is unchanged.
+    docker_setup_block = ""
+    if spec.container_image:
+        command = shlex.quote(
+            f"{container_run_prefix} bash -lc {shlex.quote(spec.command)}"
+        )
+        # `docker login` (only when a password is supplied) followed by
+        # `docker pull`. Credentials are injected as shell env vars delivered via
+        # the encrypted instance-metadata startup script and consumed through
+        # --password-stdin — the password never appears on a command line, on the
+        # serial console, or in any uploaded artifact/log. A failed pull terminates
+        # LOUDLY with the parseable `container_image_pull_failed` reason on both the
+        # serial marker and the durable terminal-record paths (mirroring the
+        # clone-fail branch) rather than letting the command die with no marker.
+        pull_log = shlex.quote(os.path.join(_GCP_ARTIFACT_DIR_PATH, "pull.log"))
+        login_block = ""
+        auth = spec.container_registry_auth or {}
+        pwd = str(auth.get("password") or "")
+        if pwd:
+            login_block = (
+                f"export BLUEPRINT_REGISTRY_SERVER="
+                f"{shlex.quote(str(auth.get('server') or ''))}\n"
+                f"export BLUEPRINT_REGISTRY_USERNAME="
+                f"{shlex.quote(str(auth.get('username') or ''))}\n"
+                f"export BLUEPRINT_REGISTRY_PASSWORD={shlex.quote(pwd)}\n"
+                'if [ -n "${BLUEPRINT_REGISTRY_PASSWORD:-}" ]; then\n'
+                '  printf %s "${BLUEPRINT_REGISTRY_PASSWORD}" | '
+                'docker login "${BLUEPRINT_REGISTRY_SERVER}" '
+                '-u "${BLUEPRINT_REGISTRY_USERNAME}" '
+                "--password-stdin >/dev/null 2>&1 || true\n"
+                "fi\n"
+            )
+        docker_setup_block = (
+            login_block
+            + 'echo "Pulling container image..."\n'
+            + f"if ! docker pull {shlex.quote(spec.container_image)} "
+            + f">{pull_log} 2>&1; then\n"
+            + f'  echo "{_SERIAL_REASON_PREFIX}container_image_pull_failed"\n'
+            + f'  echo "{_SERIAL_STATUS_PREFIX}FAILED"\n'
+            + f'  echo "{_SERIAL_EXIT_PREFIX}1"\n'
+            + "  python3 /tmp/blueprint_terminal_record.py "
+            + f"{artifact_dir} FAILED 1 container_image_pull_failed "
+            + f"{result_file} {command_log_path} >/dev/null 2>&1 || true\n"
+            + "  upload_artifacts\n"
+            + '  kill "$TTL_PID" 2>/dev/null || true\n'
+            + "  poweroff || shutdown -h now || true\n"
+            + "  exit 1\n"
+            + "fi\n"
+        )
+    else:
+        command = shlex.quote(spec.command)
     artifact_bundle = shlex.quote(_GCP_ARTIFACT_BUNDLE_PATH)
     artifact_upload_url = shlex.quote(artifact_upload_url)
     upload_timeout = _GCP_ARTIFACT_UPLOAD_TIMEOUT_SECONDS
@@ -1221,8 +1997,9 @@ python3 /tmp/blueprint_terminal_record.py \
   {artifact_dir} FAILED 1 vm_terminated_before_completion {result_file} {command_log_path} \
   >/dev/null 2>&1 || true
 {repo_setup_block}
+{setup_step_block}
 {cwd_line}
-EXIT_CODE=0
+{docker_setup_block}EXIT_CODE=0
 if python3 /tmp/blueprint_command_runner.py \
   {command} \
   {command_log_path} \

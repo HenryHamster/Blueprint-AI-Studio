@@ -435,6 +435,14 @@ def validate_standalone_chain(
     missing-parent, and multi-head detectors into one call. Returns a list of
     human-readable error strings; empty when the chain is valid.
 
+    Non-contiguous revision numbering (gaps such as 0334 -> 0347) is
+    explicitly valid.  Revision ids are Alembic-opaque labels; the only
+    structural requirements are a single head and no duplicate ids.  Gaps arise
+    naturally from the branch-cut workflow: each task branch reserves the next
+    free slot at cut time, and merge-time reconciliation renumbers everything
+    into the contiguous live sequence.  A gap in the on-disk chain is therefore
+    a normal branch-cut artifact, not an error.
+
     When *expected_schema_revision* is provided, also validates that it matches
     the structural head of the chain (the revision no other revision points to).
     This lets callers prove the EXPECTED_SCHEMA_REVISION detector fires on bad

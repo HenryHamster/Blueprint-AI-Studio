@@ -66,6 +66,7 @@ from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.depends_on_provenance import remap_structural_depends_on
 from app.models import (
     DeploymentState,
+    LocalRunner,
     Project,
     Task,
     TaskStatus,
@@ -74,6 +75,7 @@ from app.models import (
 )
 from app.resource_envelope import (
     get_project_recent_spend_usd,
+    resolve_project_require_local_runner,
     resolve_project_spend_ceiling,
     resolve_project_spend_window_days,
     resolve_project_vm_cap,
@@ -442,6 +444,8 @@ _last_post_commit_sweep: datetime = _utcnow()
 _last_sidecar_sweep: datetime = _utcnow()
 _last_bootstrap_recovery_sweep: datetime = _utcnow()
 _last_lane_baseline_backfill: datetime = _utcnow()
+_last_runner_deactivation_sweep: datetime = _utcnow()
+_last_local_runner_hold_sweep: datetime = _utcnow()
 _last_deadlock_check: datetime | None = None
 _last_zone_exhaustion_log: datetime | None = None
 _last_concurrency_broadcast: datetime | None = None
@@ -469,6 +473,336 @@ _VERIFY_TESTS_SPAWN_DEFERRAL_CAP = 5
 # Reset when any task dispatches successfully (stall resolved), then re-arm
 # if every eligible task is again blocked by account rate limits.
 _all_accounts_blocked_alerted: bool = False
+
+# A registered runner is considered live (eligible for dispatch) only if it has
+# heartbeated within this window. Runners that miss heartbeats fall out of the
+# dispatch cache and are swept to status='inactive'.
+_RUNNER_LIVENESS_SECONDS = 300
+
+# A compute_experiment held for a require-local project is failed if no runner
+# claims it within this window — prevents a permanently-wedged project when the
+# operator's hardware stays offline. Generous default; operators can bring a
+# runner up well within it.
+_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS = 6 * 3600
+
+
+def _runner_handles_task_type(runner: LocalRunner, task_type: str) -> bool:
+    """Whether a runner's declared capabilities cover this task type."""
+    task_types = (runner.capabilities or {}).get("task_types", "all")
+    if task_types == "all":
+        return True
+    if isinstance(task_types, (list, tuple, set)):
+        return task_type in task_types
+    # Malformed capability shape — be conservative and treat as no-cover.
+    return False
+
+
+def _runner_active_task_count(runner: LocalRunner) -> int:
+    """Best-effort current load, from the heartbeat-reported active task ids."""
+    active = (runner.capabilities or {}).get("active_task_ids") or []
+    try:
+        return len(active)
+    except TypeError:
+        return 0
+
+
+def _runner_at_capacity(runner: LocalRunner, pins_this_cycle: int = 0) -> bool:
+    """True when the runner's EFFECTIVE load has reached its declared max_concurrent.
+
+    Effective load = heartbeat-reported active count (tasks the runner has already
+    pulled and reported) PLUS ``pins_this_cycle`` (tasks pinned to this runner
+    earlier in the SAME dispatch pass but not yet pulled/reported). The
+    heartbeat-reported ``active_task_ids`` lags pins by at least one heartbeat, so
+    without counting same-cycle pins a burst of N QUEUED tasks would all pin to a
+    single idle runner (it reads as load 0 on every iteration) and the surplus —
+    beyond what the runner can actually pull (max_concurrent) — would sit
+    PROVISIONING until falsely reaped. Counting the in-cycle pins caps NEW work
+    per cycle at the runner's real pull capacity.
+    """
+    caps = runner.capabilities or {}
+    max_concurrent = caps.get("max_concurrent")
+    if max_concurrent is None:
+        return False
+    return _runner_active_task_count(runner) + pins_this_cycle >= max_concurrent
+
+
+async def _load_active_runners_cache(
+    session: AsyncSession,
+) -> dict[uuid.UUID, list[LocalRunner]]:
+    """Load live registered runners once per orchestrator cycle, by project.
+
+    A runner is live when status='active' AND it heartbeated within the
+    liveness window. Returns ``{project_id: [LocalRunner]}``; an empty dict when
+    no runner is registered (the common case — all existing dispatch paths then
+    run unchanged).
+    """
+    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    try:
+        rows = (
+            await session.execute(
+                select(LocalRunner).where(
+                    LocalRunner.status == "active",
+                    LocalRunner.last_seen_at.is_not(None),
+                    LocalRunner.last_seen_at > cutoff,
+                )
+            )
+        ).scalars().all()
+    except Exception:
+        logger.exception("[RUNNERS] Failed to load active-runner cache")
+        return {}
+    by_project: dict[uuid.UUID, list[LocalRunner]] = {}
+    for runner in rows:
+        by_project.setdefault(runner.project_id, []).append(runner)
+    return by_project
+
+
+async def _try_runner_dispatch(
+    session: AsyncSession,
+    task: Task,
+    active_runners_cache: dict[uuid.UUID, list[LocalRunner]],
+    runner_pins_this_cycle: dict[uuid.UUID, int] | None = None,
+) -> bool:
+    """Pin a QUEUED task to an eligible registered runner, if one exists.
+
+    Returns True when the task was pinned (PROVISIONING, vm_instance_id +
+    context['runner_target_id'] set, committed) — the caller then skips the
+    warm-pool and GCP dispatch paths for this task. Returns False when no runner
+    is eligible, leaving every existing dispatch path to run exactly as before.
+
+    ``runner_pins_this_cycle`` is a ``{runner_id: pins_so_far}`` counter the
+    caller resets ONCE per dispatch cycle (so it counts only pins made this
+    pass). It is consulted in the capacity check and incremented on a successful
+    pin so a burst of QUEUED tasks in one cycle never over-pins a single idle
+    runner beyond its max_concurrent pull capacity (the heartbeat-reported active
+    count lags pins by a heartbeat, so it alone reads 0 for every iteration).
+
+    Driven entirely by runner registration — no LOCAL_MODE flag is consulted.
+    When omitted (single-call / test callers), it defaults to a fresh per-call
+    counter, so a lone dispatch behaves exactly as before.
+    """
+    if runner_pins_this_cycle is None:
+        runner_pins_this_cycle = {}
+    ctx = task.context or {}
+    # Already pinned by a prior cycle — leave it for the runner to pull.
+    if ctx.get("runner_target_id"):
+        return False
+    task_type = (task.first_payload or {}).get("type", "")
+
+    candidates = active_runners_cache.get(task.project_id) or []
+    eligible = [
+        r
+        for r in candidates
+        if _runner_handles_task_type(r, task_type)
+        and not _runner_at_capacity(r, runner_pins_this_cycle.get(r.id, 0))
+    ]
+    if not eligible:
+        return False
+
+    # Compute experiments that declare a GPU accelerator may only be pinned to
+    # runners advertising has_gpu=True — a CPU runner cannot provide a GPU.
+    # Non-GPU compute experiments fall through to the normal eligibility check.
+    if task_type == "compute_experiment":
+        payload = task.first_payload or {}
+        accelerator = payload.get("accelerator") or (
+            payload.get("compute_experiment") or {}
+        ).get("accelerator")
+        if accelerator:
+            eligible = [r for r in eligible if (r.capabilities or {}).get("has_gpu")]
+            if not eligible:
+                return False
+
+    # Prefer the least-loaded runner by EFFECTIVE load (heartbeat-reported active
+    # count plus pins already made to it this cycle), so a multi-runner fleet
+    # spreads a same-cycle burst across runners instead of stacking one.
+    runner = min(
+        eligible,
+        key=lambda r: _runner_active_task_count(r)
+        + runner_pins_this_cycle.get(r.id, 0),
+    )
+
+    new_ctx = dict(ctx)
+    new_ctx["runner_target_id"] = str(runner.id)
+    # A task that was held (enforce-local) and is now pinned must not carry the
+    # stale wait stamp — otherwise the bounded-timeout sweep could fail it after
+    # it has already been claimed by a runner.
+    new_ctx.pop("awaiting_local_runner_since", None)
+    task.context = new_ctx
+    task.vm_instance_id = f"runner:{runner.id}"
+    task.status = TaskStatus.PROVISIONING
+    task.vm_provisioned_at = _utcnow()
+    # Pinning moves the task out of the crash-prone prep window; clear the
+    # contained-crash counter so the same commit persists it.
+    _clear_dispatch_prep_failures(task)
+    session.add(task)
+    try:
+        await session.commit()
+    except Exception:
+        logger.exception(
+            "[RUNNERS] Failed to commit runner pin for task %s", task.id
+        )
+        await session.rollback()
+        return False
+    # Only charge the in-cycle pin slot once the pin is durably committed — a
+    # rolled-back pin above must not consume the runner's per-cycle capacity.
+    runner_pins_this_cycle[runner.id] = runner_pins_this_cycle.get(runner.id, 0) + 1
+    logger.info(
+        "[RUNNERS] Pinned task %s (type=%s) to runner %s",
+        task.id,
+        task_type,
+        runner.id,
+    )
+    return True
+
+
+async def _deactivate_stale_runners(session: AsyncSession) -> None:
+    """Mark runners that missed the heartbeat window as inactive.
+
+    Keeps the dispatch cache query clean and surfaces stale runners in the admin
+    listing. Any task pinned to a now-inactive runner that the runner never
+    pulled (``started_at IS NULL``) is released back to QUEUED so the next
+    dispatch cycle can re-pin it to a live runner, hold it (enforce-local, with
+    the 6h safety-fail), or fall back to cloud. This recovery is required because
+    the orphaned-task reaper intentionally no longer reaps awaiting-pull runner
+    pins (they are not dead GCE VMs); without it a pin would wedge forever if its
+    runner went offline in the pin->pull window.
+    """
+    from sqlalchemy import or_, update as _sa_update
+
+    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    stale_ids = (
+        await session.execute(
+            select(LocalRunner.id).where(
+                LocalRunner.status == "active",
+                or_(
+                    LocalRunner.last_seen_at.is_(None),
+                    LocalRunner.last_seen_at < cutoff,
+                ),
+            )
+        )
+    ).scalars().all()
+    if not stale_ids:
+        return
+
+    await session.execute(
+        _sa_update(LocalRunner)
+        .where(LocalRunner.id.in_(stale_ids))
+        .values(status="inactive")
+    )
+
+    # Release unpulled pins on the now-inactive runners back to QUEUED. A pin the
+    # runner never claimed has started_at IS NULL and vm_instance_id "runner:{id}"
+    # (set together in _try_runner_dispatch); clearing the pin lets the dispatch
+    # loop re-decide next cycle.
+    stale_vm_ids = [f"runner:{rid}" for rid in stale_ids]
+    pinned = (
+        await session.execute(
+            select(Task).where(
+                Task.status == TaskStatus.PROVISIONING,
+                Task.started_at.is_(None),
+                Task.vm_instance_id.in_(stale_vm_ids),
+            )
+        )
+    ).scalars().all()
+    for task in pinned:
+        task.status = TaskStatus.QUEUED
+        task.vm_instance_id = None
+        task.vm_provisioned_at = None
+        new_ctx = dict(task.context or {})
+        new_ctx.pop("runner_target_id", None)
+        task.context = new_ctx
+        session.add(task)
+        logger.info(
+            "[RUNNERS] Released unpulled pin for task %s from a now-inactive "
+            "runner (back to QUEUED for re-dispatch)",
+            task.id,
+        )
+
+    await session.commit()
+
+
+async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
+    """Terminally fail compute_experiment tasks held too long for a local runner.
+
+    A require-local project's compute_experiment is held QUEUED (with
+    ``context['awaiting_local_runner_since']`` stamped) instead of provisioned in
+    the cloud when no live self-hosted runner claimed it. This sweep is the
+    safety valve: a hold older than ``_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS`` is
+    marked terminal-FAILED with an actionable reason so the project can never
+    wedge forever when the operator's hardware stays offline.
+
+    Returns the number of tasks failed. Mirrors the terminal-fail pattern used by
+    the stale-provisioning reaper: TaskStatus.FAILED + latest_status_message +
+    failure_category (PROVISION_FAILURE, an INFRA class) + failure alert +
+    record_task_result, committed in one batch.
+    """
+    from app.alert_dispatch import _maybe_create_failure_alert
+    from app.failure_classification import (
+        PROVISION_FAILURE,
+        persist_failure_category,
+    )
+    from app.routers.agent_status import record_task_result
+
+    cutoff = _utcnow() - timedelta(seconds=_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS)
+    # JSON-path predicates differ across dialects (Postgres prod vs SQLite tests),
+    # so select QUEUED tasks and filter the context stamp / payload type in
+    # Python — the candidate set is tiny (only require-local projects ever stamp).
+    rows = (
+        await session.execute(
+            select(Task).where(Task.status == TaskStatus.QUEUED)
+        )
+    ).scalars().all()
+
+    failed = 0
+    for task in rows:
+        ctx = task.context or {}
+        stamped = ctx.get("awaiting_local_runner_since")
+        if not stamped:
+            continue
+        # Belt-and-suspenders: only ever act on compute_experiment holds.
+        if str((task.first_payload or {}).get("type") or "") != "compute_experiment":
+            continue
+        try:
+            stamped_at = datetime.fromisoformat(str(stamped))
+        except (ValueError, TypeError):
+            continue
+        if stamped_at.tzinfo is not None:
+            stamped_at = stamped_at.astimezone(timezone.utc).replace(tzinfo=None)
+        if stamped_at > cutoff:
+            continue  # within the wait window — keep holding
+
+        hours = _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS // 3600
+        reason = (
+            f"require_local_runner: no self-hosted runner became available within "
+            f"{hours}h — operator hardware offline; bring a runner online and requeue"
+        )
+        task.status = TaskStatus.FAILED
+        task.latest_status_message = reason[:500]
+        persist_failure_category(task, PROVISION_FAILURE)
+        session.add(task)
+        try:
+            await _maybe_create_failure_alert(task, session, reason[:200])
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to create hold-timeout alert for task %s", task.id
+            )
+        record_task_result(
+            success=False,
+            failure_class=PROVISION_FAILURE,
+            task_id=str(task.id),
+            task_type="compute_experiment",
+        )
+        logger.warning(
+            "[RUNNERS] Failed compute_experiment %s: no local runner within %sh "
+            "(held since %s)",
+            task.id,
+            hours,
+            stamped,
+        )
+        failed += 1
+
+    if failed:
+        await session.commit()
+    return failed
 
 
 async def _emit_all_accounts_blocked_stall(
@@ -1872,7 +2206,9 @@ async def orchestrator_worker():
         _last_post_commit_sweep, \
         _last_sidecar_sweep, \
         _last_bootstrap_recovery_sweep, \
-        _last_lane_baseline_backfill
+        _last_lane_baseline_backfill, \
+        _last_runner_deactivation_sweep, \
+        _last_local_runner_hold_sweep
     while True:
         queued_tasks = []
         session = None  # defined before try so except handler can reference it
@@ -3437,6 +3773,20 @@ async def orchestrator_worker():
                 _cycle_earliest_recovery: datetime | None = None
                 _cycle_blockage_reasons: set[str] = set()
 
+                # Pull-based fleet runners: load live registered runners ONCE per
+                # cycle (keyed by project_id) so the per-task runner-dispatch check
+                # never issues a DB query. Empty dict when none are registered —
+                # the common case, in which all dispatch paths run unchanged.
+                _active_runners_cache = await _load_active_runners_cache(session)
+                # Per-cycle pin counter ({runner_id: pins_made_this_pass}).
+                # Declared inside the cycle body so it RESETS every dispatch pass
+                # — it must count only pins made in THIS cycle, since the runner's
+                # heartbeat-reported active count catches up between cycles.
+                # _try_runner_dispatch reads it (capacity check) and increments it
+                # on each committed pin so one idle runner is never over-pinned
+                # beyond its max_concurrent in a single burst.
+                _runner_pins_this_cycle: dict[uuid.UUID, int] = {}
+
                 for _qt_id, _task_type_for_gate in _queued_task_gate_info:
                     # Per-type failure gate: skip tasks whose type is currently failing
                     # (global 80% backstop already handled above; this skips only the bad type).
@@ -3505,6 +3855,57 @@ async def orchestrator_worker():
                                 )
                             await session.commit()
                             continue
+
+                        # Pull-based fleet runner routing. Checked BEFORE the
+                        # warm-pool / GCP dispatch paths: if an eligible live
+                        # runner is registered for this project, pin the task to
+                        # it (PROVISIONING + vm_instance_id='runner:{id}' +
+                        # context['runner_target_id']) and let the runner pull it
+                        # via POST /api/runner/next-task. Purely additive — when
+                        # no runner is registered this returns False and every
+                        # existing dispatch path runs exactly as before. No
+                        # LOCAL_MODE flag is involved.
+                        if await _try_runner_dispatch(
+                            session,
+                            task,
+                            _active_runners_cache,
+                            _runner_pins_this_cycle,
+                        ):
+                            _cycle_dispatched += 1
+                            continue
+
+                        # Enforce-local hold: a compute_experiment for a project
+                        # that requires a local runner must never be provisioned
+                        # in the cloud. When no live runner claimed it above, keep
+                        # it QUEUED (held) — the next cycle re-pins it the moment a
+                        # runner registers. A bounded sweep
+                        # (_fail_stale_local_runner_holds) terminally fails a hold
+                        # that exceeds the wait timeout, so the project can never
+                        # wedge forever.
+                        if (
+                            str((task.first_payload or {}).get("type") or "")
+                            == "compute_experiment"
+                        ):
+                            _holding_project = await session.get(
+                                Project, task.project_id
+                            )
+                            if _holding_project is not None and (
+                                resolve_project_require_local_runner(_holding_project)
+                            ):
+                                ctx = dict(task.context or {})
+                                if not ctx.get("awaiting_local_runner_since"):
+                                    ctx["awaiting_local_runner_since"] = (
+                                        _utcnow().isoformat()
+                                    )
+                                    task.context = ctx
+                                    session.add(task)
+                                    await session.commit()
+                                logger.info(
+                                    "[RUNNERS] Holding compute_experiment %s: "
+                                    "require_local_runner set, no live runner",
+                                    task.id,
+                                )
+                                continue
 
                         # Phase 2c: warm-VM continuity skip-provision branch.
                         # Three outcomes when warm_target_vm_id is set on the task:
@@ -7630,6 +8031,42 @@ async def orchestrator_worker():
                 except Exception:
                     logger.exception(
                         "[ORCHESTRATOR] Lane-baseline backfill sweep error"
+                    )
+            # Stale-runner deactivation — every 300s. Marks registered fleet
+            # runners that missed the heartbeat window as inactive so they drop
+            # out of the dispatch cache and the admin listing. Tasks already
+            # pinned to a now-dead runner are recovered by the orphaned-task
+            # sweep above (no new recovery code needed).
+            if _is_cadence_due(_last_runner_deactivation_sweep, 300):
+                _last_runner_deactivation_sweep = _utcnow()
+                try:
+                    async with AsyncSessionLocal() as _runner_sweep_session:
+                        await _bounded_leader_step(
+                            "runner_deactivation",
+                            _deactivate_stale_runners(_runner_sweep_session),
+                            budget=30,
+                        )
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] Stale-runner deactivation sweep error"
+                    )
+            # Enforce-local hold timeout — every 300s. Terminally fails any
+            # compute_experiment that has been held QUEUED awaiting a self-hosted
+            # runner past _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS, so a require-local
+            # project can never wedge forever when the operator's hardware stays
+            # offline.
+            if _is_cadence_due(_last_local_runner_hold_sweep, 300):
+                _last_local_runner_hold_sweep = _utcnow()
+                try:
+                    async with AsyncSessionLocal() as _hold_sweep_session:
+                        await _bounded_leader_step(
+                            "local_runner_hold_timeout",
+                            _fail_stale_local_runner_holds(_hold_sweep_session),
+                            budget=30,
+                        )
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] Local-runner hold-timeout sweep error"
                     )
             # Drain the deferred missing-branch alert queue into durable,
             # idempotent operator Alerts. The synchronous branch resolvers

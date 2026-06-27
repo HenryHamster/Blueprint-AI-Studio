@@ -34,6 +34,9 @@ TASK_RUNTIME_CONTEXT_KEYS = (
     "llm_model",
     "llm_execution_mode",
     "max_plan_account_id",
+    # Runner pin — cleared on requeue so a dead runner is not re-pinned forever
+    # and the next dispatch cycle can fall over to GCP cloud fallback.
+    "runner_target_id",
 )
 
 

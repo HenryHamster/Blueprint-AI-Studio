@@ -20,6 +20,9 @@ export function useDirectionForm() {
   // passes through a research-eligible active state. Gated in the UI to an
   // open release version, mirroring the edit-form 'staged' status option.
   const [newStaged, setNewStagedState] = useState(false);
+  // Problem model gap this direction is being created to address. Set when
+  // the operator clicks "Spawn direction" on a gap card; cleared on reset.
+  const [newLinkedGapId, setNewLinkedGapIdState] = useState<string | null>(null);
 
   // Client idempotency identity for the add path. Minted lazily on first submit
   // and reused across double-clicks / failed retries / lost-response replays so
@@ -45,6 +48,9 @@ export function useDirectionForm() {
   // context when entering edit mode (see startEdit).
   const [editSuccessEvidence, setEditSuccessEvidence] = useState('');
   const [editRetirementCondition, setEditRetirementCondition] = useState('');
+  // Cost budget in USD — seeded from direction.cost_budget_usd (or empty string
+  // when unset); sent as a float or null on PATCH.
+  const [editCostBudget, setEditCostBudget] = useState('');
 
   function startEdit(d: Direction) {
     setEditingId(d.id);
@@ -57,6 +63,7 @@ export function useDirectionForm() {
     setEditCompletionCriteria(d.completion_criteria ?? '');
     setEditSuccessEvidence(d.context?.success_evidence ?? '');
     setEditRetirementCondition(d.context?.retirement_condition ?? '');
+    setEditCostBudget(d.cost_budget_usd != null ? String(d.cost_budget_usd) : '');
   }
 
   function resetAddKeyForEditedDraft() {
@@ -105,6 +112,11 @@ export function useDirectionForm() {
     setNewStagedState(value);
   }
 
+  function setNewLinkedGapId(value: string | null) {
+    resetAddKeyForEditedDraft();
+    setNewLinkedGapIdState(value);
+  }
+
   function markAddAttemptFailed() {
     rotateAddIdempotencyKeyOnDraftChangeRef.current = true;
   }
@@ -119,8 +131,14 @@ export function useDirectionForm() {
     setNewSuccessEvidenceState('');
     setNewRetirementConditionState('');
     setNewStagedState(false);
+    setNewLinkedGapIdState(null);
     addIdempotencyKeyRef.current = null;
     rotateAddIdempotencyKeyOnDraftChangeRef.current = false;
+  }
+
+  function seedFromMessage(text: string) {
+    resetAddForm();
+    setNewTextState(text.slice(0, 2000));
   }
 
   return {
@@ -133,6 +151,7 @@ export function useDirectionForm() {
     newSuccessEvidence, setNewSuccessEvidence,
     newRetirementCondition, setNewRetirementCondition,
     newStaged, setNewStaged,
+    newLinkedGapId, setNewLinkedGapId,
     addIdempotencyKeyRef,
     markAddAttemptFailed,
     editingId, setEditingId,
@@ -145,7 +164,9 @@ export function useDirectionForm() {
     editCompletionCriteria, setEditCompletionCriteria,
     editSuccessEvidence, setEditSuccessEvidence,
     editRetirementCondition, setEditRetirementCondition,
+    editCostBudget, setEditCostBudget,
     startEdit,
     resetAddForm,
+    seedFromMessage,
   };
 }

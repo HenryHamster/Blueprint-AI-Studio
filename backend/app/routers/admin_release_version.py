@@ -694,6 +694,7 @@ async def get_version_lifecycle(
                 # True when the version has more than _TASKS_MERGED_LIMIT merged
                 # tasks; the UI can show a "showing N of total" indicator.
                 "tasks_merged_has_more": tasks_merged_has_more,
+                "theme": open_row.theme,
             }
 
         history_rows = (

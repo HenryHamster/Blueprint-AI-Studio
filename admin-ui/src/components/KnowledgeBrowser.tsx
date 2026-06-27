@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
-import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, RefreshCw, FileCode, Globe, HelpCircle, Cpu, Shield, ShieldCheck, ShieldAlert, AlertTriangle } from 'lucide-react';
+import { X, Search, BookOpen, ArrowLeft, ExternalLink, Copy, Check, CheckCircle, XCircle, RefreshCw, FileCode, Globe, HelpCircle, Cpu, Shield, ShieldCheck, ShieldAlert, AlertTriangle, Download } from 'lucide-react';
 import { ResolvedReferenceLink, isResolvableStorageUri, isSafeUrl } from './TaskCard';
 import { MarkdownContent } from './MarkdownContent';
 import { ReleaseEvidencePanel } from './ReleaseEvidence';
+import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
 import {
   fetchKnowledgeDocuments,
   fetchKnowledgeDocument,
@@ -10,7 +11,6 @@ import {
   type KnowledgeDocument,
   type KnowledgeForwardQualityVerdict,
 } from '../api';
-import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
 import { parseTimestamp } from '../utils/time';
 
 interface KnowledgeBrowserProps {
@@ -19,6 +19,7 @@ interface KnowledgeBrowserProps {
   onNavigateToTask?: (taskId: string) => void;
   onLaunchWebResearchTask?: (topic?: string) => void;
   initialDirectionId?: string;
+  initialDocumentId?: string;
 }
 
 function relativeDate(dateStr: string | null): string {
@@ -77,77 +78,6 @@ function SourceKindBadge({ kind }: { kind?: string }) {
   );
 }
 
-/**
- * Human-readable tooltip for each compute acceptance-grade reason code emitted by
- * the backend classifier (app.knowledge_query.classify_knowledge_acceptance). The
- * codes distinguish the strict acceptance path (`llm_artifact_cited`) from the
- * measured-only causes — a deterministic fallback summary, a grounding miss, or a
- * citation that never resolved to a durable artifact.
- */
-const ACCEPTANCE_REASON_LABELS: Record<string, string> = {
-  llm_artifact_cited: 'LLM-grounded, artifact-cited analysis — qualifies as acceptance evidence',
-  analysis_mode_not_llm: 'Deterministic fallback summary (analysis mode is not LLM) — measured only',
-  citation_grounding_miss: 'Citation grounding miss — measured only',
-  no_source_citations: 'No source citations — measured only',
-  missing_grounding_probe: 'No grounding probe recorded — measured only',
-  no_grounded_artifact_citation: 'No citation resolved to a durable artifact — measured only',
-};
-
-/**
- * Acceptance-grade badge for compute_experiment knowledge documents. The backend
- * (classify_knowledge_acceptance) is the single source of truth: it grades a
- * compute KnowledgeDocument as 'acceptance' (LLM-grounded, artifact-cited analysis
- * that clears the grounding probe) or 'measured_only' (deterministic fallback,
- * grounding miss, or unresolved citations). Operators need to tell the two apart
- * because only the acceptance grade qualifies as strict non-code acceptance
- * evidence. Renders nothing for non-compute documents (grade is null) or older
- * docs persisted before the grade existed, so measured-only/fallback docs stay
- * visible in normal search and source-kind filtering — this only labels them.
- */
-function AcceptanceGradeBadge({
-  doc,
-}: {
-  doc: Pick<
-    KnowledgeDocument,
-    'source_kind' | 'compute_acceptance_grade' | 'compute_acceptance_reason' | 'analysis_fallback_reason'
-    | 'analysis_mode' | 'unavailable_cause'
-  >;
-}) {
-  if (doc.source_kind !== 'compute_experiment') return null;
-  const grade = doc.compute_acceptance_grade;
-  if (grade !== 'acceptance' && grade !== 'measured_only') return null;
-  const isAcceptance = grade === 'acceptance';
-  const reason = typeof doc.compute_acceptance_reason === 'string' ? doc.compute_acceptance_reason : undefined;
-  const analysisCauseLabel = grade === 'measured_only'
-    ? formatComputeAnalysisCauseLabel({
-        unavailableCause: doc.unavailable_cause,
-        analysisFallbackReason: doc.analysis_fallback_reason,
-        analysisMode: doc.analysis_mode,
-      })
-    : null;
-  const tooltip = (reason ? ACCEPTANCE_REASON_LABELS[reason] : undefined)
-    ?? (isAcceptance ? 'Acceptance-grade compute knowledge' : 'Measured-only compute knowledge');
-  const label = isAcceptance ? 'Acceptance' : 'Measured only';
-  const cls = isAcceptance
-    ? 'bg-emerald-500/10 border-emerald-500/20 text-emerald-300'
-    : 'bg-amber-500/10 border-amber-500/20 text-amber-300';
-  return (
-    <span className="inline-flex items-center gap-1 flex-wrap">
-      <span
-        className={`${cls} border text-ui-xs uppercase tracking-wider rounded font-semibold whitespace-nowrap inline-flex items-center gap-1 px-1.5 py-0.5`}
-        title={analysisCauseLabel ? `${tooltip} · ${analysisCauseLabel}` : tooltip}
-      >
-        {isAcceptance ? <CheckCircle className="w-2.5 h-2.5 shrink-0" /> : <HelpCircle className="w-2.5 h-2.5 shrink-0" />}
-        {label}
-      </span>
-      {analysisCauseLabel && (
-        <span className="text-ui-xs text-amber-200/80 leading-tight max-w-[14rem] break-words">
-          {analysisCauseLabel}
-        </span>
-      )}
-    </span>
-  );
-}
 
 /**
  * Origin-challenge badge for a knowledge document spawned from a research finding.
@@ -400,9 +330,32 @@ function CopyableId({ id }: { id: string }) {
   );
 }
 
+function ExportMarkdown({ body }: { body?: string }) {
+  const [copied, setCopied] = useState(false);
+  const export_text = useCallback(() => {
+    const markdown = body || '';
+    navigator.clipboard?.writeText(markdown).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    }).catch(() => {/* clipboard unavailable */});
+  }, [body]);
+  if (!body) return null;
+  return (
+    <button
+      data-viewport-allow-small-target
+      onClick={export_text}
+      title="Copy markdown to clipboard"
+      className="inline-flex items-center gap-1 text-ui-sm text-neutral-500 hover:text-neutral-300 transition-colors"
+    >
+      {copied ? <Check className="w-3 h-3 text-emerald-400" /> : <Download className="w-3 h-3" />}
+      export
+    </button>
+  );
+}
+
 const PAGE_SIZE = 50;
 
-export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask, onLaunchWebResearchTask, initialDirectionId }: KnowledgeBrowserProps) {
+export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask, onLaunchWebResearchTask, initialDirectionId, initialDocumentId }: KnowledgeBrowserProps) {
   const [query, setQuery] = useState({
     search: '',
     topicFilter: null as string | null,
@@ -410,9 +363,10 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
     directionFilter: (initialDirectionId ?? null) as string | null,
     sourceKindFilter: null as string | null,
     challengeStateFilter: null as string | null,
+    sweepFilter: null as string | null,
     offset: 0,
   });
-  const { search, topicFilter, tagFilter, directionFilter, sourceKindFilter, challengeStateFilter, offset } = query;
+  const { search, topicFilter, tagFilter, directionFilter, sourceKindFilter, challengeStateFilter, sweepFilter, offset } = query;
 
   const [docs, setDocs] = useState<KnowledgeDocument[]>([]);
   const [total, setTotal] = useState(0);
@@ -420,12 +374,12 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<KnowledgeDocument | null>(null);
 
-  const setFilter = useCallback(<K extends 'search' | 'topicFilter' | 'tagFilter' | 'directionFilter' | 'sourceKindFilter' | 'challengeStateFilter'>(
+  const setFilter = useCallback(<K extends 'search' | 'topicFilter' | 'tagFilter' | 'directionFilter' | 'sourceKindFilter' | 'challengeStateFilter' | 'sweepFilter'>(
     key: K,
     value: typeof query[K],
   ) => {
     setQuery(prev => ({ ...prev, [key]: value, offset: 0 }));
-  }, [query]);
+  }, []);
 
   const loadMore = useCallback(() => {
     setQuery(prev => ({ ...prev, offset: prev.offset + PAGE_SIZE }));
@@ -445,6 +399,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
         direction: directionFilter ?? undefined,
         source_kind: sourceKindFilter ?? undefined,
         challenge_state: challengeStateFilter ?? undefined,
+        sweep: sweepFilter ?? undefined,
         limit: PAGE_SIZE,
         offset,
       })
@@ -461,7 +416,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
         .finally(() => { if (!cancelled) setLoading(false); });
     }, 250);
     return () => { cancelled = true; clearTimeout(handle); };
-  }, [selectedProjectId, search, topicFilter, tagFilter, directionFilter, sourceKindFilter, challengeStateFilter, offset]);
+  }, [selectedProjectId, search, topicFilter, tagFilter, directionFilter, sourceKindFilter, challengeStateFilter, sweepFilter, offset]);
 
   const openDoc = useCallback((doc: KnowledgeDocument) => {
     if (!selectedProjectId) return;
@@ -470,6 +425,17 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
       .then(full => setSelected(full))
       .catch(() => {/* keep summary view */});
   }, [selectedProjectId]);
+
+  // When a specific document id is provided (e.g. from the compute jobs panel),
+  // open it directly in the detail view once the panel mounts or the project changes.
+  useEffect(() => {
+    if (!initialDocumentId || !selectedProjectId) return;
+    let cancelled = false;
+    fetchKnowledgeDocument(selectedProjectId, initialDocumentId)
+      .then(full => { if (!cancelled) setSelected(full); })
+      .catch(() => {/* non-fatal: browser can navigate back */});
+    return () => { cancelled = true; };
+  }, [initialDocumentId, selectedProjectId]);
 
   const launchWebResearch = useCallback((topic?: string) => {
     onLaunchWebResearchTask?.(topic);
@@ -514,6 +480,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
               <h2 className="text-base font-semibold text-neutral-100 leading-snug">{selected.title}</h2>
               <div className="flex items-center gap-3 flex-wrap text-ui-sm text-neutral-500">
                 <CopyableId id={selected.id} />
+                <ExportMarkdown body={selected.body} />
                 <SourceKindBadge kind={selected.source_kind} />
                 <AcceptanceGradeBadge doc={selected} />
                 <OriginBadge doc={selected} />
@@ -524,6 +491,15 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                 )}
                 {selected.direction_id && <span className="px-1.5 py-0.5 rounded bg-blue-950/40 text-blue-300">{selected.direction_id}</span>}
                 {selected.topic && <span className="px-1.5 py-0.5 rounded bg-violet-950/40 text-violet-300">{selected.topic}</span>}
+                {selected.sweep_id && (
+                  // reason: sweep filter chip in compact detail meta row; text-ui-xs inline control
+                  <button
+                    data-viewport-allow-small-target
+                    onClick={e => { e.stopPropagation(); setFilter('sweepFilter', selected.sweep_id ?? null); }}
+                    className="text-ui-xs px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-300 hover:bg-amber-900/40 transition-colors font-mono"
+                    title={`Sweep ${selected.sweep_id}${selected.arm_label ? ` / ${selected.arm_label}` : ' (aggregate)'}`}
+                  >{selected.sweep_id.slice(0, 8)}…{selected.arm_label ? ` / ${selected.arm_label}` : ' agg'}</button>
+                )}
                 {selected.created_at && <span>{relativeDate(selected.created_at)}</span>}
                 {selected.source_task_id && onNavigateToTask && (() => {
                   const srcTaskId = selected.source_task_id;
@@ -609,7 +585,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
           /* List view */
           <>
             <div className="px-4 py-2 border-b border-neutral-800/50 shrink-0 space-y-2">
-              {(topicFilter || tagFilter || directionFilter) && (
+              {(topicFilter || tagFilter || directionFilter || sweepFilter) && (
                 <div className="flex items-center gap-1.5 flex-wrap">
                   {directionFilter && (
                     <span className="flex items-center gap-1 text-ui-sm bg-blue-950/40 border border-blue-900/50 text-blue-300 px-2 py-0.5 rounded">
@@ -630,6 +606,13 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                       #{tagFilter}
                       {/* reason: clear-tag-filter chip control; w-2.5 h-2.5 icon inline in chip */}
                       <button data-viewport-allow-small-target onClick={() => setFilter('tagFilter', null)} className="text-neutral-500 hover:text-neutral-200"><X className="w-2.5 h-2.5" /></button>
+                    </span>
+                  )}
+                  {sweepFilter && (
+                    <span className="flex items-center gap-1 text-ui-sm bg-amber-950/40 border border-amber-900/50 text-amber-300 px-2 py-0.5 rounded font-mono">
+                      sweep: {sweepFilter.slice(0, 8)}…
+                      {/* reason: clear-sweep-filter chip control; w-2.5 h-2.5 icon inline in chip */}
+                      <button data-viewport-allow-small-target onClick={() => setFilter('sweepFilter', null)} className="text-amber-500 hover:text-amber-200"><X className="w-2.5 h-2.5" /></button>
                     </span>
                   )}
                 </div>
@@ -759,6 +742,15 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                         onClick={e => { e.stopPropagation(); setFilter('topicFilter', doc.topic ?? null); }}
                         className="text-ui-xs px-1.5 py-0.5 rounded bg-violet-950/40 text-violet-300 hover:bg-violet-900/40 transition-colors"
                       >{doc.topic}</button>
+                    )}
+                    {doc.sweep_id && (
+                      // reason: sweep filter chip in compact card footer; text-ui-xs inline control
+                      <button
+                        data-viewport-allow-small-target
+                        onClick={e => { e.stopPropagation(); setFilter('sweepFilter', doc.sweep_id ?? null); }}
+                        className="text-ui-xs px-1.5 py-0.5 rounded bg-amber-950/40 text-amber-300 hover:bg-amber-900/40 transition-colors font-mono"
+                        title={`Sweep ${doc.sweep_id}${doc.arm_label ? ` / ${doc.arm_label}` : ' (aggregate)'}`}
+                      >{doc.sweep_id.slice(0, 8)}…{doc.arm_label ? ` / ${doc.arm_label}` : ' agg'}</button>
                     )}
                     {(doc.tags ?? []).slice(0, 4).map(t => (
                       // reason: tag filter chip in compact card footer; text-ui-xs inline control

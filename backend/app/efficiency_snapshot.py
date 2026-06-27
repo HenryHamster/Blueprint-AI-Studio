@@ -2004,6 +2004,27 @@ def compute_recommended_challenger_sample_rate(
     }
 
 
+def assess_post_deploy_gate_health(
+    panel_review_effectiveness_post_deploy: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Assess gate health for a post-deployment time window.
+
+    Computes the gate health verdict for tasks completed after a deployment
+    boundary. Used by the strategist and operator dashboard to validate that
+    the deployed version meets the ≤5% fail-open health threshold.
+
+    Returns the gate health verdict dict with state, fail_open_rate,
+    total_invocations, and min_sample fields. State will be:
+    - NO_DATA: no gate invocations post-deploy.
+    - DEGRADED: ≥5% fail-open (takes priority).
+    - INSUFFICIENT: <30 invocations (too few to certify).
+    - LOW_COVERAGE: <50% effective coverage with sufficient invocations.
+    - PARTIAL: 1-5% fail-open with sufficient invocations.
+    - HEALTHY: <1% fail-open with ≥30 invocations and ≥50% coverage.
+    """
+    return compute_gate_health_verdict(panel_review_effectiveness_post_deploy)
+
+
 def _find_agent_src() -> str | None:
     """Locate the agent/src directory for prompt.ts static-size introspection.
 

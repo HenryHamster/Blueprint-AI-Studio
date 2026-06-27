@@ -2400,6 +2400,58 @@ async def _persist_compute_experiment_knowledge_best_effort(
     return True
 
 
+async def _stamp_compute_terminal_diagnostics(
+    session: AsyncSession,
+    task: "Task",
+    logs: str,
+) -> None:
+    """Load the owning compute job, extract terminal diagnostics, classify, and persist.
+
+    Called from both pre-metric failure branches in
+    _handle_compute_experiment_completion.  Stamps:
+    - task.context["failure_category"] via persist_failure_category
+    - task.context["compute_terminal_diagnostics"] with the typed reason/phase/etc.
+    - task.latest_status_message with a human-readable terminal_reason summary
+
+    Never raises — a missing job or classification error must not block the
+    FAILED finalization.
+    """
+    from app.failure_classification import (  # noqa: PLC0415
+        classify_compute_terminal_reason,
+        persist_failure_category,
+    )
+    from app.knowledge_completion import _extract_job_terminal_diagnostics  # noqa: PLC0415
+
+    try:
+        job_id = _extract_compute_job_id(logs)
+        job = None
+        if job_id:
+            job = await get_compute_job_for_task(
+                session, job_id=job_id, task_id=task.id
+            )
+        diag = _extract_job_terminal_diagnostics(job)
+        terminal_reason = (diag or {}).get("terminal_reason") if diag else None
+        vm_phase = (diag or {}).get("vm_phase") if diag else None
+        failure_class = classify_compute_terminal_reason(terminal_reason, vm_phase)
+        persist_failure_category(task, failure_class)
+        if diag:
+            ctx = dict(task.context or {})
+            ctx["compute_terminal_diagnostics"] = diag
+            task.context = ctx
+            flag_modified(task, "context")
+        if terminal_reason:
+            phase_label = f" ({vm_phase})" if vm_phase else ""
+            task.latest_status_message = (
+                f"Compute job failed{phase_label}: {terminal_reason}"
+            )[:500]
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPUTE] Failed to stamp terminal diagnostics for task %s",
+            task.id,
+            exc_info=True,
+        )
+
+
 async def _finalize_compute_experiment(
     session: AsyncSession,
     task: Task,
@@ -3216,6 +3268,36 @@ async def _handle_compute_experiment_completion(
         task.context = crit_context
         flag_modified(task, "context")
 
+    # Fast-path: SMOKE_FAILED must never reach the gate as a "measured" result.
+    # _extract_compute_measurement returns ("SMOKE_FAILED", 0.0) for a zero-cost
+    # smoke-failed job — which would incorrectly pass the gate.  Intercept here
+    # and route to the failure path before the gate logic runs.
+    _early_meas = _extract_compute_measurement(logs)
+    if _early_meas is not None and _early_meas[0] == "SMOKE_FAILED":
+        from app.failure_classification import (  # noqa: PLC0415
+            COMPUTE_PREFLIGHT_SMOKE_FAILED,
+            persist_failure_category,
+        )
+
+        _smoke_reason = (
+            "compute_preflight_smoke_failed: command failed pre-flight smoke "
+            "on the DB-less substrate — no full VM was provisioned"
+        )
+        record_failed_gate(
+            task,
+            EvaluationVerdict(False, _smoke_reason, "compute-preflight-smoke"),
+        )
+        persist_failure_category(task, COMPUTE_PREFLIGHT_SMOKE_FAILED)
+        logger.info(
+            "[COMPUTE] Task %s FAILED at pre-flight smoke (no full VM provisioned)",
+            task.id,
+        )
+        await _spawn_act_on_verdict_followon(session, task, {}, logs, failure_mode=True)
+        await _finalize_compute_experiment(
+            session, task, TaskStatus.FAILED, logs, criterion, owns_commit=owns_commit
+        )
+        return
+
     acceptance_evidence = read_acceptance_evidence(task.first_payload)
     requires_durable_artifact = bool(
         (task.first_payload or {}).get("require_durable_artifact")
@@ -3232,6 +3314,7 @@ async def _handle_compute_experiment_completion(
         measurement = _extract_compute_measurement(logs)
         if measurement is None:
             record_failed_gate(task, verdict)
+            await _stamp_compute_terminal_diagnostics(session, task, logs)
             logger.info(
                 "[COMPUTE] Prerequisite-mode task %s produced no measured verdict: %s",
                 task.id,
@@ -3310,6 +3393,7 @@ async def _handle_compute_experiment_completion(
 
     if not verdict.passed:
         record_failed_gate(task, verdict)
+        await _stamp_compute_terminal_diagnostics(session, task, logs)
         logger.info(
             "[COMPUTE] Task %s did not clear the artifact-delivery gate: %s",
             task.id,

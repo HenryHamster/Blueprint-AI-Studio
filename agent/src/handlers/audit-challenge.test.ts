@@ -471,6 +471,49 @@ describe('handleReleaseAuditChallenge — pinned candidate + diff-range pre-flig
     expect(call.failure_category).toBe('diff_range_unresolvable');
   });
 
+  it('RETRIES a transient candidate fetch and proceeds once it succeeds', async () => {
+    // A single transient blip on `git fetch origin <sha>` must NOT torch the
+    // qualification attempt: the fetch retries and the challenge runs.
+    let fetchAttempts = 0;
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (Array.isArray(a) && a[0] === 'fetch') {
+        fetchAttempts += 1;
+        if (fetchAttempts < 2) throw new Error('fatal: could not read from remote repository');
+      }
+      return Buffer.from('');
+    });
+
+    await handleReleaseAuditChallenge(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(fetchAttempts).toBe(2); // retried once, then succeeded
+    expect(vi.mocked(runClaudeCode)).toHaveBeenCalledTimes(1);
+    const failedCall = vi.mocked(persistAndPostStatus).mock.calls.find(
+      c => c[1].failure_category === 'diff_range_unresolvable',
+    );
+    expect(failedCall).toBeUndefined();
+  });
+
+  it('attempts the candidate fetch 3 times before failing loud (retries exhausted)', async () => {
+    let fetchAttempts = 0;
+    vi.mocked(execFileSync).mockImplementation((_cmd: unknown, args: unknown) => {
+      const a = args as string[];
+      if (Array.isArray(a) && a[0] === 'fetch') {
+        fetchAttempts += 1;
+        throw new Error('network down');
+      }
+      return Buffer.from('');
+    });
+
+    await handleReleaseAuditChallenge(TASK_ID, RELEASE_PAYLOAD, BASE_TASK, GH_TOKEN, OWNER, REPO, WS, STATUS_REF());
+
+    expect(fetchAttempts).toBe(3);
+    expect(vi.mocked(runClaudeCode)).not.toHaveBeenCalled();
+    const call = vi.mocked(persistAndPostStatus).mock.calls[0][1];
+    expect(call.status).toBe('FAILED');
+    expect(call.failure_category).toBe('diff_range_unresolvable');
+  });
+
   it('emits a normalized RELEASE_AUDIT_CHALLENGE artifact on success, pinning the SHA', async () => {
     // LLM wrote a wrong SHA + an out-of-enum verdict; the handler normalizes both.
     vi.mocked(readHandlerOutput).mockReturnValue({

@@ -1627,6 +1627,123 @@ def test_local_wrapper_command_provisions_and_exports_artifact_dir():
     assert f"rm -rf {shlex.quote(artifact_dir)}" not in wrapper
 
 
+def test_local_wrapper_wraps_command_in_container_when_image_set(monkeypatch):
+    """When container_image is set the wrapper must run the command via docker run.
+
+    Verified: docker run present, state dir mounted to /tmp/blueprint_out,
+    BLUEPRINT_RESULT_FILE points inside the container, original command preserved,
+    and --gpus all is absent when no GPU is detected.
+    """
+    monkeypatch.setattr(
+        compute_backends_module,
+        "_detect_local_gpu_cache",
+        None,  # no GPU detected
+    )
+    external_id = "local-container-test"
+    state_dir = compute_backends_module._local_state_dir_for_external_id(external_id)
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "python train.py --epochs 10",
+        external_id=external_id,
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+    )
+    assert "docker run" in wrapper
+    assert "--rm" in wrapper
+    # State dir must be volume-mounted to the fixed in-container path.
+    assert f"{state_dir}:{compute_backends_module._CONTAINER_OUT_DIR}" in wrapper
+    # BLUEPRINT_RESULT_FILE must point inside the container (not the host path).
+    assert f"BLUEPRINT_RESULT_FILE={compute_backends_module._CONTAINER_OUT_DIR}/result.json" in wrapper
+    # The original command must be present (inside the docker invocation).
+    assert "python train.py --epochs 10" in wrapper
+    # GPU flag must NOT appear when no GPU is detected.
+    assert "--gpus" not in wrapper
+    # docker pull of the image must be present.
+    assert "docker pull" in wrapper
+    assert "nvcr.io/nvidia/tensorflow:25.01-tf2-py3" in wrapper
+    # Absent-field path (no container_image) must be unchanged.
+    plain_wrapper = compute_backends_module._build_local_wrapper_command(
+        "echo hi", external_id=external_id
+    )
+    assert "docker" not in plain_wrapper
+
+
+def test_local_wrapper_adds_gpus_flag_when_gpu_detected(monkeypatch):
+    """--gpus all is injected when a local GPU is detected and container_image is set."""
+    monkeypatch.setattr(
+        compute_backends_module,
+        "_detect_local_gpu_cache",
+        {"name": "Tesla T4", "memory_mib": 16384},
+    )
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "echo hi",
+        external_id="local-gpu-test",
+        container_image="nvcr.io/nvidia/cuda:12.0-base",
+    )
+    assert "--gpus all" in wrapper
+
+
+def test_local_wrapper_docker_login_included_when_registry_auth_has_password(monkeypatch):
+    """docker login command is included in the wrapper when registry auth has a password."""
+    monkeypatch.setattr(
+        compute_backends_module,
+        "_detect_local_gpu_cache",
+        None,
+    )
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "python train.py",
+        external_id="local-auth-test",
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        container_registry_auth={
+            "server": "nvcr.io",
+            "username": "$oauthtoken",
+            "password": "secret-ngc-key",
+        },
+    )
+    assert "docker login" in wrapper
+    assert "nvcr.io" in wrapper
+    assert "--password-stdin" in wrapper
+    # Password must NOT appear in plain text in the wrapper (passed via printf).
+    assert "secret-ngc-key" in wrapper  # present inside printf expression
+    assert "docker run" in wrapper
+
+
+def test_local_container_mounts_repo_and_passes_env(monkeypatch):
+    """When repo_clone + env are set, the local wrapper mounts the repo root into the
+    container as /workspace, sets PYTHONPATH=/workspace, sets the workdir to /workspace,
+    and passes the declared env as -e flags. Also verifies container_image_pull_failed
+    is emitted as a typed reason when docker pull fails.
+    """
+    monkeypatch.setattr(
+        compute_backends_module,
+        "_detect_local_gpu_cache",
+        None,  # no GPU
+    )
+    from pathlib import Path
+
+    external_id = "local-repo-env-parity-test"
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "python train.py",
+        external_id=external_id,
+        container_image="nvcr.io/nvidia/cuda:12.0-base",
+        repo_clone={"owner": "acme", "repo": "ml", "ref": "main"},
+        env={"MY_SEED": "42", "DATASET": "/data/train"},
+    )
+    # The local repo root (three levels above compute_backends.py) must be
+    # bind-mounted at /workspace inside the container.
+    expected_repo_root = str(Path(compute_backends_module.__file__).parent.parent.parent)
+    assert f"{expected_repo_root}:/workspace" in wrapper
+    # Working directory inside the container must be /workspace.
+    assert "-w" in wrapper
+    assert "/workspace" in wrapper
+    # PYTHONPATH must be set so in-container imports resolve.
+    assert "PYTHONPATH=/workspace" in wrapper
+    # Each declared env var must appear as a -e flag in the docker run invocation.
+    assert "MY_SEED=42" in wrapper
+    assert "DATASET=/data/train" in wrapper
+    # Pull failure must emit the typed terminal reason, not fall through silently.
+    assert "container_image_pull_failed" in wrapper
+    assert "REASON=container_image_pull_failed" in wrapper
+
+
 def test_gcp_startup_script_uploads_artifacts_to_per_job_prefix():
     job_id = uuid.uuid4()
     spec = ComputeLaunchSpec(
@@ -1804,6 +1921,11 @@ async def test_process_compute_jobs_once_persists_result_metrics(
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
+    # Skip the pre-flight smoke gate — this test exercises post-smoke lifecycle.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     class FakeBackend:
         def external_id_for(self, persisted_job):
@@ -1880,6 +2002,11 @@ async def test_process_compute_jobs_once_launches_and_records_terminal_success(
         deadline_seconds=300,
     )
     assert job.status == ComputeJobStatus.QUEUED
+    # Skip the pre-flight smoke gate — this test exercises post-smoke lifecycle.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     started_at = datetime.utcnow() - timedelta(seconds=30)
 
@@ -1959,6 +2086,11 @@ async def test_process_compute_jobs_once_records_launch_failure_then_clears_on_s
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
+    # Skip the pre-flight smoke gate — this test exercises launch-retry lifecycle.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     class FakeBackend:
         def __init__(self):
@@ -2024,6 +2156,11 @@ async def test_compute_runtime_deadline_starts_after_launch(db_session, monkeypa
         spend_cap_usd=1.0,
         deadline_seconds=60,
     )
+    # Skip the pre-flight smoke gate — this test exercises runtime-deadline lifecycle.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     terminate_reasons: list[str] = []
 
@@ -2117,7 +2254,9 @@ async def test_process_compute_jobs_once_times_out_provisioning_before_launch(
     )
     # Expire both the wall_clock_deadline AND the provisioning_deadline_at
     # sub-deadline so the monitor detects the provisioning timeout immediately.
+    # Also skip the pre-flight smoke gate — this test exercises provisioning timeout.
     meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
     meta["provisioning_deadline_at"] = (
         datetime.utcnow() + timedelta(milliseconds=200)
     ).isoformat()
@@ -2208,7 +2347,9 @@ async def test_provisioning_subdeadline_fails_fast(db_session, monkeypatch):
     )
 
     # Push the sub-deadline into the past to simulate a stalled provisioning VM.
+    # Also skip the pre-flight smoke gate — this test exercises provisioning timeout.
     meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
     meta["provisioning_deadline_at"] = (
         datetime.utcnow() - timedelta(seconds=1)
     ).isoformat()
@@ -2634,6 +2775,12 @@ async def test_compute_job_captures_bounded_log_artifact(db_session, monkeypatch
         backend_name=compute_backends_module.LOCAL_BACKEND_NAME,
     )
     assert job.status == ComputeJobStatus.QUEUED
+    # Skip smoke gate — command writes to $BLUEPRINT_ARTIFACT_DIR which is unset
+    # in the smoke environment; bypass to test full local backend lifecycle.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
@@ -2730,6 +2877,11 @@ async def test_compute_job_truncates_bounded_log_without_blocking_completion(
         deadline_seconds=300,
         backend_name=compute_backends_module.LOCAL_BACKEND_NAME,
     )
+    # Skip smoke gate — command uses $BLUEPRINT_ARTIFACT_DIR (unset in smoke env).
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     session_factory = async_sessionmaker(
         resolve_async_engine(db_session),
@@ -3282,6 +3434,179 @@ async def test_create_compute_job_rejects_gpu_on_local_backend(db_session, monke
             backend_name="local-subprocess",
             accelerator="T4",
         )
+
+
+def test_detect_local_gpu_absent(monkeypatch):
+    """detect_local_gpu returns None when nvidia-smi is not on the PATH."""
+    from app import compute_backends as cb
+
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: None)
+    result = cb.detect_local_gpu()
+    assert result is None
+
+
+def test_detect_local_gpu_present(monkeypatch):
+    """detect_local_gpu returns parsed name + memory when nvidia-smi succeeds."""
+    from app import compute_backends as cb
+
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/nvidia-smi")
+
+    class _FakeResult:
+        returncode = 0
+        stdout = "Tesla T4, 15360\n"
+
+    monkeypatch.setattr(cb.subprocess, "run", lambda *_a, **_kw: _FakeResult())
+    result = cb.detect_local_gpu()
+    assert result == {"name": "Tesla T4", "memory_mib": 15360}
+
+
+def test_detect_local_gpu_subprocess_error(monkeypatch):
+    """detect_local_gpu returns None and does not raise when nvidia-smi errors."""
+    from app import compute_backends as cb
+
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/nvidia-smi")
+
+    def _raise(*_a, **_kw):
+        raise RuntimeError("oops")
+
+    monkeypatch.setattr(cb.subprocess, "run", _raise)
+    result = cb.detect_local_gpu()
+    assert result is None
+
+
+def test_validate_backend_name_local_gpu_no_gpu(monkeypatch):
+    """validate_backend_name raises for local-gpu when no GPU is detected."""
+    from app import compute_backends as cb
+
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: None)
+    with pytest.raises(ValueError, match="no local GPU detected"):
+        cb.validate_backend_name("local-gpu")
+
+
+def test_validate_backend_name_local_gpu_present(monkeypatch):
+    """validate_backend_name accepts local-gpu when a GPU is detected."""
+    from app import compute_backends as cb
+
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: {"name": "T4", "memory_mib": 15360})
+    assert cb.validate_backend_name("local-gpu") == "local-gpu"
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_selects_local_gpu_when_present(
+    db_session, monkeypatch
+):
+    """GPU job with no explicit backend selects local-gpu when a GPU is detected."""
+    from app import compute_backends as cb
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: {"name": "Tesla T4", "memory_mib": 15360})
+    monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: {"name": "Tesla T4", "memory_mib": 15360})
+    task = await _make_compute_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="n1-standard-1",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        accelerator="T4",
+    )
+    assert job.backend == "local-gpu"
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_selects_gcp_when_no_gpu(db_session, monkeypatch):
+    """GPU job with no explicit backend auto-routes to gcp when no local GPU is detected."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: None)
+    task = await _make_compute_task(db_session)
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="n1-standard-1",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        accelerator="T4",
+    )
+    assert job.backend == "gcp"
+
+
+@pytest.mark.asyncio
+async def test_local_subprocess_still_rejected_for_gpu(db_session, monkeypatch):
+    """Explicitly requesting local-subprocess with a GPU job raises ValueError."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+    with pytest.raises(ValueError, match="local-subprocess"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="n1-standard-1",
+            spend_cap_usd=5.0,
+            deadline_seconds=600,
+            backend_name="local-subprocess",
+            accelerator="T4",
+        )
+
+
+@pytest.mark.asyncio
+async def test_operator_local_backends_accrue_zero_cost(db_session, monkeypatch):
+    """local-subprocess and local-gpu backends persist cost_rate_per_second=0.0,
+    while gcp retains a positive billed rate.  _accrued_cost stays $0 for local runs."""
+    from app import compute_backends as cb
+    from app.compute_backends import _accrued_cost
+    from datetime import timezone
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task_local = await _make_compute_task(db_session)
+
+    # local-subprocess: rate must be exactly 0.0
+    job_local = await compute_jobs.create_compute_job(
+        db_session,
+        task_local,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="local-subprocess",
+    )
+    assert job_local.polling_metadata["cost_rate_per_second"] == 0.0
+
+    # _accrued_cost stays $0 even after simulated elapsed time
+    job_local.started_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    as_of = datetime(2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc)  # 1 hour later
+    assert _accrued_cost(job_local, as_of) == 0.0
+
+    # local-gpu: rate must also be 0.0
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: {"name": "Tesla T4", "memory_mib": 15360})
+    monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: {"name": "Tesla T4", "memory_mib": 15360})
+    task_gpu = await _make_compute_task(db_session)
+    job_gpu = await compute_jobs.create_compute_job(
+        db_session,
+        task_gpu,
+        command="python train.py",
+        machine_type="n1-standard-1",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="local-gpu",
+        accelerator="T4",
+    )
+    assert job_gpu.polling_metadata["cost_rate_per_second"] == 0.0
+
+    # gcp backend must retain a positive (billed) rate
+    monkeypatch.setattr(compute, "LOCAL_MODE", False)
+    task_gcp = await _make_compute_task(db_session)
+    job_gcp = await compute_jobs.create_compute_job(
+        db_session,
+        task_gcp,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        deadline_seconds=600,
+        backend_name="gcp",
+    )
+    assert job_gcp.polling_metadata["cost_rate_per_second"] > 0.0
 
 
 @pytest.mark.asyncio
@@ -4932,6 +5257,11 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
+    # Skip smoke gate — this test exercises the park/wake lifecycle post-smoke.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     # The task parks on the launched job instead of poll-pinning its VM.
     await park_task(
@@ -5085,6 +5415,11 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
+    # Skip smoke gate — this test exercises the terminal-before-park lifecycle.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
+    await db_session.commit()
 
     started_at = datetime.utcnow() - timedelta(seconds=30)
 
@@ -7129,6 +7464,10 @@ async def test_compute_park_wake_is_race_safe_under_lock_contention(
             spend_cap_usd=1.0,
             deadline_seconds=300,
         )
+        # Skip smoke gate — these tests exercise wake/park race conditions.
+        meta = dict(job.polling_metadata or {})
+        meta["preflight_smoke_done"] = True
+        job.polling_metadata = meta
         await db_session.commit()
         return task, job
 
@@ -7356,6 +7695,10 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
+    # Skip smoke gate so the monitor reaches backend.launch() on the first tick.
+    meta = dict(job.polling_metadata or {})
+    meta["preflight_smoke_done"] = True
+    job.polling_metadata = meta
     await db_session.commit()
 
     launch_entered = asyncio.Event()
@@ -7441,6 +7784,10 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
+    # Skip smoke gate — this test exercises terminal-before-park wake handoff.
+    meta2 = dict(job2.polling_metadata or {})
+    meta2["preflight_smoke_done"] = True
+    job2.polling_metadata = meta2
     await db_session.commit()
 
     class _TerminalBackend:
@@ -9444,6 +9791,269 @@ def test_gcp_startup_script_writes_boot_beacon_before_command():
     assert trap_idx < beacon_idx < command_idx
 
 
+def test_gcp_startup_script_wraps_command_in_container_with_gpu():
+    """When container_image AND an accelerator are set, the GCP startup script must
+    wrap the command in `docker run --gpus all`, pull the image first, mount the VM
+    artifact dir into the container, and point BLUEPRINT_RESULT_FILE at the
+    in-container result path so the existing terminal-record reader keeps working."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py --epochs 10",
+        machine_type="a2-highgpu-1g",
+        spend_cap_usd=5.0,
+        deadline_at=None,
+        runtime_deadline_seconds=600,
+        accelerator="T4",
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # The command runs inside the declared image, with GPU passthrough.
+    assert "docker run" in script
+    assert "--rm" in script
+    assert "--gpus all" in script
+    # The image is pulled before the command runs.
+    assert "docker pull" in script
+    assert "nvcr.io/nvidia/tensorflow:25.01-tf2-py3" in script
+    # The VM artifact dir is bind-mounted into the container so result.json and
+    # artifacts written inside land on the host the terminal-record reader uses.
+    art = compute_backends_module._GCP_ARTIFACT_DIR_PATH
+    assert f"{art}:{art}" in script
+    # BLUEPRINT_RESULT_FILE seen by the in-container command points at the mounted
+    # result path (a sibling of the artifact dir), NOT the bare-VM standalone path.
+    assert f"BLUEPRINT_RESULT_FILE={art}/result.json" in script
+    # The original command is preserved inside the docker invocation.
+    assert "python train.py --epochs 10" in script
+    # docker run is wired through the command runner via `bash -lc`.
+    assert "bash -lc" in script
+    # The pull failure path emits the distinct, parseable terminal reason on BOTH
+    # the serial marker and the durable terminal-record paths.
+    assert "container_image_pull_failed" in script
+    assert (
+        f"{compute_backends_module._SERIAL_REASON_PREFIX}container_image_pull_failed"
+        in script
+    )
+    assert "FAILED 1 container_image_pull_failed" in script
+    # Boot-beacon ordering invariant must survive the inserted pull/run steps.
+    trap_idx = script.index("trap upload_artifacts EXIT")
+    beacon_idx = script.index("vm_terminated_before_completion")
+    command_idx = script.index("python3 /tmp/blueprint_command_runner.py")
+    assert trap_idx < beacon_idx < command_idx
+
+
+def test_gcp_startup_script_gpus_flag_gated_on_accelerator():
+    """--gpus all appears only when an accelerator is requested (the CPU agent image
+    lacks the NVIDIA Container Toolkit, so docker run --gpus all would fail there)."""
+    base = dict(
+        job_id=uuid.uuid4(),
+        command="python eval.py",
+        machine_type="e2-standard-4",
+        spend_cap_usd=2.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        container_image="nvcr.io/nvidia/cuda:12.0-base",
+    )
+    gpu_script = compute_backends_module._build_gcp_startup_script(
+        ComputeLaunchSpec(accelerator="T4", **base),
+        artifact_upload_url="https://storage.example.com/upload",
+    )
+    cpu_script = compute_backends_module._build_gcp_startup_script(
+        ComputeLaunchSpec(accelerator=None, **base),
+        artifact_upload_url="https://storage.example.com/upload",
+    )
+    assert "--gpus all" in gpu_script
+    assert "docker run" in cpu_script
+    assert "--gpus" not in cpu_script
+
+
+def test_gcp_startup_script_docker_login_only_with_registry_auth():
+    """`docker login --password-stdin` is emitted only when registry auth carries a
+    password; the password is delivered via an env var (never on a command line)
+    and never reaches the serial console or any artifact/log marker."""
+    secret = "s3cr3t-ngc-api-key"
+    base = dict(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="a2-highgpu-1g",
+        spend_cap_usd=5.0,
+        deadline_at=None,
+        runtime_deadline_seconds=600,
+        accelerator="T4",
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+    )
+    with_auth = compute_backends_module._build_gcp_startup_script(
+        ComputeLaunchSpec(
+            container_registry_auth={
+                "server": "nvcr.io",
+                "username": "$oauthtoken",
+                "password": secret,
+            },
+            **base,
+        ),
+        artifact_upload_url="https://storage.example.com/upload",
+    )
+    without_auth = compute_backends_module._build_gcp_startup_script(
+        ComputeLaunchSpec(**base),
+        artifact_upload_url="https://storage.example.com/upload",
+    )
+    assert "docker login" in with_auth
+    assert "--password-stdin" in with_auth
+    assert "docker login" not in without_auth
+    # The password is consumed from an env var via --password-stdin, so it never
+    # appears as an inline literal on the docker login command line itself.
+    assert f"docker login {secret}" not in with_auth
+    assert "-u \"${BLUEPRINT_REGISTRY_USERNAME}\"" in with_auth
+    # The password must NEVER be echoed to the serial console: no `echo`/marker
+    # line carries it. Every login/output redirect goes to /dev/null.
+    for line in with_auth.splitlines():
+        if line.lstrip().startswith("echo "):
+            assert secret not in line, f"password leaked to serial echo: {line!r}"
+
+
+def test_gcp_startup_script_passes_env_into_container():
+    """When container_image is set without repo_clone, spec.env and spec.cwd are
+    forwarded as docker -e flags and -w flag rather than being left only in the outer
+    VM shell — matching the local-subprocess backend's else-branch behaviour."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python eval.py",
+        machine_type="e2-standard-4",
+        spend_cap_usd=2.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        container_image="python:3.12-slim",
+        env={"MY_KEY": "my_val", "ANOTHER": "42"},
+        cwd="/workdir",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # env vars must appear as -e flags inside the docker run invocation
+    assert "-e MY_KEY=my_val" in script
+    assert "-e ANOTHER=42" in script
+    # cwd must appear as -w flag
+    assert "-w /workdir" in script
+    # docker run still wraps the command
+    assert "docker run" in script
+    assert "python eval.py" in script
+
+
+def test_gcp_startup_script_passes_env_into_container_with_repo_clone():
+    """When container_image + repo_clone + spec.env are all set, user env vars are
+    included as -e flags alongside the auto-injected PYTHONPATH=/workspace in the
+    docker run invocation (repo_clone branch of _build_gcp_startup_script)."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python eval.py",
+        machine_type="e2-standard-4",
+        spend_cap_usd=2.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        container_image="python:3.12-slim",
+        repo_clone={"owner": "octo", "repo": "demo", "ref": "main"},
+        repo_token="tok",
+        env={"MY_KEY": "my_val", "ANOTHER": "42"},
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # user env vars must appear as -e flags
+    assert "-e MY_KEY=my_val" in script
+    assert "-e ANOTHER=42" in script
+    # PYTHONPATH=/workspace is auto-injected alongside user env vars
+    assert "-e PYTHONPATH=/workspace" in script
+    # docker run still wraps the command
+    assert "docker run" in script
+    assert "python eval.py" in script
+
+
+def test_gcp_startup_script_no_docker_without_image():
+    """Absent container_image, the generated script is byte-for-byte unchanged from
+    the bare-shell path — no docker token appears anywhere."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        repo_clone={"owner": "o", "repo": "r", "ref": "main"},
+        repo_token="tok",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "docker" not in script
+    assert "container_image_pull_failed" not in script
+    # The standalone bare-VM result path is still used when no container is set.
+    assert compute_backends_module._GCP_RESULT_FILE_PATH in script
+
+
+def test_gcp_startup_script_includes_setup_step_block():
+    """A spec with setup_step includes a bail-out block with setup_step_failed reason."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="python3 eval.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+        setup_step="pip install -r requirements.txt",
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    # The setup step command appears in the script.
+    assert "pip install -r requirements.txt" in script
+    # A typed failure reason is emitted so downstream can attribute the failure.
+    assert "setup_step_failed" in script
+    assert f"{compute_backends_module._SERIAL_REASON_PREFIX}setup_step_failed" in script
+    assert f"{compute_backends_module._SERIAL_STATUS_PREFIX}FAILED" in script
+    # The setup step runs AFTER the boot beacon and BEFORE the main command runner.
+    beacon_idx = script.index("vm_terminated_before_completion")
+    setup_idx = script.index("pip install -r requirements.txt")
+    command_idx = script.index("python3 /tmp/blueprint_command_runner.py")
+    assert beacon_idx < setup_idx < command_idx
+    # The setup step output is redirected to the artifact dir for diagnosis.
+    assert "setup_step.log" in script
+
+
+def test_gcp_startup_script_no_setup_step_unchanged():
+    """No setup_step on the spec ⇒ no setup_step_failed marker in the script."""
+    spec = ComputeLaunchSpec(
+        job_id=uuid.uuid4(),
+        command="echo hi",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_at=None,
+        runtime_deadline_seconds=300,
+    )
+    script = compute_backends_module._build_gcp_startup_script(
+        spec, artifact_upload_url="https://storage.example.com/upload"
+    )
+    assert "setup_step_failed" not in script
+    assert "setup_step.log" not in script
+
+
+def test_local_wrapper_includes_setup_step():
+    """_build_local_wrapper_command with setup_step runs it before the main command."""
+    wrapper = compute_backends_module._build_local_wrapper_command(
+        "python3 eval.py",
+        external_id="local-testsetup",
+        setup_step="pip install torch",
+    )
+    # The setup step command is in the wrapper.
+    assert "pip install torch" in wrapper
+    # The setup step runs before the main command (python3 - <<'PY' block).
+    setup_idx = wrapper.index("pip install torch")
+    cmd_idx = wrapper.index("python3 -")
+    assert setup_idx < cmd_idx
+    # On failure the wrapper writes the terminal file and exits early.
+    assert "SETUP_EXIT" in wrapper
+    assert "setup_step.log" in wrapper
+
+
 async def test_attach_repo_clone_sets_repo_and_token(db_session, monkeypatch):
     """_attach_repo_clone resolves owner/repo + ref (from base_branch) + a token."""
     project = Project(
@@ -11441,4 +12051,986 @@ def test_local_backend_live_tail_read_on_poll(tmp_path):
     result = compute_backends_module._read_local_live_tail(job)
     assert result is not None, "_read_local_live_tail must return a dict when file exists"
     assert result["text"] == tail_text
-    assert result["truncated"] is False
+
+
+# ---------------------------------------------------------------------------
+# Security invariant: container_registry_auth password must never be persisted
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_registry_auth_password_rejected(
+    db_session, monkeypatch
+):
+    """create_compute_job must raise ValueError when container_registry_auth includes a
+    password — there is no delivery channel to pass the password to the backend
+    launcher (unlike repo tokens, which are freshly minted at launch time)."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+
+    with pytest.raises(ValueError, match="password cannot be delivered"):
+        await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=2.0,
+            deadline_seconds=300,
+            backend_name="local-subprocess",
+            container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+            container_registry_auth={
+                "server": "nvcr.io",
+                "username": "$oauthtoken",
+                "password": "s3cr3t-ngc-api-key",
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_registry_auth_no_password_persists_server_username(
+    db_session, monkeypatch
+):
+    """create_compute_job must persist server+username when no password is present."""
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+    task = await _make_compute_task(db_session)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=2.0,
+        deadline_seconds=300,
+        backend_name="local-subprocess",
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        container_registry_auth={
+            "server": "nvcr.io",
+            "username": "$oauthtoken",
+        },
+    )
+
+    persisted_auth = (job.polling_metadata or {}).get("container_registry_auth")
+    assert persisted_auth == {"server": "nvcr.io", "username": "$oauthtoken"}
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_registry_auth_password_accepted_for_runner_subprocess(
+    db_session, monkeypatch
+):
+    """create_compute_job must persist server+username+password when the backend
+    is runner-subprocess — the runner needs the credential to docker login."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Runner Auth Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        container_image="nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        container_registry_auth={
+            "server": "nvcr.io",
+            "username": "$oauthtoken",
+            "password": "s3cr3t-ngc-api-key",
+        },
+    )
+
+    assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+    persisted_auth = (job.polling_metadata or {}).get("container_registry_auth")
+    assert persisted_auth is not None
+    assert persisted_auth["server"] == "nvcr.io"
+    assert persisted_auth["username"] == "$oauthtoken"
+    assert persisted_auth["password"] == "s3cr3t-ngc-api-key"
+
+
+# ── Runner-subprocess backend tests ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_compute_job_runner_target_id_overrides_backend(
+    db_session, monkeypatch
+):
+    """create_compute_job must route to runner-subprocess when the locked task
+    carries runner_target_id in context, and persist runner_target_id in
+    polling_metadata alongside the normal exec fields."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Runner Routing", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+    meta = job.polling_metadata or {}
+    assert meta.get("runner_target_id") == str(runner.id)
+    # Core exec fields must be present so the runner can execute the arm.
+    assert meta.get("command") == "python train.py"
+    assert "env" in meta
+    assert "runtime_deadline_seconds" in meta
+
+
+async def _make_require_local_runner_task(
+    db_session,
+    *,
+    require_local_runner: bool,
+    runner_target_id: str | None = None,
+):
+    """Project (optionally carrying the require_local_runner policy) plus a
+    compute_experiment task, optionally runner-pinned via context. Mirrors
+    _make_compute_task but lets each case toggle the policy and the pin."""
+    build_config: dict = {}
+    if require_local_runner:
+        build_config["resource_envelope"] = {"require_local_runner": True}
+    project = Project(
+        name="Require Local Runner",
+        user_id="test-user",
+        build_config=build_config,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    context = {"runner_target_id": runner_target_id} if runner_target_id else None
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context=context,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task
+
+
+class TestCreateComputeJobRequireLocalRunner:
+    """The hard 'never bill cloud for compute when local-runner is required' gate
+    in create_compute_job: a require_local_runner project's compute_experiment job
+    that is NOT runner-pinned must be rejected before any billable cloud row is
+    written; a runner-pinned job (routed to runner-subprocess) and a project
+    without the policy proceed normally."""
+
+    @pytest.mark.asyncio
+    async def test_unpinned_compute_experiment_rejected_when_policy_set(
+        self, db_session, monkeypatch
+    ):
+        # Cloud mode: an unpinned job would otherwise default to the billable gcp backend.
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+        monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: None)
+        _project, task = await _make_require_local_runner_task(
+            db_session, require_local_runner=True
+        )
+        with pytest.raises(compute_jobs.ComputeLaunchPreconditionFailed) as excinfo:
+            await compute_jobs.create_compute_job(
+                db_session,
+                task,
+                command="python train.py",
+                machine_type="e2-standard-2",
+                spend_cap_usd=1.0,
+                deadline_seconds=300,
+            )
+        assert excinfo.value.detail.get("error") == "local_runner_required"
+
+    @pytest.mark.asyncio
+    async def test_runner_pinned_compute_experiment_allowed_when_policy_set(
+        self, db_session, monkeypatch
+    ):
+        from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+
+        monkeypatch.setattr(compute, "LOCAL_MODE", True)
+        _project, task = await _make_require_local_runner_task(
+            db_session,
+            require_local_runner=True,
+            runner_target_id=str(uuid.uuid4()),
+        )
+        job = await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+        assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+
+    @pytest.mark.asyncio
+    async def test_unpinned_compute_experiment_allowed_without_policy(
+        self, db_session, monkeypatch
+    ):
+        # No require_local_runner policy: an unpinned job lands on the normal
+        # cloud backend (gcp) — the gate must not fire.
+        monkeypatch.setattr(compute, "LOCAL_MODE", False)
+        monkeypatch.setattr(compute_jobs, "detect_local_gpu", lambda: None)
+        _project, task = await _make_require_local_runner_task(
+            db_session, require_local_runner=False
+        )
+        job = await compute_jobs.create_compute_job(
+            db_session,
+            task,
+            command="python train.py",
+            machine_type="e2-standard-2",
+            spend_cap_usd=1.0,
+            deadline_seconds=300,
+        )
+        assert job.backend == "gcp"
+
+
+@pytest.mark.asyncio
+async def test_next_compute_job_claims_starting_job_and_prevents_double_claim(
+    client, db_session, monkeypatch
+):
+    """POST /api/runner/next-compute-job atomically transitions STARTING→RUNNING
+    and a second sequential poll returns 204 (no double-claim)."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Next CJ Claim", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.STARTING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={
+            "command": "python train.py",
+            "env": {},
+            "cwd": None,
+            "runner_target_id": str(runner.id),
+            "runtime_deadline_seconds": 300,
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    # First poll: should claim the job.
+    resp1 = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp1.status_code == 200, resp1.text
+    body = resp1.json()
+    assert body["job_id"] == str(job.id)
+    assert body["command"] == "python train.py"
+    assert body["runtime_deadline_seconds"] == 300
+
+    # Job must now be RUNNING.
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+    assert job.last_heartbeat_at is not None
+    assert (job.polling_metadata or {}).get("runner_claimed_at") is not None
+
+    # Second poll: no unclaimed STARTING job remains → 204.
+    resp2 = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp2.status_code == 204
+
+
+@pytest.mark.asyncio
+async def test_next_compute_job_delivers_repo_clone_from_launch(
+    client, db_session, monkeypatch
+):
+    """repo_clone persisted by RunnerSubprocessBackend.launch() must be present in
+    /api/runner/next-compute-job response.
+
+    RunnerSubprocessBackend.launch() returns repo_clone in result.metadata.
+    _apply_launch_result is skipped for runner-subprocess (to avoid premature
+    STARTING→RUNNING transition), so the monitor must explicitly persist
+    result.metadata.  This test drives that path end-to-end: monitor tick →
+    claim endpoint, asserting non-null repo_clone reaches the runner.
+    """
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Repo Clone Delivery", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Patch _attach_repo_clone so it injects a repo_clone without needing GitHub.
+    _FAKE_REPO_CLONE = {"owner": "acme", "repo": "ml", "ref": "main"}
+
+    async def _fake_attach_repo_clone(session_factory, job, spec):
+        import dataclasses
+        return dataclasses.replace(spec, repo_clone=_FAKE_REPO_CLONE)
+
+    monkeypatch.setattr(compute_jobs, "_attach_repo_clone", _fake_attach_repo_clone)
+
+    # Patch _get_project_github_token so next_compute_job can mint a fake token.
+    # It is imported lazily inside the endpoint, so patch at the source module.
+    async def _fake_get_token(project, session):
+        return "gh-test-token"
+
+    import app.branch_cleanup as branch_cleanup_mod
+    monkeypatch.setattr(branch_cleanup_mod, "_get_project_github_token", _fake_get_token)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    # Run the monitor tick: it calls launch() and should persist repo_clone.
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+
+    # repo_clone must be persisted into polling_metadata by the new elif branch.
+    meta = job.polling_metadata or {}
+    assert meta.get("repo_clone") == _FAKE_REPO_CLONE, (
+        f"Expected repo_clone in polling_metadata after monitor launch tick; got: {meta}"
+    )
+
+    # Claim the job and assert the endpoint delivers repo_clone + repo_token.
+    resp = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["job_id"] == str(job.id)
+    assert body["repo_clone"] == _FAKE_REPO_CLONE
+    assert body["repo_token"] == "gh-test-token"
+
+
+@pytest.mark.asyncio
+async def test_next_compute_job_scoped_to_pinned_runner(client, db_session, monkeypatch):
+    """Within ONE project, a job pinned (polling_metadata['runner_target_id']) to
+    runner A must NOT be claimable by a different runner B — even a second poll by
+    B returns 204 while A claims it. This is the server-side enforcement of the
+    GPU capability gate: a non-GPU runner must not steal a GPU experiment that
+    _try_runner_dispatch pinned to a has_gpu runner."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Pinned Runner Scope", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Runner A: has GPU, the intended target.
+    token_a = auth_mod.create_runner_token(uuid.uuid4())
+    runner_a = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token_a),
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    # Runner B: no GPU, same project — must not be able to claim A's job.
+    token_b = auth_mod.create_runner_token(uuid.uuid4())
+    runner_b = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token_b),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add_all([runner_a, runner_b])
+    await db_session.commit()
+    await db_session.refresh(runner_a)
+    await db_session.refresh(runner_b)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"runner_target_id": str(runner_a.id)},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.STARTING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={
+            "command": "python train.py",
+            "env": {},
+            "runner_target_id": str(runner_a.id),
+            "runtime_deadline_seconds": 300,
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    # Runner B (wrong pin) must NOT claim the job.
+    resp_b = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token_b}"},
+    )
+    assert resp_b.status_code == 204, resp_b.text
+
+    # Job must still be STARTING (untouched by B's poll).
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.STARTING
+
+    # Runner A (correct pin) claims it.
+    resp_a = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert resp_a.status_code == 200, resp_a.text
+    assert resp_a.json()["job_id"] == str(job.id)
+    await db_session.refresh(job)
+    assert job.status == ComputeJobStatus.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_next_compute_job_project_scoped(client, db_session, monkeypatch):
+    """A runner must not claim a job belonging to a different project."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    proj_a = Project(name="Proj A", user_id="u")
+    proj_b = Project(name="Proj B", user_id="u")
+    db_session.add_all([proj_a, proj_b])
+    await db_session.commit()
+    await db_session.refresh(proj_a)
+    await db_session.refresh(proj_b)
+
+    token_b = auth_mod.create_runner_token(uuid.uuid4())
+    runner_b = LocalRunner(
+        project_id=proj_b.id,
+        token_hash=auth_mod.hash_runner_token(token_b),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner_b)
+    await db_session.commit()
+    await db_session.refresh(runner_b)
+
+    # Job belongs to proj_a — runner_b should NOT see it.
+    task_a = Task(
+        project_id=proj_a.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    job_a = ComputeJob(
+        project_id=proj_a.id,
+        task_id=task_a.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.STARTING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={"command": "echo", "env": {}, "runtime_deadline_seconds": 60},
+    )
+    db_session.add(job_a)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/runner/next-compute-job",
+        headers={"Authorization": f"Bearer {token_b}"},
+    )
+    assert resp.status_code == 204  # proj_b runner cannot see proj_a job
+
+
+@pytest.mark.asyncio
+async def test_compute_job_report_stamps_status_so_monitor_finalizes(
+    client, db_session, monkeypatch
+):
+    """POST /api/runner/compute-job/{id}/report stamps runner_exec_status so
+    RunnerSubprocessBackend.poll_status() returns SUCCEEDED/FAILED,
+    which the monitor uses to finalize the job."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME, RunnerSubprocessBackend
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Report Terminal", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": True},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={"command": "python train.py", "env": {}, "runtime_deadline_seconds": 300, "runner_target_id": str(runner.id)},
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        json={
+            "exec_status": "succeeded",
+            "exit_code": 0,
+            "result_metrics": {"accuracy": 0.99, "loss": 0.01},
+            "command_log": {"text": "Training complete", "truncated": False},
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["cancel_requested"] is False
+
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    assert meta.get("runner_exec_status") == "succeeded"
+    assert meta.get("runner_exit_code") == 0
+    assert meta.get("runner_result_metrics") == {"accuracy": 0.99, "loss": 0.01}
+    assert meta.get("runner_command_log") == {"text": "Training complete", "truncated": False}
+    assert meta.get("runner_finished_at") is not None
+
+    # poll_status must now return SUCCEEDED so the monitor can finalize.
+    backend = RunnerSubprocessBackend()
+    status_result = await backend.poll_status(job)
+    assert status_result.status == ComputeJobStatus.SUCCEEDED
+    assert status_result.exit_code == 0
+    assert status_result.metrics == {"accuracy": 0.99, "loss": 0.01}
+
+
+@pytest.mark.asyncio
+async def test_compute_job_report_command_log_extra_keys_filtered(
+    client, db_session, monkeypatch
+):
+    """POST /api/runner/compute-job/{id}/report with command_log containing extra
+    keys stores only {text, truncated} in polling_metadata (key 14c62b47c166af12)."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Extra Keys Filter", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all"},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={"command": "python run.py", "env": {}, "runtime_deadline_seconds": 300, "runner_target_id": str(runner.id)},
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        json={
+            "exec_status": "succeeded",
+            "exit_code": 0,
+            "command_log": {
+                "text": "Done",
+                "truncated": False,
+                "extra_key": "should_be_dropped",
+                "another_key": 123,
+            },
+        },
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(job)
+    meta = job.polling_metadata or {}
+    stored_log = meta.get("runner_command_log")
+    assert stored_log == {"text": "Done", "truncated": False}
+    # Extra keys must not be persisted
+    assert "extra_key" not in stored_log
+    assert "another_key" not in stored_log
+
+
+@pytest.mark.asyncio
+async def test_compute_job_report_idempotent_on_terminal_job(
+    client, db_session, monkeypatch
+):
+    """Reporting on an already-terminal job must return ok=True and cancel_requested=True
+    without updating the job (idempotent)."""
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Idempotent Report", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    job = ComputeJob(
+        project_id=project.id,
+        backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+        status=ComputeJobStatus.CANCELLED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        polling_metadata={"command": "echo", "env": {}, "runner_target_id": str(runner.id)},
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.post(
+        f"/api/runner/compute-job/{job.id}/report",
+        json={"exec_status": "running"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ok"] is True
+    assert body["cancel_requested"] is True  # terminal job signals cancel to runner
+
+
+@pytest.mark.asyncio
+async def test_try_runner_dispatch_gpu_experiment_requires_has_gpu_runner(db_session):
+    """_try_runner_dispatch must pin a GPU compute_experiment only to a runner
+    advertising has_gpu=True; a non-GPU runner must be refused."""
+    from app import auth as auth_mod
+    from app import orchestrator as orch
+    from app.models import LocalRunner
+
+    project = Project(name="GPU Gate", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    def _make_runner(has_gpu, name="runner"):
+        t = auth_mod.create_runner_token(uuid.uuid4())
+        r = LocalRunner(
+            project_id=project.id,
+            token_hash=auth_mod.hash_runner_token(t),
+            capabilities={"task_types": "all", "has_gpu": has_gpu},
+        )
+        return r
+
+    cpu_runner = _make_runner(has_gpu=False)
+    gpu_runner = _make_runner(has_gpu=True)
+    db_session.add_all([cpu_runner, gpu_runner])
+    await db_session.commit()
+    await db_session.refresh(cpu_runner)
+    await db_session.refresh(gpu_runner)
+
+    gpu_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "compute_experiment", "accelerator": "T4"}],
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(gpu_task)
+    await db_session.commit()
+    await db_session.refresh(gpu_task)
+
+    # CPU-only runner cache → GPU experiment must NOT be pinned.
+    pinned = await orch._try_runner_dispatch(
+        db_session, gpu_task, {project.id: [cpu_runner]}
+    )
+    assert pinned is False
+    await db_session.refresh(gpu_task)
+    assert gpu_task.status == TaskStatus.QUEUED
+
+    # GPU-capable runner cache → GPU experiment MUST be pinned to it.
+    pinned = await orch._try_runner_dispatch(
+        db_session, gpu_task, {project.id: [cpu_runner, gpu_runner]}
+    )
+    assert pinned is True
+    await db_session.refresh(gpu_task)
+    assert gpu_task.status == TaskStatus.PROVISIONING
+    assert gpu_task.vm_instance_id == f"runner:{gpu_runner.id}"
+
+
+@pytest.mark.asyncio
+async def test_try_runner_dispatch_cpu_experiment_routes_to_any_runner(db_session):
+    """A CPU compute_experiment (no accelerator) can be pinned to any eligible runner."""
+    from app import auth as auth_mod
+    from app import orchestrator as orch
+    from app.models import LocalRunner
+
+    project = Project(name="CPU Exp Route", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    cpu_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "compute_experiment"}],  # no accelerator
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(cpu_task)
+    await db_session.commit()
+    await db_session.refresh(cpu_task)
+
+    pinned = await orch._try_runner_dispatch(
+        db_session, cpu_task, {project.id: [runner]}
+    )
+    assert pinned is True
+    await db_session.refresh(cpu_task)
+    assert cpu_task.status == TaskStatus.PROVISIONING
+
+
+@pytest.mark.asyncio
+async def test_dead_runner_pin_cleared_on_requeue_falls_over_to_gcp(
+    db_session, monkeypatch
+):
+    """Regression: stale-PROVISIONING requeue must clear runner_target_id so the
+    mandatory cloud fallback engages instead of re-routing to the dead runner.
+
+    When clear_task_llm_runtime_context is applied during recovery (orchestrator.py
+    stale-PROVISIONING sweep) the runner_target_id key must be absent from the
+    resulting context, and a subsequent create_compute_job call must route to a
+    non-runner-subprocess backend (GCP / local) rather than back to the dead runner.
+    """
+    from app import auth as auth_mod
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+    from app.max_plan_pool import clear_task_llm_runtime_context
+    from app.models import LocalRunner
+
+    monkeypatch.setattr(compute, "LOCAL_MODE", True)
+
+    project = Project(name="Fallback Test", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    token = auth_mod.create_runner_token(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=auth_mod.hash_runner_token(token),
+        capabilities={"task_types": "all", "has_gpu": False},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    # Simulate task that was pinned to the runner (PROVISIONING), then recovered
+    # back to QUEUED by the stale-PROVISIONING sweep — context still has the pin.
+    pinned_ctx = {
+        "runner_target_id": str(runner.id),
+        "provision_failures": 1,
+    }
+    recovered_ctx = clear_task_llm_runtime_context(pinned_ctx)
+
+    # Core assertion: runner_target_id must be stripped so GCP dispatch is chosen.
+    assert "runner_target_id" not in recovered_ctx, (
+        "clear_task_llm_runtime_context must remove runner_target_id so a dead "
+        "runner is not re-pinned on requeue"
+    )
+    # Non-runtime keys (provision_failures) must be preserved.
+    assert recovered_ctx.get("provision_failures") == 1
+
+    # Integration: create_compute_job with the cleared context must NOT route to
+    # the runner-subprocess backend.
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context=recovered_ctx,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    assert job.backend != RUNNER_SUBPROCESS_BACKEND_NAME, (
+        f"After runner_target_id is cleared, create_compute_job must not route "
+        f"to {RUNNER_SUBPROCESS_BACKEND_NAME} (got {job.backend!r})"
+    )

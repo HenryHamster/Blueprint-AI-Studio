@@ -1,10 +1,11 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid } from 'lucide-react';
-import { analyzeComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchKnowledgeDocument, killComputeJob, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type KnowledgeDocument } from '../api';
+import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen } from 'lucide-react';
+import { analyzeComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
 import { asLiveReleaseEvidence } from './ReleaseEvidence.utils';
+import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
 import { formatComputeAnalysisCauseLabel } from '../utils/computeAnalysisLabels';
 import {
   isComputeJobActive,
@@ -15,12 +16,15 @@ import {
   computeJobBurnRate,
   computeJobProjectedSpend,
   computeJobMargin,
+  computeJobExecutionLocation,
   fmtUsd,
   fmtCountdown,
   fmtDuration,
 } from './ComputeJobsPanel.utils';
 
 const POLL_INTERVAL_MS = 10_000;
+
+const DIAGNOSTIC_KEYS = new Set(['exit_code', 'error', 'reason', 'stderr_excerpt', 'label', 'note', 'log', 'elapsed_seconds']);
 
 const WINDOW_OPTIONS: { label: string; minutes: number }[] = [
   { label: '6h', minutes: 360 },
@@ -49,7 +53,7 @@ function bestIndex(values: (number | null)[], dir: MetricDirection): number | nu
     const v = values[i];
     if (v === null) continue;
     if (bi === null) { bi = i; continue; }
-    const bv = values[bi]!;
+    const bv = values[bi] ?? 0;
     if (dir === 'higher_better' ? v > bv : v < bv) bi = i;
   }
   return bi;
@@ -117,6 +121,27 @@ function normalizeArms(arms: unknown): ArmRecord[] | null {
   return records.length > 0 ? records : null;
 }
 
+type ArmVerdict = {
+  winnerName: string;
+  winnerValue: number;
+  runnerUpName: string;
+  runnerUpValue: number;
+  margin: number;
+};
+
+function armComparisonVerdict(arms: ArmRecord[], metricKey: string, direction: MetricDirection): ArmVerdict | null {
+  if (direction === 'unknown') return null;
+  const measured = arms
+    .map((arm) => ({ name: arm.name, value: typeof arm.metrics[metricKey] === 'number' ? arm.metrics[metricKey] as number : null }))
+    .filter((a): a is { name: string; value: number } => a.value !== null);
+  if (measured.length < 2) return null;
+  const sorted = [...measured].sort((a, b) => direction === 'higher_better' ? b.value - a.value : a.value - b.value);
+  const winner = sorted[0];
+  const runnerUp = sorted[1];
+  const margin = direction === 'higher_better' ? winner.value - runnerUp.value : runnerUp.value - winner.value;
+  return { winnerName: winner.name, winnerValue: winner.value, runnerUpName: runnerUp.name, runnerUpValue: runnerUp.value, margin };
+}
+
 function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
   let criterionMetric: string | null = null;
   const extraKeys = new Set<string>();
@@ -182,10 +207,10 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
           return (
             <span
               key={job.id}
-              className={`rounded border px-1.5 py-0.5 text-ui-xs font-semibold ${v?.met ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : v ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-600/40 bg-neutral-800/60 text-neutral-400'}`}
+              className={`rounded border px-1.5 py-0.5 text-ui-xs font-semibold ${v?.met ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : v && !v.measurable ? 'border-amber-500/40 bg-amber-500/15 text-amber-300' : v ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-600/40 bg-neutral-800/60 text-neutral-400'}`}
               data-testid="matrix-verdict-chip"
             >
-              {(job.task_title ?? job.id).slice(0, 20)}: {v?.met ? 'met' : v ? 'missed' : 'no verdict'}
+              {(job.task_title ?? job.id).slice(0, 20)}: {v?.met ? 'met' : v && !v.measurable ? 'inconclusive' : v ? 'missed' : 'no verdict'}
             </span>
           );
         })}
@@ -208,23 +233,159 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
                   <div className="text-ui-sm font-semibold text-neutral-300 font-mono mb-0.5">
                     {(job.task_title ?? job.id).slice(0, 24)}
                   </div>
-                  {arms.map((arm) => (
-                    <div key={arm.name} className="flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm font-mono mb-0.5 pl-2">
-                      <span className="text-neutral-400 font-semibold">{arm.name}:</span>
-                      {Object.entries(arm.metrics).map(([mk, mv]) => (
-                        <span key={mk}>
-                          <span className="text-neutral-500">{mk}:</span>{' '}
-                          <span className="text-neutral-300">{String(mv)}</span>
-                        </span>
-                      ))}
-                    </div>
-                  ))}
+                  {arms.map((arm) => {
+                    const armExitCode = typeof arm.metrics.exit_code === 'number' ? arm.metrics.exit_code : null;
+                    const armError = typeof arm.metrics.error === 'string' ? arm.metrics.error : typeof arm.metrics.reason === 'string' ? arm.metrics.reason : null;
+                    const armFailed = (armExitCode !== null && armExitCode !== 0) || armError !== null;
+                    return (
+                      <div key={arm.name} className={`flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm font-mono mb-0.5 pl-2`}>
+                        <span className={`font-semibold ${armFailed ? 'text-red-300' : 'text-neutral-400'}`}>{arm.name}:</span>
+                        {armExitCode !== null && (
+                          <span
+                            className={`rounded border px-1 py-0.5 text-ui-xs ${armFailed ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-700 bg-neutral-800/60 text-neutral-400'}`}
+                            data-testid="arm-exit-code"
+                          >
+                            exit {armExitCode}
+                          </span>
+                        )}
+                        {Object.entries(arm.metrics).filter(([mk]) => !DIAGNOSTIC_KEYS.has(mk)).map(([mk, mv]) => (
+                          <span key={mk}>
+                            <span className="text-neutral-500">{mk}:</span>{' '}
+                            <span className="text-neutral-300">{String(mv)}</span>
+                          </span>
+                        ))}
+                        {armError && (
+                          <span className="text-red-300/90 break-words" data-testid="arm-error">{armError.slice(0, 120)}{armError.length > 120 ? '…' : ''}</span>
+                        )}
+                      </div>
+                    );
+                  })}
                 </div>
               );
             })}
           </div>
         );
       })()}
+    </div>
+  );
+}
+
+function SweepKnowledgeGroupsSection({
+  sweepGroups,
+  onNavigateToKnowledge,
+}: {
+  sweepGroups: ComputeSweepGroupsResponse['sweep_groups'];
+  onNavigateToKnowledge?: (documentId: string) => void;
+}) {
+  const [compareSet, setCompareSet] = useState<Set<string>>(new Set());
+  const entries = Object.entries(sweepGroups);
+  if (entries.length === 0) return null;
+
+  function toggleCompare(sweepId: string) {
+    setCompareSet((prev) => {
+      const next = new Set(prev);
+      if (next.has(sweepId)) next.delete(sweepId); else next.add(sweepId);
+      return next;
+    });
+  }
+
+  return (
+    <div className="mb-3 flex flex-col gap-2" data-testid="sweep-knowledge-groups">
+      <div className="text-ui-xs font-semibold text-neutral-500 uppercase tracking-widest">
+        Sweep comparisons (knowledge)
+      </div>
+      {entries.map(([sweepId, docs]) => {
+        const comparing = compareSet.has(sweepId);
+        const label = docs[0]?.title ?? sweepId;
+        return (
+          <div
+            key={sweepId}
+            className="rounded-lg border border-indigo-500/20 bg-indigo-500/5 px-3 py-2"
+            data-testid="sweep-knowledge-group"
+          >
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <span className="text-ui-sm font-semibold text-indigo-300 break-words min-w-0" data-testid="sweep-knowledge-group-label">
+                {label}
+              </span>
+              <div className="flex items-center gap-2 shrink-0">
+                {!comparing && (
+                  <span className="text-ui-sm text-neutral-400 font-mono">
+                    {docs.length} runs
+                  </span>
+                )}
+                <button
+                  type="button"
+                  onClick={() => toggleCompare(sweepId)}
+                  className="min-h-[44px] flex items-center gap-1 rounded px-1.5 py-0.5 text-ui-xs font-semibold text-indigo-400 hover:text-indigo-200 hover:bg-indigo-500/15 transition-colors"
+                  data-testid="sweep-knowledge-compare-toggle"
+                >
+                  <LayoutGrid className="w-3 h-3" />
+                  {comparing ? 'List' : 'Compare'}
+                </button>
+              </div>
+            </div>
+            {comparing ? (
+              <div className="overflow-x-auto">
+                <table className="w-full text-ui-sm font-mono" data-testid="sweep-knowledge-comparison-table">
+                  <thead>
+                    <tr>
+                      <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Run</th>
+                      <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Grade</th>
+                      <th className="text-left pb-1 text-neutral-500 font-normal">Summary</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {docs.map((doc) => (
+                      <tr key={doc.id} className="border-t border-neutral-800/50">
+                        <td className="py-0.5 pr-3 text-neutral-300 max-w-32 truncate">
+                          {onNavigateToKnowledge ? (
+                            <button
+                              type="button"
+                              onClick={() => onNavigateToKnowledge(doc.id)}
+                              className="text-sky-300 hover:text-sky-200 hover:underline text-left truncate max-w-full"
+                            >
+                              {(doc.arm_label ?? doc.title).slice(0, 28)}
+                            </button>
+                          ) : (
+                            <span className="truncate">{(doc.arm_label ?? doc.title).slice(0, 28)}</span>
+                          )}
+                        </td>
+                        <td className="py-0.5 pr-3 text-neutral-400">{doc.acceptance_grade ?? '—'}</td>
+                        <td className="py-0.5 text-neutral-400 max-w-xs truncate">{doc.summary?.slice(0, 80) ?? '—'}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="flex flex-col gap-0.5">
+                {docs.map((doc) => (
+                  <div key={doc.id} className="flex items-center gap-2 text-ui-sm font-mono text-neutral-400">
+                    <span className="min-w-0 flex-1 truncate">
+                      {onNavigateToKnowledge ? (
+                        <button
+                          type="button"
+                          onClick={() => onNavigateToKnowledge(doc.id)}
+                          className="text-sky-300 hover:text-sky-200 hover:underline text-left truncate"
+                        >
+                          {doc.arm_label ?? doc.title}
+                        </button>
+                      ) : (
+                        doc.arm_label ?? doc.title
+                      )}
+                    </span>
+                    {doc.acceptance_grade && (
+                      <span className="shrink-0 rounded border border-neutral-600/40 bg-neutral-800/60 px-1 py-0.5 text-ui-xs text-neutral-300">
+                        {doc.acceptance_grade}
+                      </span>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -248,8 +409,8 @@ function bestRunId(group: ComputeJob[]): string | null {
   const op = measurable[0].criterion_verdict?.operator ?? '>=';
   const higherBetter = op === '>=' || op === '>';
   return measurable.reduce((best, job) => {
-    const bv = best.criterion_verdict!.value!;
-    const jv = job.criterion_verdict!.value!;
+    const bv = best.criterion_verdict?.value ?? 0;
+    const jv = job.criterion_verdict?.value ?? 0;
     return higherBetter ? (jv > bv ? job : best) : (jv < bv ? job : best);
   }, measurable[0]).id;
 }
@@ -321,6 +482,10 @@ function ExperimentSweepSummary({ jobs }: { jobs: ComputeJob[] }) {
                           <span className="shrink-0 rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-ui-xs text-emerald-300">
                             met
                           </span>
+                        ) : !verdict.measurable ? (
+                          <span className="shrink-0 rounded border border-amber-500/40 bg-amber-500/15 px-1 py-0.5 text-ui-xs text-amber-300">
+                            inconclusive
+                          </span>
                         ) : (
                           <span className="shrink-0 rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-ui-xs text-red-300">
                             unmet
@@ -351,15 +516,99 @@ function budgetBarClass(pct: number): string {
   return 'bg-sky-500';
 }
 
+function HeldExperimentsSection({
+  experiments,
+  onApprove,
+  onDismiss,
+}: {
+  experiments: HeldComputeExperiment[];
+  onApprove?: (taskId: string) => Promise<void>;
+  onDismiss?: (taskId: string) => Promise<void>;
+}) {
+  const [actionId, setActionId] = useState<string | null>(null);
+
+  if (!experiments || experiments.length === 0) return null;
+
+  const handleApprove = async (id: string) => {
+    if (!onApprove) return;
+    setActionId(id);
+    try { await onApprove(id); } finally { setActionId(null); }
+  };
+
+  const handleDismiss = async (id: string) => {
+    if (!onDismiss) return;
+    setActionId(id);
+    try { await onDismiss(id); } finally { setActionId(null); }
+  };
+
+  return (
+    <div className="mb-3" data-testid="held-experiments-section">
+      <div className="text-ui-sm font-semibold text-amber-300 uppercase tracking-widest mb-1.5 flex items-center gap-1.5">
+        <AlertTriangle className="w-3 h-3 shrink-0" />
+        Held for approval
+      </div>
+      <div className="flex flex-col gap-1.5">
+        {experiments.map((exp) => {
+          const spendCap = (exp.payloads?.[0] as Record<string, unknown> | undefined)?.spend_cap_usd;
+          const capLabel = spendCap != null ? ` · $${Number(spendCap).toFixed(2)}` : '';
+          const busy = actionId === exp.id;
+          return (
+            <div
+              key={exp.id}
+              className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 flex items-center justify-between gap-3"
+              data-testid="held-experiment-row"
+            >
+              <div className="min-w-0">
+                <div className="text-xs font-semibold text-amber-200 break-words">{exp.title}{capLabel}</div>
+                <div className="text-ui-sm text-amber-300/70 font-mono">spend cap requires operator approval</div>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                {onApprove && (
+                  <button
+                    type="button"
+                    onClick={() => void handleApprove(exp.id)}
+                    disabled={busy}
+                    className="min-h-[44px] flex items-center gap-1.5 rounded bg-emerald-500/20 px-3 text-ui-md font-semibold text-emerald-200 hover:bg-emerald-500/30 transition-colors disabled:opacity-50"
+                    data-testid="held-experiment-approve"
+                  >
+                    <CheckCircle className="w-3 h-3" />
+                    {busy ? 'Approving…' : 'Approve'}
+                  </button>
+                )}
+                {onDismiss && (
+                  <button
+                    type="button"
+                    onClick={() => void handleDismiss(exp.id)}
+                    disabled={busy}
+                    className="min-h-[44px] flex items-center gap-1.5 rounded bg-red-500/20 px-3 text-ui-md font-semibold text-red-200 hover:bg-red-500/30 transition-colors disabled:opacity-50"
+                    data-testid="held-experiment-dismiss"
+                  >
+                    <XCircle className="w-3 h-3" />
+                    {busy ? 'Dismissing…' : 'Dismiss'}
+                  </button>
+                )}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 interface ComputeJobsPanelProps {
   projectId: string | null;
   onNavigateToTask?: (taskId: string) => void;
   onLaunchCompute?: () => void;
   onDuplicateTask?: (taskId: string) => Promise<void>;
+  onApproveExperiment?: (taskId: string) => Promise<void>;
+  onDismissExperiment?: (taskId: string) => Promise<void>;
+  onNavigateToKnowledge?: (documentId: string) => void;
 }
 
-export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onDuplicateTask }: ComputeJobsPanelProps) {
+export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onApproveExperiment, onDismissExperiment, onNavigateToKnowledge }: ComputeJobsPanelProps) {
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
+  const [heldExperiments, setHeldExperiments] = useState<HeldComputeExperiment[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [summary, setSummary] = useState<ComputeJobsSummary | null>(null);
   const [lifetimeSummary, setLifetimeSummary] = useState<ComputeJobsSummary | null>(null);
@@ -369,9 +618,20 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [allTerminal, setAllTerminal] = useState(false);
   const [killingId, setKillingId] = useState<string | null>(null);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
+  const [rerunState, setRerunState] = useState<{
+    jobId: string;
+    taskId: string;
+    spendCap: string;
+    deadlineSec: string;
+    threshold: string;
+    criterion: { metric: string; operator: ComputeSuccessOperator } | null;
+    submitting: boolean;
+    error: string | null;
+  } | null>(null);
   const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
   const [analysisDocs, setAnalysisDocs] = useState<Record<string, KnowledgeDocument>>({});
   const [knowledgeDocs, setKnowledgeDocs] = useState<Record<string, KnowledgeDocument>>({});
+  const [sweepGroups, setSweepGroups] = useState<ComputeSweepGroupsResponse['sweep_groups']>({});
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
   const [nowMs, setNowMs] = useState(() => Date.now());
 
@@ -422,6 +682,38 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     enabled: !!projectId,
     deps: [projectId, finishedWindowMinutes, allTerminal],
   });
+
+  // Poll held (requires_approval) compute experiments every 30s so operators
+  // see them here without visiting the Board.
+  usePoller(
+    async (signal) => {
+      if (!projectId) return;
+      try {
+        const held = await fetchHeldComputeExperiments(projectId, signal);
+        setHeldExperiments(Array.isArray(held) ? held : []);
+      } catch (e) {
+        if (e instanceof Error && e.name === 'AbortError') return;
+        // Non-fatal: held section is supplementary; don't surface as panel error
+      }
+    },
+    { intervalMs: 30_000, enabled: !!projectId, deps: [projectId] },
+  );
+
+  // Poll sweep-grouped knowledge docs every 60s — complementary to the live job
+  // poll, uses durable knowledge documents so changes are infrequent.
+  usePoller(
+    async (signal) => {
+      if (!projectId) return;
+      try {
+        const result = await fetchComputeSweepGroups(projectId, signal);
+        setSweepGroups(result.sweep_groups ?? {});
+      } catch (e) {
+        if (e instanceof Error && e.name === 'AbortError') return;
+        // Non-fatal: sweep groups are supplementary
+      }
+    },
+    { intervalMs: 60_000, enabled: !!projectId, deps: [projectId] },
+  );
 
   // Fetch lifetime aggregate summary once per project (unbounded lifetime totals).
   useEffect(() => {
@@ -522,6 +814,46 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     [load, projectId],
   );
 
+  const handleRerunOpen = useCallback((job: ComputeJob) => {
+    if (!job.task_id) return;
+    setRerunState({
+      jobId: job.id,
+      taskId: job.task_id,
+      spendCap: job.spend_cap_usd != null ? String(job.spend_cap_usd) : '',
+      deadlineSec: job.launch_contract?.requested_deadline_seconds != null
+        ? String(job.launch_contract.requested_deadline_seconds)
+        : '',
+      threshold: job.success_criterion?.threshold != null ? String(job.success_criterion.threshold) : '',
+      criterion: job.success_criterion
+        ? { metric: job.success_criterion.metric, operator: job.success_criterion.operator as ComputeSuccessOperator }
+        : null,
+      submitting: false,
+      error: null,
+    });
+  }, []);
+
+  const handleRerunSubmit = useCallback(async () => {
+    if (!rerunState) return;
+    setRerunState((prev) => prev ? { ...prev, submitting: true, error: null } : prev);
+    try {
+      const body: { success_criterion?: { metric: string; operator: ComputeSuccessOperator; threshold: number }; spend_cap_usd?: number; deadline_seconds?: number } = {};
+      if (rerunState.spendCap !== '') body.spend_cap_usd = parseFloat(rerunState.spendCap);
+      if (rerunState.deadlineSec !== '') body.deadline_seconds = parseInt(rerunState.deadlineSec, 10);
+      if (rerunState.criterion && rerunState.threshold !== '') {
+        body.success_criterion = {
+          metric: rerunState.criterion.metric,
+          operator: rerunState.criterion.operator,
+          threshold: parseFloat(rerunState.threshold),
+        };
+      }
+      await rerunComputeExperiment(rerunState.taskId, body);
+      setRerunState(null);
+      await load();
+    } catch (e) {
+      setRerunState((prev) => prev ? { ...prev, submitting: false, error: e instanceof Error ? e.message : 'Re-run failed' } : prev);
+    }
+  }, [rerunState, load]);
+
   if (!projectId) {
     return (
       <div className="flex-1 flex items-center justify-center text-neutral-500 text-ui-sm">
@@ -533,33 +865,49 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
   return (
     <div className="mt-4 rounded-xl border border-neutral-800 bg-neutral-950/60 p-4" data-viewport-allow-truncation>
-      <div className="flex items-center justify-between gap-2 mb-3">
+      <div className="flex items-center justify-between gap-2 mb-1">
         <div className="flex items-center gap-2 text-ui-md font-bold text-neutral-400 uppercase tracking-widest">
           <Cpu className="w-3.5 h-3.5 shrink-0" />
           Compute jobs
         </div>
-        <div className="flex items-center gap-0.5" data-testid="compute-window-selector">
-          {WINDOW_OPTIONS.map(({ label, minutes }) => (
+        <div className="flex items-center gap-2">
+          {onLaunchCompute && (
             <button
-              key={minutes}
               type="button"
-              onClick={() => { setAllTerminal(false); setFinishedWindowMinutes(minutes); setHasMore(false); }}
-              className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${!allTerminal && finishedWindowMinutes === minutes ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
-              data-testid={`compute-window-${label}`}
+              onClick={onLaunchCompute}
+              className="shrink-0 min-h-[36px] rounded bg-sky-500/20 px-3 text-ui-sm font-semibold text-sky-200 transition-colors hover:bg-sky-500/30"
             >
-              {label}
+              Launch experiment
             </button>
-          ))}
-          <button
-            type="button"
-            onClick={() => { setAllTerminal(true); setHasMore(false); }}
-            className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${allTerminal ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
-            data-testid="compute-window-all"
-          >
-            All
-          </button>
+          )}
+          <div className="flex items-center gap-0.5" data-testid="compute-window-selector">
+            {WINDOW_OPTIONS.map(({ label, minutes }) => (
+              <button
+                key={minutes}
+                type="button"
+                onClick={() => { setAllTerminal(false); setFinishedWindowMinutes(minutes); setHasMore(false); }}
+                className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${!allTerminal && finishedWindowMinutes === minutes ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+                data-testid={`compute-window-${label}`}
+              >
+                {label}
+              </button>
+            ))}
+            <button
+              type="button"
+              onClick={() => { setAllTerminal(true); setHasMore(false); }}
+              className={`min-h-[44px] min-w-[44px] rounded px-1.5 py-0.5 text-ui-xs font-semibold transition-colors ${allTerminal ? 'bg-neutral-700 text-neutral-100' : 'text-neutral-500 hover:text-neutral-300'}`}
+              data-testid="compute-window-all"
+            >
+              All
+            </button>
+          </div>
         </div>
       </div>
+      {!allTerminal && (
+        <div className="mb-2 text-ui-xs text-neutral-500" data-testid="compute-window-indicator">
+          Showing jobs from the last {WINDOW_OPTIONS.find(o => o.minutes === finishedWindowMinutes)?.label || '6h'}
+        </div>
+      )}
 
       {lifetimeSummary && lifetimeSummary.total_jobs > 0 && (
         <div
@@ -585,30 +933,39 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
       )}
 
       {summary && summary.total_jobs > 0 && (
-        <div
-          className="mb-3 flex flex-wrap gap-x-4 gap-y-0.5 text-ui-sm font-mono text-neutral-400"
-          data-testid="compute-jobs-summary"
-        >
-          <span className="text-neutral-500 text-xs uppercase tracking-widest">Windowed</span>
-          <span>
-            <span className="text-neutral-500">total</span> {summary.total_jobs}
-          </span>
-          {summary.active_jobs > 0 && (
+        <div className="mb-3 flex flex-col gap-2" data-testid="compute-jobs-summary">
+          <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-ui-sm font-mono text-neutral-400">
+            <span className="text-neutral-500 text-xs uppercase tracking-widest">Windowed</span>
             <span>
-              <span className="text-neutral-500">active</span>{' '}
-              <span className="text-sky-300">{summary.active_jobs}</span>
+              <span className="text-neutral-500">total</span> {summary.total_jobs}
             </span>
-          )}
-          {summary.total_spend_usd > 0 && (
-            <span>
-              <span className="text-neutral-500">spend</span> {fmtUsd(summary.total_spend_usd)}
-            </span>
-          )}
-          {summary.criterion_measured > 0 && (
-            <span>
-              <span className="text-neutral-500">criterion</span>{' '}
-              {summary.criterion_met}/{summary.criterion_measured} met
-            </span>
+            {summary.active_jobs > 0 && (
+              <span>
+                <span className="text-neutral-500">active</span>{' '}
+                <span className="text-sky-300">{summary.active_jobs}</span>
+              </span>
+            )}
+            {summary.total_spend_usd > 0 && (
+              <span>
+                <span className="text-neutral-500">spend</span> {fmtUsd(summary.total_spend_usd)}
+              </span>
+            )}
+            {summary.criterion_measured > 0 && (
+              <span>
+                <span className="text-neutral-500">criterion</span>{' '}
+                {summary.criterion_met}/{summary.criterion_measured} met
+              </span>
+            )}
+          </div>
+          {Object.keys(summary.outcome_breakdown).length > 0 && (
+            <div className="flex flex-wrap gap-x-4 gap-y-0.5 text-ui-sm font-mono text-neutral-400">
+              <span className="text-neutral-500 text-xs uppercase tracking-widest">Outcomes</span>
+              {Object.entries(summary.outcome_breakdown).map(([outcome, count]) => (
+                <span key={outcome}>
+                  <span className="text-neutral-500">{outcome}</span> {count}
+                </span>
+              ))}
+            </div>
           )}
         </div>
       )}
@@ -622,25 +979,20 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
 
       {showEmptyState && (
         <div className="rounded-lg border border-neutral-800/80 bg-neutral-900/40 px-3 py-2">
-          <div className="flex items-center justify-between gap-3">
-            <div className="min-w-0">
-              <div className="text-xs font-semibold text-neutral-200">No compute jobs</div>
-              <div className="mt-0.5 text-ui-sm text-neutral-500">
-                Launch a structured experiment for this project.
-              </div>
-            </div>
-            {onLaunchCompute && (
-              <button
-                type="button"
-                onClick={onLaunchCompute}
-                className="shrink-0 min-h-[36px] rounded bg-sky-500/20 px-3 text-ui-md font-semibold text-sky-200 transition-colors hover:bg-sky-500/30"
-              >
-                Launch compute experiment
-              </button>
-            )}
+          <div className="text-xs font-semibold text-neutral-200">No compute jobs</div>
+          <div className="mt-0.5 text-ui-sm text-neutral-500">
+            Launch a structured experiment for this project.
           </div>
         </div>
       )}
+
+      <HeldExperimentsSection
+        experiments={heldExperiments}
+        onApprove={onApproveExperiment}
+        onDismiss={onDismissExperiment}
+      />
+
+      <SweepKnowledgeGroupsSection sweepGroups={sweepGroups} onNavigateToKnowledge={onNavigateToKnowledge} />
 
       <ExperimentSweepSummary jobs={jobs} />
 
@@ -650,6 +1002,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
           const cap = job.spend_cap_usd ?? 0;
           const spent = computeJobSpent(job);
           const pct = cap > 0 ? Math.min(1, spent / cap) : 0;
+          const { label: backendLabel, isOperatorHardware } = computeJobExecutionLocation(job.backend ?? '');
           return (
             <div
               key={job.id}
@@ -670,7 +1023,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     </div>
                   )}
                   <div className="text-ui-sm text-neutral-500 font-mono mt-0.5 break-words">
-                    {job.backend}
+                    {backendLabel}
                     {job.machine_type ? ` · ${job.machine_type}` : ''}
                     {job.accelerator_type ? ` · ${job.accelerator_type} x${job.accelerator_count ?? 1}` : ''}
                     {job.launch_contract?.provisioning_model ? ` · ${job.launch_contract.provisioning_model}` : ''}
@@ -693,20 +1046,27 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 </span>
               </div>
 
-              <div className="mb-1.5">
-                <div className="flex items-center justify-between text-ui-sm text-neutral-400 font-mono mb-1">
-                  <span>Budget</span>
-                  <span>
-                    {fmtUsd(spent)} / {fmtUsd(job.spend_cap_usd)}
-                  </span>
+              {isOperatorHardware ? (
+                <div className="mb-1.5 flex items-center justify-between text-ui-sm text-neutral-400 font-mono" data-testid="compute-operator-cost">
+                  <span>Cost</span>
+                  <span>$0.00 · not billed at cloud rates</span>
                 </div>
-                <div className="h-1.5 w-full rounded-full bg-neutral-800 overflow-hidden">
-                  <div
-                    className={`h-full ${budgetBarClass(pct)}`}
-                    style={{ width: `${Math.round(pct * 100)}%` }}
-                  />
+              ) : (
+                <div className="mb-1.5">
+                  <div className="flex items-center justify-between text-ui-sm text-neutral-400 font-mono mb-1">
+                    <span>Budget</span>
+                    <span>
+                      {fmtUsd(spent)} / {fmtUsd(job.spend_cap_usd)}
+                    </span>
+                  </div>
+                  <div className="h-1.5 w-full rounded-full bg-neutral-800 overflow-hidden">
+                    <div
+                      className={`h-full ${budgetBarClass(pct)}`}
+                      style={{ width: `${Math.round(pct * 100)}%` }}
+                    />
+                  </div>
                 </div>
-              </div>
+              )}
 
               {(() => {
                 if (!active) return null;
@@ -806,10 +1166,74 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         <Cpu className="w-3 h-3" />
                         {analyzingId === job.id ? 'Analyzing…' : 'Run analysis'}
                       </button>
-                      {onDuplicateTask && (
+                      {rerunState?.jobId === job.id ? (
+                        <div className="flex flex-col gap-2 rounded border border-sky-500/30 bg-sky-500/10 p-2 text-ui-sm" data-testid="rerun-inline-panel">
+                          <div className="font-semibold text-sky-200">Re-run with adjustments</div>
+                          <div className="flex flex-wrap gap-2">
+                            <label className="flex flex-col gap-0.5">
+                              <span className="text-neutral-400">Spend cap (USD)</span>
+                              <input
+                                type="number"
+                                min="0.01"
+                                step="0.01"
+                                value={rerunState.spendCap}
+                                onChange={(e) => setRerunState((p) => p ? { ...p, spendCap: e.target.value } : p)}
+                                className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                data-testid="rerun-spend-cap"
+                              />
+                            </label>
+                            <label className="flex flex-col gap-0.5">
+                              <span className="text-neutral-400">Deadline (sec)</span>
+                              <input
+                                type="number"
+                                min="1"
+                                step="1"
+                                value={rerunState.deadlineSec}
+                                onChange={(e) => setRerunState((p) => p ? { ...p, deadlineSec: e.target.value } : p)}
+                                className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                data-testid="rerun-deadline-sec"
+                              />
+                            </label>
+                            {rerunState.criterion && (
+                              <label className="flex flex-col gap-0.5">
+                                <span className="text-neutral-400">Threshold ({rerunState.criterion.metric} {rerunState.criterion.operator})</span>
+                                <input
+                                  type="number"
+                                  step="any"
+                                  value={rerunState.threshold}
+                                  onChange={(e) => setRerunState((p) => p ? { ...p, threshold: e.target.value } : p)}
+                                  className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                  data-testid="rerun-threshold"
+                                />
+                              </label>
+                            )}
+                          </div>
+                          {rerunState.error && (
+                            <div className="text-red-300 text-ui-xs" data-testid="rerun-error">{rerunState.error}</div>
+                          )}
+                          <div className="flex gap-2">
+                            <button
+                              onClick={() => void handleRerunSubmit()}
+                              disabled={rerunState.submitting}
+                              className="rounded bg-sky-500/30 text-sky-200 hover:bg-sky-500/40 px-3 py-1.5 text-ui-sm font-semibold disabled:opacity-50"
+                              data-testid="rerun-submit"
+                            >
+                              {rerunState.submitting ? 'Launching…' : 'Launch re-run'}
+                            </button>
+                            <button
+                              onClick={() => setRerunState(null)}
+                              className="rounded bg-neutral-700/40 text-neutral-300 hover:bg-neutral-700/60 px-3 py-1.5 text-ui-sm"
+                              data-testid="rerun-cancel"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
                         <button
-                          onClick={() => job.task_id && void onDuplicateTask(job.task_id)}
-                          className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-sky-500/20 text-sky-200 hover:bg-sky-500/30 text-ui-md font-semibold px-3 transition-colors"
+                          onClick={() => handleRerunOpen(job)}
+                          disabled={!job.task_id}
+                          className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-sky-500/20 text-sky-200 hover:bg-sky-500/30 text-ui-md font-semibold px-3 transition-colors disabled:opacity-50"
                           title="Re-run this experiment with the same configuration"
                         >
                           <Cpu className="w-3 h-3" />
@@ -890,14 +1314,31 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     <div className="flex items-start gap-1.5">
                       <FileText className="w-3 h-3 shrink-0 mt-0.5 text-sky-300" />
                       <div className="min-w-0 flex-1">
-                        <button
-                          type="button"
-                          onClick={() => toggleDocExpanded(docKey)}
-                          className="font-semibold text-sky-200 break-words text-left w-full hover:text-sky-100"
-                          data-testid="compute-knowledge-doc-toggle"
-                        >
-                          {doc.title}
-                        </button>
+                        <div className="flex items-center justify-between gap-2">
+                          <button
+                            type="button"
+                            onClick={() => toggleDocExpanded(docKey)}
+                            className="font-semibold text-sky-200 break-words text-left flex-1 hover:text-sky-100"
+                            data-testid="compute-knowledge-doc-toggle"
+                          >
+                            {doc.title}
+                          </button>
+                          {onNavigateToKnowledge && (
+                            <button
+                              type="button"
+                              onClick={() => onNavigateToKnowledge(doc.id)}
+                              className="min-h-[44px] shrink-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-ui-xs font-semibold text-sky-400 hover:text-sky-200 hover:bg-sky-500/15 transition-colors"
+                              title="View in Knowledge Library"
+                              data-testid="compute-knowledge-doc-library-link"
+                            >
+                              <BookOpen className="w-3 h-3" />
+                              Library
+                            </button>
+                          )}
+                        </div>
+                        <div className="mt-1 flex items-center gap-2 flex-wrap">
+                          <AcceptanceGradeBadge doc={doc} />
+                        </div>
                         {!expanded && doc.summary && (
                           <div className="mt-0.5 text-sky-300/80 break-words whitespace-pre-wrap line-clamp-3">{doc.summary}</div>
                         )}
@@ -1021,16 +1462,33 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         <div className="text-ui-sm text-neutral-500 font-mono mb-0.5">Arms</div>
                         <div className="flex flex-col gap-1">
                           {arms.map((arm) => {
-                            const numericEntries = Object.entries(arm.metrics).filter(([, mv]) => typeof mv === 'number');
+                            const exitCodeVal = typeof arm.metrics.exit_code === 'number' ? arm.metrics.exit_code : null;
+                            const errorVal = typeof arm.metrics.error === 'string' ? arm.metrics.error : typeof arm.metrics.reason === 'string' ? arm.metrics.reason : null;
+                            const stderrVal = typeof arm.metrics.stderr_excerpt === 'string' ? arm.metrics.stderr_excerpt : null;
+                            const isFailed = (exitCodeVal !== null && exitCodeVal !== 0) || errorVal !== null;
+                            const numericEntries = Object.entries(arm.metrics).filter(([mk, mv]) => typeof mv === 'number' && !DIAGNOSTIC_KEYS.has(mk));
                             const labelVal = typeof arm.metrics.label === 'string' ? arm.metrics.label : null;
                             const noteVal = typeof arm.metrics.note === 'string' ? arm.metrics.note : null;
                             const logVal = typeof arm.metrics.log === 'string' ? arm.metrics.log : null;
                             const otherStrings = Object.entries(arm.metrics).filter(
-                              ([mk, mv]) => typeof mv === 'string' && mk !== 'label' && mk !== 'note' && mk !== 'log',
+                              ([mk, mv]) => typeof mv === 'string' && !DIAGNOSTIC_KEYS.has(mk),
                             );
                             return (
-                              <div key={arm.name} className="rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1">
-                                <div className="text-ui-sm font-semibold text-neutral-300 font-mono">{arm.name}</div>
+                              <div
+                                key={arm.name}
+                                className={`rounded border px-2 py-1 ${isFailed ? 'border-red-500/30 bg-red-500/10' : 'border-neutral-700/50 bg-neutral-800/40'}`}
+                              >
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <div className={`text-ui-sm font-semibold font-mono ${isFailed ? 'text-red-300' : 'text-neutral-300'}`}>{arm.name}</div>
+                                  {exitCodeVal !== null && (
+                                    <span
+                                      className={`rounded border px-1 py-0.5 text-ui-xs ${isFailed ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-neutral-700 bg-neutral-800/60 text-neutral-400'}`}
+                                      data-testid="arm-exit-code"
+                                    >
+                                      exit {exitCodeVal}
+                                    </span>
+                                  )}
+                                </div>
                                 {labelVal && (
                                   <div className="text-ui-sm text-neutral-400 italic mt-0.5" data-testid="arm-label">{labelVal}</div>
                                 )}
@@ -1048,16 +1506,47 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                                     <span className="text-neutral-500">{mk}:</span> {String(mv)}
                                   </div>
                                 ))}
+                                {errorVal && (
+                                  <div className="mt-0.5 text-ui-sm text-red-300/90 break-words font-mono" data-testid="arm-error">
+                                    {errorVal.slice(0, 120)}{errorVal.length > 120 ? '…' : ''}
+                                  </div>
+                                )}
                                 {noteVal && (
                                   <div className="mt-0.5 text-ui-sm text-neutral-400 break-words" data-testid="arm-note">{noteVal}</div>
                                 )}
                                 {logVal && (
                                   <pre className="mt-0.5 rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-24 overflow-y-auto" data-testid="arm-log">{logVal}</pre>
                                 )}
+                                {stderrVal && (
+                                  <pre className="mt-0.5 rounded border border-neutral-800 bg-neutral-950 px-2 py-1 text-ui-xs text-red-200 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-24 overflow-y-auto" data-testid="arm-stderr">{stderrVal}</pre>
+                                )}
                               </div>
                             );
                           })}
                         </div>
+                        {(() => {
+                          const cv = job.criterion_verdict;
+                          if (!cv?.metric) return null;
+                          const dir: MetricDirection = cv.operator === '>=' || cv.operator === '>' ? 'higher_better' : 'lower_better';
+                          const verdict = armComparisonVerdict(arms, cv.metric, dir);
+                          if (!verdict) return null;
+                          return (
+                            <div
+                              className="mt-1.5 flex items-center gap-1.5 text-ui-sm font-mono flex-wrap"
+                              data-testid="arm-comparison-verdict"
+                            >
+                              <span className="text-neutral-500 shrink-0">Winner</span>
+                              <span className="font-semibold text-emerald-300">{verdict.winnerName}</span>
+                              <span className="text-neutral-400">{cv.metric}={verdict.winnerValue}</span>
+                              <span
+                                className="rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-ui-xs font-semibold text-emerald-300"
+                                data-testid="arm-comparison-margin"
+                              >
+                                +{verdict.margin.toFixed(2)} vs {verdict.runnerUpName}
+                              </span>
+                            </div>
+                          );
+                        })()}
                       </div>
                     )}
                   </>
@@ -1066,86 +1555,142 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               {(() => {
                 if (active) return null;
                 const { experiment, benchmark, hypothesis } = job;
-                if (!experiment && !benchmark && !hypothesis) return null;
-                return (
-                  <div
-                    className="mt-1.5 flex flex-col gap-0.5 text-ui-sm font-mono"
-                    data-testid="compute-experiment-identity"
-                  >
-                    {(experiment || benchmark) && (
-                      <div className="flex items-start gap-1.5">
-                        <span className="text-neutral-500 shrink-0">{experiment ? 'Experiment' : 'Benchmark'}</span>
-                        <span className="text-neutral-300 break-words">{experiment ?? benchmark}</span>
-                      </div>
-                    )}
-                    {hypothesis && (
-                      <div className="flex items-start gap-1.5">
-                        <span className="text-neutral-500 shrink-0">Hypothesis</span>
-                        <span className="text-neutral-300 break-words">{hypothesis}</span>
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
-              {(() => {
-                if (active) return null;
                 const sc = job.success_criterion;
                 const verdict = job.criterion_verdict;
-                if (!sc) return null;
-                const expr = `${sc.metric} ${sc.operator} ${sc.threshold}`;
-                const margin = computeJobMargin(job);
-                let chip: React.ReactNode;
-                if (!verdict) {
-                  chip = (
-                    <span className="rounded border border-neutral-600/40 bg-neutral-800/60 px-1 py-0.5 text-neutral-400">
-                      not reported
-                    </span>
-                  );
-                } else if (verdict.met) {
-                  chip = (
-                    <span
-                      className="rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-emerald-300"
-                      data-testid="criterion-met"
-                    >
-                      met
-                    </span>
-                  );
-                } else {
-                  chip = (
-                    <span
-                      className="rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-red-300"
-                      data-testid="criterion-unmet"
-                    >
-                      {verdict.measurable ? 'unmet' : 'unmet (not measurable)'}
-                    </span>
-                  );
+                const hasIdentity = !!(experiment || benchmark || hypothesis);
+                if (!hasIdentity && !sc) return null;
+
+                // Derive top-level verdict state when hypothesis + criterion are both present.
+                type VerdictState = 'held' | 'refuted' | 'inconclusive';
+                let verdictState: VerdictState | null = null;
+                if (hypothesis && sc && verdict) {
+                  verdictState = !verdict.measurable ? 'inconclusive' : verdict.met ? 'held' : 'refuted';
                 }
+
+                const expr = sc ? `${sc.metric} ${sc.operator} ${sc.threshold}` : null;
+                const margin = computeJobMargin(job);
+
+                let chip: React.ReactNode;
+                if (sc) {
+                  if (!verdict) {
+                    chip = (
+                      <span className="rounded border border-neutral-600/40 bg-neutral-800/60 px-1 py-0.5 text-neutral-400">
+                        not reported
+                      </span>
+                    );
+                  } else if (verdict.met) {
+                    chip = (
+                      <span
+                        className="rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-emerald-300"
+                        data-testid="criterion-met"
+                      >
+                        met
+                      </span>
+                    );
+                  } else if (!verdict.measurable) {
+                    chip = (
+                      <span
+                        className="rounded border border-amber-500/40 bg-amber-500/15 px-1 py-0.5 text-amber-300"
+                        data-testid="criterion-inconclusive"
+                      >
+                        inconclusive
+                      </span>
+                    );
+                  } else {
+                    chip = (
+                      <span
+                        className="rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-red-300"
+                        data-testid="criterion-unmet"
+                      >
+                        unmet
+                      </span>
+                    );
+                  }
+                }
+
                 return (
                   <div
-                    className="mt-1.5 flex flex-col gap-1 text-ui-sm font-mono"
-                    data-testid="criterion-verdict-row"
+                    className="mt-1.5"
+                    data-testid={verdictState ? 'fused-experiment-verdict' : undefined}
                   >
-                    <div className="flex items-center gap-1.5">
-                      <span className="text-neutral-500 shrink-0">Criterion</span>
-                      <span className="text-neutral-300 break-words">{expr}</span>
-                      {verdict && verdict.value !== null && verdict.value !== undefined && (
-                        <span className="text-neutral-500">
-                          (measured: {verdict.value})
-                        </span>
-                      )}
-                      {chip}
-                    </div>
-                    {margin !== null && (
-                      <div className="flex items-center gap-1.5 text-neutral-500">
-                        <span className="shrink-0">Margin</span>
+                    {verdictState && (
+                      <div className="mb-1 flex items-center gap-1.5">
                         <span
-                          className={`font-semibold ${
-                            margin >= 0 ? 'text-emerald-300' : 'text-red-300'
+                          className={`rounded border px-1.5 py-0.5 text-ui-xs font-bold ${
+                            verdictState === 'held'
+                              ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                              : verdictState === 'refuted'
+                                ? 'border-red-500/40 bg-red-500/15 text-red-300'
+                                : 'border-amber-500/40 bg-amber-500/15 text-amber-300'
                           }`}
-                          data-testid="criterion-margin"
+                          data-testid="verdict-label"
                         >
-                          {margin >= 0 ? '+' : ''}{margin.toFixed(2)}
+                          {verdictState === 'held' ? 'HELD' : verdictState === 'refuted' ? 'REFUTED' : 'INCONCLUSIVE'}
                         </span>
+                      </div>
+                    )}
+                    {(hasIdentity || sc) && (
+                      <div className="rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5 flex flex-col gap-0.5">
+                    {hasIdentity && (
+                      <div
+                        className="flex flex-col gap-0.5 text-ui-sm font-mono"
+                        data-testid="compute-experiment-identity"
+                      >
+                        {(experiment || benchmark) && (
+                          <div className="flex items-start gap-1.5">
+                            <span className="text-neutral-500 shrink-0">{experiment ? 'Experiment' : 'Benchmark'}</span>
+                            <span className="text-neutral-300 break-words">{experiment ?? benchmark}</span>
+                          </div>
+                        )}
+                        {hypothesis && (
+                          <div className="flex items-start gap-1.5">
+                            <span className="text-neutral-500 shrink-0">Hypothesis</span>
+                            <span className="text-neutral-300 break-words">{hypothesis}</span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {sc && (
+                      <div
+                        className="flex flex-col gap-1 text-ui-sm font-mono"
+                        data-testid="criterion-verdict-row"
+                      >
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-neutral-500 shrink-0">Criterion</span>
+                          <span className="text-neutral-300 break-words">{expr}</span>
+                          {verdict && verdict.value !== null && verdict.value !== undefined && (
+                            <span className="text-neutral-500">
+                              (measured: {verdict.value})
+                            </span>
+                          )}
+                          {chip}
+                        </div>
+                        {verdict?.binding_status && (
+                          <div className="flex items-center gap-1.5 text-neutral-500">
+                            <span className="shrink-0">Binding status</span>
+                            <span
+                              className="font-semibold text-neutral-300"
+                              data-testid="criterion-binding-status"
+                            >
+                              {verdict.binding_status}
+                            </span>
+                          </div>
+                        )}
+                        {margin !== null && (
+                          <div className="flex items-center gap-1.5 text-neutral-500">
+                            <span className="shrink-0">Margin</span>
+                            <span
+                              className={`font-semibold ${
+                                margin >= 0 ? 'text-emerald-300' : 'text-red-300'
+                              }`}
+                              data-testid="criterion-margin"
+                            >
+                              {margin >= 0 ? '+' : ''}{margin.toFixed(2)}
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    )}
                       </div>
                     )}
                   </div>

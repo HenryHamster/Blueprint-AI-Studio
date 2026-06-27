@@ -62,6 +62,8 @@ from app.strategic_completion import (
     _spawn_retirement_memos,
     _strategic_event_completion_summary,
     _compute_model_gc_telemetry,
+    record_retired_direction_memory,
+    _check_gap_respawn_block,
 )
 from app.strategic_spawning import (
     _build_previous_decision_outcomes,
@@ -1157,6 +1159,201 @@ class TestIsDirectionDuplicate:
         assert _is_direction_duplicate(proposal, existing, []) is True
 
 
+# ── record_retired_direction_memory + _check_gap_respawn_block ───────────────
+
+
+class TestRecordRetiredDirectionMemory:
+    def test_records_entry_with_gap_id(self):
+        vision: dict = {}
+        d = {
+            "id": "d-abc",
+            "text": "model gc garbage collection optimize performance",
+            "gap_id": "g-model-gc",
+        }
+        record_retired_direction_memory(vision, d, reason="strategic_retire")
+        entries = vision["_recently_retired_directions"]
+        assert len(entries) == 1
+        entry = entries[0]
+        assert entry["id"] == "d-abc"
+        assert entry["gap_id"] == "g-model-gc"
+        assert entry["reason"] == "strategic_retire"
+        assert "model" in entry["text_tokens"]
+        assert "gc" in entry["text_tokens"]
+        assert "retired_at" in entry
+
+    def test_records_entry_without_gap_id(self):
+        vision: dict = {}
+        d = {"id": "d-xyz", "text": "cache layer optimization database"}
+        record_retired_direction_memory(vision, d, reason="auto_completed")
+        entry = vision["_recently_retired_directions"][0]
+        assert "gap_id" not in entry
+        assert entry["reason"] == "auto_completed"
+
+    def test_fifo_eviction_at_cap(self):
+        from app.strategic_completion import _RETIRED_MEMORY_CAP
+
+        vision: dict = {
+            "_recently_retired_directions": [
+                {"id": f"d-{i}", "text_tokens": [], "retired_at": "2026-01-01T00:00:00", "reason": "r"}
+                for i in range(_RETIRED_MEMORY_CAP)
+            ]
+        }
+        d = {"id": "d-new", "text": "unique new direction text"}
+        record_retired_direction_memory(vision, d, reason="strategic_retire")
+        entries = vision["_recently_retired_directions"]
+        assert len(entries) == _RETIRED_MEMORY_CAP
+        # Newest entry is last; oldest (d-0) was evicted
+        assert entries[-1]["id"] == "d-new"
+        assert all(e["id"] != "d-0" for e in entries)
+
+    def test_stopwords_excluded_from_tokens(self):
+        vision: dict = {}
+        d = {"id": "d-1", "text": "the fix add update improve database"}
+        record_retired_direction_memory(vision, d, reason="strategic_retire")
+        tokens = vision["_recently_retired_directions"][0]["text_tokens"]
+        # stopwords (fix, add, update, improve, the) should be excluded
+        assert "fix" not in tokens
+        assert "add" not in tokens
+        assert "database" in tokens
+
+
+class TestCheckGapRespawnBlock:
+    def _make_entry(self, *, direction_id="d-abc", text_tokens=None, gap_id=None, days_ago=1):
+        retired_at = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        entry: dict = {
+            "id": direction_id,
+            "text_tokens": text_tokens or [],
+            "retired_at": retired_at,
+            "reason": "strategic_retire",
+        }
+        if gap_id:
+            entry["gap_id"] = gap_id
+        return entry
+
+    def test_blocks_on_exact_gap_id_match(self):
+        entry = self._make_entry(direction_id="d-old", gap_id="g-model-gc")
+        reason = _check_gap_respawn_block(
+            "model gc new implementation",
+            "g-model-gc",
+            [entry],
+            cooldown_days=14,
+        )
+        assert reason is not None
+        assert "g-model-gc" in reason
+        assert "d-old" in reason
+
+    def test_blocks_on_text_token_overlap(self):
+        entry = self._make_entry(
+            direction_id="d-old",
+            text_tokens=["cache", "database", "query", "performance"],
+        )
+        reason = _check_gap_respawn_block(
+            "cache database query performance layer",
+            None,
+            [entry],
+            cooldown_days=14,
+        )
+        assert reason is not None
+        assert "d-old" in reason
+
+    def test_no_block_when_entry_outside_cooldown(self):
+        entry = self._make_entry(gap_id="g-model-gc", days_ago=20)
+        reason = _check_gap_respawn_block(
+            "model gc new implementation",
+            "g-model-gc",
+            [entry],
+            cooldown_days=14,
+        )
+        assert reason is None
+
+    def test_no_block_when_gap_id_differs(self):
+        entry = self._make_entry(gap_id="g-other-gap")
+        reason = _check_gap_respawn_block(
+            "model gc optimization",
+            "g-model-gc",
+            [entry],
+            cooldown_days=14,
+        )
+        assert reason is None
+
+    def test_no_block_when_text_overlap_below_threshold(self):
+        entry = self._make_entry(text_tokens=["cache", "database", "query"])
+        reason = _check_gap_respawn_block(
+            "cache database query latency improvement",
+            None,
+            [entry],
+            cooldown_days=14,
+        )
+        # Only 3 shared tokens → below threshold of 4
+        assert reason is None
+
+    def test_no_block_on_empty_memory(self):
+        reason = _check_gap_respawn_block("anything here", "g-any", [], cooldown_days=14)
+        assert reason is None
+
+    def test_zero_cooldown_disables_all_blocks(self):
+        entry = self._make_entry(gap_id="g-model-gc", days_ago=0)
+        reason = _check_gap_respawn_block(
+            "model gc new implementation",
+            "g-model-gc",
+            [entry],
+            cooldown_days=0,
+        )
+        # cooldown_days=0 means cutoff = now, so even a 0-day-old entry is outside window
+        assert reason is None
+
+
+def test_strategic_refresh_rejects_same_gap_duplicate_direction():
+    """Acceptance test: same-gap duplicate blocked via retired memory; distinct direction allowed.
+
+    Verifies:
+    1. Exact gap_id match → blocked (enforce mode)
+    2. Text-overlap match for gap-pruned direction → blocked via retained memory (enforce mode)
+    3. Genuinely distinct direction on same gap → NOT blocked (observe mode)
+    """
+    from app.strategic_completion import _RETIRED_MEMORY_CAP  # noqa: F401
+
+    # Build retired memory as if g-model-gc direction was previously retired
+    retired_dir = {
+        "id": "d-retired-gc",
+        "text": "model gc garbage collection entry deduplication",
+        "gap_id": "g-model-gc",
+    }
+    vision: dict = {}
+    record_retired_direction_memory(vision, retired_dir, reason="strategic_retire")
+    retired_memory = vision["_recently_retired_directions"]
+
+    # 1. Exact gap_id match → blocked in enforce mode
+    block_reason = _check_gap_respawn_block(
+        "model gc garbage collection entry deduplication",
+        "g-model-gc",
+        retired_memory,
+        cooldown_days=14,
+    )
+    assert block_reason is not None, "Same-gap exact duplicate should be blocked"
+    assert "g-model-gc" in block_reason
+
+    # 2. Near-duplicate text overlap (pruned direction survives in memory) → blocked
+    block_reason_overlap = _check_gap_respawn_block(
+        "model gc garbage collection entry memory pruning",  # 4+ shared tokens
+        None,  # gap_id absent (agent omitted it) → text-overlap gate fires
+        retired_memory,
+        cooldown_days=14,
+    )
+    assert block_reason_overlap is not None, (
+        "Text-overlap duplicate of a pruned retired direction should be blocked"
+    )
+
+    # 3. Genuinely distinct direction on a different gap → NOT blocked
+    no_block = _check_gap_respawn_block(
+        "authentication oauth token refresh pipeline",
+        "g-auth-refresh",  # different gap
+        retired_memory,
+        cooldown_days=14,
+    )
+    assert no_block is None, "Distinct direction on a different gap should not be blocked"
+
+
 # ── _record_strategic_task_failure ───────────────────────────────────────────
 
 
@@ -1746,6 +1943,116 @@ class TestCheckDirectionStarvation:
         assert len(project.directions) == 2
         assert project.vision.get("_direction_starvation_count") == 5
         alert_mock.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_starvation_fallback_dedups_against_persisted_rejected_memory(
+        self, strat_fail_db, mocker
+    ):
+        """Starvation fallback deduplicates against vision['rejected_proposals'].
+
+        The directions list contains no active product directions (triggering
+        NO_PRODUCT_DIRECTIONS gap).  The fallback text is "Deliver user-visible
+        product improvements".  We pre-seed vision['rejected_proposals'] with a
+        recent entry whose text overlaps enough (>=4 shared non-stopword tokens)
+        to trigger the duplicate guard — simulating the scenario where the
+        matching direction was pruned from the directions list but its rejection
+        was persisted in vision memory.  The fallback must NOT create a new
+        direction; instead it resets the counter and fires an alert.
+        """
+        alert_mock = mocker.patch(
+            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
+        )
+        from datetime import timezone
+
+        recent_ts = (
+            __import__("datetime").datetime.now(timezone.utc).isoformat()
+        )
+        project = Project(
+            name="P",
+            user_id="u1",
+            vision={
+                "_direction_starvation_count": 4,
+                "rejected_proposals": [
+                    {
+                        # >=4 shared non-stopword tokens with fallback text
+                        # "Deliver user-visible product improvements"
+                        "text": "Deliver user-visible product improvements for users",
+                        "rejected_at": recent_ts,
+                    }
+                ],
+            },
+            directions=[
+                _active_dir(id="1", category="structural"),
+                _active_dir(id="2", category="structural"),
+                _active_dir(id="3", category="structural"),
+            ],
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db
+        )
+
+        # No new direction created — dedup matched persisted rejected memory
+        assert len(project.directions) == 3
+        # Counter reset (dedup path resets and alerts instead of creating)
+        assert project.vision.get("_direction_starvation_count") == 0
+        # Alert fired to prompt manual intervention
+        alert_mock.assert_called_once()
+
+    async def test_starvation_fallback_dedups_against_retired_memory(
+        self, strat_fail_db, mocker
+    ):
+        """Starvation fallback is suppressed when its text overlaps a recently-retired direction.
+
+        Proof: counter reset + operator alert fired, no direction created.
+        """
+        alert_mock = mocker.patch(
+            "app.alert_dispatch._create_strategic_alert", new=AsyncMock()
+        )
+        from datetime import timezone
+
+        recent_ts = (
+            __import__("datetime").datetime.now(timezone.utc).isoformat()
+        )
+        # Pre-seed retired memory with tokens that overlap the fallback
+        # "Deliver user-visible product improvements" (NO_PRODUCT_DIRECTIONS gap).
+        project = Project(
+            name="P",
+            user_id="u1",
+            vision={
+                "_direction_starvation_count": 4,
+                "_recently_retired_directions": [
+                    {
+                        "id": "d-retired1",
+                        "text_tokens": list(
+                            {"deliver", "user-visible", "product", "improvements"}
+                        ),
+                        "retired_at": recent_ts,
+                        "reason": "strategic_retire",
+                    }
+                ],
+            },
+            directions=[
+                _active_dir(id="1", category="structural"),
+                _active_dir(id="2", category="structural"),
+                _active_dir(id="3", category="structural"),
+            ],
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+
+        await _check_direction_starvation(
+            project, dirs_created=0, session=strat_fail_db
+        )
+
+        # No new direction created — dedup matched retired memory
+        assert len(project.directions) == 3
+        # Counter reset (dedup path resets and alerts instead of creating)
+        assert project.vision.get("_direction_starvation_count") == 0
+        # Alert fired to prompt manual intervention
+        alert_mock.assert_called_once()
 
 
 # ── Rationale persistence & retrieval ────────────────────────────────────────
@@ -9163,6 +9470,54 @@ class TestPortfolioOperations:
         )
         assert rec["portfolio_operations"] == []
 
+    def test_stage_direction_with_text_reclassified_to_create(self):
+        # A stage_direction verdict carrying text but NO direction_id is really a
+        # vote to STAGE A NEW direction, which the strategist executes as
+        # create_direction(staged=true) (the stage path cannot create). The stored
+        # op + fingerprint must match that create_direction move, otherwise the
+        # approved staged-create is hard-blocked as "no matching verdict".
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "portfolio_operations": [
+                    {
+                        "op": "stage_direction",
+                        "text": "Stand up a local-GPU runner lane",
+                        "verdict": "approved",
+                    }
+                ],
+            }
+        )
+        ops = rec["portfolio_operations"]
+        assert len(ops) == 1
+        assert ops[0]["op"] == "create_direction"
+        assert ops[0]["fingerprint"] == portfolio_operation_fingerprint(
+            "create_direction", text="Stand up a local-GPU runner lane"
+        )
+        assert ops[0]["fingerprint"].startswith("create_direction:text:")
+        assert ops[0]["verdict"] == "approved"
+
+    def test_stage_direction_with_direction_id_is_unchanged(self):
+        # Staging an EXISTING direction by id stays a real stage_direction op.
+        rec = sanitize_strategic_challenge_record(
+            {
+                "status": "ok",
+                "portfolio_operations": [
+                    {
+                        "op": "stage_direction",
+                        "direction_id": "d-1",
+                        "verdict": "approved",
+                    }
+                ],
+            }
+        )
+        ops = rec["portfolio_operations"]
+        assert len(ops) == 1
+        assert ops[0]["op"] == "stage_direction"
+        assert ops[0]["fingerprint"] == portfolio_operation_fingerprint(
+            "stage_direction", direction_id="d-1"
+        )
+
 
 class TestPortfolioOperationFingerprint:
     def test_id_keyed_ops_are_stable_and_canonical(self):
@@ -9249,6 +9604,26 @@ class TestChallengeRejectsPortfolioOp:
     def test_missing_record_does_not_block(self):
         assert challenge_rejects_portfolio_op(
             None, "retire_direction", direction_id="d-1"
+        ) == (False, "")
+
+    def test_approved_staged_create_is_not_blocked(self):
+        # Regression: a stage_direction verdict with text (no direction_id) is the
+        # approval to STAGE A NEW direction, which the strategist runs as
+        # create_direction(staged=true). The stored verdict is reclassified to
+        # create_direction so the gate matches the executed op rather than failing
+        # with "no matching portfolio_operations verdict" every cycle.
+        rec = self._rec(
+            [
+                {
+                    "op": "stage_direction",
+                    "text": "Stand up a local-GPU runner lane",
+                    "verdict": "approved",
+                }
+            ]
+        )
+        assert rec["portfolio_operations"][0]["op"] == "create_direction"
+        assert challenge_rejects_portfolio_op(
+            rec, "create_direction", text="Stand up a local-GPU runner lane"
         ) == (False, "")
 
 
@@ -14294,6 +14669,153 @@ async def test_strategist_can_correct_already_set_version_goal(db_session):
     assert version.goal == "operator override", (
         f"Operator goal must not be overridden by strategist; got {version.goal!r}"
     )
+
+
+# ===========================================================================
+# extract_new_version_goal unit tests
+# ===========================================================================
+
+
+def test_extract_new_version_goal_valid_string():
+    """Valid, non-contentless strings are returned cleaned."""
+    from app.strategic_completion import extract_new_version_goal
+
+    goal = "Deliver autonomous coordination so Blueprint manages 3+ projects with zero daily interventions."
+    assert extract_new_version_goal(goal) == goal
+    # Trims surrounding whitespace
+    assert extract_new_version_goal(f"  {goal}  ") == goal
+
+
+def test_extract_new_version_goal_invalid_inputs():
+    """Non-string, blank, and None inputs are rejected."""
+    from app.strategic_completion import extract_new_version_goal
+
+    assert extract_new_version_goal(None) is None
+    assert extract_new_version_goal(42) is None
+    assert extract_new_version_goal([]) is None
+    assert extract_new_version_goal("") is None
+    assert extract_new_version_goal("   ") is None
+
+
+def test_extract_new_version_goal_contentless_rejected():
+    """Contentless single-word placeholder goals are rejected by is_contentless_goal."""
+    from app.strategic_completion import extract_new_version_goal
+
+    # is_contentless_goal only rejects single-word placeholders (see release_scoring.py)
+    assert extract_new_version_goal("test") is None
+    assert extract_new_version_goal("n/a") is None
+
+
+def test_extract_new_version_goal_max_length():
+    """Values are bounded to _NEW_VERSION_GOAL_MAX characters."""
+    from app.strategic_completion import extract_new_version_goal, _NEW_VERSION_GOAL_MAX
+
+    # A non-contentless string just under the limit passes
+    short_goal = "Deliver " + "x" * 400
+    result = extract_new_version_goal(short_goal)
+    assert result is not None
+    assert len(result) <= _NEW_VERSION_GOAL_MAX
+
+    # A very long string is truncated, not rejected
+    long_goal = "Deliver " + "x" * 2000
+    result_long = extract_new_version_goal(long_goal)
+    assert result_long is not None
+    assert len(result_long) == _NEW_VERSION_GOAL_MAX
+
+
+# ===========================================================================
+# _apply_new_version_goal — non-silent no-op logging
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_apply_new_version_goal_logs_info_when_no_open_version(db_session, caplog):
+    """When there is no open ReleaseVersion, _apply_new_version_goal must log at
+    INFO level (not silently swallow the no-op) so operators can diagnose why
+    the goal was not stored."""
+    import logging
+    from app.strategic_completion import _apply_new_version_goal
+
+    project = Project(
+        name="NoVersion",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    # No ReleaseVersion opened — project has no open version.
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with caplog.at_level(logging.INFO, logger="app.strategic_completion"):
+        await _apply_new_version_goal(
+            "A substantive directional goal that should have been stored.",
+            task, project, db_session, path="test",
+        )
+
+    assert any(
+        "skipping new_version_goal" in record.message and record.levelno == logging.INFO
+        for record in caplog.records
+    ), f"Expected INFO-level skip log; got: {[r.message for r in caplog.records]}"
+
+
+@pytest.mark.asyncio
+async def test_apply_new_version_goal_logs_info_when_operator_goal_frozen(db_session, caplog):
+    """When the open version has an operator-set goal, _apply_new_version_goal
+    must log at INFO level (not debug) so the skip is visible in standard logs."""
+    import logging
+    from app.strategic_completion import _apply_new_version_goal
+    from app import release_version as rv
+
+    project = Project(
+        name="OpFrozen",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_goal(version, "operator choice", editor_id="op@example.com", source="operator")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.goal_editor_info == "[operator:op@example.com]"
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    with caplog.at_level(logging.INFO, logger="app.strategic_completion"):
+        await _apply_new_version_goal(
+            "Strategist attempt that must be rejected.",
+            task, project, db_session, path="test",
+        )
+
+    assert any(
+        "operator goals are frozen to strategist" in record.message and record.levelno == logging.INFO
+        for record in caplog.records
+    ), f"Expected INFO-level frozen-goal log; got: {[r.message for r in caplog.records]}"
+
+    # Goal must remain unchanged
+    await db_session.refresh(version)
+    assert version.goal == "operator choice"
 
 
 # ===========================================================================

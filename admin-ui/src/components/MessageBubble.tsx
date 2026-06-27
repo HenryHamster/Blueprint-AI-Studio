@@ -2,6 +2,7 @@ import { X, Check, AlertTriangle, HelpCircle, Bug, StickyNote, MessageSquare, Pl
 import { useState, useCallback } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS } from './eventPrefs';
+import { MarkdownContent } from './MarkdownContent';
 
 type CitationState = 'absent' | 'present' | 'indeterminate';
 
@@ -28,6 +29,9 @@ function CopyableMessageRef({ msgId }: { msgId: string }) {
     <button
       onClick={copy}
       title="Copy message ref"
+      // Compact secondary affordance in the dense message-metadata header row;
+      // a 44px touch target would inflate every message's header on mobile.
+      data-viewport-allow-small-target
       className="inline-flex items-center gap-1 font-mono text-ui-sm text-neutral-600 hover:text-neutral-400 transition-colors"
     >
       {copied ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
@@ -222,7 +226,7 @@ export interface MessageBubbleProps {
   onSetResolveInput: (value: string) => void;
   onStartInvestigate: (msgId: string) => void;
   onCancelInvestigate: () => void;
-  onReply: (replyTo: { id: string; content: string; from: string }) => void;
+  onReply: (replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => void;
 }
 
 export function MessageBubble({
@@ -314,7 +318,15 @@ export function MessageBubble({
             </div>
           )}
           {/* Content */}
-          <p className="text-sm text-neutral-200 leading-relaxed whitespace-pre-wrap">{msg.content}</p>
+          {userMsg ? (
+            <div className="text-sm text-neutral-200 leading-relaxed">
+              <MarkdownContent content={msg.content} />
+            </div>
+          ) : (
+            <div className="text-sm text-neutral-200 leading-relaxed">
+              <MarkdownContent content={msg.content} />
+            </div>
+          )}
           <StaleCitationBadge msg={msg} />
           {/* Context badges */}
           <ContextBadges context={msg.context} fromType={msg.from_type} />
@@ -368,7 +380,7 @@ export function MessageBubble({
               </button>
             )}
             <button
-              onClick={() => onReply({ id: msg.id, content: msg.content, from: formatFromType(msg) })}
+              onClick={() => onReply({ id: msg.id, content: msg.content, from: formatFromType(msg), message_type: msg.message_type, status: msg.status })}
               title="Reply"
               className="text-neutral-600 hover:text-blue-400 p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
             >

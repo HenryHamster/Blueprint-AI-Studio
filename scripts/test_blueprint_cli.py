@@ -130,6 +130,10 @@ HELP_INVOCATIONS = [
     ["messages", "list"],
     ["messages", "send"],
     ["messages", "answer"],
+    ["messages", "confirm"],
+    ["messages", "confirm", "list"],
+    ["messages", "confirm", "accept"],
+    ["messages", "confirm", "dismiss"],
     ["fleet"],
     ["fleet", "pool"],
     ["fleet", "warm"],
@@ -141,12 +145,15 @@ HELP_INVOCATIONS = [
     ["knowledge"],
     ["knowledge", "list"],
     ["knowledge", "show"],
+    ["knowledge", "sweep"],
     ["compute"],
     ["compute", "list"],
     ["compute", "show"],
     ["compute", "kill"],
     ["compute", "analyze"],
     ["compute", "run"],
+    ["compute", "launch"],
+    ["tasks", "create"],
 ]
 
 
@@ -468,10 +475,32 @@ def mock_api(monkeypatch):
                      "active_tasks": 0, "rl_hit_count": 1, "disabled_models": {}},
                 ],
             }
-        if "/messages" in path and "/answer" in path and method == "POST":
-            msg_id = path.split("/messages/")[1].split("/answer")[0]
-            return {"id": f"answer-{msg_id[:8]}", "parent_message_id": msg_id,
-                    "status": "created", "type": "ANSWER"}
+        if "/messages/" in path and method == "PATCH":
+            msg_id = path.split("/messages/")[1].split("?")[0]
+            return {"id": msg_id, "status": "resolved"}
+        if "/pending-confirm/" in path and "/accept" in path and method == "POST":
+            pending_id = path.split("/pending-confirm/")[1].split("/accept")[0]
+            return {"status": "accepted", "pending_id": pending_id, "type": "major_decision"}
+        if "/pending-confirm/" in path and "/dismiss" in path and method == "POST":
+            pending_id = path.split("/pending-confirm/")[1].split("/dismiss")[0]
+            return {"status": "dismissed", "pending_id": pending_id}
+        if path.rstrip("/").endswith("/projects/proj-1") and method == "GET":
+            return {
+                "id": "proj-1",
+                "project_name": "test-project",
+                "problem_model": {
+                    "pending_user_confirmation": [
+                        {"id": "pend-abc123", "type": "major_decision",
+                         "proposal": "Should we adopt the new auth flow?",
+                         "rationale": "Current flow has scaling issues",
+                         "created_at": "2026-06-15T10:00:00Z"},
+                        {"id": "pend-def456", "type": "intent_change",
+                         "proposal": "Shift focus to mobile-first design",
+                         "rationale": "User feedback indicates mobile priority",
+                         "created_at": "2026-06-14T08:00:00Z"},
+                    ]
+                },
+            }
         if "/messages" in path and method == "POST":
             return {"id": "msg-abc", "status": "created", "arming": "not_armed"}
         if "/messages" in path:
@@ -687,15 +716,36 @@ def mock_api(monkeypatch):
             docs = [
                 {"id": "kdoc-001", "title": "API Rate Limiting", "source_kind": "web_research",
                  "direction_id": "d-abc12345", "created_at": "2026-06-15T00:00:00Z",
-                 "topic": "api", "tags": ["rate-limiting", "resilience"]},
+                 "topic": "api", "tags": ["rate-limiting", "resilience"],
+                 "sweep_id": None, "arm_label": None},
                 {"id": "kdoc-002", "title": "Design Patterns", "source_kind": "design",
                  "direction_id": "d-def67890", "created_at": "2026-06-14T00:00:00Z",
-                 "topic": "architecture", "tags": []},
+                 "topic": "architecture", "tags": [],
+                 "sweep_id": None, "arm_label": None},
+                {"id": "kdoc-arm-a", "title": "Sweep arm alpha", "source_kind": "compute_experiment",
+                 "direction_id": "d-sweep01", "created_at": "2026-06-20T00:00:00Z",
+                 "topic": "experiment", "tags": [],
+                 "sweep_id": "swp-test001", "arm_label": "alpha",
+                 "forward_quality_verdict": {
+                     "criterion_met": True,
+                     "cost_usd": 1.25,
+                     "result_metrics": {"accuracy": 0.92},
+                 }},
+                {"id": "kdoc-arm-b", "title": "Sweep arm beta", "source_kind": "compute_experiment",
+                 "direction_id": "d-sweep01", "created_at": "2026-06-20T01:00:00Z",
+                 "topic": "experiment", "tags": [],
+                 "sweep_id": "swp-test001", "arm_label": "beta",
+                 "forward_quality_verdict": {
+                     "criterion_met": False,
+                     "cost_usd": 1.10,
+                     "result_metrics": {"accuracy": 0.81},
+                 }},
             ]
             direction_f = qs.get("direction", [None])[0]
             source_kind_f = qs.get("source_kind", [None])[0]
             q_f = qs.get("q", [None])[0]
             tag_f = qs.get("tag", [None])[0]
+            sweep_id_f = qs.get("sweep_id", [None])[0]
             if direction_f:
                 docs = [d for d in docs if d.get("direction_id") == direction_f]
             if source_kind_f:
@@ -704,6 +754,8 @@ def mock_api(monkeypatch):
                 docs = [d for d in docs if q_f.lower() in (d.get("title") or "").lower()]
             if tag_f:
                 docs = [d for d in docs if tag_f in (d.get("tags") or [])]
+            if sweep_id_f:
+                docs = [d for d in docs if d.get("sweep_id") == sweep_id_f]
             return {"documents": docs, "total": len(docs)}
         if "/compute-jobs/" in path and "/kill" in path and method == "POST":
             job_id = path.split("/compute-jobs/")[1].split("/")[0]
@@ -759,6 +811,50 @@ def mock_api(monkeypatch):
                      {"label": "variant-b", "note": "second variant", "log": "variant-b run log\nperformance improved", "score": 0.88},
                  ]}},
                  "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.7}},
+                {"id": "cjob-eee0-0000-0000-000000000005",
+                 "status": "SUCCEEDED", "task_title": "Failed arms test",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 2.1,
+                 "experiment": "exp-failed",
+                 "criterion_verdict": {"met": False, "metric": "latency", "operator": "lt", "threshold": 100, "value": None, "measurable": False},
+                 "polling_metadata": {"result_metrics": {"arms": {"passing": {"latency": 75.0}, "crashed": {"exit_code": 1, "error": "arm result file not written (arm may have failed)"}, "no_metric": {"exit_code": 0, "error": "metric 'latency' not found in result"}}},
+                                      "command_log": {"text": "Running experiment\nArm 1 passed\nArm 2 crashed\nArm 3 completed but no metric", "truncated": False}},
+                 "success_criterion": {"metric": "latency", "operator": "lt", "threshold": 100}},
+                {"id": "cjob-fff0-0000-0000-000000000006",
+                 "status": "FAILED", "task_title": "Failed list-arm test",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 3.5,
+                 "experiment": "exp-failed-list-arm",
+                 "criterion_verdict": None,
+                 "polling_metadata": {"result_metrics": {"arms": [
+                     {"name": "arm_ok", "score": 0.85},
+                     {"name": "arm_timeout", "exit_code": 124,
+                      "reason": "arm timed out (exit 124): wall-clock limit exceeded",
+                      "stderr_excerpt": "Timeout after 3600s"},
+                 ]}},
+                 "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.8}},
+                {"id": "cjob-ggg0-0000-0000-000000000007",
+                 "status": "FAILED", "task_title": "Failed arm test",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 4.0,
+                 "experiment": "exp-failed-arm",
+                 "criterion_verdict": None,
+                 "polling_metadata": {"result_metrics": {"arms": {
+                     "arm_ok": {"score": 0.91},
+                     "arm_crash": {"exit_code": 1, "error": "arm crashed (exit 1): result file not written",
+                                   "stderr_excerpt": "Traceback (most recent call last):\n  ...\nRuntimeError: CUDA OOM"},
+                 }}},
+                 "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.8}},
+                {"id": "cjob-hhh0-0000-0000-000000000008",
+                 "status": "FAILED", "task_title": "Provisioning failure test",
+                 "task_type": "compute_experiment",
+                 "final_cost_usd": 0.0,
+                 "experiment": "exp-prov-fail",
+                 "terminal_reason": "VM provisioning failed: insufficient quota for machine_type n2-standard-32 in zone us-central1-a",
+                 "vm_phase": "provisioning",
+                 "launch_contract": {"requested_deadline_seconds": 7200, "provisioning_model": "SPOT"},
+                 "criterion_verdict": None,
+                 "success_criterion": {"metric": "latency", "operator": "lt", "threshold": 100}},
             ]
             job = next((j for j in _ALL_MOCK_JOBS if j["id"] == job_id), None)
             if job is None:
@@ -798,6 +894,15 @@ def mock_api(monkeypatch):
                      "polling_metadata": {"result_metrics": {"score": 0.95, "arms": {"baseline": {"score": 0.85, "label": "baseline version", "note": "original implementation", "log": "baseline test output\nall checks passed"}, "optimized": {"score": 0.95, "label": "optimized version", "note": "after refactoring", "log": "optimized test output\nperformance improved"}}},
                                           "command_log": {"text": "Setup phase complete\nRunning comprehensive benchmark\nResults collected\nAnalysis complete", "truncated": False}},
                      "success_criterion": {"metric": "score", "operator": "gt", "threshold": 0.8}},
+                    {"id": "cjob-eee0-0000-0000-000000000005",
+                     "status": "SUCCEEDED", "task_title": "Failed arms test",
+                     "task_type": "compute_experiment",
+                     "final_cost_usd": 2.1,
+                     "experiment": "exp-failed",
+                     "criterion_verdict": {"met": False, "metric": "latency", "operator": "lt", "threshold": 100, "value": None, "measurable": False},
+                     "polling_metadata": {"result_metrics": {"arms": {"passing": {"latency": 75.0}, "crashed": {"exit_code": 1, "error": "arm result file not written (arm may have failed)"}, "no_metric": {"exit_code": 0, "error": "metric 'latency' not found in result"}}},
+                                          "command_log": {"text": "Running experiment\nArm 1 passed\nArm 2 crashed\nArm 3 completed but no metric", "truncated": False}},
+                     "success_criterion": {"metric": "latency", "operator": "lt", "threshold": 100}},
                 ],
                 "has_more": False,
                 "limit": 20,
@@ -1203,6 +1308,52 @@ def test_promote_recover_qualify_fires_with_yes(mock_api, monkeypatch, capsys):
     rc = blueprint.main(["--json", "promote-recover", "qualify", "--yes"])
     assert rc == 0
     assert any(method == "POST" and "qualify" in path for method, path, _ in mock_api)
+
+
+def test_ops_requeue_failed_aborts_without_confirmation(mock_api, monkeypatch, capsys):
+    """ops requeue-failed without --yes on non-interactive stdin must not fire."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc = blueprint.main(["ops", "requeue-failed"])
+    assert rc == 0
+    # no PATCH to tasks should have been issued
+    assert not any("/tasks/" in path and method == "PATCH" for method, path, _ in mock_api)
+    err = capsys.readouterr().err
+    assert "Refusing to mutate without --yes" in err
+
+
+def test_ops_requeue_failed_read_only_config_refuses(mock_api, monkeypatch):
+    """ops requeue-failed refuses under a read-only (agent-JWT) config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["ops", "requeue-failed", "--yes"])
+    assert exc.value.code == 1
+
+
+def test_ops_requeue_failed_fires_with_yes(mock_api, monkeypatch, capsys):
+    """ops requeue-failed with --yes fires the mutation and emits human summary."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["ops", "requeue-failed", "--yes"])
+    assert rc == 0
+    # PATCH to tasks should have been issued
+    assert any("/tasks/" in path and method == "PATCH" for method, path, _ in mock_api)
+    out = capsys.readouterr().out
+    # human summary without --json
+    assert "Requeued" in out
+
+
+def test_ops_requeue_failed_json(mock_api, monkeypatch, capsys):
+    """ops requeue-failed --json emits JSON output."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["--json", "ops", "requeue-failed", "--yes"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert "count" in parsed
+    assert "requeued" in parsed
 
 
 def test_logs_json_with_mocked_fetch(monkeypatch, capsys):
@@ -2714,6 +2865,8 @@ def test_messages_group(mock_api, monkeypatch, capsys):
     assert "please fix the CI" in out
     assert "[Q]" in out            # QUESTION icon
     assert "operator" in out
+    assert "msg-001" in out        # message ID
+    assert "msg-002" in out        # message ID
     # default status=open must be sent
     assert any("/messages?status=open" in path for _, path, _ in mock_api)
 
@@ -2755,29 +2908,31 @@ def test_messages_group(mock_api, monkeypatch, capsys):
 
 
 def test_messages_answer(mock_api, monkeypatch, capsys):
-    """messages answer sends a threaded reply linked to the target message id."""
+    """messages answer resolves a QUESTION via PATCH /api/admin/messages/{id}."""
 
-    # --- answer posts correct body with message_id in URL ---
+    # --- answer calls PATCH with resolution body ---
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
     monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
     mock_api.clear()
     rc = blueprint.main(["messages", "answer", "msg-002", "yes, we are stuck"])
     assert rc == 0
-    post_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "/answer" in p]
-    assert len(post_calls) == 1
-    _, path, body = post_calls[0]
-    assert "/messages/msg-002/answer" in path
-    assert body["content"] == "yes, we are stuck"
+    patch_calls = [(m, p, b) for m, p, b in mock_api if m == "PATCH" and "/messages/msg-002" in p]
+    assert len(patch_calls) == 1
+    _, path, body = patch_calls[0]
+    assert "/messages/msg-002" in path
+    assert body["resolution"] == "yes, we are stuck"
+    # The old /answer POST route must not have been called
+    assert not any("/answer" in p for _, p, _ in mock_api)
     out = capsys.readouterr().out
-    assert "answer-msg" in out
+    assert "Answer sent" in out
 
-    # --- answer with --json emits valid JSON with parent_message_id ---
+    # --- answer with --json emits valid JSON with id and status ---
     mock_api.clear()
     rc = blueprint.main(["--json", "messages", "answer", "msg-002", "response text"])
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
-    assert parsed["parent_message_id"] == "msg-002"
-    assert parsed["type"] == "ANSWER"
+    assert parsed["id"] == "msg-002"
+    assert parsed["status"] == "resolved"
 
     # --- read-only config refuses answer ---
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
@@ -3048,7 +3203,7 @@ def test_compute_list_json(mock_api, capsys):
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
     jobs = parsed["compute_jobs"]
-    assert len(jobs) == 3
+    assert len(jobs) == 4
     # running job has no cost yet
     running = next(j for j in jobs if j["status"] == "RUNNING")
     assert running["task_title"] == "GPU benchmark alpha"
@@ -3056,7 +3211,7 @@ def test_compute_list_json(mock_api, capsys):
     assert running["final_cost_usd"] is None
     # succeeded jobs have cost and a criterion verdict
     done_jobs = [j for j in jobs if j["status"] == "SUCCEEDED"]
-    assert len(done_jobs) == 2
+    assert len(done_jobs) == 3
     gpu_benchmark = next(j for j in done_jobs if j["task_title"] == "GPU benchmark beta")
     assert gpu_benchmark["final_cost_usd"] == 12.5
     assert gpu_benchmark["criterion_verdict"]["met"] is True
@@ -3239,6 +3394,29 @@ def test_compute_show_renders_per_arm_transcript(mock_api, capsys):
     assert "optimized test output" in out
 
 
+def test_compute_show_renders_per_arm_failure_diagnostics(mock_api, capsys):
+    """compute show renders a crashed arm's exit code + error excerpt and flags a ran-but-no-metric arm."""
+    job_id = "cjob-eee0-0000-0000-000000000005"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Per-arm breakdown must appear
+    assert "per-arm results" in out
+    assert "passing" in out
+    assert "crashed" in out
+    assert "no_metric" in out
+    # Passing arm must show metric
+    assert "latency" in out
+    assert "75" in out or "75.0" in out
+    # Crashed arm must show exit code and error
+    assert "exit_code" in out or "exit code" in out
+    assert "1" in out
+    assert "arm result file not written" in out or "may have failed" in out
+    # No-metric arm must show exit code and error
+    assert "0" in out
+    assert "metric 'latency' not found" in out or "not found in result" in out
+
+
 def test_compute_show_registers_in_help_invocations():
     """'compute show' is in HELP_INVOCATIONS so --help parsing is verified."""
     assert ["compute", "show"] in HELP_INVOCATIONS
@@ -3322,6 +3500,141 @@ def test_knowledge_show_prefix_no_match_prints_error(monkeypatch, capsys):
     assert rc == 0
     err = capsys.readouterr().err
     assert "no-match" in err
+
+
+def test_knowledge_sweep_lists_arms_side_by_side(mock_api, capsys):
+    """knowledge sweep <sweep_id> renders a side-by-side arm comparison table."""
+    rc = blueprint.main(["knowledge", "sweep", "swp-test001"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Header shows the sweep id
+    assert "swp-test001" in out
+    # Both arm labels appear
+    assert "alpha" in out
+    assert "beta" in out
+    # criterion_met renders distinctly: MET vs NOT MET
+    assert "MET" in out
+    assert "NOT MET" in out
+    # Cost values appear
+    assert "1.25" in out
+    assert "1.10" in out
+    # The API was called with the sweep_id filter
+    assert any("sweep_id=swp-test001" in path for _, path, _ in mock_api)
+
+
+def test_knowledge_sweep_request_carries_sweep_id_and_source_kind(mock_api, capsys):
+    """knowledge sweep passes sweep_id and source_kind=compute_experiment to the API."""
+    blueprint.main(["knowledge", "sweep", "swp-test001"])
+    sweep_calls = [p for _, p, _ in mock_api if "sweep_id=swp-test001" in p]
+    assert sweep_calls, "Expected at least one API call with sweep_id=swp-test001"
+    assert all("source_kind=compute_experiment" in p for p in sweep_calls)
+
+
+def test_knowledge_sweep_empty_state(monkeypatch, capsys):
+    """knowledge sweep prints a clear message when no arm results are indexed."""
+    def fake_api(method, path, body=None, timeout=30):
+        if "/knowledge-documents" in path and method == "GET":
+            return {"documents": [], "total": 0}
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["knowledge", "sweep", "swp-missing"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "no arm results" in out.lower() or "none" in out.lower()
+
+
+def test_knowledge_sweep_aggregate_doc_arms_block(monkeypatch, capsys):
+    """knowledge sweep parses arm rows from an aggregate doc's forward_quality_verdict['arms'] block."""
+    aggregate_doc = {
+        "id": "kdoc-agg-1",
+        "title": "Sweep aggregate",
+        "source_kind": "compute_experiment",
+        "sweep_id": "swp-agg01",
+        "arm_label": None,
+        "forward_quality_verdict": {
+            "arms": {
+                "ctrl": {"criterion_met": True, "cost_usd": 0.50, "result_metrics": {"accuracy": 0.95}},
+                "trt": {"criterion_met": False, "cost_usd": 0.55, "result_metrics": {"accuracy": 0.78}},
+            }
+        },
+    }
+
+    def fake_api(method, path, body=None, timeout=30):
+        if "/knowledge-documents" in path and method == "GET":
+            return {"documents": [aggregate_doc], "total": 1}
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["knowledge", "sweep", "swp-agg01"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "ctrl" in out
+    assert "trt" in out
+    assert "MET" in out
+    assert "NOT MET" in out
+
+
+def test_knowledge_sweep_aggregate_arms_real_criterion_cost(monkeypatch, capsys):
+    """Aggregate doc with per_arm_verdicts renders real MET/NOT MET and dollar costs.
+
+    This is the acceptance test for the per-arm criterion+cost fix: the sweep
+    table must show real verdict strings and dollar amounts — never '?' — when
+    the aggregate document carries a per_arm_verdicts block (populated by the
+    backend cost-apportionment path) and an arms block (raw aggregator output).
+    """
+    aggregate_doc = {
+        "id": "kdoc-agg-real",
+        "title": "Real sweep aggregate",
+        "source_kind": "compute_experiment",
+        "sweep_id": "swp-real01",
+        "arm_label": None,
+        "forward_quality_verdict": {
+            "arms": {
+                "baseline": {"accuracy": 0.85, "exit_code": 0, "elapsed_seconds": 60.0},
+                "optimized": {"accuracy": 0.93, "exit_code": 0, "elapsed_seconds": 40.0},
+            },
+            "per_arm_verdicts": {
+                "baseline": {"value": 0.85, "met": False, "cost_usd": 0.15},
+                "optimized": {"value": 0.93, "met": True, "cost_usd": 0.10},
+            },
+        },
+    }
+
+    def fake_api(method, path, body=None, timeout=30):
+        if "/knowledge-documents" in path and method == "GET":
+            return {"documents": [aggregate_doc], "total": 1}
+        return {}
+
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    rc = blueprint.main(["knowledge", "sweep", "swp-real01"])
+    assert rc == 0
+    out = capsys.readouterr().out
+
+    # Both arm names appear
+    assert "baseline" in out
+    assert "optimized" in out
+
+    # Real criterion verdicts — no '?' for criterion
+    assert "MET" in out
+    assert "NOT MET" in out
+
+    # Real costs — dollar amounts appear, no '?' for cost
+    assert "$0.15" in out or "0.15" in out
+    assert "$0.10" in out or "0.10" in out
+
+    # No '?' in criterion or cost columns (every cell is resolved)
+    lines = [ln for ln in out.splitlines() if "baseline" in ln or "optimized" in ln]
+    for line in lines:
+        # Strip the arm name and metric columns, check criterion+cost are not '?'
+        parts = line.split()
+        assert "?" not in parts[2:], f"'?' found in criterion/cost column: {line!r}"
 
 
 def test_compute_kill_aborts_without_yes(mock_api, monkeypatch, capsys):
@@ -3444,6 +3757,64 @@ def test_compute_show_list_shaped_arms(mock_api, capsys):
     assert "second variant" in out
     assert "variant-a run log" in out
     assert "variant-b run log" in out
+
+
+def test_compute_show_failed_arm_renders_exit_and_error(mock_api, capsys):
+    """compute show renders a failed arm's exit code and error while the sibling arm's metric still appears."""
+    job_id = "cjob-ggg0-0000-0000-000000000007"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "per-arm results" in out
+    # Healthy arm still shows its metric
+    assert "[arm_ok]" in out
+    assert "0.91" in out
+    # Failed arm must show exit code and error reason
+    assert "[arm_crash]" in out
+    assert "exit_code: 1" in out
+    assert "arm crashed (exit 1): result file not written" in out
+    # stderr excerpt must appear
+    assert "CUDA OOM" in out
+
+
+def test_compute_show_list_arms_failed_arm_renders_diagnostics(mock_api, capsys):
+    """compute show renders failure diagnostics for a list-shaped arms entry with a timeout."""
+    job_id = "cjob-fff0-0000-0000-000000000006"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "per-arm results" in out
+    # Healthy arm still shows its metric
+    assert "[arm_ok]" in out
+    assert "0.85" in out
+    # Timed-out arm must show exit code and reason
+    assert "[arm_timeout]" in out
+    assert "exit_code: 124" in out
+    assert "wall-clock limit exceeded" in out
+    assert "Timeout after 3600s" in out
+
+
+def test_compute_show_renders_terminal_reason_and_provisioning_cause(mock_api, capsys):
+    """compute show renders terminal_reason and provisioning-failure diagnostics."""
+    job_id = "cjob-hhh0-0000-0000-000000000008"
+    rc = blueprint.main(["compute", "show", job_id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    # Terminal reason must be displayed
+    assert "terminal" in out
+    assert "VM provisioning failed" in out
+    assert "insufficient quota" in out
+    # Provisioning phase must be displayed
+    assert "vm_phase" in out
+    assert "provisioning" in out
+    # Launch contract must be displayed
+    assert "deadline" in out
+    assert "7200" in out
+    assert "model" in out
+    assert "SPOT" in out
+    # Status and title must be shown
+    assert "FAILED" in out
+    assert "Provisioning failure test" in out
 
 
 def test_compute_run_local(capsys):
@@ -3716,3 +4087,1093 @@ def test_compute_run_local_criterion_verdict_auc_case_mismatch(tmp_path, monkeyp
     assert "MET" in out
     assert "NOT MET" not in out
     assert "0.9" in out
+
+
+def test_compute_run_local_two_arm_metric_isolation(tmp_path, monkeypatch, capsys):
+    """Each arm writes to its own isolated result file; both values are captured independently (not last-arm-wins)."""
+    import subprocess as _subprocess
+
+    spec = {
+        "declared_metric": "score",
+        "arms": [
+            {"name": "arm_a", "command": "echo arm_a"},
+            {"name": "arm_b", "command": "echo arm_b"},
+        ],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run_arms(cmd, env=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+        if rf:
+            # Each arm writes a distinct score value to its own result file.
+            # arm_a gets 0.7; arm_b gets 0.9 — determined by the path suffix.
+            value = 0.7 if "arm_a" in rf else 0.9
+            with open(rf, "w") as f:
+                json.dump({"score": value}, f)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run_arms)
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    assert "SUCCEEDED" in out
+    # Both arm values must appear in output — not overwritten by last arm
+    assert "arm_a" in out
+    assert "arm_b" in out
+    assert "0.7" in out
+    assert "0.9" in out
+    # Verify the JSON result structure directly by re-running and capturing result
+    import io as _io
+    captured = _io.StringIO()
+    monkeypatch.setattr("sys.stdout", captured)
+    args2 = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args2)
+    # The render output shows per-arm values; both arms' distinct metric values present
+    out2 = captured.getvalue()
+    assert "arm_a" in out2 and "0.7" in out2
+    assert "arm_b" in out2 and "0.9" in out2
+
+
+def test_compute_run_local_arms_one_failure_captured(tmp_path, monkeypatch, capsys):
+    """One arm fails; the other arm's metric is still captured (failure does not suppress success)."""
+    import subprocess as _subprocess
+
+    spec = {
+        "declared_metric": "accuracy",
+        "arms": [
+            {"name": "good_arm", "command": "echo good"},
+            {"name": "bad_arm", "command": "exit 1"},
+        ],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run_mixed(cmd, env=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+
+        class R:
+            pass
+
+        if rf and "good_arm" in rf:
+            with open(rf, "w") as f:
+                json.dump({"accuracy": 0.85}, f)
+            R.returncode = 0
+        else:
+            R.returncode = 1
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run_mixed)
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint.cmd_compute(args)
+
+    out = capsys.readouterr().out
+    # Overall status reflects the failure
+    assert "FAILED" in out
+    # The good arm's metric must still appear
+    assert "good_arm" in out
+    assert "0.85" in out
+    # The bad arm is marked as failed, not silently dropped
+    assert "bad_arm" in out
+    assert "FAILED" in out
+
+
+def test_compute_run_local_arms_emit_canonical_shape(tmp_path, monkeypatch, capsys):
+    """Per-arm entries match the canonical aggregator shape on both success and failure."""
+    import subprocess as _subprocess
+
+    spec = {
+        "declared_metric": "accuracy",
+        "arms": [
+            {"name": "good_arm", "command": "echo good"},
+            {"name": "bad_arm", "command": "exit 1"},
+        ],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run_mixed(cmd, env=None, stderr=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+
+        class R:
+            pass
+
+        if rf and "good_arm" in rf:
+            with open(rf, "w") as f:
+                json.dump({"accuracy": 0.85}, f)
+            R.returncode = 0
+        else:
+            R.returncode = 1
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run_mixed)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["--json", "compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    arms_block = data["metrics"]["arms"]
+
+    # Success arm: {declared_metric: value, exit_code: 0} — no legacy __failed__ key
+    good = arms_block["good_arm"]
+    assert good["accuracy"] == 0.85
+    assert good["exit_code"] == 0
+    assert "__failed__" not in good
+    assert "error" not in good
+
+    # Failure arm: {error: reason, exit_code: N} — no legacy __failed__ / __exit_code__ keys
+    bad = arms_block["bad_arm"]
+    assert "error" in bad
+    assert bad["exit_code"] == 1
+    assert "__failed__" not in bad
+    assert "__exit_code__" not in bad
+    # Reason should be a classified string mentioning the exit code
+    assert "exit 1" in bad["error"] or "crash" in bad["error"]
+
+
+def test_compute_run_arms_success_extracts_declared_metric(tmp_path, monkeypatch, capsys):
+    """Successful arm with declared_metric emits only {declared_metric, exit_code}, not the full dict."""
+    import subprocess as _subprocess
+
+    spec = {
+        "declared_metric": "loss",
+        "arms": [{"name": "arm_a", "command": "echo hi"}],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run(cmd, env=None, stderr=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+        if rf:
+            with open(rf, "w") as f:
+                json.dump({"loss": 0.12, "extra_field": "noise"}, f)
+
+        class R:
+            returncode = 0
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["--json", "compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    arm = data["metrics"]["arms"]["arm_a"]
+    assert arm["loss"] == 0.12
+    assert arm["exit_code"] == 0
+    # The canonical shape extracts only the declared metric (plus exit_code)
+    assert "extra_field" not in arm
+
+
+def test_compute_run_arms_exit0_metric_missing_emits_unmeasured_reason(tmp_path, monkeypatch, capsys):
+    """Arm exits 0 but declared_metric is absent from result → unmeasured criterion error."""
+    import subprocess as _subprocess
+
+    spec = {
+        "declared_metric": "auc",
+        "arms": [{"name": "arm_x", "command": "echo hi"}],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run(cmd, env=None, stderr=None, **kwargs):
+        rf = env.get("BLUEPRINT_RESULT_FILE") if env else None
+        if rf:
+            # Writes result file but WITHOUT the declared metric
+            with open(rf, "w") as f:
+                json.dump({"wrong_metric": 0.5}, f)
+
+        class R:
+            returncode = 0
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["--json", "compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    arm = data["metrics"]["arms"]["arm_x"]
+    assert "error" in arm
+    assert arm["exit_code"] == 0
+    assert "unmeasured criterion" in arm["error"]
+    assert "auc" in arm["error"]
+
+
+def test_compute_run_arms_stderr_captured_in_failure_entry(tmp_path, monkeypatch, capsys):
+    """Failed arm's stderr output appears as stderr_excerpt in the canonical entry."""
+    import subprocess as _subprocess
+
+    spec = {
+        "declared_metric": "score",
+        "arms": [{"name": "failing_arm", "command": "echo oops >&2; exit 2"}],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run(cmd, env=None, stderr=None, **kwargs):
+        # Write stderr content to the captured file handle if provided
+        if stderr is not None and hasattr(stderr, "write"):
+            stderr.write(b"Traceback: something went wrong\n")
+
+        class R:
+            returncode = 2
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["--json", "compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    arm = data["metrics"]["arms"]["failing_arm"]
+    assert "error" in arm
+    assert arm["exit_code"] == 2
+    assert "stderr_excerpt" in arm
+    assert "Traceback" in arm["stderr_excerpt"]
+
+
+# ── GPU detection tests ───────────────────────────────────────────────────────
+
+
+def test_detect_local_gpu_no_gpu(monkeypatch):
+    """_detect_local_gpu returns detected=False when neither nvidia-smi nor rocm-smi is present."""
+    monkeypatch.setattr(blueprint.shutil, "which", lambda cmd: None)
+    result = blueprint._detect_local_gpu()
+    assert result["detected"] is False
+    assert result["backend"] is None
+    assert result["devices"] == []
+
+
+def test_detect_local_gpu_nvidia_found(monkeypatch):
+    """_detect_local_gpu returns detected=True with backend=nvidia and device name from nvidia-smi."""
+    import subprocess as _subprocess
+
+    def fake_which(cmd):
+        return "/usr/bin/nvidia-smi" if cmd == "nvidia-smi" else None
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            returncode = 0
+            stdout = "Tesla T4\n"
+        return R()
+
+    monkeypatch.setattr(blueprint.shutil, "which", fake_which)
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    result = blueprint._detect_local_gpu()
+    assert result["detected"] is True
+    assert result["backend"] == "nvidia"
+    assert "Tesla T4" in result["devices"]
+
+
+def test_detect_local_gpu_nvidia_fails_gracefully(monkeypatch):
+    """_detect_local_gpu returns detected=False when nvidia-smi is present but returns non-zero."""
+    import subprocess as _subprocess
+
+    def fake_which(cmd):
+        return "/usr/bin/nvidia-smi" if cmd == "nvidia-smi" else None
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            returncode = 1
+            stdout = ""
+        return R()
+
+    monkeypatch.setattr(blueprint.shutil, "which", fake_which)
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    result = blueprint._detect_local_gpu()
+    assert result["detected"] is False
+
+
+def test_detect_local_gpu_nvidia_exception_soft_fail(monkeypatch):
+    """_detect_local_gpu returns detected=False when subprocess.run raises (e.g. timeout)."""
+    import subprocess as _subprocess
+
+    def fake_which(cmd):
+        return "/usr/bin/nvidia-smi" if cmd == "nvidia-smi" else None
+
+    def fake_run(cmd, **kwargs):
+        raise _subprocess.TimeoutExpired(cmd, 5)
+
+    monkeypatch.setattr(blueprint.shutil, "which", fake_which)
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+
+    result = blueprint._detect_local_gpu()
+    assert result["detected"] is False
+
+
+def test_compute_run_detects_and_reports_local_gpu(tmp_path, monkeypatch, capsys):
+    """compute run reports the detected GPU in output and injects BLUEPRINT_LOCAL_GPU into the subprocess env."""
+    import subprocess as _subprocess
+
+    injected_env = {}
+
+    def fake_run(cmd, env=None, **kwargs):
+        if env:
+            injected_env.update(env)
+            rf = env.get("BLUEPRINT_RESULT_FILE")
+            if rf:
+                import json as _json
+                with open(rf, "w") as f:
+                    _json.dump({"accuracy": 0.9}, f)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": True, "backend": "nvidia", "devices": ["Tesla T4"],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "echo hi"])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    assert "gpu" in out
+    assert "Tesla T4" in out
+    assert injected_env.get("BLUEPRINT_LOCAL_GPU") == "Tesla T4"
+
+
+def test_compute_run_no_gpu_reports_none(tmp_path, monkeypatch, capsys):
+    """compute run reports 'gpu : none' and injects BLUEPRINT_LOCAL_GPU=none when no GPU detected."""
+    import subprocess as _subprocess
+
+    injected_env = {}
+
+    def fake_run(cmd, env=None, **kwargs):
+        if env:
+            injected_env.update(env)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "echo hi"])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    assert "gpu         : none" in out
+    assert injected_env.get("BLUEPRINT_LOCAL_GPU") == "none"
+
+
+def test_compute_run_gpu_in_json_result(tmp_path, monkeypatch, capsys):
+    """compute run --json includes 'gpu' key with detected field in the emitted JSON."""
+    import subprocess as _subprocess
+
+    def fake_run(cmd, env=None, **kwargs):
+        if env:
+            rf = env.get("BLUEPRINT_RESULT_FILE")
+            if rf:
+                import json as _json
+                with open(rf, "w") as f:
+                    _json.dump({"loss": 0.3}, f)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": True, "backend": "nvidia", "devices": ["RTX 4090"],
+    })
+
+    args = blueprint.build_parser().parse_args(["--json", "compute", "run", "echo hi"])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    data = json.loads(out)
+    assert "gpu" in data
+    assert data["gpu"]["detected"] is True
+    assert data["gpu"]["backend"] == "nvidia"
+    assert "RTX 4090" in data["gpu"]["devices"]
+
+
+def test_compute_run_arms_gpu_detected(tmp_path, monkeypatch, capsys):
+    """compute run with arms also reports the GPU line when a GPU is detected."""
+    import subprocess as _subprocess
+
+    spec = {
+        "arms": [
+            {"name": "arm_a", "command": "echo hi"},
+        ],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run(cmd, env=None, **kwargs):
+        if env:
+            rf = env.get("BLUEPRINT_RESULT_FILE")
+            if rf:
+                import json as _json
+                with open(rf, "w") as f:
+                    _json.dump({"score": 1.0}, f)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": True, "backend": "nvidia", "devices": ["Tesla V100"],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    assert "gpu" in out
+    assert "Tesla V100" in out
+
+
+def test_compute_run_arms_json_mode_produces_valid_json(tmp_path, monkeypatch, capsys):
+    """compute run --json with a multi-arm spec emits valid JSON with no extra text."""
+    import subprocess as _subprocess
+
+    spec = {
+        "arms": [
+            {"name": "arm_a", "command": "echo hi"},
+            {"name": "arm_b", "command": "echo bye"},
+        ],
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    def fake_run(cmd, env=None, **kwargs):
+        if env:
+            rf = env.get("BLUEPRINT_RESULT_FILE")
+            if rf:
+                import json as _json
+                with open(rf, "w") as f:
+                    _json.dump({"score": 0.9}, f)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["--json", "compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    out = capsys.readouterr().out
+    # Must be parseable as JSON with no leading text from per-arm prints
+    data = json.loads(out)
+    assert "status" in data
+    assert "metrics" in data
+    arms_block = data["metrics"]["arms"]
+    assert "arm_a" in arms_block
+    assert "arm_b" in arms_block
+
+
+# ---------------------------------------------------------------------------
+# Container-image wrapping tests for _compute_run_local (single-command + arms)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_run_local_single_command_wrapped_in_docker(tmp_path, monkeypatch, capsys):
+    """When container_image is set, the single-command path runs 'docker run' not bare bash."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "python train.py",
+        "container_image": "myregistry.io/myimage:latest",
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    captured_cmds = []
+
+    def fake_run(cmd, env=None, **kwargs):
+        captured_cmds.append(list(cmd) if isinstance(cmd, list) else cmd)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    # The run command must use docker, not bare bash
+    run_cmds = [c for c in captured_cmds if isinstance(c, list) and c[:2] == ["docker", "run"]]
+    assert run_cmds, f"expected a 'docker run' invocation; got commands: {captured_cmds}"
+    docker_cmd = run_cmds[0]
+    assert "myregistry.io/myimage:latest" in docker_cmd
+    assert "BLUEPRINT_RESULT_FILE" in " ".join(docker_cmd)
+    # No --gpus when no GPU detected
+    assert "--gpus" not in docker_cmd
+
+
+def test_compute_run_local_single_command_docker_gpus_when_gpu_detected(tmp_path, monkeypatch, capsys):
+    """When container_image is set and a GPU is detected, --gpus all is added to docker run."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "python train.py",
+        "container_image": "myregistry.io/myimage:cuda",
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    captured_cmds = []
+
+    def fake_run(cmd, env=None, **kwargs):
+        captured_cmds.append(list(cmd) if isinstance(cmd, list) else cmd)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": True, "backend": "nvidia", "devices": ["Tesla T4"],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    run_cmds = [c for c in captured_cmds if isinstance(c, list) and c[:2] == ["docker", "run"]]
+    assert run_cmds, f"expected 'docker run'; got: {captured_cmds}"
+    docker_cmd = run_cmds[0]
+    assert "--gpus" in docker_cmd
+    assert "all" in docker_cmd
+
+
+def test_compute_run_local_no_container_uses_bare_bash(tmp_path, monkeypatch, capsys):
+    """When container_image is absent, the command runs via bare bash -lc (unchanged path)."""
+    import subprocess as _subprocess
+
+    captured_cmds = []
+
+    def fake_run(cmd, env=None, **kwargs):
+        captured_cmds.append(list(cmd) if isinstance(cmd, list) else cmd)
+        if env:
+            rf = env.get("BLUEPRINT_RESULT_FILE")
+            if rf:
+                with open(rf, "w") as f:
+                    json.dump({"loss": 0.5}, f)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "echo hi"])
+    blueprint._compute_run_local(args)
+
+    assert any(
+        isinstance(c, list) and c[:2] == ["bash", "-lc"]
+        for c in captured_cmds
+    ), f"expected bare 'bash -lc'; got: {captured_cmds}"
+    # No docker invocation
+    assert not any(
+        isinstance(c, list) and "docker" in c
+        for c in captured_cmds
+    ), f"expected no docker call; got: {captured_cmds}"
+
+
+def test_compute_run_local_arms_wrapped_in_docker_per_arm(tmp_path, monkeypatch, capsys):
+    """When container_image is set with arms, each arm command runs via a separate docker run."""
+    import subprocess as _subprocess
+
+    spec = {
+        "arms": [
+            {"name": "adam", "command": "python train.py --opt adam"},
+            {"name": "sgd", "command": "python train.py --opt sgd"},
+        ],
+        "declared_metric": "val_loss",
+        "container_image": "myregistry.io/myimage:latest",
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    captured_cmds = []
+
+    def fake_run(cmd, env=None, **kwargs):
+        captured_cmds.append(list(cmd) if isinstance(cmd, list) else cmd)
+
+        class R:
+            returncode = 0
+
+        return R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    docker_run_cmds = [
+        c for c in captured_cmds if isinstance(c, list) and c[:2] == ["docker", "run"]
+    ]
+    # One docker run per arm
+    assert len(docker_run_cmds) == 2, f"expected 2 docker run invocations; got: {captured_cmds}"
+    for docker_cmd in docker_run_cmds:
+        assert "myregistry.io/myimage:latest" in docker_cmd
+        assert "BLUEPRINT_RESULT_FILE" in " ".join(docker_cmd)
+        assert "--gpus" not in docker_cmd  # no GPU detected
+
+
+# ---------------------------------------------------------------------------
+# docker-login alignment tests (_compute_docker_login / _compute_run_local)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_run_docker_login_password_only_and_failure(tmp_path, monkeypatch):
+    """Login is attempted when only a password is supplied; a failed login aborts before pull."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "python train.py",
+        "container_image": "nvcr.io/nvidia/pytorch:24.01",
+        "container_registry_auth": {"password": "secret"},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    login_calls = []
+
+    class _FailResult:
+        returncode = 1
+        stderr = b"unauthorized"
+
+    class _OkResult:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(cmd, **kwargs):
+        login_calls.append(list(cmd) if isinstance(cmd, list) else cmd)
+        if cmd[0] == "docker" and cmd[1] == "login":
+            return _FailResult()
+        return _OkResult()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    with pytest.raises(SystemExit) as exc_info:
+        blueprint._compute_run_local(args)
+
+    assert exc_info.value.code == 1
+    # login was attempted
+    login_invocations = [c for c in login_calls if isinstance(c, list) and c[:2] == ["docker", "login"]]
+    assert login_invocations, "docker login must be called when password is present"
+    # docker pull was NOT called after the failed login
+    pull_invocations = [c for c in login_calls if isinstance(c, list) and "pull" in c]
+    assert not pull_invocations, "docker pull must not be called after a failed login"
+
+
+def test_compute_run_docker_login_password_only_gates_login(tmp_path, monkeypatch):
+    """docker login is attempted even when server and username are absent, if password is set."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "echo hi",
+        "container_image": "nvcr.io/nvidia/pytorch:24.01",
+        "container_registry_auth": {"password": "tok3n"},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    login_cmds = []
+
+    class _R:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(cmd, **kwargs):
+        if isinstance(cmd, list) and cmd[:2] == ["docker", "login"]:
+            login_cmds.append(list(cmd))
+        return _R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    assert login_cmds, "expected docker login to be called when password is present without server/username"
+    login_cmd = login_cmds[0]
+    assert "--password-stdin" in login_cmd
+    # no --username flag because username was not set
+    assert "--username" not in login_cmd
+    # no server appended because server was not set
+    assert "nvcr.io" not in login_cmd
+
+
+def test_compute_run_docker_login_skipped_when_no_password(tmp_path, monkeypatch):
+    """docker login is not called when container_registry_auth lacks a password."""
+    import subprocess as _subprocess
+
+    spec = {
+        "command": "echo hi",
+        "container_image": "myregistry.io/img:latest",
+        "container_registry_auth": {"server": "myregistry.io", "username": "user"},
+    }
+    spec_file = tmp_path / "spec.json"
+    spec_file.write_text(json.dumps(spec))
+
+    login_calls = []
+
+    class _R:
+        returncode = 0
+        stderr = b""
+
+    def fake_run(cmd, **kwargs):
+        if isinstance(cmd, list) and cmd[:2] == ["docker", "login"]:
+            login_calls.append(list(cmd))
+        return _R()
+
+    monkeypatch.setattr(_subprocess, "run", fake_run)
+    monkeypatch.setattr(blueprint, "_detect_local_gpu", lambda: {
+        "detected": False, "backend": None, "devices": [],
+    })
+
+    args = blueprint.build_parser().parse_args(["compute", "run", "--local", str(spec_file)])
+    blueprint._compute_run_local(args)
+
+    assert not login_calls, "docker login must not be called when password is absent"
+
+
+# ── tasks create ─────────────────────────────────────────────────────────────
+
+def test_tasks_create_posts_task(mock_api, monkeypatch, capsys):
+    """tasks create POSTs to /api/admin/tasks with correct fields."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    rc = blueprint.main(["tasks", "create", "My new task", "Do the thing.", "--yes"])
+    assert rc == 0
+    create_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "/api/admin/tasks" in p and "compute-experiment" not in p]
+    assert create_calls, "Expected a POST to /api/admin/tasks"
+    body = create_calls[0][2]
+    assert body["title"] == "My new task"
+    assert body["prompt"] == "Do the thing."
+    assert body["github_repo"] == "owner/repo"
+    assert body["task_type"] == "create"
+    assert body["base_branch"] == "main"
+
+
+def test_tasks_create_custom_type_and_repo(mock_api, monkeypatch, capsys):
+    """tasks create respects --type, --repo, and --base-branch overrides."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "default/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "default/repo", "default_base_branch": "main",
+    })
+    rc = blueprint.main([
+        "tasks", "create", "Fix bug", "Patch the thing.",
+        "--type", "fix", "--repo", "myorg/myrepo", "--base-branch", "dev", "--yes",
+    ])
+    assert rc == 0
+    create_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "/api/admin/tasks" in p and "compute-experiment" not in p]
+    assert create_calls
+    body = create_calls[0][2]
+    assert body["task_type"] == "fix"
+    assert body["github_repo"] == "myorg/myrepo"
+    assert body["base_branch"] == "dev"
+
+
+def test_tasks_create_read_only_refused(mock_api, monkeypatch):
+    """tasks create refuses under a read-only (agent-JWT) config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["tasks", "create", "T", "P", "--yes"])
+    assert exc.value.code == 1
+
+
+def test_tasks_create_aborts_without_yes(mock_api, monkeypatch, capsys):
+    """tasks create aborts on non-interactive stdin without --yes."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc = blueprint.main(["tasks", "create", "T", "P"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Aborted" in out
+    assert not any(m == "POST" and "/api/admin/tasks" in p and "compute-experiment" not in p for m, p, _ in mock_api)
+
+
+def test_tasks_create_missing_repo_errors(mock_api, monkeypatch, capsys):
+    """tasks create exits with error when no repo is configured or supplied."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y", "default_repo": "",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y", "default_repo": "",
+    })
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["tasks", "create", "T", "P", "--yes"])
+    assert exc.value.code == 1
+
+
+# ── compute launch ────────────────────────────────────────────────────────────
+
+def test_compute_launch_creates_cloud_experiment(mock_api, monkeypatch, capsys):
+    """compute launch --dud --yes POSTs to /api/admin/tasks/compute-experiment with correct body."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    rc = blueprint.main(["compute", "launch", "--dud", "--yes"])
+    assert rc == 0
+    launch_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "compute-experiment" in p]
+    assert launch_calls, "Expected a POST to /api/admin/tasks/compute-experiment"
+    body = launch_calls[0][2]
+    assert body["github_repo"] == "owner/repo"
+    assert "dud_ok" in body["command"]
+    assert body["success_criterion"]["metric"] == "dud_ok"
+    assert body["success_criterion"]["operator"] == ">="
+    assert body["success_criterion"]["threshold"] == 1.0
+    assert body["spend_cap_usd"] == 0.50
+    assert body["deadline_seconds"] == 600
+
+
+def test_compute_launch_custom_command(mock_api, monkeypatch, capsys):
+    """compute launch with explicit --command and --metric posts the correct criterion."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    rc = blueprint.main([
+        "compute", "launch",
+        "--repo", "myorg/ml",
+        "--command", "python3 train.py",
+        "--metric", "accuracy",
+        "--operator", ">=",
+        "--threshold", "0.9",
+        "--title", "Train run",
+        "--yes",
+    ])
+    assert rc == 0
+    launch_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "compute-experiment" in p]
+    assert launch_calls
+    body = launch_calls[0][2]
+    assert body["github_repo"] == "myorg/ml"
+    assert body["command"] == "python3 train.py"
+    assert body["success_criterion"]["metric"] == "accuracy"
+    assert body["success_criterion"]["threshold"] == 0.9
+    assert body["title"] == "Train run"
+
+
+def test_compute_launch_read_only_refused(mock_api, monkeypatch):
+    """compute launch refuses under a read-only config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["compute", "launch", "--dud", "--yes"])
+    assert exc.value.code == 1
+
+
+def test_compute_launch_aborts_without_yes(mock_api, monkeypatch, capsys):
+    """compute launch aborts on non-interactive stdin without --yes."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y",
+        "default_repo": "owner/repo", "default_base_branch": "main",
+    })
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc = blueprint.main(["compute", "launch", "--dud"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Aborted" in out
+    assert not any(m == "POST" and "compute-experiment" in p for m, p, _ in mock_api)
+
+
+def test_compute_launch_no_command_errors(mock_api, monkeypatch):
+    """compute launch without --dud or --command exits with error."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {
+        "api_url": "x", "api_key": "y", "default_repo": "owner/repo",
+    })
+    monkeypatch.setattr(blueprint, "load_config", lambda: {
+        "api_url": "x", "api_key": "y", "default_repo": "owner/repo",
+    })
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["compute", "launch", "--yes"])
+    assert exc.value.code == 1
+
+
+# ── messages answer and confirm ───────────────────────────────────────────────
+
+def test_messages_answer_targets_real_endpoint(mock_api, monkeypatch, capsys):
+    """messages answer calls PATCH /api/admin/messages/{id} with resolution body,
+    not a fabricated POST to /projects/{pid}/messages/{id}/answer."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    msg_id = "msg-uuid-0001"
+    rc = blueprint.main(["messages", "answer", msg_id, "This is my answer"])
+    assert rc == 0
+    # Must have called PATCH /api/admin/messages/{msg_id}
+    patch_calls = [(m, p, b) for m, p, b in mock_api
+                   if m == "PATCH" and f"/messages/{msg_id}" in p]
+    assert patch_calls, "Expected a PATCH to /api/admin/messages/{msg_id}, none recorded"
+    _, path, body = patch_calls[0]
+    assert "resolution" in body, "Body must contain 'resolution' field"
+    assert body["resolution"] == "This is my answer"
+    # The old /answer POST route must NOT have been called
+    old_route_calls = [p for _, p, _ in mock_api if "/answer" in p]
+    assert not old_route_calls, f"Old /answer route was called: {old_route_calls}"
+
+
+def test_messages_confirm_list_json(mock_api, capsys):
+    """messages confirm list --json returns pending_user_confirmation from project."""
+    rc = blueprint.main(["--json", "messages", "confirm", "list"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert "pending" in parsed
+    assert len(parsed["pending"]) == 2
+    ids = [p["id"] for p in parsed["pending"]]
+    assert "pend-abc123" in ids
+    assert "pend-def456" in ids
+    # Must have fetched the project
+    assert any("/projects/proj-1" in p for _, p, _ in mock_api)
+
+
+def test_messages_confirm_list_human_render(mock_api, capsys):
+    """messages confirm list (human) shows pending IDs, types, and proposals."""
+    rc = blueprint.main(["messages", "confirm", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "PENDING CONFIRMATIONS" in out
+    assert "pend-abc123" in out
+    assert "major_decision" in out
+    assert "Should we adopt" in out
+
+
+def test_messages_confirm_accept_fires_with_yes(mock_api, monkeypatch, capsys):
+    """messages confirm accept --yes POSTs to /pending-confirm/{id}/accept."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["messages", "confirm", "accept", "pend-abc123",
+                         "--answer", "Yes, proceed", "--yes"])
+    assert rc == 0
+    accept_calls = [(m, p, b) for m, p, b in mock_api
+                    if m == "POST" and "/pending-confirm/pend-abc123/accept" in p]
+    assert accept_calls, "Expected POST to /pending-confirm/pend-abc123/accept"
+    _, _, body = accept_calls[0]
+    assert body.get("answer") == "Yes, proceed"
+    out = capsys.readouterr().out
+    assert "Accepted" in out
+
+
+def test_messages_confirm_accept_aborts_without_yes(mock_api, monkeypatch, capsys):
+    """messages confirm accept aborts on non-interactive stdin without --yes."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr("sys.stdin.isatty", lambda: False)
+    rc = blueprint.main(["messages", "confirm", "accept", "pend-abc123"])
+    assert rc == 0
+    accept_calls = [p for m, p, _ in mock_api
+                    if m == "POST" and "/pending-confirm/" in p]
+    assert not accept_calls, "accept must not fire without --yes on non-interactive stdin"
+    out = capsys.readouterr().out
+    assert "Aborted" in out
+
+
+def test_messages_confirm_dismiss_fires_with_yes(mock_api, monkeypatch, capsys):
+    """messages confirm dismiss --yes POSTs to /pending-confirm/{id}/dismiss."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    rc = blueprint.main(["messages", "confirm", "dismiss", "pend-def456",
+                         "--note", "Not needed anymore", "--yes"])
+    assert rc == 0
+    dismiss_calls = [(m, p, b) for m, p, b in mock_api
+                     if m == "POST" and "/pending-confirm/pend-def456/dismiss" in p]
+    assert dismiss_calls, "Expected POST to /pending-confirm/pend-def456/dismiss"
+    _, _, body = dismiss_calls[0]
+    assert body.get("note") == "Not needed anymore"
+    out = capsys.readouterr().out
+    assert "Dismissed" in out
+
+
+def test_messages_confirm_read_only_refused(mock_api, monkeypatch):
+    """messages confirm accept/dismiss refuse under a read-only config."""
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
+    with pytest.raises(SystemExit) as exc:
+        blueprint.main(["messages", "confirm", "accept", "pend-abc123", "--yes"])
+    assert exc.value.code == 1

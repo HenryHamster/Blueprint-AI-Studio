@@ -214,6 +214,17 @@ async def _ensure_vm_deleted(
     if not vm_id:
         return True  # No VM to delete
 
+    # Runner guard: vm_instance_ids prefixed 'runner:' are logical names, not
+    # GCE instance names.  There is no VM to delete — skip GCP calls entirely.
+    if vm_id.startswith("runner:"):
+        logger.info(
+            "[VM CLEANUP] Skipping GCP teardown for runner-pinned task (vm_id=%s, task=%s) "
+            "— no GCE instance exists for runner tasks",
+            vm_id,
+            task_id,
+        )
+        return True
+
     # Warm-pool guard: a live pool member that just finished a task is reconciled
     # by the pool lifecycle (returned to IDLE for re-lease, or retired by the
     # maintainer which also clears its secret + registry row). Tearing its VM down

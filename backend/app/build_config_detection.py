@@ -103,6 +103,14 @@ def apply_operator_build_config_overrides(
             detected["requires_ci_checks"] = False
         else:
             detected["requires_ci_checks"] = existing["requires_ci_checks"]
+    # The promotion-CI self-heal policy is operator-owned and never emitted by
+    # repo detection; carry an explicit choice (including False) forward so a
+    # manual re-detect / empty-config auto-refresh does not silently revert an
+    # operator opt-out back to the default-ON.
+    if "promotion_ci_selfheal_enabled" in existing:
+        detected["promotion_ci_selfheal_enabled"] = existing[
+            "promotion_ci_selfheal_enabled"
+        ]
     # Per-project parallelism overrides are operator-owned and never emitted
     # by repo detection; carry them forward so re-detect does not silently
     # lift a deliberate throttle (see schemas.BuildConfig).

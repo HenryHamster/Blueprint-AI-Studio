@@ -9,6 +9,12 @@ vi.mock('../api', () => ({
   // DirectionsPanel calls apiFetch, not fetch directly — route through
   // the global fetch stub so the test's mockFetch() responses still apply.
   apiFetch: (path: string, init?: RequestInit) => (globalThis.fetch as typeof fetch)(path, init),
+  // useDirectionsData also imports fetchVersionLifecycle and (since the #11917
+  // perf reorder) calls it at the TOP of fetchDirections, before the directions
+  // apiFetch calls. The mock factory fully replaces '../api', so this export must
+  // be present or it resolves to undefined and the call throws synchronously —
+  // which the try/catch swallows, silently skipping every later apiFetch.
+  fetchVersionLifecycle: vi.fn().mockResolvedValue(null),
 }));
 
 vi.mock('./DirectionCard', () => ({
@@ -156,8 +162,8 @@ describe('DirectionsPanel', () => {
 
   it('renders directions for the passed selectedProjectId and has no project picker', async () => {
     mockFetch(baseResponses);
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
-    await screen.findByPlaceholderText('New direction...');
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    await screen.findByRole('button', { name: 'New direction' });
     // No project <select> dropdown should be rendered
     expect(screen.queryByRole('combobox', { name: /project/i })).toBeNull();
     // Only the priority and category selects are present, not a project picker
@@ -177,12 +183,12 @@ describe('DirectionsPanel', () => {
         design_doc: {},
       },
     });
-    const { rerender } = render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
-    await screen.findByPlaceholderText('New direction...');
+    const { rerender } = render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    await screen.findByRole('button', { name: 'New direction' });
     const proj1CallCount = fetchSpy.mock.calls.filter((c) => String(c[0]).includes('proj1')).length;
     expect(proj1CallCount).toBeGreaterThan(0);
 
-    rerender(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj2" projects={TEST_PROJECTS} />);
+    rerender(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj2" projects={TEST_PROJECTS} />);
     await waitFor(() => {
       expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes('proj2'))).toBe(true);
     });
@@ -206,7 +212,7 @@ describe('DirectionsPanel', () => {
         design_doc: {},
       },
     });
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
     await screen.findByText('Build the feature');
     expect(screen.getByTestId('direction-card')).toBeInTheDocument();
   });
@@ -224,7 +230,7 @@ describe('DirectionsPanel', () => {
         design_doc: {},
       },
     });
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
     await screen.findByText('Active direction');
     // Section headers render as "{label} ({count})"
     expect(screen.getAllByText('Active (1)').length).toBeGreaterThan(0);
@@ -234,8 +240,8 @@ describe('DirectionsPanel', () => {
   it('clicking the Problem Model tab shows ProblemModelViewer', async () => {
     mockFetch(baseResponses);
     const user = userEvent.setup();
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
-    await screen.findByPlaceholderText('New direction...');
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    await screen.findByRole('button', { name: 'New direction' });
     await user.click(screen.getByRole('button', { name: /Problem Model/ }));
     expect(screen.getByTestId('problem-model-viewer')).toBeInTheDocument();
   });
@@ -243,8 +249,8 @@ describe('DirectionsPanel', () => {
   it('clicking the Running Update tab shows RunningUpdatePanel', async () => {
     mockFetch(baseResponses);
     const user = userEvent.setup();
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
-    await screen.findByPlaceholderText('New direction...');
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    await screen.findByRole('button', { name: 'New direction' });
     await user.click(screen.getByRole('button', { name: /Running Update/ }));
     expect(screen.getByTestId('running-update-panel')).toBeInTheDocument();
   });
@@ -252,8 +258,8 @@ describe('DirectionsPanel', () => {
   it('clicking the Design Doc tab shows DesignDocViewer', async () => {
     mockFetch(baseResponses);
     const user = userEvent.setup();
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
-    await screen.findByPlaceholderText('New direction...');
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    await screen.findByRole('button', { name: 'New direction' });
     await user.click(screen.getByRole('button', { name: 'Design Doc' }));
     expect(screen.getByTestId('design-doc-viewer')).toBeInTheDocument();
   });
@@ -261,8 +267,9 @@ describe('DirectionsPanel', () => {
   it('clicking the Add button triggers a POST fetch for the direction', async () => {
     mockFetch(baseResponses);
     const user = userEvent.setup();
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
-    // Wait for form to appear
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    // Expand the add-direction form, then locate the input
+    await user.click(await screen.findByRole('button', { name: 'New direction' }));
     const input = await screen.findByPlaceholderText('New direction...');
     // Add button is the only button in the same flex row as the input
     const parent = input.parentElement;
@@ -304,13 +311,21 @@ describe('DirectionsPanel', () => {
       return Promise.resolve({ ok: true, json: () => Promise.resolve({ directions: [] }) } as Response);
     });
 
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+
+    // First attempt — expand, click add (fails), form collapses
+    await user.click(await screen.findByRole('button', { name: 'New direction' }));
     const input = await screen.findByPlaceholderText('New direction...');
     const addBtn = input.parentElement?.querySelector('button');
     if (!addBtn) throw new Error('test setup: expected add button');
+    await user.click(addBtn); // fails — key retained, form collapses
 
-    await user.click(addBtn); // fails — key retained
-    await user.click(addBtn); // retry — same key
+    // Retry — re-expand form, find a fresh add button reference
+    await user.click(await screen.findByRole('button', { name: 'New direction' }));
+    const input2 = await screen.findByPlaceholderText('New direction...');
+    const addBtn2 = input2.parentElement?.querySelector('button');
+    if (!addBtn2) throw new Error('test setup: expected add button on retry');
+    await user.click(addBtn2); // retry — same key
 
     await waitFor(() => {
       const posts = fetchSpy.mock.calls.filter(
@@ -339,7 +354,8 @@ describe('DirectionsPanel', () => {
       return Promise.resolve({ ok: true, json: () => Promise.resolve({ directions: [] }) } as Response);
     });
 
-    render(<DirectionsPanel onClose={vi.fn()} addToast={addToast} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    render(<DirectionsPanel addToast={addToast} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    await user.click(await screen.findByRole('button', { name: 'New direction' }));
     const input = await screen.findByPlaceholderText('New direction...');
     const addBtn = input.parentElement?.querySelector('button');
     if (!addBtn) throw new Error('test setup: expected add button');
@@ -359,36 +375,36 @@ describe('DirectionsPanel', () => {
 
   it('renders the strategist-working indicator when strategistActive is true', async () => {
     mockFetch(baseResponses);
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive />);
-    await screen.findByPlaceholderText('New direction...');
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive />);
+    await screen.findByRole('button', { name: 'New direction' });
     expect(screen.getByText('Strategist working…')).toBeInTheDocument();
   });
 
   it('hides the strategist-working indicator when strategistActive is absent/false', async () => {
     mockFetch(baseResponses);
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
-    await screen.findByPlaceholderText('New direction...');
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
+    await screen.findByRole('button', { name: 'New direction' });
     expect(screen.queryByText('Strategist working…')).toBeNull();
   });
 
   it('shows generic "Strategist working…" when strategistActive=true and no cycleProgress (minimal event backward-compat)', async () => {
     mockFetch(baseResponses);
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={null} />);
-    await screen.findByPlaceholderText('New direction...');
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={null} />);
+    await screen.findByRole('button', { name: 'New direction' });
     expect(screen.getByText('Strategist working…')).toBeInTheDocument();
   });
 
   it('shows phase label from enriched cycleProgress event', async () => {
     mockFetch(baseResponses);
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={{ task_id: 't1', phase_label: 'Reviewing directions' }} />);
-    await screen.findByPlaceholderText('New direction...');
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={{ task_id: 't1', phase_label: 'Reviewing directions' }} />);
+    await screen.findByRole('button', { name: 'New direction' });
     expect(screen.getByText('Strategist: Reviewing directions…')).toBeInTheDocument();
   });
 
   it('shows steering excerpt under the phase label in directions panel', async () => {
     mockFetch(baseResponses);
-    render(<DirectionsPanel onClose={vi.fn()} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={{ task_id: 't1', phase_label: 'Evaluating', steering_excerpt: 'Focus on reliability' }} />);
-    await screen.findByPlaceholderText('New direction...');
+    render(<DirectionsPanel addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} strategistActive cycleProgress={{ task_id: 't1', phase_label: 'Evaluating', steering_excerpt: 'Focus on reliability' }} />);
+    await screen.findByRole('button', { name: 'New direction' });
     expect(screen.getByText('Strategist: Evaluating…')).toBeInTheDocument();
     expect(screen.getByText(/"Focus on reliability"/)).toBeInTheDocument();
   });
@@ -397,7 +413,7 @@ describe('DirectionsPanel', () => {
     mockFetch(baseResponses);
     render(
       <DirectionsPanel
-        onClose={vi.fn()}
+
         addToast={vi.fn()}
         selectedProjectId="proj1"
         projects={TEST_PROJECTS}
@@ -405,7 +421,7 @@ describe('DirectionsPanel', () => {
         lastCycleCompletion={{ status: 'completed', created_count: 2, tasks_spawned: 3 }}
       />
     );
-    await screen.findByPlaceholderText('New direction...');
+    await screen.findByRole('button', { name: 'New direction' });
     expect(screen.getByText('Cycle complete')).toBeInTheDocument();
     expect(screen.getByText(/\+2 direction/)).toBeInTheDocument();
     expect(screen.getByText(/3 tasks spawned/)).toBeInTheDocument();
@@ -415,7 +431,7 @@ describe('DirectionsPanel', () => {
     mockFetch(baseResponses);
     render(
       <DirectionsPanel
-        onClose={vi.fn()}
+
         addToast={vi.fn()}
         selectedProjectId="proj1"
         projects={TEST_PROJECTS}
@@ -423,19 +439,7 @@ describe('DirectionsPanel', () => {
         lastCycleCompletion={{ status: 'completed', created_count: 1 }}
       />
     );
-    await screen.findByPlaceholderText('New direction...');
+    await screen.findByRole('button', { name: 'New direction' });
     expect(screen.queryByText('Cycle complete')).toBeNull();
-  });
-
-  it('clicking the close backdrop fires onClose', async () => {
-    mockFetch(baseResponses);
-    const user = userEvent.setup();
-    const onClose = vi.fn();
-    const { container } = render(<DirectionsPanel onClose={onClose} addToast={vi.fn()} selectedProjectId="proj1" projects={TEST_PROJECTS} />);
-    await screen.findByPlaceholderText('New direction...');
-    // Backdrop is the div with both "absolute" and "inset-0" classes
-    const backdrop = container.querySelector('.absolute.inset-0');
-    await user.click(backdrop as HTMLElement);
-    expect(onClose).toHaveBeenCalledOnce();
   });
 });

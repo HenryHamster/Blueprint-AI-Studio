@@ -8,7 +8,7 @@ export interface MessagesComposerProps {
   newType: string;
   newContent: string;
   submitting: boolean;
-  replyTo: { id: string; content: string; from: string } | null;
+  replyTo: { id: string; content: string; from: string; message_type: string; status: string } | null;
   /** Outcome the server reported for the last send, or null before any send. */
   lastArming?: ArmingOutcome | null;
   /** Whether a strategic cycle is currently running (live WS-driven signal). */

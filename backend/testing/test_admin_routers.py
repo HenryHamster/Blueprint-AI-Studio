@@ -1116,6 +1116,61 @@ class TestUpdateProject:
         assert "revision" not in doc
 
     @pytest.mark.asyncio
+    async def test_design_doc_edit_preserves_underscore_system_keys(
+        self, client: AsyncClient, db_session
+    ):
+        """A wholesale design_doc edit from the doc editor (which surfaces only
+        public keys) must NOT drop system/operator-owned underscore-prefixed keys
+        such as _auto_remediation — this is exactly how an operator's enabled
+        auto-remediation config silently disappeared after a later doc edit. An
+        underscore key that IS in the payload still wins (explicit intent)."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.design_doc = {
+            "key": "old",
+            "_auto_remediation": {"enabled": True, "max_per_hour": 2},
+            "_issue_implementation": {"enabled": True},
+            "_meta": {"revision": 4},
+        }
+        flag_modified(project, "design_doc")
+        db_session.add(project)
+        await db_session.commit()
+
+        # The editor round-trips ONLY the public key.
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={"design_doc": {"key": "new"}, "design_doc_base_revision": 4},
+        )
+        assert resp.status_code == 200
+
+        await db_session.refresh(project)
+        doc = project.design_doc or {}
+        assert doc.get("key") == "new"
+        # System/operator-owned underscore keys survived the wholesale replace.
+        assert doc.get("_auto_remediation") == {"enabled": True, "max_per_hour": 2}
+        assert doc.get("_issue_implementation") == {"enabled": True}
+        assert doc.get("_meta", {}).get("revision") == 5
+
+        # An explicit underscore key in a later payload overrides the stored one.
+        resp = await client.patch(
+            f"/api/admin/projects/{project.id}",
+            json={
+                "design_doc": {
+                    "key": "new",
+                    "_auto_remediation": {"enabled": False},
+                },
+                "design_doc_base_revision": 5,
+            },
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        doc = project.design_doc or {}
+        assert doc.get("_auto_remediation") == {"enabled": False}
+        # The untouched underscore key is still preserved.
+        assert doc.get("_issue_implementation") == {"enabled": True}
+
+    @pytest.mark.asyncio
     async def test_design_doc_no_base_revision_always_succeeds(
         self, client: AsyncClient, db_session
     ):
@@ -3083,6 +3138,49 @@ class TestAutonomousMode:
         assert body["counts"].get(direction_id) == 1
         assert body["counts_by_type"][direction_id]["research"] == 1
 
+    @pytest.mark.asyncio
+    async def test_directions_lite_mode_omits_heavy_fields(
+        self, client: AsyncClient, db_session
+    ):
+        """?lite=1 omits design_doc, problem_model, self_reflection_log, and
+        running_update_reconciliation while preserving directions and lightweight fields."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session)
+        project.directions = [{"id": "d-lite1", "text": "Lite test", "priority": "medium"}]
+        project.design_doc = {"key": "large doc"}
+        project.problem_model = {"intent": {"purpose": "Build X."}}
+        project.self_reflection_log = [{"entry": "some reflection"}]
+        flag_modified(project, "directions")
+        flag_modified(project, "design_doc")
+        flag_modified(project, "problem_model")
+        flag_modified(project, "self_reflection_log")
+        db_session.add(project)
+        await db_session.commit()
+
+        # Full response includes heavy fields
+        full = await client.get(f"/api/admin/projects/{project.id}/directions")
+        assert full.status_code == 200
+        full_data = full.json()
+        assert "design_doc" in full_data
+        assert "problem_model" in full_data
+        assert "self_reflection_log" in full_data
+        assert len(full_data["directions"]) == 1
+
+        # Lite response omits heavy fields but keeps directions and lightweight fields
+        lite = await client.get(
+            f"/api/admin/projects/{project.id}/directions?lite=1"
+        )
+        assert lite.status_code == 200
+        lite_data = lite.json()
+        assert "design_doc" not in lite_data
+        assert "problem_model" not in lite_data
+        assert "self_reflection_log" not in lite_data
+        assert "running_update_reconciliation" not in lite_data
+        assert len(lite_data["directions"]) == 1
+        assert "autonomous_enabled" in lite_data
+        assert "running_update" in lite_data
+
 
 class TestAutonomyDebug:
     """Tests for GET /api/admin/projects/{project_id}/autonomy-debug."""
@@ -4648,6 +4746,60 @@ class TestMessages:
         assert note.context.get("event_type") == "question_answer"
         assert note.context.get("reply_to") == str(question.id)
         assert note.context.get("answer") == "Do X instead."
+
+    @pytest.mark.asyncio
+    async def test_operator_reply_resolves_open_question(
+        self, client: AsyncClient, db_session
+    ):
+        """Operator replying to an open QUESTION via PATCH resolves it and posts a question_answer NOTE.
+
+        This exercises the frontend reply path: when the operator types an answer
+        to a system QUESTION and submits, the UI calls PATCH /messages/{id} with the
+        answer as the resolution. The backend marks the question resolved and creates
+        a question_answer NOTE linked back to it so the strategist sees it answered.
+        """
+        from sqlmodel import select
+
+        project = await _make_project(db_session)
+        question = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="system",
+            content="Should I use approach A or B?",
+            status="open",
+        )
+        db_session.add(question)
+        await db_session.commit()
+        await db_session.refresh(question)
+
+        resp = await client.patch(
+            f"/api/admin/messages/{question.id}",
+            json={"resolution": "Use approach A."},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "resolved"
+
+        # Question row is now resolved with the operator's answer stored
+        await db_session.refresh(question)
+        assert question.status == "resolved"
+        assert question.resolution == "Use approach A."
+
+        # A question_answer NOTE was created so the strategist can read it
+        notes = (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.message_type == MessageType.NOTE,
+                    ProjectMessage.from_type == "user",
+                )
+            )
+        ).scalars().all()
+        assert len(notes) == 1, "Exactly one answer note should be created"
+        note = notes[0]
+        assert note.context is not None
+        assert note.context.get("event_type") == "question_answer"
+        assert note.context.get("reply_to") == str(question.id)
+        assert note.context.get("answer") == "Use approach A."
 
     @pytest.mark.asyncio
     async def test_delete_message(self, client: AsyncClient, db_session):
@@ -7971,6 +8123,333 @@ class TestDismissPendingConfirmation:
         )
         assert resp.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_dismiss_records_operator_note(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "revision": 5,
+            "last_updated": "2026-01-01T00:00:00",
+            "last_updated_by": "agent",
+            "intent": {"purpose": "", "current_focus": "", "user_purpose": ""},
+            "context": {},
+            "constraints": [],
+            "capabilities": [],
+            "gaps": [],
+            "archived_gaps": [],
+            "friction": [],
+            "pending_user_confirmation": [
+                {
+                    "id": "p-cred001",
+                    "type": "credentials_needed",
+                    "proposal": "Need AWS credentials for prod account.",
+                    "rationale": "Deploy pipeline is blocked.",
+                    "created_at": "2026-01-03T00:00:00",
+                },
+            ],
+            "revision_log": [],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-cred001/dismiss",
+            json={"note": "Credentials added to vault"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "dismissed"
+        assert data["pending_id"] == "p-cred001"
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["pending_user_confirmation"] == []
+        assert pm["revision"] == 6
+        assert pm["last_updated_by"] == "user"
+        assert len(pm["revision_log"]) == 1
+        last_log = pm["revision_log"][-1]
+        assert last_log["changes"]["dismissal_note"] == "Credentials added to vault"
+        assert last_log["changes"]["dismissed_proposal"] == "Need AWS credentials for prod account."
+
+    @pytest.mark.asyncio
+    async def test_dismiss_without_note_no_revision_log_entry(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "revision": 2,
+            "last_updated": "2026-01-01T00:00:00",
+            "last_updated_by": "agent",
+            "intent": {"purpose": "", "current_focus": "", "user_purpose": ""},
+            "context": {},
+            "constraints": [],
+            "capabilities": [],
+            "gaps": [],
+            "archived_gaps": [],
+            "friction": [],
+            "pending_user_confirmation": [
+                {
+                    "id": "p-access001",
+                    "type": "access_needed",
+                    "proposal": "Need read access to the S3 bucket.",
+                    "created_at": "2026-01-03T00:00:00",
+                },
+            ],
+            "revision_log": [],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-access001/dismiss"
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["pending_user_confirmation"] == []
+        assert pm["revision_log"] == []
+
+    @pytest.mark.asyncio
+    async def test_dismiss_note_over_5000_chars_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """note field longer than 5000 characters must be rejected with 422."""
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "revision": 1,
+            "intent": {"purpose": "", "current_focus": "", "user_purpose": ""},
+            "context": {},
+            "constraints": [],
+            "capabilities": [],
+            "gaps": [],
+            "archived_gaps": [],
+            "friction": [],
+            "pending_user_confirmation": [
+                {
+                    "id": "p-abc12345",
+                    "type": "major_decision",
+                    "proposal": "Should we migrate?",
+                    "created_at": "2026-01-01T00:00:00",
+                }
+            ],
+            "revision_log": [],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-abc12345/dismiss",
+            json={"note": "x" * 5001},
+        )
+        assert resp.status_code == 422
+
+
+class TestAcceptPendingConfirmation:
+    """POST /pending-confirm/{id}/accept applies type-specific action and clears the item."""
+
+    _BASE_PM: dict = {
+        "revision": 2,
+        "last_updated": "2026-01-01T00:00:00",
+        "last_updated_by": "agent",
+        "intent": {"purpose": "Old purpose", "current_focus": "focus", "user_purpose": "Old purpose"},
+        "context": {},
+        "constraints": [],
+        "capabilities": [],
+        "gaps": [],
+        "archived_gaps": [],
+        "friction": [],
+        "revision_log": [],
+    }
+
+    @pytest.mark.asyncio
+    async def test_accept_intent_change_updates_purpose(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            **self._BASE_PM,
+            "pending_user_confirmation": [
+                {
+                    "id": "p-ic001",
+                    "type": "intent_change",
+                    "proposal": "New project purpose text",
+                    "rationale": "Direction shifted.",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            ],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-ic001/accept",
+            json={"answer": None},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "accepted"
+        assert data["type"] == "intent_change"
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["pending_user_confirmation"] == []
+        assert pm["intent"]["purpose"] == "New project purpose text"
+        assert pm["revision"] == 3
+        assert pm["last_updated_by"] == "user"
+
+    @pytest.mark.asyncio
+    async def test_accept_major_decision_records_answer(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            **self._BASE_PM,
+            "pending_user_confirmation": [
+                {
+                    "id": "p-md001",
+                    "type": "major_decision",
+                    "proposal": "Should we migrate to Postgres 16?",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            ],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-md001/accept",
+            json={"answer": "Yes, proceed with migration."},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "accepted"
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["pending_user_confirmation"] == []
+        # Answer is recorded in the revision log
+        last_log = pm["revision_log"][-1]
+        assert last_log["changes"]["decision_answer"] == "Yes, proceed with migration."
+        assert last_log["changes"]["decision_question"] == "Should we migrate to Postgres 16?"
+
+    @pytest.mark.asyncio
+    async def test_accept_credentials_needed_records_answer(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            **self._BASE_PM,
+            "pending_user_confirmation": [
+                {
+                    "id": "p-cred002",
+                    "type": "credentials_needed",
+                    "proposal": "Need DB password for prod.",
+                    "created_at": "2026-01-04T00:00:00",
+                },
+            ],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-cred002/accept",
+            json={"answer": "Password added to secrets manager."},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "accepted"
+        assert data["type"] == "credentials_needed"
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["pending_user_confirmation"] == []
+        last_log = pm["revision_log"][-1]
+        assert last_log["changes"]["decision_answer"] == "Password added to secrets manager."
+        assert last_log["changes"]["decision_question"] == "Need DB password for prod."
+
+    @pytest.mark.asyncio
+    async def test_accept_intent_change_with_note_records_revision_log(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {
+            **self._BASE_PM,
+            "pending_user_confirmation": [
+                {
+                    "id": "p-ic002",
+                    "type": "intent_change",
+                    "proposal": "Expand scope to include mobile.",
+                    "created_at": "2026-01-04T00:00:00",
+                },
+            ],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-ic002/accept",
+            json={"answer": "Agreed — prioritize Android first."},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["type"] == "intent_change"
+
+        await db_session.refresh(project)
+        pm = project.problem_model
+        assert pm["pending_user_confirmation"] == []
+        assert pm["intent"]["purpose"] == "Expand scope to include mobile."
+        last_log = pm["revision_log"][-1]
+        assert last_log["changes"]["operator_note"] == "Agreed — prioritize Android first."
+        assert last_log["changes"]["accepted_proposal"] == "Expand scope to include mobile."
+
+    @pytest.mark.asyncio
+    async def test_accept_unknown_id_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        project.problem_model = {**self._BASE_PM, "pending_user_confirmation": []}
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-notexist/accept",
+            json={"answer": None},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_accept_answer_over_5000_chars_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """answer field longer than 5000 characters must be rejected with 422."""
+        project = await _make_project(db_session)
+        project.problem_model = {
+            "revision": 1,
+            "intent": {"purpose": "", "current_focus": "", "user_purpose": ""},
+            "context": {},
+            "constraints": [],
+            "capabilities": [],
+            "gaps": [],
+            "archived_gaps": [],
+            "friction": [],
+            "pending_user_confirmation": [
+                {
+                    "id": "p-dec001",
+                    "type": "major_decision",
+                    "proposal": "Go with option A?",
+                    "created_at": "2026-01-01T00:00:00",
+                }
+            ],
+            "revision_log": [],
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/pending-confirm/p-dec001/accept",
+            json={"answer": "y" * 5001},
+        )
+        assert resp.status_code == 422
+
 
 class TestBuildDeployStatePayload:
     """Regression: WS broadcasts use websocket.send_json which lacks FastAPI's
@@ -8932,6 +9411,102 @@ class TestSetVersionTheme:
 
         await db_session.refresh(version)
         assert version.theme is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# admin_release_version.py — Version Lifecycle Theme Exposure
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestVersionLifecycleTheme:
+    """GET /version-lifecycle exposes theme on current_version."""
+
+    @pytest.mark.asyncio
+    async def test_theme_surfaced_in_version_lifecycle(
+        self, client: AsyncClient, db_session
+    ):
+        """current_version.theme reflects the theme set on the open ReleaseVersion."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+            theme="reliability",
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["theme"] == "reliability"
+
+    @pytest.mark.asyncio
+    async def test_theme_none_when_not_set(
+        self, client: AsyncClient, db_session
+    ):
+        """current_version.theme is None when no theme has been set."""
+        project = await _make_project(db_session)
+        version = ReleaseVersion(
+            project_id=project.id,
+            version_number=1,
+            phase="build",
+            status="open",
+        )
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=0),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["theme"] is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -16598,6 +17173,43 @@ class TestComputeExperimentTaskLaunch:
         }
 
     @pytest.mark.asyncio
+    async def test_container_fields_persist_for_runner_experiments(
+        self, client: AsyncClient, db_session
+    ):
+        # Container-aware fields (image + registry auth + host setup_step) must
+        # survive request validation -> launch_contract -> stored task payload,
+        # or a CUDA/NGC experiment would silently run bare on the runner.
+        await self._project_with_repo(db_session)
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json=self._valid_payload(
+                container_image="nvcr.io/nvidia/tensorflow:25.01",
+                container_registry_auth={
+                    "server": "nvcr.io",
+                    "username": "$oauthtoken",
+                    "password": "nvapi-SECRET",
+                },
+                setup_step="echo host-prep",
+            ),
+        )
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(data["id"]))
+            )
+        ).scalar_one()
+        payload = task.payloads[0]
+        assert payload["container_image"] == "nvcr.io/nvidia/tensorflow:25.01"
+        assert payload["container_registry_auth"] == {
+            "server": "nvcr.io",
+            "username": "$oauthtoken",
+            "password": "nvapi-SECRET",
+        }
+        assert payload["setup_step"] == "echo host-prep"
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("override", "expected_detail"),
         [
@@ -16988,6 +17600,229 @@ class TestComputeExperimentTaskLaunch:
             "auto-created compute-experiment project must have bootstrap_completed_at "
             "set so the bootstrap-recovery sweep skips it"
         )
+
+    @pytest.mark.asyncio
+    async def test_arms_launch_synthesizes_command_and_persists_contract(
+        self, client: AsyncClient, db_session
+    ):
+        """POST /api/admin/tasks/compute-experiment with arms + declared_metric
+        must persist the arms/declared_metric on the payload and synthesize
+        a command via the contract validator."""
+        await self._project_with_repo(db_session)
+        from app.shared_state import runtime_config as _rc
+
+        previous_threshold = _rc.get("compute_experiment_spend_threshold_usd")
+        _rc["compute_experiment_spend_threshold_usd"] = 5.0
+        try:
+            resp = await client.post(
+                "/api/admin/tasks/compute-experiment",
+                json={
+                    "github_repo": "acme/compute",
+                    "title": "A vs B sweep",
+                    "prompt": "Compare arm-A and arm-B",
+                    "base_branch": "automain",
+                    "arms": [
+                        {"name": "arm-A", "command": "python train.py --lr 0.01"},
+                        {"name": "arm-B", "command": "python train.py --lr 0.001"},
+                    ],
+                    "declared_metric": "val/accuracy",
+                    "spend_cap_usd": 5.0,
+                    "deadline_seconds": 900,
+                },
+            )
+        finally:
+            if previous_threshold is None:
+                _rc.pop("compute_experiment_spend_threshold_usd", None)
+            else:
+                _rc["compute_experiment_spend_threshold_usd"] = previous_threshold
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        task = (
+            await db_session.execute(
+                select(Task).where(Task.id == uuid.UUID(data["id"]))
+            )
+        ).scalar_one()
+        payload = task.payloads[0]
+        assert payload["type"] == "compute_experiment"
+        # Arms and declared_metric must be persisted on the stored payload.
+        assert payload["arms"] == [
+            {"name": "arm-A", "command": "python train.py --lr 0.01"},
+            {"name": "arm-B", "command": "python train.py --lr 0.001"},
+        ]
+        assert payload["declared_metric"] == "val/accuracy"
+        # The contract validator synthesizes a command from the arms; it must be
+        # a non-empty string (the actual script is an opaque base64 blob).
+        assert isinstance(payload["command"], str) and payload["command"].strip()
+
+    @pytest.mark.asyncio
+    async def test_arms_without_declared_metric_rejected(
+        self, client: AsyncClient, db_session
+    ):
+        """Providing arms without declared_metric must return 422."""
+        await self._project_with_repo(db_session)
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={
+                "github_repo": "acme/compute",
+                "title": "Missing metric sweep",
+                "prompt": "Compare arms without a declared metric",
+                "base_branch": "automain",
+                "arms": [
+                    {"name": "arm-A", "command": "python train.py --lr 0.01"},
+                    {"name": "arm-B", "command": "python train.py --lr 0.001"},
+                ],
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 900,
+            },
+        )
+        assert resp.status_code == 422, resp.text
+        assert "declared_metric" in resp.text
+
+    @pytest.mark.asyncio
+    async def test_neither_command_nor_arms_rejected(
+        self, client: AsyncClient, db_session
+    ):
+        """Providing neither command nor arms must return 422."""
+        await self._project_with_repo(db_session)
+        resp = await client.post(
+            "/api/admin/tasks/compute-experiment",
+            json={
+                "github_repo": "acme/compute",
+                "title": "Missing command sweep",
+                "prompt": "No command or arms",
+                "base_branch": "automain",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 900,
+            },
+        )
+        assert resp.status_code == 422, resp.text
+        assert "command" in resp.text
+
+
+class TestRerunComputeExperiment:
+    """POST /api/admin/tasks/{task_id}/rerun — re-run a compute_experiment."""
+
+    async def _project_with_task(self, session, **payload_overrides):
+        project = Project(
+            name="acme/rerun",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="rerun",
+            integration_branch="automain",
+            promotion_target="automain",
+        )
+        session.add(project)
+        await session.commit()
+        await session.refresh(project)
+        session.add(ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner"))
+        base_payload = {
+            "type": "compute_experiment",
+            "title": "GPU bench",
+            "prompt": "Run it.",
+            "base_branch": "automain",
+            "command": "python bench.py --out result.json",
+            "spend_cap_usd": 5.0,
+            "deadline_seconds": 900,
+            "success_criterion": {
+                "kind": "metric",
+                "metric": "tokens_per_second",
+                "operator": ">=",
+                "threshold": 100.0,
+                "min_file_count": 1,
+            },
+        }
+        base_payload.update(payload_overrides)
+        task = Task(
+            project_id=project.id,
+            title="GPU bench",
+            description="Run it.",
+            payloads=[base_payload],
+            status=TaskStatus.COMPLETED,
+            created_by="USER",
+            launched_by_user_id=TEST_USER_ID,
+        )
+        session.add(task)
+        await session.commit()
+        await session.refresh(task)
+        return project, task
+
+    @pytest.mark.asyncio
+    async def test_rerun_creates_child_task_with_parent_link(
+        self, client: AsyncClient, db_session
+    ):
+        """POST /rerun creates a QUEUED task with parent_task_id pointing at source."""
+        _, source = await self._project_with_task(db_session)
+        resp = await client.post(f"/api/admin/tasks/{source.id}/rerun", json={})
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["parent_task_id"] == str(source.id)
+        child = (
+            await db_session.execute(select(Task).where(Task.id == uuid.UUID(data["id"])))
+        ).scalar_one()
+        assert child.status == TaskStatus.QUEUED
+        assert child.parent_task_id == source.id
+        # Payload inherits source fields.
+        assert child.payloads[0]["command"] == "python bench.py --out result.json"
+
+    @pytest.mark.asyncio
+    async def test_rerun_override_fields_take_precedence(
+        self, client: AsyncClient, db_session
+    ):
+        """Caller-supplied overrides replace source payload fields."""
+        _, source = await self._project_with_task(db_session)
+        resp = await client.post(
+            f"/api/admin/tasks/{source.id}/rerun",
+            json={
+                "spend_cap_usd": 2.5,
+                "deadline_seconds": 600,
+                "success_criterion": {
+                    "metric": "tokens_per_second",
+                    "operator": ">=",
+                    "threshold": 150.0,
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        child = (
+            await db_session.execute(select(Task).where(Task.id == uuid.UUID(data["id"])))
+        ).scalar_one()
+        assert child.payloads[0]["spend_cap_usd"] == 2.5
+        assert child.payloads[0]["deadline_seconds"] == 600
+        assert child.payloads[0]["success_criterion"]["threshold"] == 150.0
+
+    @pytest.mark.asyncio
+    async def test_rerun_non_compute_task_returns_422(
+        self, client: AsyncClient, db_session
+    ):
+        """Re-running a non-compute_experiment task returns 422."""
+        project = Project(
+            name="acme/other",
+            user_id=TEST_USER_ID,
+            github_owner="acme",
+            github_repo="other",
+            integration_branch="automain",
+            promotion_target="automain",
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        db_session.add(ProjectMember(project_id=project.id, user_id=TEST_USER_ID, role="owner"))
+        task = Task(
+            project_id=project.id,
+            title="Research task",
+            description="Do research",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="USER",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        resp = await client.post(f"/api/admin/tasks/{task.id}/rerun", json={})
+        assert resp.status_code == 422, resp.text
+        assert "compute_experiment" in resp.text
 
 
 class TestBugReportCitationGate:
@@ -20101,6 +20936,34 @@ class TestApprovalNeededFilter:
         false_ids = {t["id"] for t in resp.json()["tasks"]}
         assert no_id in false_ids
         assert needs_id not in false_ids
+
+    @pytest.mark.asyncio
+    async def test_patch_requires_approval_false_sets_spend_approval_cleared_at(
+        self, client: AsyncClient, db_session
+    ):
+        """PATCH {requires_approval: false} on a held compute_experiment task must
+        set spend_approval_cleared_at so check_compute_spend_approval unblocks."""
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "compute_experiment", "spend_cap_usd": 20.0}],
+            requires_approval=True,
+            spend_approval_cleared_at=None,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.patch(
+            f"/api/admin/tasks/{task.id}",
+            json={"requires_approval": False},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(task)
+        assert task.requires_approval is False
+        assert task.spend_approval_cleared_at is not None
 
 
 class TestPoolAccountMutationsRequireAdmin:

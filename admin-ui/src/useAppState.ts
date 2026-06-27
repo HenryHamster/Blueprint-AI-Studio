@@ -215,6 +215,7 @@ export function useAppState() {
     handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
     handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn,
     handleBulkAction, handleBulkCancel,
+    handleResetIterationCap, handleTriggerRollup,
   } = useTasksState({
     addToast, setError, statusFilter, addMetricsPoint,
     notifyRef, notifyOnFailRef, notifyOnApprovalNeededRef, soundOnCompleteRef,
@@ -567,6 +568,7 @@ export function useAppState() {
     actionLoadingMap,
     fetchTasks, handleApprove, handleClearWaveDeps, handleRequestChanges, handleCancel, handleRetry, handleEditPrompt, handleDismiss, handleArchiveTask, handleUnarchiveTask,
     handleBulkArchive, handleBulkArchiveSelected, handleBulkArchiveColumn, handleBulkAction, handleBulkCancel,
+    handleResetIterationCap, handleTriggerRollup,
     selectionMode, setSelectionMode, selectedTaskIds, toggleSelectionMode, toggleTaskSelection, bulkColumnToggle, shiftSelectRange,
     confirmDialog, setConfirmDialog,
     // Toasts

@@ -100,4 +100,26 @@ describe('taskCsv helpers', () => {
 
     expect(ordered.map((task) => task.id)).toEqual(['task-2', 'task-1']);
   });
+
+  it('sorts by duration using actual elapsed time (completed task duration vs running task elapsed time)', () => {
+    // Scenario: a completed task that ran 5 min two days ago vs a currently-running task
+    // Now is 2026-05-27T12:00:00Z
+    const completedQuickTask = makeTask({
+      id: 'completed-quick',
+      created_at: '2026-05-25T10:00:00Z',
+      started_at: '2026-05-25T10:00:00Z',
+      status: 'COMPLETED',
+      history: [{ timestamp: '2026-05-25T10:05:00Z', action: 'done', details: {} }],
+    });
+
+    const runningLongTask = makeTask({
+      id: 'running-long',
+      created_at: '2026-05-27T11:00:00Z',
+      started_at: '2026-05-27T11:00:00Z',
+      status: 'IN_PROGRESS',
+    });
+
+    const sorted = sortTasks([completedQuickTask, runningLongTask], 'duration', Date.UTC(2026, 4, 27, 12, 0, 0));
+    expect(sorted.map((task) => task.id)).toEqual(['running-long', 'completed-quick']);
+  });
 });

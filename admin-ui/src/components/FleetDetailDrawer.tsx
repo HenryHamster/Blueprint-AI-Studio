@@ -1,14 +1,21 @@
+import { useState } from 'react';
 import { X } from 'lucide-react';
 import { WarmVmPanel } from './WarmVmPanel';
+import { FleetRunnersPanel } from './FleetRunnersPanel';
 import type { Project } from '../types/project';
 
 interface FleetDetailDrawerProps {
   onClose: () => void;
   onViewTask: (taskId: string) => void;
   projects: Project[];
+  selectedProjectId?: string | null;
 }
 
-export function FleetDetailDrawer({ onClose, onViewTask, projects }: FleetDetailDrawerProps) {
+type Tab = 'vm-fleet' | 'runners';
+
+export function FleetDetailDrawer({ onClose, onViewTask, projects, selectedProjectId }: FleetDetailDrawerProps) {
+  const [tab, setTab] = useState<Tab>('vm-fleet');
+
   return (
     <div className="fixed inset-0 z-50 flex justify-end">
       <div className="absolute inset-0 bg-black/40" onClick={onClose} />
@@ -24,8 +31,35 @@ export function FleetDetailDrawer({ onClose, onViewTask, projects }: FleetDetail
             <X className="w-4 h-4" />
           </button>
         </div>
+
+        <div className="flex border-b border-neutral-800 shrink-0 px-4">
+          <button
+            onClick={() => setTab('vm-fleet')}
+            className={`py-2 px-3 text-xs font-medium border-b-2 transition-colors ${tab === 'vm-fleet' ? 'border-blue-500 text-blue-400' : 'border-transparent text-neutral-400 hover:text-neutral-200'}`}
+          >
+            VM Fleet
+          </button>
+          <button
+            onClick={() => setTab('runners')}
+            className={`py-2 px-3 text-xs font-medium border-b-2 transition-colors ${tab === 'runners' ? 'border-blue-500 text-blue-400' : 'border-transparent text-neutral-400 hover:text-neutral-200'}`}
+          >
+            Self-hosted runners
+          </button>
+        </div>
+
         <div className="flex-1 overflow-auto custom-scrollbar">
-          <WarmVmPanel onViewTask={onViewTask} projects={projects} />
+          {tab === 'vm-fleet' && (
+            <WarmVmPanel onViewTask={onViewTask} projects={projects} />
+          )}
+          {tab === 'runners' && (
+            selectedProjectId ? (
+              <FleetRunnersPanel projectId={selectedProjectId} />
+            ) : (
+              <div className="p-6 text-xs text-neutral-500 text-center">
+                Select a project to manage self-hosted runners.
+              </div>
+            )
+          )}
         </div>
       </div>
     </div>

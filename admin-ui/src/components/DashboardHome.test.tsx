@@ -55,6 +55,12 @@ vi.mock('./WarmReuseVsCostTrend', () => ({
   WarmReuseVsCostTrend: () => <div data-testid="warm-reuse-vs-cost-trend">WarmReuseVsCostTrend</div>,
 }));
 
+vi.mock('./ViewportDebtPanel', () => ({
+  ViewportDebtPanel: ({ projectId }: { projectId: string }) => (
+    <div data-testid="viewport-debt-panel" data-project-id={projectId}>ViewportDebtPanel</div>
+  ),
+}));
+
 vi.mock('./TaskDurationWidget', () => ({
   TaskDurationWidget: () => <div data-testid="task-duration-widget">TaskDurationWidget</div>,
 }));
@@ -2896,6 +2902,36 @@ describe('DashboardHome', () => {
         expect(capturedProps.prMonitor?.stale).toBe(true);
       });
       expect(capturedProps.prMonitor?.degraded).toBeFalsy();
+    });
+  });
+
+  describe('ViewportDebtPanel visibility', () => {
+    it('hides ViewportDebtPanel for a non-self-repo project', async () => {
+      setupApiMocks({});
+      render(
+        <DashboardHome
+          tasks={[]}
+          selectedProjectId="proj-other"
+          projects={[{ id: 'proj-other', name: 'Other', is_self_repo: false } as import('../types/project').Project]}
+          onViewTask={vi.fn()}
+        />,
+      );
+      await screen.findByText('All systems healthy');
+      expect(screen.queryByTestId('viewport-debt-panel')).not.toBeInTheDocument();
+    });
+
+    it('shows ViewportDebtPanel for a self-repo project', async () => {
+      setupApiMocks({});
+      render(
+        <DashboardHome
+          tasks={[]}
+          selectedProjectId="proj-self"
+          projects={[{ id: 'proj-self', name: 'Blueprint', is_self_repo: true } as import('../types/project').Project]}
+          onViewTask={vi.fn()}
+        />,
+      );
+      await screen.findByText('All systems healthy');
+      expect(screen.getByTestId('viewport-debt-panel')).toBeInTheDocument();
     });
   });
 });

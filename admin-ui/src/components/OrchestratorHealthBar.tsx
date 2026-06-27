@@ -19,7 +19,7 @@ interface GithubQuota {
   status: 'ok' | 'degraded' | 'critical' | 'unknown';
 }
 
-interface DetailedHealth {
+export interface DetailedHealth {
   circuit_breaker: { projects: Record<string, CircuitBreakerState> };
   max_plan_pool: { total: number; available: number; by_provider?: Record<string, { total: number; available: number }> };
   autonomous: { enabled: boolean; consecutive_failures: number };
@@ -27,7 +27,7 @@ interface DetailedHealth {
   github_quota: GithubQuota;
 }
 
-interface PipelineThrottle {
+export interface PipelineThrottle {
   reason: string;
   detail: string;
   recovery_seconds: number | null;

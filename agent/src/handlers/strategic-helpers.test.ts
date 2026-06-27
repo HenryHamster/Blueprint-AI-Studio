@@ -692,6 +692,42 @@ describe('parseStrategicChallengeRecord', () => {
     expect(rec.status).toBe('blocked');
     expect(rec.portfolio_operations).toEqual([]);
   });
+
+  it('reclassifies a text-only stage_direction verdict to create_direction', () => {
+    // A stage_direction verdict carrying text but no direction_id is a vote to
+    // STAGE A NEW direction, which executes as create_direction(staged=true). The
+    // agent-side fingerprint must match the backend's stored create_direction op,
+    // while staging an EXISTING direction by id stays a real stage_direction.
+    const raw = `{
+      "status": "ok",
+      "evidence_progress": [],
+      "retirement_critique_quality": {"verdict": "solid", "rationale": "ok"},
+      "portfolio_shape_risk": {"verdict": "low", "rationale": "ok"},
+      "portfolio_operations": [
+        {"op": "stage_direction", "text": "Stand up a local-GPU runner lane", "verdict": "approved", "rationale": "clean new lane"},
+        {"op": "stage_direction", "direction_id": "d-keep", "verdict": "approved", "rationale": "existing dir staged by id"}
+      ]
+    }`;
+    const rec = parseStrategicChallengeRecord(raw);
+    expect(rec.status).toBe('ok');
+    expect(rec.portfolio_operations).toHaveLength(2);
+
+    const stagedCreate = rec.portfolio_operations[0];
+    expect(stagedCreate.op).toBe('create_direction');
+    expect(stagedCreate.direction_id).toBe('');
+    expect(stagedCreate.text).toBe('Stand up a local-GPU runner lane');
+    expect(stagedCreate.fingerprint).toBe(
+      portfolioOperationFingerprint('create_direction', { text: 'Stand up a local-GPU runner lane' }),
+    );
+    expect(stagedCreate.fingerprint).toMatch(/^create_direction:text:[0-9a-f]{16}$/);
+
+    const stagedExisting = rec.portfolio_operations[1];
+    expect(stagedExisting.op).toBe('stage_direction');
+    expect(stagedExisting.direction_id).toBe('d-keep');
+    expect(stagedExisting.fingerprint).toBe(
+      portfolioOperationFingerprint('stage_direction', { directionId: 'd-keep' }),
+    );
+  });
 });
 
 describe('buildStrategicChallengeExecutorSection', () => {

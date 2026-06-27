@@ -13,6 +13,7 @@ vi.mock('../api', () => ({
   fetchTaskTypeCatalog: vi.fn(async () => []),
   createComputeExperiment: vi.fn(async () => ({ id: 'compute-experiment-test' })),
   computeExperimentPreflight: vi.fn(async () => ({})),
+  draftComputeExperiment: vi.fn(async () => ({ draft_available: false })),
 }));
 
 const LAUNCHABLE_OPTIONS = [
@@ -528,5 +529,81 @@ describe('NewTaskModal — viewport regression', () => {
     const panelButton = buttons.find(b => b.textContent?.includes('Panel Review'));
     expect(panelButton).toBeTruthy();
     expect(panelButton?.querySelector('svg')).toBeTruthy();
+  });
+
+  test('renders compute experiment preflight error state at 1280px', async () => {
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <NewTaskModal
+            newTaskRepo="example/repo"
+            newTaskBranch="main"
+            newTaskTitle="Test compute experiment"
+            newTaskPrompt="Run a test experiment with GPU"
+            newTaskType="compute_experiment"
+            newTaskPrNumber=""
+            newTaskPrBranch=""
+            setNewTaskRepo={() => {}}
+            setNewTaskBranch={() => {}}
+            setNewTaskTitle={() => {}}
+            setNewTaskPrompt={() => {}}
+            setNewTaskType={() => {}}
+            setNewTaskPrNumber={() => {}}
+            setNewTaskPrBranch={() => {}}
+            newTaskModel=""
+            newTaskEffort=""
+            setNewTaskModel={() => {}}
+            setNewTaskEffort={() => {}}
+            computeExperiment={defaultComputeExperimentForm()}
+            setComputeExperiment={() => {}}
+            getDefaultModelForType={() => 'claude-opus-4-7'}
+            getDefaultEffortForType={() => 'medium'}
+            repoOptions={[{ full_name: 'example/repo', default_branch: 'main' }]}
+            repoLoading={false}
+            repoError={null}
+            useManualRepo={false}
+            setUseManualRepo={() => {}}
+            branchOptions={['main']}
+            branchLoading={false}
+            branchError={null}
+            useManualBranch={false}
+            setUseManualBranch={() => {}}
+            setBranchOptions={() => {}}
+            launchableTaskTypeOptions={[
+              { value: 'create', label: 'Create', description: 'Write code, open PR' },
+              { value: 'compute_experiment', label: 'Compute', description: 'Run GPU experiment' },
+            ]}
+            taskBranchDefaultsReady={true}
+            taskBranchDefaultsLoading={false}
+            taskBranchDefaultsError={null}
+            preflightResult={{
+              rate_per_hour: null,
+              projected_cost_usd: null,
+              max_runtime_seconds: null,
+              in_policy: false,
+              reason: 'GPU type H100 exceeds project hardware restrictions',
+              allowed_accelerator_types: ['T4', 'A100'],
+              allowed_machine_types: null,
+            }}
+            preflightLoading={false}
+            preflightError="Request timeout after 5s — unable to estimate cost"
+            onRepoChange={() => {}}
+            onSubmit={async () => {}}
+            onClose={() => {}}
+          />,
+        );
+      });
+      await act(async () => {
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      });
+    });
+    // Verify error state is visible
+    expect(document.body.textContent).toContain('Couldn\'t estimate cost');
+    expect(document.body.textContent).toContain('Request timeout after 5s — unable to estimate cost');
   });
 });

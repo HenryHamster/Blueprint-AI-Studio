@@ -145,7 +145,10 @@ if touches "admin-ui/"; then
       echo "[check] no changed JS/TS files in admin-ui, skipping lint"
     fi
   fi
-  run "admin-ui build" bash -c 'cd "admin-ui" && npm run build'
+  # Use typecheck-only on agent VMs: vite build is OOM-killed (exit 137) under
+  # memory cgroup constraints. tsc -b --noEmit catches all type errors; the
+  # full vite bundle runs in CI after ./pr open.
+  run "admin-ui typecheck" bash -c 'cd "admin-ui" && npm run typecheck'
 fi
 
 if touches "agent/"; then
@@ -208,6 +211,12 @@ if touches "backend/"; then
         # only with memory headroom for it.
         _GATE_MODE="harness"
       fi
+    elif [ -f scripts/test-backend.sh ] && grep -qs -- '--standalone' scripts/test-backend.sh && grep -qs -- '--no-postgres' scripts/test-backend.sh; then
+      # Docker unavailable but harness supports --standalone --no-postgres: run
+      # the no-DB invariant + manifest suites directly (no Docker, no Postgres
+      # required). Keeps typed-mock/helper-leak/manifest violations from
+      # silently passing when they would only be caught at the promotion qualifier.
+      _GATE_MODE="harness-standalone"
     fi
     if [ "$_GATE_MODE" = "bare" ] && [ "$_PG_ENV_OK" = "0" ] && grep -qs USE_TEST_POSTGRES "backend/conftest.py" "backend"/*/conftest.py; then
       # The suite selects Postgres-vs-SQLite from env, the Postgres test env

@@ -1745,6 +1745,9 @@ async def list_knowledge_documents(
     finding_hash: str | None = Query(
         default=None, description="Exact originating research finding hash filter"
     ),
+    sweep_id: str | None = Query(
+        default=None, description="Exact sweep-id filter (compute_experiment sweeps)"
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
@@ -1773,6 +1776,7 @@ async def list_knowledge_documents(
         origin_state=origin_state,
         challenge_state=challenge_state,
         finding_hash=finding_hash,
+        sweep_id=sweep_id,
         limit=limit,
         offset=offset,
     )

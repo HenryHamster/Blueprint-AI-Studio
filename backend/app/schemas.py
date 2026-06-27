@@ -526,7 +526,13 @@ def serialize_compute_job_response(job: object) -> Dict[str, Any]:
     return data
 
 
-_POLLING_METADATA_LAUNCH_SPEC_KEYS = frozenset({"env", "command", "cwd"})
+# Launch-spec keys removed from polling_metadata before operator-facing exposure.
+# ``container_registry_auth`` carries registry credentials (e.g. an NGC API key /
+# password) used to pull the experiment container for runner-subprocess jobs — it
+# must never reach the admin API alongside env/command/cwd internal launch material.
+_POLLING_METADATA_LAUNCH_SPEC_KEYS = frozenset(
+    {"env", "command", "cwd", "container_registry_auth"}
+)
 
 # Regex patterns for scrubbing secrets/credentials from RPC error messages.
 _URL_QUERY_RE = re.compile(r"\?[^\s'\"<>]*")
@@ -606,9 +612,10 @@ def _redact_dict_strings(obj: Any) -> Any:
 def serialize_compute_job_response_safe(job: object) -> Dict[str, Any]:
     """Return a JSON-ready compute-job response with launch-spec fields redacted.
 
-    Strips ``env``, ``command``, and ``cwd`` from ``polling_metadata`` before
-    returning so operator-facing endpoints never expose internal launch material
-    that may contain secrets or internal paths.  Also sanitizes the promoted
+    Strips ``env``, ``command``, ``cwd``, and ``container_registry_auth`` from
+    ``polling_metadata`` before returning so operator-facing endpoints never
+    expose internal launch material that may contain secrets (e.g. a registry
+    password / NGC API key) or internal paths.  Also sanitizes the promoted
     ``compute_rpc_diagnostic`` to strip URL query strings and credential-bearing
     tokens from raw provider exception text, and promotes ``vm_phase``,
     and ``launch_contract`` for operator diagnostics.  The agent-facing endpoints
@@ -866,6 +873,13 @@ class ResourceEnvelope(BaseModel):
     # If set, GPU compute jobs must use one of these accelerators (e.g. ["T4", "L4"]).
     # An empty list blocks all GPU jobs. CPU jobs (no accelerator) are never blocked by this field.
     allowed_accelerator_types: list[str] | None = Field(None)
+    # When True, compute_experiment tasks for this project must run on a
+    # registered self-hosted local runner — they NEVER fall back to billable
+    # cloud compute. With no live runner the experiment is held (and eventually
+    # failed by a bounded timeout) rather than provisioned in the cloud. Scoped
+    # to compute_experiment tasks for now; a future field could extend the
+    # policy to other task types. Absent/None ⇒ False (cloud fallback permitted).
+    require_local_runner: bool | None = Field(None)
 
     @field_validator("allowed_machine_types", mode="before")
     @classmethod
@@ -932,6 +946,21 @@ class BuildConfig(BaseModel):
     # validation on every write path (onboard, PATCH, re-detect, auto-refresh)
     # — the merge gate reads it via ``ci_resolution.requires_ci_checks``.
     requires_ci_checks: bool = True
+    # Whether the engine self-heals its OWN release-promotion CI failures. When a
+    # promotion PR's full CI matrix goes red, the reconciler harvests the failing
+    # tests into a fix task on the integration branch (or re-qualifies on an infra
+    # flake) so the next qualification does not re-promote the same red code — a
+    # release-pipeline concern, DISTINCT from the generic protected-branch
+    # auto-remediation gate (``design_doc._auto_remediation.enabled``, which the
+    # strategist rewrites each cycle). It lives here in operator-owned
+    # ``build_config`` precisely so the strategist cannot clobber it, and survives
+    # validation on every write path (onboard, PATCH, re-detect). Default ON for
+    # every project and project-agnostic by design — the harvest only ever runs
+    # when a promotion PR's CI fails, so a blanket default is self-limiting and
+    # needs no repo-identity / self-repo special-casing. Resolved via
+    # ``release_reconciliation.promotion_ci_selfheal_enabled`` and overridable per
+    # project (set False to opt out).
+    promotion_ci_selfheal_enabled: bool = True
     # Deterministic empty/near-empty repo signal, computed at onboarding from
     # the already-fetched root + first-level subdirectory listings during
     # build-config detection (see ``admin_onboard._classify_repo_emptiness``).

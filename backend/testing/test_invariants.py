@@ -669,7 +669,15 @@ class TestSchemaRevisionSync:
             text=True,
         ).stdout.splitlines()
         pattern = re.compile(rf"^(?:{'|'.join(map(re.escape, helpers))})$|\.bak$")
-        leaked = [path for path in tracked if pattern.search(path)]
+        # 'check' is the repo's own build-runner and is intentionally tracked in git.
+        # It also appears in AGENT_HELPER_NAMES because agents overwrite it with a
+        # task-specific version via writeCheckHelper; the /.gitignore entry prevents
+        # an UNTRACKED 'check' file from being accidentally staged.
+        _TRACKED_BY_DESIGN: frozenset = frozenset({'check'})
+        leaked = [
+            path for path in tracked
+            if pattern.search(path) and path not in _TRACKED_BY_DESIGN
+        ]
         assert not leaked, "Tracked helper or backup files found:\n  " + "\n  ".join(
             leaked
         )
@@ -1793,6 +1801,28 @@ class TestChainInvariantSeedFixtures:
         no_errors = validate_standalone_chain(sources, expected_schema_revision="0003")
         assert not no_errors, (
             f"validate_standalone_chain reported errors for correct revision '0003': {no_errors}"
+        )
+
+    def test_gapped_linear_chain_validates_clean(self):
+        """A single-head chain with non-contiguous revision numbers (gap) is valid.
+
+        The v20 audit flagged the 0334->0347 Alembic numbering gap as suspicious.
+        Gaps are a normal branch-cut artifact: tasks reserve numbers at cut time
+        and merge-time reconciliation fills them.  validate_standalone_chain must
+        accept a gapped-but-linear chain without error.
+        """
+        from app.migration_chain import validate_standalone_chain
+
+        # 0001 -> 0009 -> 0047: two deliberate gaps, but a single linear head.
+        sources = {
+            "0001_root.py": self._src("0001", None),
+            "0009_mid.py": self._src("0009", "0001"),
+            "0047_tip.py": self._src("0047", "0009"),
+        }
+        errors = validate_standalone_chain(sources)
+        assert not errors, (
+            "validate_standalone_chain incorrectly rejected a gapped-but-linear "
+            f"chain (0001->0009->0047); errors: {errors}"
         )
 
     def test_validate_standalone_chain_aggregates_all_detectors(self):
@@ -10042,4 +10072,45 @@ def test_task_type_evaluation_registry_is_consistent():
         "TaskType evaluation registry has drifted from the locked spec. "
         "This invariant is always-on (every PR) to catch vocabulary changes early. "
         "If the drift is intentional, update both task_capabilities.py AND this assertion."
+    )
+
+
+def test_pytest_filterwarnings_includes_httpx_error_guard():
+    """pyproject.toml must configure filterwarnings to turn httpx DeprecationWarnings into errors.
+
+    This guard prevents silent regressions where a dependency bump introduces a
+    deprecated-API call that only surfaces as a hard removal in the next version.
+    Motivating case: httpx 0.27 deprecated app=; httpx 0.28 removed it.
+    """
+    import sys
+
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        try:
+            import tomli as tomllib  # type: ignore[no-redef]
+        except ImportError:
+            pytest.skip("tomllib/tomli not available on Python < 3.11")
+            return
+
+    pyproject_path = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    assert pyproject_path.exists(), f"pyproject.toml not found at {pyproject_path}"
+
+    with open(pyproject_path, "rb") as fh:
+        config = tomllib.load(fh)
+
+    filterwarnings = (
+        config.get("tool", {})
+        .get("pytest", {})
+        .get("ini_options", {})
+        .get("filterwarnings", [])
+    )
+
+    assert any(
+        entry == "error::DeprecationWarning:httpx" for entry in filterwarnings
+    ), (
+        "Missing 'error::DeprecationWarning:httpx' in "
+        "[tool.pytest.ini_options].filterwarnings in pyproject.toml. "
+        "This guard ensures httpx deprecation warnings surface as test failures "
+        "before they become hard removals in the next version bump."
     )

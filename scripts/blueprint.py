@@ -307,6 +307,8 @@ def cmd_tasks(args: argparse.Namespace) -> None:
         _tasks_research(args)
     elif sub == "autonomy-debug":
         _tasks_autonomy_debug(args)
+    elif sub == "create":
+        _tasks_create(args)
     else:
         _tasks_list(args)
 
@@ -742,6 +744,19 @@ def _render_task_detail(t: dict) -> None:
     msg = t.get("latest_status_message")
     if msg:
         print(f"  Message:  {msg[:200]}")
+    ctx = t.get("context") or {}
+    fc = ctx.get("failure_category") or ctx.get("failure_class")
+    if fc and t.get("status") in ("FAILED", "CANCELLED"):
+        print(f"  FailClass: {fc}")
+    diag = ctx.get("compute_terminal_diagnostics")
+    if diag:
+        reason = diag.get("terminal_reason", "")
+        phase = diag.get("vm_phase", "")
+        phase_label = f" [{phase}]" if phase else ""
+        print(f"  ComputeDiag:{phase_label} {reason}"[:200])
+        cause = diag.get("provisioning_cause")
+        if cause:
+            print(f"    ProvCause: {cause}"[:200])
     desc = t.get("description")
     if desc:
         print(f"\n  Description:\n    {desc[:500]}")
@@ -907,6 +922,39 @@ def _tasks_research(args: argparse.Namespace) -> None:
         print("No recent research tasks found.")
         return
     _emit(args, {"tasks": tasks, "total": len(tasks)}, _render_task_list)
+
+
+def _tasks_create(args: argparse.Namespace) -> None:
+    _require_write_config("tasks create")
+    cfg = load_config()
+    title = args.title
+    prompt = args.prompt
+    task_type = getattr(args, "task_type", "create")
+    github_repo = getattr(args, "repo", None) or cfg.get("default_repo", "")
+    base_branch = getattr(args, "base_branch", None) or cfg.get("default_base_branch", "main")
+    if not github_repo:
+        print("ERROR: --repo is required (or set default_repo in config).", file=sys.stderr)
+        sys.exit(1)
+    if not _confirm(f"Create task: {title[:60]}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    body: dict = {
+        "github_repo": github_repo,
+        "title": title,
+        "prompt": prompt,
+        "task_type": task_type,
+        "base_branch": base_branch,
+    }
+    if getattr(args, "model", None):
+        body["model"] = args.model
+    if getattr(args, "effort", None):
+        body["effort"] = args.effort
+    if getattr(args, "hotfix", False):
+        body["hotfix"] = True
+    result = api("POST", "/api/admin/tasks", body)
+    _emit(args, result, lambda r: print(
+        f"  task created: {r.get('id', '?')}  [{r.get('task_type', '?')}]  {r.get('title', '')}"
+    ))
 
 
 # ── versions ──────────────────────────────────────────────────────────────--
@@ -1877,12 +1925,14 @@ def _render_envelope(data: dict) -> None:
 # ── messages ─────────────────────────────────────────────────────────────────
 
 def cmd_messages(args: argparse.Namespace) -> None:
-    """Dispatch messages subcommands: list / send / answer."""
+    """Dispatch messages subcommands: list / send / answer / confirm."""
     sub = getattr(args, "messages_cmd", None) or "list"
     if sub == "send":
         _messages_send(args)
     elif sub == "answer":
         _messages_answer(args)
+    elif sub == "confirm":
+        _messages_confirm(args)
     else:
         _messages_list(args)
 
@@ -1907,10 +1957,11 @@ def _render_messages(data: dict) -> None:
         print("No messages.")
         return
     for m in msgs:
+        msg_id = m.get("id", "?")
         icon = _MSG_ICONS.get(m.get("type", ""), "?")
         src = m.get("from", "?")
         age = (m.get("created_at") or "?")[:16]
-        print(f"  [{icon}] ({src}, {age}) {(m.get('content') or '')[:120]}")
+        print(f"  {msg_id} [{icon}] ({src}, {age}) {(m.get('content') or '')[:120]}")
 
 
 def _messages_send(args: argparse.Namespace) -> None:
@@ -1932,21 +1983,77 @@ def _messages_send(args: argparse.Namespace) -> None:
 
 
 def _messages_answer(args: argparse.Namespace) -> None:
-    cfg = load_config()
-    if cfg.get("read_only"):
-        print(
-            "ERROR: 'answer' is a mutating action but the resolved config is "
-            "read-only (agent-JWT fallback). Provide an admin API key "
-            "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    pid = get_project_id(getattr(args, "project_id", None))
+    _require_write_config("answer")
     message_id = args.message_id
-    result = api("POST", f"/api/admin/projects/{pid}/messages/{message_id}/answer", {
-        "content": args.content,
+    result = api("PATCH", f"/api/admin/messages/{message_id}", {
+        "resolution": args.content,
     })
     _emit(args, result, lambda d: print(f"  Answer sent: {d.get('id', '?')}"))
+
+
+def _messages_confirm(args: argparse.Namespace) -> None:
+    """Dispatch messages confirm subcommands: list / accept / dismiss."""
+    sub = getattr(args, "confirm_cmd", None) or "list"
+    if sub == "accept":
+        _messages_confirm_accept(args)
+    elif sub == "dismiss":
+        _messages_confirm_dismiss(args)
+    else:
+        _messages_confirm_list(args)
+
+
+def _messages_confirm_list(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    project = api("GET", f"/api/admin/projects/{pid}")
+    pm = project.get("problem_model") or {}
+    items = pm.get("pending_user_confirmation") or []
+    _emit(args, {"pending": items}, _render_pending_list)
+
+
+def _render_pending_list(data: dict) -> None:
+    items = data.get("pending") or []
+    print(f"=== PENDING CONFIRMATIONS ({len(items)}) ===")
+    if not items:
+        print("  (none)")
+        return
+    for p in items:
+        pid = p.get("id", "?")
+        ptype = p.get("type", "?")
+        proposal = (p.get("proposal") or "")[:100]
+        rationale = (p.get("rationale") or "")[:80]
+        created = (p.get("created_at") or "?")[:16]
+        print(f"  {pid}  [{ptype}]  {created}")
+        print(f"    {proposal}")
+        if rationale:
+            print(f"    rationale: {rationale}")
+
+
+def _messages_confirm_accept(args: argparse.Namespace) -> None:
+    _require_write_config("messages confirm accept")
+    pid = get_project_id(getattr(args, "project_id", None))
+    pending_id = args.pending_id
+    if not _confirm(f"Accept pending confirmation {pending_id}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    body: dict = {}
+    if getattr(args, "answer", None):
+        body["answer"] = args.answer
+    result = api("POST", f"/api/admin/projects/{pid}/pending-confirm/{pending_id}/accept", body)
+    _emit(args, result, lambda d: print(f"  Accepted: {pending_id}  status={d.get('status', 'ok')}"))
+
+
+def _messages_confirm_dismiss(args: argparse.Namespace) -> None:
+    _require_write_config("messages confirm dismiss")
+    pid = get_project_id(getattr(args, "project_id", None))
+    pending_id = args.pending_id
+    if not _confirm(f"Dismiss pending confirmation {pending_id}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    body: dict = {}
+    if getattr(args, "note", None):
+        body["note"] = args.note
+    result = api("POST", f"/api/admin/projects/{pid}/pending-confirm/{pending_id}/dismiss", body)
+    _emit(args, result, lambda d: print(f"  Dismissed: {pending_id}  status={d.get('status', 'ok')}"))
 
 
 # ── fleet (pool / warm / accounts / zones) ────────────────────────────────────
@@ -2259,6 +2366,10 @@ def cmd_ops(args: argparse.Namespace) -> None:
 
 def _ops_repair(args: argparse.Namespace) -> None:
     """Repair stuck state."""
+    _require_write_config("repair")
+    if not _confirm("Repair stuck/orphaned tasks?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
     result = api("POST", "/api/admin/repair-state", {})
     repairs = result.get('repairs', [])
     data = {"action": "repair", "count": result.get('count', 0), "repairs": repairs}
@@ -2274,16 +2385,24 @@ def _ops_repair(args: argparse.Namespace) -> None:
 
 def _ops_reset_health(args: argparse.Namespace) -> None:
     """Force-reset health checks."""
+    _require_write_config("reset-health")
+    if not _confirm("Force-reset health checks?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
     result = api("POST", "/api/admin/deploy-state/reset-health", {})
     _emit(args, result, lambda d: print(json.dumps(d, indent=2, default=str)))
 
 
 def _ops_requeue_failed(args: argparse.Namespace) -> None:
     """Requeue all FAILED tasks."""
+    _require_write_config("requeue-failed")
     from blueprint_api import list_tasks
     failed = list_tasks(status="FAILED", limit=100)
     if not failed:
         _emit(args, {"count": 0}, lambda d: print("No failed tasks."))
+        return
+    if not _confirm(f"Requeue {len(failed)} failed task(s)?", getattr(args, "yes", False)):
+        print("Aborted.")
         return
     requeued = []
     failed_requeue = []
@@ -2312,6 +2431,10 @@ def _ops_requeue_failed(args: argparse.Namespace) -> None:
 
 def _ops_restart_orchestrator(args: argparse.Namespace) -> None:
     """Restart background loops."""
+    _require_write_config("restart-orchestrator")
+    if not _confirm("Restart orchestrator background loops?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
     result = api("POST", "/api/admin/restart-orchestrator", {})
     _emit(args, result, lambda d: print(json.dumps(d, indent=2, default=str)))
 
@@ -2319,7 +2442,11 @@ def _ops_restart_orchestrator(args: argparse.Namespace) -> None:
 def _ops_circuit_breaker(args: argparse.Namespace) -> None:
     """Show circuit breaker state, optionally reset for a project."""
     if getattr(args, "reset", None):
+        _require_write_config("circuit-breaker reset")
         pid = args.reset if args.reset else get_project_id()
+        if not _confirm(f"Reset circuit breaker for {pid}?", getattr(args, "yes", False)):
+            print("Aborted.")
+            return
         result = api("POST", f"/api/admin/projects/{pid}/circuit-breaker/reset", {})
         _emit(args, {"action": "reset", "project_id": pid, "result": result},
               lambda d: print(json.dumps(d.get('result'), indent=2, default=str)))
@@ -3296,10 +3423,12 @@ def _render_playbook(data: dict) -> None:
 # ── knowledge ────────────────────────────────────────────────────────────────
 
 def cmd_knowledge(args: argparse.Namespace) -> None:
-    """Dispatch knowledge subcommands: list / show."""
+    """Dispatch knowledge subcommands: list / show / sweep."""
     sub = getattr(args, "knowledge_cmd", None) or "list"
     if sub == "show":
         _knowledge_show(args)
+    elif sub == "sweep":
+        _knowledge_sweep(args)
     else:
         _knowledge_list(args)
 
@@ -3398,6 +3527,109 @@ def _render_knowledge_doc(doc: dict) -> None:
             print(f"    {i}. {ref}")
 
 
+def _knowledge_sweep(args: argparse.Namespace) -> None:
+    pid = get_project_id(getattr(args, "project_id", None))
+    sweep_id = args.sweep_id
+    path = (
+        f"/api/admin/projects/{pid}/knowledge-documents"
+        f"?sweep_id={sweep_id}&source_kind=compute_experiment&limit=200"
+    )
+    resp = api("GET", path)
+    docs = resp.get("documents", resp) if isinstance(resp, dict) else resp
+    _emit(args, {"sweep_id": sweep_id, "documents": docs or []}, _render_knowledge_sweep)
+
+
+def _render_knowledge_sweep(data: dict) -> None:
+    sweep_id = data.get("sweep_id", "?")
+    docs = data.get("documents") or []
+    print(f"=== SWEEP ARMS: {sweep_id} ===")
+    if not docs:
+        print("  (no arm results indexed for this sweep)")
+        return
+
+    # Build arm rows from per-arm docs (arm_label set) and/or the aggregate
+    # doc whose forward_quality_verdict['arms'] block carries per-arm results.
+    rows: list[dict] = []
+    for doc in docs:
+        arm_label = doc.get("arm_label")
+        verdict = doc.get("forward_quality_verdict") or {}
+        if arm_label:
+            # Per-arm document
+            rows.append({
+                "arm": arm_label,
+                "metric": _sweep_metric_value(verdict),
+                "criterion_met": verdict.get("criterion_met"),
+                "cost_usd": verdict.get("cost_usd"),
+            })
+        else:
+            # Aggregate document — per_arm_verdicts is authoritative for criterion/cost
+            per_arm_verdicts = verdict.get("per_arm_verdicts") or {}
+            arms_block = verdict.get("arms") or {}
+            if isinstance(arms_block, dict):
+                for name, arm_data in arms_block.items():
+                    if isinstance(arm_data, dict):
+                        pav = per_arm_verdicts.get(name) if isinstance(per_arm_verdicts, dict) else {}
+                        rows.append({
+                            "arm": name,
+                            "metric": _sweep_metric_value(arm_data),
+                            "criterion_met": pav.get("met") if pav else arm_data.get("criterion_met"),
+                            "cost_usd": pav.get("cost_usd") if pav else arm_data.get("cost_usd"),
+                        })
+            elif isinstance(arms_block, list):
+                for arm_data in arms_block:
+                    if isinstance(arm_data, dict):
+                        arm_name = arm_data.get("arm") or arm_data.get("arm_label") or arm_data.get("name") or "?"
+                        pav = per_arm_verdicts.get(arm_name) if isinstance(per_arm_verdicts, dict) else {}
+                        rows.append({
+                            "arm": arm_name,
+                            "metric": _sweep_metric_value(arm_data),
+                            "criterion_met": pav.get("met") if pav else arm_data.get("criterion_met"),
+                            "cost_usd": pav.get("cost_usd") if pav else arm_data.get("cost_usd"),
+                        })
+
+    if not rows:
+        print("  (no per-arm results found in indexed documents)")
+        return
+
+    col_arm = max(len(r["arm"]) for r in rows)
+    col_arm = max(col_arm, 4)
+    header = f"  {'ARM':<{col_arm}}  {'METRIC':>14}  {'CRITERION':>9}  {'COST (USD)':>10}"
+    print(header)
+    print("  " + "-" * (col_arm + 14 + 9 + 10 + 9))
+    for r in rows:
+        arm = r["arm"]
+        metric = r["metric"]
+        met = r["criterion_met"]
+        if met is True:
+            crit_str = "MET"
+        elif met is False:
+            crit_str = "NOT MET"
+        else:
+            crit_str = "?"
+        cost = r["cost_usd"]
+        cost_str = f"${cost:.4f}" if isinstance(cost, (int, float)) else "?"
+        metric_str = f"{metric:.4f}" if isinstance(metric, (int, float)) else (str(metric) if metric is not None else "?")
+        print(f"  {arm:<{col_arm}}  {metric_str:>14}  {crit_str:>9}  {cost_str:>10}")
+
+
+def _sweep_metric_value(verdict: dict) -> "float | str | None":
+    """Extract the primary metric value from a per-arm verdict or arm-block entry."""
+    # Direct scalar value
+    if "value" in verdict:
+        return verdict["value"]
+    # result_metrics: prefer the first non-'arms' scalar
+    metrics = verdict.get("result_metrics") or {}
+    if isinstance(metrics, dict):
+        for k, v in metrics.items():
+            if k != "arms" and isinstance(v, (int, float)):
+                return v
+    # criterion carries threshold — not a measured value, skip
+    criterion = verdict.get("criterion") or {}
+    if isinstance(criterion, dict) and "value" in criterion:
+        return criterion["value"]
+    return None
+
+
 # ── compute ───────────────────────────────────────────────────────────────────
 
 _ACTIVE_COMPUTE_STATUSES = frozenset({"QUEUED", "STARTING", "RUNNING", "POLLING"})
@@ -3440,7 +3672,7 @@ def _compute_job_projected_spend(j: dict, burn_rate: "float | None", now: "datet
 
 
 def cmd_compute(args: argparse.Namespace) -> None:
-    """Dispatch compute subcommands: list / show / kill / analyze / run."""
+    """Dispatch compute subcommands: list / show / kill / analyze / run / launch."""
     sub = getattr(args, "compute_cmd", None) or "list"
     if sub == "kill":
         _compute_kill(args)
@@ -3450,6 +3682,8 @@ def cmd_compute(args: argparse.Namespace) -> None:
         _compute_show(args)
     elif sub == "run":
         _compute_run_local(args)
+    elif sub == "launch":
+        _compute_launch(args)
     else:
         _compute_list(args)
 
@@ -3595,6 +3829,20 @@ def _render_compute_show(data: dict) -> None:
         cost = j.get("final_cost_usd")
         if cost is not None:
             print(f"  cost      : ${cost:.4f}")
+        terminal_reason = j.get("terminal_reason")
+        if terminal_reason:
+            print(f"  terminal  : {terminal_reason}")
+        vm_phase = j.get("vm_phase")
+        if vm_phase == "provisioning":
+            print(f"  vm_phase  : {vm_phase}")
+            launch_contract = j.get("launch_contract") or {}
+            if launch_contract:
+                deadline = launch_contract.get("requested_deadline_seconds")
+                model = launch_contract.get("provisioning_model")
+                if deadline:
+                    print(f"    deadline: {deadline}s")
+                if model:
+                    print(f"    model   : {model}")
     exit_code = (j.get("polling_metadata") or {}).get("exit_code")
     if exit_code is not None:
         print(f"  exit_code : {exit_code}")
@@ -3614,17 +3862,29 @@ def _render_compute_show(data: dict) -> None:
             print(f"  metrics   : {scalar_items}")
         if arms:
             print("  per-arm results:")
+            _DIAG_KEYS = {"label", "note", "log", "exit_code", "error", "reason", "stderr_excerpt"}
             if isinstance(arms, dict):
                 for arm_name, arm_metrics in arms.items():
                     if isinstance(arm_metrics, dict):
                         label = arm_metrics.get("label")
                         note = arm_metrics.get("note")
                         log = arm_metrics.get("log")
-                        scalar_metrics = {k: v for k, v in arm_metrics.items() if k not in ("label", "note", "log")}
+                        exit_code = arm_metrics.get("exit_code")
+                        error = arm_metrics.get("error") or arm_metrics.get("reason")
+                        stderr_excerpt = arm_metrics.get("stderr_excerpt")
+                        scalar_metrics = {k: v for k, v in arm_metrics.items() if k not in _DIAG_KEYS}
                         print(f"    [{arm_name}]", end="")
-                        if scalar_metrics:
+                        if error:
+                            print(f" ⚠ FAILED", end="")
+                        elif scalar_metrics:
                             print(f" {scalar_metrics}", end="")
                         print()
+                        if exit_code is not None:
+                            print(f"      exit_code: {exit_code}")
+                        if error:
+                            print(f"      error: {error}")
+                        if stderr_excerpt:
+                            print(f"      stderr: {stderr_excerpt[:300]}")
                         if label:
                             print(f"      label: {label}")
                         if note:
@@ -3642,11 +3902,22 @@ def _render_compute_show(data: dict) -> None:
                         label = arm_entry.get("label")
                         note = arm_entry.get("note")
                         log = arm_entry.get("log")
-                        scalar_metrics = {k: v for k, v in arm_entry.items() if k not in ("label", "name", "arm", "note", "log")}
+                        exit_code = arm_entry.get("exit_code")
+                        error = arm_entry.get("error") or arm_entry.get("reason")
+                        stderr_excerpt = arm_entry.get("stderr_excerpt")
+                        scalar_metrics = {k: v for k, v in arm_entry.items() if k not in (_DIAG_KEYS | {"name", "arm"})}
                         print(f"    [{heading}]", end="")
-                        if scalar_metrics:
+                        if error:
+                            print(f" ⚠ FAILED", end="")
+                        elif scalar_metrics:
                             print(f" {scalar_metrics}", end="")
                         print()
+                        if exit_code is not None:
+                            print(f"      exit_code: {exit_code}")
+                        if error:
+                            print(f"      error: {error}")
+                        if stderr_excerpt:
+                            print(f"      stderr: {stderr_excerpt[:300]}")
                         if label:
                             print(f"      label: {label}")
                         if note:
@@ -3760,6 +4031,121 @@ def _evaluate_criterion(metrics: dict | None, criterion: dict) -> dict:
             "threshold": thr, "value": value, "met": met}
 
 
+def _detect_local_gpu() -> dict:
+    """Probe for a local GPU using nvidia-smi or rocm-smi.
+
+    Guarded by shutil.which so no subprocess is spawned in environments where
+    the tools are absent (e.g., CI/test VMs). Fail-soft by contract — never
+    raises; returns detected=False on any error.
+
+    Returns a dict with keys:
+      detected (bool), backend (str|None), devices (list[str])
+    """
+    if shutil.which("nvidia-smi"):
+        try:
+            result = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                devices = [line.strip() for line in result.stdout.strip().splitlines() if line.strip()]
+                return {"detected": True, "backend": "nvidia", "devices": devices}
+        except Exception:  # noqa: BLE001
+            pass
+
+    if shutil.which("rocm-smi"):
+        try:
+            result = subprocess.run(
+                ["rocm-smi", "--showproductname"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                devices = [line.strip() for line in result.stdout.strip().splitlines()
+                           if line.strip() and "GPU" in line]
+                if devices:
+                    return {"detected": True, "backend": "rocm", "devices": devices}
+        except Exception:  # noqa: BLE001
+            pass
+
+    return {"detected": False, "backend": None, "devices": []}
+
+
+_COMPUTE_STDERR_MAX_BYTES = 2048
+
+
+def _compute_arm_failure_reason(
+    exit_code: int | None,
+    declared_metric: str | None,
+    *,
+    result_missing: bool,
+    metric_missing: bool,
+) -> str:
+    if exit_code == 124:
+        return "arm timed out (exit 124)"
+    if result_missing:
+        if exit_code is not None and exit_code != 0:
+            return f"arm crashed (exit {exit_code}): result file not written"
+        return "arm result file not written (arm may have failed)"
+    if metric_missing:
+        metric_name = declared_metric or "<unknown>"
+        if exit_code is not None and exit_code != 0:
+            return f"arm crashed (exit {exit_code}): metric '{metric_name}' not found in result"
+        return f"unmeasured criterion: metric '{metric_name}' not found in result"
+    if exit_code is not None and exit_code != 0:
+        return f"arm crashed (exit {exit_code})"
+    return "unknown failure"
+
+
+def _read_arm_stderr_excerpt(path: str) -> str | None:
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        if not data:
+            return None
+        tail = data[-_COMPUTE_STDERR_MAX_BYTES:]
+        return tail.decode(errors="replace").strip() or None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _compute_docker_login(auth: dict, *, _subprocess_run=None) -> bool:
+    """Run `docker login` using the credentials in *auth*.
+
+    Gates on ``password`` only — server and username are optional.
+    Returns True on success or when no password is present; False on any
+    failure (non-zero exit, timeout, subprocess error).
+
+    ``_subprocess_run`` is an optional override injected by tests.
+    """
+    password = auth.get("password") or ""
+    if not password:
+        return True
+
+    server = auth.get("server") or ""
+    username = auth.get("username") or ""
+    _run = _subprocess_run if _subprocess_run is not None else subprocess.run
+
+    cmd = ["docker", "login", "--password-stdin"]
+    if username:
+        cmd += ["--username", username]
+    if server:
+        cmd.append(server)
+
+    try:
+        result = _run(cmd, input=password.encode(), capture_output=True, timeout=60)
+        if result.returncode != 0:
+            stderr = result.stderr.decode("utf-8", "replace")[:500]
+            print(f"error: docker login failed (exit={result.returncode}): {stderr}")
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        print("error: docker login timed out")
+        return False
+    except Exception as exc:  # noqa: BLE001
+        print(f"error: docker login error: {exc}")
+        return False
+
+
 def _compute_run_local(args: argparse.Namespace) -> None:
     """Execute a compute_experiment command locally without the orchestrator.
 
@@ -3769,6 +4155,12 @@ def _compute_run_local(args: argparse.Namespace) -> None:
     """
     declared_metric: str | None = None
     success_criterion: dict | None = None
+    arms: list | None = None
+    container_image: str | None = None
+    container_registry_auth: dict | None = None
+    spec_env: dict[str, str] | None = None
+    spec_cwd: str | None = None
+    spec_repo_clone: dict | None = None
     if getattr(args, "local_spec", None):
         # --local <spec.json>: read spec file; validate_backend_name is bypassed
         # because we call subprocess.run directly (no DB-backed flow).
@@ -3780,9 +4172,10 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"error: could not read spec file {args.local_spec!r}: {exc}")
             sys.exit(1)
+        arms = spec.get("arms") or None
         command = spec.get("command")
-        if not command:
-            print("error: spec JSON must contain a 'command' field")
+        if not command and not arms:
+            print("error: spec JSON must contain a 'command' field (or an 'arms' list)")
             sys.exit(1)
         declared_metric = spec.get("declared_metric")
         raw_sc = spec.get("success_criterion")
@@ -3791,8 +4184,22 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         elif raw_sc is not None:
             print("error: spec 'success_criterion' must be an object with metric/operator/threshold")
             sys.exit(1)
+        container_image = spec.get("container_image") or None
+        raw_auth = spec.get("container_registry_auth")
+        if isinstance(raw_auth, dict):
+            container_registry_auth = raw_auth
+        raw_env = spec.get("env")
+        if isinstance(raw_env, dict):
+            spec_env = {str(k): str(v) for k, v in raw_env.items()}
+        raw_cwd = spec.get("cwd")
+        if isinstance(raw_cwd, str) and raw_cwd:
+            spec_cwd = raw_cwd
+        raw_repo_clone = spec.get("repo_clone")
+        if isinstance(raw_repo_clone, dict):
+            spec_repo_clone = raw_repo_clone
     else:
         command = args.run_command
+        container_image = getattr(args, "container_image", None) or None
 
     # CLI flags as fallback criterion source (spec takes precedence)
     if success_criterion is None:
@@ -3802,32 +4209,214 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         if cm is not None and co is not None and ct is not None:
             success_criterion = {"metric": cm, "operator": co, "threshold": ct}
 
-    if command is None:
+    if command is None and not arms:
         print("error: provide a run command or --local <spec.json>")
         sys.exit(1)
 
     tmpdir = tempfile.mkdtemp(prefix="blueprint-compute-run-")
-    result_file = os.path.join(tmpdir, "result.json")
     artifact_dir = os.path.join(tmpdir, "artifacts")
     os.makedirs(artifact_dir, exist_ok=True)
     env = os.environ.copy()
-    env["BLUEPRINT_RESULT_FILE"] = result_file
     env["BLUEPRINT_ARTIFACT_DIR"] = artifact_dir
 
-    print(f"command     : {command}")
-    print(f"result_file : {result_file}")
-    if declared_metric:
-        print(f"declared    : {declared_metric}")
-    if success_criterion:
+    gpu_info = _detect_local_gpu()
+    if gpu_info["detected"]:
+        device_label = gpu_info["devices"][0] if gpu_info["devices"] else "unknown"
+        env["BLUEPRINT_LOCAL_GPU"] = device_label
+    else:
+        env["BLUEPRINT_LOCAL_GPU"] = "none"
+
+    if container_image:
+        if container_registry_auth and isinstance(container_registry_auth, dict):
+            if container_registry_auth.get("password"):
+                if not _compute_docker_login(container_registry_auth):
+                    sys.exit(1)
+        if not _json_mode(args):
+            print(f"image       : {container_image}")
+            print("docker pull : pulling...")
+        pull_result = subprocess.run(
+            ["docker", "pull", container_image],
+            stdout=subprocess.DEVNULL if _json_mode(args) else None,
+        )
+        if pull_result.returncode != 0:
+            print(f"error: docker pull {container_image!r} failed (exit {pull_result.returncode})")
+            sys.exit(pull_result.returncode)
+
+    if arms:
+        arm_names = [a.get("name", f"arm_{i}") for i, a in enumerate(arms)]
+        if not _json_mode(args):
+            print(f"arms        : {arm_names}")
+            if gpu_info["detected"]:
+                print(f"gpu         : {env['BLUEPRINT_LOCAL_GPU']}")
+            else:
+                print("gpu         : none")
+            if declared_metric:
+                print(f"declared    : {declared_metric}")
+            print("running arms...")
+
+        arm_results: dict[str, dict] = {}
+        overall_exit_code = 0
+        for i, arm in enumerate(arms):
+            arm_name = arm.get("name", f"arm_{i}")
+            arm_cmd = arm.get("command", "")
+            arm_result_file = os.path.join(tmpdir, f"result_{arm_name}.json")
+            arm_stderr_file = os.path.join(tmpdir, f"stderr_{arm_name}.txt")
+            arm_env = env.copy()
+            arm_env["BLUEPRINT_RESULT_FILE"] = arm_result_file
+
+            if not _json_mode(args):
+                print(f"  [{arm_name}] running...")
+            with open(arm_stderr_file, "wb") as arm_stderr_fh:
+                if container_image:
+                    container_result = f"/tmp/blueprint_out/result_{arm_name}.json"
+                    docker_arm_cmd = ["docker", "run", "--rm"]
+                    if gpu_info["detected"]:
+                        docker_arm_cmd += ["--gpus", "all"]
+                    if spec_repo_clone:
+                        _repo_root = os.path.abspath(".")
+                        docker_arm_cmd += ["-v", f"{_repo_root}:/workspace"]
+                        docker_arm_cmd += ["-e", "PYTHONPATH=/workspace"]
+                        docker_arm_cmd += ["-w", "/workspace"]
+                    elif spec_cwd:
+                        docker_arm_cmd += ["-w", spec_cwd]
+                    for _k, _v in (spec_env or {}).items():
+                        docker_arm_cmd += ["-e", f"{_k}={_v}"]
+                    docker_arm_cmd += [
+                        "-v", f"{tmpdir}:/tmp/blueprint_out",
+                        "-e", f"BLUEPRINT_RESULT_FILE={container_result}",
+                        "-e", "BLUEPRINT_ARTIFACT_DIR=/tmp/blueprint_out/artifacts",
+                        container_image, "bash", "-lc", arm_cmd,
+                    ]
+                    arm_proc = subprocess.run(docker_arm_cmd, stderr=arm_stderr_fh)
+                else:
+                    arm_env.update(spec_env or {})
+                    arm_proc = subprocess.run(
+                        ["bash", "-lc", arm_cmd], env=arm_env, cwd=spec_cwd or None,
+                        stderr=arm_stderr_fh,
+                    )
+            arm_exit_code = arm_proc.returncode
+            if arm_exit_code != 0:
+                overall_exit_code = arm_exit_code
+
+            # Parse result file
+            result_missing = not os.path.exists(arm_result_file)
+            arm_metrics: dict | None = None
+            if not result_missing:
+                try:
+                    with open(arm_result_file) as f:
+                        arm_metrics = json.load(f)
+                except Exception as exc:  # noqa: BLE001
+                    if not _json_mode(args):
+                        print(f"  [{arm_name}] warning: could not parse result file: {exc}")
+                    result_missing = True
+
+            metric_missing = (
+                declared_metric is not None
+                and not result_missing
+                and arm_metrics is not None
+                and arm_metrics.get(declared_metric) is None
+            )
+
+            # Build canonical per-arm entry
+            is_failure = arm_exit_code != 0 or result_missing or metric_missing
+            if is_failure:
+                reason = _compute_arm_failure_reason(
+                    arm_exit_code,
+                    declared_metric,
+                    result_missing=result_missing,
+                    metric_missing=metric_missing,
+                )
+                arm_entry: dict = {"error": reason, "exit_code": arm_exit_code}
+                excerpt = _read_arm_stderr_excerpt(arm_stderr_file)
+                if excerpt:
+                    arm_entry["stderr_excerpt"] = excerpt
+                arm_results[arm_name] = arm_entry
+            elif declared_metric and arm_metrics is not None:
+                arm_results[arm_name] = {declared_metric: arm_metrics[declared_metric], "exit_code": arm_exit_code}
+            else:
+                arm_entry = arm_metrics if arm_metrics is not None else {}
+                arm_entry["exit_code"] = arm_exit_code
+                arm_results[arm_name] = arm_entry
+
+        status = "SUCCEEDED" if overall_exit_code == 0 else "FAILED"
+        metrics: dict | None = {"arms": arm_results}
+        verdict: dict | None = None
+        result = {"status": status, "exit_code": overall_exit_code, "metrics": metrics,
+                  "declared_metric": declared_metric, "verdict": verdict, "gpu": gpu_info}
+
+        def _render(r: dict) -> None:
+            print(f"status      : {r['status']} (exit_code={r['exit_code']})")
+            dm = r.get("declared_metric")
+            arms_block = (r.get("metrics") or {}).get("arms", {})
+            if arms_block:
+                print(f"arms        : {len(arms_block)} arm(s)")
+                for aname, ametrics in arms_block.items():
+                    error = ametrics.get("error")
+                    if error:
+                        print(f"  [{aname}] FAILED: {error}")
+                        excerpt = ametrics.get("stderr_excerpt")
+                        if excerpt:
+                            print(f"  [{aname}] stderr: {excerpt[:200]}")
+                    elif dm:
+                        val = ametrics.get(dm)
+                        if val is not None:
+                            print(f"  [{aname}] {dm}={val}")
+                        else:
+                            print(f"  [{aname}] {dm}=NOT CAPTURED")
+                    else:
+                        print(f"  [{aname}] {ametrics}")
+            else:
+                print("metrics     : (none emitted)")
+
+        _emit(args, result, _render)
+        return
+
+    result_file = os.path.join(tmpdir, "result.json")
+    env["BLUEPRINT_RESULT_FILE"] = result_file
+
+    if not _json_mode(args):
+        print(f"command     : {command}")
+        print(f"result_file : {result_file}")
+        if gpu_info["detected"]:
+            print(f"gpu         : {env['BLUEPRINT_LOCAL_GPU']}")
+        else:
+            print("gpu         : none")
+        if declared_metric:
+            print(f"declared    : {declared_metric}")
+    if not _json_mode(args) and success_criterion:
         sc = success_criterion
         print(f"criterion   : {sc.get('metric')} {sc.get('operator')} {sc.get('threshold')}")
-    print("running...")
+    if not _json_mode(args):
+        print("running...")
 
-    proc = subprocess.run(["bash", "-lc", command], env=env)
+    if container_image:
+        docker_single_cmd = ["docker", "run", "--rm"]
+        if gpu_info["detected"]:
+            docker_single_cmd += ["--gpus", "all"]
+        if spec_repo_clone:
+            _repo_root = os.path.abspath(".")
+            docker_single_cmd += ["-v", f"{_repo_root}:/workspace"]
+            docker_single_cmd += ["-e", "PYTHONPATH=/workspace"]
+            docker_single_cmd += ["-w", "/workspace"]
+        elif spec_cwd:
+            docker_single_cmd += ["-w", spec_cwd]
+        for _k, _v in (spec_env or {}).items():
+            docker_single_cmd += ["-e", f"{_k}={_v}"]
+        docker_single_cmd += [
+            "-v", f"{tmpdir}:/tmp/blueprint_out",
+            "-e", "BLUEPRINT_RESULT_FILE=/tmp/blueprint_out/result.json",
+            "-e", "BLUEPRINT_ARTIFACT_DIR=/tmp/blueprint_out/artifacts",
+            container_image, "bash", "-lc", command,
+        ]
+        proc = subprocess.run(docker_single_cmd)
+        result_file = os.path.join(tmpdir, "result.json")
+    else:
+        env.update(spec_env or {})
+        proc = subprocess.run(["bash", "-lc", command], env=env, cwd=spec_cwd or None)
     exit_code = proc.returncode
     status = "SUCCEEDED" if exit_code == 0 else "FAILED"
 
-    metrics: dict | None = None
+    metrics = None
     if os.path.exists(result_file):
         try:
             with open(result_file) as f:
@@ -3835,12 +4424,12 @@ def _compute_run_local(args: argparse.Namespace) -> None:
         except Exception as exc:  # noqa: BLE001
             print(f"  warning: could not parse result file: {exc}")
 
-    verdict: dict | None = None
+    verdict = None
     if success_criterion is not None:
         verdict = _evaluate_criterion(metrics, success_criterion)
 
     result = {"status": status, "exit_code": exit_code, "metrics": metrics,
-              "declared_metric": declared_metric, "verdict": verdict}
+              "declared_metric": declared_metric, "verdict": verdict, "gpu": gpu_info}
 
     def _render(r: dict) -> None:
         print(f"status      : {r['status']} (exit_code={r['exit_code']})")
@@ -3869,6 +4458,74 @@ def _compute_run_local(args: argparse.Namespace) -> None:
                 print(f"verdict     : {vstr}  ({mn} not evaluable)")
 
     _emit(args, result, _render)
+
+
+# No-repo substrate probe command (inlined from launch_compute_experiment.py).
+_COMPUTE_DUD_COMMAND = """python3 - <<'PYEOF'
+import json
+import os
+import sys
+
+result = {"dud_ok": 1, "py_major": sys.version_info[0]}
+rf = os.environ.get("BLUEPRINT_RESULT_FILE")
+if rf:
+    with open(rf, "w") as f:
+        json.dump(result, f)
+ad = os.environ.get("BLUEPRINT_ARTIFACT_DIR")
+if ad:
+    with open(os.path.join(ad, "dud.txt"), "w") as f:
+        f.write("compute substrate reached runtime and wrote an artifact\\n")
+print(json.dumps(result))
+PYEOF"""
+
+
+def _compute_launch(args: argparse.Namespace) -> None:
+    _require_write_config("compute launch")
+    dud = getattr(args, "dud", False)
+    command = _COMPUTE_DUD_COMMAND if dud else getattr(args, "experiment_command", None)
+    if not command:
+        print("ERROR: provide --dud or --command.", file=sys.stderr)
+        sys.exit(1)
+    cfg = load_config()
+    github_repo = getattr(args, "repo", None) or cfg.get("default_repo", "")
+    if not github_repo:
+        print("ERROR: --repo is required (or set default_repo in config).", file=sys.stderr)
+        sys.exit(1)
+    title = getattr(args, "title", None) or ("operator substrate probe" if dud else "operator compute experiment")
+    prompt = getattr(args, "prompt", None) or "Operator-launched compute_experiment."
+    base_branch = getattr(args, "base_branch", None) or cfg.get("default_base_branch", "main")
+    spend_cap = getattr(args, "spend_cap", 0.50)
+    deadline = getattr(args, "deadline", 600)
+    raw_metric = getattr(args, "metric", None)
+    metric = (raw_metric or "dud_ok") if dud else raw_metric
+    operator = getattr(args, "operator", ">=")
+    raw_threshold = getattr(args, "threshold", None)
+    threshold = (raw_threshold if raw_threshold is not None else 1.0) if dud else raw_threshold
+    if not _confirm(f"Launch compute experiment: {title[:60]}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    body: dict = {
+        "github_repo": github_repo,
+        "title": title,
+        "prompt": prompt,
+        "base_branch": base_branch,
+        "command": command,
+        "spend_cap_usd": spend_cap,
+        "deadline_seconds": deadline,
+    }
+    if metric:
+        body["success_criterion"] = {
+            "metric": metric,
+            "operator": operator,
+            "threshold": threshold,
+        }
+    if getattr(args, "machine_type", None):
+        body["machine_type"] = args.machine_type
+    result = api("POST", "/api/admin/tasks/compute-experiment", body)
+    _emit(args, result, lambda r: print(
+        f"  compute experiment created: {r.get('task_id', r.get('id', '?'))}"
+        + (f"  job_id={r.get('compute_job_id', '')}" if r.get("compute_job_id") else "")
+    ))
 
 
 # ── argument parser ──────────────────────────────────────────────────────────
@@ -3910,18 +4567,28 @@ def build_parser() -> argparse.ArgumentParser:
                            description="System intervention subcommands for stuck-state recovery, "
                                        "health resets, task requeuing, and orchestrator restarts.")
     ops_sub = p_ops.add_subparsers(dest="ops_cmd")
-    ops_sub.add_parser("repair", parents=[common],
+    p_ops_repair = ops_sub.add_parser("repair", parents=[common],
                        help="Repair stuck state (orphaned parents, stale locks).")
-    ops_sub.add_parser("reset-health", parents=[common],
+    p_ops_repair.add_argument("--yes", action="store_true",
+                              help="Skip the confirmation prompt (for scripting).")
+    p_ops_reset = ops_sub.add_parser("reset-health", parents=[common],
                        help="Force-reset health checks.")
-    ops_sub.add_parser("requeue-failed", parents=[common],
+    p_ops_reset.add_argument("--yes", action="store_true",
+                             help="Skip the confirmation prompt (for scripting).")
+    p_ops_requeue = ops_sub.add_parser("requeue-failed", parents=[common],
                        help="Requeue all FAILED tasks.")
-    ops_sub.add_parser("restart-orchestrator", parents=[common],
+    p_ops_requeue.add_argument("--yes", action="store_true",
+                               help="Skip the confirmation prompt (for scripting).")
+    p_ops_restart = ops_sub.add_parser("restart-orchestrator", parents=[common],
                        help="Restart background loops.")
+    p_ops_restart.add_argument("--yes", action="store_true",
+                               help="Skip the confirmation prompt (for scripting).")
     p_ops_cb = ops_sub.add_parser("circuit-breaker", parents=[common],
                                   help="Show circuit breaker state or reset for a project.")
     p_ops_cb.add_argument("--reset", metavar="PROJECT_ID", default=None,
                           help="Reset circuit breaker for a project (defaults to current project).")
+    p_ops_cb.add_argument("--yes", action="store_true",
+                          help="Skip the confirmation prompt (for scripting).")
 
     # trials
     sub.add_parser("trials", parents=[common],
@@ -4053,6 +4720,31 @@ def build_parser() -> argparse.ArgumentParser:
     tasks_sub.add_parser(
         "autonomy-debug", parents=[common],
         help="Show why autonomy is or isn't spawning: blocking guards and eligible directions.")
+    p_tasks_create = tasks_sub.add_parser(
+        "create", parents=[common],
+        help="Create and queue a new task (confirms before mutating).")
+    p_tasks_create.add_argument("title", help="Short task title.")
+    p_tasks_create.add_argument("prompt", help="Full task prompt / description.")
+    p_tasks_create.add_argument(
+        "--type", dest="task_type", default="create",
+        choices=["create", "fix", "research", "memo", "design_doc_update"],
+        help="Task type (default: create).")
+    p_tasks_create.add_argument(
+        "--repo", default=None, metavar="OWNER/REPO",
+        help="GitHub repo (default: default_repo from config).")
+    p_tasks_create.add_argument(
+        "--base-branch", dest="base_branch", default=None,
+        help="Base branch (default: default_base_branch from config or 'main').")
+    p_tasks_create.add_argument(
+        "--model", default=None, help="Model override for this task.")
+    p_tasks_create.add_argument(
+        "--effort", default=None,
+        choices=["low", "medium", "high", "xhigh", "max"],
+        help="Effort/reasoning level override.")
+    p_tasks_create.add_argument(
+        "--hotfix", action="store_true", help="Mark task as hotfix priority.")
+    p_tasks_create.add_argument("--yes", action="store_true",
+                                help="Skip the confirmation prompt.")
 
     # versions
     p_versions = sub.add_parser("versions", parents=[common],
@@ -4213,6 +4905,30 @@ def build_parser() -> argparse.ArgumentParser:
                                         help="Answer a QUESTION message with a threaded reply.")
     p_msgs_answer.add_argument("message_id", help="ID of the message to answer.")
     p_msgs_answer.add_argument("content", help="Answer content.")
+    p_msgs_confirm = msgs_sub.add_parser(
+        "confirm", parents=[common],
+        help="List or respond to strategist pending_user_confirmation items.",
+        description="List pending confirmations from the problem model, then accept or dismiss them. "
+                    "Defaults to `list` when no subcommand is given.",
+    )
+    confirm_sub = p_msgs_confirm.add_subparsers(dest="confirm_cmd")
+    confirm_sub.add_parser("list", parents=[common], help="List pending confirmations.")
+    p_confirm_accept = confirm_sub.add_parser(
+        "accept", parents=[common],
+        help="Accept a pending confirmation (applies intent_change or records decision).")
+    p_confirm_accept.add_argument("pending_id", help="ID of the pending confirmation item.")
+    p_confirm_accept.add_argument("--answer", default=None,
+                                  help="Operator answer text (for major_decision items).")
+    p_confirm_accept.add_argument("--yes", action="store_true",
+                                  help="Skip the confirmation prompt.")
+    p_confirm_dismiss = confirm_sub.add_parser(
+        "dismiss", parents=[common],
+        help="Dismiss a pending confirmation (records dismissal in revision log).")
+    p_confirm_dismiss.add_argument("pending_id", help="ID of the pending confirmation item.")
+    p_confirm_dismiss.add_argument("--note", default=None,
+                                   help="Optional note explaining the dismissal.")
+    p_confirm_dismiss.add_argument("--yes", action="store_true",
+                                   help="Skip the confirmation prompt.")
 
     # logs
     p_logs = sub.add_parser("logs", parents=[common], help="Read Cloud Run logs via gcloud.",
@@ -4414,6 +5130,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_ks = knowledge_sub.add_parser("show", parents=[common],
                                     help="Show a knowledge document with its full body.")
     p_ks.add_argument("doc_id", help="Knowledge document id.")
+    p_ksw = knowledge_sub.add_parser(
+        "sweep", parents=[common],
+        help="Show a side-by-side arm comparison table for a compute-experiment sweep.",
+    )
+    p_ksw.add_argument("sweep_id", help="Sweep id (e.g. swp-abc123).")
 
     # compute
     p_compute = sub.add_parser(
@@ -4468,6 +5189,13 @@ def build_parser() -> argparse.ArgumentParser:
              "metric/operator/threshold). Runs the command locally without the orchestrator."
     )
     p_compute_run.add_argument(
+        "--image", dest="container_image", default=None, metavar="IMAGE_URI",
+        help="Container image URI to run the command inside "
+             "(e.g. nvcr.io/nvidia/tensorflow:25.01-tf2-py3). "
+             "When set the command is wrapped in docker run with the result-file "
+             "directory volume-mounted. --gpus all is added when a local GPU is detected. "
+             "Spec file takes precedence over this flag.")
+    p_compute_run.add_argument(
         "--criterion-metric", dest="criterion_metric", default=None, metavar="METRIC",
         help="Metric name for success criterion (positional form only; spec takes precedence).")
     p_compute_run.add_argument(
@@ -4477,6 +5205,47 @@ def build_parser() -> argparse.ArgumentParser:
         "--criterion-threshold", dest="criterion_threshold", type=float, default=None,
         metavar="THRESHOLD",
         help="Threshold for success criterion.")
+    p_compute_launch = compute_sub.add_parser(
+        "launch", parents=[common],
+        help="Launch a cloud compute experiment on the orchestrator (confirms before mutating).",
+        description="POST a compute_experiment task to the orchestrator. "
+                    "Use --dud for a no-repo substrate probe, or supply --command for a custom experiment.")
+    p_compute_launch.add_argument(
+        "--repo", default=None, metavar="OWNER/REPO",
+        help="GitHub repo for the experiment (default: default_repo from config).")
+    p_compute_launch.add_argument(
+        "--dud", action="store_true",
+        help="Use the built-in no-repo substrate-probe command with dud_ok>=1 criterion.")
+    p_compute_launch.add_argument(
+        "--command", dest="experiment_command", default=None,
+        help="Bash command string for the experiment (ignored when --dud).")
+    p_compute_launch.add_argument(
+        "--title", default=None, help="Task title (default: 'operator substrate probe' for --dud).")
+    p_compute_launch.add_argument(
+        "--prompt", default=None, help="Task prompt / description.")
+    p_compute_launch.add_argument(
+        "--base-branch", dest="base_branch", default=None,
+        help="Base branch (default: default_base_branch from config or 'main').")
+    p_compute_launch.add_argument(
+        "--spend-cap", dest="spend_cap", type=float, default=0.50,
+        help="Spend cap in USD (default 0.50).")
+    p_compute_launch.add_argument(
+        "--deadline", type=int, default=600,
+        help="Deadline in seconds (default 600).")
+    p_compute_launch.add_argument(
+        "--metric", default=None,
+        help="Success-criterion metric name (default 'dud_ok' for --dud).")
+    p_compute_launch.add_argument(
+        "--operator", default=">=",
+        help="Success-criterion operator: >= <= > < == != (default >=).")
+    p_compute_launch.add_argument(
+        "--threshold", type=float, default=None,
+        help="Success-criterion threshold (default 1.0 for --dud).")
+    p_compute_launch.add_argument(
+        "--machine-type", dest="machine_type", default=None,
+        help="GCP machine type override (e.g. n1-standard-4).")
+    p_compute_launch.add_argument(
+        "--yes", action="store_true", help="Skip the confirmation prompt.")
 
     # playbook
     p_pb = sub.add_parser("playbook", parents=[common],

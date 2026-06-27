@@ -446,6 +446,126 @@ def test_deduplicate_findings_region_identity_skip():
     assert outcome.filtered[0]["reason"].startswith("region overlap with: ")
 
 
+def test_cross_direction_actionable_finding_survives_word_overlap_only():
+    # Regression for the ~28% "research spawned 0 children" over-filter: two
+    # INDEPENDENT directions both touch the same hot file region and share
+    # several generic title words, but represent genuinely-distinct work (no
+    # shared claim, file Jaccard < STRONG threshold). The bare title-word
+    # corroboration arm USED to suppress this — now cross-direction findings
+    # require a strong corroborator, so the distinct finding SURVIVES.
+    finding = {
+        "title": "fix dispatch retry backoff in orchestrator loop handler",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-A",
+        # 2 shared files (region) + 2 unique → Jaccard 2/4 = 0.5 < 0.7 strong.
+        "related_files": [
+            "app/orchestrator.py",
+            "app/dispatch.py",
+            "app/retry_local.py",
+            "app/backoff_local.py",
+        ],
+        "claims": ["dispatch retry has no backoff"],
+    }
+    existing = [
+        (
+            "dir-B",  # DIFFERENT direction
+            "fix dispatch retry backoff in orchestrator loop logging",
+            None,
+            [
+                "app/orchestrator.py",
+                "app/dispatch.py",
+                "app/logging_other.py",
+                "app/metrics_other.py",
+            ],
+        )
+    ]
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing,
+        open_pr_files=set(),
+    )
+    assert outcome.word_overlap_count == 0
+    assert len(outcome.deduplicated) == 1
+
+
+def test_same_direction_region_duplicate_still_caught_after_cross_fix():
+    # The cross-direction relaxation must NOT loosen same-direction dedup: an
+    # identical-region, word-overlapping finding from the SAME direction is
+    # still a genuine duplicate (same author iterating on the same intent) and
+    # must STILL be filtered by title-word corroboration alone.
+    finding = {
+        "title": "fix dispatch retry backoff in orchestrator loop handler",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-A",
+        "related_files": [
+            "app/orchestrator.py",
+            "app/dispatch.py",
+            "app/retry_local.py",
+            "app/backoff_local.py",
+        ],
+    }
+    existing = [
+        (
+            "dir-A",  # SAME direction
+            "fix dispatch retry backoff in orchestrator loop logging",
+            None,
+            [
+                "app/orchestrator.py",
+                "app/dispatch.py",
+                "app/logging_other.py",
+                "app/metrics_other.py",
+            ],
+        )
+    ]
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing,
+        open_pr_files=set(),
+    )
+    assert outcome.word_overlap_count == 1
+    assert outcome.deduplicated == []
+
+
+def test_cross_direction_duplicate_with_shared_claim_still_caught():
+    # Cross-direction findings are NOT exempt from dedup — a STRONG corroborator
+    # (a shared claim) still proves identity even across independent directions,
+    # so a true cross-direction duplicate is filtered.
+    finding = {
+        "title": "patch the dispatch loop",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-A",
+        "related_files": ["app/orchestrator.py", "app/dispatch.py"],
+        "claims": ["dispatch loop drops tasks on lock timeout"],
+    }
+    existing = [
+        {
+            "direction_id": "dir-B",  # DIFFERENT direction
+            "title": "rework dispatch entrypoint",
+            "related_files": ["app/orchestrator.py", "app/dispatch.py"],
+            "claims": ["dispatch loop drops tasks on lock timeout"],
+        }
+    ]
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing,
+        open_pr_files=set(),
+    )
+    assert outcome.word_overlap_count == 1
+    assert outcome.deduplicated == []
+
+
 def test_deduplicate_findings_title_collision_without_region_kept():
     # Regression for the `a/b`-token false positive: titles collide on a shared
     # token but the findings target DIFFERENT files (no region). Must NOT dedup.

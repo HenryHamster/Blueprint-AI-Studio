@@ -1137,11 +1137,13 @@ async def _resolve_review_second_opinion(
             "Second-opinion panel review failed/unparseable — review escalated"
         )[:500]
         session.add(challenger)
+        _gates_on = _runtime_config.get("require_approval_gates", True)
         if original_task_id:
             try:
                 orig = await session.get(Task, uuid.UUID(original_task_id))
                 if orig:
-                    orig.requires_approval = True
+                    if _gates_on:
+                        orig.requires_approval = True
                     orig.latest_status_message = (
                         "Second-opinion review challenge unresolved — manual "
                         "review required"
@@ -5712,21 +5714,48 @@ async def _process_post_commit(
                 # research cycle. Instead raise PostCommitFinalCommitFailed — which
                 # preserves the post_commit_pending marker so the sweep retries just
                 # the spawn from stored plan_output without re-running the agent.
+                #
+                # This recovery is NOT gated on the error being keyword-transient.
+                # The previous version only preserved the marker for errors whose
+                # string matched a transient keyword (timeout/connection/…), so a
+                # mid-spawn failure that did NOT match (a lock contention surfaced
+                # as a bare LockNotAvailableError, a SerializationFailure, an
+                # autoflush IntegrityError, …) fell through to the FAILED branch
+                # below and STRANDED its committed findings: the task showed
+                # terminal FAILED / "no actionable findings" with 0 children while
+                # plan_output held real, undispatched work — the irrecoverable
+                # ~28%-of-zero-child class (cause B). Resuming the spawn is always
+                # safe regardless of the original error: the resume path
+                # (_handle_research_completion, _research_spawn_pending branch)
+                # never re-runs the agent — it replays the spawn from the durable
+                # plan_output — and the duplicate-spawn guard makes a re-run that
+                # actually did land children a no-op. So whenever findings are
+                # durable and the spawn was in flight, prefer sweep-retry over a
+                # terminal FAILED that buries the work.
+                _spawn_pending = bool((task.context or {}).get("_research_spawn_pending"))
+                _has_durable_findings = bool(
+                    isinstance(task.plan_output, list) and task.plan_output
+                )
                 if (
-                    is_transient
-                    and task_type == "research"
-                    and bool((task.context or {}).get("_research_spawn_pending"))
+                    task_type == "research"
+                    and _spawn_pending
+                    and _has_durable_findings
                 ):
                     logger.warning(
-                        "[HANDLER] Research task %s: transient error mid-spawn; "
-                        "preserving post_commit_pending for sweep to retry spawn "
-                        "from stored findings (handler_exc=%r)",
+                        "[HANDLER] Research task %s: error mid-spawn with %d durable "
+                        "finding(s) in plan_output (transient=%s); preserving "
+                        "post_commit_pending for sweep to retry spawn from stored "
+                        "findings rather than stranding them on a terminal FAILED "
+                        "(handler_exc=%r)",
                         task_id,
+                        len(task.plan_output),
+                        is_transient,
                         handler_exc,
                     )
                     raise PostCommitFinalCommitFailed(
-                        f"research mid-spawn transient error for {task_id}; "
-                        f"sweep retries spawn: {handler_exc!r}"
+                        f"research mid-spawn error for {task_id}; "
+                        f"sweep retries spawn from {len(task.plan_output)} stored "
+                        f"finding(s): {handler_exc!r}"
                     ) from handler_exc
                 if is_transient and task.attempt_count < _runtime_config["max_retries"]:
                     task.status = TaskStatus.QUEUED
@@ -6286,13 +6315,46 @@ async def close_orphan_pr_if_any(
     lets the caller bail cleanly if the GitHub call hangs.
     """
     ctx = task.context or {}
+
+    # Resolve PR number from any recorded location.  The url-keyed context
+    # entries (_pr_url / pr_url) are checked first for backward compat; then
+    # the per-review-cycle review_loop.pr_number (create/fix tasks) and the
+    # rollup_pr_number (plan/research sub-rollup tasks whose PR targets the
+    # parent staging branch rather than main).
+    pr_number: int | None = None
     pr_url = ctx.get("_pr_url") or ctx.get("pr_url") or ""
-    if not pr_url:
+    if pr_url:
+        m = re.search(r"/pull/(\d+)", pr_url)
+        if m:
+            pr_number = int(m.group(1))
+    if pr_number is None:
+        # Also check review_loop.pr_number — set by the review pipeline for
+        # sub-rollup and review-loop PRs that store the number but not a full URL
+        # in _pr_url / pr_url (the canonical lookup above misses these, causing
+        # the cancel path to leak the PR open and block the parent rollup).
+        _rl = ctx.get("review_loop") or {}
+        if isinstance(_rl, dict) and _rl.get("pr_number") is not None:
+            try:
+                pr_number = int(_rl["pr_number"])
+            except (ValueError, TypeError):
+                pass
+    if pr_number is None:
+        # Also check rollup_pr_number / rollup_pr_url — set for rollup parents
+        # in awaiting-approval and security-blocked states (never seeds review_loop).
+        _rollup_url = ctx.get("rollup_pr_url") or ""
+        if _rollup_url:
+            _m = re.search(r"/pull/(\d+)", _rollup_url)
+            if _m:
+                pr_number = int(_m.group(1))
+    if pr_number is None:
+        _rpn = ctx.get("rollup_pr_number")
+        if _rpn is not None:
+            try:
+                pr_number = int(_rpn)
+            except (ValueError, TypeError):
+                pass
+    if pr_number is None:
         return False
-    m = re.search(r"/pull/(\d+)", pr_url)
-    if not m:
-        return False
-    pr_number = int(m.group(1))
 
     from app.github import close_pull_request, get_pull_request
     from app.routers.agent import get_github_token_for_task

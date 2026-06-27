@@ -23,6 +23,7 @@ import { ComposeDrawer } from './components/ComposeDrawer';
 import { FleetDetailDrawer } from './components/FleetDetailDrawer';
 import { NewTaskModal } from './components/NewTaskModal';
 import { NewProjectModal } from './components/NewProjectModal';
+import { ProjectManagementModal } from './components/ProjectManagementModal';
 import { HeaderBar } from './components/HeaderBar';
 import type { SectionId } from './components/SettingsDropdown';
 import MetricsDashboard from './components/MetricsDashboard';
@@ -31,7 +32,6 @@ import { DashboardHome } from './components/DashboardHome';
 import { ConsoleHome } from './components/ConsoleHome';
 import { ComputeJobsPanel } from './components/ComputeJobsPanel';
 import { defaultComputeExperimentForm } from './hooks/useTaskModal';
-import { ProjectSwitcherDropdown } from './components/ProjectSwitcherDropdown';
 import type { PrimaryTab } from './hooks/useUIState';
 import { BulkActionBar } from './components/BulkActionBar';
 import { KanbanBoard } from './components/KanbanBoard';
@@ -47,8 +47,6 @@ import { QuickFilterPresets } from './components/QuickFilterPresets';
 import { BoardSavedViewsBar, type BoardFilterSnapshot } from './components/BoardSavedViewsBar';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 import type { Task } from './components/TaskCard';
-// StatusBar removed — redundant connection info
-import { OrchestratorHealthBar } from './components/OrchestratorHealthBar';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
 import { parseTimestamp } from './utils/time';
@@ -259,6 +257,7 @@ export default function App() {
 
   // New project modal
   const [showNewProjectModal, setShowNewProjectModal] = useState(false);
+  const [showProjectManagement, setShowProjectManagement] = useState(false);
   const [setupProjectId, setSetupProjectId] = useState<string | null>(null);
   const setupProject = useMemo(() => {
     if (!setupProjectId) return undefined;
@@ -293,6 +292,7 @@ export default function App() {
   const [dismissedZoneAlertIds, setDismissedZoneAlertIds] = useState<Set<string>>(new Set());
   const [researchBrowserDirectionId, setResearchBrowserDirectionId] = useState<string | null>(null);
   const [knowledgeBrowserDirectionId, setKnowledgeBrowserDirectionId] = useState<string | null>(null);
+  const [knowledgeBrowserInitialDocId, setKnowledgeBrowserInitialDocId] = useState<string | null>(null);
   const [researchFeed, setResearchFeed] = useState<Task[]>([]);
 
   // Fetch project tasks when the Findings Journal opens so findings and implementation child
@@ -510,14 +510,7 @@ export default function App() {
   // the kanban/pipeline views, 'directions' renders DirectionsPanel in page mode.
   const activeTab: PrimaryTab = s.activeTab;
   const handleTabChange = (tab: PrimaryTab) => {
-    if (tab === 'settings') {
-      s.handleToggleSettings();
-      return;
-    }
     s.setActiveTab(tab);
-    if (tab === 'board' && s.viewMode === 'home') {
-      s.setViewMode('kanban');
-    }
   };
 
   if (s.authLoading) {
@@ -608,8 +601,6 @@ export default function App() {
         onUpdateNotifyOnHighSignalMessage={s.setNotifyOnHighSignalMessage}
         onSetViewMode={(mode) => {
           s.setViewMode(mode);
-          if (mode === 'home') s.setActiveTab('home');
-          else s.setActiveTab('board');
         }}
         showResearchBrowser={s.showResearchBrowser}
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
@@ -631,7 +622,8 @@ export default function App() {
         newSinceLastVisitCount={newSinceLastVisit}
         needsAttentionCount={s.needsAttentionCount}
         onOpenNewTaskModal={s.openNewTaskModal}
-        onShowDirections={() => s.setActiveTab('directions')}
+        onNewProject={() => setShowNewProjectModal(true)}
+        onManageProjects={() => setShowProjectManagement(true)}
         onSignOut={() => signOut(auth)}
         userEmail={s.user.email || ''}
         wsRef={s.wsRef}
@@ -774,6 +766,13 @@ export default function App() {
         onUpdateIntegrationBranch={s.handleUpdateIntegrationBranch}
         promotionTargetData={s.promotionTargetData}
         onUpdatePromotionTarget={s.handleUpdatePromotionTarget}
+        projects={s.projects}
+        onSelectProject={s.setSelectedProjectId}
+        activeTab={activeTab}
+        onTabChange={handleTabChange}
+        health={s.orchestratorHealth}
+        detailedHealth={s.detailedHealth}
+        pipelineThrottle={s.pipelineThrottle}
       />
 
       <div
@@ -794,51 +793,6 @@ export default function App() {
         </ErrorBoundary>
       </div>
 
-      <OrchestratorHealthBar
-        health={s.orchestratorHealth}
-        detailedHealth={s.detailedHealth}
-        apiHealthy={s.apiHealthy}
-        wsConnected={s.wsConnected}
-        lastFetchTime={s.lastFetchTime}
-        tasks={s.tasks}
-        pipelineThrottle={s.pipelineThrottle}
-      />
-
-      {/* Primary nav: project switcher + tab strip */}
-      <div className="flex items-center gap-3 shrink-0 border-b border-neutral-800/60 pb-1 mb-1">
-        <ProjectSwitcherDropdown
-          projects={s.projects}
-          selectedProjectId={s.selectedProjectId}
-          onSelectProject={s.setSelectedProjectId}
-        />
-        <nav className="flex items-center gap-0.5 flex-1">
-          {(['home', 'board', 'directions', 'compute', 'settings'] as const).map(tab => {
-            const isActive = tab === 'settings' ? s.showSettings : activeTab === tab;
-            const label = tab.charAt(0).toUpperCase() + tab.slice(1);
-            return (
-              <button
-                key={tab}
-                onClick={() => handleTabChange(tab)}
-                className={`px-3 py-1.5 rounded-md text-sm font-medium transition-colors ${
-                  isActive
-                    ? 'bg-neutral-800 text-neutral-100'
-                    : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
-                }`}
-              >
-                {label}
-              </button>
-            );
-          })}
-        </nav>
-        {/* eslint-disable-next-line viewport/min-touch-target */}
-        <button
-          onClick={() => setShowNewProjectModal(true)}
-          className="text-xs text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1"
-          title="New project"
-        >
-          + Project
-        </button>
-      </div>
 
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
         const projectId = s.selectedProjectId;
@@ -922,7 +876,6 @@ export default function App() {
       ) : activeTab === 'directions' ? (
         <ErrorBoundary level="panel">
           <DirectionsPanel
-            pageMode
             addToast={s.addToast}
             selectedProjectId={s.selectedProjectId}
             projects={s.projects}
@@ -960,6 +913,9 @@ export default function App() {
                 fetchTask(taskId).then(s.openDuplicateTaskModal).catch(() => { s.addToast('Could not load task — it may have been deleted', 'error'); });
               }
             }}
+            onApproveExperiment={s.handleApprove}
+            onDismissExperiment={s.handleDismiss}
+            onNavigateToKnowledge={(docId) => { setKnowledgeBrowserInitialDocId(docId); s.setShowKnowledgeBrowser(true); }}
           />
         </ErrorBoundary>
       ) : activeTab === 'home' ? (
@@ -974,25 +930,28 @@ export default function App() {
             onViewTask={s.handleViewLogs}
             onShowAnalytics={() => setShowAnalytics(true)}
             onOpenFleet={() => s.setShowFleetDetail(true)}
+            onCreateTask={s.openNewTaskModal}
           />
         </ErrorBoundary>
       ) : (
         <>
-          {/* Board view mode sub-tabs + Research/Knowledge toolbar buttons */}
+          {/* Board toolbar: segmented Kanban|Pipeline toggle + Research/Knowledge buttons */}
           <div className="flex items-center gap-1 shrink-0 mb-1">
-            {(['kanban', 'pipeline'] as const).map(mode => (
-              <button
-                key={mode}
-                onClick={() => s.setViewMode(mode)}
-                className={`px-3 py-1 rounded text-xs font-medium transition-colors ${
-                  s.viewMode === mode
-                    ? 'bg-neutral-800 text-neutral-100'
-                    : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
-                }`}
-              >
-                {mode.charAt(0).toUpperCase() + mode.slice(1)}
-              </button>
-            ))}
+            <div className="flex bg-neutral-900 border border-neutral-800 rounded-md p-0.5 shrink-0" role="group" aria-label="Board view">
+              {(['kanban', 'pipeline'] as const).map(mode => (
+                <button
+                  key={mode}
+                  onClick={() => s.setViewMode(mode)}
+                  className={`px-3 py-0.5 rounded text-xs font-medium transition-colors ${
+                    s.viewMode === mode
+                      ? 'bg-neutral-700 text-neutral-100 shadow-sm'
+                      : 'text-neutral-500 hover:text-neutral-300'
+                  }`}
+                >
+                  {mode.charAt(0).toUpperCase() + mode.slice(1)}
+                </button>
+              ))}
+            </div>
             <div className="flex-1" />
             {/* eslint-disable-next-line viewport/min-touch-target */}
             <button
@@ -1050,6 +1009,8 @@ export default function App() {
                   { label: 'Oldest first', value: 'oldest' },
                   { label: 'Type', value: 'type' },
                   { label: 'Title', value: 'title' },
+                  { label: 'Longest running', value: 'duration' },
+                  { label: 'Most retried', value: 'attempts' },
                 ]}
                 value={sortBy}
                 onChange={v => setSortBy(v as SortBy)}
@@ -1255,6 +1216,17 @@ export default function App() {
         />
       )}
 
+      {showProjectManagement && (
+        <ProjectManagementModal
+          projects={s.projects}
+          selectedProjectId={s.selectedProjectId}
+          onNewProject={() => setShowNewProjectModal(true)}
+          onRefreshProjects={s.fetchProjects}
+          onSelectProject={s.setSelectedProjectId}
+          onClose={() => setShowProjectManagement(false)}
+        />
+      )}
+
       {s.showResearchBrowser && (
         <ResearchBrowser
           tasks={s.tasks}
@@ -1280,9 +1252,10 @@ export default function App() {
       {s.showKnowledgeBrowser && (
         <KnowledgeBrowser
           selectedProjectId={s.selectedProjectId}
-          onClose={() => { s.setShowKnowledgeBrowser(false); setKnowledgeBrowserDirectionId(null); }}
+          onClose={() => { s.setShowKnowledgeBrowser(false); setKnowledgeBrowserDirectionId(null); setKnowledgeBrowserInitialDocId(null); }}
           onLaunchWebResearchTask={s.openWebResearchTaskModal}
           initialDirectionId={knowledgeBrowserDirectionId ?? undefined}
+          initialDocumentId={knowledgeBrowserInitialDocId ?? undefined}
           onNavigateToTask={(taskId) => {
             s.setShowKnowledgeBrowser(false);
             const target = s.tasks.find(t => t.id === taskId);
@@ -1316,6 +1289,8 @@ export default function App() {
           onEditPrompt={s.handleEditPrompt}
           onDismiss={s.handleDismiss}
           onDuplicate={s.openDuplicateTaskModal}
+          onResetIterationCap={s.handleResetIterationCap}
+          onTriggerRollup={s.handleTriggerRollup}
           onPanelReview={(task) => {
             const payload = (task.payloads?.[0] ?? {}) as Record<string, unknown>;
             const prNumber = payload.pr_number as number | undefined;
@@ -1439,6 +1414,7 @@ export default function App() {
           onClose={() => s.setShowFleetDetail(false)}
           onViewTask={handleViewTask}
           projects={s.projects}
+          selectedProjectId={s.selectedProjectId}
         />
       )}
 

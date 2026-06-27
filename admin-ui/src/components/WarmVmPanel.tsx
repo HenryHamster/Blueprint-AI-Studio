@@ -415,8 +415,8 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
                 <BacklogReuseFunnelRow funnel={data.backlog_reuse_funnel} />
               )}
 
-              {(pool?.project_allowlist?.length ?? 0) > 0 && (
-                <BacklogDropoutRow projectId={pool!.project_allowlist![0]} />
+              {pool?.project_allowlist && pool.project_allowlist.length > 0 && (
+                <BacklogDropoutRow projectId={pool.project_allowlist[0]} />
               )}
 
               {data.chain_continuity_funnel && (

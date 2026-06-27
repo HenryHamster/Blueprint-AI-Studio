@@ -28,10 +28,11 @@ from app.models import (
     Alert,
     AlertSeverity,
     AuditFindingResolution,
+    Project,
     ReleaseDeployArtifact,
 )
 from app.release_artifacts import required_release_artifact_kinds
-from app.release_promotion import _notify_operator
+from app.release_promotion import _notify_operator, _resolve_github_with_session
 from app.release_reconciliation import (
     _confirm_serving_or_fail,
     _reconcile_if_deploy_failed_recovered,
@@ -128,19 +129,70 @@ async def _force_finalize_timed_out_qualification(
     ``stabilize`` phase (so the next strategic cycle re-targets it), and raises
     an ``Alert`` so the stuck qualification is operator-visible.  The version
     stays ``open`` — a timed-out qualification only ever blocks, never
-    promotes, which is always safe.  The caller commits the session.
+    promotes, which is always safe.
+
+    Special case: if the candidate is already reachable from the promotion
+    target (out-of-band promotion), records ``blocker = "qualification_superseded"``
+    instead so the next qualification engages the already-promoted exemption.
+    Fail-closed: if GitHub credentials or checks fail, falls back to the generic
+    ``qualification_timeout`` blocker (never fabricates a supersession).  The
+    caller commits the session.
     """
     qual = dict(version.last_qualification or {})
     age_minutes = age_seconds / 60.0
+    candidate_sha: str | None = qual.get("candidate_sha")
+    blocker = "qualification_timeout"
+    blocker_detail_suffix = "a qualifier child never reached a terminal state"
+
+    # Check for out-of-band supersession: if the candidate is already reachable
+    # from the promotion target, prefer qualification_superseded provenance
+    # (so the already-promoted exemption engages) over the generic timeout.
+    # Fail-closed: GitHub credential/API failures leave the default timeout blocker.
+    if candidate_sha:
+        try:
+            project = await session.get(Project, version.project_id)
+            if project is not None:
+                resolved = await _resolve_github_with_session(session, project)
+                if resolved is not None:
+                    from app import release_promotion
+
+                    token, owner, repo = resolved
+                    if await release_promotion._candidate_already_on_main(
+                        token, owner, repo, candidate_sha, version, project=project
+                    ):
+                        blocker = "qualification_superseded"
+                        blocker_detail_suffix = (
+                            f"candidate {candidate_sha[:12]} is already reachable from "
+                            f"promotion target without a qualifier-initiated promotion"
+                        )
+                        logger.info(
+                            "[RELEASE_QUALIFIER] sweep: version v%d candidate %s "
+                            "already on promotion target — recording as "
+                            "qualification_superseded instead of timeout",
+                            version.version_number,
+                            candidate_sha[:8],
+                        )
+                else:
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] sweep: no GitHub credentials for v%d — "
+                        "cannot check out-of-band supersession; using qualification_timeout",
+                        version.version_number,
+                    )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: out-of-band supersession check failed "
+                "for v%d — falling back to qualification_timeout",
+                version.version_number,
+            )
+
     detail = (
         f"qualification pending {age_minutes:.0f} min "
-        f"(> {_MAX_QUALIFICATION_DURATION_SECONDS // 60} min limit) — a "
-        f"qualifier child never reached a terminal state"
+        f"(> {_MAX_QUALIFICATION_DURATION_SECONDS // 60} min limit) — {blocker_detail_suffix}"
     )
     record = {
         **qual,
         "status": "infra_failure",
-        "blocker": "qualification_timeout",
+        "blocker": blocker,
         "detail": detail,
         "finalized_at": _utcnow().isoformat(),
     }
@@ -166,16 +218,17 @@ async def _force_finalize_timed_out_qualification(
                 f"stuck pending for {age_minutes:.0f} minutes — a qualifier "
                 f"child (release_audit / qualifier-smoketest) never reached a "
                 f"terminal state. Force-finalized as a blocked qualification "
-                f"(blocker=qualification_timeout); the version returns to the "
+                f"(blocker={blocker}); the version returns to the "
                 f"stabilize phase for the next strategic cycle."
             ),
         )
     )
     logger.warning(
         "[RELEASE_QUALIFIER] sweep: version v%d qualification timed out "
-        "(pending %.0f min) — force-finalized as qualification_timeout",
+        "(pending %.0f min) — force-finalized as %s",
         version.version_number,
         age_minutes,
+        blocker,
     )
 
 

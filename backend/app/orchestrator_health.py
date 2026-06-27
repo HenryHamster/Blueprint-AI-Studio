@@ -22,7 +22,12 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 import app.shared_state as _shared_state
-from app.landed_signal import has_landed_signal
+from app.landed_signal import (
+    NON_MERGE_UNBLOCK_REASON_KEY,
+    has_landed_signal,
+    has_merge_unblock_signal,
+)
+from app.rollup_management import _FORCE_DROP_REASONS
 from app.models import Project, Task, TaskStatus
 from app.orchestrator_filters import _prod_files
 from app.time_utils import _utcnow
@@ -818,6 +823,40 @@ async def recut_landed_cross_base_dependents(
     return [eid for eid in eligible_ids if eid not in dropped]
 
 
+async def _dep_parent_lineage_has_landed(dep: Task, session: AsyncSession) -> bool:
+    """True when *dep*'s immediate lineage parent has landed on integration AND
+    *dep* itself genuinely merged into that lineage.
+
+    Defense-in-depth for cross-base code-deps that completed before the
+    recursive propagation swept them: a staging-merged code task whose own
+    ``landed_on_integration`` flag was not yet flipped is still provably on
+    the integration trunk when its parent research/rollup task has landed
+    (the parent's rollup merge carried the child's code to integration).
+    Checking one level up is sufficient because
+    ``_propagate_landed_to_rollup_children`` stamps the immediate parent when
+    the ancestor rollup lands; the parent's landed signal is durable.
+
+    Guards against false positives: a force-dropped dep (review_respawn_cap /
+    malformed_pr_url / rollup_no_pr_artifact) or a no-merge COMPLETED dep
+    (has_merge_unblock_signal False) must NOT be released — their code was
+    discarded, so the parent landing on integration does NOT carry their code
+    to the trunk. Mirrors the sweep filter in
+    ``rollup_management._propagate_landed_to_rollup_children``.
+    """
+    ctx = dep.context or {}
+    if ctx.get(NON_MERGE_UNBLOCK_REASON_KEY) in _FORCE_DROP_REASONS:
+        return False
+    if not has_merge_unblock_signal(dep):
+        return False
+    parent_id = dep.parent_task_id
+    if not parent_id:
+        return False
+    parent = await session.get(Task, parent_id)
+    if parent is None:
+        return False
+    return has_landed_signal(parent)
+
+
 async def _clear_deps_satisfied_marker(task_id, session: AsyncSession) -> None:
     """Durably clear the ``_deps_satisfied`` warm-claim marker on *task_id*.
 
@@ -870,13 +909,29 @@ async def _check_candidate_task_deps(
     # on the live replacement clone, not a satisfied no-op).
     from app.failure_classification import is_non_death_cancellation
 
+    # Batch-fetch all replacement tasks up front to avoid N+1 queries.
+    _replacement_uuids: list[uuid.UUID] = []
+    for _dt in dep_tasks:
+        if _dt.status == TaskStatus.CANCELLED:
+            _rid = (_dt.context or {}).get("_replaced_by_task_id")
+            if _rid:
+                with contextlib.suppress(ValueError, AttributeError):
+                    _replacement_uuids.append(uuid.UUID(_rid))
+    _replacement_cache: dict[uuid.UUID, Task] = {}
+    if _replacement_uuids:
+        _rows = await session.execute(
+            select(Task).where(Task.id.in_(_replacement_uuids))
+        )
+        for _t in _rows.scalars().all():
+            _replacement_cache[_t.id] = _t
+
     for dt in dep_tasks:
         effective_dt = dt
         if dt.status == TaskStatus.CANCELLED:
             replacement_id_str = (dt.context or {}).get("_replaced_by_task_id")
             if replacement_id_str:
                 try:
-                    replacement = await session.get(Task, uuid.UUID(replacement_id_str))
+                    replacement = _replacement_cache.get(uuid.UUID(replacement_id_str))
                 except (ValueError, AttributeError):
                     replacement = None
                 if replacement:
@@ -939,8 +994,15 @@ async def _check_candidate_task_deps(
             # rollup branch (pr_merged-to-staging) is NOT enough — keep holding
             # until it lands, after which the dependent becomes eligible and its
             # base is re-cut from current integration before dispatch.
+            #
+            # Defense-in-depth: when the dep's own signal was not yet propagated
+            # (e.g. it is a grandchild of a landed rollup whose recursive sweep
+            # hadn't run yet), check whether its immediate lineage parent has
+            # landed — the parent's rollup merge provably carried this dep's code
+            # to integration, so holding further wedges the dependent forever.
             if not has_landed_signal(effective_dt):
-                all_met = False
+                if not await _dep_parent_lineage_has_landed(effective_dt, session):
+                    all_met = False
             continue
 
         # Same-base (or ordering-only cross-base) COMPLETED dependency. For

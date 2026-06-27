@@ -1548,6 +1548,37 @@ def test_override_merge_absent_requires_ci_checks_leaves_detected_unchanged():
     assert "requires_ci_checks" not in merged
 
 
+def test_build_config_schema_defaults_promotion_ci_selfheal_true():
+    from app.schemas import BuildConfig as BuildConfigSchema
+
+    persisted = BuildConfigSchema().model_dump(exclude_none=True)
+    # Default ON for every project: the engine self-heals its own promotion CI.
+    assert persisted["promotion_ci_selfheal_enabled"] is True
+
+
+def test_build_config_schema_persists_promotion_ci_selfheal_false():
+    from app.schemas import BuildConfig as BuildConfigSchema
+
+    persisted = BuildConfigSchema(
+        **{"promotion_ci_selfheal_enabled": False}
+    ).model_dump(exclude_none=True)
+    # exclude_none must NOT strip an explicit operator opt-out (False is not None).
+    assert persisted["promotion_ci_selfheal_enabled"] is False
+
+
+def test_override_merge_preserves_existing_promotion_ci_selfheal_false():
+    from app.build_config_detection import apply_operator_build_config_overrides
+
+    # Repo detection never emits promotion_ci_selfheal_enabled; a stored operator
+    # opt-out must carry forward onto freshly-detected config so re-detect does
+    # not silently revert it back to the default-ON.
+    detected = {"language": "python", "directories": []}
+    merged = apply_operator_build_config_overrides(
+        detected, {"promotion_ci_selfheal_enabled": False}
+    )
+    assert merged["promotion_ci_selfheal_enabled"] is False
+
+
 def test_override_merge_preserves_existing_requires_ci_checks_true():
     from app.build_config_detection import apply_operator_build_config_overrides
 

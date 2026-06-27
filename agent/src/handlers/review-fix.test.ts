@@ -175,12 +175,12 @@ beforeEach(() => {
   // Default: ls-remote returns a ref line (branch exists) so handleReview tests
   // that don't care about the deleted-branch path proceed normally. Tests that
   // need the branch-missing or transport-error behavior override this per-test.
-  vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+  vi.mocked(execFileSync).mockImplementation((cmd: string, args?: readonly string[]) => {
     if (cmd === 'git' && Array.isArray(args) && args.includes('ls-remote')) {
       return 'abc123\trefs/heads/feature\n';
     }
     return '';
-  }) as unknown as typeof execFileSync);
+  });
   vi.mocked(indexMod.git).mockReturnValue('');
   vi.mocked(indexMod.gitAsync).mockResolvedValue('');
   vi.mocked(indexMod.runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
@@ -192,7 +192,7 @@ beforeEach(() => {
   global.fetch = vi.fn().mockResolvedValue({
     ok: true,
     json: () => Promise.resolve({ title: 'PR title', body: 'PR body' }),
-  }) as unknown as typeof fetch;
+  });
 });
 
 // ── Review history text truncation: reviewer and fixer must align ───────────
@@ -529,12 +529,12 @@ describe('handleReview — scope overflow replaces scope-narrowed preamble', () 
 
   it('small-scope PR exceeding threshold gets overflow preamble WITHOUT "lower priority" text', async () => {
     // 8 files > small threshold of 6.
-    vi.mocked(indexMod.git).mockImplementation(((args: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args: string[]) => {
       if (Array.isArray(args) && args[0] === 'diff' && args[1] === '--name-status') {
         return fakeDiffNameStatus(8);
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-overflow-small', basePayload, { context: { scope: 'small' } },
@@ -552,12 +552,12 @@ describe('handleReview — scope overflow replaces scope-narrowed preamble', () 
 
   it('small-scope PR within threshold keeps the small-scope preamble (no overflow note)', async () => {
     // 3 files within small threshold of 6.
-    vi.mocked(indexMod.git).mockImplementation(((args: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args: string[]) => {
       if (Array.isArray(args) && args[0] === 'diff' && args[1] === '--name-status') {
         return fakeDiffNameStatus(3);
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-no-overflow', basePayload, { context: { scope: 'small' } },
@@ -571,12 +571,12 @@ describe('handleReview — scope overflow replaces scope-narrowed preamble', () 
 
   it('medium-scope PR exceeding threshold replaces empty preamble with overflow note', async () => {
     // 12 files > medium threshold of 10.
-    vi.mocked(indexMod.git).mockImplementation(((args: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args: string[]) => {
       if (Array.isArray(args) && args[0] === 'diff' && args[1] === '--name-status') {
         return fakeDiffNameStatus(12);
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-overflow-medium', basePayload, { context: { scope: 'medium' } },
@@ -693,13 +693,13 @@ describe('detectMediumScopeSubsystemHint — medium-scope subsystem hint', () =>
 
 describe('handleReview — medium-scope subsystem hint integration', () => {
   it('injects agent-focused hint into the review prompt for medium-scope agent-only PRs', async () => {
-    vi.mocked(resolveBuildConfig).mockReturnValueOnce(BLUEPRINT_CONFIG as ReturnType<typeof resolveBuildConfig>);
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce(BLUEPRINT_CONFIG);
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tagent/src/handlers/review-fix.ts';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-medium-agent',
@@ -715,13 +715,13 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
   it('scopes build_config lint guidance to changed files in the review prompt', async () => {
     vi.mocked(resolveBuildConfig).mockReturnValueOnce({
       directories: [{ path: 'svc', type: 'python', lint_cmd: 'ruff check .' }],
-    } as ReturnType<typeof resolveBuildConfig>);
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    });
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tsvc/a.py';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-review-lint-scope',
@@ -743,13 +743,13 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
   ])('scopes %s build_config lint guidance to changed Python files with the configured binary', async (_label, lintCmd) => {
     vi.mocked(resolveBuildConfig).mockReturnValueOnce({
       directories: [{ path: 'svc', type: 'python', lint_cmd: lintCmd }],
-    } as ReturnType<typeof resolveBuildConfig>);
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    });
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tsvc/a.py';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-review-py-lint-scope',
@@ -773,11 +773,11 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
   ])('review prompt contains exact buildScopedLintOneliner output for %s (drift guard)', async (lintCmd) => {
     vi.mocked(resolveBuildConfig).mockReturnValueOnce({
       directories: [{ path: 'svc', type: 'python', lint_cmd: lintCmd }],
-    } as ReturnType<typeof resolveBuildConfig>);
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    });
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) return 'M\tsvc/a.py';
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       `task-lint-drift-${lintCmd.replace(/\W/g, '-')}`,
@@ -793,13 +793,13 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
   });
 
   it('injects cross-system hint for multi-subsystem medium-scope PRs', async () => {
-    vi.mocked(resolveBuildConfig).mockReturnValueOnce(BLUEPRINT_CONFIG as ReturnType<typeof resolveBuildConfig>);
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(resolveBuildConfig).mockReturnValueOnce(BLUEPRINT_CONFIG);
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tagent/src/index.ts\nM\tbackend/app/main.py';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-medium-mixed',
@@ -816,12 +816,12 @@ describe('handleReview — medium-scope subsystem hint integration', () => {
   });
 
   it('does not emit medium-scope hint for small-scope PRs', async () => {
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tagent/src/handlers/review-fix.ts';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-small-agent',
@@ -841,12 +841,12 @@ describe('handleReview — self-review blind-spots surfacing', () => {
   it('passes task.context._self_review_outcome and the changed-file path list to formatSelfReviewBlindSpots, and injects the returned section into the prompt', async () => {
     const promptMod = await import('../prompt.js');
     vi.mocked(promptMod.formatSelfReviewBlindSpots).mockReturnValue('SELF_REVIEW_BLIND_SPOTS_MARKER\n\n');
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tagent/src/prompt.ts\nA\tagent/src/handlers/review-fix.ts';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     const outcome = {
       verdict: 'PASS',
@@ -871,12 +871,12 @@ describe('handleReview — self-review blind-spots surfacing', () => {
   it('passes undefined self-review outcome when task.context is absent', async () => {
     const promptMod = await import('../prompt.js');
     vi.mocked(promptMod.formatSelfReviewBlindSpots).mockReturnValue('');
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\ta.ts';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-no-context',
@@ -891,12 +891,12 @@ describe('handleReview — self-review blind-spots surfacing', () => {
 // ── handleReview: PR changed_files emission ─────────────────────────────────
 describe('handleReview — emits changed_files for downstream drift detection', () => {
   it('includes changed_files in persistAndPostStatus so the next fix-spawn drift detector has fresh PR state', async () => {
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tbackend/app/main.py\nA\tbackend/app/new.py';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-changed-files',
@@ -915,14 +915,14 @@ describe('handleReview — emits changed_files for downstream drift detection', 
   });
 
   it('omits changed_files when the diff command yielded nothing parseable', async () => {
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         // The handler defaults to "(could not generate file list)" on failure;
         // simulate that path by returning the same sentinel.
         return '(could not generate file list)';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-no-diff',
@@ -943,13 +943,13 @@ describe('handleReview — emits changed_files for downstream drift detection', 
 // ── handleReview: planned-files classifier (four-category parity) ───────────
 describe('handleReview — unplanned-file four-category classifier', () => {
   it('replaces the old "flag as MAJOR unless directly necessary" line with the four-category classifier when planned files are configured and the diff contains an unplanned non-test file', async () => {
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         // planned: src/auth.ts; unplanned non-test: src/main.ts
         return 'M\tagent/src/auth.ts\nM\tagent/src/main.ts';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-classifier',
@@ -973,12 +973,12 @@ describe('handleReview — unplanned-file four-category classifier', () => {
   });
 
   it('shows the "all in plan" message instead of the classifier when no unplanned non-test files are present', async () => {
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tagent/src/auth.ts';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-allplanned',
@@ -993,12 +993,12 @@ describe('handleReview — unplanned-file four-category classifier', () => {
   });
 
   it('does not emit the planned-files section when the task has no _planned_files context', async () => {
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tagent/src/main.ts';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-noplan',
@@ -1013,12 +1013,12 @@ describe('handleReview — unplanned-file four-category classifier', () => {
   });
 
   it('classifier omits unplanned TEST-path files (test paths are not in scope-creep scope)', async () => {
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tagent/src/auth.ts\nA\tagent/src/auth.test.ts';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleReview(
       'task-test-unplanned',
@@ -1474,12 +1474,12 @@ describe('handleReview — deleted head branch short-circuit', () => {
 
   it('completes cleanly with PR_BRANCH_DELETED when branch no longer exists on remote', async () => {
     // ls-remote returns empty string = branch does not exist
-    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+    vi.mocked(execFileSync).mockImplementation((cmd: string, args?: readonly string[]) => {
       if (cmd === 'git' && Array.isArray(args) && args.includes('ls-remote')) {
         return '';
       }
       return '';
-    }) as unknown as typeof execFileSync);
+    });
 
     const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
 
@@ -1502,12 +1502,12 @@ describe('handleReview — deleted head branch short-circuit', () => {
 
   it('proceeds to clone and review when branch exists on remote', async () => {
     // ls-remote returns a ref line = branch exists
-    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+    vi.mocked(execFileSync).mockImplementation((cmd: string, args?: readonly string[]) => {
       if (cmd === 'git' && Array.isArray(args) && args.includes('ls-remote')) {
         return 'abc123\trefs/heads/feature/deleted\n';
       }
       return '';
-    }) as unknown as typeof execFileSync);
+    });
 
     const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
 
@@ -1524,12 +1524,12 @@ describe('handleReview — deleted head branch short-circuit', () => {
 
   it('falls through to clone when ls-remote throws (transport/auth failure)', async () => {
     // ls-remote throws = network/auth error; clone should still be attempted
-    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+    vi.mocked(execFileSync).mockImplementation((cmd: string, args?: readonly string[]) => {
       if (cmd === 'git' && Array.isArray(args) && args.includes('ls-remote')) {
         throw new Error('fatal: unable to look up github.com');
       }
       return '';
-    }) as unknown as typeof execFileSync);
+    });
 
     const { prepareWorkspaceForRole } = await import('../workspacePrep.js');
 
@@ -1715,10 +1715,10 @@ describe('handleFix — runCodeChangeTask delegation', () => {
 
   it('rebases onto base branch before delegating to runCodeChangeTask', async () => {
     const seenGitArgs: string[][] = [];
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args) seenGitArgs.push(args);
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await handleFix(
       'task-fix-rebase',
@@ -1793,12 +1793,12 @@ describe('handleFix — self-review blind-spots surfacing', () => {
   it('passes task.context._self_review_outcome and the changed-file path list to formatSelfReviewBlindSpots, and prepends the returned section to the prompt', async () => {
     const promptMod = await import('../prompt.js');
     vi.mocked(promptMod.formatSelfReviewBlindSpots).mockReturnValue('FIX_BLIND_SPOTS_MARKER\n\n');
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-only')) {
         return 'agent/src/prompts/self-review.ts\nagent/src/handlers/review-fix.ts';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     const outcome = {
       verdict: 'PASS',
@@ -1934,12 +1934,12 @@ describe('handleFix — direction implementation constraints', () => {
 describe('handleFix — conflict marker detection', () => {
   it('enriches the prompt with a CONFLICT MARKERS FOUND header when git grep finds markers', async () => {
     // No unmerged paths (git mock returns ''), but grep finds marker-bearing files.
-    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+    vi.mocked(execFileSync).mockImplementation((cmd: string, args?: readonly string[]) => {
       if (cmd === 'git' && args && args.includes('grep')) {
         return 'backend/app/foo.py\nagent/src/bar.ts\n';
       }
       return '';
-    }) as unknown as typeof execFileSync);
+    });
 
     await handleFix(
       'task-fix-1',
@@ -2178,7 +2178,7 @@ describe('handleFix — reviewer working set propagation', () => {
 
 describe('handleFix — stale-premise detection', () => {
   it('pivots prompt to CI-focused guidance when rebase is clean but PR still has failing checks', async () => {
-    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+    vi.mocked(execFileSync).mockImplementation((cmd: string, args?: readonly string[]) => {
       // No conflict markers anywhere.
       if (cmd === 'git' && args && args.includes('grep')) return '';
       if (cmd === 'curl' && args) {
@@ -2196,7 +2196,7 @@ describe('handleFix — stale-premise detection', () => {
         }
       }
       return '';
-    }) as unknown as typeof execFileSync);
+    });
 
     await handleFix(
       'task-fix-2',
@@ -2216,7 +2216,7 @@ describe('handleFix — stale-premise detection', () => {
   });
 
   it('completes with stale-premise status (no Claude run) when rebase is clean and no checks are failing', async () => {
-    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+    vi.mocked(execFileSync).mockImplementation((cmd: string, args?: readonly string[]) => {
       if (cmd === 'git' && args && args.includes('grep')) return '';
       if (cmd === 'curl' && args) {
         const url = args[args.length - 1] || '';
@@ -2228,7 +2228,7 @@ describe('handleFix — stale-premise detection', () => {
         }
       }
       return '';
-    }) as unknown as typeof execFileSync);
+    });
 
     await handleFix(
       'task-fix-3',
@@ -2251,7 +2251,7 @@ describe('handleFix — stale-premise detection', () => {
   });
 
   it('warns about GitHub-reported unmergeable state when rebase is clean but mergeable=false', async () => {
-    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+    vi.mocked(execFileSync).mockImplementation((cmd: string, args?: readonly string[]) => {
       if (cmd === 'git' && args && args.includes('grep')) return '';
       if (cmd === 'curl' && args) {
         const url = args[args.length - 1] || '';
@@ -2263,7 +2263,7 @@ describe('handleFix — stale-premise detection', () => {
         }
       }
       return '';
-    }) as unknown as typeof execFileSync);
+    });
 
     await handleFix(
       'task-fix-4',
@@ -2282,11 +2282,11 @@ describe('handleFix — stale-premise detection', () => {
   });
 
   it('does not trigger stale-premise path when prompt does not mention conflicts', async () => {
-    vi.mocked(execFileSync).mockImplementation(((cmd: string, args?: readonly string[]) => {
+    vi.mocked(execFileSync).mockImplementation((cmd: string, args?: readonly string[]) => {
       if (cmd === 'git' && args && args.includes('grep')) return '';
       // curl should NOT be called in this branch; return empty defensively.
       return '';
-    }) as unknown as typeof execFileSync);
+    });
 
     await handleFix(
       'task-fix-5',
@@ -2385,7 +2385,7 @@ describe('pushForceWithLeaseRetrying — concurrent push retry', () => {
   it('aborts the rebase and throws a descriptive error when rebase conflicts after stale-info retry', async () => {
     vi.mocked(indexMod.gitAsync).mockRejectedValueOnce(new Error('stale info'));
     const abortCalls: string[][] = [];
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (!args) return '';
       if (args[0] === 'rebase' && args[1] !== '--abort') {
         throw new Error('CONFLICT: cannot rebase');
@@ -2395,7 +2395,7 @@ describe('pushForceWithLeaseRetrying — concurrent push retry', () => {
         return '';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await expect(pushForceWithLeaseRetrying('feature/x', null))
       .rejects.toThrow(/Rebase onto updated origin\/feature\/x conflicted after concurrent push/);
@@ -2448,7 +2448,7 @@ describe('pushForceWithLeaseRetrying — concurrent push retry', () => {
 
   it('silently ignores a rebase --abort failure and still throws the descriptive conflict error', async () => {
     vi.mocked(indexMod.gitAsync).mockRejectedValueOnce(new Error('stale info'));
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (!args) return '';
       if (args[0] === 'rebase' && args[1] !== '--abort') {
         throw new Error('CONFLICT during rebase');
@@ -2457,7 +2457,7 @@ describe('pushForceWithLeaseRetrying — concurrent push retry', () => {
         throw new Error('fatal: no rebase in progress');
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
 
     await expect(pushForceWithLeaseRetrying('feature/x', null))
       .rejects.toThrow(/Rebase onto updated origin\/feature\/x conflicted after concurrent push/);
@@ -2614,7 +2614,7 @@ describe('handleFix structural prompt invariants', () => {
       directories: [
         { path: 'web', type: 'node', lint_cmd: 'eslint src', build_cmd: 'npm run build', test_cmd: 'npm test' },
       ],
-    } as ReturnType<typeof resolveBuildConfig>);
+    });
     await handleFix('task-fix-bc', FIX_PAYLOAD, FIX_TASK, 'token', 'owner', 'repo', null, statusRef());
     const p = capturedFixPrompt();
     expect(p).toContain('Task lifecycle — you own it end-to-end');
@@ -3150,10 +3150,10 @@ describe('handleReview — parallel-review fan-out gating', () => {
   );
 
   function mockBigCrossModuleDiff(): void {
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) return BIG_DIFF;
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
     vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
   }
 
@@ -3203,12 +3203,12 @@ describe('handleReview — parallel-review fan-out gating', () => {
   });
 
   it('does NOT inject parallel guidance when the helper returns false (trivial diff) even with flag on', async () => {
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tbackend/app/only.py';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
     vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
     await handleReview(
       'task-parallel-trivial',
@@ -3250,12 +3250,12 @@ describe('handleReview — parallel-review fan-out gating', () => {
   });
 
   it('does NOT add review_was_parallelized when fan-out was not injected', async () => {
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-status')) {
         return 'M\tbackend/app/only.py';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
     vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync).mockReturnValue('{"verdict":"APPROVE","feedback":"ok"}');
@@ -3343,10 +3343,10 @@ describe('handleFix — parallel-fix fan-out gating', () => {
   ].join('\n');
 
   function mockBigFixDiff(): void {
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-only')) return BIG_FIX_DIFF;
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
     vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
   }
 
@@ -3413,12 +3413,12 @@ describe('handleFix — parallel-fix fan-out gating', () => {
   });
 
   it('does NOT inject PARALLEL_FIX_GUIDANCE when diff is trivial (single-module)', async () => {
-    vi.mocked(indexMod.git).mockImplementation(((args?: string[]) => {
+    vi.mocked(indexMod.git).mockImplementation((args?: string[]) => {
       if (args && args[0] === 'diff' && args.includes('--name-only')) {
         return 'backend/app/only.py';
       }
       return '';
-    }) as unknown as typeof indexMod.git);
+    });
     vi.mocked(resolveBuildConfig).mockReturnValue(BLUEPRINT_CONFIG);
     await handleFix(
       'task-fix-parallel-trivial',
@@ -3475,7 +3475,7 @@ describe('mid-run ./fetch provisioning for review/fix', () => {
     expect(prompt).toContain('./fetch section <key>');
     expect(prompt).toContain('./fetch playbook <key>');
     expect(prompt).not.toContain('./fetch problem-model');
-    expect(vi.mocked(writeFetchHelper)).toHaveBeenCalledWith(
+    expectCalledWith(writeFetchHelper,
       'task-review-fetch', 'p-rev', expect.anything(), { verbs: PLAN_FETCH_VERBS },
     );
   });
@@ -3498,7 +3498,7 @@ describe('mid-run ./fetch provisioning for review/fix', () => {
     );
     const prompt = capturedFixPrompt();
     expect(prompt).toContain('MID-RUN FETCH (./fetch)');
-    expect(vi.mocked(writeFetchHelper)).toHaveBeenCalledWith(
+    expectCalledWith(writeFetchHelper,
       'task-fix-fetch', 'p-fix', expect.anything(), { verbs: PLAN_FETCH_VERBS },
     );
   });
@@ -3680,7 +3680,7 @@ describe('handleReview — pr metadata fetch aborts on timeout', () => {
           });
         }
       });
-    }) as unknown as typeof fetch;
+    });
 
     // Use fake timers so we can fire the 25s timeout without waiting.
     vi.useFakeTimers();

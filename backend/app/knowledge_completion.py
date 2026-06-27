@@ -1136,6 +1136,105 @@ _COMPUTE_LOG_TEXT_CAP = 4000
 _COMPUTE_MAX_CITATIONS = 20
 
 
+def _enrich_per_arm_cost(
+    per_arm_verdicts: dict[str, dict[str, Any]],
+    arms: Any,
+    total_cost: float | None,
+) -> None:
+    """Add apportioned cost_usd to each per-arm verdict entry, in-place.
+
+    Apportions total_cost by elapsed_seconds fraction when available in the arms
+    block; falls back to an even split when durations are missing, and leaves
+    cost_usd None when total_cost is None.
+    """
+    if not per_arm_verdicts:
+        return
+    if total_cost is None:
+        for pav in per_arm_verdicts.values():
+            pav["cost_usd"] = None
+        return
+
+    elapsed: dict[str, float] = {}
+    arm_iter: list[tuple[str, Any]] = []
+    if isinstance(arms, dict):
+        arm_iter = list(arms.items())
+    elif isinstance(arms, list):
+        arm_iter = [
+            (a.get("name") or a.get("label") or a.get("arm") or f"arm_{i}", a)
+            for i, a in enumerate(arms)
+            if isinstance(a, dict)
+        ]
+    for arm_name, arm_data in arm_iter:
+        if isinstance(arm_data, dict):
+            e = arm_data.get("elapsed_seconds")
+            if isinstance(e, (int, float)) and e >= 0:
+                elapsed[str(arm_name)] = float(e)
+
+    total_elapsed = sum(elapsed.values())
+    n_arms = len(per_arm_verdicts)
+
+    for arm_name, pav in per_arm_verdicts.items():
+        if total_elapsed > 0 and arm_name in elapsed:
+            arm_cost = total_cost * elapsed[arm_name] / total_elapsed
+        else:
+            arm_cost = total_cost / n_arms if n_arms > 0 else None
+        pav["cost_usd"] = arm_cost
+
+
+def _evaluate_criterion_per_arm(
+    criterion: dict[str, Any], arms: Any
+) -> dict[str, dict[str, Any]] | None:
+    """Evaluate criterion against each arm and return per-arm verdicts.
+
+    Returns a dict mapping arm name → {"value": metric_value, "met": bool}, or
+    None if no criterion/arms or evaluation is not possible. Mirrors the per-arm
+    metric extraction logic in task_evaluators._find_metric_in_arms.
+    """
+    if not isinstance(criterion, dict) or arms is None:
+        return None
+
+    metric = criterion.get("metric")
+    op = criterion.get("operator")
+    threshold = criterion.get("threshold")
+    if not metric or not op or threshold is None:
+        return None
+
+    # Import the criterion_met helper from task_evaluators
+    from app.task_evaluators import criterion_met as _criterion_met, _coerce_number
+
+    per_arm: dict[str, dict[str, Any]] = {}
+    arm_items: list[tuple[str, Any]] = []
+
+    # Handle both dict and list arm shapes
+    if isinstance(arms, dict):
+        arm_items = list(arms.items())
+    elif isinstance(arms, list):
+        arm_items = [
+            (a.get("name") or a.get("label") or a.get("arm") or f"arm_{i}", a)
+            for i, a in enumerate(arms)
+            if isinstance(a, dict)
+        ]
+
+    for arm_name, arm_data in arm_items:
+        if not isinstance(arm_data, dict):
+            continue
+
+        # Extract metric value from arm, trying exact match then case-insensitive
+        raw_value = arm_data.get(metric)
+        if raw_value is None:
+            # Try case-insensitive lookup
+            for key in arm_data:
+                if key.lower() == metric.lower():
+                    raw_value = arm_data[key]
+                    break
+
+        value = _coerce_number(raw_value)
+        met = _criterion_met(raw_value, op, threshold)
+        per_arm[str(arm_name)] = {"value": value, "met": met}
+
+    return per_arm if per_arm else None
+
+
 def _build_compute_experiment_document(
     task: Task,
     *,
@@ -1164,7 +1263,10 @@ def _build_compute_experiment_document(
     multi-arm comparison block, when the experiment reported one) are captured
     FAITHFULLY — verbatim, no interpretation — into the body and the
     ``verdict_record`` so the strategist and the later opt-in judgment agent can
-    query the real result rather than a truncated narrative.
+    query the real result rather than a truncated narrative. Supports arms-only
+    results (no top-level scalars, only an ``arms`` block): scalar-only results,
+    mixed results with both scalars and arms, and arms-only results all render
+    correctly with appropriate sections in the body.
     """
     payload = task.first_payload or {}
     experiment = str(payload.get("experiment") or "").strip()
@@ -1306,6 +1408,49 @@ def _build_compute_experiment_document(
         body_lines.append("```json")
         body_lines.append(json.dumps(arms, sort_keys=True, default=str))
         body_lines.append("```")
+        # Append human-readable failure summary for any arm that failed so a
+        # strategist can see which arms crashed and why without parsing JSON.
+        failed_lines: list[str] = []
+        arm_items: list[tuple[str, Any]] = []
+        if isinstance(arms, dict):
+            arm_items = list(arms.items())
+        elif isinstance(arms, list):
+            arm_items = [(a.get("name") or a.get("label") or a.get("arm") or f"arm_{i}", a)
+                         for i, a in enumerate(arms) if isinstance(a, dict)]
+        for arm_name, arm_data in arm_items:
+            if not isinstance(arm_data, dict):
+                continue
+            arm_exit = arm_data.get("exit_code")
+            arm_error = arm_data.get("error") or arm_data.get("reason")
+            arm_stderr = arm_data.get("stderr_excerpt")
+            if (arm_exit is not None and arm_exit != 0) or arm_error:
+                parts: list[str] = [f"**{arm_name}** FAILED"]
+                if arm_exit is not None:
+                    parts.append(f"exit {arm_exit}")
+                if arm_error:
+                    parts.append(str(arm_error)[:200])
+                line = ": ".join(parts)
+                if arm_stderr:
+                    line += f" | stderr: {arm_stderr[:200]}"
+                failed_lines.append(f"- {line}")
+        if failed_lines:
+            body_lines.append("")
+            body_lines.append("### Failed arms")
+            body_lines.extend(failed_lines)
+
+        # Append per-arm criterion verdicts when a criterion is declared
+        per_arm_verdicts = _evaluate_criterion_per_arm(criterion, arms)
+        if per_arm_verdicts:
+            body_lines.append("")
+            body_lines.append("### Per-arm criterion evaluation")
+            for arm_name, verdict in per_arm_verdicts.items():
+                value = verdict.get("value")
+                met = verdict.get("met")
+                status = "✓ MET" if met else "✗ NOT MET"
+                if value is not None:
+                    body_lines.append(f"- **{arm_name}:** {status} ({criterion.get('metric')}={value})")
+                else:
+                    body_lines.append(f"- **{arm_name}:** {status} ({criterion.get('metric')}=unmeasured)")
     body = "\n".join(body_lines)
 
     raw_tags = payload.get("tags")
@@ -1336,6 +1481,11 @@ def _build_compute_experiment_document(
         verdict_record["result_metrics"] = result_metrics
     if arms is not None:
         verdict_record["arms"] = arms
+    # Per-arm criterion verdicts for deterministic querying and rendering
+    per_arm_verdicts = _evaluate_criterion_per_arm(criterion, arms)
+    if per_arm_verdicts:
+        _enrich_per_arm_cost(per_arm_verdicts, arms, cost)
+        verdict_record["per_arm_verdicts"] = per_arm_verdicts
 
     return {
         "title": title,
@@ -1932,6 +2082,12 @@ async def _persist_compute_knowledge_document(
     direction_id = (task.context or {}).get("direction_id")
     direction_id = str(direction_id) if direction_id else None
 
+    payload = task.first_payload or {}
+    raw_sweep_id = payload.get("sweep_id") or None
+    sweep_id_val = (str(raw_sweep_id).strip()[:128] if raw_sweep_id else None) or None
+    raw_arm = payload.get("experiment") or payload.get("arm_label") or None
+    arm_label_val = (str(raw_arm).strip()[:256] if raw_arm else None) or None
+
     title = document["title"]
     summary = document["summary"]
     topic = document["topic"]
@@ -2011,6 +2167,8 @@ async def _persist_compute_knowledge_document(
             tags=tags,
             source_citations=citations,
             forward_quality_verdict=verdict_record,
+            sweep_id=sweep_id_val,
+            arm_label=arm_label_val,
         )
         session.add(doc)
     else:
@@ -2025,6 +2183,11 @@ async def _persist_compute_knowledge_document(
             doc.tags = tags
             doc.source_citations = citations
             doc.forward_quality_verdict = verdict_record
+            # Backfill sweep identity on upgrade if not yet set.
+            if doc.sweep_id is None and sweep_id_val:
+                doc.sweep_id = sweep_id_val
+            if doc.arm_label is None and arm_label_val:
+                doc.arm_label = arm_label_val
             flag_modified(doc, "tags")
             flag_modified(doc, "source_citations")
             flag_modified(doc, "forward_quality_verdict")

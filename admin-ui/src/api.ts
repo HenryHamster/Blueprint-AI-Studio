@@ -204,7 +204,9 @@ export interface ComputeExperimentLaunchRequest {
   base_branch: string;
   title: string;
   prompt: string;
-  command: string;
+  command?: string;
+  arms?: Array<{ name: string; command: string }>;
+  declared_metric?: string;
   spend_cap_usd: number;
   deadline_seconds: number;
   accelerator?: string;
@@ -219,6 +221,17 @@ export interface ComputeExperimentLaunchRequest {
   require_live_release?: boolean;
   require_durable_artifact?: boolean;
   provisioning_model?: string;
+  // Optional container image the experiment runs inside (e.g. nvcr.io/nvidia/...).
+  // Required for CUDA/NGC stacks; absent ⇒ the command runs bare on the runner.
+  container_image?: string;
+  // Optional credentials for a private/gated registry. The self-hosted local
+  // runner performs `docker login --password-stdin` with these before pulling.
+  // The password is write-only — never returned from any GET.
+  container_registry_auth?: {
+    server?: string;
+    username?: string;
+    password?: string;
+  };
   model?: string;
   effort?: string;
 }
@@ -253,6 +266,33 @@ export async function createComputeExperiment(
   return res.json();
 }
 
+/** Overridable fields for re-running a compute_experiment from its result. */
+export interface RerunComputeExperimentRequest {
+  success_criterion?: ComputeSuccessCriterion;
+  spend_cap_usd?: number;
+  deadline_seconds?: number;
+}
+
+/**
+ * Re-run a compute_experiment task, optionally overriding criterion/spend/deadline.
+ * Creates a new task linked to the source via parent_task_id.
+ */
+export async function rerunComputeExperiment(
+  taskId: string,
+  body: RerunComputeExperimentRequest,
+): Promise<ComputeExperimentLaunchResponse> {
+  const res = await apiFetch(`/api/admin/tasks/${encodeURIComponent(taskId)}/rerun`, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = (data?.detail as string | undefined) || `Error ${res.status}`;
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
 /**
  * Request body for the compute-experiment preflight projection endpoint.
  * Mirrors `ComputeExperimentPreflightPayload` in backend/app/admin.py.
@@ -276,6 +316,8 @@ export interface ComputeExperimentPreflightResponse {
   rate_per_hour: number | null;
   projected_cost_usd: number | null;
   max_runtime_seconds: number | null;
+  effective_spend_cap_usd: number | null;
+  effective_deadline_seconds: number | null;
   allowed_accelerator_types: string[] | null;
   allowed_machine_types: string[] | null;
   in_policy: boolean;
@@ -298,6 +340,58 @@ export async function computeExperimentPreflight(
     method: 'POST',
     body: JSON.stringify(body),
   }, 0, 15000, signal);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.error?.message || data?.detail || `Error ${res.status}`;
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+/** Request body for the compute-experiment idea-to-draft endpoint. */
+export interface ComputeExperimentDraftRequest {
+  idea: string;
+  github_repo?: string;
+  base_branch?: string;
+}
+
+/**
+ * Response from the draft endpoint. `draft_available` is false when the model
+ * could not produce a usable contract; callers should fall back to manual entry.
+ * All contract fields are optional — only populated when `draft_available` is true.
+ */
+export interface ComputeExperimentDraftResponse {
+  draft_available: boolean;
+  title?: string;
+  prompt?: string;
+  hypothesis?: string;
+  command?: string;
+  arms?: Array<{ name: string; command: string }>;
+  declared_metric?: string;
+  spend_cap_usd?: number;
+  deadline_seconds?: number;
+  experiment?: string;
+  benchmark?: string;
+  metric?: string;
+  success_criterion?: ComputeSuccessCriterion;
+  accelerator?: string;
+  machine_type?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Generate a draft compute-experiment launch contract from a plain-language idea.
+ * POST /api/admin/tasks/compute-experiment/draft — 0 retries, 30 s timeout.
+ * Throws on non-2xx; check `draft_available` before using contract fields.
+ */
+export async function draftComputeExperiment(
+  body: ComputeExperimentDraftRequest,
+  signal?: AbortSignal,
+): Promise<ComputeExperimentDraftResponse> {
+  const res = await apiFetch('/api/admin/tasks/compute-experiment/draft', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  }, 0, 30000, signal);
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     const msg = data?.error?.message || data?.detail || `Error ${res.status}`;
@@ -2142,6 +2236,9 @@ export interface CurrentVersion {
   tasks_merged_has_more?: boolean;
   /** Acceptance-criteria bucket counts for all merged tasks in this version. */
   acceptance_aggregate?: Record<string, number> | null;
+  /** Delivery theme for this version (e.g. leanness, reliability, performance,
+   *  feature, mixed, none). Null when the thinker has not set one yet. */
+  theme?: string | null;
 }
 
 export interface RecentVersion {
@@ -2340,6 +2437,24 @@ export async function setProjectPromotionEnabled(
   return res.json();
 }
 
+export interface SelfAuditResponse {
+  task_id: string;
+  project_id: string;
+  status: string;
+}
+
+export async function triggerSelfAudit(projectId: string): Promise<SelfAuditResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/self-audit`, {
+    method: 'POST',
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to trigger self-audit: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to trigger self-audit: ${res.status}`);
+  }
+  return res.json();
+}
+
 export async function fetchVersionLifecycle(projectId: string): Promise<VersionLifecycleResponse> {
   const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-lifecycle`);
   if (!res.ok) throw new Error(`Failed to fetch version lifecycle: ${res.status}`);
@@ -2417,6 +2532,27 @@ export async function setVersionGoal(
     body: JSON.stringify({ goal: goal ?? null }),
   });
   if (!res.ok) throw new Error(`Failed to set version goal: ${res.status}`);
+  return res.json();
+}
+
+export interface SetVersionThemeResponse {
+  version_number: number;
+  theme: string | null;
+}
+
+export async function setVersionTheme(
+  projectId: string,
+  theme: string | null,
+): Promise<SetVersionThemeResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-theme`, {
+    method: 'POST',
+    body: JSON.stringify({ theme: theme ?? null }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to set version theme: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to set version theme: ${res.status}`);
+  }
   return res.json();
 }
 
@@ -3016,6 +3152,7 @@ export interface ComputeJob {
     value: number | null;
     met: boolean;
     measurable: boolean;
+    binding_status?: string | null;
   } | null;
   // Durable KnowledgeDocument auto-persisted on task completion for all
   // measured terminal jobs. Surfaced from task.plan_output.knowledge_document.id.
@@ -3043,6 +3180,32 @@ export interface ComputeJobsListResponse {
   summary: ComputeJobsSummary;
   limit: number;
   offset: number;
+}
+
+export interface HeldComputeExperiment {
+  id: string;
+  title: string;
+  status: string;
+  requires_approval: boolean;
+  payloads?: Record<string, unknown>[];
+  created_at: string;
+}
+
+export async function fetchHeldComputeExperiments(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<HeldComputeExperiment[]> {
+  const query = new URLSearchParams({
+    task_type: 'compute_experiment',
+    approval_needed: 'true',
+    archived: 'false',
+    project_id: projectId,
+    limit: '20',
+  });
+  const res = await apiFetch(`/api/admin/tasks?${query.toString()}`, undefined, 2, 20000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch held compute experiments: ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data) ? data : (data.tasks ?? []);
 }
 
 export async function fetchComputeJobs(
@@ -3118,6 +3281,35 @@ export async function fetchComputeJobsPaged(
     hasMore: !!data.has_more,
     summary: data.summary ?? emptySummary,
   };
+}
+
+export interface ComputeSweepKnowledgeEntry {
+  id: string;
+  title: string;
+  summary?: string | null;
+  acceptance_grade?: string | null;
+  arm_label?: string | null;
+  created_at?: string | null;
+  source_kind?: string | null;
+}
+
+export interface ComputeSweepGroupsResponse {
+  sweep_groups: Record<string, ComputeSweepKnowledgeEntry[]>;
+}
+
+export async function fetchComputeSweepGroups(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ComputeSweepGroupsResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs/sweep-groups`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch sweep groups: ${res.status}`);
+  return res.json();
 }
 
 export async function fetchComputeJobsAggregateSummary(
@@ -3412,6 +3604,10 @@ export interface KnowledgeDocument {
    *  Present (non-null) only for compute_experiment documents whose launching job ran as
    *  a live-release proof; null/absent otherwise. */
   release_evidence?: LiveReleaseEvidence | null;
+  /** Sweep grouping ID for compute_experiment multi-arm experiments. Groups all arms and aggregate. */
+  sweep_id?: string | null;
+  /** Arm label within a sweep (e.g. 'baseline', 'variant'). Null for the aggregate sweep doc. */
+  arm_label?: string | null;
   /** Only present on get-by-id (the full markdown body). */
   body?: string;
 }
@@ -3426,7 +3622,7 @@ export interface KnowledgeDocumentsResponse {
 /** List / search a project's knowledge documents, newest-first. `q` drives full-text/tag/topic search. */
 export async function fetchKnowledgeDocuments(
   projectId: string,
-  params?: { q?: string; topic?: string; tag?: string; direction?: string; source_kind?: string; origin_state?: string; challenge_state?: string; finding_hash?: string; limit?: number; offset?: number },
+  params?: { q?: string; topic?: string; tag?: string; direction?: string; source_kind?: string; origin_state?: string; challenge_state?: string; finding_hash?: string; sweep?: string; limit?: number; offset?: number },
 ): Promise<KnowledgeDocumentsResponse> {
   const sp = new URLSearchParams();
   if (params?.q) sp.set('q', params.q);
@@ -3437,6 +3633,7 @@ export async function fetchKnowledgeDocuments(
   if (params?.origin_state) sp.set('origin_state', params.origin_state);
   if (params?.challenge_state) sp.set('challenge_state', params.challenge_state);
   if (params?.finding_hash) sp.set('finding_hash', params.finding_hash);
+  if (params?.sweep) sp.set('sweep_id', params.sweep);
   if (params?.limit !== undefined) sp.set('limit', String(params.limit));
   if (params?.offset !== undefined) sp.set('offset', String(params.offset));
   const query = sp.toString();
@@ -3823,10 +4020,116 @@ export async function declareCapabilityVerdict(
 export async function dismissPendingConfirmation(
   projectId: string,
   pendingId: string,
+  note?: string,
 ): Promise<void> {
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/pending-confirm/${encodeURIComponent(pendingId)}/dismiss`,
-    { method: 'POST' },
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note: note ?? null }),
+    },
   );
   if (!res.ok) throw new Error(`Failed to dismiss pending confirmation: ${res.status}`);
+}
+
+export async function acceptPendingConfirmation(
+  projectId: string,
+  pendingId: string,
+  answer?: string,
+): Promise<{ status: string; type: string }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/pending-confirm/${encodeURIComponent(pendingId)}/accept`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answer: answer ?? null }),
+    },
+  );
+  if (!res.ok) throw new Error(`Failed to accept pending confirmation: ${res.status}`);
+  return res.json();
+}
+
+/** A pull-based fleet runner registered to a project. */
+export interface FleetRunner {
+  id: string;
+  hostname: string | null;
+  version: string | null;
+  status: string;
+  capabilities: {
+    task_types?: string | string[];
+    has_gpu?: boolean;
+    max_concurrent?: number;
+    // Task ids the runner reported as currently executing in its last heartbeat.
+    active_task_ids?: string[];
+    [key: string]: unknown;
+  };
+  last_seen_at: string | null;
+  created_at: string | null;
+}
+
+/** Register a new fleet runner for a project. Returns the one-time token. */
+export async function registerFleetRunner(
+  projectId: string,
+  opts: { hostname?: string; version?: string; capabilities?: Record<string, unknown> } = {},
+): Promise<{ runner_id: string; token: string }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/register`,
+    { method: 'POST', body: JSON.stringify(opts) },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to register runner: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to register runner: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** List active (non-deleted) runners for a project. */
+export async function listFleetRunners(projectId: string): Promise<FleetRunner[]> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners`,
+  );
+  if (!res.ok) throw new Error(`Failed to list runners: ${res.status}`);
+  return res.json();
+}
+
+/** Revoke a runner by ID (marks it deleted). */
+export async function revokeFleetRunner(projectId: string, runnerId: string): Promise<void> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}`,
+    { method: 'DELETE' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to revoke runner: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to revoke runner: ${res.status}`);
+  }
+}
+
+/** Reset the review-fix iteration cap for a PR-linked task. Archives FAILED
+ *  review/fix tasks on the PR to drop them from the global count and zeroes
+ *  the per-chain iteration counter. */
+export async function resetTaskIterationCap(
+  taskId: string,
+): Promise<{ archived_count: number; previous_per_chain_iteration: number }> {
+  const res = await apiFetch(`/api/admin/tasks/${taskId}/reset-iteration-cap`, { method: 'POST' });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to reset iteration cap: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Force-create the rollup PR for an EVALUATING parent task. Idempotent —
+ *  returns the existing PR if one is already in progress. */
+export async function triggerTaskRollup(
+  taskId: string,
+): Promise<{ rollup_pr_number?: number; rollup_pr_url?: string; pr_number?: number; pr_url?: string }> {
+  const res = await apiFetch(`/api/admin/tasks/${taskId}/rollup`, { method: 'POST' });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to trigger rollup: ${res.status}`);
+  }
+  return res.json();
 }

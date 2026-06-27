@@ -25,7 +25,7 @@ from app.direction_outcomes import (
     verified_merged_count,
 )
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
-from app.knowledge_query import build_knowledge_index, fetch_direction_knowledge_index
+from app.knowledge_query import build_knowledge_index, build_compute_sweep_groups, fetch_direction_knowledge_index
 from app.models import (
     Task,
     Project,
@@ -34,8 +34,10 @@ from app.models import (
     MessageType,
     ProjectMessage,
     SystemMaturity,
+    LocalRunner,
 )
 from app.deploy_identity import project_matches_deploy_identity
+from app.resource_envelope import resolve_project_require_local_runner
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.release_artifacts import (
     summarize_required_artifact_gap,
@@ -97,6 +99,61 @@ _CHALLENGE_AGREEMENT_BUCKETS = (
     CHALLENGE_DISAGREES,
     CHALLENGE_INDETERMINATE,
 )
+
+# Mirrors ``orchestrator._RUNNER_LIVENESS_SECONDS`` (300): a registered runner is
+# considered live only if it heartbeated within this window. Replicated here
+# rather than imported to avoid an ``orchestrator -> autonomous_research ->
+# strategic_spawning`` import cycle (strategic_spawning is pulled in lazily by
+# the orchestrator's autonomous_research call chain; importing orchestrator at
+# this module's top would invert that order). Keep in sync with orchestrator.
+_RUNNER_LIVENESS_SECONDS = 300
+
+
+async def _load_local_runner_status(
+    session: AsyncSession, project_id: uuid.UUID
+) -> dict[str, Any]:
+    """Live self-hosted local-runner availability for the strategist's context.
+
+    Surfaces whether the operator's self-hosted GPU hardware is up so the
+    strategist can avoid authoring GPU ``compute_experiment`` tasks that would
+    otherwise silently fall back to billable cloud GPU while the hardware is
+    offline. Informational only — there is NO dispatch effect or hard block.
+
+    Returns ``{"ever_registered": bool, "active_total": int, "active_gpu": int}``:
+
+    * ``ever_registered`` — the project has >=1 non-deleted ``LocalRunner`` row
+      (operator set up local hardware at some point).
+    * ``active_total`` — runners with ``status=='active'`` that heartbeated within
+      the liveness window (mirrors the orchestrator dispatch-cache predicate).
+    * ``active_gpu`` — subset of ``active_total`` whose ``capabilities.has_gpu`` is
+      truthy.
+
+    One query (non-deleted runners for the project — a small set); the liveness
+    + GPU filtering is done in Python to stay dialect-agnostic over the JSONB
+    ``capabilities`` column.
+    """
+    rows = (
+        await session.execute(
+            select(LocalRunner).where(
+                LocalRunner.project_id == project_id,
+                LocalRunner.status != "deleted",
+            )
+        )
+    ).scalars().all()
+    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    active_total = 0
+    active_gpu = 0
+    for runner in rows:
+        last_seen = runner.last_seen_at
+        if runner.status == "active" and last_seen is not None and last_seen > cutoff:
+            active_total += 1
+            if (runner.capabilities or {}).get("has_gpu"):
+                active_gpu += 1
+    return {
+        "ever_registered": len(rows) > 0,
+        "active_total": active_total,
+        "active_gpu": active_gpu,
+    }
 
 
 def _empty_finding_challenge_summary() -> dict[str, Any]:
@@ -1051,6 +1108,15 @@ def _summarize_efficiency_snapshot(snapshot: dict) -> dict:
             "total_challenged": raw_peff.get("total_challenged"),
             "challenged_degraded": raw_peff.get("challenged_degraded"),
             "effective_coverage": raw_peff.get("effective_coverage"),
+        }
+    raw_peff_pd = snapshot.get("panel_review_effectiveness_post_deploy") or {}
+    if raw_peff_pd:
+        result["panel_review_effectiveness_post_deploy"] = {
+            "gate_health": raw_peff_pd.get("gate_health"),
+            "fail_open_rate": raw_peff_pd.get("fail_open_rate"),
+            "total_challenged": raw_peff_pd.get("total_challenged"),
+            "challenged_degraded": raw_peff_pd.get("challenged_degraded"),
+            "effective_coverage": raw_peff_pd.get("effective_coverage"),
         }
     return result
 
@@ -2516,6 +2582,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # drops it whole under budget rather than trimming — mirroring
     # staged_directions / operator_overrides. Full bodies fetched on demand.
     "knowledge_index": {"priority": "medium"},
+    # Per-sweep comparative arm grouping — bounded at build time so the packer
+    # drops it whole under budget rather than trimming. Same tier as
+    # knowledge_index.
+    "compute_experiment_sweeps": {"priority": "medium"},
     "capability_trial_verdicts": {"priority": "medium"},
     "outcome_evaluation": {
         "priority": "medium",
@@ -2627,6 +2697,9 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     # _STRATEGIC_REVIEW_SCHEMA["knowledge_index"]. Capped at build time, dropped
     # whole under budget; full bodies fetched on demand.
     "knowledge_index": {"priority": "medium"},
+    # Per-sweep comparative arm grouping — bounded at build time, dropped whole
+    # under budget; full bodies fetched on demand.
+    "compute_experiment_sweeps": {"priority": "medium"},
     # Shared capability vocabulary — see _STRATEGIC_REVIEW_SCHEMA. Small, bounded.
     "available_capabilities": {"priority": "medium"},
 }
@@ -5998,6 +6071,23 @@ async def _spawn_strategic_review(
     # design output) so the strategist knows what knowledge already exists and
     # can fetch full bodies on demand — included only when documents exist.
     _knowledge_index = await build_knowledge_index(session, project.id)
+    _compute_sweep_groups = await build_compute_sweep_groups(session, project.id)
+    # Live self-hosted local-runner availability, so the strategist avoids
+    # authoring GPU compute_experiment tasks (which silently fall back to
+    # billable cloud GPU) while the operator's hardware is offline. Included in
+    # the payload when the project has ever registered a runner OR declares the
+    # enforce-local policy (below).
+    _local_runner_status = await _load_local_runner_status(session, project.id)
+    # Surface the enforce-local policy alongside availability so the strategist
+    # can reason about consequence: when require_local_runner is True a GPU
+    # experiment authored while no runner is live is HELD (never billable cloud
+    # fallback) and terminally fails after the hold window; when False it falls
+    # back to billable cloud GPU. Merged at the call site (not inside
+    # _load_local_runner_status) so that helper's return shape stays stable for
+    # its unit tests. Resolved from build_config.resource_envelope.
+    _local_runner_status["require_local_runner"] = resolve_project_require_local_runner(
+        project
+    )
     _active_direction_ids = [
         d.get("id")
         for d in (project.directions or [])
@@ -6034,6 +6124,21 @@ async def _spawn_strategic_review(
             # large/oversized AND something is actually prunable. Advisory list.
             **({"prune_candidates": _prune_candidates} if _prune_candidates else {}),
             **({"knowledge_index": _knowledge_index} if _knowledge_index else {}),
+            **({"compute_experiment_sweeps": _compute_sweep_groups} if _compute_sweep_groups else {}),
+            # Live local-runner availability — surfaced when the operator has
+            # ever registered self-hosted hardware OR the project declares the
+            # enforce-local policy (require_local_runner). Absent => agent authors
+            # for cloud normally; present => agent can hold GPU experiments while
+            # active_gpu == 0 to avoid silent billable-cloud-GPU fallback (or, when
+            # require_local_runner is set, an indefinite hold + terminal fail).
+            **(
+                {"local_runner_status": _local_runner_status}
+                if (
+                    _local_runner_status.get("ever_registered")
+                    or _local_runner_status.get("require_local_runner")
+                )
+                else {}
+            ),
             "running_update": project.running_update or "",
             "running_update_acknowledged_at": (
                 project.running_update_acknowledged_at.isoformat()

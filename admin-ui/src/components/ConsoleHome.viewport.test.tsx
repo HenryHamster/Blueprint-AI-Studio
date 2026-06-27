@@ -47,6 +47,9 @@ vi.mock('../api', () => ({
   // expose every named export the component imports or the module linker
   // throws "does not provide an export named 'fetchTask'" at import time.
   fetchTask: vi.fn(async () => ({})),
+  // Same linker requirement: ConsoleHome statically imports triggerSelfAudit
+  // (the self-audit button click path), so the mock must expose it too.
+  triggerSelfAudit: vi.fn(async () => ({ task_id: 'audit-task-test' })),
   API_BASE_URL: '',
   authGet: vi.fn(async () => ({})),
 }));

@@ -7063,6 +7063,212 @@ class TestCrossBaseDependencyGate:
         # A dependency that can never land must still cascade-cancel — no hang.
         assert result == "cascade_cancel"
 
+    @pytest.mark.asyncio
+    async def test_staging_merged_dep_eligible_when_lineage_parent_landed(
+        self, db_session
+    ):
+        """Dependent is eligible when a staging-merged dep's parent lineage has landed.
+
+        Reproduces the permanent cross-lineage wedge: a code task (dep) merged its
+        PR into its research parent's staging branch — not integration — completing
+        with pr_merged=True, landed_on_integration=False,
+        _non_merge_unblock_reason=merged_pr_non_integration_branch.  When the
+        research parent's rollup later lands on integration, the parent carries
+        landed_on_integration=True, but the dep (now a grandchild scenario relative
+        to an outer rollup) may not have been propagated yet.
+
+        _check_candidate_task_deps must resolve the dep as "landed" (via the parent
+        lineage check) and return "eligible" rather than wedging forever.
+        """
+        from app.orchestrator import _check_candidate_task_deps
+        from app.landed_signal import (
+            mark_unblocked_non_merge,
+            mark_landed_on_integration,
+        )
+
+        project = make_project(name="CrossLineageWedge", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Research/rollup parent — has itself landed on integration via its
+        # own rollup PR.
+        lineage_parent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "base_branch": "research/r1"}],
+            context={},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(lineage_parent)
+        db_session.add(lineage_parent)
+        await db_session.commit()
+        await db_session.refresh(lineage_parent)
+
+        # Code child that merged its PR to the research task's staging branch
+        # (not to integration) — the normal path for a rollup-lineage code task.
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/r1"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+            parent_task_id=lineage_parent.id,
+        )
+        mark_unblocked_non_merge(dep, reason="merged_pr_non_integration_branch")
+        db_session.add(dep)
+        await db_session.commit()
+
+        # Dependent on a different base with a genuine cross-base code-dependency.
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        # The dep's own signal is False, but its lineage parent has landed →
+        # dependent must be eligible (not permanently waiting).
+        result, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert result == "eligible", (
+            "cross-base code-dep should be eligible when lineage parent has landed "
+            "on integration, even if the dep's own landed_on_integration is False"
+        )
+
+    @pytest.mark.asyncio
+    async def test_staging_merged_dep_held_when_lineage_parent_not_yet_landed(
+        self, db_session
+    ):
+        """Regression guard: hold preserved when lineage has NOT yet landed.
+
+        The defense-in-depth check must NOT release a dependent when its code
+        dep's lineage parent also has not landed.  This preserves the invariant
+        that only deps whose code is provably on integration unblock dependents.
+        """
+        from app.orchestrator import _check_candidate_task_deps
+        from app.landed_signal import mark_unblocked_non_merge
+
+        project = make_project(name="CrossLineageHold", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Research parent whose rollup has NOT yet landed on integration.
+        lineage_parent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "base_branch": "research/r1"}],
+            context={},
+            status=TaskStatus.COMPLETED,
+        )
+        # Parent merged to staging only, not to integration.
+        mark_unblocked_non_merge(
+            lineage_parent, reason="merged_pr_non_integration_branch"
+        )
+        db_session.add(lineage_parent)
+        await db_session.commit()
+        await db_session.refresh(lineage_parent)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/r1"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+            parent_task_id=lineage_parent.id,
+        )
+        mark_unblocked_non_merge(dep, reason="merged_pr_non_integration_branch")
+        db_session.add(dep)
+        await db_session.commit()
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        # Neither dep nor its parent has landed → must stay "waiting".
+        result, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert result == "waiting", (
+            "cross-base code-dep must still hold when neither the dep nor its "
+            "lineage parent has landed on integration"
+        )
+
+    @pytest.mark.asyncio
+    async def test_force_dropped_dep_held_even_when_lineage_parent_landed(
+        self, db_session
+    ):
+        """Force-dropped deps must NOT release even if the lineage parent has landed.
+
+        A dep completed with a force-drop reason (review_respawn_cap /
+        malformed_pr_url / rollup_no_pr_artifact) means its code was discarded —
+        the parent landing on integration does NOT carry that code to the trunk.
+        _dep_parent_lineage_has_landed must short-circuit on the force-drop
+        guard and return False so the dependent stays "waiting".
+
+        Regression guard for the guard added at orchestrator_health.py:847-848.
+        """
+        from app.orchestrator import _check_candidate_task_deps
+        from app.landed_signal import (
+            mark_unblocked_non_merge,
+            mark_landed_on_integration,
+        )
+
+        project = make_project(name="ForceDropParentLanded", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Lineage parent that HAS landed on integration.
+        lineage_parent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "base_branch": "research/r1"}],
+            context={},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(lineage_parent)
+        db_session.add(lineage_parent)
+        await db_session.commit()
+        await db_session.refresh(lineage_parent)
+
+        # Code child that was force-dropped (review_respawn_cap) — its code was
+        # discarded, so the parent landing does NOT carry this dep's code.
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/r1"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+            parent_task_id=lineage_parent.id,
+        )
+        mark_unblocked_non_merge(dep, reason="review_respawn_cap")
+        db_session.add(dep)
+        await db_session.commit()
+
+        # Dependent on a different base with a genuine cross-base code-dependency.
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+
+        # Parent has landed but dep was force-dropped → must stay "waiting".
+        result, _ = await _check_candidate_task_deps(
+            dependent, [dep], [dep.id], db_session, self._verify_true
+        )
+        assert result == "waiting", (
+            "force-dropped dep (review_respawn_cap) must not release dependent "
+            "even when the dep's lineage parent has landed on integration — "
+            "the dep's code was discarded and never reached the trunk"
+        )
+
 
 class TestCrossBaseBaseRecut:
     """Once a cross-rollup code-dependency lands, the dependent's staging/rollup

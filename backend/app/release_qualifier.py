@@ -1262,12 +1262,33 @@ async def run_qualification(
     #    in-flight check, the spawns, and the last_qualification write.  The
     #    second caller blocks here until the first commits, then sees the
     #    pending record and short-circuits at the in-flight guard below.
+    #
+    #    ``populate_existing=True`` (+ an explicit ``expire`` for callers that
+    #    pre-loaded the row) is the correctness linchpin: when ``version`` was
+    #    already cached in this session's identity map — notably the strategic
+    #    ``qualify_request`` path, which loads the open version via
+    #    ``current_open_version(session, ...)`` and may then hold a copy that
+    #    PRE-DATES a ``promote()`` committed in another session — a bare
+    #    ``with_for_update()`` SELECT acquires the DB lock but returns that SAME
+    #    cached instance WITHOUT refreshing its attributes, so the under-lock
+    #    guards below (phase / in-flight / promotion-in-flight / cached-verdict)
+    #    would read STALE ``last_qualification``.  That is how a re-qualify slips
+    #    past the promotion-in-flight guard while a promotion PR is genuinely open
+    #    in ``promotion_check_wait`` and spawns a redundant audit + merge-grade.
+    #    Forcing the loaded row to overwrite the cached attributes makes the
+    #    under-lock guards authoritative regardless of caller staleness (mirrors
+    #    the ``populate_existing`` pattern the managed-check-wait reconciler
+    #    helpers already use).  ``populate_existing`` overwrites the attributes of
+    #    an instance already present in the identity map, so it is sufficient on
+    #    its own — ``version`` is not mutated before this point, so no dirty write
+    #    is lost.
     locked_version = (
         (
             await session.execute(
                 select(release_version.ReleaseVersion)
                 .where(release_version.ReleaseVersion.id == version.id)
                 .with_for_update()
+                .execution_options(populate_existing=True)
             )
         )
         .scalars()
@@ -1381,6 +1402,15 @@ async def run_qualification(
         prior_qual.get("infra_attempt_history")
         if prior_qual.get("status") == "infra_failure"
         else []
+    )
+    # Carry forward the prior-superseded flag: when the reconciler previously
+    # wrote blocker='qualification_superseded' (force-promote out-of-band), the
+    # new qualification's diff is stabilization-only and grading it against the
+    # frozen goal is meaningless.  Sticky: once set it survives across infra-
+    # failure retry cycles until a genuine new version cycle clears it.
+    prior_superseded: bool = bool(
+        prior_qual.get("prior_superseded")
+        or prior_qual.get("blocker") == "qualification_superseded"
     )
 
     # 5. Spawn the heavy children.
@@ -1496,6 +1526,7 @@ async def run_qualification(
         "previous_infra_failure_signature": prior_infra_failure_signature,
         "previous_infra_failure_candidate_sha": prior_infra_failure_candidate_sha,
         "infra_attempt_history": infra_attempt_history,
+        "prior_superseded": prior_superseded,
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic
@@ -3227,6 +3258,68 @@ async def _finalize_qualification(
             )
             return await _handle_infra_failure(session, version, qual, label)
         merge_grade_blocked = bool(merge_grade_cert["blocked"])
+        # Already-promoted exemption: when the previous qualification was
+        # qualification_superseded (force-promoted out-of-band), the feature
+        # content is already on the promotion target.  Grading stabilization-
+        # only tail commits against the frozen goal is meaningless — suppress.
+        if merge_grade_blocked and qual.get("prior_superseded"):
+            logger.warning(
+                "[RELEASE_QUALIFIER] v%d merge_grade_goal_coverage suppressed: "
+                "prior qualification was superseded (force-promoted out-of-band); "
+                "stabilization-only diff graded against frozen goal is not actionable",
+                version.version_number,
+            )
+            merge_grade_blocked = False
+            merge_grade_cert = {**merge_grade_cert, "status": "superseded_exempt", "blocked": False}
+        # Fallback: direct GitHub ancestry check when prior_superseded was not
+        # set (e.g. GitHub-cred outage let the 6h timeout beat the supersession
+        # reconciler).  Fail-closed: cred unavailable or any error → leave
+        # merge_grade_blocked as-is.
+        #
+        # Normal path (_pre_gates is not None): result was pre-resolved before
+        # the FOR UPDATE lock in _finalize_locked_version — consume it directly
+        # without re-issuing a GitHub call under the lock.
+        # Fallback path (_pre_gates is None): direct calls from tests or the
+        # timeout reaper — run inline as before.
+        if merge_grade_blocked and candidate_sha:
+            if _pre_gates is not None:
+                if _pre_gates.get("pre_merge_grade_already_on_main") is True:
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] v%d merge_grade_goal_coverage suppressed: "
+                        "direct GitHub ancestry check confirms candidate %s is already "
+                        "on main (prior_superseded was not set — likely GitHub-cred outage "
+                        "during force-promote window)",
+                        version.version_number,
+                        candidate_sha[:8],
+                    )
+                    merge_grade_blocked = False
+                    merge_grade_cert = {**merge_grade_cert, "status": "superseded_exempt", "blocked": False}
+            else:
+                try:
+                    _mg_project = await session.get(Project, version.project_id)
+                    _mg_resolved = await _resolve_github_with_session(session, _mg_project)
+                    if _mg_resolved is not None:
+                        _mg_token, _mg_owner, _mg_repo = _mg_resolved
+                        if await _candidate_already_on_main(
+                            _mg_token, _mg_owner, _mg_repo, candidate_sha, version, project=_mg_project
+                        ):
+                            logger.warning(
+                                "[RELEASE_QUALIFIER] v%d merge_grade_goal_coverage suppressed: "
+                                "direct GitHub ancestry check confirms candidate %s is already "
+                                "on main (prior_superseded was not set — likely GitHub-cred outage "
+                                "during force-promote window)",
+                                version.version_number,
+                                candidate_sha[:8],
+                            )
+                            merge_grade_blocked = False
+                            merge_grade_cert = {**merge_grade_cert, "status": "superseded_exempt", "blocked": False}
+                except Exception:
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] v%d direct already-on-main check failed "
+                        "(fail-closed): merge_grade_goal_coverage block preserved",
+                        version.version_number,
+                        exc_info=True,
+                    )
 
     # --- Compute the composite ---------------------------------------------
     # Whether an UNRESOLVED candidate CI (pending / no check-runs) hard-blocks
@@ -4074,6 +4167,41 @@ async def _finalize_locked_version(
         ) = await _resolve_migration_apply_at_finalize(
             session, peek, peek_candidate_sha
         )
+        # Pre-resolve the direct already-on-main ancestry check (merge-grade
+        # exemption fallback) before acquiring the lock.  Only attempt when a
+        # merge-grade child was spawned, a candidate SHA is available, and the
+        # prior_superseded exemption will not already clear the block (short-
+        # circuit avoids a spurious GitHub call).  Fail-closed: any error or
+        # cred unavailability → None (preserved in _pre_gates; consumed as
+        # fail-closed inside _finalize_qualification).
+        _pre_merge_grade_already_on_main: bool | None = None
+        if (
+            peek_qual.get("merge_grade_task_id")
+            and peek_candidate_sha
+            and not peek_qual.get("prior_superseded")
+        ):
+            try:
+                _mg_project_pre = await session.get(Project, peek.project_id)
+                _mg_resolved_pre = await _resolve_github_with_session(
+                    session, _mg_project_pre
+                )
+                if _mg_resolved_pre is not None:
+                    _mg_token_pre, _mg_owner_pre, _mg_repo_pre = _mg_resolved_pre
+                    _pre_merge_grade_already_on_main = await _candidate_already_on_main(
+                        _mg_token_pre,
+                        _mg_owner_pre,
+                        _mg_repo_pre,
+                        peek_candidate_sha,
+                        peek,
+                        project=_mg_project_pre,
+                    )
+            except Exception:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] pre-lock already-on-main check failed "
+                    "(fail-closed): stored as None in _pre_gates",
+                    exc_info=True,
+                )
+
         _pre_gates = {
             "ci_green": pre_ci_green,
             "ci_resolution": pre_ci_resolution,
@@ -4082,6 +4210,7 @@ async def _finalize_locked_version(
             "apply_verdict": pre_apply_verdict,
             "apply_detail": pre_apply_detail,
             "pre_theme_evidence": await _fetch_version_theme_evidence(session, peek),
+            "pre_merge_grade_already_on_main": _pre_merge_grade_already_on_main,
         }
 
     # Expire the peek instance so the FOR UPDATE select below forces a fresh

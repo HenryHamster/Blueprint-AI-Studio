@@ -6,7 +6,7 @@ from math import ceil
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -142,6 +142,11 @@ class _DirectionPayload(BaseModel):
             "convention."
         ),
     )
+    gap_id: Optional[str] = Field(
+        default=None,
+        max_length=100,
+        description="Problem model gap ID this direction is created to address.",
+    )
 
 
 @router.get("/projects/{project_id}/directions")
@@ -149,6 +154,15 @@ async def get_directions(
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
+    lite: bool = Query(
+        False,
+        description=(
+            "When true, omit heavy stable project-level fields (design_doc, "
+            "problem_model, self_reflection_log, vision, running_update_reconciliation). "
+            "Used by the 10-second poll path to reduce payload size; the initial "
+            "full load always uses lite=false."
+        ),
+    ),
 ):
     from app.shared_state import get_direction_hold_info as _get_direction_hold_info
     from app.shared_state import runtime_config as _runtime_config
@@ -160,9 +174,10 @@ async def get_directions(
         _compute_churn_metrics,
         _compute_lifetime_burn_metrics,
     )
-    from app.running_update_merge import (
-        summarize_running_update_reconciliation,
-    )
+    if not lite:
+        from app.running_update_merge import (
+            summarize_running_update_reconciliation,
+        )
 
     project = await _get_user_project(project_id, current_user["user_id"], session)
     directions = project.directions or []
@@ -260,42 +275,50 @@ async def get_directions(
                 "knowledge_document_count": knowledge_counts.get(d.get("id", ""), 0),
             }
         )
-    problem_model_dict = project.problem_model or {}
-    proof_problem_model = enrich_problem_model_capability_proofs(
-        problem_model_dict,
-        getattr(project, "capability_proof_records", None),
-    )
-    problem_model_size_health = None
-    if problem_model_dict:
-        try:
-            pm = ProblemModel(**problem_model_dict)
-            problem_model_size_health = compute_model_size_signal(pm)
-        except Exception:  # noqa: BLE001 — best-effort enrichment; a malformed stored problem_model must not 500 the directions listing
-            logger.debug(
-                "[DIRECTIONS] problem_model size-health computation skipped "
-                "(malformed stored problem_model)",
-                exc_info=True,
-            )
-    return {
+    resp: dict = {
         "directions": enriched,
         "autonomous_enabled": project.autonomous_enabled,
-        "vision": project.vision or {},
-        "design_doc": project.design_doc or {},
-        "problem_model": proof_problem_model,
-        "problem_model_size_health": problem_model_size_health,
         "running_update": project.running_update or None,
         "running_update_acknowledged_at": (
             project.running_update_acknowledged_at.isoformat()
             if project.running_update_acknowledged_at
             else None
         ),
-        "running_update_reconciliation": summarize_running_update_reconciliation(
-            project.vision
-        ),
-        "self_reflection_log": project.self_reflection_log or [],
         "is_self_repo": bool(project.is_self_repo),
         "enable_self_improvement": project.enable_self_improvement,
     }
+
+    if not lite:
+        problem_model_dict = project.problem_model or {}
+        proof_problem_model = enrich_problem_model_capability_proofs(
+            problem_model_dict,
+            getattr(project, "capability_proof_records", None),
+        )
+        problem_model_size_health = None
+        if problem_model_dict:
+            try:
+                pm = ProblemModel(**problem_model_dict)
+                problem_model_size_health = compute_model_size_signal(pm)
+            except Exception:  # noqa: BLE001 — best-effort enrichment; a malformed stored problem_model must not 500 the directions listing
+                logger.debug(
+                    "[DIRECTIONS] problem_model size-health computation skipped "
+                    "(malformed stored problem_model)",
+                    exc_info=True,
+                )
+        resp.update(
+            {
+                "vision": project.vision or {},
+                "design_doc": project.design_doc or {},
+                "problem_model": proof_problem_model,
+                "problem_model_size_health": problem_model_size_health,
+                "running_update_reconciliation": summarize_running_update_reconciliation(
+                    project.vision
+                ),
+                "self_reflection_log": project.self_reflection_log or [],
+            }
+        )
+
+    return resp
 
 
 @router.post("/projects/{project_id}/directions")
@@ -375,6 +398,8 @@ async def add_direction(
         context["retirement_condition"] = payload.retirement_condition
     if context:
         direction["context"] = context
+    if payload.gap_id:
+        direction["gap_id"] = payload.gap_id
 
     existing_direction: list = []  # Will be populated if we find a duplicate
 
@@ -781,6 +806,17 @@ async def update_direction(
             status_code=400,
             detail="system_id must be a string of at most 100 characters",
         )
+    if (
+        "gap_id" in payload
+        and payload["gap_id"] is not None
+        and (
+            not isinstance(payload["gap_id"], str) or len(payload["gap_id"]) > 100
+        )
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="gap_id must be a string of at most 100 characters",
+        )
 
     # Resolve and validate the staging TARGET version. Triggered both when a
     # direction transitions to ``staged`` AND when an already-staged direction is
@@ -983,6 +1019,11 @@ async def update_direction(
                         d.pop("system_id", None)
                     else:
                         d["system_id"] = payload["system_id"][:100]
+                if "gap_id" in payload:
+                    if payload["gap_id"] is None:
+                        d.pop("gap_id", None)
+                    else:
+                        d["gap_id"] = payload["gap_id"]
 
                 # Reset outcome-detection state when any contract field actually changed.
                 _new_ctx = d.get("context") or {}

@@ -37,6 +37,7 @@ from app.admin import _get_user_project_with_role
 from app.resource_envelope import (
     get_project_recent_spend_usd,
     resolve_project_hardware_policy,
+    resolve_project_require_local_runner,
     resolve_project_spend_ceiling,
     resolve_project_spend_warning_fraction,
     resolve_project_spend_window_days,
@@ -822,6 +823,7 @@ def _resource_envelope_response(
         ),
         "allowed_machine_types": allowed_machines,
         "allowed_accelerator_types": allowed_accels,
+        "require_local_runner": resolve_project_require_local_runner(project),
         "active_vm_count": active_vm_count,
         "recent_spend_usd": float(recent_spend_usd),
         "recent_spend_compute_usd": float(spend_breakdown["compute"]),
@@ -1291,6 +1293,7 @@ async def update_resource_envelope_config(
         "max_concurrent_compute_jobs",
         "allowed_machine_types",
         "allowed_accelerator_types",
+        "require_local_runner",
     }
     if not body:
         raise HTTPException(

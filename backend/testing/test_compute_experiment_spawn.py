@@ -171,6 +171,46 @@ def test_author_contract_omits_absent_gpu_fields():
     assert "provisioning_model" not in contract
 
 
+def test_author_contract_forwards_sweep_id():
+    # sweep_id is forwarded when present so the completion handler can route the
+    # result through the sweep aggregate path instead of the standalone verdict path.
+    finding = {
+        "command": "python sweep.py",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 300,
+        "sweep_id": "sid-x",
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["sweep_id"] == "sid-x"
+
+
+def test_author_contract_omits_absent_sweep_id():
+    finding = {"command": "python run.py", "spend_cap_usd": 1.0, "deadline_seconds": 60}
+    contract = _author_compute_launch_contract(finding)
+    assert "sweep_id" not in contract
+
+
+def test_author_contract_forwards_setup_step():
+    # setup_step is forwarded when present (flat) so the platform can run it
+    # on the same substrate BEFORE the main command.
+    finding = {
+        "command": "python eval.py",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 300,
+        "setup_step": "pip install -r requirements.txt",
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["setup_step"] == "pip install -r requirements.txt"
+
+
+def test_author_contract_omits_absent_setup_step():
+    # When setup_step is absent, it must not appear in the contract — callers
+    # that check for its presence rely on absence meaning "no setup needed".
+    finding = {"command": "python run.py", "spend_cap_usd": 1.0, "deadline_seconds": 60}
+    contract = _author_compute_launch_contract(finding)
+    assert "setup_step" not in contract
+
+
 # --- contract validation --------------------------------------------------
 
 
@@ -243,56 +283,71 @@ def _base_contract(**extra):
     }
 
 
-def test_validate_contract_rejects_missing_smoke_sample():
-    ok, reason = _validate_compute_launch_contract(_base_contract())
-    assert ok is False
-    assert "smoke_sample" in reason
+class TestValidateContractSmokeAdvisory:
+    """Author smoke_sample failures are ADVISORY, not blocking — v20 design decision.
 
+    ``_validate_compute_launch_contract`` deliberately demotes every author-attested
+    smoke failure from a hard rejection to a logged warning.  The binding gate is the
+    platform-executed pre-flight smoke (capability ``platform-preflight-smoke``) which
+    runs the actual command on the real compute substrate before any VM is billed.
+    Author smoke runs cheaply on the orchestrator host and cannot account for GPU
+    hardware, private container registries, or custom base images — so a failed or
+    absent author smoke must NEVER block launch.
 
-def test_validate_contract_rejects_non_dict_smoke_sample():
-    ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample="yes"))
-    assert ok is False
-    assert "smoke_sample" in reason
+    These tests pin that intentional demotion.  If any test in this class starts
+    asserting ``ok is False``, that is a regression: the platform smoke gate is the
+    correct enforcement point, not the author contract validator.
+    """
 
+    def test_accepts_without_author_smoke_sample(self):
+        # No smoke_sample at all: platform smoke will gate at launch.
+        ok, reason = _validate_compute_launch_contract(_base_contract())
+        assert ok is True
+        assert reason == ""
 
-def test_validate_contract_rejects_failed_smoke_startup():
-    smoke = {
-        "exit_code": 1,
-        "startup_ok": False,
-        "metric_captured": False,
-        "error_excerpt": "ModuleNotFoundError: No module named 'backend'",
-    }
-    ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample=smoke))
-    assert ok is False
-    assert "smoke failed" in reason
-    assert "ModuleNotFoundError" in reason
+    def test_advisory_non_dict_smoke_sample(self):
+        # A malformed (non-dict) smoke_sample is advisory — contract still accepted.
+        ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample="yes"))
+        assert ok is True
+        assert reason == ""
 
+    def test_advisory_failed_smoke_startup(self):
+        # Startup failure in author smoke_sample is advisory — accepted.
+        smoke = {
+            "exit_code": 1,
+            "startup_ok": False,
+            "metric_captured": False,
+            "error_excerpt": "ModuleNotFoundError: No module named 'backend'",
+        }
+        ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample=smoke))
+        assert ok is True
+        assert reason == ""
 
-def test_validate_contract_rejects_unsmokable():
-    smoke = {
-        "unsmokable": True,
-        "unsmokable_reason": "requires T4 GPU not available on this VM",
-    }
-    ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample=smoke))
-    assert ok is False
-    assert "un-smokable" in reason
-    assert "T4 GPU" in reason
+    def test_advisory_unsmokable(self):
+        # Unsmokable author attestation (e.g. GPU-only) is advisory — accepted.
+        smoke = {
+            "unsmokable": True,
+            "unsmokable_reason": "requires T4 GPU not available on this VM",
+        }
+        ok, reason = _validate_compute_launch_contract(_base_contract(smoke_sample=smoke))
+        assert ok is True
+        assert reason == ""
 
-
-def test_validate_contract_rejects_metric_not_captured_when_criterion_declared():
-    smoke = {
-        "exit_code": 0,
-        "startup_ok": True,
-        "metric_captured": False,
-        "timed_out": False,
-    }
-    contract = _base_contract(
-        smoke_sample=smoke,
-        success_criterion={"metric": "accuracy", "operator": ">=", "threshold": 0.9},
-    )
-    ok, reason = _validate_compute_launch_contract(contract)
-    assert ok is False
-    assert "metric" in reason
+    def test_advisory_metric_not_captured_when_criterion_declared(self):
+        # Author smoke that did not capture the declared metric is advisory.
+        smoke = {
+            "exit_code": 0,
+            "startup_ok": True,
+            "metric_captured": False,
+            "timed_out": False,
+        }
+        contract = _base_contract(
+            smoke_sample=smoke,
+            success_criterion={"metric": "accuracy", "operator": ">=", "threshold": 0.9},
+        )
+        ok, reason = _validate_compute_launch_contract(contract)
+        assert ok is True
+        assert reason == ""
 
 
 def test_validate_contract_accepts_valid_smoke_no_criterion():
@@ -814,19 +869,25 @@ async def test_unmeasured_criterion_surfaces_emitted_keys(
     """compute_unmeasured_criterion failure message surfaces what the command
     actually emitted so a case/name mismatch is instantly visible.
 
-    Case A: COMPUTE_RESULT emitted a differently-NAMED metric ('roc_auc_score')
-            while the criterion declares 'auc' → the metric stays unmeasured and
-            miss_reason lists emitted_keys=['roc_auc_score'] hinting at the
-            name mismatch. (A pure case difference such as 'AUC' vs 'auc' is now
-            tolerated by the case-insensitive matcher in
-            evaluate_compute_success_criterion (#11745) and is therefore measured,
-            not surfaced here — only a genuine name divergence reaches this path.)
+    Case A (positive — locks in case-insensitive resolution): COMPUTE_RESULT
+            emits 'AUC' (uppercase) and criterion declares 'auc' (lowercase).
+            _find_metric_case_insensitive resolves the match, so the criterion IS
+            measured and met (0.85 >= 0.8). The task must NOT fail with
+            compute_unmeasured_criterion; it advances to EVALUATING (follow-on
+            spawned) with compute_success_criterion showing met=True,
+            measurable=True, value=0.85.
+    Case A': genuine name mismatch — criterion declares 'auc' but the experiment
+             emits 'roc_auc' (different name, not just different case). No
+             case-insensitive match is found, so the criterion is unmeasured and
+             the task FAILS with failure_category == 'compute_unmeasured_criterion'.
+             The evaluation_gate reason must surface the declared metric and the
+             emitted_keys with a name/case-mismatch hint.
     Case B: COMPUTE_RESULT has no experiment metrics at all (only cost fields)
             → miss_reason reports emitted_keys=[].
     Case C: no COMPUTE_RESULT parsed (crash before result) — exercised separately
             by test_unmeasured_criterion_no_artifact_is_crash_path.
     """
-    # --- Case A: differently-named metric key emitted (not a pure case diff) ---
+    # --- Case A: case-insensitive resolution — 'AUC' resolves declared 'auc' ---
     task_a = await _make_compute_task(
         db_session,
         {
@@ -841,27 +902,60 @@ async def test_unmeasured_criterion_surfaces_emitted_keys(
             },
         },
     )
-    result_with_name_mismatch = json.dumps(
+    result_with_upper_case = json.dumps(
         {
             "outcome": "SUCCESS",
             "final_cost_usd": 0.10,
-            # declared as 'auc' but emitted under a different NAME (not just case),
-            # so the case-insensitive matcher does not resolve it → unmeasured.
-            "roc_auc_score": 0.85,
+            "AUC": 0.85,  # emitted uppercase; resolves declared lowercase 'auc'
         }
     )
     await _handle_compute_experiment_completion(
-        task_a, result_with_name_mismatch, db_session
+        task_a, result_with_upper_case, db_session
     )
     await db_session.refresh(task_a)
-    assert task_a.status == TaskStatus.FAILED
-    assert task_a.context["failure_category"] == "compute_unmeasured_criterion"
-    gate_reason = task_a.context["evaluation_gate"]["reason"]
-    # Must name the declared metric, the emitted keys, and hint at a name mismatch.
-    assert "auc" in gate_reason
-    assert "roc_auc_score" in gate_reason
-    assert "emitted_keys" in gate_reason
-    assert "case" in gate_reason.lower() or "name" in gate_reason.lower()
+    # Case-insensitive match: criterion IS measured and met — must NOT fail.
+    assert task_a.status != TaskStatus.FAILED
+    assert task_a.status in (TaskStatus.EVALUATING, TaskStatus.COMPLETED)
+    assert "failure_category" not in (task_a.context or {})
+    crit_a = (task_a.context or {}).get("compute_success_criterion", {})
+    assert crit_a.get("met") is True
+    assert crit_a.get("measurable") is True
+    assert crit_a.get("value") == pytest.approx(0.85)
+
+    # --- Case A': genuine name mismatch — 'roc_auc' does not match 'auc' ---
+    task_a2 = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "auc-name-mismatch-experiment",
+            "success_criterion": {
+                "kind": "metric",
+                "metric": "auc",
+                "operator": ">=",
+                "threshold": 0.8,
+            },
+        },
+    )
+    result_name_mismatch = json.dumps(
+        {
+            "outcome": "SUCCESS",
+            "final_cost_usd": 0.10,
+            "roc_auc": 0.85,  # different name — no case-insensitive match for 'auc'
+        }
+    )
+    await _handle_compute_experiment_completion(
+        task_a2, result_name_mismatch, db_session
+    )
+    await db_session.refresh(task_a2)
+    assert task_a2.status == TaskStatus.FAILED
+    assert task_a2.context["failure_category"] == "compute_unmeasured_criterion"
+    gate_reason_a2 = task_a2.context["evaluation_gate"]["reason"]
+    # Must name the declared metric, the emitted keys, and hint at name/case mismatch.
+    assert "auc" in gate_reason_a2
+    assert "roc_auc" in gate_reason_a2
+    assert "emitted_keys" in gate_reason_a2
+    assert "case" in gate_reason_a2.lower() or "name" in gate_reason_a2.lower()
 
     # --- Case B: no experiment metrics in result at all ---
     task_b = await _make_compute_task(
@@ -1606,7 +1700,7 @@ async def test_launch_allows_operator_approved_above_threshold_compute_job(db_se
             task,
             command="python bench.py",
             machine_type="e2-standard-2",
-            spend_cap_usd=10.0,
+            spend_cap_usd=12.0,
             deadline_seconds=300,
         )
         assert job is not None
@@ -1619,9 +1713,10 @@ async def test_launch_allows_operator_approved_above_threshold_compute_job(db_se
 
 @pytest.mark.asyncio
 async def test_launch_allows_zero_config_project_below_global_threshold(db_session):
-    """Chokepoint reads global runtime_config: a project with runtime_config_json=None
-    uses the global threshold (default 10.0), so a spend below that launches without
-    a precondition failure."""
+    """Chokepoint reads global runtime_config: threshold comes from
+    ``runtime_config_state.runtime_config``, not any per-project column (Project has no
+    such column). A spend below the global threshold launches without a precondition
+    failure; a spend above it is refused even for the same project."""
     from app import runtime_config_state as rcs
     from app.compute_jobs import ComputeLaunchPreconditionFailed
 
@@ -1631,7 +1726,6 @@ async def test_launch_allows_zero_config_project_below_global_threshold(db_sessi
         project = Project(
             name="ZeroConfigGate",
             user_id="test-user",
-            runtime_config_json=None,
         )
         db_session.add(project)
         await db_session.commit()
@@ -1949,6 +2043,74 @@ def test_arms_contract_validation_single_quote_safe():
     assert "python b.py --flag='value'" in decoded
 
 
+def test_arm_synthesis_isolates_per_arm_results():
+    """Synthesised bash script gives each arm its own BLUEPRINT_RESULT_FILE; two
+    arms emitting different declared_metric values both appear in the aggregated
+    output (not last-arm-wins)."""
+    import re
+    import tempfile
+    from pathlib import Path
+
+    from app.compute_arm_aggregator import aggregate
+
+    contract = {
+        "arms": [
+            {"name": "adam", "command": "python train.py --opt adam"},
+            {"name": "sgd", "command": "python train.py --opt sgd"},
+        ],
+        "declared_metric": "val_loss",
+        "spend_cap_usd": 5.0,
+        "deadline_seconds": 3600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is True
+
+    cmd = contract["command"]
+    m = re.search(r"echo (\S+) \| base64 -d \| bash", cmd)
+    assert m is not None, f"command did not match base64-decode pattern: {cmd!r}"
+    import base64 as _b64
+
+    script = _b64.b64decode(m.group(1)).decode()
+
+    # Each arm must export BLUEPRINT_RESULT_FILE to its own per-arm result path.
+    assert "adam/result.json" in script
+    assert "sgd/result.json" in script
+    # The two per-arm paths must be at different positions (not sharing one file).
+    assert script.index("adam/result.json") != script.index("sgd/result.json")
+    # Arms run in subshells so one failure cannot abort others.
+    assert "(export BLUEPRINT_RESULT_FILE=" in script
+    # Per-arm stderr is captured to a file.
+    assert "2>" in script
+    # Aggregator receives per-arm exit-code and stderr file specs.
+    assert "--exit-codes" in script
+    assert "--stderr" in script
+
+    # Aggregator produces {"arms": {name: {metric: value}}} with BOTH arms,
+    # even when they emit DIFFERENT values — verifies not last-arm-wins.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        adam_result = Path(tmpdir) / "adam_result.json"
+        sgd_result = Path(tmpdir) / "sgd_result.json"
+        output = Path(tmpdir) / "main_result.json"
+
+        adam_result.write_text(json.dumps({"val_loss": 0.42}))
+        sgd_result.write_text(json.dumps({"val_loss": 0.61}))
+
+        result = aggregate(
+            [("adam", str(adam_result)), ("sgd", str(sgd_result))],
+            "val_loss",
+            str(output),
+        )
+
+    assert result == {
+        "arms": {
+            "adam": {"val_loss": 0.42},
+            "sgd": {"val_loss": 0.61},
+        }
+    }
+    # Confirm neither arm overwrote the other.
+    assert result["arms"]["adam"]["val_loss"] != result["arms"]["sgd"]["val_loss"]
+
+
 def test_arms_contract_validation_missing_declared_metric():
     """arms without declared_metric is rejected."""
     contract = {
@@ -2030,6 +2192,366 @@ def test_declared_metric_non_empty_string_required_standalone():
     assert "declared_metric" in reason
 
 
+def test_arms_duplicate_name_rejected():
+    """Two arms with the same name must be rejected — they would silently overwrite
+    each other's result file, reintroducing the last-arm-wins data loss."""
+    contract = {
+        "arms": [
+            {"name": "dup", "command": "python a.py"},
+            {"name": "dup", "command": "python b.py"},
+        ],
+        "declared_metric": "score",
+        "spend_cap_usd": 2.0,
+        "deadline_seconds": 600,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "dup" in reason
+    assert "duplicate" in reason.lower() or "unique" in reason.lower()
+
+
+def test_arms_invalid_name_charset_rejected():
+    """Arm names with shell metacharacters are rejected before interpolation into bash."""
+    bad_names = [
+        'a"; touch /tmp/PWNED #',
+        "arm with spaces",
+        "arm$var",
+        "arm;cmd",
+        "arm`cmd`",
+        "arm:colon",
+        "arm/slash",
+    ]
+    for bad_name in bad_names:
+        contract = {
+            "arms": [{"name": bad_name, "command": "python a.py"}],
+            "declared_metric": "score",
+            "spend_cap_usd": 2.0,
+            "deadline_seconds": 600,
+        }
+        ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+        assert ok is False, f"expected rejection for arm name {bad_name!r}, got ok=True"
+        assert "invalid characters" in reason or "name" in reason
+
+
+def test_declared_metric_invalid_charset_rejected():
+    """declared_metric with shell metacharacters is rejected before interpolation."""
+    bad_metrics = [
+        'loss"; touch /tmp/X #',
+        "metric with spaces",
+        "metric$var",
+        "metric;cmd",
+    ]
+    for bad_metric in bad_metrics:
+        contract = {
+            "arms": [{"name": "arm-a", "command": "python a.py"}],
+            "declared_metric": bad_metric,
+            "spend_cap_usd": 2.0,
+            "deadline_seconds": 600,
+        }
+        ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+        assert ok is False, f"expected rejection for declared_metric {bad_metric!r}, got ok=True"
+        assert "declared_metric" in reason or "invalid characters" in reason
+
+
+def test_declared_metric_valid_charsets_accepted():
+    """Metric keys with common valid patterns (val/loss, top-1, accuracy) are accepted."""
+    valid_metrics = ["val_loss", "val/loss", "top-1", "accuracy", "f1.score"]
+    for metric in valid_metrics:
+        contract = {
+            "arms": [{"name": "arm-a", "command": "python a.py"}],
+            "declared_metric": metric,
+            "spend_cap_usd": 2.0,
+            "deadline_seconds": 600,
+        }
+        ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+        assert ok is True, f"expected acceptance for metric {metric!r}, got reason={reason!r}"
+
+
+# ---------------------------------------------------------------------------
+# container_image / container_registry_auth contract-forwarding tests
+# ---------------------------------------------------------------------------
+
+
+def test_author_contract_picks_up_container_image_when_present():
+    """_author_compute_launch_contract forwards container_image from finding."""
+    finding = {
+        "command": "python train.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": "nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["container_image"] == "nvcr.io/nvidia/tensorflow:25.01-tf2-py3"
+
+
+def test_author_contract_picks_up_container_registry_auth_when_present():
+    """_author_compute_launch_contract forwards container_registry_auth from finding."""
+    auth = {"server": "nvcr.io", "username": "$oauthtoken", "password": "secret"}
+    finding = {
+        "command": "python train.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": "nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        "container_registry_auth": auth,
+    }
+    contract = _author_compute_launch_contract(finding)
+    assert contract["container_registry_auth"] == auth
+
+
+def test_author_contract_omits_container_fields_when_absent():
+    """_author_compute_launch_contract omits container fields when not in finding."""
+    finding = {"command": "python run.py", "spend_cap_usd": 1.0, "deadline_seconds": 60}
+    contract = _author_compute_launch_contract(finding)
+    assert "container_image" not in contract
+    assert "container_registry_auth" not in contract
+
+
+def test_validate_contract_accepts_valid_container_image():
+    """_validate_compute_launch_contract accepts a non-empty container_image string."""
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": "nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is True, f"expected ok but got reason={reason!r}"
+
+
+def test_validate_contract_rejects_empty_container_image():
+    """_validate_compute_launch_contract rejects an empty string container_image."""
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": "",
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "container_image" in reason
+
+
+def test_validate_contract_rejects_whitespace_container_image():
+    """_validate_compute_launch_contract rejects a whitespace-only container_image."""
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": "   ",
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "container_image" in reason
+
+
+def test_validate_contract_rejects_non_string_container_image():
+    """_validate_compute_launch_contract rejects a non-string container_image."""
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": 42,
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "container_image" in reason
+
+
+def test_validate_contract_rejects_non_dict_container_registry_auth():
+    """_validate_compute_launch_contract rejects a non-dict container_registry_auth."""
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": "nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        "container_registry_auth": "not-a-dict",
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "container_registry_auth" in reason
+
+
+def test_validate_contract_rejects_non_string_field_in_container_registry_auth():
+    """_validate_compute_launch_contract rejects container_registry_auth with a non-string field."""
+    contract = {
+        "command": "python run.py",
+        "spend_cap_usd": 1.0,
+        "deadline_seconds": 300,
+        "container_image": "nvcr.io/nvidia/tensorflow:25.01-tf2-py3",
+        "container_registry_auth": {"server": "nvcr.io", "username": 123, "password": "pw"},
+    }
+    ok, reason = _validate_compute_launch_contract(contract, require_smoke=False)
+    assert ok is False
+    assert "container_registry_auth" in reason
+
+
+# ---------------------------------------------------------------------------
+# compute_arm_aggregator: error-branch coverage
+# ---------------------------------------------------------------------------
+
+
+def test_aggregator_missing_result_file_captured_as_error():
+    """A missing arm result file is recorded as an error for that arm; other
+    arms still appear with their real metric values (failure isolation)."""
+    import tempfile
+    from pathlib import Path
+
+    from app.compute_arm_aggregator import aggregate
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        good_result = Path(tmpdir) / "good_result.json"
+        output = Path(tmpdir) / "main_result.json"
+        good_result.write_text(json.dumps({"score": 0.95}))
+
+        missing_path = Path(tmpdir) / "nonexistent_result.json"
+
+        result = aggregate(
+            [("good-arm", str(good_result)), ("missing-arm", str(missing_path))],
+            "score",
+            str(output),
+        )
+
+    assert result["arms"]["good-arm"] == {"score": 0.95}
+    assert "error" in result["arms"]["missing-arm"]
+    assert "not written" in result["arms"]["missing-arm"]["error"] or "result" in result["arms"]["missing-arm"]["error"]
+
+
+def test_aggregator_metric_not_in_result_captured_as_error():
+    """When the declared metric is absent from an arm's result file, that arm
+    records an error while other arms still capture their metric."""
+    import tempfile
+    from pathlib import Path
+
+    from app.compute_arm_aggregator import aggregate
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        good_result = Path(tmpdir) / "good_result.json"
+        bad_result = Path(tmpdir) / "bad_result.json"
+        output = Path(tmpdir) / "main_result.json"
+
+        good_result.write_text(json.dumps({"score": 0.88}))
+        bad_result.write_text(json.dumps({"other_metric": 42}))  # missing 'score'
+
+        result = aggregate(
+            [("arm-a", str(good_result)), ("arm-b", str(bad_result))],
+            "score",
+            str(output),
+        )
+
+    assert result["arms"]["arm-a"] == {"score": 0.88}
+    assert "error" in result["arms"]["arm-b"]
+    assert "score" in result["arms"]["arm-b"]["error"]
+
+
+def test_aggregator_surfaces_per_arm_exit_code():
+    """A crashed arm surfaces a non-zero exit_code and a human-readable reason;
+    a sibling arm still shows its metric value (failure isolation preserved).
+    Exit code 124 produces a timeout reason; exit code 0 with missing metric
+    produces an unmeasured-criterion reason."""
+    import tempfile
+    from pathlib import Path
+
+    from app.compute_arm_aggregator import aggregate
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+
+        # good arm: wrote result.json, exit 0
+        good_result = base / "good_result.json"
+        good_result.write_text(json.dumps({"score": 0.95}))
+        good_exit = base / "good_exit"
+        good_exit.write_text("0\n")
+
+        # crashed arm: no result.json, exit 1, has stderr
+        crashed_exit = base / "crashed_exit"
+        crashed_exit.write_text("1\n")
+        crashed_stderr = base / "crashed_stderr"
+        crashed_stderr.write_text("Traceback (most recent call last):\n  RuntimeError: out of memory\n")
+
+        # timed-out arm: no result.json, exit 124
+        timeout_exit = base / "timeout_exit"
+        timeout_exit.write_text("124\n")
+
+        # unmeasured arm: wrote result.json but with wrong metric, exit 0
+        unmeasured_result = base / "unmeasured_result.json"
+        unmeasured_result.write_text(json.dumps({"other_metric": 42}))
+        unmeasured_exit = base / "unmeasured_exit"
+        unmeasured_exit.write_text("0\n")
+
+        output = base / "main_result.json"
+        result = aggregate(
+            [
+                ("good", str(good_result)),
+                ("crashed", str(base / "nonexistent_result.json")),
+                ("timed-out", str(base / "nonexistent_result2.json")),
+                ("unmeasured", str(unmeasured_result)),
+            ],
+            "score",
+            str(output),
+            exit_codes={
+                "good": str(good_exit),
+                "crashed": str(crashed_exit),
+                "timed-out": str(timeout_exit),
+                "unmeasured": str(unmeasured_exit),
+            },
+            stderr_files={
+                "crashed": str(crashed_stderr),
+            },
+        )
+
+    # Good arm: metric value present, exit_code attached
+    assert result["arms"]["good"]["score"] == 0.95
+    assert result["arms"]["good"]["exit_code"] == 0
+
+    # Crashed arm: non-zero exit_code, crash reason, stderr excerpt
+    crashed = result["arms"]["crashed"]
+    assert crashed["exit_code"] == 1
+    assert "error" in crashed
+    assert "crashed" in crashed["error"] or "1" in crashed["error"]
+    assert "stderr_excerpt" in crashed
+    assert "RuntimeError" in crashed["stderr_excerpt"]
+
+    # Timed-out arm: exit_code 124, timeout reason
+    timed_out = result["arms"]["timed-out"]
+    assert timed_out["exit_code"] == 124
+    assert "error" in timed_out
+    assert "timed out" in timed_out["error"] or "124" in timed_out["error"]
+
+    # Unmeasured arm: exit 0, but metric absent → unmeasured-criterion reason
+    unmeasured = result["arms"]["unmeasured"]
+    assert unmeasured["exit_code"] == 0
+    assert "error" in unmeasured
+    assert "unmeasured" in unmeasured["error"] or "score" in unmeasured["error"]
+
+
+def test_aggregator_exit_code_absent_tolerated():
+    """When no exit_code file is provided for an arm, aggregate() still records
+    the failure reason without crashing; existing callers are unaffected."""
+    import tempfile
+    from pathlib import Path
+
+    from app.compute_arm_aggregator import aggregate
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+
+        good_result = base / "good_result.json"
+        good_result.write_text(json.dumps({"val": 1.0}))
+        output = base / "out.json"
+
+        # Call with no exit_codes/stderr_files (backward-compat path)
+        result = aggregate(
+            [("arm-good", str(good_result)), ("arm-bad", str(base / "missing.json"))],
+            "val",
+            str(output),
+        )
+
+    assert result["arms"]["arm-good"] == {"val": 1.0}
+    assert "error" in result["arms"]["arm-bad"]
+    # No exit_code field when not provided
+    assert "exit_code" not in result["arms"]["arm-bad"]
+
+
 # ---------------------------------------------------------------------------
 # E2E: arms payload survives strategist spawn_task to child task
 # ---------------------------------------------------------------------------
@@ -2074,3 +2596,554 @@ async def test_strategist_spawn_compute_experiment_arms_e2e(
     assert payload.get("declared_metric") == "val_loss"
     # A synthesized top-level command must also be present for the compute job.
     assert isinstance(payload.get("command"), str) and payload["command"]
+
+
+# --- pre-flight smoke gate ------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_rejects_failing_command_before_full_provision(
+    db_session, monkeypatch, _quiet_compute_io
+):
+    """Pre-flight smoke gate: a command that dies on the DB-less substrate is
+    rejected before any full VM is provisioned.  backend.launch() must never be
+    called; the job must end up FAILED/SMOKE_FAILED."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.compute_backends import PreflightSmokeResult
+    from app.database import resolve_async_engine
+
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "command": "python3 -c 'import no_such_module'",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+        },
+    )
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 -c 'import no_such_module'",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    # Mock smoke to fail deterministically (no real subprocess needed).
+    monkeypatch.setattr(
+        compute_jobs,
+        "run_preflight_smoke",
+        AsyncMock(
+            return_value=PreflightSmokeResult(
+                startup_ok=False,
+                exit_code=1,
+                metric_captured=False,
+                declared_metric_value=None,
+                error_excerpt="ModuleNotFoundError: No module named 'no_such_module'",
+            )
+        ),
+    )
+
+    launch_called = []
+
+    class FakeBackend:
+        async def launch(self, spec):
+            launch_called.append(spec)
+            raise AssertionError("launch must not be called for smoke-failed jobs")
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            from app.compute_backends import ComputeCostResult
+
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            from app.compute_backends import ComputeStatusResult
+
+            return ComputeStatusResult(status=ComputeJobStatus.QUEUED)
+
+        async def terminate(self, persisted_job, *, reason):
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+
+    assert not launch_called, "backend.launch() must never be called for smoke-failed jobs"
+    assert job.status == ComputeJobStatus.FAILED
+    assert job.outcome == ComputeJobOutcome.SMOKE_FAILED
+    assert job.final_cost_usd == 0.0
+    assert "compute_preflight_smoke_failed" in (job.terminal_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_passing_command_proceeds_to_full_launch(
+    db_session, monkeypatch, _quiet_compute_io
+):
+    """Pre-flight smoke gate: a command that passes the smoke is allowed to
+    proceed to the normal full-VM provisioning path."""
+    from datetime import datetime
+
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.compute_backends import (
+        ComputeCostResult,
+        ComputeLaunchResult,
+        ComputeStatusResult,
+        PreflightSmokeResult,
+    )
+    from app.database import resolve_async_engine
+
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "command": "echo hello",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+        },
+    )
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="echo hello",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+
+    monkeypatch.setattr(
+        compute_jobs,
+        "run_preflight_smoke",
+        AsyncMock(
+            return_value=PreflightSmokeResult(
+                startup_ok=True,
+                exit_code=0,
+                metric_captured=True,
+                declared_metric_value=None,
+                error_excerpt="",
+            )
+        ),
+    )
+
+    launch_called = []
+
+    class FakeBackend:
+        def external_id_for(self, persisted_job):
+            return "fake-vm-smoke-pass"
+
+        async def launch(self, spec):
+            launch_called.append(spec.job_id)
+            return ComputeLaunchResult(
+                external_id="fake-vm-smoke-pass",
+                started_at=datetime.utcnow(),
+                cost_rate_per_second=0.001,
+            )
+
+        async def poll_cost(self, persisted_job, *, as_of):
+            return ComputeCostResult(total_cost_usd=0.0, measured_at=as_of)
+
+        async def poll_status(self, persisted_job):
+            return ComputeStatusResult(status=ComputeJobStatus.RUNNING)
+
+        async def terminate(self, persisted_job, *, reason):
+            return True
+
+    monkeypatch.setattr(compute_jobs, "get_compute_backend", lambda _name: FakeBackend())
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+
+    # Tick 1: smoke runs and passes; job NOT yet launched (waits for next tick).
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+    assert not launch_called, "launch must not be called on the smoke tick"
+    assert (job.polling_metadata or {}).get("preflight_smoke_done") is True
+    assert (job.polling_metadata or {}).get("preflight_smoke_status") == "passed"
+
+    # Tick 2: smoke already done; job proceeds to full provisioning.
+    await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
+    await db_session.refresh(job)
+    assert launch_called, "backend.launch() must be called after smoke passes"
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_failed_task_completion_route(
+    db_session, _quiet_compute_io
+):
+    """When a task's compute job has SMOKE_FAILED outcome, the completion handler
+    marks the task FAILED (not COMPLETED) and stamps compute_preflight_smoke_failed
+    as the failure_category — the gate must not treat SMOKE_FAILED as a measured
+    terminal result."""
+    from app.compute_jobs import build_compute_result_logs
+    from app.failure_classification import COMPUTE_PREFLIGHT_SMOKE_FAILED
+
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "command": "python3 -c 'import no_such_module'",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+        },
+    )
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 -c 'import no_such_module'",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    # Simulate a SMOKE_FAILED terminal state (as set by the monitor).
+    job.status = ComputeJobStatus.FAILED
+    job.outcome = ComputeJobOutcome.SMOKE_FAILED
+    job.final_cost_usd = 0.0
+    job.accrued_cost_usd = 0.0
+    job.terminal_reason = "compute_preflight_smoke_failed: exit 1"
+    db_session.add(job)
+    await db_session.commit()
+
+    logs = build_compute_result_logs(job)
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert (task.context or {}).get("failure_category") == COMPUTE_PREFLIGHT_SMOKE_FAILED
+
+
+# --- run_preflight_smoke unit tests (real executor, no mock) ------------------
+
+
+@pytest.mark.asyncio
+async def test_run_preflight_smoke_failing_command():
+    """run_preflight_smoke: a command that exits non-zero sets startup_ok=False."""
+    from app.compute_backends import run_preflight_smoke
+
+    result = await run_preflight_smoke("exit 42", timeout_seconds=10)
+    assert result.startup_ok is False
+    assert result.exit_code == 42
+    assert result.metric_captured is True  # no declared_metric -> always "captured"
+
+
+@pytest.mark.asyncio
+async def test_run_preflight_smoke_long_running_command_is_pass():
+    """run_preflight_smoke: a command that is still running at timeout is a PASS.
+
+    A GPU training command will never finish within the short smoke window; the
+    timeout (exit_code=None) must be treated as startup_ok=True, not a FAIL.
+    """
+    from app.compute_backends import run_preflight_smoke
+
+    # 'sleep 60' runs far beyond the 2 s timeout — should be treated as alive/passing.
+    result = await run_preflight_smoke("sleep 60", timeout_seconds=2)
+    assert result.startup_ok is True
+    assert result.exit_code is None  # timed out = still running
+    assert result.metric_captured is True  # no declared_metric -> always "captured"
+
+
+@pytest.mark.asyncio
+async def test_run_preflight_smoke_clean_exit_with_metric():
+    """run_preflight_smoke: clean exit with a valid result file captures the metric."""
+    from app.compute_backends import run_preflight_smoke
+
+    # Command writes the metric directly to the result file env var path.
+    cmd = "python3 -c \"import json,os; json.dump({'val_loss': 0.42}, open(os.environ['BLUEPRINT_RESULT_FILE'], 'w'))\""
+    result = await run_preflight_smoke(cmd, declared_metric="val_loss", timeout_seconds=10)
+    assert result.startup_ok is True
+    assert result.exit_code == 0
+    assert result.metric_captured is True
+    assert abs((result.declared_metric_value or 0) - 0.42) < 1e-9
+
+
+@pytest.mark.asyncio
+async def test_run_preflight_smoke_timeout_does_not_fail_on_declared_metric():
+    """run_preflight_smoke: a timeout with a declared metric must still be a PASS.
+
+    This covers the CRITICAL false-rejection: a GPU training command declares a
+    metric (e.g. val_loss) but cannot write the result file within the short smoke
+    window.  The timeout (exit_code=None) must not be counted as metric_captured=False.
+    The _run_and_apply_preflight_smoke caller gates the metric check on exit_code==0.
+    """
+    from app.compute_backends import run_preflight_smoke
+
+    # Command sleeps far past timeout so it never writes the result file.
+    result = await run_preflight_smoke(
+        "sleep 60", declared_metric="val_loss", timeout_seconds=2
+    )
+    assert result.startup_ok is True
+    assert result.exit_code is None
+    # metric_captured will be False (file not written), but the CALLER (compute_jobs)
+    # must not penalize this — it only checks metric when exit_code == 0.
+    assert result.metric_captured is False
+
+
+# --- containerized pre-flight smoke (container_image set) ----------------------
+
+
+def _make_fake_subprocess_exec(captured, *, returncode=0, stderr=b""):
+    """Return a fake asyncio.create_subprocess_exec that records its argv.
+
+    Captures each invocation's positional args/kwargs so tests can assert the
+    constructed shell command WITHOUT spawning a real process or needing Docker.
+    """
+
+    async def _fake_exec(*args, **kwargs):
+        captured.append({"args": args, "kwargs": kwargs})
+
+        class _FakeProc:
+            def __init__(self):
+                self.returncode = returncode
+
+            async def communicate(self):
+                return (b"", stderr)
+
+            def kill(self):
+                pass
+
+            async def wait(self):
+                return returncode
+
+        return _FakeProc()
+
+    return _fake_exec
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_runs_containerized_when_image_set(monkeypatch):
+    """When container_image is set AND Docker is available, the smoke command is
+    wrapped in docker pull + docker run of the declared image, with the result
+    file mounted back to the host out dir — substrate-faithful smoke (bug a58156be)."""
+    import app.compute_backends as cb
+
+    captured: list[dict] = []
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: None)
+    monkeypatch.setattr(cb.asyncio, "create_subprocess_exec", _make_fake_subprocess_exec(captured))
+
+    result = await cb.run_preflight_smoke(
+        "python3 train.py",
+        container_image="ghcr.io/acme/trainer:latest",
+        timeout_seconds=5,
+    )
+
+    assert len(captured) == 1, "exactly one (main) subprocess call expected"
+    # The third positional arg to create_subprocess_exec is the bash -lc command.
+    assert captured[0]["args"][0] == "bash"
+    assert captured[0]["args"][1] == "-lc"
+    cmd = captured[0]["args"][2]
+    # docker pull + docker run of the declared image.
+    assert "docker pull ghcr.io/acme/trainer:latest" in cmd
+    assert "docker run --rm" in cmd
+    assert "ghcr.io/acme/trainer:latest" in cmd
+    assert "bash -lc" in cmd  # inner command re-wrapped inside the container
+    # tmpdir is bind-mounted as the container out dir so result.json lands on host.
+    assert ":/tmp/blueprint_out" in cmd
+    assert "BLUEPRINT_RESULT_FILE=/tmp/blueprint_out/result.json" in cmd
+    # No GPU detected -> no --gpus all flag.
+    assert "--gpus" not in cmd
+    assert result.ran_containerized is True
+    assert result.degraded_no_docker is False
+    assert result.startup_ok is True
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_degrades_to_bare_host_when_docker_absent(monkeypatch):
+    """When container_image is set but Docker is NOT on the orchestrator, the smoke
+    falls back to the bare-host bash -lc path and flags degraded_no_docker — it must
+    NOT hard-fail the job solely because Docker is missing on the orchestrator."""
+    import app.compute_backends as cb
+
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: None)
+
+    # No fake exec: let the real (bare) command run on the host.
+    result = await cb.run_preflight_smoke(
+        "echo hi",
+        container_image="ghcr.io/acme/trainer:latest",
+        timeout_seconds=5,
+    )
+
+    assert result.degraded_no_docker is True
+    assert result.ran_containerized is False
+    # Bare-host echo exits 0 -> startup OK -> the job is NOT failed for missing Docker.
+    assert result.startup_ok is True
+    assert result.exit_code == 0
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_container_registry_auth_emits_docker_login(monkeypatch):
+    """A registry auth carrying a password produces a docker login --password-stdin
+    preamble before the pull (the orchestrated path strips the password, but the
+    helper must honor it when provided directly)."""
+    import app.compute_backends as cb
+
+    captured: list[dict] = []
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: None)
+    monkeypatch.setattr(cb.asyncio, "create_subprocess_exec", _make_fake_subprocess_exec(captured))
+
+    result = await cb.run_preflight_smoke(
+        "python3 train.py",
+        container_image="reg.example.com/p/img:1",
+        container_registry_auth={
+            "server": "reg.example.com",
+            "username": "robot",
+            "password": "s3cret",
+        },
+        timeout_seconds=5,
+    )
+
+    cmd = captured[0]["args"][2]
+    assert "docker login reg.example.com -u robot --password-stdin" in cmd
+    assert "s3cret" in cmd  # password fed via printf | --password-stdin
+    # login precedes the pull which precedes the run.
+    assert cmd.index("docker login") < cmd.index("docker pull") < cmd.index("docker run")
+    assert result.ran_containerized is True
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_setup_step_runs_outside_container(monkeypatch):
+    """setup_step runs OUTSIDE the container (bare bash -lc), matching the real
+    local-subprocess backend, while the main command runs containerized."""
+    import app.compute_backends as cb
+
+    captured: list[dict] = []
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(cb, "detect_local_gpu", lambda: None)
+    monkeypatch.setattr(cb.asyncio, "create_subprocess_exec", _make_fake_subprocess_exec(captured))
+
+    await cb.run_preflight_smoke(
+        "python3 main.py",
+        setup_step="pip install -e .",
+        container_image="ghcr.io/acme/trainer:latest",
+        timeout_seconds=6,
+    )
+
+    assert len(captured) == 2, "setup_step + main = two subprocess calls"
+    setup_cmd = captured[0]["args"][2]
+    main_cmd = captured[1]["args"][2]
+    # setup runs bare on the host — no docker wrapping.
+    assert setup_cmd == "pip install -e ."
+    assert "docker" not in setup_cmd
+    # main command is containerized.
+    assert "docker run --rm" in main_cmd
+    assert "docker pull ghcr.io/acme/trainer:latest" in main_cmd
+
+
+@pytest.mark.asyncio
+async def test_preflight_smoke_no_container_image_is_unchanged(monkeypatch):
+    """The absent-container_image path is byte-for-byte unchanged: the command is
+    passed bare to bash -lc even when Docker happens to be available."""
+    import app.compute_backends as cb
+
+    captured: list[dict] = []
+    monkeypatch.setattr(cb.shutil, "which", lambda _name: "/usr/bin/docker")
+    monkeypatch.setattr(cb.asyncio, "create_subprocess_exec", _make_fake_subprocess_exec(captured))
+
+    result = await cb.run_preflight_smoke("echo hello", timeout_seconds=5)
+
+    cmd = captured[0]["args"][2]
+    assert cmd == "echo hello"  # no docker wrapping
+    assert result.ran_containerized is False
+    assert result.degraded_no_docker is False
+
+
+@pytest.mark.asyncio
+async def test_degraded_smoke_does_not_reject_container_job(
+    db_session, monkeypatch, _quiet_compute_io
+):
+    """When Docker is absent on the orchestrator (degraded_no_docker=True), a
+    bare-host smoke failure must NOT gate a container_image job.  The command may
+    legitimately depend on in-container libs not present on the host; the real VM
+    will have Docker, so the job must proceed to full provisioning."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+    from app.compute_backends import PreflightSmokeResult
+    from app.database import resolve_async_engine
+
+    task = await _make_compute_task(
+        db_session,
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "command": "python3 train.py",
+            "spend_cap_usd": 1.0,
+            "deadline_seconds": 300,
+        },
+    )
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python3 train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+        container_image="ghcr.io/acme/trainer:latest",
+    )
+
+    # Simulate Docker-absent orchestrator: bare-host run of a container-only command
+    # fails (the in-container dep is missing on host), but degraded_no_docker=True.
+    monkeypatch.setattr(
+        compute_jobs,
+        "run_preflight_smoke",
+        AsyncMock(
+            return_value=PreflightSmokeResult(
+                startup_ok=False,
+                exit_code=1,
+                metric_captured=False,
+                declared_metric_value=None,
+                error_excerpt="ModuleNotFoundError: No module named 'acme_trainer'",
+                degraded_no_docker=True,
+            )
+        ),
+    )
+
+    session_factory = async_sessionmaker(
+        resolve_async_engine(db_session),
+        expire_on_commit=False,
+        class_=AsyncSession,
+    )
+    from app.compute_jobs import _run_and_apply_preflight_smoke
+
+    await _run_and_apply_preflight_smoke(session_factory, job, task)
+    await db_session.refresh(job)
+
+    # Degraded smoke must NOT reject the job — it should be marked as smoke-done
+    # (pass) so the next monitor tick proceeds to full VM provisioning.
+    assert job.status != ComputeJobStatus.FAILED, (
+        "container job must not be rejected by a degraded (Docker-less) smoke failure"
+    )
+    assert job.outcome != ComputeJobOutcome.SMOKE_FAILED
+    meta = job.polling_metadata or {}
+    assert meta.get("preflight_smoke_done") is True
+    assert meta.get("preflight_smoke_status") == "passed"
+    assert meta.get("preflight_smoke_degraded_no_docker") is True

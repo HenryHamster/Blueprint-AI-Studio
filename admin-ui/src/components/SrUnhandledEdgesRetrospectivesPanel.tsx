@@ -240,7 +240,6 @@ export function SrUnhandledEdgesRetrospectivesPanel({ selectedProjectId, onSelec
               {blindSpotFilter && <> for theme &quot;{blindSpotFilter}&quot;</>}
               {casePatternFilter && <> matching &quot;{casePatternFilter}&quot;</>}
               .{' '}
-              {/* eslint-disable-next-line viewport/min-touch-target -- inline text link, dense context */}
               <button
                 type="button"
                 className="underline hover:text-neutral-300"
@@ -307,7 +306,6 @@ function SrUnhandledEdgesRow({ task, onClick }: { task: SrUnhandledEdgesTask; on
           <span className="text-neutral-600 shrink-0" title={task.created_at}>{timeAgo(task.created_at)}</span>
         )}
         {task.pr_url && isSafeUrl(task.pr_url) && (
-          // eslint-disable-next-line viewport/min-touch-target -- dense inline link
           <a href={task.pr_url} target="_blank" rel="noopener noreferrer" onClick={e => e.stopPropagation()} className="text-blue-400 hover:underline text-ui-xs shrink-0">PR</a>
         )}
       </div>

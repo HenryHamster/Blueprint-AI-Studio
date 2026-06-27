@@ -1,15 +1,16 @@
 import { useState } from 'react';
-import { Pencil, ChevronDown, ChevronRight, AlertCircle, Target, Box, CheckCircle2, Circle, Clock, Flag, X } from 'lucide-react';
+import { Pencil, ChevronDown, ChevronRight, AlertCircle, Target, Box, CheckCircle2, Circle, Clock, Flag, GitBranch, Plus } from 'lucide-react';
 import { timeAgo } from '../utils/time';
 import { MarkdownContent } from './MarkdownContent';
 import { ProblemModelEditor } from './ProblemModelEditor';
-import { dismissPendingConfirmation } from '../api';
+import { PendingConfirmationList } from './ProblemModelAttention';
+import { dismissPendingConfirmation, acceptPendingConfirmation } from '../api';
+import type { CurrentVersion } from '../api';
 import type {
   ProblemModel,
   Gap,
   Capability,
   Friction,
-  PendingConfirmation,
   ProblemModelPatch,
   Source,
   SelfReflectionEntry,
@@ -20,8 +21,13 @@ interface ProblemModelViewerProps {
   projectId: string;
   problemModel: ProblemModel;
   selfReflectionLog?: SelfReflectionEntry[];
+  currentVersion?: CurrentVersion | null;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onUpdated: (patched: ProblemModel) => void;
+  // Callbacks wired from DirectionsPanel to make gap cards actionable.
+  onSpawnDirection?: (gapId: string, gapName: string) => void;
+  onLinkDirection?: (directionId: string, gapId: string) => void;
+  directions?: Array<{ id: string; text: string }>;
 }
 
 const capabilityBarColors: Record<string, string> = {
@@ -46,13 +52,6 @@ const sizeColors: Record<string, string> = {
   small: 'text-neutral-500',
   medium: 'text-neutral-400',
   large: 'text-neutral-300',
-};
-
-const pendingTypeLabels: Record<string, string> = {
-  credentials_needed: 'Credentials needed',
-  access_needed: 'Access needed',
-  intent_change: 'Intent change',
-  major_decision: 'Major decision',
 };
 
 const proofStatusLabels: Record<string, string> = {
@@ -86,11 +85,16 @@ function SourceBadge({ source }: { source: Source }) {
   );
 }
 
-function SectionHeader({ children, icon, count }: { children: React.ReactNode; icon?: React.ReactNode; count?: number }) {
+function SectionHeader({ children, icon, count, amberCount }: { children: React.ReactNode; icon?: React.ReactNode; count?: number; amberCount?: number }) {
   return (
     <div className="flex items-center gap-2 mb-2 mt-4 first:mt-0">
       {icon && <span className="text-neutral-500">{icon}</span>}
       <h3 className="text-sm font-semibold text-neutral-200 uppercase tracking-wide">{children}</h3>
+      {typeof amberCount === 'number' && (
+        <span className="ml-1 px-1.5 py-0.5 text-xs font-semibold rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
+          {amberCount}
+        </span>
+      )}
       {typeof count === 'number' && (
         <span className="text-xs text-neutral-500">({count})</span>
       )}
@@ -147,9 +151,52 @@ function CapabilityBar({ capability }: { capability: Capability }) {
   );
 }
 
-function GapCard({ gap }: { gap: Gap }) {
+function GapLinkSelect({
+  gapId,
+  directions,
+  onLink,
+}: {
+  gapId: string;
+  directions: Array<{ id: string; text: string }>;
+  onLink: (directionId: string, gapId: string) => void;
+}) {
+  const [value, setValue] = useState('');
+  return (
+    <select
+      value={value}
+      onChange={e => {
+        const id = e.target.value;
+        if (id) {
+          onLink(id, gapId);
+          setValue('');
+        }
+      }}
+      className="text-xs bg-neutral-900 border border-neutral-700 text-neutral-400 rounded px-2 py-1 focus:outline-none focus:ring-1 focus:ring-neutral-600"
+    >
+      <option value="">Link direction…</option>
+      {directions.map(d => (
+        <option key={d.id} value={d.id}>
+          {d.text.length > 50 ? `${d.text.slice(0, 50)}…` : d.text}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function GapCard({
+  gap,
+  onSpawnDirection,
+  onLinkDirection,
+  directions,
+}: {
+  gap: Gap;
+  onSpawnDirection?: (gapId: string, gapName: string) => void;
+  onLinkDirection?: (directionId: string, gapId: string) => void;
+  directions?: Array<{ id: string; text: string }>;
+}) {
   const activeMoves = gap.active_moves ?? [];
   const pastMoves = gap.past_moves ?? [];
+  const hasActions = onSpawnDirection || (onLinkDirection && directions && directions.length > 0);
   return (
     <div className="border border-neutral-800 rounded-md p-3 bg-neutral-900/40">
       <div className="flex items-start justify-between gap-2 mb-1">
@@ -185,6 +232,23 @@ function GapCard({ gap }: { gap: Gap }) {
           )}
           {pastMoves.length > 0 && (
             <span><span className="text-neutral-400">Past:</span> {pastMoves.length}</span>
+          )}
+        </div>
+      )}
+      {hasActions && (
+        <div className="mt-2 pt-2 border-t border-neutral-800/60 flex items-center gap-2 flex-wrap">
+          {onSpawnDirection && (
+            <button
+              type="button"
+              onClick={() => onSpawnDirection(gap.id, gap.name)}
+              className="inline-flex items-center gap-1 px-2 py-1 min-h-[44px] md:min-h-auto text-xs rounded border border-neutral-700 bg-neutral-800/50 text-neutral-300 hover:bg-neutral-800 hover:text-neutral-100 transition"
+            >
+              <Plus size={10} />
+              Spawn direction
+            </button>
+          )}
+          {onLinkDirection && directions && directions.length > 0 && (
+            <GapLinkSelect gapId={gap.id} directions={directions} onLink={onLinkDirection} />
           )}
         </div>
       )}
@@ -235,53 +299,6 @@ function FrictionRow({ friction }: { friction: Friction }) {
   );
 }
 
-function PendingConfirmationRow({
-  pending,
-  onDismiss,
-}: {
-  pending: PendingConfirmation;
-  onDismiss?: () => void;
-}) {
-  const [dismissing, setDismissing] = useState(false);
-  return (
-    <div className="border border-amber-500/40 rounded-md p-3 bg-amber-500/5">
-      <div className="flex items-start gap-2">
-        <AlertCircle size={14} className="text-amber-400 shrink-0 mt-0.5" />
-        <div className="flex-1 min-w-0">
-          <div className="flex items-baseline gap-2 mb-1">
-            <span className="text-xs font-semibold text-amber-300 uppercase tracking-wide">
-              {pendingTypeLabels[pending.type] || pending.type}
-            </span>
-            <span className="text-ui-sm font-mono text-neutral-600">{pending.id}</span>
-          </div>
-          <p className="text-sm text-neutral-100">{pending.proposal}</p>
-          {pending.rationale && (
-            <p className="text-xs text-neutral-400 mt-1">{pending.rationale}</p>
-          )}
-          {pending.created_at && (
-            <p className="text-ui-sm text-neutral-500 mt-1">{timeAgo(pending.created_at)}</p>
-          )}
-        </div>
-        {onDismiss && (
-          <button
-            type="button"
-            disabled={dismissing}
-            onClick={async () => {
-              setDismissing(true);
-              try { await onDismiss(); } finally { setDismissing(false); }
-            }}
-            className="shrink-0 inline-flex items-center gap-1 px-2 py-1 min-h-[44px] md:min-h-0 text-xs font-medium rounded border border-neutral-700 bg-neutral-800/50 text-neutral-400 hover:bg-neutral-800 hover:text-neutral-100 transition disabled:opacity-50"
-            title="Mark as resolved"
-          >
-            <X size={11} />
-            Resolve
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
-
 function SelfReflectionCard({ entry }: { entry: SelfReflectionEntry }) {
   return (
     <div className="border border-neutral-800 rounded-md p-3 bg-neutral-900/30 space-y-2">
@@ -317,8 +334,12 @@ export default function ProblemModelViewer({
   projectId,
   problemModel,
   selfReflectionLog = [],
+  currentVersion,
   addToast,
   onUpdated,
+  onSpawnDirection,
+  onLinkDirection,
+  directions,
 }: ProblemModelViewerProps) {
   const [showEditor, setShowEditor] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
@@ -335,8 +356,9 @@ export default function ProblemModelViewer({
   const lastUpdated = problemModel.last_updated ?? '';
   const lastUpdatedBy = problemModel.last_updated_by ?? null;
 
-  const isEmpty = !intent.purpose && !intent.current_focus && constraints.length === 0
-    && capabilities.length === 0 && gaps.length === 0 && friction.length === 0;
+  const isEmpty = !intent.purpose && !intent.user_purpose && !intent.current_focus
+    && constraints.length === 0 && capabilities.length === 0
+    && gaps.length === 0 && friction.length === 0;
 
   // Group capabilities by status for a cleaner visual grouping
   const capsByStatus = capabilities.reduce<Record<string, Capability[]>>((acc, cap) => {
@@ -354,6 +376,8 @@ export default function ProblemModelViewer({
   const hasContextFields = Boolean(
     context.project_type || context.users || context.team || context.deploy_cadence || context.notes
   );
+
+  const hasIntent = Boolean(intent.purpose || intent.user_purpose || intent.current_focus);
 
   return (
     <div className="flex flex-col h-full">
@@ -390,37 +414,53 @@ export default function ProblemModelViewer({
           </div>
         )}
 
-        {/* Pending confirmations — visually prominent when present */}
+        {/* Pending confirmations — calm rows, amber used once per row (left accent) */}
         {pending.length > 0 && (
           <section>
-            <SectionHeader icon={<AlertCircle size={14} />} count={pending.length}>
+            <SectionHeader icon={<AlertCircle size={14} />} amberCount={pending.length}>
               Needs your attention
             </SectionHeader>
-            <div className="space-y-2">
-              {pending.map((p) => (
-                <PendingConfirmationRow
-                  key={p.id}
-                  pending={p}
-                  onDismiss={async () => {
-                    try {
-                      await dismissPendingConfirmation(projectId, p.id);
-                      onUpdated({
-                        ...problemModel,
-                        pending_user_confirmation: pending.filter((x) => x.id !== p.id),
-                        revision: (problemModel.revision ?? 0) + 1,
-                      });
-                    } catch {
-                      addToast('Failed to dismiss — try again', 'error');
+            <PendingConfirmationList
+              pending={pending}
+              onDismiss={async (id, note) => {
+                try {
+                  await dismissPendingConfirmation(projectId, id, note);
+                  onUpdated({
+                    ...problemModel,
+                    pending_user_confirmation: pending.filter((x) => x.id !== id),
+                    revision: (problemModel.revision ?? 0) + 1,
+                  });
+                } catch {
+                  addToast('Failed to dismiss — try again', 'error');
+                }
+              }}
+              onAccept={async (id, answer) => {
+                try {
+                  const result = await acceptPendingConfirmation(projectId, id, answer);
+                  const next: ProblemModel = {
+                    ...problemModel,
+                    pending_user_confirmation: pending.filter((x) => x.id !== id),
+                    revision: (problemModel.revision ?? 0) + 1,
+                  };
+                  // For intent_change, reflect the accepted proposal in local state.
+                  if (result.type === 'intent_change') {
+                    const accepted = pending.find((x) => x.id === id);
+                    if (accepted) {
+                      const cur = problemModel.intent ?? { purpose: '', current_focus: '' };
+                      next.intent = { ...cur, purpose: accepted.proposal };
                     }
-                  }}
-                />
-              ))}
-            </div>
+                  }
+                  onUpdated(next);
+                } catch {
+                  addToast('Failed to accept — try again', 'error');
+                }
+              }}
+            />
           </section>
         )}
 
         {/* Intent */}
-        {(intent.purpose || intent.current_focus) && (
+        {hasIntent && (
           <section>
             <SectionHeader icon={<Flag size={14} />}>Intent</SectionHeader>
             {intent.purpose && (
@@ -429,11 +469,57 @@ export default function ProblemModelViewer({
                 <p className="text-sm text-neutral-200">{intent.purpose}</p>
               </div>
             )}
+            {intent.user_purpose && (
+              <div className="mb-2">
+                <h4 className="text-xs text-neutral-500 uppercase tracking-wide mb-0.5">Operator purpose</h4>
+                <p className="text-sm text-neutral-200">{intent.user_purpose}</p>
+              </div>
+            )}
             {intent.current_focus && (
               <div>
                 <h4 className="text-xs text-neutral-500 uppercase tracking-wide mb-0.5">Current focus</h4>
                 <p className="text-sm text-neutral-200">{intent.current_focus}</p>
               </div>
+            )}
+          </section>
+        )}
+
+        {/* Version goal strip — threaded from version-lifecycle, no new fetch */}
+        {currentVersion != null && (
+          <section>
+            <SectionHeader icon={<GitBranch size={14} />}>Version goal</SectionHeader>
+            {currentVersion.theme && (
+              <p className="text-ui-sm mb-1">
+                <span className="text-neutral-500">Theme: </span>
+                <span className="px-1.5 py-0.5 rounded bg-neutral-800/70 text-neutral-300 border border-neutral-700 font-medium">
+                  {currentVersion.theme}
+                </span>
+              </p>
+            )}
+            {currentVersion.goal ? (
+              <div className="flex flex-col gap-1">
+                <p className="text-sm text-neutral-200" title={currentVersion.goal}>
+                  {currentVersion.goal}
+                </p>
+                {currentVersion.goal_updated_at && (
+                  <p className="text-ui-sm text-neutral-500">
+                    {currentVersion.goal_editor_info && <span>{currentVersion.goal_editor_info} </span>}
+                    {timeAgo(currentVersion.goal_updated_at)}
+                  </p>
+                )}
+                {currentVersion.live_current_focus && currentVersion.live_current_focus !== currentVersion.goal && (
+                  <div className="flex flex-col gap-1 pt-1 border-t border-amber-500/20">
+                    <p className="text-ui-sm px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20">
+                      Goal has drifted from live focus
+                    </p>
+                    <p className="text-ui-sm text-neutral-400" title={currentVersion.live_current_focus}>
+                      <span className="text-neutral-600">Live focus: </span>{currentVersion.live_current_focus}
+                    </p>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <p className="text-xs text-neutral-600 italic">No version goal set yet.</p>
             )}
           </section>
         )}
@@ -501,7 +587,15 @@ export default function ProblemModelViewer({
           <section>
             <SectionHeader icon={<Circle size={14} />} count={sortedGaps.length}>Active gaps</SectionHeader>
             <div className="space-y-2">
-              {sortedGaps.map((g, i) => <GapCard key={g.id ?? `gap-${i}`} gap={g} />)}
+              {sortedGaps.map((g, i) => (
+                <GapCard
+                  key={g.id ?? `gap-${i}`}
+                  gap={g}
+                  onSpawnDirection={onSpawnDirection}
+                  onLinkDirection={onLinkDirection}
+                  directions={directions}
+                />
+              ))}
             </div>
           </section>
         )}

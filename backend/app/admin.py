@@ -63,6 +63,7 @@ from app.compute_experiment_contract import (
     _validate_compute_launch_contract,
     resolve_compute_spend_approval,
 )
+from app.compute_jobs import clamp_spend_cap_usd, clamp_deadline_seconds
 from app.vm_cost_rates import (
     get_compute_rate_per_second,
     resolve_compute_machine_type,
@@ -1543,7 +1544,9 @@ class ComputeExperimentTaskPayload(BaseModel):
     base_branch: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
     )
-    command: str = Field(..., min_length=1)
+    command: str | None = None
+    arms: list[dict[str, str]] | None = None
+    declared_metric: str | None = None
     spend_cap_usd: float
     deadline_seconds: int
     accelerator: str | None = None
@@ -1558,9 +1561,25 @@ class ComputeExperimentTaskPayload(BaseModel):
     require_live_release: bool = False
     require_durable_artifact: bool = False
     provisioning_model: str | None = None
+    # Container-aware runner fields (parity with the research/plan authoring path):
+    # required for CUDA/NGC stacks (e.g. nvcr.io images) or the command runs bare.
+    # The registry password is only ever persisted for runner-subprocess jobs.
+    container_image: str | None = None
+    container_registry_auth: dict[str, str] | None = None
+    setup_step: str | None = None
     idempotency_key: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_.-]+$"
     )
+
+    @model_validator(mode="after")
+    def validate_command_or_arms(self) -> "ComputeExperimentTaskPayload":
+        has_command = bool(self.command and self.command.strip())
+        has_arms = bool(self.arms)
+        if not has_command and not has_arms:
+            raise ValueError("Either 'command' or 'arms' (with 'declared_metric') must be provided")
+        if has_arms and not (self.declared_metric and self.declared_metric.strip()):
+            raise ValueError("'declared_metric' is required when 'arms' is specified")
+        return self
 
     @field_validator("provisioning_model")
     @classmethod
@@ -1962,6 +1981,248 @@ async def create_task_manually(
     }
 
 
+class ComputeExperimentDraftRequest(BaseModel):
+    idea: str = Field(..., min_length=1, max_length=10000)
+    github_repo: str | None = Field(
+        default=None, pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$"
+    )
+    base_branch: str | None = Field(default=None, max_length=255)
+
+
+class ComputeExperimentDraftSuccessCriterion(BaseModel):
+    metric: str
+    operator: str
+    threshold: float
+
+
+class ComputeExperimentDraft(BaseModel):
+    draft_available: bool
+    notes: str | None = None
+    title: str | None = None
+    prompt: str | None = None
+    hypothesis: str | None = None
+    command: str | None = None
+    arms: list[dict[str, str]] | None = None
+    declared_metric: str | None = None
+    spend_cap_usd: float | None = None
+    deadline_seconds: int | None = None
+    experiment: str | None = None
+    benchmark: str | None = None
+    metric: str | None = None
+    success_criterion: ComputeExperimentDraftSuccessCriterion | None = None
+    accelerator: str | None = None
+    machine_type: str | None = None
+
+
+_DRAFT_LLM_MODEL = "claude-haiku-4-5-20251001"
+_DRAFT_LLM_TIMEOUT = 30.0
+_DRAFT_LLM_MAX_TOKENS = 2000
+_DISABLE_DRAFT_LLM_ENV = "DISABLE_COMPUTE_EXPERIMENT_DRAFT_LLM"
+
+_DRAFT_LLM_SYSTEM = """You are an expert at designing compute experiments for ML/research projects.
+Given a plain-language research idea, produce a structured JSON launch contract for a Blueprint compute experiment.
+Return ONLY valid JSON — no markdown fences, no prose before or after. Use this exact schema:
+{
+  "title": "<short descriptive title>",
+  "prompt": "<agent prompt: what the experiment should do and measure>",
+  "hypothesis": "<what you expect to find>",
+  "command": "<shell command to run the experiment, OR null if using arms>",
+  "arms": null,
+  "declared_metric": null,
+  "spend_cap_usd": <positive float, default 2.0>,
+  "deadline_seconds": <positive integer, default 1800>,
+  "experiment": "<experiment identifier slug>",
+  "benchmark": null,
+  "metric": "<primary metric name if applicable, else null>",
+  "success_criterion": {
+    "metric": "<metric name>",
+    "operator": ">=",
+    "threshold": <numeric threshold>
+  },
+  "accelerator": null,
+  "machine_type": null
+}
+Rules:
+- Use either "command" (single run) or "arms" (list of {name, command} dicts for multi-arm sweep), never both.
+- When arms is non-null, declared_metric must be set to the metric name all arms share.
+- metric names must match ^[A-Za-z0-9_./-]+$.
+- arm names must match ^[A-Za-z0-9_-]+$.
+- spend_cap_usd must be a positive number; deadline_seconds must be a positive integer.
+- success_criterion is all-or-nothing: either all three fields (metric, operator, threshold) are present, or omit the key entirely (null).
+- Use sane defaults: spend_cap_usd=2.0, deadline_seconds=1800 when the idea doesn't imply otherwise.
+- Keep the command runnable in a Python repo environment (PYTHONPATH set to repo root, no network outside pip).
+"""
+
+
+def _parse_draft_json(raw: str) -> dict | None:
+    """Parse LLM output as JSON, tolerating fenced output."""
+    import re as _re
+
+    text = (raw or "").strip()
+    if text.startswith("```"):
+        text = _re.sub(r"^```[a-zA-Z0-9]*\n?", "", text)
+        text = _re.sub(r"\n?```$", "", text).strip()
+    try:
+        obj = json.loads(text)
+        return obj if isinstance(obj, dict) else None
+    except (json.JSONDecodeError, ValueError):
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end <= start:
+            return None
+        try:
+            obj = json.loads(text[start : end + 1])
+            return obj if isinstance(obj, dict) else None
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+
+def _coerce_draft(raw: dict) -> ComputeExperimentDraft:
+    """Coerce and sanitize the LLM's raw dict into a valid ComputeExperimentDraft."""
+    import re as _re
+
+    _METRIC_RE = _re.compile(r"^[A-Za-z0-9_./-]+$")
+    _ARM_NAME_RE = _re.compile(r"^[A-Za-z0-9_-]+$")
+
+    def _safe_metric(v: object) -> str | None:
+        if isinstance(v, str) and _METRIC_RE.match(v):
+            return v
+        return None
+
+    success_criterion: ComputeExperimentDraftSuccessCriterion | None = None
+    sc_raw = raw.get("success_criterion")
+    if isinstance(sc_raw, dict):
+        m = _safe_metric(sc_raw.get("metric"))
+        op = sc_raw.get("operator")
+        thr = sc_raw.get("threshold")
+        if m and op in (">=", "<=", ">", "<", "==", "!=") and isinstance(thr, (int, float)):
+            success_criterion = ComputeExperimentDraftSuccessCriterion(
+                metric=m, operator=str(op), threshold=float(thr)
+            )
+
+    arms_raw = raw.get("arms")
+    arms: list[dict[str, str]] | None = None
+    if isinstance(arms_raw, list) and arms_raw:
+        coerced_arms = []
+        for arm in arms_raw:
+            if isinstance(arm, dict):
+                name = arm.get("name", "")
+                cmd = arm.get("command", "")
+                if isinstance(name, str) and _ARM_NAME_RE.match(name) and isinstance(cmd, str):
+                    coerced_arms.append({"name": name, "command": cmd})
+        arms = coerced_arms if coerced_arms else None
+
+    spend_cap = raw.get("spend_cap_usd")
+    if not isinstance(spend_cap, (int, float)) or spend_cap <= 0:
+        spend_cap = 2.0
+
+    deadline = raw.get("deadline_seconds")
+    if not isinstance(deadline, int) or deadline <= 0:
+        try:
+            deadline = int(deadline)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            deadline = 1800
+        if deadline <= 0:
+            deadline = 1800
+
+    declared_metric = _safe_metric(raw.get("declared_metric")) if arms else None
+
+    return ComputeExperimentDraft(
+        draft_available=True,
+        title=raw.get("title") if isinstance(raw.get("title"), str) else None,
+        prompt=raw.get("prompt") if isinstance(raw.get("prompt"), str) else None,
+        hypothesis=raw.get("hypothesis") if isinstance(raw.get("hypothesis"), str) else None,
+        command=raw.get("command") if isinstance(raw.get("command"), str) and not arms else None,
+        arms=arms,
+        declared_metric=declared_metric,
+        spend_cap_usd=float(spend_cap),
+        deadline_seconds=int(deadline),
+        experiment=raw.get("experiment") if isinstance(raw.get("experiment"), str) else None,
+        benchmark=raw.get("benchmark") if isinstance(raw.get("benchmark"), str) else None,
+        metric=_safe_metric(raw.get("metric")),
+        success_criterion=success_criterion,
+        accelerator=raw.get("accelerator") if isinstance(raw.get("accelerator"), str) else None,
+        machine_type=raw.get("machine_type") if isinstance(raw.get("machine_type"), str) else None,
+    )
+
+
+async def _call_draft_llm(api_key: str, idea: str, github_repo: str | None, base_branch: str | None) -> dict | None:
+    """Call Anthropic to produce a draft compute-experiment contract. Returns dict or None."""
+    context_parts = [f"Research idea: {idea}"]
+    if github_repo:
+        context_parts.append(f"Repository: {github_repo}")
+    if base_branch:
+        context_parts.append(f"Base branch: {base_branch}")
+    user_message = "\n".join(context_parts)
+
+    for attempt in range(2):
+        try:
+            import anthropic as _anthropic
+
+            client = _anthropic.AsyncAnthropic(api_key=api_key)
+            resp = await client.messages.create(
+                model=_DRAFT_LLM_MODEL,
+                max_tokens=_DRAFT_LLM_MAX_TOKENS,
+                timeout=_DRAFT_LLM_TIMEOUT,
+                system=_DRAFT_LLM_SYSTEM,
+                messages=[{"role": "user", "content": user_message}],
+            )
+            raw_text = resp.content[0].text.strip()
+            parsed = _parse_draft_json(raw_text)
+            if parsed is None:
+                if attempt == 0:
+                    logger.info("[DRAFT] JSON parse failed on first attempt, retrying")
+                    continue
+                logger.info("[DRAFT] JSON parse failed on retry; draft unavailable")
+                return None
+            return parsed
+        except (json.JSONDecodeError, ValueError, KeyError, IndexError) as exc:
+            if attempt == 0:
+                logger.info("[DRAFT] parse error %s, retrying once", exc)
+                continue
+            logger.info("[DRAFT] parse error on retry; draft unavailable")
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.info("[DRAFT] LLM call failed (%s); draft unavailable", exc)
+            return None
+    return None
+
+
+@router.post("/tasks/compute-experiment/draft")
+@limiter.limit("20/minute")
+async def compute_experiment_draft(
+    request: Request,
+    payload: ComputeExperimentDraftRequest,
+    current_user: dict = Depends(get_current_user),
+) -> ComputeExperimentDraft:
+    """Return a structured draft compute-experiment launch contract from a plain-language idea.
+
+    Pure read-only: does NOT persist anything, does NOT launch a task or compute job.
+    Calls Anthropic to produce the draft; degrades gracefully when the key is absent or the call fails.
+    """
+    if os.environ.get(_DISABLE_DRAFT_LLM_ENV, "").strip() == "1":
+        return ComputeExperimentDraft(
+            draft_available=False,
+            notes="Draft LLM is disabled via environment configuration.",
+        )
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        return ComputeExperimentDraft(
+            draft_available=False,
+            notes="Draft generation is unavailable: ANTHROPIC_API_KEY is not configured.",
+        )
+
+    raw = await _call_draft_llm(api_key, payload.idea, payload.github_repo, payload.base_branch)
+    if raw is None:
+        return ComputeExperimentDraft(
+            draft_available=False,
+            notes="Draft generation failed: the LLM did not return a parseable response.",
+        )
+
+    return _coerce_draft(raw)
+
+
 class ComputeExperimentPreflightPayload(BaseModel):
     github_repo: str = Field(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
     accelerator: str | None = None
@@ -2016,6 +2277,9 @@ async def compute_experiment_preflight(
         machine_type=payload.machine_type,
     )
 
+    effective_spend_cap_usd = clamp_spend_cap_usd(payload.spend_cap_usd)
+    effective_deadline_seconds = clamp_deadline_seconds(payload.deadline_seconds)
+
     rate_per_second: float | None = None
     rate_per_hour: float | None = None
     projected_cost_usd: float | None = None
@@ -2028,9 +2292,9 @@ async def compute_experiment_preflight(
             spot=spot,
         )
         rate_per_hour = rate_per_second * 3600
-        projected_cost_usd = rate_per_second * payload.deadline_seconds
+        projected_cost_usd = rate_per_second * effective_deadline_seconds
         if rate_per_second > 0:
-            max_runtime_seconds = int(payload.spend_cap_usd / rate_per_second)
+            max_runtime_seconds = int(effective_spend_cap_usd / rate_per_second)
 
     # Policy verdict: use the canonical accelerator name (spec.name) to mirror
     # the comparison done in _check_project_hardware_policy.
@@ -2065,6 +2329,8 @@ async def compute_experiment_preflight(
         "rate_per_hour": rate_per_hour,
         "projected_cost_usd": projected_cost_usd,
         "max_runtime_seconds": max_runtime_seconds,
+        "effective_spend_cap_usd": effective_spend_cap_usd,
+        "effective_deadline_seconds": effective_deadline_seconds,
         "allowed_accelerator_types": allowed_accels,
         "allowed_machine_types": allowed_machines,
         "in_policy": in_policy,
@@ -2124,10 +2390,14 @@ async def create_compute_experiment_task(
         payload.base_branch or _get_project_promotion_target_for_task(project)
     )
     launch_contract: dict[str, Any] = {
-        "command": payload.command,
         "spend_cap_usd": payload.spend_cap_usd,
         "deadline_seconds": payload.deadline_seconds,
     }
+    if payload.arms is not None:
+        launch_contract["arms"] = payload.arms
+        launch_contract["declared_metric"] = payload.declared_metric
+    else:
+        launch_contract["command"] = payload.command
     if payload.success_criterion is not None:
         launch_contract["success_criterion"] = payload.success_criterion.model_dump()
     for opt_key in (
@@ -2140,6 +2410,9 @@ async def create_compute_experiment_task(
         "hypothesis",
         "metric",
         "provisioning_model",
+        "container_image",
+        "container_registry_auth",
+        "setup_step",
     ):
         val = getattr(payload, opt_key)
         if val is not None:
@@ -2228,6 +2501,11 @@ async def create_compute_experiment_task(
                 "hypothesis",
                 "metric",
                 "provisioning_model",
+                "arms",
+                "declared_metric",
+                "container_image",
+                "container_registry_auth",
+                "setup_step",
             )
             if launch_contract.get(k) is not None
         },
@@ -2382,6 +2660,120 @@ async def create_compute_experiment_task(
         "status": new_task.status,
         "vm_instance_id": new_task.vm_instance_id,
         "requires_approval": new_task.requires_approval,
+    }
+
+
+class RerunComputeExperimentPayload(BaseModel):
+    success_criterion: ComputeSuccessCriterion | None = None
+    spend_cap_usd: float | None = Field(default=None, gt=0)
+    deadline_seconds: int | None = Field(default=None, gt=0)
+
+
+@router.post("/tasks/{task_id}/rerun")
+@limiter.limit("60/minute")
+async def rerun_compute_experiment(
+    request: Request,
+    task_id: uuid.UUID,
+    payload: RerunComputeExperimentPayload,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Re-run a compute_experiment task, optionally overriding criterion/spend/deadline.
+
+    Clones the source task's launch contract, applies caller-supplied overrides,
+    validates the result, and creates a new QUEUED task with ``parent_task_id``
+    pointing at the source so the two runs are linked.
+    """
+    source = await _get_user_task(task_id, current_user["user_id"], session)
+
+    source_payload = source.first_payload
+    if not source_payload or source_payload.get("type") != "compute_experiment":
+        raise HTTPException(
+            status_code=422,
+            detail="Task is not a compute_experiment and cannot be re-run via this endpoint",
+        )
+
+    # Clone the source payload and apply caller overrides.
+    new_payload_raw: dict[str, Any] = dict(source_payload)
+    if payload.spend_cap_usd is not None:
+        new_payload_raw["spend_cap_usd"] = float(payload.spend_cap_usd)
+    if payload.deadline_seconds is not None:
+        new_payload_raw["deadline_seconds"] = int(payload.deadline_seconds)
+    if payload.success_criterion is not None:
+        new_payload_raw["success_criterion"] = payload.success_criterion.model_dump()
+
+    # Rebuild launch_contract to re-run validation.
+    launch_contract: dict[str, Any] = {
+        "spend_cap_usd": new_payload_raw["spend_cap_usd"],
+        "deadline_seconds": new_payload_raw["deadline_seconds"],
+    }
+    if new_payload_raw.get("arms") is not None:
+        launch_contract["arms"] = new_payload_raw["arms"]
+        if new_payload_raw.get("declared_metric") is not None:
+            launch_contract["declared_metric"] = new_payload_raw["declared_metric"]
+    else:
+        launch_contract["command"] = new_payload_raw.get("command", "")
+    if new_payload_raw.get("success_criterion") is not None:
+        launch_contract["success_criterion"] = new_payload_raw["success_criterion"]
+
+    ok, reason = _validate_compute_launch_contract(launch_contract, require_smoke=False)
+    if not ok:
+        raise HTTPException(status_code=422, detail=reason)
+
+    try:
+        task_payload = validate_task_payload(new_payload_raw)
+    except ValueError as exc:
+        logger.warning("Rerun payload validation error: %s: %s", type(exc).__name__, exc)
+        raise HTTPException(status_code=422, detail="Invalid re-run payload")
+
+    # Load the project to check spend-approval threshold.
+    project = await session.get(Project, source.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    requires_approval, _ = resolve_compute_spend_approval(
+        runtime_config=_runtime_config,
+        direction=None,
+        spend_cap_usd=float(new_payload_raw["spend_cap_usd"]),
+    )
+
+    vm_name = f"agent-vm-{uuid.uuid4().hex}"
+    new_task = Task(
+        project_id=source.project_id,
+        title=source.title,
+        description=source.description,
+        payloads=[task_payload],
+        vm_instance_id=vm_name,
+        status=TaskStatus.QUEUED,
+        created_by="USER",
+        launched_by_user_id=current_user["user_id"],
+        requires_approval=requires_approval,
+        parent_task_id=source.id,
+    )
+    session.add(new_task)
+    await session.commit()
+    await session.refresh(new_task)
+
+    history = TaskHistory(
+        task_id=new_task.id,
+        action="CREATED",
+        details={
+            "created_by": "USER",
+            "method": "admin_compute_experiment_rerun",
+            "source_task_id": str(source.id),
+        },
+    )
+    session.add(history)
+    await session.commit()
+
+    return {
+        "id": str(new_task.id),
+        "project_id": str(project.id),
+        "title": new_task.title,
+        "status": new_task.status,
+        "vm_instance_id": new_task.vm_instance_id,
+        "requires_approval": new_task.requires_approval,
+        "parent_task_id": str(source.id),
     }
 
 
