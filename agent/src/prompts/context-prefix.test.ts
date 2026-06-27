@@ -195,6 +195,32 @@ describe('buildContextPrefix', () => {
     expect(prefix).not.toContain('[analysis_unavailable');
   });
 
+  it('flat knowledge index renders criterion NOT MET for a failing standalone compute_experiment distinct from its trustworthiness grade', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        knowledge_index: [
+          {
+            id: 'kd-compute-failing',
+            title: 'Failed accuracy benchmark',
+            summary: 'Accuracy 0.85 < 0.9 threshold — criterion not met.',
+            topic: 'compute',
+            source_kind: 'compute_experiment',
+            criterion_met: false,
+            compute_acceptance_grade: 'measured_only',
+            compute_acceptance_reason: 'analysis_mode_not_llm',
+          },
+        ],
+      }],
+    });
+
+    expect(prefix).toContain('[kd-compute-failing] Failed accuracy benchmark');
+    expect(prefix).toContain('[NOT MET]');
+    expect(prefix).toContain('[measured_only: analysis_mode_not_llm]');
+    expect(prefix).not.toContain('[acceptance]');
+    expect(prefix).toContain('Accuracy 0.85 < 0.9 threshold');
+  });
+
   it('renders the acceptance-evidence section when context.acceptance_evidence is present', () => {
     const prefix = buildContextPrefix({
       payloads: [{ type: 'create' }],

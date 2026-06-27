@@ -412,22 +412,34 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       const sourceKind = strVal(entry.source_kind);
       if (sourceKind) meta.push(sourceKind);
       const metaSuffix = meta.length > 0 ? ` (${meta.join(', ')})` : '';
-      let gradeBadge = '';
+      let badges = '';
       if (sourceKind === 'compute_experiment') {
-        const grade = strVal(entry.compute_acceptance_grade);
+        const criterionMet = entry.criterion_met;
         const unavailableCause = strVal(entry.unavailable_cause);
-        const acceptanceReason = strVal(entry.compute_acceptance_reason);
-        if (grade === 'acceptance') {
-          gradeBadge = ' [acceptance]';
-        } else if (unavailableCause) {
-          gradeBadge = ` [analysis_unavailable: ${unavailableCause}]`;
-        } else if (acceptanceReason) {
-          gradeBadge = ` [measured_only: ${acceptanceReason}]`;
+        let verdict: string;
+        if (unavailableCause) {
+          verdict = `analysis_unavailable: ${unavailableCause}`;
+        } else if (criterionMet === true) {
+          verdict = 'MET';
+        } else if (criterionMet === false) {
+          verdict = 'NOT MET';
         } else {
-          gradeBadge = ' [measured_only]';
+          verdict = 'UNMEASURED';
+        }
+        badges += ` [${verdict}]`;
+        if (!unavailableCause) {
+          const grade = strVal(entry.compute_acceptance_grade);
+          const acceptanceReason = strVal(entry.compute_acceptance_reason);
+          if (grade === 'acceptance') {
+            badges += ' [acceptance]';
+          } else if (acceptanceReason) {
+            badges += ` [measured_only: ${acceptanceReason}]`;
+          } else {
+            badges += ' [measured_only]';
+          }
         }
       }
-      kdLines.push(`- [${id}] ${title}${metaSuffix}${gradeBadge}`);
+      kdLines.push(`- [${id}] ${title}${metaSuffix}${badges}`);
       const summary = strVal(entry.summary);
       if (summary) kdLines.push(`  ${summary}`);
     }
