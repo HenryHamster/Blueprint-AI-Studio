@@ -1080,7 +1080,7 @@ describe('buildSweepComparisonSection', () => {
     expect(result).toBe('');
   });
 
-  it('classifies a completed sweep, names the winning arm, and demands one follow-on', () => {
+  it('renders metric values and best-arm margin for completed sweeps', () => {
     // All arms have a definitive verdict — this is the named acceptance test
     const result = buildSweepComparisonSection({
       'sweep-abc': [
@@ -1089,6 +1089,11 @@ describe('buildSweepComparisonSection', () => {
           title: 'Approach A: fast tokenizer',
           arm_label: 'fast-tokenizer',
           criterion_met: true,
+          criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+          per_arm_verdicts: {
+            'fast-tokenizer': { value: 0.93, met: true },
+            'slow-tokenizer': { value: 0.88, met: false },
+          },
           summary: 'Achieved 98% accuracy at 2x throughput',
         },
         {
@@ -1105,10 +1110,10 @@ describe('buildSweepComparisonSection', () => {
     // Sweep id present
     expect(result).toContain('Sweep sweep-abc');
     // Names the winning arm
-    expect(result).toContain('Winner: **fast-tokenizer**');
+    expect(result).toContain('Winner: **fast-tokenizer** (accuracy=0.93; margin=0.05 over slow-tokenizer=0.88)');
     // Both arms listed with verdicts
-    expect(result).toContain('**fast-tokenizer** [MET]');
-    expect(result).toContain('**slow-tokenizer** [NOT MET]');
+    expect(result).toContain('**fast-tokenizer** [MET] [k-met] (accuracy=0.93)');
+    expect(result).toContain('**slow-tokenizer** [NOT MET] [k-not] (accuracy=0.88)');
     // Demands a follow-on move
     expect(result).toContain('exactly ONE follow-on move');
     // Refers to fetch for full analysis
@@ -1118,11 +1123,27 @@ describe('buildSweepComparisonSection', () => {
   it('shows "none (all NOT MET)" as winner when no arm met the criterion', () => {
     const result = buildSweepComparisonSection({
       'sweep-all-fail': [
-        { id: 'k-a', title: 'arm A', arm_label: 'a', criterion_met: false },
-        { id: 'k-b', title: 'arm B', arm_label: 'b', criterion_met: false },
+        {
+          id: 'k-a',
+          title: 'arm A',
+          arm_label: 'a',
+          criterion_met: false,
+          criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+          per_arm_verdicts: {
+            a: { value: 0.82, met: false },
+            b: { value: 0.79, met: false },
+          },
+        },
+        {
+          id: 'k-b',
+          title: 'arm B',
+          arm_label: 'b',
+          criterion_met: false,
+        },
       ],
     });
     expect(result).toContain('Winner: **none (all NOT MET)**');
+    expect(result).toContain('Best measured arm: **a** (accuracy=0.82; margin=0.03 over b=0.79)');
     expect(result).toContain('Winning: 0/2 arm(s) MET, 2/2 NOT MET');
   });
 

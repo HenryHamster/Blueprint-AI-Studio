@@ -442,6 +442,10 @@ function countOrLocal(value: unknown, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function formatMetricNumber(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(4).replace(/\.?0+$/, '');
+}
+
 /**
  * Render a mandatory synthesis block for fully-verdicted multi-arm compute-experiment
  * sweeps (all arms MET or NOT MET — no UNMEASURED or unavailable entries). A completed
@@ -488,27 +492,75 @@ export function buildSweepComparisonSection(
   );
 
   for (const { sweepId, arms } of completed) {
-    const winningArms = arms.filter(a => a.criterion_met === true);
-    const losingArms = arms.filter(a => a.criterion_met === false);
-    const winnerLabel = winningArms.length > 0
-      ? winningArms.map(a => strVal(a.arm_label) || strVal(a.id)).join(', ')
+    const criterion = arms.find(a => a.criterion && typeof a.criterion === 'object')?.criterion as Record<string, unknown> | undefined;
+    const verdicts = arms.find(a => a.per_arm_verdicts && typeof a.per_arm_verdicts === 'object')?.per_arm_verdicts as Record<string, Record<string, unknown>> | undefined;
+    const lowerIsBetter = strVal(criterion?.operator) === '<' || strVal(criterion?.operator) === '<=';
+    const metricName = strVal(criterion?.metric, 'value');
+    const armRows = arms.map(arm => {
+      const label = strVal(arm.arm_label) || strVal(arm.id);
+      const verdict = label && verdicts?.[label] ? verdicts[label] : undefined;
+      const value = typeof verdict?.value === 'number' ? verdict.value : Number(verdict?.value);
+      return {
+        label,
+        id: strVal(arm.id),
+        met: verdict?.met === true || arm.criterion_met === true,
+        value: Number.isFinite(value) ? value : null,
+        summary: strVal(arm.summary),
+      };
+    });
+    const measuredArms = armRows.filter(arm => arm.value !== null).sort((a, b) => {
+      const aValue = a.value ?? 0;
+      const bValue = b.value ?? 0;
+      const delta = lowerIsBetter ? (aValue - bValue) : (bValue - aValue);
+      return delta !== 0 ? delta : a.label.localeCompare(b.label);
+    });
+    const nextMeasuredArm = measuredArms[1];
+    const metArms = armRows.filter(arm => arm.met && arm.value !== null);
+    const winningArm = metArms.length > 0
+      ? metArms.sort((a, b) => {
+          const aValue = a.value ?? 0;
+          const bValue = b.value ?? 0;
+          const delta = lowerIsBetter ? (aValue - bValue) : (bValue - aValue);
+          return delta !== 0 ? delta : a.label.localeCompare(b.label);
+        })[0]
+      : undefined;
+    const metLabels = armRows.filter(arm => arm.met).map(arm => arm.label);
+    const winnerLabel = winningArm
+      ? winningArm.label
+      : metLabels.length > 0
+        ? metLabels.join(', ')
       : 'none (all NOT MET)';
+    const renderMetricTail = (arm: { label: string; value: number | null }, runnerUp: { label: string; value: number | null } | undefined): string => {
+      if (arm.value === null) return '';
+      const valuePart = `${metricName}=${formatMetricNumber(arm.value)}`;
+      if (!runnerUp || runnerUp.value === null) return ` (${valuePart})`;
+      const margin = lowerIsBetter ? runnerUp.value - arm.value : arm.value - runnerUp.value;
+      return ` (${valuePart}; margin=${formatMetricNumber(Math.abs(margin))} over ${runnerUp.label}=${formatMetricNumber(runnerUp.value)})`;
+    };
 
     lines.push(`\n### Sweep ${sweepId}`);
-    lines.push(`Winner: **${winnerLabel}**`);
+    lines.push(
+      winningArm
+        ? `Winner: **${winnerLabel}**${renderMetricTail(winningArm, nextMeasuredArm)}`
+        : `Winner: **${winnerLabel}**`,
+    );
+    if (!winningArm && measuredArms.length > 0) {
+      lines.push(
+        `Best measured arm: **${measuredArms[0].label}**${renderMetricTail(measuredArms[0], nextMeasuredArm)}`,
+      );
+    }
 
-    for (const arm of arms) {
-      const armId = strVal(arm.id);
-      const armLabel = strVal(arm.arm_label) || armId;
-      const verdict = arm.criterion_met === true ? 'MET' : 'NOT MET';
-      const summary = strVal(arm.summary);
-      const summaryTail = summary ? ` — ${summary.slice(0, 200)}` : '';
-      lines.push(`- **${armLabel}** [${verdict}] [${armId}]${summaryTail}`);
+    for (const arm of armRows) {
+      const armLabel = arm.label || arm.id;
+      const verdict = arm.met ? 'MET' : 'NOT MET';
+      const metricTail = arm.value === null ? '' : ` (${strVal(criterion?.metric, 'value')}=${formatMetricNumber(arm.value)})`;
+      const summaryTail = arm.summary ? ` — ${arm.summary.slice(0, 200)}` : '';
+      lines.push(`- **${armLabel}** [${verdict}] [${arm.id}]${metricTail}${summaryTail}`);
     }
 
     lines.push(
       `Use \`./fetch knowledge <id>\` for each arm's full analysis before concluding. ` +
-      `Winning: ${winningArms.length}/${arms.length} arm(s) MET, ${losingArms.length}/${arms.length} NOT MET.`,
+      `Winning: ${armRows.filter(a => a.met).length}/${armRows.length} arm(s) MET, ${armRows.filter(a => !a.met).length}/${armRows.length} NOT MET.`,
     );
   }
 
