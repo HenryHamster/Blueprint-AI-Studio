@@ -30,6 +30,7 @@ from app.migration_chain import build_migration_chain, find_heads
 from app.rollup_migration_validation import (
     _plan_backmerge_migration_reconciliation,
 )
+from testing import check_size_limits as csl
 from app.models import (
     Alert,
     AlertSeverity,
@@ -3408,3 +3409,116 @@ async def test_module_size_check_within_cap_no_alert(db_session, mocker):
 
     assert result["status"] == "merged"
     assert await _alerts_for(db_session, project.id) == []
+
+
+async def test_module_size_check_alerts_on_uncapped_large_changed_file(
+    db_session, mocker
+):
+    """A back-merge PR that changes a source file over the uncapped-file threshold
+    (hb._UNCAPPED_SIZE_THRESHOLD) with NO cap entry in module_size_limits.json
+    emits a WARNING Alert. The merge is NOT blocked — the check is advisory."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 101, "html_url": "http://pr/101"},
+        merge_return={"merged": True},
+    )
+    assert hb._UNCAPPED_SIZE_THRESHOLD == csl._COVERAGE_THRESHOLD
+
+    # A file that maps to the backend section but has no cap entry.
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(
+            return_value=[_make_pr_file("backend/app/brand_new_huge_module.py")]
+        ),
+    )
+    # The limits file has no entry for brand_new_huge_module.py.
+    mocker.patch.object(
+        hb,
+        "_load_size_limits",
+        return_value={"backend": {}, "agent": {}, "frontend": {}},
+    )
+    # File is over the uncapped threshold.
+    over_threshold = csl._COVERAGE_THRESHOLD + 100
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=_make_file_content(over_threshold)),
+    )
+
+    result = await hb.open_backmerge_pr(
+        db_session, project.id, merged_pr_url="http://pr/hotfix-5"
+    )
+    await db_session.commit()
+
+    # The merge still proceeds — the check is advisory, never blocking.
+    assert result["status"] == "merged"
+
+    # A WARNING alert is raised for the uncapped large module.
+    alerts = await _alerts_for(db_session, project.id)
+    assert len(alerts) == 1
+    a = alerts[0]
+    assert a.severity == AlertSeverity.WARNING
+    assert "brand_new_huge_module.py" in a.title
+    assert "no cap" in a.title
+    # The message directs the operator to add a cap.
+    assert "module_size_limits.json" in a.message
+    assert "check_size_limits.py" in a.message
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        # Agent exclusions: .test.ts and .d.ts files
+        "agent/src/foo.test.ts",
+        "agent/src/types/bar.d.ts",
+        # Frontend exclusions: .test.ts, .test.tsx, .d.ts, and test/ prefix
+        "admin-ui/src/components/Foo.test.ts",
+        "admin-ui/src/components/Foo.test.tsx",
+        "admin-ui/src/types/global.d.ts",
+        "admin-ui/src/test/setup.ts",
+    ],
+)
+async def test_module_size_check_skips_excluded_file_types(
+    filename, db_session, mocker
+):
+    """Excluded file types (test files, declaration files) must NOT raise alerts
+    even when they exceed the uncapped threshold and have no cap entry.
+    check_size_limits.py --fix will never add caps for these files, so alerting
+    would send operators on a wild goose chase."""
+    project = await _make_project(db_session)
+    _patch_github(
+        mocker,
+        create_return={"number": 102, "html_url": "http://pr/102"},
+        merge_return={"merged": True},
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[_make_pr_file(filename)]),
+    )
+    mocker.patch.object(
+        hb,
+        "_load_size_limits",
+        return_value={"backend": {}, "agent": {}, "frontend": {}},
+    )
+    # File is over the uncapped threshold.
+    over_threshold = csl._COVERAGE_THRESHOLD + 100
+    get_file_text = mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=_make_file_content(over_threshold)),
+    )
+
+    result = await hb.open_backmerge_pr(
+        db_session, project.id, merged_pr_url="http://pr/hotfix-excluded"
+    )
+    await db_session.commit()
+
+    # Merge still proceeds — excluded files never block.
+    assert result["status"] == "merged"
+    # The filename alone proves the file is excluded, so no content fetch is needed.
+    get_file_text.assert_not_awaited()
+    # No alert should be raised for excluded file types.
+    alerts = await _alerts_for(db_session, project.id)
+    assert alerts == [], (
+        f"Expected no alert for excluded file {filename!r} but got: "
+        + ", ".join(a.title for a in alerts)
+    )

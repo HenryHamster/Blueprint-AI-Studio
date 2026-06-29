@@ -1039,6 +1039,44 @@ describe('buildPortfolioComposition', () => {
     expect(out).not.toContain('may under-count');
     expect(out).not.toContain('coverage gaps not shown');
   });
+
+  // portfolio_composition_does_not_emit_definitive_ratio_warning_from_trimmed_subset
+  it('suppresses definitive LOW PRODUCT RATIO when list is trimmed (shipped < authoritativeTotal)', () => {
+    // 1 product of 2 shipped, authoritative total is 8 — many directions trimmed.
+    // The full portfolio might have many more product directions, so the definitive
+    // warning must not fire.
+    const dirs = [
+      { id: 'd-1', category: 'product', total_cycles: 1 },
+      { id: 'd-2', category: 'structural', total_cycles: 1 },
+    ];
+    const out = buildPortfolioComposition(dirs, [], undefined, 8);
+    expect(out).not.toContain('[LOW PRODUCT RATIO — <30%]');
+  });
+
+  it('shows tempered advisory instead of definitive warning when list is trimmed', () => {
+    const dirs = [
+      { id: 'd-1', category: 'product', total_cycles: 1 },
+      { id: 'd-2', category: 'structural', total_cycles: 1 },
+    ];
+    const out = buildPortfolioComposition(dirs, [], undefined, 8);
+    // productPct = 1/8 = 13%, which is <30%, but the list is trimmed —
+    // expect the softer advisory that names the caveat.
+    expect(out).toContain('LOW PRODUCT RATIO IN SHOWN SUBSET');
+    expect(out).toContain('omitted directions may alter the full mix');
+  });
+
+  it('still fires definitive LOW PRODUCT RATIO when list is complete (shipped === authoritativeTotal)', () => {
+    // 1 product of 4 shipped, authoritative total is also 4 — no trimming.
+    const dirs = [
+      { id: 'd-1', category: 'product', total_cycles: 1 },
+      { id: 'd-2', category: 'structural', total_cycles: 1 },
+      { id: 'd-3', category: 'structural', total_cycles: 1 },
+      { id: 'd-4', category: 'structural', total_cycles: 1 },
+    ];
+    const out = buildPortfolioComposition(dirs, [], undefined, 4);
+    expect(out).toContain('[LOW PRODUCT RATIO — <30%]');
+    expect(out).not.toContain('SHOWN SUBSET');
+  });
 });
 
 describe('buildEmptyRepoGuidance', () => {

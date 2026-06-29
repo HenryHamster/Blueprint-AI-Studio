@@ -1830,3 +1830,207 @@ async def test_ask_compute_job_supplementary_citation_not_grounded(
     # No durable citations means empty citations list
     assert body["citations"] == []
     assert body["grounding"]["grounded"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_multi_turn_history_grounded(
+    client: AsyncClient, db_session
+):
+    """Multi-turn Q&A: prior turns appear as context-only in the prompt,
+    and the new answer is still independently grounded via durable citations."""
+    project = await _make_project(db_session, name="Multi-Turn History Project")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 2.0}},
+        polling_metadata={"result_metrics": {"accuracy": 0.93}},
+    )
+
+    captured_prompts: list[str] = []
+
+    class _FakeContent:
+        # Citation must match the durable ref format: artifact_uri#metric:name=value
+        text = '{"answer": "The accuracy was 0.93.", "citations": ["gs://bucket/jobs/job-1/result.json#metric:accuracy=0.93"]}'
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+
+    class _FakeMessages:
+        async def create(self, **kwargs):
+            captured_prompts.append(
+                (kwargs.get("messages") or [{}])[0].get("content", "")
+            )
+            return _FakeResponse()
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    prior_history = [
+        {"question": "Did this run succeed?", "answer": "Yes, it succeeded."},
+    ]
+
+    with (
+        patch("anthropic.AsyncAnthropic", return_value=_FakeClient()),
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={
+                "question": "What was the accuracy?",
+                "history": prior_history,
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # Answer is grounded in durable evidence (real result_reference metric citation)
+    assert body["grounding_miss"] is False
+    assert len(body["citations"]) >= 1
+
+    # Prior conversation must appear in the prompt under a context-only label
+    assert len(captured_prompts) >= 1
+    prompt_text = captured_prompts[0]
+    assert "Prior conversation" in prompt_text
+    assert "Did this run succeed?" in prompt_text
+    assert "Yes, it succeeded." in prompt_text
+    # History label must indicate it is NOT citable evidence
+    assert "NOT evidence" in prompt_text or "context only" in prompt_text.lower()
+
+    # The allowed-citation list must NOT include any text from the prior answer
+    # (history must not bleed into the allowed-citation set)
+    assert "Yes, it succeeded." not in prompt_text.split("Choose citations ONLY")[1]
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_history_bounded_and_malformed_ignored(
+    client: AsyncClient, db_session
+):
+    """Oversized history is clamped server-side; malformed entries are ignored (no 500)."""
+    project = await _make_project(db_session, name="History Bounds Project")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS"}},
+        polling_metadata={"result_metrics": {"score": 0.8}},
+    )
+
+    captured_prompts: list[str] = []
+
+    class _FakeContent:
+        text = '{"answer": "The score was 0.8.", "citations": ["gs://bucket/jobs/job-1/result.json#metric:score=0.8"]}'
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+
+    class _FakeMessages:
+        async def create(self, **kwargs):
+            captured_prompts.append(
+                (kwargs.get("messages") or [{}])[0].get("content", "")
+            )
+            return _FakeResponse()
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    # 10 valid turns (exceeds _QA_HISTORY_MAX_TURNS=6) plus 2 malformed entries
+    oversized_history = [
+        {
+            "question": (
+                f"history-question-{i}-" + ("Q" * 1200) + "-question-overflow"
+                if i == 9
+                else f"history-question-{i}"
+            ),
+            "answer": (
+                f"history-answer-{i}-" + ("A" * 1200) + "-answer-overflow"
+                if i == 9
+                else f"history-answer-{i}"
+            ),
+        }
+        for i in range(10)
+    ] + [
+        {"bad_key": "no question or answer"},  # malformed — missing required fields
+        "not a dict",  # malformed — wrong type entirely
+    ]
+
+    with (
+        patch("anthropic.AsyncAnthropic", return_value=_FakeClient()),
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "What was the score?", "history": oversized_history},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["grounding_miss"] is False
+
+    assert captured_prompts
+    prompt_text = captured_prompts[0]
+    assert "Prior conversation" in prompt_text
+    assert all(f"history-question-{i}" not in prompt_text for i in range(4))
+    assert all(f"history-answer-{i}" not in prompt_text for i in range(4))
+    assert all(f"history-question-{i}" in prompt_text for i in range(4, 9))
+    assert all(f"history-answer-{i}" in prompt_text for i in range(4, 9))
+    assert "history-question-9-" in prompt_text
+    assert "history-answer-9-" in prompt_text
+    assert "-question-overflow" not in prompt_text
+    assert "-answer-overflow" not in prompt_text
+    assert "bad_key" not in prompt_text
+    assert "not a dict" not in prompt_text
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_history_not_citable(
+    client: AsyncClient, db_session
+):
+    """History text must not satisfy the durable-citation gate even if the LLM cites it.
+
+    A prior answer's text is injected into the prompt as context-only. If the LLM
+    tries to cite a phrase from that prior answer, the durable_cits gate must still
+    reject it (it is not in the real_evidence_set).
+    """
+    project = await _make_project(db_session, name="History Not Citable Project")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 1.0}},
+        polling_metadata={"result_metrics": {"p_val": 0.01}},
+    )
+
+    PRIOR_ANSWER_TEXT = "p_val was 0.01 in the prior run"
+
+    class _FakeContent:
+        # LLM cites text from the prior answer — this must NOT pass the durable gate
+        text = f'{{"answer": "Based on prior context.", "citations": ["{PRIOR_ANSWER_TEXT}"]}}'
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+
+    class _FakeMessages:
+        async def create(self, **kwargs):
+            return _FakeResponse()
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    with (
+        patch("anthropic.AsyncAnthropic", return_value=_FakeClient()),
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={
+                "question": "Confirm the p-value?",
+                "history": [{"question": "What was p_val?", "answer": PRIOR_ANSWER_TEXT}],
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # Prior answer text is not durable evidence — must be rejected by the grounding gate
+    assert body["grounding_miss"] is True
+    assert body["citations"] == []

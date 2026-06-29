@@ -30,10 +30,15 @@ _MAX_AUTO_PAUSE_CYCLES = 3
 # direction the health guardrail keeps churn/unproductive/saturated-pausing
 # (Rules 1, 2, 5) accumulates churn_family_pause_count; once it has been paused
 # this many times for a churn-family reason it is auto-retired, freeing the slot
-# without strategist intervention. "Lifetime burn backstop:" is deliberately
-# EXCLUDED — those pauses set needs_manual_intervention and opt out of auto-
-# recovery, so the operator (not this ladder) must act on them.
+# without strategist intervention.
 _MAX_CHURN_PAUSE_CYCLES = 2
+
+# Lifetime-burn auto-retire ladder (5th ladder). A direction that repeatedly
+# trips the lifetime burn backstop (Rule 6) accumulates lifetime_burn_pause_count.
+# Once it reaches this threshold it is auto-retired instead of left open for
+# indefinite operator intervention — the burn pattern is structural and the slot
+# can be reused. The burn-pause notification fires before retirement on each cycle.
+_MAX_LIFETIME_BURN_PAUSE_CYCLES = 2
 _ZOMBIE_FAMILY_PREFIXES = (
     "Unproductive:",
     "Churn guardrail:",
@@ -377,6 +382,53 @@ async def _process_direction_lifecycle_locked(
     )
 
     directions_modified = False
+
+    def _reconcile_retired_gap(retired_id: str) -> None:
+        """Prune a terminally-retired direction out of every problem-model gap's
+        ``active_moves`` (archiving it in ``past_moves`` and recording a
+        ``GapDeferral`` when the retire empties a gap), so a completed direction
+        can never linger in a gap's active staffing list.
+
+        Authoritative on direction id: it matches across ALL gaps regardless of
+        the direction's possibly-stale ``gap_id`` hint (closing the latent hole
+        where a missing/wrong ``gap_id`` made the old per-gap reconcile a no-op).
+        Runs under the already-held project-row lock, mutating
+        ``project.problem_model`` in place. Fail-open: a malformed/empty problem
+        model never raises and never blocks the retire.
+        """
+        raw = project.problem_model
+        if not isinstance(raw, dict):
+            return
+        gaps = raw.get("gaps")
+        if not isinstance(gaps, list):
+            return
+        # Only write when the id is actually staffing some gap — keeps the
+        # durable problem model byte-identical on the common no-op case.
+        in_active = any(
+            isinstance(g, dict)
+            and isinstance(g.get("active_moves"), list)
+            and str(retired_id) in {str(m) for m in g["active_moves"]}
+            for g in gaps
+        )
+        if not in_active:
+            return
+        from app.problem_model import (  # noqa: PLC0415
+            reconcile_gaps_for_retired_directions,
+        )
+
+        try:
+            _reconciled, _ = reconcile_gaps_for_retired_directions(
+                raw, [retired_id], _utcnow().isoformat()
+            )
+        except Exception as _reconcile_exc:  # fail-open — never block the retire
+            logger.warning(
+                f"[AUTONOMOUS] Gap reconcile failed for retired direction "
+                f"{retired_id}: {_reconcile_exc}"
+            )
+            return
+        project.problem_model = _reconciled
+        flag_modified(project, "problem_model")
+
     # Prune dead directions (expired/completed/rejected) to prevent JSON bloat.
     # "staged" directions are inert-by-design (begin-after-current-version-
     # promotes) and MUST survive the prune so they remain to be auto-activated
@@ -811,14 +863,19 @@ async def _process_direction_lifecycle_locked(
                 churn_ev = _compute_churn_metrics(d)
                 if churn_ev:
                     d["churn_pause_evidence"] = churn_ev
-            # Lifetime burn backstop: store evidence and flag for manual intervention.
-            # The lifetime metric won't drop on its own after auto-recovery, so the
-            # direction would thrash through repeated pause/extend cycles — surface it
-            # for operator decision (retire vs. reset history_aggregate) instead.
+            # Lifetime burn backstop: store evidence, increment ladder counter, and
+            # flag for manual intervention. The lifetime metric won't drop on its own
+            # after auto-recovery, so the direction would thrash through repeated
+            # pause/extend cycles. On the first few pauses surface it for operator
+            # decision; once the counter hits _MAX_LIFETIME_BURN_PAUSE_CYCLES the
+            # lifetime-burn retire ladder (below) will auto-retire it instead.
             if pause_reason.startswith("Lifetime burn backstop:"):
                 lb_ev = _compute_lifetime_burn_metrics(d)
                 if lb_ev:
                     d["lifetime_burn_pause_evidence"] = lb_ev
+                d["lifetime_burn_pause_count"] = (
+                    d.get("lifetime_burn_pause_count", 0) + 1
+                )
                 if not d.get("needs_manual_intervention"):
                     d["needs_manual_intervention"] = True
                     d["needs_manual_intervention_at"] = _utcnow().isoformat()
@@ -1044,19 +1101,72 @@ async def _process_direction_lifecycle_locked(
                         f"[NOTIFY] Failed to post zombie retire milestone for {did}: "
                         f"{_notify_exc}"
                     )
-                # Gap reconciliation (Direction C, ref 626ec3f5): free the gap this
-                # direction was staffing so it can be re-staffed. Fail-open — a
-                # malformed problem model returns None and the retire still lands.
-                gap_id = d.get("gap_id")
-                if gap_id:
-                    from app.problem_model import reconcile_gap_staffing_raw
+                # Gap reconciliation (Direction C, ref 626ec3f5): free the gap
+                # this direction was staffing so it can be re-staffed. Unified
+                # onto the authoritative id-match helper so a missing/stale
+                # gap_id no longer hides a staffing entry. Fail-open.
+                _reconcile_retired_gap(did)
+                directions_modified = True
+                continue  # terminal — skip active_directions.append
+            # Lifetime-burn auto-retire ladder (5th ladder): a direction that has
+            # repeatedly tripped the lifetime burn backstop is structurally stuck —
+            # the cumulative non-merge ratio will not improve without a history reset.
+            # Rather than holding it open indefinitely for manual action, auto-retire
+            # it so the slot can be reused. The burn-pause notification already fired
+            # above; post the retirement milestone and clear the manual-hold flags.
+            lb_pause_count = d.get("lifetime_burn_pause_count", 0)
+            if lb_pause_count >= _MAX_LIFETIME_BURN_PAUSE_CYCLES:
+                d["status"] = "completed"
+                d["auto_completed"] = True
+                d["auto_completed_reason"] = (
+                    f"Auto-retired: direction tripped lifetime burn backstop "
+                    f"{lb_pause_count} times with no recovery. "
+                    f"Slot freed for new directions."
+                )
+                d["completed_at"] = _utcnow().isoformat()
+                # Clear the manual-hold flags — retirement supersedes them.
+                d.pop("needs_manual_intervention", None)
+                d.pop("needs_manual_intervention_at", None)
+                logger.info(
+                    f"[AUTONOMOUS] Auto-retired lifetime-burn direction {did} after "
+                    f"{lb_pause_count} burn-pause cycles: {d.get('text', '')[:60]}"
+                )
+                from app.models import Alert, AlertSeverity
 
-                    _reconciled_pm = reconcile_gap_staffing_raw(
-                        project.problem_model, did, None, gap_id
+                session.add(
+                    Alert(
+                        project_id=project.id,
+                        severity=AlertSeverity.INFO,
+                        title="Direction auto-retired (lifetime burn)",
+                        message=(
+                            f"Direction '{d.get('text', '')[:80]}' was auto-retired after "
+                            f"{lb_pause_count} lifetime burn backstop pauses. "
+                            f"Slot freed for strategic agent to create a replacement."
+                        ),
                     )
-                    if _reconciled_pm is not None:
-                        project.problem_model = _reconciled_pm
-                        flag_modified(project, "problem_model")
+                )
+                try:
+                    from app.notification_dispatch import (
+                        post_direction_milestone_message,
+                    )  # noqa: PLC0415
+
+                    await post_direction_milestone_message(
+                        session,
+                        project.id,
+                        direction_text=d.get("text", ""),
+                        milestone="auto-retired-lifetime-burn",
+                        reason=d["auto_completed_reason"],
+                        direction_id=did,
+                    )
+                except Exception as _notify_exc:
+                    logger.warning(
+                        f"[NOTIFY] Failed to post lifetime-burn retire milestone for {did}: "
+                        f"{_notify_exc}"
+                    )
+                # Gap reconciliation: prune this direction from every gap's
+                # active_moves by id — authoritative helper so a missing/stale
+                # gap_id cannot leave the direction as phantom active staff.
+                _reconcile_retired_gap(did)
                 directions_modified = True
                 continue  # terminal — skip active_directions.append
             MAX_AUTO_PAUSE_CYCLES = _MAX_AUTO_PAUSE_CYCLES
@@ -1103,6 +1213,10 @@ async def _process_direction_lifecycle_locked(
                     logger.warning(
                         f"[NOTIFY] Failed to post direction milestone message: {_notify_exc}"
                     )
+                # Prune the now-completed direction out of any gap it was
+                # staffing — same terminal invariant the zombie/strategic
+                # retires preserve. Fail-open.
+                _reconcile_retired_gap(did)
                 directions_modified = True
             # The auto-paused direction's diagnosis-research spawn was removed
             # with the detect->investigate->fix apparatus strip. The pause itself
@@ -1307,6 +1421,15 @@ async def _process_direction_lifecycle_locked(
                             logger.warning(
                                 f"[NOTIFY] Failed to post scaffolding auto-retire milestone: {_sc_notify_exc}"
                             )
+                        # Prune the now-completed direction out of any gap it
+                        # was staffing — same terminal invariant the
+                        # zombie/strategic retires preserve. Fail-open.
+                        _reconcile_retired_gap(did)
+                        # Persist the completion: without this the in-memory
+                        # status="completed" mutation is silently lost on a tick
+                        # where the flagged-cycles counter did not advance (no
+                        # new research cycle), so the retire re-fires next tick.
+                        directions_modified = True
                         # Retired direction is terminal — skip the append so the
                         # downstream greedy selection cannot spawn a cycle on it
                         # this tick (mirrors the auto-pause `continue` at L1202).

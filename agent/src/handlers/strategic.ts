@@ -27,7 +27,7 @@ import {
   formatRetiredDirectionsSummary,
 } from './research-direction-context.js';
 import {
-  computeResearchPlanPromptFingerprint,
+  computeStrategicPromptFingerprint,
   buildThinkerPrompt,
   runThinkerWithGate,
 } from '../prompts/thinker.js';
@@ -254,11 +254,6 @@ export async function handleStrategic(
   writeMessagesHelper(taskId);
   const researchMode = strVal(payload.research_mode, 'research');
   const disallowedTools = configureAgentPermissions(researchMode);
-  const promptFingerprint = computeResearchPlanPromptFingerprint('research');
-  const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
-  if (setPromptFingerprint) setPromptFingerprint(promptFingerprint);
-  const sendHeartbeat = (indexMod as { sendHeartbeatSync?: (taskId: string, status: string, extra?: Record<string, unknown>) => void }).sendHeartbeatSync;
-  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
   const contextPrefix = buildContextPrefix(task);
 
@@ -633,7 +628,7 @@ prompts, schemas, tools, or orchestration.` : '';
     const versionPhase = payload.version_phase && typeof payload.version_phase === 'object'
       ? payload.version_phase as Record<string, unknown>
       : undefined;
-    const thinkerPrompt = buildThinkerPrompt({
+    const thinkerParams = {
       contextPrefix,
       projectName,
       clockHeader,
@@ -693,13 +688,24 @@ prompts, schemas, tools, or orchestration.` : '';
       sweepComparisonSection: buildSweepComparisonSection(
         payload.compute_experiment_sweeps as Record<string, Array<Record<string, unknown>>> | undefined,
       ),
-    });
+    };
+
+    const thinkerPrompt = buildThinkerPrompt(thinkerParams);
+    const promptSuffix = renderStrategicPromptSuffix(payload);
+    const promptFingerprint = computeStrategicPromptFingerprint(
+      thinkerParams,
+      promptSuffix,
+    );
+    const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
+    if (setPromptFingerprint) setPromptFingerprint(promptFingerprint);
+    const sendHeartbeat = (indexMod as { sendHeartbeatSync?: (taskId: string, status: string, extra?: Record<string, unknown>) => void }).sendHeartbeatSync;
+    if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
     // Append the backend-supplied prompt_suffix as "Additional instructions"
     // (same convention as every other task type). This guidance is reasoning
     // input — deployment framing, stabilize audit-findings hints, stall nudges,
     // mode hints — so it belongs in the analysis pass that produces decisions.
-    const thinkerPromptWithSuffix = thinkerPrompt + renderStrategicPromptSuffix(payload);
+    const thinkerPromptWithSuffix = thinkerPrompt + promptSuffix;
 
     const thinkerGateResult = await runThinkerWithGate(
       thinkerPromptWithSuffix, taskId, ws, statusRef, model, effort, disallowedTools,
@@ -1112,8 +1118,8 @@ ${strategicChallengeSection}
     try {
       const directionCreatedInOutput = /"status"\s*:\s*"ok"[\s\S]{0,100}"op"\s*:\s*"create_direction"/.test(allOutput)
         || /"op"\s*:\s*"create_direction"[\s\S]{0,100}"status"\s*:\s*"ok"/.test(allOutput);
-      const directionUpdatedInOutput = /"status"\s*:\s*"ok"[\s\S]{0,100}"op"\s*:\s*"(update_direction|retire_direction|approve_direction|reject_direction)"/.test(allOutput)
-        || /"op"\s*:\s*"(update_direction|retire_direction|approve_direction|reject_direction)"[\s\S]{0,100}"status"\s*:\s*"ok"/.test(allOutput);
+      const directionUpdatedInOutput = /"status"\s*:\s*"ok"[\s\S]{0,100}"op"\s*:\s*"(update_direction|retire_direction|stage_direction|approve_direction|reject_direction)"/.test(allOutput)
+        || /"op"\s*:\s*"(update_direction|retire_direction|stage_direction|approve_direction|reject_direction)"[\s\S]{0,100}"status"\s*:\s*"ok"/.test(allOutput);
       const anyDirectionOp = directionCreatedInOutput || directionUpdatedInOutput;
 
       // Detect constraint rejections (cap/dedup) so we don't retry wastefully
@@ -1122,6 +1128,7 @@ ${strategicChallengeSection}
       // Check if thinker's structured output contained direction recommendations
       const structuredSection = analysisText.match(/## Structured Output[\s\S]*$/i)?.[0] ?? '';
       const thinkerRecommendedCreates = /create[_-]direction|"op"\s*:\s*"create"/i.test(structuredSection);
+      const thinkerRecommendedOtherOps = /retire[_-]direction|update[_-]direction|stage[_-]direction|approve[_-]direction|reject[_-]direction/i.test(structuredSection);
 
       if (directionRejectedInOutput && !anyDirectionOp) {
         sendLog(ws, '\n[INFO] Direction creation was attempted but rejected by constraints (cap/duplicate). Not retrying.\n');
@@ -1134,6 +1141,22 @@ ${strategicChallengeSection}
           './strategic create-direction \'{"text": "...", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "success_evidence": "observable outcome that proves this direction is done (required)", "retirement_condition": "measurable condition that triggers retirement (required)", "dedup_reasoning": {"closest_directions": ["d-xxx"], "distinction": "..."}}\' \n\n' +
           'success_evidence and retirement_condition are required fields — the backend will reject the call with HTTP 400 if either is missing.\n\n' +
           'Extract the directions from the analysis and call the commands. Nothing else.',
+          ws, statusRef, model, effort, disallowedTools
+        );
+        exitCode = retryResult.exitCode;
+        allOutput = allOutput + '\n' + retryResult.allOutput;
+        lastResultText = retryResult.lastResultText || lastResultText;
+      } else if (exitCode === 0 && thinkerRecommendedOtherOps && !anyDirectionOp) {
+        sendLog(ws, '\n[WARNING] Strategic executor completed but recommended direction operations were not executed. Retrying...\n');
+        const retryResult = await runClaudeCode(
+          'Your previous attempt did not execute the recommended direction operation commands.\n\n' +
+          'The strategic analysis recommended one or more of the following operations. Run the relevant commands NOW:\n\n' +
+          './strategic retire-direction \'{"direction_id": "d-xxx", "rationale": "..."}\'\n' +
+          './strategic update-direction \'{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "success_evidence": "...", "retirement_condition": "..."}, "rationale": "..."}\'\n' +
+          './strategic stage-direction \'{"direction_id": "d-xxx", "rationale": "why this belongs to the next version"}\'\n' +
+          './strategic approve-direction \'{"direction_id": "d-xxx", "rationale": "..."}\'\n' +
+          './strategic reject-direction \'{"direction_id": "d-xxx", "rationale": "..."}\'\n\n' +
+          'Extract the direction operation from the analysis and call the appropriate command. Nothing else.',
           ws, statusRef, model, effort, disallowedTools
         );
         exitCode = retryResult.exitCode;

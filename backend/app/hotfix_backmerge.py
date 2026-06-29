@@ -72,6 +72,11 @@ from app.broadcast import broadcast_to_project
 # credential resolver used by the whole LTS machinery.
 from app.release_qualifier import _lts_branch_names, _resolve_github_with_session
 from app.size_limit_policy import _is_chronic_offender, parse_bump_history
+from testing.check_size_limits import (
+    _COVERAGE_THRESHOLD as _UNCAPPED_SIZE_THRESHOLD,
+    _is_agent_excluded,
+    _is_frontend_excluded,
+)
 from app.models import (
     Alert,
     AlertSeverity,
@@ -109,6 +114,14 @@ _FILE_PREFIX_MAP: list[tuple[str, str]] = [
     ("agent/src/", "agent"),
     ("admin-ui/src/", "frontend"),
 ]
+
+# Maps section names to their uncapped-file exclusion predicate.  Mirrors the
+# per-section exclusion rules in check_size_limits._SECTION_SCAN so that the
+# same files that check_size_limits.py --fix would skip are also skipped here.
+_SECTION_EXCLUSION: dict[str, object] = {
+    "agent": _is_agent_excluded,
+    "frontend": _is_frontend_excluded,
+}
 
 # Task type for the conflict-resolution task.  ``create`` (not ``plan``): runs
 # the agent directly against automain so the resolver prompt reaches the
@@ -205,7 +218,13 @@ async def _check_module_size_violations(
         section, rel = mapping
         cap = (limits.get(section) or {}).get(rel)
         if cap is None:
-            continue
+            # No cap entry — skip files that the canonical guardrail excludes
+            # (agent .test.ts/.d.ts; frontend .test.ts/.test.tsx/.d.ts/test/*).
+            # check_size_limits.py --fix will never add a cap for these, so
+            # alerting on them would send operators on a wild goose chase.
+            exclude_fn = _SECTION_EXCLUSION.get(section)
+            if exclude_fn and exclude_fn(rel):  # type: ignore[operator]
+                continue
         text = await github.get_file_text_at_ref(
             filename,
             token=token,
@@ -217,7 +236,12 @@ async def _check_module_size_violations(
         if text is None:
             continue
         count = len(text.splitlines())
-        if count > cap:
+        if cap is None:
+            if count > _UNCAPPED_SIZE_THRESHOLD:
+                violations.append(
+                    {"section": section, "rel": rel, "count": count, "cap": None}
+                )
+        elif count > cap:
             violations.append(
                 {"section": section, "rel": rel, "count": count, "cap": cap}
             )
@@ -251,6 +275,61 @@ async def _emit_size_violation_alerts(
         count = v["count"]
         cap = v["cap"]
 
+        trigger_clause = f" (triggered by {trigger_desc})" if trigger_desc else ""
+
+        if cap is None:
+            # Uncapped large file — no history, no chronic check.
+            bucket = (count // 100) * 100
+            uncapped_title = (
+                f"Uncapped module in back-merge: {section}/{rel} "
+                f"(~{bucket} lines, no cap)"
+            )
+            existing_uncapped = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == project_id,
+                            Alert.title == uncapped_title,
+                            Alert.dismissed_at.is_(None),
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if existing_uncapped is not None:
+                logger.debug(
+                    "[BACKMERGE] uncapped module alert already open for %s/%s; skipping",
+                    section,
+                    rel,
+                )
+                continue
+            uncapped_alert = Alert(
+                project_id=project_id,
+                severity=AlertSeverity.WARNING,
+                title=uncapped_title,
+                message=(
+                    f"Back-merge PR #{pr_number}{trigger_clause} includes `{rel}` "
+                    f"({section}) at approximately {bucket}+ lines with no cap entry "
+                    f"in module_size_limits.json. Run "
+                    f"`python3 backend/testing/check_size_limits.py --fix` to add a cap, "
+                    f"or consider decomposing `{rel}` into smaller modules. "
+                    f"The back-merge proceeded normally."
+                ),
+            )
+            session.add(uncapped_alert)
+            await session.flush()
+            await _broadcast_alert(project_id, uncapped_alert)
+            logger.warning(
+                "[BACKMERGE] uncapped module: %s/%s has %d lines (no cap) "
+                "in back-merge PR #%s",
+                section,
+                rel,
+                count,
+                pr_number,
+            )
+            continue
+
         # Advisory bump-history lookup — never blocks the alert path.
         try:
             history = parse_bump_history(rel, section)
@@ -258,8 +337,6 @@ async def _emit_size_violation_alerts(
         except Exception:  # noqa: BLE001
             history = []
             chronic = False
-
-        trigger_clause = f" (triggered by {trigger_desc})" if trigger_desc else ""
 
         if chronic:
             bump_count = len(history)

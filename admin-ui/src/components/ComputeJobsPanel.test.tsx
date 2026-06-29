@@ -2810,7 +2810,7 @@ describe('ComputeJobsPanel render + kill', () => {
     // Ungrounded disclaimer is absent for a grounded answer
     expect(result.querySelector('[data-testid="compute-ask-ungrounded"]')).toBeNull();
     // API called with correct args
-    expect(askComputeJob).toHaveBeenCalledWith('job-1', 'What accuracy did this run achieve?');
+    expect(askComputeJob).toHaveBeenCalledWith('job-1', 'What accuracy did this run achieve?', undefined);
   });
 
   test('shows starter questions based on criterion verdict', async () => {
@@ -2988,6 +2988,161 @@ describe('ComputeJobsPanel render + kill', () => {
     // Other messages absent
     expect(queryByTestId('compute-ask-grounded')).toBeNull();
     expect(queryByTestId('compute-ask-ungrounded')).toBeNull();
+  });
+
+  test('renders ungrounded compute Q&A answer with an unverified caution treatment', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: 'The model might have been overfitting.',
+      citations: [],
+      grounding_miss: true,
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'Why did this happen?' } });
+    });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+    // Result block uses amber warning colors instead of indigo
+    const resultBlock = await findByTestId('compute-ask-result');
+    expect(resultBlock.className).toContain('bg-amber-500/10');
+    expect(resultBlock.className).toContain('border-amber-500/30');
+    // Caution label is visible
+    const cautionLabel = await findByTestId('compute-ask-unverified-caution');
+    expect(cautionLabel.textContent).toContain('Unverified answer');
+    expect(cautionLabel.textContent).toContain('no grounding found');
+    // Answer text uses amber color
+    expect(resultBlock.textContent).toContain('The model might have been overfitting.');
+    const answerDiv = resultBlock.querySelector('.text-amber-200');
+    expect(answerDiv).toBeTruthy();
+  });
+
+  test('multi-turn: both Q&A pairs remain rendered after second question, prior turn sent as history', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.5 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+
+    // First answer: grounded
+    askComputeJob.mockResolvedValueOnce({
+      answer: 'The accuracy was 0.95.',
+      citations: ['gs://artifacts/metrics.json#metric:accuracy'],
+      grounding_miss: false,
+      fallback_reason: null,
+    });
+    // Second answer: also grounded
+    askComputeJob.mockResolvedValueOnce({
+      answer: 'The control arm scored 0.85.',
+      citations: ['gs://artifacts/metrics.json#arm:control'],
+      grounding_miss: false,
+      fallback_reason: null,
+    });
+
+    const { findByTestId, findAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+
+    // Ask first question
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'What was the accuracy?' } });
+    });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+
+    // First result rendered
+    await findByTestId('compute-ask-result');
+
+    // Ask second question (input should be cleared after first answer)
+    const input2 = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input2, { target: { value: 'And arm control?' } });
+    });
+    await act(async () => { submitBtn.click(); });
+
+    // Both Q&A pairs must still be in the DOM
+    const results = await findAllByTestId('compute-ask-result');
+    expect(results.length).toBe(2);
+    expect(results[0].textContent).toContain('0.95');
+    expect(results[1].textContent).toContain('0.85');
+
+    // Thread questions rendered
+    const questions = await findAllByTestId('compute-ask-thread-question');
+    expect(questions.length).toBe(2);
+
+    // Second call must include the prior turn as history
+    expect(askComputeJob).toHaveBeenNthCalledWith(
+      2,
+      'job-1',
+      'And arm control?',
+      [{ question: 'What was the accuracy?', answer: 'The accuracy was 0.95.' }],
+    );
+  });
+
+  test('multi-turn: per-answer grounding treatment preserved (first grounded, second unverified)', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.5 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+
+    askComputeJob.mockResolvedValueOnce({
+      answer: 'Accuracy was 0.91.',
+      citations: ['gs://artifacts/metrics.json#metric:accuracy'],
+      grounding_miss: false,
+      fallback_reason: null,
+    });
+    askComputeJob.mockResolvedValueOnce({
+      answer: 'Cannot find evidence for that.',
+      citations: [],
+      grounding_miss: true,
+      fallback_reason: null,
+    });
+
+    const { findByTestId, findAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => { fireEvent.change(input, { target: { value: 'First question' } }); });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+
+    await findByTestId('compute-ask-grounded');
+
+    const input2 = await findByTestId('compute-ask-input');
+    await act(async () => { fireEvent.change(input2, { target: { value: 'Second question' } }); });
+    await act(async () => { submitBtn.click(); });
+
+    const results = await findAllByTestId('compute-ask-result');
+    expect(results.length).toBe(2);
+    // First is grounded (indigo style)
+    expect(results[0].className).toContain('indigo');
+    // Second is unverified (amber style)
+    expect(results[1].className).toContain('amber');
+
+    // Ungrounded notice on second turn
+    const ungrounded = results[1].querySelector('[data-testid="compute-ask-unverified-caution"]');
+    expect(ungrounded).toBeTruthy();
+  });
+
+  test('multi-turn: clear conversation button resets thread', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.5 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: 'Some answer.',
+      citations: ['gs://artifacts/metrics.json#metric:x'],
+      grounding_miss: false,
+      fallback_reason: null,
+    });
+
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => { fireEvent.change(input, { target: { value: 'A question' } }); });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+    await findByTestId('compute-ask-result');
+
+    // Clear button appears
+    const clearBtn = await findByTestId('compute-ask-clear');
+    await act(async () => { clearBtn.click(); });
+
+    // Thread must be gone after clearing
+    expect(queryByTestId('compute-ask-result')).toBeNull();
+    expect(queryByTestId('compute-ask-thread')).toBeNull();
   });
 });
 

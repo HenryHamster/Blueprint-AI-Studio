@@ -14669,3 +14669,138 @@ async def test_genuine_cross_tree_none_base_branch_is_noop(db_session, mocker):
         "_maybe_inherit_base must not overwrite dependent base_branch with empty "
         "string when foundation has no base_branch"
     )
+
+
+@_pytest.mark.asyncio
+async def test_exhaustion_autocomplete_reconciles_gap_active_moves(db_session):
+    """Auto-completing an exhausted direction reconciles the problem-model gap.
+
+    When apply_post_spawn_state auto-completes a direction (via the dedup-deadlock
+    exhaustion path), any gap in project.problem_model whose active_moves contains
+    that direction id must have it pruned out (moved to past_moves) after the call.
+    This mirrors the invariant enforced by strategic and zombie retirements.
+
+    Acceptance requirement: test_exhaustion_autocomplete_reconciles_gap_active_moves
+    """
+    from datetime import datetime, timedelta
+
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-gap-reconcile-test"
+
+    # Two pre-existing dedup-zero history entries to prime the deadlock window.
+    old_history = [
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "task_id": "t-gcr-old1",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 2,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "task_id": "t-gcr-old2",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 1,
+                "word_overlap_dedup": 1,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+    ]
+    direction = {
+        **_active_direction(direction_id, "Exhausted direction with gap"),
+        "research_history": old_history,
+    }
+
+    # problem_model has a gap with this direction in active_moves
+    gap_id = "g-test-gap-01"
+    initial_problem_model = {
+        "gaps": [
+            {
+                "id": gap_id,
+                "title": "Test gap",
+                "active_moves": [direction_id],
+                "past_moves": [],
+            }
+        ]
+    }
+
+    project = _Project(
+        name="Gap Reconcile Test",
+        user_id="test-user-gcr1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+        problem_model=initial_problem_model,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Third dedup-zero cycle — triggers exhaustion auto-complete via deadlock detection.
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],  # findings
+        [],  # child_tasks
+        [],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        1,   # hash_dedup_count — dedup activity in 3rd cycle
+        0,   # word_overlap_count
+        0,   # file_overlap_count
+        0,   # evidence_overlap_count
+        0,   # type_filtered_count
+        0,   # empty_prompt_count
+        "research-branch",
+        "main",
+        0,   # research_depth
+        None,  # parent_research_task_id
+    )
+    await db_session.refresh(project)
+
+    # Direction must be terminally completed.
+    d = project.directions[0]
+    assert d["status"] == "completed", (
+        f"direction must be auto-completed, got {d['status']!r}"
+    )
+
+    # problem_model gap must have direction pruned from active_moves and moved to past_moves.
+    pm = project.problem_model or {}
+    gaps = pm.get("gaps", [])
+    assert gaps, "problem_model must still have gaps list"
+    test_gap = next((g for g in gaps if g.get("id") == gap_id), None)
+    assert test_gap is not None, f"gap {gap_id} must still exist in problem_model"
+
+    active_moves = test_gap.get("active_moves", [])
+    past_moves = test_gap.get("past_moves", [])
+
+    assert direction_id not in active_moves, (
+        f"completed direction {direction_id!r} must be pruned from gap active_moves, "
+        f"got active_moves={active_moves!r}"
+    )
+    assert direction_id in past_moves, (
+        f"completed direction {direction_id!r} must appear in gap past_moves, "
+        f"got past_moves={past_moves!r}"
+    )

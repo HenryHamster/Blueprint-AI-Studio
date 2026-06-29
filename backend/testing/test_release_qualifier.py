@@ -20293,6 +20293,25 @@ class TestFormatQualificationForApi:
         assert out["promotion_error_detail"] == "merge conflict"
         assert out["goal_alignment"] == qual["goal_alignment"]
 
+    def test_smoketest_enabled_false_is_exposed(self):
+        """format_qualification_for_api surfaces smoketest_enabled=False so consumers
+        know the smoketest dimension was disabled and the 0.0 sub-score is a
+        placeholder, not an active release-hardening lane."""
+        qual = {"status": "not_promoted", "smoketest_enabled": False}
+        out = rq.format_qualification_for_api(qual)
+        assert out["smoketest_enabled"] is False
+
+    def test_smoketest_enabled_true_is_exposed(self):
+        qual = {"status": "not_promoted", "smoketest_enabled": True}
+        out = rq.format_qualification_for_api(qual)
+        assert out["smoketest_enabled"] is True
+
+    def test_smoketest_enabled_absent_returns_none(self):
+        """Legacy qualification records without smoketest_enabled return None
+        so callers can distinguish 'disabled' from 'unknown'."""
+        out = rq.format_qualification_for_api({"status": "pending"})
+        assert out["smoketest_enabled"] is None
+
 
 # ===========================================================================
 # QualificationVerdict recording — the durable per-verdict history (Phase 4)
@@ -24977,6 +24996,65 @@ def test_format_verdict_for_api_acceptance_aggregate_none_on_legacy():
     assert out["acceptance_aggregate"] is None
 
 
+def test_format_verdict_for_api_smoketest_enabled_false():
+    """format_verdict_for_api surfaces smoketest_enabled=False from sub_scores
+    so consumers know the smoketest dimension was disabled and the 0.0 placeholder
+    should not be rendered as an active release-hardening lane."""
+    import uuid
+
+    verdict = QualificationVerdict(
+        project_id=uuid.uuid4(),
+        release_version_id=uuid.uuid4(),
+        candidate_sha="abc123",
+        confidence=0.88,
+        sub_scores={"audit": 0.90, "test_erosion": 0.85, "smoketest": 0.0, "smoketest_enabled": False},
+        would_promote=False,
+        promotion_enabled=False,
+        terminal_status="not_promoted",
+        threshold=0.9,
+    )
+    out = rq.format_verdict_for_api(verdict)
+    assert out["smoketest_enabled"] is False
+
+
+def test_format_verdict_for_api_smoketest_enabled_true():
+    import uuid
+
+    verdict = QualificationVerdict(
+        project_id=uuid.uuid4(),
+        release_version_id=uuid.uuid4(),
+        candidate_sha="abc123",
+        confidence=0.91,
+        sub_scores={"audit": 0.90, "test_erosion": 0.85, "smoketest": 0.80, "smoketest_enabled": True},
+        would_promote=True,
+        promotion_enabled=False,
+        terminal_status="dry_run",
+        threshold=0.9,
+    )
+    out = rq.format_verdict_for_api(verdict)
+    assert out["smoketest_enabled"] is True
+
+
+def test_format_verdict_for_api_smoketest_enabled_none_on_legacy():
+    """Legacy verdict rows without smoketest_enabled in sub_scores return None
+    so callers can distinguish 'disabled' from 'unknown'."""
+    import uuid
+
+    verdict = QualificationVerdict(
+        project_id=uuid.uuid4(),
+        release_version_id=uuid.uuid4(),
+        candidate_sha="legacy2",
+        confidence=0.85,
+        sub_scores={"audit": 0.90, "test_erosion": 0.85, "smoketest": 0.75},
+        would_promote=False,
+        promotion_enabled=False,
+        terminal_status="not_promoted",
+    )
+    out = rq.format_verdict_for_api(verdict)
+    assert "smoketest_enabled" in out
+    assert out["smoketest_enabled"] is None
+
+
 def test_get_latest_qualification_audit_findings_prefers_verdict_row():
     """The findings helper prefers the durable verdict row's audit_findings and
     falls back to last_qualification only when no verdict is supplied."""
@@ -27052,6 +27130,19 @@ class TestComputeGoalCoverageDrift:
         assert result["signal"] == "no_grade_yet"
         assert result["coverage"] is None
 
+    def test_ungraded_statuses_do_not_look_on_track(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        for status in ("not_applicable", "superseded_exempt"):
+            result = compute_goal_coverage_drift(
+                "Improve authentication coverage",
+                merge_grade_status=status,
+                merge_grade_coverage=0.91,
+                merges_since_grade=0,
+            )
+            assert result["signal"] == status
+            assert "passed" not in result["detail"].lower()
+
     def test_on_track_pass_grade_low_delta(self):
         from app.release_scoring import compute_goal_coverage_drift
 
@@ -27141,3 +27232,127 @@ class TestComputeGoalCoverageDrift:
             merges_since_grade=0,
         )
         assert result["biggest_gap"] == "Missing rate limiting"
+
+    def test_no_grade_yet_below_threshold(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status=None,
+            merges_since_grade=4,
+        )
+        assert result["signal"] == "no_grade_yet"
+        assert result["stale"] is False
+        assert result["merges_since_grade"] == 4
+
+    def test_drifting_at_threshold_when_no_grade_yet(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status=None,
+            merges_since_grade=5,
+        )
+        assert result["signal"] == "drifting"
+        assert result["stale"] is True
+        assert result["merges_since_grade"] == 5
+        assert result["coverage"] is None
+
+    def test_drifting_above_threshold_when_no_grade_yet(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status=None,
+            merges_since_grade=10,
+        )
+        assert result["signal"] == "drifting"
+        assert result["stale"] is True
+        assert result["merges_since_grade"] == 10
+        assert result["coverage"] is None
+
+    def test_not_applicable_status_non_stale(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="not_applicable",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "not_applicable"
+        assert result["stale"] is False
+
+    def test_not_applicable_status_stale_not_drifting(self):
+        """stale semantics do not apply to not_applicable — must stay not_applicable."""
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="not_applicable",
+            merges_since_grade=5,
+        )
+        assert result["signal"] == "not_applicable"
+
+    def test_superseded_exempt_status_non_stale(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="superseded_exempt",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "superseded_exempt"
+        assert result["stale"] is False
+
+    def test_superseded_exempt_status_stale_not_drifting(self):
+        """stale semantics do not apply to superseded_exempt — must stay superseded_exempt."""
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="superseded_exempt",
+            merges_since_grade=5,
+        )
+        assert result["signal"] == "superseded_exempt"
+
+    def test_unparseable_status_returns_no_grade_yet(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="unparseable",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "no_grade_yet"
+
+    def test_unknown_future_status_returns_no_grade_yet(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="future_status",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "no_grade_yet"
+
+    def test_pass_status_non_stale_returns_on_track(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="pass",
+            merge_grade_coverage=0.9,
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "on_track"
+
+    def test_fail_status_returns_drifting(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="fail",
+            merge_grade_coverage=0.4,
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "drifting"

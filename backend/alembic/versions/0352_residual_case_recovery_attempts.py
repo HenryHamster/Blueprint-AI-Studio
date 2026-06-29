@@ -1,15 +1,15 @@
 """Add recovery_attempts to ResidualRemediationCase.
 
-Revision ID: 0355
-Revises: 0349
+Revision ID: 0352
+Revises: 0351
 """
 
 from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0355"
-down_revision = "0349"
+revision = "0352"
+down_revision = "0351"
 branch_labels = None
 depends_on = None
 

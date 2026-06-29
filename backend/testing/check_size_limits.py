@@ -73,6 +73,44 @@ def _classify_breach(
     )
 
 
+def classify_size_record(
+    rel: str,
+    count: "int | None",
+    cap: "int | None",
+    section: str = "backend",
+    *,
+    override_chronic: bool = False,
+    with_verdict: bool = True,
+) -> dict:
+    """Content-injectable breach-and-bump classification for ONE counted record.
+
+    Pure / filesystem-free: the caller supplies the already-computed line
+    ``count`` (``None`` when the file is absent / unreadable) and the ``cap``.
+    This is the SINGLE source of truth for the breach test (``count > cap``) and
+    the chronic/bump policy (``_classify_breach``), so the disk-mode CLI path
+    (via :func:`scan_section`) and the at-SHA evaluator
+    (``backend/app/ci_compliance.py``) classify identically without duplicating
+    the policy.
+
+    Returns ``{rel, count, cap, breach, verdict}``:
+
+      * ``breach`` — True only when BOTH ``count`` and ``cap`` are present and
+        ``count > cap``. A file absent at the ref (``count is None``) is never a
+        breach (a missing file cannot have grown past its cap).
+      * ``verdict`` — the ``BreachVerdict`` from :func:`_classify_breach` when
+        ``breach`` (and ``with_verdict``), else ``None``. ``with_verdict=False``
+        skips the (git-touching) chronic lookup for the plain check path, which
+        only needs the breach flag.
+    """
+    breach = count is not None and cap is not None and count > cap
+    verdict = None
+    if breach and with_verdict:
+        verdict = _classify_breach(
+            rel, count, section, override_chronic=override_chronic
+        )
+    return {"rel": rel, "count": count, "cap": cap, "breach": breach, "verdict": verdict}
+
+
 # Repo root is two levels up from this file (backend/testing -> repo root).
 _DEFAULT_REPO_ROOT = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "..")
@@ -171,32 +209,26 @@ def count_lines(path: str) -> int:
         return len(f.readlines())
 
 
-def scan_section(caps: dict, root: str) -> list[dict]:
+def scan_section(caps: dict, root: str, section: str = "backend") -> list[dict]:
     """Line-count every file in ``caps`` under ``root``.
 
-    Returns one record per file: ``{rel, path, count, cap, breach}``.
+    Returns one record per file: ``{rel, path, count, cap, breach, verdict}``.
     A file missing from disk is recorded with ``count=None`` and
     ``breach=False`` (a missing file can't have grown past its cap).
+
+    The breach test is delegated to :func:`classify_size_record` (the shared,
+    filesystem-free policy) so the disk-mode CLI and the at-SHA evaluator agree
+    bit-for-bit. ``with_verdict=False`` keeps the plain check path free of the
+    per-file git lookup the chronic verdict would trigger.
     """
     records = []
     for rel in caps:
         cap = caps[rel]
         path = os.path.join(root, rel)
-        if not os.path.isfile(path):
-            records.append(
-                {"rel": rel, "path": path, "count": None, "cap": cap, "breach": False}
-            )
-            continue
-        count = count_lines(path)
-        records.append(
-            {
-                "rel": rel,
-                "path": path,
-                "count": count,
-                "cap": cap,
-                "breach": count > cap,
-            }
-        )
+        count = count_lines(path) if os.path.isfile(path) else None
+        rec = classify_size_record(rel, count, cap, section, with_verdict=False)
+        rec["path"] = path
+        records.append(rec)
     return records
 
 
@@ -265,7 +297,7 @@ def evaluate(
         if root is None:
             skipped.append(section)
             continue
-        checked[section] = scan_section(caps, root)
+        checked[section] = scan_section(caps, root, section)
     return checked, skipped
 
 
@@ -316,16 +348,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--repo-root",
         dest="repo_root",
-        default=_DEFAULT_REPO_ROOT,
+        default=None,
         help="repo root used to resolve section source trees (default: inferred)",
     )
     args = parser.parse_args(argv)
+    repo_root_explicit = args.repo_root is not None
+    if args.repo_root is None:
+        args.repo_root = _DEFAULT_REPO_ROOT
 
     data = load_limits(args.json_path)
     # The environment-specific frontend escape hatches (ADMIN_UI_SRC /
-    # /admin-ui/src) apply only to the real run rooted at the default repo
-    # root. An explicit --repo-root means hermetic resolution under that root.
-    use_env_overrides = os.path.normpath(args.repo_root) == _DEFAULT_REPO_ROOT
+    # /admin-ui/src) apply only to the real run when the caller did not pass an
+    # explicit --repo-root. An explicit root means hermetic resolution under
+    # that checkout, even if it happens to equal the default path.
+    use_env_overrides = not repo_root_explicit
     checked, skipped = evaluate(
         data, args.sections, args.repo_root, use_env_overrides=use_env_overrides
     )
@@ -347,7 +383,10 @@ def main(argv: list[str] | None = None) -> int:
     for section in args.sections:
         if section in skipped:
             continue
-        root = resolve_section_root(section, args.repo_root)
+        # Keep the uncapped scan on the same root resolution path as evaluate().
+        root = resolve_section_root(
+            section, args.repo_root, use_env_overrides=use_env_overrides
+        )
         if root is None:
             continue
         suffixes, is_excluded = _SECTION_SCAN[section]
@@ -363,12 +402,13 @@ def main(argv: list[str] | None = None) -> int:
         bumped: list[tuple[str, dict, int]] = []
         added: list[tuple[str, dict, int]] = []
         for section, rec in breaches:
-            verdict = _classify_breach(
+            verdict = classify_size_record(
                 rec["rel"],
                 rec["count"],
+                rec["cap"],
                 section,
                 override_chronic=args.force_chronic,
-            )
+            )["verdict"]
             if verdict["is_chronic"] and not args.force_chronic:
                 print(
                     f"[chronic] {section}/{rec['rel']}: {rec['count']} lines — "

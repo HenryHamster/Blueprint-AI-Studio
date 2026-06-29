@@ -608,6 +608,17 @@ class Project(SQLModel, table=True):
         default=None,
         sa_column=Column(String, nullable=True),
     )
+    # Per-automain-HEAD CI-compliance status (module-size guardrails), keyed by
+    # commit SHA. Written by ci_compliance.record_ci_compliance after
+    # evaluate_ci_compliance_at_ref reads the capped modules at the HEAD ref via
+    # the GitHub file-read-at-SHA path; read via get_ci_compliance and surfaced
+    # in the strategist payload so guardrail violations are discovered
+    # CONTINUOUSLY (per merge) rather than only when qualification CI fails.
+    # Shape: {sha: {ref, compliant: bool, violations: [{section, rel, count, cap}]}}.
+    # NULL = never evaluated.
+    ci_compliance: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
 
     @property
     def enable_self_improvement(self) -> bool:

@@ -254,6 +254,27 @@ describe('buildCycleStartReconciliationSection', () => {
     expect(result).toContain('**blocked orphan** [low] (gap g-b) — BLOCKED');
   });
 
+  it('buildCycleStartReconciliationSection renders stale active moves staffed deferrals and phantom refs', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      staffed_but_deferred: [{ gap_id: 'g-defer', name: 'deferred but staffed', priority: 'high', status: 'active' }],
+      ungrounded_directions: [],
+      stale_active_moves: [{ gap_id: 'g-stale', gap_name: 'stale staffed gap', stale_direction_ids: ['d-retired'] }],
+      phantom_direction_refs: [{ direction_id: 'd-4890df9e', cited_in: 'intent.current_focus' }, { direction_id: 'd-aaaabbbb', cited_in: 'running_update' }],
+      direction_pipeline: [],
+      counts: { staffed_but_deferred: 1, stale_active_moves: 1, phantom_direction_refs: 2 },
+    });
+
+    expect(result).toContain('Staffed-but-deferred gaps — contradictory staffing state (1)');
+    expect(result).toContain('**deferred but staffed** [high] (gap g-defer, status=active)');
+    expect(result).toContain('Stale gap active_moves — listed direction is no longer active (1)');
+    expect(result).toContain('**stale staffed gap** (gap g-stale) — stale active_moves: d-retired');
+    expect(result).toContain('Phantom direction refs — prose cites missing directions (2)');
+    expect(result).toContain('d-4890df9e cited in intent.current_focus');
+    expect(result).toContain('d-aaaabbbb cited in running_update');
+  });
+
   it('splits the research pipeline into held / recent / waiting / in-progress / idle', () => {
     const result = buildCycleStartReconciliationSection({
       capability_contradictions: [],
@@ -1080,23 +1101,32 @@ describe('buildSweepComparisonSection', () => {
     expect(result).toBe('');
   });
 
-  it('classifies a completed sweep, names the winning arm, and demands one follow-on', () => {
-    // All arms have a definitive verdict — this is the named acceptance test
+  it('names the winning arm by measured value and renders the numeric margin', () => {
     const result = buildSweepComparisonSection({
       'sweep-abc': [
         {
-          id: 'k-met',
-          title: 'Approach A: fast tokenizer',
-          arm_label: 'fast-tokenizer',
-          criterion_met: true,
-          summary: 'Achieved 98% accuracy at 2x throughput',
+          id: 'k-alpha',
+          title: 'Approach A: alpha',
+          arm_label: 'alpha',
+          criterion_met: false,
+          criterion: { metric: 'loss', operator: '<=', threshold: 0.85 },
+          per_arm_verdicts: {
+            alpha: { value: 0.94, met: false },
+            beta: { value: 0.81, met: true },
+          },
+          summary: 'Higher loss and slower convergence',
         },
         {
-          id: 'k-not',
-          title: 'Approach B: slow tokenizer',
-          arm_label: 'slow-tokenizer',
-          criterion_met: false,
-          summary: 'Only reached 85% accuracy',
+          id: 'k-beta',
+          title: 'Approach B: beta',
+          arm_label: 'beta',
+          criterion_met: true,
+          criterion: { metric: 'loss', operator: '<=', threshold: 0.85 },
+          per_arm_verdicts: {
+            alpha: { value: 0.94, met: false },
+            beta: { value: 0.81, met: true },
+          },
+          summary: 'Lower loss and better convergence',
         },
       ],
     });
@@ -1104,11 +1134,12 @@ describe('buildSweepComparisonSection', () => {
     expect(result).toContain('## Completed experiment sweeps — synthesis required');
     // Sweep id present
     expect(result).toContain('Sweep sweep-abc');
-    // Names the winning arm
-    expect(result).toContain('Winner: **fast-tokenizer**');
+    // Names the winning arm by the measured value, not the array order.
+    expect(result).toContain('Winner: **beta** (loss=0.81)');
+    expect(result).toContain('margin: +0.13 loss over alpha');
     // Both arms listed with verdicts
-    expect(result).toContain('**fast-tokenizer** [MET]');
-    expect(result).toContain('**slow-tokenizer** [NOT MET]');
+    expect(result).toContain('**alpha** [NOT MET]');
+    expect(result).toContain('**beta** [MET]');
     // Demands a follow-on move
     expect(result).toContain('exactly ONE follow-on move');
     // Refers to fetch for full analysis
@@ -1118,12 +1149,56 @@ describe('buildSweepComparisonSection', () => {
   it('shows "none (all NOT MET)" as winner when no arm met the criterion', () => {
     const result = buildSweepComparisonSection({
       'sweep-all-fail': [
-        { id: 'k-a', title: 'arm A', arm_label: 'a', criterion_met: false },
-        { id: 'k-b', title: 'arm B', arm_label: 'b', criterion_met: false },
+        {
+          id: 'k-a',
+          title: 'arm A',
+          arm_label: 'a',
+          criterion_met: false,
+          criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+          per_arm_verdicts: { a: { value: 0.82, met: false }, b: { value: 0.87, met: false } },
+        },
+        {
+          id: 'k-b',
+          title: 'arm B',
+          arm_label: 'b',
+          criterion_met: false,
+          criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+          per_arm_verdicts: { a: { value: 0.82, met: false }, b: { value: 0.87, met: false } },
+        },
       ],
     });
     expect(result).toContain('Winner: **none (all NOT MET)**');
     expect(result).toContain('Winning: 0/2 arm(s) MET, 2/2 NOT MET');
+  });
+
+  it('falls back to the current label-only winner rendering when measured values are unavailable', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-fallback': [
+        { id: 'k-fast', title: 'arm A', arm_label: 'fast-tokenizer', criterion_met: true, summary: 'Fast path' },
+        { id: 'k-slow', title: 'arm B', arm_label: 'slow-tokenizer', criterion_met: false, summary: 'Slow path' },
+      ],
+    });
+    expect(result).toContain('Winner: **fast-tokenizer**');
+    expect(result).not.toContain('(accuracy=');
+    expect(result).not.toContain('margin:');
+  });
+
+  it('omits the margin when there is only one numeric arm', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-single': [
+        {
+          id: 'k-solo',
+          title: 'Solo arm',
+          arm_label: 'solo',
+          criterion_met: true,
+          criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+          per_arm_verdicts: { solo: { value: 0.97, met: true } },
+          summary: 'Single-arm completion',
+        },
+      ],
+    });
+    expect(result).toContain('Winner: **solo** (accuracy=0.97)');
+    expect(result).not.toContain('margin:');
   });
 
   it('renders multiple completed sweeps independently', () => {

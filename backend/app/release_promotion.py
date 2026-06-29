@@ -351,6 +351,13 @@ async def _record_qualification_verdict(
                 "resolved_sha": ci_resolution.get("resolved_sha"),
                 "detail": ci_resolution.get("detail"),
             }
+        # Embed smoketest_enabled so the immutable verdict row carries per-attempt
+        # enablement state without requiring a dedicated DB column.
+        # None is preserved for absent keys (legacy base_records); False means the
+        # dimension was explicitly disabled for this run.
+        if "smoketest_enabled" in base_record:
+            sub_scores = dict(sub_scores)
+            sub_scores["smoketest_enabled"] = base_record["smoketest_enabled"]
 
         confidence = base_record.get("confidence")
         threshold = base_record.get("threshold")

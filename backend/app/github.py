@@ -642,6 +642,77 @@ async def get_file_text_at_ref(
         return None
 
 
+async def list_repo_tree_paths_at_ref(
+    token: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    *,
+    project_id: str | None = None,
+) -> list[dict] | None:
+    """List all file paths in the repo at ``ref`` via GitHub's recursive tree API.
+
+    Returns a list of dicts ``{"path": str, "size": int}`` for every blob in the
+    tree. Returns ``None`` on any error (network, 404, truncated tree — the caller
+    decides how to fail-safe). A single API call retrieves the full tree so this
+    is much more efficient than walking directories file-by-file.
+
+    GitHub truncates trees with > 100,000 entries; the caller receives ``None``
+    in that case so it can degrade gracefully rather than silently missing files.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    encoded_ref = quote(ref, safe="")
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/git/trees/"
+        f"{encoded_ref}?recursive=1"
+    )
+    try:
+        response = await _github_request(
+            "GET", url, headers, max_retries=2, project_id=project_id
+        )
+        if response.status_code != 200:
+            logger.warning(
+                "[GITHUB] tree listing for %s/%s@%s: HTTP %s",
+                owner,
+                repo,
+                ref,
+                response.status_code,
+            )
+            return None
+        payload = response.json()
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("truncated"):
+            logger.warning(
+                "[GITHUB] tree listing for %s/%s@%s was truncated (>100k entries)",
+                owner,
+                repo,
+                ref,
+            )
+            return None
+        tree = payload.get("tree")
+        if not isinstance(tree, list):
+            return None
+        return [
+            {"path": entry["path"], "size": entry.get("size", 0)}
+            for entry in tree
+            if isinstance(entry, dict) and entry.get("type") == "blob"
+        ]
+    except Exception as e:  # noqa: BLE001 — never crash the caller on a tree-list error
+        logger.warning(
+            "[GITHUB] tree listing for %s/%s@%s raised: %s",
+            owner,
+            repo,
+            ref,
+            e,
+        )
+        return None
+
+
 async def commit_file_changes(
     token: str,
     owner: str,
