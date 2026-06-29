@@ -171,7 +171,7 @@ export function CommandPalette({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center bg-black/70 px-3 py-4 backdrop-blur-sm sm:items-center"
+      className="fixed inset-0 z-[70] flex items-start justify-center bg-black/70 px-3 py-4 backdrop-blur-sm sm:items-center"
       onMouseDown={event => {
         if (event.target === event.currentTarget) {
           onClose();

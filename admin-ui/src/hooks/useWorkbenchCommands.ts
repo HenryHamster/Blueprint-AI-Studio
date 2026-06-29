@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import type { WorkbenchCommand } from '../components/CommandPalette';
 import type { ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
+import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import type { SectionId } from '../components/SettingsDropdown';
 import type { PrimaryTab } from './useUIState';
 import type { ViewMode } from './useViewPreferences';
@@ -19,6 +20,9 @@ interface UseWorkbenchCommandsOptions {
   problemModelRevision?: number | null;
   hasDesignDoc?: boolean;
   designRevision?: number | null;
+  strategicInteractionMode: StrategicInteractionMode;
+  savingStrategicWorkbench?: boolean;
+  switchStrategicInteractionMode: (mode: StrategicInteractionMode) => void;
   focusStrategicComposer: () => void;
   handleTabChange: (tab: PrimaryTab) => void;
   setCommandPaletteOpen: (open: boolean) => void;
@@ -50,6 +54,9 @@ export function useWorkbenchCommands({
   problemModelRevision,
   hasDesignDoc,
   designRevision,
+  strategicInteractionMode,
+  savingStrategicWorkbench = false,
+  switchStrategicInteractionMode,
   focusStrategicComposer,
   handleTabChange,
   setCommandPaletteOpen,
@@ -93,6 +100,46 @@ export function useWorkbenchCommands({
       handleTabChange('pipeline');
       closePalette();
     };
+    const setStrategicModeAndOpenChat = (mode: StrategicInteractionMode) => {
+      switchStrategicInteractionMode(mode);
+      closePalette();
+    };
+    const strategicModeCommands: Array<{
+      id: string;
+      mode: StrategicInteractionMode;
+      label: string;
+      detail: string;
+      keywords: string[];
+    }> = [
+      {
+        id: 'strategic.mode.chat',
+        mode: 'chat',
+        label: 'Switch Strategic to Chat',
+        detail: 'Conversation-first steering',
+        keywords: ['chat', 'conversation'],
+      },
+      {
+        id: 'strategic.mode.check_in',
+        mode: 'check_in',
+        label: 'Switch Strategic to Check-in',
+        detail: 'Ask for a concise status pass',
+        keywords: ['check in', 'check-in', 'status'],
+      },
+      {
+        id: 'strategic.mode.monitor',
+        mode: 'monitor',
+        label: 'Switch Strategic to Monitor',
+        detail: 'Watch work without waking Strategic',
+        keywords: ['monitor', 'passive'],
+      },
+      {
+        id: 'strategic.mode.continuous',
+        mode: 'continuous',
+        label: 'Switch Strategic to Workday',
+        detail: 'Keep Strategic ready for active work',
+        keywords: ['workday', 'continuous', 'active'],
+      },
+    ];
 
     return [
       {
@@ -105,6 +152,15 @@ export function useWorkbenchCommands({
         disabled: projectDisabled,
         run: focusStrategicComposer,
       },
+      ...strategicModeCommands.map((command): WorkbenchCommand => ({
+        id: command.id,
+        label: command.label,
+        section: 'Strategic',
+        detail: command.mode === strategicInteractionMode ? 'Current mode' : command.detail,
+        keywords: ['mode', 'session', 'interaction', 'strategic', ...command.keywords],
+        disabled: projectDisabled || savingStrategicWorkbench || command.mode === strategicInteractionMode,
+        run: command.mode === strategicInteractionMode ? closePalette : () => setStrategicModeAndOpenChat(command.mode),
+      })),
       {
         id: 'workbench.refresh',
         label: 'Refresh workbench',
@@ -322,6 +378,7 @@ export function useWorkbenchCommands({
     openProjectMembers,
     problemModelRevision,
     refreshWorkbench,
+    savingStrategicWorkbench,
     selectedProjectId,
     selectedProjectRepoLabel,
     setCommandPaletteOpen,
@@ -333,7 +390,9 @@ export function useWorkbenchCommands({
     setShowArchive,
     setShowKnowledgeBrowser,
     setShowResearchBrowser,
+    switchStrategicInteractionMode,
     setViewMode,
+    strategicInteractionMode,
     visibleActiveCount,
     visibleQueuedCount,
   ]);

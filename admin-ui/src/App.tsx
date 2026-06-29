@@ -45,7 +45,7 @@ import { ProjectMembers } from './components/ProjectMembers';
 import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
 import { StrategicContextRail } from './components/StrategicContextRail';
-import { StrategicSessionControl } from './components/StrategicSessionControl';
+import { StrategicSessionControl, type StrategicInteractionMode } from './components/StrategicSessionControl';
 import { TaskContextRail } from './components/TaskContextRail';
 import { CommandPalette } from './components/CommandPalette';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
@@ -62,12 +62,7 @@ import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbench
 import { updateStrategicWorkbenchState, type StrategicWorkbenchState } from './strategicStateApi';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
-import {
-  buildOptimisticStrategicWorkbench,
-  normalizeStrategicInteractionMode,
-  tabForWorkbenchSurface,
-  workbenchSurfaceForTab,
-} from './utils/strategicWorkbenchSession';
+import { buildOptimisticStrategicWorkbench, normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSurfaceForTab } from './utils/strategicWorkbenchSession';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -893,23 +888,22 @@ export default function App() {
     setStrategicComposerFocusSignal(value => value + 1);
     setCommandPaletteOpen(false);
   }, [handleTabChange]);
+  const currentStrategicInteractionMode = normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode);
+  const setStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
+    void persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' });
+  }, [persistStrategicWorkbench]);
+  const switchStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
+    setStrategicInteractionMode(mode);
+    strategicWorkbenchOperatorSurfaceTouchedRef.current = true;
+    strategicWorkbenchRestoreProjectRef.current = s.selectedProjectId;
+    s.setShowArchive(false);
+    s.setActiveTab('chat');
+  }, [s, setStrategicInteractionMode]);
 
-  const commandPaletteShortcutEnabled = Boolean(
-    !s.showNewTaskModal &&
-    !s.logTask &&
-    !s.showSettings &&
-    !s.showUserManagement &&
-    !s.showComposeDrawer &&
-    !s.showFleetDetail &&
-    !s.showDirections &&
-    !s.showMetrics &&
-    !showNewProjectModal &&
-    !setupProjectId &&
-    !s.confirmDialog &&
-    !showProjectManagement &&
-    !showProjectMembers &&
-    !commandPaletteOpen
-  );
+  const commandPaletteShortcutEnabled = !commandPaletteOpen && !s.showNewTaskModal && !s.logTask && !s.showSettings &&
+    !s.showUserManagement && !s.showComposeDrawer && !s.showFleetDetail && !s.showDirections &&
+    !s.showMetrics && !showNewProjectModal && !setupProjectId && !s.confirmDialog &&
+    !showProjectManagement && !showProjectMembers;
   const openCommandPalette = useCallback(() => {
     s.setShowResearchBrowser(false);
     s.setShowKnowledgeBrowser(false);
@@ -940,6 +934,9 @@ export default function App() {
     problemModelRevision: strategicReadModel.data?.problem_model.revision,
     hasDesignDoc: strategicReadModel.data?.design.has_design_doc,
     designRevision: strategicReadModel.data?.design.revision,
+    strategicInteractionMode: currentStrategicInteractionMode,
+    savingStrategicWorkbench,
+    switchStrategicInteractionMode,
     focusStrategicComposer,
     handleTabChange,
     setCommandPaletteOpen,
@@ -1406,7 +1403,7 @@ export default function App() {
               saving={savingStrategicWorkbench}
               localRunner={strategicReadModel.data?.runtime?.local_runner ?? null}
               runtimeWork={strategicReadModel.data?.runtime?.work ?? null}
-              onModeChange={(mode) => { void persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' }); }}
+              onModeChange={setStrategicInteractionMode}
               onOpenDevices={() => {
                 setRuntimeSection('devices');
                 handleTabChange('runtime');

@@ -32,6 +32,14 @@ function makeCommands(overrides: Partial<WorkbenchCommand>[] = []): WorkbenchCom
       disabled: true,
       run: vi.fn(),
     },
+    {
+      id: 'strategic-mode',
+      label: 'Switch Strategic to Workday',
+      section: 'Strategic',
+      detail: 'Keep Strategic ready for active work',
+      keywords: ['mode', 'session', 'continuous'],
+      run: vi.fn(),
+    },
   ];
 
   return base.map((command, index) => ({ ...command, ...overrides[index] }));
@@ -63,6 +71,11 @@ describe('CommandPalette', () => {
     await user.type(input, 'stop');
     expect(screen.getByRole('button', { name: /Stop all workers/i })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Open task drawer/i })).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: 'Clear command search' }));
+    await user.type(input, 'mode');
+    expect(screen.getByRole('button', { name: /Switch Strategic to Workday/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Sync fleet/i })).toBeNull();
   });
 
   test('renders command shortcuts when provided', () => {
@@ -76,6 +89,18 @@ describe('CommandPalette', () => {
 
     expect(screen.getByText('O')).toBeInTheDocument();
     expect(screen.getByText('S')).toBeInTheDocument();
+  });
+
+  test('renders above workbench drawers', () => {
+    const { container } = render(
+      <CommandPalette
+        open
+        commands={makeCommands()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(container.firstElementChild).toHaveClass('z-[70]');
   });
 
   test('runs the active command with keyboard navigation and Enter', async () => {
@@ -101,6 +126,7 @@ describe('CommandPalette', () => {
       { disabled: true },
       { disabled: true },
       { disabled: true },
+      { disabled: true },
     ]);
     render(
       <CommandPalette
@@ -116,6 +142,7 @@ describe('CommandPalette', () => {
     expect(commands[0].run).not.toHaveBeenCalled();
     expect(commands[1].run).not.toHaveBeenCalled();
     expect(commands[2].run).not.toHaveBeenCalled();
+    expect(commands[3].run).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: /Stop all workers/i })).toBeDisabled();
   });
 

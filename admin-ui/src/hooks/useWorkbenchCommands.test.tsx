@@ -4,6 +4,7 @@ import { act } from 'react';
 import { useEffect } from 'react';
 import { useWorkbenchCommands, type PipelineSection } from './useWorkbenchCommands';
 import type { ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
+import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import type { ViewMode } from './useViewPreferences';
 
 type Captured = ReturnType<typeof useWorkbenchCommands>;
@@ -22,6 +23,9 @@ function Harness(overrides: Partial<Parameters<typeof useWorkbenchCommands>[0]> 
     problemModelRevision: 7,
     hasDesignDoc: true,
     designRevision: 8,
+    strategicInteractionMode: 'chat',
+    savingStrategicWorkbench: false,
+    switchStrategicInteractionMode: vi.fn(),
     focusStrategicComposer: vi.fn(),
     handleTabChange: vi.fn(),
     setCommandPaletteOpen: vi.fn(),
@@ -89,6 +93,36 @@ describe('useWorkbenchCommands', () => {
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
+  test('routes Strategic mode commands through the shared workbench session setter', () => {
+    const switchStrategicInteractionMode = vi.fn<(mode: StrategicInteractionMode) => void>();
+    const handleTabChange = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    mount({
+      strategicInteractionMode: 'continuous',
+      switchStrategicInteractionMode,
+      handleTabChange,
+      setCommandPaletteOpen,
+    });
+
+    expect(captured.filter(command => command.id.startsWith('strategic.mode.')).map(command => command.id)).toEqual([
+      'strategic.mode.chat',
+      'strategic.mode.check_in',
+      'strategic.mode.monitor',
+      'strategic.mode.continuous',
+    ]);
+    const currentModeCommand = captured.find(command => command.id === 'strategic.mode.continuous');
+    expect(currentModeCommand?.detail).toBe('Current mode');
+    expect(currentModeCommand?.disabled).toBe(true);
+    currentModeCommand?.run();
+
+    captured.find(command => command.id === 'strategic.mode.monitor')?.run();
+
+    expect(switchStrategicInteractionMode).toHaveBeenCalledWith('monitor');
+    expect(switchStrategicInteractionMode).toHaveBeenCalledTimes(1);
+    expect(handleTabChange).not.toHaveBeenCalledWith('chat');
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
   test('routes pipeline and runtime commands without introducing backend actions', () => {
     const handleTabChange = vi.fn();
     const setPipelineSection = vi.fn<(section: PipelineSection) => void>();
@@ -114,8 +148,17 @@ describe('useWorkbenchCommands', () => {
     mount({ selectedProjectId: null, selectedProjectRepoLabel: null });
 
     expect(captured.find(command => command.id === 'strategic.focus')?.disabled).toBe(true);
+    expect(captured.filter(command => command.id.startsWith('strategic.mode.')).every(command => command.disabled)).toBe(true);
     expect(captured.find(command => command.id === 'pipeline.flow')?.disabled).toBeFalsy();
     expect(captured.find(command => command.id === 'runtime.health')?.disabled).toBeFalsy();
+  });
+
+  test('disables Strategic mode commands while saving without blocking navigation commands', () => {
+    mount({ savingStrategicWorkbench: true });
+
+    expect(captured.filter(command => command.id.startsWith('strategic.mode.')).every(command => command.disabled)).toBe(true);
+    expect(captured.find(command => command.id === 'strategic.focus')?.disabled).toBeFalsy();
+    expect(captured.find(command => command.id === 'pipeline.flow')?.disabled).toBeFalsy();
   });
 
   test('opens the supplied activity surface instead of a stale global flag', () => {

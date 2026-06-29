@@ -5,7 +5,13 @@ import { useCommandPaletteShortcut } from './useCommandPaletteShortcut';
 
 function Harness({ onOpen, enabled = true }: { onOpen: () => void; enabled?: boolean }) {
   useCommandPaletteShortcut(onOpen, enabled);
-  return <input aria-label="composer" />;
+  return (
+    <>
+      <input aria-label="composer" />
+      <textarea aria-label="notes" />
+      <div aria-label="rich composer" contentEditable />
+    </>
+  );
 }
 
 describe('useCommandPaletteShortcut', () => {
@@ -49,19 +55,26 @@ describe('useCommandPaletteShortcut', () => {
     expect(event.defaultPrevented).toBe(true);
   });
 
-  test('opens on Meta+K even while an input is focused', () => {
+  test('ignores command shortcuts from editable fields', () => {
     const onOpen = mount();
-    host?.querySelector('input')?.focus();
-    const event = new KeyboardEvent('keydown', {
-      key: 'K',
-      metaKey: true,
-      bubbles: true,
-      cancelable: true,
-    });
+    const editableTargets = [
+      host?.querySelector('input'),
+      host?.querySelector('textarea'),
+      host?.querySelector('[contenteditable]'),
+    ];
 
-    document.dispatchEvent(event);
+    for (const target of editableTargets) {
+      const event = new KeyboardEvent('keydown', {
+        key: 'K',
+        metaKey: true,
+        bubbles: true,
+        cancelable: true,
+      });
+      target?.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(false);
+    }
 
-    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(onOpen).not.toHaveBeenCalled();
   });
 
   test('does not capture Ctrl+K while disabled', () => {
@@ -77,6 +90,21 @@ describe('useCommandPaletteShortcut', () => {
 
     expect(onOpen).not.toHaveBeenCalled();
     expect(event.defaultPrevented).toBe(false);
+  });
+
+  test('ignores Ctrl+K that another handler already consumed', () => {
+    const onOpen = mount();
+    const event = new KeyboardEvent('keydown', {
+      key: 'k',
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    event.preventDefault();
+
+    document.dispatchEvent(event);
+
+    expect(onOpen).not.toHaveBeenCalled();
   });
 
   test('ignores unrelated keys', () => {
