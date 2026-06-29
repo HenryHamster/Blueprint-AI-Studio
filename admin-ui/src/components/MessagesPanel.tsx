@@ -187,6 +187,8 @@ export interface MessagesPanelProps {
   strategicState?: StrategicStateResponse | null;
   /** Refresh the Strategic read model after a chat action changes Strategic state. */
   onStrategicStateRefresh?: () => void | Promise<void>;
+  /** Record a successful operator interaction with Strategic workbench state. */
+  onStrategicInteraction?: () => void | Promise<void>;
   /** Legacy refresh callback kept for callers that still wire the old prop name. */
   onStrategicRefresh?: () => void;
 }
@@ -262,7 +264,7 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, contextPackage, strategicState, onStrategicStateRefresh, onStrategicRefresh }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, contextPackage, strategicState, onStrategicStateRefresh, onStrategicInteraction, onStrategicRefresh }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -274,6 +276,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const strategicAttention = currentStrategicState?.attention ?? null;
   const strategicTaskCounts = currentStrategicState?.tasks.counts ?? null;
   const refreshStrategicState = onStrategicStateRefresh ?? onStrategicRefresh;
+  const recordStrategicInteraction = useCallback(() => {
+    if (!onStrategicInteraction) return;
+    Promise.resolve(onStrategicInteraction()).catch(() => {});
+  }, [onStrategicInteraction]);
   const selectedProjectIdRef = useRef(selectedProjectId);
   selectedProjectIdRef.current = selectedProjectId;
   const usesStrategicReadModelRef = useRef(usesStrategicReadModel);
@@ -1028,6 +1034,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         addToast('Question answered', 'success');
         void refreshStrategicState?.();
+        recordStrategicInteraction();
         await fetchMessages();
         return;
       }
@@ -1095,6 +1102,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       }
       await fetchMessages();
       if (!didRefreshStrategicState) void refreshStrategicState?.();
+      recordStrategicInteraction();
     } catch {
       addToast('Failed to send message', 'error');
     } finally {

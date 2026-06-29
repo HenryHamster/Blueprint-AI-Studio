@@ -45,6 +45,7 @@ import { ProjectMembers } from './components/ProjectMembers';
 import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
 import { StrategicContextRail } from './components/StrategicContextRail';
+import { StrategicSessionControl } from './components/StrategicSessionControl';
 import { TaskContextRail } from './components/TaskContextRail';
 import { CommandPalette } from './components/CommandPalette';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
@@ -58,8 +59,15 @@ import { WorkbenchFrame, WorkbenchMetric, WorkbenchPanel, WorkbenchSplit, Workbe
 import { useStrategicReadModel } from './hooks/useStrategicReadModel';
 import { useCommandPaletteShortcut } from './hooks/useCommandPaletteShortcut';
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
+import { updateStrategicWorkbenchState, type StrategicWorkbenchState } from './strategicStateApi';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
+import {
+  buildOptimisticStrategicWorkbench,
+  normalizeStrategicInteractionMode,
+  tabForWorkbenchSurface,
+  workbenchSurfaceForTab,
+} from './utils/strategicWorkbenchSession';
 
 const COLUMNS: KanbanColumn[] = [
   { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
@@ -468,6 +476,64 @@ export default function App() {
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
   const strategicReadModel = useStrategicReadModel(s.selectedProjectId);
+  const [optimisticStrategicWorkbench, setOptimisticStrategicWorkbench] = useState<StrategicWorkbenchState | null>(null);
+  const [savingStrategicWorkbench, setSavingStrategicWorkbench] = useState(false);
+  const strategicWorkbenchStateRef = useRef<StrategicWorkbenchState | null>(null);
+  const strategicWorkbenchSaveSeqRef = useRef(0);
+  const strategicWorkbenchSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const strategicWorkbenchOperatorSurfaceTouchedRef = useRef(false);
+  const strategicWorkbenchRestoreProjectRef = useRef<string | null>(null);
+  useEffect(() => {
+    strategicWorkbenchStateRef.current = null;
+    setOptimisticStrategicWorkbench(null);
+    setSavingStrategicWorkbench(false);
+    strategicWorkbenchSaveSeqRef.current += 1;
+    strategicWorkbenchSaveQueueRef.current = Promise.resolve();
+    strategicWorkbenchOperatorSurfaceTouchedRef.current = false;
+    strategicWorkbenchRestoreProjectRef.current = null;
+  }, [selectedProjectId]);
+  const strategicReadModelWorkbench = strategicReadModel.data?.project_id === selectedProjectId
+    ? strategicReadModel.data?.workbench ?? null
+    : null;
+  const strategicWorkbenchState = optimisticStrategicWorkbench ?? strategicReadModelWorkbench;
+  useEffect(() => {
+    strategicWorkbenchStateRef.current = strategicWorkbenchState;
+  }, [strategicWorkbenchState]);
+  const persistStrategicWorkbench = useCallback((patch: Partial<StrategicWorkbenchState>) => {
+    const projectId = s.selectedProjectId;
+    if (!projectId) return;
+    const saveSeq = strategicWorkbenchSaveSeqRef.current + 1;
+    strategicWorkbenchSaveSeqRef.current = saveSeq;
+    const base = strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench;
+    const optimistic = buildOptimisticStrategicWorkbench(base, patch);
+    strategicWorkbenchStateRef.current = optimistic;
+    setOptimisticStrategicWorkbench(optimistic);
+    setSavingStrategicWorkbench(true);
+
+    const save = strategicWorkbenchSaveQueueRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        try {
+          const saved = await updateStrategicWorkbenchState(projectId, patch);
+          if (strategicWorkbenchSaveSeqRef.current !== saveSeq) return;
+          strategicWorkbenchStateRef.current = saved;
+          setOptimisticStrategicWorkbench(saved);
+          void strategicReadModel.refresh();
+        } catch {
+          if (strategicWorkbenchSaveSeqRef.current === saveSeq) {
+            strategicWorkbenchStateRef.current = base;
+            setOptimisticStrategicWorkbench(base);
+            s.addToast('Could not save Strategic session', 'error');
+          }
+        } finally {
+          if (strategicWorkbenchSaveSeqRef.current === saveSeq) setSavingStrategicWorkbench(false);
+        }
+      });
+    strategicWorkbenchSaveQueueRef.current = save.then(
+      () => undefined,
+      () => undefined,
+    );
+  }, [s, strategicReadModel, strategicReadModelWorkbench]);
   const pipelineAttentionCount = useMemo(() => {
     const counts = strategicReadModel.data?.attention?.counts;
     if (!counts) return s.needsAttentionCount;
@@ -594,6 +660,17 @@ export default function App() {
   const [runtimeSection, setRuntimeSection] = useState<RuntimeSection>('health');
   const [runtimeConfigSection, setRuntimeConfigSection] = useState<RuntimeSettingsSection>('orchestrator');
   const { setActiveTab: setPrimaryTab, setViewMode: setTaskViewMode } = s;
+  useEffect(() => {
+    if (!selectedProjectId || !strategicWorkbenchState?.active_surface) return;
+    if (strategicWorkbenchOperatorSurfaceTouchedRef.current) return;
+    if (strategicWorkbenchRestoreProjectRef.current === selectedProjectId) return;
+    const tab = tabForWorkbenchSurface(strategicWorkbenchState.active_surface);
+    if (!tab) return;
+    strategicWorkbenchRestoreProjectRef.current = selectedProjectId;
+    if (tab !== 'chat') s.setShowMessages(false);
+    if (tab !== 'pipeline') s.setShowArchive(false);
+    if (tab !== activeTab) setPrimaryTab(tab);
+  }, [activeTab, s, selectedProjectId, setPrimaryTab, strategicWorkbenchState?.active_surface]);
   useEffect(() => {
     if (activeTab !== 'pipeline') return;
     if (s.showArchive) {
@@ -800,12 +877,16 @@ export default function App() {
 
   // activeTab drives the four operator modes: Strategic, Pipeline, Project, Runtime.
   const handleTabChange = useCallback((tab: PrimaryTab) => {
+    strategicWorkbenchOperatorSurfaceTouchedRef.current = true;
+    strategicWorkbenchRestoreProjectRef.current = s.selectedProjectId;
     if (tab !== 'chat') s.setShowMessages(false);
     if (tab !== 'pipeline') {
       s.setShowArchive(false);
     }
+    const surface = workbenchSurfaceForTab(tab);
+    if (surface) void persistStrategicWorkbench({ active_surface: surface });
     s.setActiveTab(tab);
-  }, [s]);
+  }, [s, persistStrategicWorkbench]);
 
   const focusStrategicComposer = useCallback(() => {
     handleTabChange('chat');
@@ -1317,7 +1398,27 @@ export default function App() {
           onClose={() => s.setShowUserManagement(false)}
         />
       ) : activeTab === 'chat' ? (
-        <WorkbenchSurface title="Strategic" flush>
+        <WorkbenchSurface
+          title="Strategic"
+          actions={(
+            <StrategicSessionControl
+              mode={normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode)}
+              saving={savingStrategicWorkbench}
+              localRunner={strategicReadModel.data?.runtime?.local_runner ?? null}
+              runtimeWork={strategicReadModel.data?.runtime?.work ?? null}
+              onModeChange={(mode) => { void persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' }); }}
+              onOpenDevices={() => {
+                setRuntimeSection('devices');
+                handleTabChange('runtime');
+              }}
+              onOpenCompute={() => {
+                setRuntimeSection('compute');
+                handleTabChange('runtime');
+              }}
+            />
+          )}
+          flush
+        >
           <WorkbenchSplit
             main={(
               <MessagesPanel
@@ -1337,6 +1438,7 @@ export default function App() {
                 focusComposerSignal={strategicComposerFocusSignal}
                 strategicState={strategicReadModel.data ?? null}
                 onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
+                onStrategicInteraction={() => { void persistStrategicWorkbench({ active_surface: 'strategic' }); }}
               />
             )}
             rail={(

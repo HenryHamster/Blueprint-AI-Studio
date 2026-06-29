@@ -27,6 +27,7 @@ _ALLOWED_INTERACTION_MODES = frozenset(
 )
 _ALLOWED_ACTIVE_SURFACES = frozenset({"strategic", "pipeline", "project", "runtime"})
 _MAX_SELECTED_REFS = 12
+_STRATEGIC_ARMING_INTERACTION_MODES = frozenset({"check_in", "continuous"})
 
 
 def workbench_state_size_bytes(raw: Any) -> int:
@@ -131,6 +132,38 @@ def workbench_state_from_prefs(prefs: dict[str, Any] | None) -> dict[str, Any]:
     return sanitize_workbench_state(raw, touch=False)
 
 
+def workbench_mode_should_arm_strategic_refresh(
+    previous: dict[str, Any] | None,
+    current: dict[str, Any],
+) -> bool:
+    """True when the operator intentionally enters an active Strategic mode."""
+
+    current_mode = current.get("interaction_mode")
+    if current_mode not in _STRATEGIC_ARMING_INTERACTION_MODES:
+        return False
+    previous_mode = (
+        previous.get("interaction_mode") if isinstance(previous, dict) else None
+    )
+    return previous_mode != current_mode
+
+
+def workbench_mode_refresh_excerpt(state: dict[str, Any]) -> str:
+    mode = state.get("interaction_mode")
+    mode_label = "workday" if mode == "continuous" else "check-in"
+    active_surface = state.get("active_surface") or "strategic"
+    refs = state.get("selected_refs") if isinstance(state.get("selected_refs"), list) else []
+    ref_labels = [
+        ref.get("label") or f"{ref.get('kind')}:{ref.get('id')}"
+        for ref in refs[:3]
+        if isinstance(ref, dict) and (ref.get("label") or ref.get("id"))
+    ]
+    detail = f"Operator switched Strategic workbench to {mode_label} mode"
+    detail += f" from {active_surface}."
+    if ref_labels:
+        detail += " Context: " + "; ".join(str(label)[:120] for label in ref_labels)
+    return detail[:600]
+
+
 async def get_strategic_workbench_state(
     session: AsyncSession,
     user_id: str,
@@ -146,17 +179,34 @@ async def upsert_strategic_workbench_state(
     project_id: uuid.UUID,
     raw_state: dict[str, Any],
 ) -> dict[str, Any]:
+    _previous, state = await upsert_strategic_workbench_state_with_previous(
+        session,
+        user_id,
+        project_id,
+        raw_state,
+    )
+    return state
+
+
+async def upsert_strategic_workbench_state_with_previous(
+    session: AsyncSession,
+    user_id: str,
+    project_id: uuid.UUID,
+    raw_state: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
     state_holder: dict[str, dict[str, Any]] = {}
 
     def merge(existing_prefs: dict[str, Any]) -> dict[str, Any]:
+        previous = workbench_state_from_prefs(existing_prefs)
         state = sanitize_workbench_state(
             raw_state,
-            existing=workbench_state_from_prefs(existing_prefs),
+            existing=previous,
         )
+        state_holder["previous"] = previous
         state_holder["state"] = state
         prefs = dict(existing_prefs)
         prefs[WORKBENCH_STATE_KEY] = state
         return prefs
 
     await mutate_messages_noise_prefs(session, user_id, project_id, merge)
-    return state_holder["state"]
+    return state_holder["previous"], state_holder["state"]

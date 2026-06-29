@@ -41,8 +41,17 @@ from app.workbench_state import (
     WORKBENCH_STATE_KEY,
     WORKBENCH_STATE_MAX_BYTES,
     get_strategic_workbench_state,
-    upsert_strategic_workbench_state,
+    upsert_strategic_workbench_state_with_previous,
+    workbench_mode_refresh_excerpt,
+    workbench_mode_should_arm_strategic_refresh,
     workbench_state_size_bytes,
+)
+from app.strategic_trigger import (
+    ARMING_NOT_ARMED,
+    ARMING_PASSIVE_NOTE,
+    ARMING_STEERING,
+    ORIGIN_OPERATOR,
+    request_strategic_refresh,
 )
 from app import notification_dispatch as _nd
 from app.playbook_storage import (
@@ -650,7 +659,7 @@ async def create_message(
     # so the two paths cannot diverge again. Best-effort: the helper does not
     # commit (we own the txn) and swallows its own errors, so message creation
     # never fails on it; the second commit persists the marker independently.
-    from app.strategic_trigger import ARMING_STEERING, maybe_arm_operator_refresh
+    from app.strategic_trigger import maybe_arm_operator_refresh
 
     # The shared gate returns the *truthful* arming outcome — the actual wake
     # decision for this message (steering / passive note / routine event), or
@@ -942,14 +951,28 @@ async def put_messages_workbench_state(
             detail="Workbench state too large (max 50KB)",
         )
 
-    state = await upsert_strategic_workbench_state(
+    previous_state, state = await upsert_strategic_workbench_state_with_previous(
         session,
         current_user["user_id"],
         pid,
         payload.workbench,
     )
+    arming = ARMING_PASSIVE_NOTE
+    should_arm = workbench_mode_should_arm_strategic_refresh(previous_state, state)
     await session.commit()
-    return {"status": "ok", "workbench": state}
+    if should_arm:
+        armed = await request_strategic_refresh(
+            session,
+            pid,
+            "workbench_interaction_mode",
+            origin=ORIGIN_OPERATOR,
+            steering_excerpt=workbench_mode_refresh_excerpt(state),
+            skip_locked=False,
+        )
+        arming = ARMING_STEERING if armed else ARMING_NOT_ARMED
+        if armed:
+            await session.commit()
+    return {"status": "ok", "workbench": state, "arming": arming}
 
 
 # ── Messages Saved-Views Endpoints ──────────────────────────────────────────

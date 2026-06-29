@@ -5364,6 +5364,7 @@ class TestMessagesWorkbenchState:
             json={"project_id": str(project.id), "workbench": payload},
         )
         assert put_resp.status_code == 200
+        assert put_resp.json()["arming"] == "steering"
         stored = put_resp.json()["workbench"]
         assert stored["interaction_mode"] == "continuous"
         assert stored["active_surface"] == "pipeline"
@@ -5379,6 +5380,169 @@ class TestMessagesWorkbenchState:
         )
         assert get_resp.status_code == 200
         assert get_resp.json()["workbench"] == stored
+
+    @pytest.mark.asyncio
+    async def test_entering_active_mode_arms_strategic_refresh(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        resp = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "check_in",
+                    "active_surface": "strategic",
+                    "selected_refs": [
+                        {
+                            "kind": "direction",
+                            "id": "d-workbench",
+                            "label": "Operator workbench",
+                        }
+                    ],
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["arming"] == "steering"
+        await db_session.refresh(project)
+        marker = (project.vision or {}).get("_strategic_refresh")
+        assert marker["origin"] == "operator"
+        assert marker["reason"] == "workbench_interaction_mode"
+        assert marker["operator_count"] == 1
+        assert "check-in mode" in marker["excerpt"]
+        assert "Operator workbench" in marker["excerpt"]
+
+    @pytest.mark.asyncio
+    async def test_repeating_same_active_mode_does_not_rearm(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        first = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "continuous",
+                    "active_surface": "strategic",
+                },
+            },
+        )
+        second = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "continuous",
+                    "active_surface": "pipeline",
+                },
+            },
+        )
+
+        assert first.status_code == 200
+        assert first.json()["arming"] == "steering"
+        assert second.status_code == 200
+        assert second.json()["arming"] == "passive_note"
+        await db_session.refresh(project)
+        marker = (project.vision or {}).get("_strategic_refresh")
+        assert marker["reason"] == "workbench_interaction_mode"
+        assert marker["operator_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_surface_only_update_after_active_mode_does_not_rearm(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        first = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "continuous",
+                    "active_surface": "strategic",
+                },
+            },
+        )
+        second = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "active_surface": "runtime",
+                },
+            },
+        )
+
+        assert first.status_code == 200
+        assert first.json()["arming"] == "steering"
+        assert second.status_code == 200
+        assert second.json()["arming"] == "passive_note"
+        stored = second.json()["workbench"]
+        assert stored["interaction_mode"] == "continuous"
+        assert stored["active_surface"] == "runtime"
+        await db_session.refresh(project)
+        marker = (project.vision or {}).get("_strategic_refresh")
+        assert marker["reason"] == "workbench_interaction_mode"
+        assert marker["operator_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_arm_rollback_does_not_discard_workbench_state(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+
+        async def _rollback_then_fail(session, *args, **kwargs):
+            await session.rollback()
+            return False
+
+        with patch(
+            "app.routers.admin_notifications.request_strategic_refresh",
+            new=AsyncMock(side_effect=_rollback_then_fail),
+        ):
+            resp = await client.put(
+                "/api/admin/messages/workbench-state",
+                json={
+                    "project_id": str(project.id),
+                    "workbench": {
+                        "interaction_mode": "check_in",
+                        "active_surface": "strategic",
+                    },
+                },
+            )
+
+        assert resp.status_code == 200
+        assert resp.json()["arming"] == "not_armed"
+        assert resp.json()["workbench"]["interaction_mode"] == "check_in"
+
+        get_resp = await client.get(
+            f"/api/admin/messages/workbench-state?project_id={project.id}"
+        )
+        assert get_resp.status_code == 200
+        assert get_resp.json()["workbench"]["interaction_mode"] == "check_in"
+        await db_session.refresh(project)
+        assert not (project.vision or {}).get("_strategic_refresh")
+
+    @pytest.mark.asyncio
+    async def test_monitor_mode_does_not_arm_strategic_refresh(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        resp = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "monitor",
+                    "active_surface": "pipeline",
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["arming"] == "passive_note"
+        await db_session.refresh(project)
+        assert not (project.vision or {}).get("_strategic_refresh")
 
     @pytest.mark.asyncio
     async def test_workbench_state_preserves_noise_pref_reserved_data(

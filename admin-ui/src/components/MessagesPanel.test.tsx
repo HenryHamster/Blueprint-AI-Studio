@@ -3900,9 +3900,11 @@ describe('MessagesPanel send arming receipt', () => {
     _setupQuestionAnswerMock(question);
     const addToast = vi.fn();
     const onStrategicStateRefresh = vi.fn();
+    const onStrategicInteraction = vi.fn();
     const el = await renderPanel(addToast, false, {
       strategicState: makeStrategicState(),
       onStrategicStateRefresh,
+      onStrategicInteraction,
     });
 
     const replyBtn = [...el.querySelectorAll('button')].find(button => button.title === 'Reply');
@@ -3912,6 +3914,7 @@ describe('MessagesPanel send arming receipt', () => {
 
     await waitFor(() => expect(addToast).toHaveBeenCalledWith('Question answered', 'success'));
     expect(onStrategicStateRefresh).toHaveBeenCalledTimes(1);
+    expect(onStrategicInteraction).toHaveBeenCalledTimes(1);
   });
 
   test('passive_note send shows a success "won’t wake" toast', async () => {
@@ -3926,6 +3929,18 @@ describe('MessagesPanel send arming receipt', () => {
     expect(text).toContain('won’t wake the strategist');
     expect(severity).toBe('success');
     expect(hintText(el)).toBe(armingHintCopy('passive_note'));
+  });
+
+  test('successful send records the Strategic interaction', async () => {
+    _setupSendMock({ arming: 'passive_note' });
+    const addToast = vi.fn();
+    const onStrategicInteraction = vi.fn();
+    const el = await renderPanel(addToast, false, { onStrategicInteraction });
+
+    await typeAndSend(el, 'record this in the current session');
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    expect(onStrategicInteraction).toHaveBeenCalledTimes(1);
   });
 
   test('routine_event send shows a success "won’t wake" routine toast', async () => {
