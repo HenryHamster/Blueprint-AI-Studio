@@ -10,22 +10,21 @@ function toneClass(tone: StrategicContextDescriptorModel['contextTone']): string
 export function StrategicContextDescriptor({
   model,
   variant = 'composer',
+  onOpen,
 }: {
   model: StrategicContextDescriptorModel;
   variant?: 'composer' | 'receipt';
+  onOpen?: () => void;
 }) {
   const visibleRefs = model.refs.slice(0, 2);
   const hiddenRefCount = Math.max(0, model.refCount - visibleRefs.length);
   const compact = variant === 'receipt';
-  return (
-    <div
-      data-testid={compact ? 'strategic-context-receipt' : 'strategic-context-descriptor'}
-      title={model.capturedAt ? `Captured ${model.capturedAt}` : undefined}
-      className={compact
-        ? 'flex max-w-full flex-wrap items-center gap-x-1.5 gap-y-1 text-ui-md leading-snug text-neutral-500'
-        : 'mx-auto mb-2 flex w-full max-w-4xl flex-wrap items-center gap-x-2 gap-y-1 text-ui-md leading-snug text-neutral-500'
-      }
-    >
+  const title = onOpen ? 'Open Strategic context commands' : model.capturedAt ? `Captured ${model.capturedAt}` : undefined;
+  const className = compact
+    ? 'flex max-w-full flex-wrap items-center gap-x-1.5 gap-y-1 text-ui-md leading-snug text-neutral-500'
+    : 'mx-auto mb-2 flex w-full max-w-4xl flex-wrap items-center gap-x-2 gap-y-1 text-ui-md leading-snug text-neutral-500';
+  const content = (
+    <>
       <span className="inline-flex min-w-0 items-center gap-1.5 font-medium text-neutral-400">
         <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${toneClass(model.contextTone)}`} />
         {compact ? 'Sent with context' : 'Context'}
@@ -61,6 +60,28 @@ export function StrategicContextDescriptor({
       {hiddenRefCount > 0 && (
         <span className="text-neutral-600">+{hiddenRefCount}</span>
       )}
+    </>
+  );
+  if (onOpen) {
+    return (
+      <button
+        type="button"
+        data-testid="strategic-context-descriptor"
+        title={title}
+        onClick={onOpen}
+        className={`${className} min-h-11 rounded-md px-1 text-left transition-colors hover:text-neutral-300 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-700`}
+      >
+        {content}
+      </button>
+    );
+  }
+  return (
+    <div
+      data-testid={compact ? 'strategic-context-receipt' : 'strategic-context-descriptor'}
+      title={title}
+      className={className}
+    >
+      {content}
     </div>
   );
 }

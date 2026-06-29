@@ -30,6 +30,7 @@ async function renderComposer(
         onSubmit={() => {}}
         chrome={chrome}
         strategicContext={strategicContext}
+        onOpenStrategicContext={() => {}}
       />,
     );
   });

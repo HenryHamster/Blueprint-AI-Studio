@@ -31,7 +31,8 @@ import type { PrimaryTab } from './hooks/useUIState';
 import { defaultComputeExperimentForm } from './hooks/useTaskModal';
 import { BulkActionBar } from './components/BulkActionBar';
 import { KanbanBoard } from './components/KanbanBoard';
-import type { KanbanColumn, SortBy } from './components/KanbanBoard';
+import type { SortBy } from './components/KanbanBoard';
+import { ACTIVE_PIPELINE_STATUSES, CANCELLABLE_STATUSES, COLUMNS, SORT_KEY, TERMINAL_STATUSES } from './appWorkbenchConstants';
 import { downloadTaskCsv, orderTasksForKanbanExport } from './utils/taskCsv';
 import { Pagination } from './components/Pagination';
 import ArchiveView from './components/ArchiveView';
@@ -42,7 +43,7 @@ import { MessagesPanel } from './components/MessagesPanel';
 import { StrategicContextRail } from './components/StrategicContextRail';
 import { StrategicSessionControl, type StrategicInteractionMode } from './components/StrategicSessionControl';
 import { TaskContextRail } from './components/TaskContextRail';
-import { CommandPalette } from './components/CommandPalette';
+import { CommandPaletteHost } from './components/CommandPaletteHost';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
 import { BoardSavedViewsBar, type BoardFilterSnapshot } from './components/BoardSavedViewsBar';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
@@ -54,27 +55,14 @@ import { WorkbenchFrame, WorkbenchMetric, WorkbenchPanel, WorkbenchSplit, Workbe
 import { useStrategicReadModel } from './hooks/useStrategicReadModel';
 import { useOperatorKeyboardShortcuts } from './hooks/useOperatorKeyboardShortcuts';
 import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
+import { useCommandPaletteState } from './hooks/useCommandPaletteState';
+import { useStrategicContextNavigation } from './hooks/useStrategicContextNavigation';
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
 import { updateStrategicWorkbenchState, type StrategicWorkbenchState } from './strategicStateApi';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 import { buildOptimisticStrategicWorkbench, normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSurfaceForTab } from './utils/strategicWorkbenchSession';
 
-const COLUMNS: KanbanColumn[] = [
-  { id: 'QUEUED', label: 'Queued', includes: ['QUEUED', 'PROVISIONING'] },
-  { id: 'IN_PROGRESS', label: 'In Progress', includes: ['IN_PROGRESS'] },
-  { id: 'EVALUATING', label: 'Evaluating', includes: ['EVALUATING'] },
-  { id: 'BLOCKED', label: 'Blocked', includes: ['BLOCKED'] },
-  { id: 'PARKED', label: 'Parked', includes: ['PARKED'] },
-  { id: 'FAILED', label: 'Failed', includes: ['FAILED'] },
-  { id: 'CANCELLED', label: 'Cancelled', includes: ['CANCELLED'] },
-  { id: 'COMPLETED', label: 'Completed', includes: ['COMPLETED'] },
-];
-
-const SORT_KEY = 'blueprint-admin:kanban-sort';
-const CANCELLABLE_STATUSES = new Set(['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING', 'BLOCKED', 'PARKED']);
-const TERMINAL_STATUSES = new Set(['COMPLETED', 'CANCELLED', 'FAILED']);
-const ACTIVE_PIPELINE_STATUSES = new Set(['IN_PROGRESS', 'PROVISIONING', 'EVALUATING']);
 type StrategicSessionRefs = StrategicWorkbenchState['selected_refs'];
 
 export default function App() {
@@ -527,7 +515,7 @@ export default function App() {
       (counts.parked_tasks ?? 0)
     );
   }, [s.needsAttentionCount, strategicReadModel.data?.attention?.counts]);
-  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const { open: commandPaletteOpen, query: commandPaletteQuery, setOpen: setCommandPaletteOpen, setQuery: setCommandPaletteQuery, openWithQuery: openCommandPaletteWithQuery } = useCommandPaletteState();
   const [strategicComposerFocusSignal, setStrategicComposerFocusSignal] = useState(0);
 
   const selectedTasks = useMemo(() => s.tasks.filter(t => s.selectedTaskIds.has(t.id)), [s.tasks, s.selectedTaskIds]);
@@ -878,8 +866,14 @@ export default function App() {
 
   const focusStrategicComposer = useCallback(() => {
     handleTabChange('chat'); setStrategicComposerFocusSignal(value => value + 1); setCommandPaletteOpen(false);
-  }, [handleTabChange]);
+  }, [handleTabChange, setCommandPaletteOpen]);
   const strategicMessageTarget = useStrategicMessageTarget(() => handleTabChange('chat'), selectedProjectId);
+  const openStrategicContextTarget = useStrategicContextNavigation({
+    handleTabChange, handleViewTaskById, openMessages: strategicMessageTarget.open,
+    setKnowledgeBrowserDirectionId, setKnowledgeBrowserInitialDocId,
+    setPipelineSection, setProjectSection, setRuntimeSection,
+    setShowArchive: s.setShowArchive, setShowKnowledgeBrowser: s.setShowKnowledgeBrowser, setViewMode: s.setViewMode,
+  });
   const currentStrategicInteractionMode = normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode);
   const setStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
     void persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' });
@@ -896,7 +890,7 @@ export default function App() {
     setSettingsInitialSection(section);
     if (!s.showSettings) s.handleToggleSettings();
     setCommandPaletteOpen(false);
-  }, [s]);
+  }, [s, setCommandPaletteOpen]);
 
   const workbenchCommands = useWorkbenchCommands({
     selectedProjectId: s.selectedProjectId,
@@ -911,9 +905,11 @@ export default function App() {
     hasDesignDoc: strategicReadModel.data?.design.has_design_doc,
     designRevision: strategicReadModel.data?.design.revision,
     strategicInteractionMode: currentStrategicInteractionMode,
+    strategicState: strategicReadModel.data ?? null, strategicWorkbenchState,
     savingStrategicWorkbench,
     switchStrategicInteractionMode,
     focusStrategicComposer,
+    openStrategicContextTarget, updateStrategicSessionRefs,
     handleTabChange,
     setCommandPaletteOpen,
     setPipelineSection,
@@ -938,13 +934,9 @@ export default function App() {
   const { openCommandPalette } = useOperatorKeyboardShortcuts({
     activeTab,
     blockingModalOpen: Boolean(s.showNewTaskModal || s.logTask || s.showComposeDrawer || s.showFleetDetail || s.confirmDialog || showNewProjectModal || setupProjectId || showProjectManagement || showProjectMembers),
-    commandPaletteOpen,
-    commands: workbenchCommands,
-    searchInputRef,
+    commandPaletteOpen, commands: workbenchCommands, searchInputRef,
     searchShortcutBlocked: Boolean(s.showNewTaskModal || s.logTask || s.showResearchBrowser || s.showSettings),
-    selectedTaskCount: s.selectedTaskIds.size,
-    selectionMode: s.selectionMode,
-    setCommandPaletteOpen,
+    selectedTaskCount: s.selectedTaskIds.size, selectionMode: s.selectionMode, setCommandPaletteOpen,
     setKnowledgeBrowserDirectionId,
     setKnowledgeBrowserInitialDocId,
     setResearchBrowserDirectionId,
@@ -952,8 +944,7 @@ export default function App() {
     setShowAlertsPopover: s.setShowAlertsPopover,
     setShowKnowledgeBrowser: s.setShowKnowledgeBrowser,
     setShowResearchBrowser: s.setShowResearchBrowser,
-    showSettings: s.showSettings,
-    toggleSettings: s.handleToggleSettings,
+    showSettings: s.showSettings, toggleSettings: s.handleToggleSettings,
   });
 
   const pipelineSurfaceActions = (
@@ -1342,11 +1333,7 @@ export default function App() {
         pipelineThrottle={s.pipelineThrottle}
       />
 
-      <CommandPalette
-        open={commandPaletteOpen}
-        commands={workbenchCommands}
-        onClose={() => setCommandPaletteOpen(false)}
-      />
+      <CommandPaletteHost open={commandPaletteOpen} commands={workbenchCommands} query={commandPaletteQuery} onQueryChange={setCommandPaletteQuery} setOpen={setCommandPaletteOpen} />
 
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
         const projectId = s.selectedProjectId;
@@ -1434,6 +1421,7 @@ export default function App() {
                 strategicState={strategicReadModel.data ?? null} strategicWorkbenchState={strategicWorkbenchState}
                 onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
                 onStrategicInteraction={() => { void persistStrategicWorkbench({ active_surface: 'strategic' }); }}
+                onOpenStrategicContextCommands={() => openCommandPaletteWithQuery('context')}
               />
             )}
             rail={(

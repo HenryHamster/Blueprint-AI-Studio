@@ -73,9 +73,46 @@ describe('CommandPalette', () => {
     expect(screen.queryByRole('button', { name: /Open task drawer/i })).toBeNull();
 
     await user.click(screen.getByRole('button', { name: 'Clear command search' }));
+    await user.type(input, 'selected task');
+    expect(screen.getByRole('button', { name: /Open task drawer/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Sync fleet/i })).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: 'Clear command search' }));
     await user.type(input, 'mode');
     expect(screen.getByRole('button', { name: /Switch Strategic to Workday/i })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /Sync fleet/i })).toBeNull();
+  });
+
+  test('supports controlled query state', async () => {
+    const user = userEvent.setup();
+    const onQueryChange = vi.fn();
+    const { rerender } = render(
+      <CommandPalette
+        open
+        commands={makeCommands()}
+        query="runner"
+        onQueryChange={onQueryChange}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByLabelText('Search commands')).toHaveValue('runner');
+    expect(screen.getByRole('button', { name: /Sync fleet/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /Open task drawer/i })).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: 'Clear command search' }));
+    expect(onQueryChange).toHaveBeenCalledWith('');
+
+    rerender(
+      <CommandPalette
+        open
+        commands={makeCommands()}
+        query=""
+        onQueryChange={onQueryChange}
+        onClose={vi.fn()}
+      />,
+    );
+    expect(screen.getByRole('button', { name: /Open task drawer/i })).toBeInTheDocument();
   });
 
   test('renders command shortcuts when provided', () => {

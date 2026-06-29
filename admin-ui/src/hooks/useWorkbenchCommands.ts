@@ -3,10 +3,13 @@ import type { WorkbenchCommand } from '../components/CommandPalette';
 import type { ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import type { SectionId } from '../components/SettingsDropdown';
+import type { StrategicContextCanvasNode, StrategicContextPackageDrilldown, StrategicContextResourceRef, StrategicStateResponse, StrategicWorkbenchState, StrategicWorkSessionRefDescriptor } from '../strategicStateApi';
+import { removeStrategicSelectedRef, upsertStrategicSelectedRef, type StrategicSelectedRef } from '../utils/strategicWorkbenchSession';
 import type { PrimaryTab } from './useUIState';
 import type { ViewMode } from './useViewPreferences';
 
 export type PipelineSection = 'flow' | 'board' | 'archive';
+type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
 
 interface UseWorkbenchCommandsOptions {
   selectedProjectId: string | null;
@@ -21,9 +24,15 @@ interface UseWorkbenchCommandsOptions {
   hasDesignDoc?: boolean;
   designRevision?: number | null;
   strategicInteractionMode: StrategicInteractionMode;
+  strategicState?: StrategicStateResponse | null;
+  strategicWorkbenchState?: StrategicWorkbenchState | null;
   savingStrategicWorkbench?: boolean;
   switchStrategicInteractionMode: (mode: StrategicInteractionMode) => void;
   focusStrategicComposer: () => void;
+  openStrategicContextTarget?: (target?: StrategicContextTarget | null) => void;
+  updateStrategicSessionRefs?: (
+    updateRefs: (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs']
+  ) => void;
   handleTabChange: (tab: PrimaryTab) => void;
   setCommandPaletteOpen: (open: boolean) => void;
   setPipelineSection: (section: PipelineSection) => void;
@@ -42,6 +51,44 @@ interface UseWorkbenchCommandsOptions {
   openProjectMembers: () => void;
 }
 
+function contextKindLabel(kind?: string | null): string {
+  if (kind === 'knowledge_document') return 'knowledge';
+  if (kind === 'canvas') return 'map';
+  return (kind || 'context').replace(/_/g, ' ');
+}
+
+function contextRefKey(ref: Pick<StrategicSelectedRef, 'kind' | 'id'>): string {
+  return `${ref.kind}:${ref.id}`;
+}
+
+function selectedRefFromResource(resource: StrategicContextResourceRef): StrategicSelectedRef {
+  return {
+    kind: resource.kind,
+    id: resource.id,
+    label: resource.label,
+  };
+}
+
+function selectedRefFromNode(node: StrategicContextCanvasNode): StrategicSelectedRef {
+  return {
+    kind: node.kind,
+    id: node.id,
+    label: node.label,
+  };
+}
+
+function selectedRefFromDescriptor(ref: StrategicWorkSessionRefDescriptor): StrategicSelectedRef {
+  return {
+    kind: ref.kind,
+    id: ref.id,
+    label: ref.label,
+  };
+}
+
+function fallbackSelectedRefLabel(ref: StrategicSelectedRef): string {
+  return ref.label?.trim() || `${contextKindLabel(ref.kind)} ${ref.id.slice(0, 8)}`;
+}
+
 export function useWorkbenchCommands({
   selectedProjectId,
   selectedProjectRepoLabel,
@@ -55,9 +102,13 @@ export function useWorkbenchCommands({
   hasDesignDoc,
   designRevision,
   strategicInteractionMode,
+  strategicState,
+  strategicWorkbenchState,
   savingStrategicWorkbench = false,
   switchStrategicInteractionMode,
   focusStrategicComposer,
+  openStrategicContextTarget,
+  updateStrategicSessionRefs,
   handleTabChange,
   setCommandPaletteOpen,
   setPipelineSection,
@@ -104,6 +155,117 @@ export function useWorkbenchCommands({
       switchStrategicInteractionMode(mode);
       closePalette();
     };
+    const selectedRefs = strategicWorkbenchState?.selected_refs ?? strategicState?.work_session?.selected_refs ?? strategicState?.workbench?.selected_refs ?? [];
+    const selectedKeys = new Set(selectedRefs.map(contextRefKey));
+    const contextPackage = strategicState?.context_package ?? null;
+    const contextCommandEntries: WorkbenchCommand[] = [];
+    const seenContextCommandIds = new Set<string>();
+    const seenContextOpenRefs = new Set<string>();
+    const seenContextActionRefs = new Set<string>();
+    const addContextCommand = (command: WorkbenchCommand) => {
+      if (seenContextCommandIds.has(command.id)) return;
+      seenContextCommandIds.add(command.id);
+      contextCommandEntries.push(command);
+    };
+    const openContextTarget = (target?: StrategicContextTarget | null) => {
+      openStrategicContextTarget?.(target);
+      closePalette();
+    };
+    const keepContextRef = (ref: StrategicSelectedRef) => {
+      updateStrategicSessionRefs?.(refs => upsertStrategicSelectedRef(refs, ref));
+      closePalette();
+    };
+    const removeContextRef = (ref: Pick<StrategicSelectedRef, 'kind' | 'id'>) => {
+      updateStrategicSessionRefs?.(refs => removeStrategicSelectedRef(refs, ref));
+      closePalette();
+    };
+    const addRefCommands = (source: {
+      ref: StrategicSelectedRef;
+      label: string;
+      detail?: string | null;
+      target?: StrategicContextTarget | null;
+      origin: 'kept' | 'resource' | 'map';
+    }) => {
+      const key = contextRefKey(source.ref);
+      const selected = selectedKeys.has(key);
+      const detail = [contextKindLabel(source.ref.kind), source.detail].filter(Boolean).join(' / ');
+      if (source.target && openStrategicContextTarget && !seenContextOpenRefs.has(key)) {
+        seenContextOpenRefs.add(key);
+        addContextCommand({
+          id: `strategic.context.open.${source.origin}.${key}`,
+          label: source.origin === 'kept' ? `Open kept context: ${source.label}` : `Open context: ${source.label}`,
+          section: 'Context',
+          detail,
+          keywords: ['strategic', 'context', source.origin, source.ref.kind, source.label],
+          disabled: projectDisabled,
+          run: () => openContextTarget(source.target),
+        });
+      }
+      if (updateStrategicSessionRefs && !seenContextActionRefs.has(key)) {
+        seenContextActionRefs.add(key);
+        addContextCommand({
+          id: `strategic.context.${selected ? 'remove' : 'keep'}.${key}`,
+          label: `${selected ? 'Remove from' : 'Keep in'} Strategic context: ${source.label}`,
+          section: 'Context',
+          detail,
+          keywords: ['strategic', 'context', selected ? 'remove' : 'keep', source.ref.kind, source.label],
+          disabled: projectDisabled || savingStrategicWorkbench,
+          run: selected ? () => removeContextRef(source.ref) : () => keepContextRef(source.ref),
+        });
+      }
+    };
+    if (contextPackage) {
+      const resourceCount = contextPackage.resources?.length ?? 0;
+      const nodeCount = contextPackage.canvas?.node_count ?? contextPackage.canvas?.nodes?.length ?? 0;
+      addContextCommand({
+        id: 'strategic.context.map',
+        label: 'Strategic context map',
+        section: 'Context',
+        detail: `${selectedRefs.length} kept, ${resourceCount} resources, ${nodeCount} nodes`,
+        keywords: ['strategic', 'context', 'map', 'canvas', 'kept'],
+        disabled: projectDisabled,
+        run: focusStrategicComposer,
+      });
+    }
+    selectedRefs.slice(0, 12).forEach(ref => {
+      addRefCommands({
+        ref,
+        label: fallbackSelectedRefLabel(ref),
+        detail: 'kept',
+        target: null,
+        origin: 'kept',
+      });
+    });
+    (strategicState?.work_session?.selected_ref_descriptors ?? []).slice(0, 8).forEach(ref => {
+      addRefCommands({
+        ref: selectedRefFromDescriptor(ref),
+        label: ref.label,
+        detail: ref.status ?? null,
+        target: ref.target,
+        origin: 'kept',
+      });
+    });
+    (contextPackage?.resources ?? []).slice(0, 8).forEach(resource => {
+      addRefCommands({
+        ref: selectedRefFromResource(resource),
+        label: resource.label,
+        detail: resource.summary ?? null,
+        target: resource.target,
+        origin: 'resource',
+      });
+    });
+    (contextPackage?.canvas?.nodes ?? [])
+      .filter(node => node.kind !== 'project')
+      .slice(0, 8)
+      .forEach(node => {
+        addRefCommands({
+          ref: selectedRefFromNode(node),
+          label: node.label,
+          detail: node.summary ?? node.status ?? null,
+          target: node.target,
+          origin: 'map',
+        });
+      });
     const strategicModeCommands: Array<{
       id: string;
       mode: StrategicInteractionMode;
@@ -161,6 +323,7 @@ export function useWorkbenchCommands({
         disabled: projectDisabled || savingStrategicWorkbench || command.mode === strategicInteractionMode,
         run: command.mode === strategicInteractionMode ? closePalette : () => setStrategicModeAndOpenChat(command.mode),
       })),
+      ...contextCommandEntries,
       {
         id: 'workbench.refresh',
         label: 'Refresh',
@@ -372,6 +535,7 @@ export function useWorkbenchCommands({
     handleTabChange,
     hasDesignDoc,
     maxPlanAccountCount,
+    openStrategicContextTarget,
     openGlobalSettings,
     openNewTaskModal,
     openProjectManagement,
@@ -390,9 +554,12 @@ export function useWorkbenchCommands({
     setShowArchive,
     setShowKnowledgeBrowser,
     setShowResearchBrowser,
+    strategicState,
+    strategicWorkbenchState,
     switchStrategicInteractionMode,
     setViewMode,
     strategicInteractionMode,
+    updateStrategicSessionRefs,
     visibleActiveCount,
     visibleQueuedCount,
   ]);

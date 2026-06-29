@@ -34,6 +34,7 @@ function commandMatches(command: WorkbenchCommand, query: string): boolean {
   const searchable = [
     command.label,
     command.section ?? '',
+    command.detail ?? '',
     ...(command.keywords ?? []),
   ].join(' ').toLowerCase();
 

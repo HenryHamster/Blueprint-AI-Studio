@@ -5,6 +5,7 @@ import { useEffect } from 'react';
 import { useWorkbenchCommands, type PipelineSection } from './useWorkbenchCommands';
 import type { ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
+import type { StrategicStateResponse, StrategicWorkbenchState } from '../strategicStateApi';
 import type { ViewMode } from './useViewPreferences';
 
 type Captured = ReturnType<typeof useWorkbenchCommands>;
@@ -121,6 +122,100 @@ describe('useWorkbenchCommands', () => {
     expect(switchStrategicInteractionMode).toHaveBeenCalledWith('monitor');
     expect(switchStrategicInteractionMode).toHaveBeenCalledTimes(1);
     expect(handleTabChange).not.toHaveBeenCalledWith('chat');
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
+  test('exposes dynamic Strategic context commands for open, keep, and remove actions', () => {
+    const target = { surface: 'task', task_id: 'task-context-1' } as const;
+    const openStrategicContextTarget = vi.fn();
+    const updateStrategicSessionRefs = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const strategicState = {
+      work_session: {
+        selected_refs: [
+          { kind: 'artifact', id: 'artifact:latest', label: 'Latest report' },
+        ],
+        selected_ref_descriptors: [
+          {
+            kind: 'artifact',
+            id: 'artifact:latest',
+            label: 'Latest report',
+            status: 'active',
+            target,
+          },
+        ],
+      },
+      context_package: {
+        resources: [
+          {
+            kind: 'artifact',
+            id: 'artifact:latest',
+            label: 'Latest report',
+            summary: 'Duplicate resource should not add another command',
+            target,
+          },
+          {
+            kind: 'knowledge_document',
+            id: 'knowledge:operator-notes',
+            label: 'Operator notes',
+            summary: 'Current workday notes',
+            target: { surface: 'knowledge', document_id: 'knowledge:operator-notes' },
+          },
+        ],
+        canvas: {
+          node_count: 1,
+          nodes: [
+            {
+              id: 'task-context-1',
+              kind: 'task',
+              label: 'Investigate failed runner',
+              target,
+            },
+          ],
+        },
+      },
+    } as StrategicStateResponse;
+    const strategicWorkbenchState = {
+      version: 1,
+      interaction_mode: 'continuous',
+      active_surface: 'strategic',
+      selected_refs: [
+        { kind: 'artifact', id: 'artifact:latest', label: 'Latest report' },
+        { kind: 'task', id: 'task:optimistic', label: 'Optimistic task' },
+      ],
+    } as StrategicWorkbenchState;
+
+    mount({
+      strategicState,
+      strategicWorkbenchState,
+      openStrategicContextTarget,
+      updateStrategicSessionRefs,
+      setCommandPaletteOpen,
+    });
+
+    expect(captured.filter(command => command.label.includes('Latest report'))).toHaveLength(2);
+    expect(captured.filter(command => command.id === 'strategic.context.remove.artifact:artifact:latest')).toHaveLength(1);
+    expect(captured.filter(command => command.id.includes('strategic.context.open') && command.id.includes('artifact:artifact:latest'))).toHaveLength(1);
+
+    captured.find(command => command.id === 'strategic.context.open.kept.artifact:artifact:latest')?.run();
+    expect(openStrategicContextTarget).toHaveBeenCalledWith(target);
+
+    captured.find(command => command.id === 'strategic.context.keep.knowledge_document:knowledge:operator-notes')?.run();
+    expect(updateStrategicSessionRefs).toHaveBeenLastCalledWith(expect.any(Function));
+    let updater = updateStrategicSessionRefs.mock.calls.at(-1)?.[0] as (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs'];
+    expect(updater([])).toEqual([
+      { kind: 'knowledge_document', id: 'knowledge:operator-notes', label: 'Operator notes' },
+    ]);
+
+    captured.find(command => command.id === 'strategic.context.remove.artifact:artifact:latest')?.run();
+    expect(updateStrategicSessionRefs).toHaveBeenLastCalledWith(expect.any(Function));
+    updater = updateStrategicSessionRefs.mock.calls.at(-1)?.[0] as (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs'];
+    expect(updater([{ kind: 'artifact', id: 'artifact:latest', label: 'Latest report' }])).toEqual([]);
+
+    captured.find(command => command.id === 'strategic.context.remove.task:task:optimistic')?.run();
+    expect(updateStrategicSessionRefs).toHaveBeenLastCalledWith(expect.any(Function));
+    updater = updateStrategicSessionRefs.mock.calls.at(-1)?.[0] as (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs'];
+    expect(updater([{ kind: 'task', id: 'task:optimistic', label: 'Optimistic task' }])).toEqual([]);
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 

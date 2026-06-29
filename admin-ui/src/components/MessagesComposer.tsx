@@ -16,6 +16,7 @@ export interface MessagesComposerProps {
   /** Whether a strategic cycle is currently running (live WS-driven signal). */
   strategistBusy?: boolean;
   strategicContext?: StrategicContextDescriptorModel | null;
+  onOpenStrategicContext?: () => void;
   onChangeType: (value: string) => void;
   onChangeContent: (value: string) => void;
   onCancelReply: () => void;
@@ -40,6 +41,7 @@ export function MessagesComposer({
   lastArming,
   strategistBusy,
   strategicContext,
+  onOpenStrategicContext,
   onChangeType,
   onChangeContent,
   onCancelReply,
@@ -69,7 +71,9 @@ export function MessagesComposer({
       ? 'shrink-0 border-t border-neutral-800 bg-[#05080c] px-4 py-3 md:px-8'
       : 'px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50'
     }>
-      {minimal && strategicContext && <StrategicContextDescriptor model={strategicContext} />}
+      {minimal && strategicContext && (
+        <StrategicContextDescriptor model={strategicContext} onOpen={onOpenStrategicContext} />
+      )}
       {/* Reply quote bar */}
       {replyTo && (
         <div className={`${minimal ? 'mx-auto max-w-4xl' : ''} mb-2 flex items-center gap-2 rounded-r-lg border-l-2 border-blue-500/50 bg-neutral-800/60 px-3 py-1.5`}>
