@@ -3814,6 +3814,126 @@ class TestMessages:
         assert third.json()["id"] != first_id
 
     @pytest.mark.asyncio
+    async def test_create_message_snapshots_current_strategic_session_context(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        workbench_resp = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "monitor",
+                    "active_surface": "pipeline",
+                    "selected_refs": [
+                        {"kind": "task", "id": "task-1", "label": "Watch task"},
+                        {"kind": "task", "id": "task-1", "label": "Duplicate"},
+                    ],
+                },
+            },
+        )
+        assert workbench_resp.status_code == 200
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "Keep this task in view.",
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        msg = (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        session = (msg.context or {})["strategic_session"]
+        assert session["interaction_mode"] == "monitor"
+        assert session["active_surface"] == "pipeline"
+        assert session["selected_refs"] == [
+            {"kind": "task", "id": "task-1", "label": "Watch task"}
+        ]
+        assert session["captured_at"]
+
+    @pytest.mark.asyncio
+    async def test_create_message_sanitizes_explicit_strategic_session_context(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        selected_refs = [
+            {"kind": "canvas", "id": "strategic-canvas:proj-1", "label": "Context map"},
+            {"kind": "canvas", "id": "strategic-canvas:proj-1", "label": "Duplicate"},
+            {"kind": "artifact", "id": "artifact-1", "label": "x" * 500, "storage_uri": "gs://secret"},
+            *[
+                {"kind": "task", "id": f"task-{index}", "label": f"Task {index}"}
+                for index in range(20)
+            ],
+        ]
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "FEEDBACK",
+                "content": "Use these refs.",
+                "context": {"reply_to": "question-1"},
+                "workbench_context": {
+                    "interaction_mode": "invalid",
+                    "active_surface": "runtime",
+                    "session_started_at": "2026-06-29T12:00:00Z",
+                    "context_package_id": "strategic-context:proj-1",
+                    "selected_refs": selected_refs,
+                    "storage_uri": "gs://secret",
+                },
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        msg = (
+            await db_session.execute(
+                select(ProjectMessage).where(ProjectMessage.id == uuid.UUID(resp.json()["id"]))
+            )
+        ).scalar_one()
+        context = msg.context or {}
+        assert context["reply_to"] == "question-1"
+        session = context["strategic_session"]
+        assert session["interaction_mode"] == "chat"
+        assert session["active_surface"] == "runtime"
+        assert session["session_started_at"] == "2026-06-29T12:00:00Z"
+        assert session["context_package_id"] == "strategic-context:proj-1"
+        assert len(session["selected_refs"]) == 12
+        assert session["selected_refs"][:2] == [
+            {"kind": "canvas", "id": "strategic-canvas:proj-1", "label": "Context map"},
+            {"kind": "artifact", "id": "artifact-1", "label": "x" * 160},
+        ]
+        assert "storage_uri" not in session
+
+    @pytest.mark.asyncio
+    async def test_create_message_rejects_oversized_workbench_context(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "This should not scan a huge workbench context.",
+                "workbench_context": {
+                    "selected_refs": [
+                        {"kind": "task", "id": "x" * 60_000}
+                    ],
+                },
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "Workbench context too large" in resp.json()["error"]["message"]
+
+    @pytest.mark.asyncio
     async def test_create_message_no_access_returns_404(
         self, client: AsyncClient, db_session
     ):
@@ -4613,6 +4733,32 @@ class TestMessages:
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "resolved"
+
+    @pytest.mark.asyncio
+    async def test_resolve_linked_message(self, client: AsyncClient, db_session):
+        """A linked message can be closed from the operator workbench."""
+        project = await _make_project(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BLOCKER,
+            from_type="system",
+            content="Owned by a direction, now done",
+            status="linked",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        resp = await client.patch(
+            f"/api/admin/messages/{msg.id}",
+            json={"resolution": "Direction finished."},
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "resolved"
+        await db_session.refresh(msg)
+        assert msg.status == "resolved"
+        assert msg.resolution == "Direction finished."
 
     @pytest.mark.asyncio
     async def test_resolve_message_over_limit_returns_400(

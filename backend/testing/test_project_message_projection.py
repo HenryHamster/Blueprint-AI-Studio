@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 from httpx import AsyncClient
+from sqlmodel import select
 
 from app.models import MessageType, Project, ProjectMember, ProjectMessage
 from app.project_message_projection import (
@@ -103,6 +104,45 @@ def test_message_preview_compacts_content_and_context_subset():
     assert "huge" not in data["context"]
 
 
+def test_message_preview_preserves_bounded_strategic_session_snapshot():
+    msg = _message(
+        context={
+            "event_type": "blocker_linked",
+            "strategic_session": {
+                "version": 1,
+                "interaction_mode": "continuous",
+                "active_surface": "pipeline",
+                "session_started_at": "2026-06-29T12:00:00Z",
+                "captured_at": "2026-06-29T12:05:00Z",
+                "context_package_id": "strategic-context:proj-1",
+                "selected_refs": [
+                    {"kind": "canvas", "id": "strategic-canvas:proj-1", "label": "Context map"},
+                    {"kind": "canvas", "id": "strategic-canvas:proj-1", "label": "Duplicate"},
+                    {"kind": "artifact", "id": "artifact-1", "label": "x" * 500, "storage_uri": "gs://secret"},
+                    {"kind": "", "id": "ignored"},
+                ],
+                "storage_uri": "gs://secret",
+            },
+            "huge": "not returned",
+        },
+    )
+
+    data = message_preview_dict(msg)
+
+    assert data["context"]["event_type"] == "blocker_linked"
+    assert "huge" not in data["context"]
+    session = data["context"]["strategic_session"]
+    assert session["interaction_mode"] == "continuous"
+    assert session["active_surface"] == "pipeline"
+    assert session["context_package_id"] == "strategic-context:proj-1"
+    assert session["captured_at"] == "2026-06-29T12:05:00Z"
+    assert session["selected_refs"] == [
+        {"kind": "canvas", "id": "strategic-canvas:proj-1", "label": "Context map"},
+        {"kind": "artifact", "id": "artifact-1", "label": "x" * 160},
+    ]
+    assert "storage_uri" not in session
+
+
 @pytest.mark.asyncio
 async def test_admin_messages_endpoint_keeps_full_message_contract(
     client: AsyncClient,
@@ -190,6 +230,64 @@ async def test_legacy_project_messages_endpoint_keeps_type_from_aliases(
     assert "message_type" not in item
     assert "from_type" not in item
     assert item["context"] == {}
+
+
+@pytest.mark.asyncio
+async def test_legacy_project_message_create_snapshots_strategic_session(
+    client: AsyncClient,
+    db_session,
+):
+    project = await _make_project(db_session)
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/messages",
+        json={
+            "message_type": "NOTE",
+            "content": "Keep this canvas around.",
+            "workbench_context": {
+                "interaction_mode": "check_in",
+                "active_surface": "project",
+                "selected_refs": [
+                    {"kind": "canvas", "id": "strategic-canvas:proj-1", "label": "Context map"}
+                ],
+            },
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    msg = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.id == uuid.UUID(resp.json()["id"]))
+        )
+    ).scalar_one()
+    session = (msg.context or {})["strategic_session"]
+    assert session["interaction_mode"] == "check_in"
+    assert session["active_surface"] == "project"
+    assert session["selected_refs"] == [
+        {"kind": "canvas", "id": "strategic-canvas:proj-1", "label": "Context map"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_legacy_project_message_create_rejects_oversized_workbench_context(
+    client: AsyncClient,
+    db_session,
+):
+    project = await _make_project(db_session)
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/messages",
+        json={
+            "message_type": "NOTE",
+            "content": "Too much context.",
+            "workbench_context": {
+                "selected_refs": [{"kind": "task", "id": "x" * 60_000}],
+            },
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "Workbench context too large" in resp.json()["error"]["message"]
 
 
 @pytest.mark.asyncio

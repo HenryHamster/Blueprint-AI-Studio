@@ -34,6 +34,10 @@ def workbench_state_size_bytes(raw: Any) -> int:
     return len(json.dumps(raw, separators=(",", ":"), default=str).encode("utf-8"))
 
 
+def workbench_state_exceeds_max_bytes(raw: Any) -> bool:
+    return workbench_state_size_bytes(raw) > WORKBENCH_STATE_MAX_BYTES
+
+
 def default_workbench_state() -> dict[str, Any]:
     return {
         "version": 1,
@@ -78,6 +82,87 @@ def _sanitize_selected_refs(raw: Any) -> list[dict[str, str]]:
         if len(selected_refs) >= _MAX_SELECTED_REFS:
             break
     return selected_refs
+
+
+def sanitize_strategic_session_snapshot(
+    raw: Any,
+    *,
+    fallback: dict[str, Any] | None = None,
+    captured_at: str | None = None,
+) -> dict[str, Any]:
+    data = raw if isinstance(raw, dict) else {}
+    previous = fallback if isinstance(fallback, dict) else {}
+
+    interaction_mode = _string(
+        data.get("interaction_mode", previous.get("interaction_mode")),
+        max_chars=40,
+    )
+    if interaction_mode not in _ALLOWED_INTERACTION_MODES:
+        interaction_mode = "chat"
+
+    active_surface = _string(
+        data.get("active_surface", previous.get("active_surface")),
+        max_chars=40,
+    )
+    if active_surface not in _ALLOWED_ACTIVE_SURFACES:
+        active_surface = "strategic"
+
+    session_started_at = _string(
+        data.get("session_started_at", previous.get("session_started_at")),
+        max_chars=80,
+    )
+    context_package_id = _string(
+        data.get("context_package_id", previous.get("context_package_id")),
+        max_chars=160,
+    )
+    snapshot: dict[str, Any] = {
+        "version": 1,
+        "interaction_mode": interaction_mode,
+        "active_surface": active_surface,
+        "session_started_at": session_started_at,
+        "context_package_id": context_package_id,
+        "selected_refs": _sanitize_selected_refs(
+            data.get("selected_refs", previous.get("selected_refs"))
+        ),
+    }
+    stored_captured_at = _string(data.get("captured_at"), max_chars=80)
+    effective_captured_at = captured_at or stored_captured_at
+    if effective_captured_at:
+        snapshot["captured_at"] = effective_captured_at
+    return snapshot
+
+
+def strategic_session_snapshot_has_signal(snapshot: dict[str, Any]) -> bool:
+    return bool(
+        snapshot.get("selected_refs")
+        or snapshot.get("interaction_mode") not in (None, "chat")
+        or snapshot.get("active_surface") not in (None, "strategic")
+        or snapshot.get("session_started_at")
+        or snapshot.get("context_package_id")
+    )
+
+
+async def build_message_strategic_session_snapshot(
+    session: AsyncSession,
+    user_id: str,
+    project_id: uuid.UUID,
+    workbench_context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    fallback_workbench = None
+    if workbench_context is None:
+        fallback_workbench = await get_strategic_workbench_state(
+            session,
+            user_id,
+            project_id,
+        )
+    snapshot = sanitize_strategic_session_snapshot(
+        workbench_context if workbench_context is not None else fallback_workbench,
+        fallback=fallback_workbench,
+        captured_at=_utcnow().isoformat(),
+    )
+    if workbench_context is not None or strategic_session_snapshot_has_signal(snapshot):
+        return snapshot
+    return None
 
 
 def sanitize_workbench_state(

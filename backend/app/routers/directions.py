@@ -38,6 +38,10 @@ from app.capability_proof import enrich_problem_model_capability_proofs
 from app.direction_refractory import get_direction_refractory_info
 from app.project_message_projection import legacy_direction_message_dict
 from app.problem_model import compute_model_size_signal, ProblemModel
+from app.workbench_state import (
+    build_message_strategic_session_snapshot,
+    workbench_state_exceeds_max_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1389,6 +1393,7 @@ async def trigger_strategic_cycle(
 class _CreateMessage(BaseModel):
     content: str
     message_type: str = "NOTE"  # NOTE, FEEDBACK, BUG_REPORT, QUESTION, BLOCKER
+    workbench_context: Dict[str, Any] | None = None
     # Client-generated idempotency key. When supplied, a repeat send (double
     # submit / network retry of the same steering instruction) converges to the
     # single already-stored message and a single arming, mirroring the live-chat
@@ -1411,6 +1416,11 @@ async def create_message(
         raise HTTPException(
             status_code=400,
             detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
+        )
+    if workbench_state_exceeds_max_bytes(payload.workbench_context):
+        raise HTTPException(
+            status_code=400,
+            detail="Workbench context too large (max 50KB)",
         )
 
     try:
@@ -1460,6 +1470,11 @@ async def create_message(
         )
         if warning:
             msg_context = {"_provenance_warnings": warning}
+    strategic_session = await build_message_strategic_session_snapshot(
+        session, user["user_id"], project.id, payload.workbench_context
+    )
+    if strategic_session:
+        msg_context = {**(msg_context or {}), "strategic_session": strategic_session}
 
     msg = ProjectMessage(
         project_id=project.id,

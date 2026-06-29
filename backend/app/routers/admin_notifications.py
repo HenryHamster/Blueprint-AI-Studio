@@ -38,13 +38,12 @@ from app.messages_noise_prefs_store import (
     mutate_messages_noise_prefs,
 )
 from app.workbench_state import (
-    WORKBENCH_STATE_KEY,
-    WORKBENCH_STATE_MAX_BYTES,
-    get_strategic_workbench_state,
+    WORKBENCH_STATE_KEY, WORKBENCH_STATE_MAX_BYTES,
+    build_message_strategic_session_snapshot, get_strategic_workbench_state,
     upsert_strategic_workbench_state_with_previous,
     workbench_mode_refresh_excerpt,
     workbench_mode_should_arm_strategic_refresh,
-    workbench_state_size_bytes,
+    workbench_state_exceeds_max_bytes, workbench_state_size_bytes,
 )
 from app.strategic_trigger import (
     ARMING_NOT_ARMED,
@@ -78,9 +77,7 @@ class _MessageCreate(BaseModel):
     message_type: str = "NOTE"
     content: str
     context: Optional[Dict[str, Any]] = None
-    # Client-generated idempotency key. When supplied, a repeat send (double
-    # click / network retry) carrying the same key returns the existing
-    # message instead of creating a duplicate. Absent = legacy behavior.
+    workbench_context: Optional[Dict[str, Any]] = None
     idempotency_key: Optional[str] = None
 
 
@@ -552,6 +549,8 @@ async def create_message(
     ctx = payload.context or {}
     if len(json.dumps(ctx)) > 50_000:
         raise HTTPException(status_code=400, detail="Context too large (max 50KB)")
+    if workbench_state_exceeds_max_bytes(payload.workbench_context):
+        raise HTTPException(status_code=400, detail="Workbench context too large (max 50KB)")
 
     # Idempotency: if this send carries a client key and a message with that
     # key already exists for the project, return the existing row instead of
@@ -588,6 +587,14 @@ async def create_message(
         warning = await compute_message_citation_warning(session, project, content)
         if warning:
             ctx = {**ctx, "_provenance_warnings": warning}
+
+    strategic_session = await build_message_strategic_session_snapshot(
+        session, current_user["user_id"], project_id, payload.workbench_context
+    )
+    if strategic_session:
+        ctx = {**ctx, "strategic_session": strategic_session}
+    if len(json.dumps(ctx, default=str)) > 50_000:
+        raise HTTPException(status_code=400, detail="Context too large (max 50KB)")
 
     msg = ProjectMessage(
         project_id=project_id,
@@ -708,7 +715,7 @@ async def resolve_message(
     result = await session.execute(
         update(ProjectMessage).where(
             ProjectMessage.id == message_id,
-            ProjectMessage.status == "open"
+            ProjectMessage.status.in_(["open", LINKED_STATUS])
         ).values(
             status="resolved",
             resolution=resolution or None,

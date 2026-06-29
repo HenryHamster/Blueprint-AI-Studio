@@ -10,6 +10,10 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from app.models import ProjectMessage
+from app.workbench_state import (
+    sanitize_strategic_session_snapshot,
+    strategic_session_snapshot_has_signal,
+)
 
 
 DEFAULT_MESSAGE_CONTEXT_PREVIEW_KEYS = (
@@ -123,6 +127,12 @@ def message_preview_dict(
         for key in context_keys
         if raw_context.get(key) is not None
     }
+    if isinstance(raw_context.get("strategic_session"), dict):
+        strategic_session = sanitize_strategic_session_snapshot(
+            raw_context.get("strategic_session"),
+        )
+        if strategic_session_snapshot_has_signal(strategic_session):
+            context_preview["strategic_session"] = strategic_session
     return {
         **base,
         "content": compact_text(base["content"], max_chars=content_max_chars) or "",

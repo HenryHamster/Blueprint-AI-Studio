@@ -177,6 +177,25 @@ async def test_strategic_state_returns_persistent_workbench_projection(
         context={
             "_convergence_link": {"kind": "direction", "id": "d-high"},
             "event_type": "blocker_linked",
+            "strategic_session": {
+                "version": 1,
+                "interaction_mode": "continuous",
+                "active_surface": "strategic",
+                "context_package_id": f"strategic-context:{project.id}",
+                "selected_refs": [
+                    {
+                        "kind": "canvas",
+                        "id": f"strategic-canvas:{project.id}",
+                        "label": "Raw context map label",
+                    },
+                    {
+                        "kind": "canvas",
+                        "id": f"strategic-canvas:{project.id}",
+                        "label": "Duplicate context map",
+                    },
+                ],
+                "storage_uri": "gs://secret",
+            },
             "huge": "x" * 10_000,
         },
     )
@@ -248,7 +267,23 @@ async def test_strategic_state_returns_persistent_workbench_projection(
         m for m in data["messages"]["items"] if m["status"] == "linked"
     )
     assert len(linked_preview["content"]) <= 280
-    assert linked_preview["context"] == {"event_type": "blocker_linked"}
+    assert linked_preview["context"]["event_type"] == "blocker_linked"
+    linked_session = linked_preview["context"]["strategic_session"]
+    assert linked_session["interaction_mode"] == "continuous"
+    assert linked_session["selected_refs"] == [
+        {
+            "kind": "canvas",
+            "id": f"strategic-canvas:{project.id}",
+            "label": "Raw context map label",
+        },
+    ]
+    assert "storage_uri" not in linked_session
+    canvas_descriptor = linked_session["selected_ref_descriptors"][0]
+    assert canvas_descriptor["label"] == "Strategic context map"
+    assert canvas_descriptor["target"] == {
+        "surface": "project",
+        "section": "problem-model",
+    }
     assert data["design"]["revision"] == 3
     package = data["context_package"]
     assert package["id"] == f"strategic-context:{project.id}"

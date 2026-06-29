@@ -333,8 +333,27 @@ def _is_live_strategic_task(task: Task | None) -> bool:
     return bool(task is not None and task.status in _LIVE_STRATEGIC_TASK_STATUSES)
 
 
-def _message_preview(message: ProjectMessage) -> Dict[str, Any]:
-    return message_preview_dict(message)
+def _message_preview(
+    message: ProjectMessage,
+    *,
+    context_package: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    preview = message_preview_dict(message)
+    context = preview.get("context")
+    strategic_session = (
+        context.get("strategic_session")
+        if isinstance(context, dict)
+        else None
+    )
+    if isinstance(strategic_session, dict):
+        selected_refs = strategic_session.get("selected_refs")
+        if isinstance(selected_refs, list):
+            strategic_session["selected_ref_descriptors"] = [
+                _selected_ref_descriptor(ref, context_package)
+                for ref in selected_refs[:12]
+                if isinstance(ref, dict)
+            ]
+    return preview
 
 
 def _task_summary(task: Task | None) -> Dict[str, Any] | None:
@@ -986,7 +1005,10 @@ async def get_project_strategic_state(
         "directions": directions_summary,
         "messages": {
             "counts": message_counts,
-            "items": [_message_preview(message) for message in message_rows],
+            "items": [
+                _message_preview(message, context_package=context_package)
+                for message in message_rows
+            ],
         },
         "tasks": {
             "counts": task_counts,
