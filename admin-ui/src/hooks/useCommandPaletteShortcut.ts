@@ -1,0 +1,15 @@
+import { useEffect } from 'react';
+
+export function useCommandPaletteShortcut(onOpen: () => void, enabled = true) {
+  useEffect(() => {
+    if (!enabled) return;
+    const handleCommandShortcut = (event: KeyboardEvent) => {
+      if (event.defaultPrevented) return;
+      if (!(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'k') return;
+      event.preventDefault();
+      onOpen();
+    };
+    document.addEventListener('keydown', handleCommandShortcut);
+    return () => document.removeEventListener('keydown', handleCommandShortcut);
+  }, [enabled, onOpen]);
+}

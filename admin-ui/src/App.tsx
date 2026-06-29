@@ -45,6 +45,7 @@ import { ProjectMembers } from './components/ProjectMembers';
 import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
 import { StrategicContextRail } from './components/StrategicContextRail';
+import { CommandPalette } from './components/CommandPalette';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
 import { BoardSavedViewsBar, type BoardFilterSnapshot } from './components/BoardSavedViewsBar';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
@@ -54,6 +55,8 @@ import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPa
 import { ProjectWorkspace, RuntimeWorkspace, type ProjectManageSection, type ProjectSection, type RuntimeSection, type RuntimeSettingsSection } from './components/OperatorWorkspaces';
 import { WorkbenchFrame, WorkbenchMetric, WorkbenchPanel, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
 import { useStrategicReadModel } from './hooks/useStrategicReadModel';
+import { useCommandPaletteShortcut } from './hooks/useCommandPaletteShortcut';
+import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 
@@ -72,10 +75,6 @@ const SORT_KEY = 'blueprint-admin:kanban-sort';
 const CANCELLABLE_STATUSES = new Set(['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING', 'BLOCKED', 'PARKED']);
 const TERMINAL_STATUSES = new Set(['COMPLETED', 'CANCELLED', 'FAILED']);
 const ACTIVE_PIPELINE_STATUSES = new Set(['IN_PROGRESS', 'PROVISIONING', 'EVALUATING']);
-
-type PipelineSection = 'flow' | 'board' | 'archive';
-
-
 
 export default function App() {
   const s = useAppState();
@@ -315,6 +314,9 @@ export default function App() {
     () => s.projects.find(p => p.id === s.selectedProjectId) ?? null,
     [s.projects, s.selectedProjectId],
   );
+  const selectedProjectRepoLabel = selectedProject
+    ? `${selectedProject.github_owner}/${selectedProject.github_repo}`
+    : null;
 
   // Fetch project members when panel opens or project changes
   const { fetchProjectMembers } = s;
@@ -465,6 +467,8 @@ export default function App() {
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
   const strategicReadModel = useStrategicReadModel(s.selectedProjectId);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [strategicComposerFocusSignal, setStrategicComposerFocusSignal] = useState(0);
 
   const selectedTasks = useMemo(() => s.tasks.filter(t => s.selectedTaskIds.has(t.id)), [s.tasks, s.selectedTaskIds]);
   const cancellableTasks = useMemo(() => selectedTasks.filter(t => CANCELLABLE_STATUSES.has(t.status)), [selectedTasks]);
@@ -773,14 +777,79 @@ export default function App() {
     onUpdatePromotionTarget: s.handleUpdatePromotionTarget,
   };
 
-  // activeTab drives the four operator modes: Chat, Pipeline, Project, Runtime.
-  const handleTabChange = (tab: PrimaryTab) => {
+  // activeTab drives the four operator modes: Strategic, Pipeline, Project, Runtime.
+  const handleTabChange = useCallback((tab: PrimaryTab) => {
     if (tab !== 'chat') s.setShowMessages(false);
     if (tab !== 'pipeline') {
       s.setShowArchive(false);
     }
     s.setActiveTab(tab);
-  };
+  }, [s]);
+
+  const focusStrategicComposer = useCallback(() => {
+    handleTabChange('chat');
+    setStrategicComposerFocusSignal(value => value + 1);
+    setCommandPaletteOpen(false);
+  }, [handleTabChange]);
+
+  const commandPaletteShortcutEnabled = Boolean(
+    !s.showNewTaskModal &&
+    !s.logTask &&
+    !s.showResearchBrowser &&
+    !s.showKnowledgeBrowser &&
+    !s.showSettings &&
+    !s.showUserManagement &&
+    !s.showAlertsPopover &&
+    !s.showComposeDrawer &&
+    !s.showFleetDetail &&
+    !s.showDirections &&
+    !s.showMetrics &&
+    !showNewProjectModal &&
+    !setupProjectId &&
+    !s.confirmDialog &&
+    !showActivityFeed &&
+    !showProjectManagement &&
+    !showProjectMembers &&
+    !commandPaletteOpen
+  );
+  const openCommandPalette = useCallback(() => {
+    setCommandPaletteOpen(true);
+  }, []);
+  useCommandPaletteShortcut(openCommandPalette, commandPaletteShortcutEnabled);
+
+  const openGlobalSettings = useCallback((section: SectionId | null = null) => {
+    setSettingsInitialSection(section);
+    if (!s.showSettings) s.handleToggleSettings();
+    setCommandPaletteOpen(false);
+  }, [s]);
+
+  const workbenchCommands = useWorkbenchCommands({
+    selectedProjectId: s.selectedProjectId,
+    selectedProjectRepoLabel,
+    directionsCount: directions.length,
+    filteredTaskCount: filteredTasks.length,
+    visibleActiveCount: visibleActiveTasks.length,
+    visibleQueuedCount: visibleQueuedTasks.length,
+    maxPlanAccountCount: s.maxPlanAccounts.length,
+    apiHealthy: s.apiHealthy,
+    problemModelRevision: strategicReadModel.data?.problem_model.revision,
+    hasDesignDoc: strategicReadModel.data?.design.has_design_doc,
+    designRevision: strategicReadModel.data?.design.revision,
+    focusStrategicComposer,
+    handleTabChange,
+    setCommandPaletteOpen,
+    setPipelineSection,
+    setProjectSection,
+    setRuntimeSection,
+    setRuntimeConfigSection,
+    setViewMode: s.setViewMode,
+    setShowArchive: s.setShowArchive,
+    setShowActivityFeed,
+    setShowResearchBrowser: s.setShowResearchBrowser,
+    setShowKnowledgeBrowser: s.setShowKnowledgeBrowser,
+    openNewTaskModal: s.openNewTaskModal,
+    openGlobalSettings,
+  });
 
   const pipelineSurfaceActions = (
     <>
@@ -911,10 +980,6 @@ export default function App() {
   const pipelinePagination = (
     <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />
   );
-
-  const selectedProjectRepoLabel = selectedProject
-    ? `${selectedProject.github_owner}/${selectedProject.github_repo}`
-    : null;
 
   if (s.authLoading) {
     return (
@@ -1165,9 +1230,16 @@ export default function App() {
         onSelectProject={s.setSelectedProjectId}
         activeTab={activeTab}
         onTabChange={handleTabChange}
+        onMessageStrategic={focusStrategicComposer}
         health={s.orchestratorHealth}
         detailedHealth={s.detailedHealth}
         pipelineThrottle={s.pipelineThrottle}
+      />
+
+      <CommandPalette
+        open={commandPaletteOpen}
+        commands={workbenchCommands}
+        onClose={() => setCommandPaletteOpen(false)}
       />
 
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
@@ -1231,6 +1303,7 @@ export default function App() {
                 strategistActive={s.strategistActive}
                 cycleProgress={s.cycleProgress}
                 lastCycleCompletion={s.lastCycleCompletion}
+                focusComposerSignal={strategicComposerFocusSignal}
               />
             )}
             rail={(

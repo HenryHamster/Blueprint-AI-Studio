@@ -4317,7 +4317,7 @@ describe('MessagesPanel composer draft persistence', () => {
     });
   });
 
-  test('minimal chat surfaces and sends the restored draft message type', async () => {
+  test('minimal chat restores draft content but sends through the Strategic steer path', async () => {
     const draftKey = 'messages_composer_draft:test-user@example.com:proj-draft';
     localStorage.setItem(draftKey, JSON.stringify({ type: 'BLOCKER', content: 'use the clean chat path' }));
     const postedBodies: unknown[] = [];
@@ -4354,7 +4354,8 @@ describe('MessagesPanel composer draft persistence', () => {
 
     const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
     expect(textarea.value).toBe('use the clean chat path');
-    expect(container.textContent).toContain('Blocker');
+    expect(container.textContent).toContain('Strategic');
+    expect(container.textContent).not.toContain('Blocker');
 
     await act(async () => {
       getByText('Send').click();
@@ -4363,7 +4364,7 @@ describe('MessagesPanel composer draft persistence', () => {
     await waitFor(() => expect(postedBodies).toHaveLength(1));
     expect(postedBodies[0]).toMatchObject({
       project_id: 'proj-draft',
-      message_type: 'BLOCKER',
+      message_type: 'FEEDBACK',
       content: 'use the clean chat path',
     });
   });

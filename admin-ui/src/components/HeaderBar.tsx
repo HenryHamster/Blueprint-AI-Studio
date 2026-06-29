@@ -207,6 +207,7 @@ export interface HeaderBarProps {
   // Unified top bar — tab nav
   activeTab: PrimaryTab;
   onTabChange: (tab: PrimaryTab) => void;
+  onMessageStrategic?: () => void;
   // Unified top bar — HealthPill
   health: OrchestratorHealth | null;
   detailedHealth: DetailedHealth | null;
@@ -431,7 +432,10 @@ export function HeaderBar(props: HeaderBarProps) {
 
         <button
           type="button"
-          onClick={() => props.onTabChange('chat')}
+          onClick={() => {
+            if (props.onMessageStrategic) props.onMessageStrategic();
+            else props.onTabChange('chat');
+          }}
           className="hidden min-w-0 flex-1 items-center rounded-md border border-neutral-800 bg-[#0b0f14] px-3 py-1.5 text-left font-mono text-xs text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-300 lg:flex"
         >
           <span className="truncate">Message Strategic...</span>
@@ -452,6 +456,7 @@ export function HeaderBar(props: HeaderBarProps) {
             const chatBadgeCount = tab === 'chat'
               ? Math.max(openMessageCount ?? 0, newSinceLastVisitCount ?? 0)
               : 0;
+            const label = tab === 'chat' ? 'Strategic' : tab.charAt(0).toUpperCase() + tab.slice(1);
             return (
               <button
                 key={tab}
@@ -462,7 +467,7 @@ export function HeaderBar(props: HeaderBarProps) {
                     : 'text-neutral-300 hover:bg-neutral-900 hover:text-neutral-100'
                 }`}
               >
-                {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                {label}
                 {chatBadgeCount > 0 && (
                   <span className="ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-ui-sm font-bold leading-none text-black">
                     {chatBadgeCount > 99 ? '99+' : chatBadgeCount}
@@ -784,7 +789,7 @@ export function HeaderBar(props: HeaderBarProps) {
                     }`}
                   >
                     <Compass className="w-4 h-4 shrink-0" />
-                    <span>{tab.charAt(0).toUpperCase() + tab.slice(1)}</span>
+                    <span>{tab === 'chat' ? 'Strategic' : tab.charAt(0).toUpperCase() + tab.slice(1)}</span>
                     {tab === 'chat' && (openMessageCount > 0 || (newSinceLastVisitCount ?? 0) > 0) && (
                       <span className="ml-auto bg-amber-500 text-black text-ui-xs font-bold px-1.5 py-0.5 rounded-full leading-none">
                         {Math.max(openMessageCount, newSinceLastVisitCount ?? 0)}
@@ -806,7 +811,7 @@ export function HeaderBar(props: HeaderBarProps) {
                       {[
                         ['N', 'New task'],
                         ['R', 'Refresh tasks'],
-                        ['1', 'Chat'],
+                        ['1', 'Strategic'],
                         ['2', 'Pipeline'],
                         ['3', 'Project'],
                         ['4', 'Runtime'],

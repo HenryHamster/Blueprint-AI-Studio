@@ -109,18 +109,18 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     await expectMinTouchTargetAt(375, async () => {});
   });
 
-  test('minimal chat composer keeps type selector visible without hint clutter', async () => {
+  test('minimal chat composer hides type selector while preserving Strategic steering hint', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
       host.style.padding = '12px';
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
-      await renderComposer(r, 'BLOCKER', null, false, 'minimal');
+      await renderComposer(r, 'FEEDBACK', null, false, 'minimal');
     });
-    expect(host!.textContent).toContain('Blocker');
+    expect(host!.textContent).toContain('Strategic');
     expect(host!.textContent).toContain('Send');
-    expect(host!.textContent).not.toContain('reaches the strategist soon');
+    expect(host!.textContent).toContain('reaches the strategist soon');
     expect(host!.textContent).not.toContain('won’t wake the strategist');
     await expectNoTextTruncationAt(375, async () => {});
     await expectMinTouchTargetAt(375, async () => {});

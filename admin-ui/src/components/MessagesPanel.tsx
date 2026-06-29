@@ -133,6 +133,8 @@ export interface MessagesPanelProps {
   cycleProgress?: StrategicCycleProgress | null;
   /** Outcome receipt from the most recently completed cycle, shown until the next cycle begins. */
   lastCycleCompletion?: StrategicCycleCompletion | null;
+  /** Incrementing signal from the workbench shell to focus the Strategic composer. */
+  focusComposerSignal?: number;
 }
 
 type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean; criticalOnly: boolean };
@@ -206,7 +208,7 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -230,6 +232,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // to a fresh type-based prediction).
   const [lastArming, setLastArming] = useState<ArmingOutcome | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const effectiveNewType = conversationMode ? 'FEEDBACK' : newType;
   // Idempotency key for the in-flight draft. Generated once per draft and
   // reused across retries / a rapid double-submit so the backend collapses
   // them to one logical message; cleared after a successful send so the next
@@ -457,6 +460,14 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [openKebabId]);
+
+  useEffect(() => {
+    if (!focusComposerSignal) return;
+    const timer = window.setTimeout(() => {
+      textareaRef.current?.focus();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [focusComposerSignal]);
 
   // Memoized message-list derivation: open/resolved split, high-signal vs routine,
   // pinned blockers/questions, auto-promoted failing groups, visible-resolved, and
@@ -910,7 +921,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           project_id: selectedProjectId,
-          message_type: newType,
+          message_type: effectiveNewType,
           content: newContent.trim(),
           idempotency_key: idempotencyKeyRef.current,
           ...(Object.keys(context).length > 0 ? { context } : {}),
@@ -1490,14 +1501,14 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       {/* Compose area — bottom, chat-style */}
       <MessagesComposer
         textareaRef={textareaRef}
-        newType={newType}
+        newType={effectiveNewType}
         newContent={newContent}
         submitting={submitting}
         replyTo={replyTo}
         lastArming={lastArming}
         strategistBusy={strategistActive}
         onChangeType={(value) => { setNewType(value); setLastArming(null); if (newContent) saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: value, content: newContent }); }}
-        onChangeContent={(value) => { setNewContent(value); if (value) { saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: newType, content: value }); } else { clearComposerDraft(auth.currentUser?.email, selectedProjectId); } }}
+        onChangeContent={(value) => { setNewContent(value); if (value) { saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value }); } else { clearComposerDraft(auth.currentUser?.email, selectedProjectId); } }}
         onCancelReply={() => setReplyTo(null)}
         onSubmit={handleSubmit}
         chrome={conversationMode ? 'minimal' : 'full'}

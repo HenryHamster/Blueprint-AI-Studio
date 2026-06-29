@@ -1,5 +1,5 @@
 import { type RefObject } from 'react';
-import { X, Send, Reply } from 'lucide-react';
+import { X, Send, Reply, Sparkles } from 'lucide-react';
 import { MessageTypeDropdown } from './MessageTypeDropdown';
 import { type ArmingOutcome, composerHintCopy } from './messageArming';
 
@@ -79,7 +79,14 @@ export function MessagesComposer({
         ? 'mx-auto flex w-full max-w-4xl items-end gap-2 rounded-lg border border-neutral-700 bg-[#10151c] p-2 shadow-[0_12px_40px_rgba(0,0,0,0.25)]'
         : 'flex gap-2 items-end'
       }>
-        <MessageTypeDropdown value={newType} onChange={onChangeType} compact={minimal} />
+        {minimal ? (
+          <div className="hidden min-h-[44px] shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs font-semibold text-neutral-300 sm:inline-flex">
+            <Sparkles className="h-3.5 w-3.5 text-emerald-300" aria-hidden="true" />
+            <span>Strategic</span>
+          </div>
+        ) : (
+          <MessageTypeDropdown value={newType} onChange={onChangeType} compact={minimal} />
+        )}
         <div className="relative flex-1">
           <textarea
             ref={textareaRef}
@@ -109,11 +116,11 @@ export function MessagesComposer({
       </div>
       {/* Steering hint: grounded in the last send's real outcome when available,
           otherwise predicted from the selected type. */}
-      {!minimal && (
-        <p className="text-ui-md leading-snug text-neutral-500 mt-1.5 px-0.5">
+      <div className={minimal ? 'mx-auto mt-1.5 w-full max-w-4xl px-1' : ''}>
+        <p className={`${minimal ? 'text-ui-md text-neutral-600' : 'text-ui-md text-neutral-500'} leading-snug ${minimal ? '' : 'mt-1.5 px-0.5'}`}>
           {hintText}
         </p>
-      )}
+      </div>
     </div>
   );
 }
