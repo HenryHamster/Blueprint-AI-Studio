@@ -1560,3 +1560,72 @@ async def test_attest_endpoint_no_open_version(client: AsyncClient, db_session):
         json={"reason": "valid reason"},
     )
     assert resp.status_code == 409, resp.text
+
+
+@pytest.mark.asyncio
+async def test_full_pipeline_end_to_end_via_refresh_after_merge(db_session):
+    """Full acceptance-criteria pipeline exercised through the real post-merge entry point.
+
+    Covers all four pipeline stages:
+      1. Criterion authoring via ac.create_criterion
+      2. Direction-to-task propagation (Direction.criterion_keys → Task.criterion_ids)
+      3. Merge evidence recording via refresh_direction_outcomes_after_merge (real caller)
+      4. Coverage computation via ac.get_version_coverage_summary
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.direction_outcomes import refresh_direction_outcomes_after_merge
+
+    # Stage 1: Criterion authoring
+    project = await _make_project(db_session, "E2EPipeline")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Test criterion",
+    )
+
+    # Stage 2: Direction-to-task propagation
+    direction_row = Direction(
+        project_id=project.id,
+        direction_key="d-e2e-pipeline",
+        data={"id": "d-e2e-pipeline", "text": "E2E pipeline direction", "status": "active"},
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(direction_row)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title="E2E pipeline task",
+        payloads=[{"type": "create", "prompt": "implement e2e"}],
+        context={
+            "direction_id": "d-e2e-pipeline",
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "test ran green under verified merge",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Stage 3: Merge evidence recording via the REAL post-merge entry point
+    await refresh_direction_outcomes_after_merge(task, db_session)
+
+    # Verify evidence rows: task_merge + reachability
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) == 2
+    assert {e.source_kind for e in evidence} == {"task_merge", "reachability"}
+
+    # Stage 4: Coverage computation
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["total"] == 1
+    assert summary["covered"] == 1
+    assert summary["criteria"][0]["coverage"] == "covered"

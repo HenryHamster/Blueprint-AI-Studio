@@ -13,6 +13,7 @@ import uuid
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
+import sqlalchemy.exc
 from sqlalchemy import func
 from sqlmodel import select
 
@@ -192,6 +193,17 @@ async def record_evidence(
     try:
         await session.commit()
         await session.refresh(evidence)
+    except sqlalchemy.exc.IntegrityError:
+        # Unique constraint violation: concurrent caller already recorded this
+        # evidence. The constraint turning a race into a no-op is expected.
+        await session.rollback()
+        logger.debug(
+            "record_evidence: duplicate evidence skipped for criterion %s "
+            "(source_kind=%s source_id=%s)",
+            criterion_id,
+            source_kind,
+            source_id,
+        )
     except Exception:
         logger.exception(
             "record_evidence: failed to persist evidence for criterion %s", criterion_id

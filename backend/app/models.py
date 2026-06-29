@@ -4057,6 +4057,14 @@ class CriterionEvidence(SQLModel, table=True):
     __table_args__ = (
         Index("ix_criterionevidence_criterion_id", "criterion_id"),
         Index("ix_criterionevidence_project", "project_id"),
+        Index(
+            "uq_criterionevidence_dedup",
+            "criterion_id",
+            "source_kind",
+            "source_id",
+            unique=True,
+            postgresql_where=text("source_id IS NOT NULL"),
+        ),
     )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
