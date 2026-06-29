@@ -1,9 +1,11 @@
 from datetime import timedelta
+from unittest.mock import AsyncMock
 
 import pytest
 from httpx import AsyncClient
 
 from app.models import (
+    ReleaseVersion,
     Alert,
     AlertSeverity,
     Artifact,
@@ -1518,3 +1520,137 @@ async def test_direction_attention_detail_uses_intervention_reason(
     ]
     assert len(direction_items) == 1
     assert direction_items[0]["detail"] == specific_reason
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_sha_freshness_unknown_when_no_open_version(
+    client: AsyncClient, db_session
+):
+    """No open ReleaseVersion → sha_freshness.verdict is unknown, endpoint still 200."""
+    project = await _make_project(db_session)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    freshness = resp.json()["sha_freshness"]
+    assert freshness is not None
+    assert freshness["verdict"] == "unknown"
+    # No SHAs present when there is no open version
+    assert "active_candidate_sha" not in freshness
+    assert "integration_head_sha" not in freshness
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_exposes_sha_freshness_verdict_when_candidate_behind(
+    client: AsyncClient, db_session, mocker
+):
+    """Open version with candidate SHA behind integration HEAD → verdict stale.
+
+    This is the acceptance-criteria test: non-trivial mock + real merge-test
+    verdict path (candidate != head_sha → current=False → verdict=stale).
+    """
+    project = await _make_project(db_session)
+    candidate_sha = "abc1234" * 5
+    head_sha = "def5678" * 5
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"candidate_sha": candidate_sha, "status": "not_promoted"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.strategic_spawning._resolve_candidate_currency",
+        new=AsyncMock(
+            return_value={
+                "current": False,
+                "candidate_sha": candidate_sha,
+                "head_sha": head_sha,
+            }
+        ),
+    )
+    mocker.patch(
+        "app.strategic_spawning.get_project_integration_branch",
+        return_value="main",
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    freshness = resp.json()["sha_freshness"]
+    assert freshness["verdict"] == "stale"
+    assert freshness["active_candidate_sha"] == candidate_sha
+    assert freshness["integration_head_sha"] == head_sha
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_sha_freshness_fresh_when_candidate_matches_head(
+    client: AsyncClient, db_session, mocker
+):
+    """Open version where candidate == integration HEAD → verdict fresh."""
+    project = await _make_project(db_session)
+    sha = "aabbccdd" * 5
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"candidate_sha": sha, "status": "not_promoted"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.strategic_spawning._resolve_candidate_currency",
+        new=AsyncMock(
+            return_value={
+                "current": True,
+                "candidate_sha": sha,
+                "head_sha": sha,
+            }
+        ),
+    )
+    mocker.patch(
+        "app.strategic_spawning.get_project_integration_branch",
+        return_value="main",
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    freshness = resp.json()["sha_freshness"]
+    assert freshness["verdict"] == "fresh"
+    assert freshness["active_candidate_sha"] == sha
+    assert freshness["integration_head_sha"] == sha
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_sha_freshness_unknown_when_resolve_fails(
+    client: AsyncClient, db_session, mocker
+):
+    """When _resolve_candidate_currency raises, sha_freshness.verdict is unknown.
+    Endpoint must still return 200 (GitHub failure must not break the read model)."""
+    project = await _make_project(db_session)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"candidate_sha": "abc123", "status": "not_promoted"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.strategic_spawning._resolve_candidate_currency",
+        new=AsyncMock(side_effect=RuntimeError("GitHub API timeout")),
+    )
+    mocker.patch(
+        "app.strategic_spawning.get_project_integration_branch",
+        return_value="main",
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    freshness = resp.json()["sha_freshness"]
+    assert freshness["verdict"] == "unknown"

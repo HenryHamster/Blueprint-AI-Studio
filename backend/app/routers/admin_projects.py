@@ -7,6 +7,8 @@ operator overrides for branch naming, cleanup prefixes, Git identity, and
 self-improvement flags.
 """
 
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +25,7 @@ from app.database import get_session, resolve_dialect_name
 from app.shared_state import limiter
 from app.models import (
     ProjectMessage,
+    ReleaseVersion,
     StrategicCycle,
     Task,
     TaskStatus,
@@ -60,6 +63,8 @@ router = APIRouter(
     tags=["admin-projects"],
     dependencies=[Depends(get_current_user)],
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _redact_build_config(build_config: dict, role: str) -> dict:
@@ -714,6 +719,50 @@ async def get_project_strategic_state(
         project.id,
     )
 
+    # SHA-aware freshness: resolve candidate vs integration HEAD, best-effort.
+    # A GitHub API failure must not break the endpoint — verdict degrades to unknown.
+    sha_freshness: dict | None = None
+    open_version = (
+        await session.execute(
+            select(ReleaseVersion)
+            .where(
+                ReleaseVersion.project_id == project.id,
+                ReleaseVersion.status == "open",
+            )
+            .order_by(ReleaseVersion.opened_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    if open_version is not None:
+        try:
+            from app.strategic_spawning import (  # noqa: PLC0415
+                _resolve_candidate_currency,
+                get_project_integration_branch,
+            )
+
+            _last_qual = open_version.last_qualification or {}
+            _integration_branch = get_project_integration_branch(project)
+            currency = await _resolve_candidate_currency(
+                session, project, _last_qual, _integration_branch
+            )
+            if currency is not None:
+                verdict = "fresh" if currency["current"] is True else "stale"
+                sha_freshness = {
+                    "active_candidate_sha": currency.get("candidate_sha"),
+                    "integration_head_sha": currency.get("head_sha"),
+                    "verdict": verdict,
+                }
+            else:
+                sha_freshness = {"verdict": "unknown"}
+        except Exception:
+            logger.exception(
+                "[STRATEGIC_STATE] sha_freshness resolve failed for project %s",
+                project.id,
+            )
+            sha_freshness = {"verdict": "unknown"}
+    else:
+        sha_freshness = {"verdict": "unknown"}
+
     return {
         "project_id": str(project.id),
         "strategic": {
@@ -744,6 +793,7 @@ async def get_project_strategic_state(
             if isinstance(project.design_doc, dict)
             else None,
         },
+        "sha_freshness": sha_freshness,
     }
 
 

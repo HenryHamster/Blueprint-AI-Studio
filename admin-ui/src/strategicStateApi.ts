@@ -382,6 +382,11 @@ export interface StrategicStateResponse {
     has_design_doc: boolean;
     revision?: number | null;
   };
+  sha_freshness?: {
+    active_candidate_sha?: string | null;
+    integration_head_sha?: string | null;
+    verdict: 'stale' | 'fresh' | 'unknown' | string;
+  } | null;
 }
 
 export async function fetchStrategicState(

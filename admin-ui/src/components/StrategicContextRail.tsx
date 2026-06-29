@@ -347,15 +347,27 @@ export function StrategicContextRail({
   const attentionNeeds = attention?.counts.needs_operator ?? 0;
   const attentionWatch = attention?.counts.watch ?? 0;
   const staleCycle = Boolean(activeCycle?.stale);
+  const shaFreshness = state?.sha_freshness ?? null;
   const operatorSteerQueued = Boolean(
     pendingSteer && (pendingSteer.origin === 'operator' || (pendingSteer.operator_count ?? 0) > 0),
   );
   const isWorking = !staleCycle && (strategistActive || Boolean(activeCycle?.has_active_task));
   const statusTone = isWorking ? 'bg-cyan-400' : pendingSteer ? 'bg-amber-300' : 'bg-neutral-600';
+  const staleCycleLabel = ((): string => {
+    if (!staleCycle) return '';
+    if (shaFreshness?.verdict === 'stale') {
+      const cSha = shaFreshness.active_candidate_sha?.slice(0, 7);
+      const iSha = shaFreshness.integration_head_sha?.slice(0, 7);
+      if (cSha && iSha) return `Cycle stale · candidate @${cSha} vs integration @${iSha}`;
+      if (cSha) return `Cycle stale · candidate @${cSha}`;
+      if (iSha) return `Cycle stale · integration @${iSha}`;
+    }
+    return 'Cycle stale';
+  })();
   const statusLabel = isWorking
     ? (cycleProgress?.phase_label ?? phaseLabel(state?.strategic.active_phase))
     : staleCycle
-      ? 'Cycle stale'
+      ? staleCycleLabel
     : pendingSteer
       ? operatorSteerQueued
         ? 'Steer queued'

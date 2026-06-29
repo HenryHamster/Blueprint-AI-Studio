@@ -737,6 +737,76 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).not.toContain('Cycle running');
   });
 
+  test('shows SHA-aware stale label with both candidate and integration SHAs when sha_freshness is stale', () => {
+    const staleState: StrategicStateResponse = {
+      ...STATE,
+      strategic: {
+        ...STATE.strategic,
+        active_cycle: {
+          ...STATE.strategic.active_cycle!,
+          has_active_task: false,
+          stale: true,
+        },
+        active_task: null,
+      },
+      sha_freshness: {
+        verdict: 'stale',
+        active_candidate_sha: 'abc1234def56',
+        integration_head_sha: 'xyz9876uvw01',
+      },
+    };
+    const { host } = mount({ state: staleState, strategistActive: false });
+
+    expect(host.textContent).toContain('Cycle stale');
+    expect(host.textContent).toContain('candidate @abc1234');
+    expect(host.textContent).toContain('integration @xyz9876');
+  });
+
+  test('falls back to generic Cycle stale when sha_freshness verdict is not stale', () => {
+    const staleState: StrategicStateResponse = {
+      ...STATE,
+      strategic: {
+        ...STATE.strategic,
+        active_cycle: {
+          ...STATE.strategic.active_cycle!,
+          has_active_task: false,
+          stale: true,
+        },
+        active_task: null,
+      },
+      sha_freshness: {
+        verdict: 'unknown',
+        active_candidate_sha: null,
+        integration_head_sha: null,
+      },
+    };
+    const { host } = mount({ state: staleState, strategistActive: false });
+
+    expect(host.textContent).toContain('Cycle stale');
+    expect(host.textContent).not.toContain('candidate @');
+    expect(host.textContent).not.toContain('integration @');
+  });
+
+  test('falls back to generic Cycle stale when sha_freshness is absent', () => {
+    const staleState: StrategicStateResponse = {
+      ...STATE,
+      strategic: {
+        ...STATE.strategic,
+        active_cycle: {
+          ...STATE.strategic.active_cycle!,
+          has_active_task: false,
+          stale: true,
+        },
+        active_task: null,
+      },
+    };
+    const { host } = mount({ state: staleState, strategistActive: false });
+
+    expect(host.textContent).toContain('Cycle stale');
+    expect(host.textContent).not.toContain('candidate @');
+    expect(host.textContent).not.toContain('integration @');
+  });
+
   test('distinguishes automated refreshes from operator steers', () => {
     const refreshState: StrategicStateResponse = {
       ...STATE,

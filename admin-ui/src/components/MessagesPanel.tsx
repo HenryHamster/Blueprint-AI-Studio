@@ -1467,6 +1467,13 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
                 Context {effectiveContextPackage.status}
               </span>
             )}
+            {effectiveContextPackage?.status === 'stale' && currentStrategicState?.sha_freshness?.verdict === 'stale' && (() => {
+              const cSha = currentStrategicState.sha_freshness?.active_candidate_sha?.slice(0, 7);
+              const iSha = currentStrategicState.sha_freshness?.integration_head_sha?.slice(0, 7);
+              if (cSha && iSha) return <span className="text-amber-500/70">sha diverged: @{cSha} vs @{iSha}</span>;
+              if (cSha || iSha) return <span className="text-amber-500/70">sha diverged</span>;
+              return null;
+            })()}
             {strategicAttention?.level === 'needs_operator' && attentionNeeds > 0 && (
               <span className={attentionTextTone(strategicAttention.level)}>
                 {attentionNeeds} needs attention
