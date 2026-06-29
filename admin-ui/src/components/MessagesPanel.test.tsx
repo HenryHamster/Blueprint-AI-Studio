@@ -662,7 +662,7 @@ describe('MessagesPanel chrome modes', () => {
     expect(strip?.textContent).not.toContain('3 running / 5 queued');
   });
 
-  test('minimal chat composer shows optimistic Strategic session context chips', async () => {
+  test('minimal chat composer shows optimistic Strategic session context descriptor', async () => {
     const el = await renderPanel({
       filterChrome: 'minimal',
       strategicState: makeStrategicState({
@@ -701,9 +701,11 @@ describe('MessagesPanel chrome modes', () => {
       },
     });
 
-    const chips = el.querySelector('[data-testid="strategic-session-context-chips"]');
-    expect(chips?.textContent).toContain('Latest context report');
-    expect(chips?.textContent).not.toContain('Operator notes');
+    const descriptor = el.querySelector('[data-testid="strategic-context-descriptor"]');
+    expect(descriptor?.textContent).toContain('Context');
+    expect(descriptor?.textContent).toContain('Workday');
+    expect(descriptor?.textContent).toContain('Latest context report');
+    expect(descriptor?.textContent).not.toContain('Operator notes');
   });
 
   test('minimal chat chrome shows conversation messages chronologically without routine alerts', async () => {

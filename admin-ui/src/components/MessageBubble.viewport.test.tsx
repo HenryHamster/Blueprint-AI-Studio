@@ -146,6 +146,49 @@ describe('MessageBubble — viewport regression', () => {
     await expectMinTouchTargetAt(420, async () => {});
   });
 
+  test('operator chat message with Strategic context receipt fits 375px without overflow', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <MessageBubble
+            {...makeProps({
+              presentation: 'chat',
+              actionMode: 'reply-only',
+              msg: makeMsg({
+                from_type: 'operator',
+                content: 'Use the current context.',
+                context: {
+                  strategic_session: {
+                    version: 1,
+                    interaction_mode: 'continuous',
+                    active_surface: 'pipeline',
+                    context_package_id: 'strategic-context:project-123',
+                    selected_refs: [
+                      {
+                        kind: 'knowledge_document',
+                        id: 'knowledge:operator-notes',
+                        label: 'Operator notes for the local Strategic workday session',
+                      },
+                    ],
+                  },
+                },
+              }),
+            })}
+          />,
+        );
+      });
+    });
+    if (host) expect(host.textContent).toContain('Sent with context');
+    if (host) expect(host.textContent).toContain('Operator notes');
+    await expectNoTextTruncationAt(375, async () => {});
+    await expectMinTouchTargetAt(375, async () => {});
+  });
+
   test('strategic message with markdown links fits 420px without overflow, truncation, or small targets', async () => {
     await expectNoOverflowAt(420, async () => {
       host = document.createElement('div');

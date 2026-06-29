@@ -24,6 +24,7 @@ import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { DirectionsAddForm } from './DirectionsAddForm';
 import type { StrategicContextPackageDescriptor, StrategicMessageTarget, StrategicStateResponse, StrategicWorkbenchState } from '../strategicStateApi';
+import { buildStrategicContextDescriptor } from '../utils/strategicContextDescriptor';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -159,42 +160,6 @@ function buildMessageWorkbenchContext(
     session_started_at: sessionStartedAt,
     context_package_id: contextPackageId,
   };
-}
-
-function sessionRefFallbackLabel(kind: string, id: string, label?: string): string {
-  if (label?.trim()) return label.trim();
-  return `${kind.replace(/_/g, ' ')} ${id.slice(0, 8)}`;
-}
-
-function buildSessionContextChips(
-  state?: StrategicStateResponse | null,
-  workbenchOverride?: StrategicWorkbenchState | null,
-): Array<{ id: string; kind: string; label: string; status?: string | null }> {
-  const workbench = workbenchOverride ?? state?.workbench ?? null;
-  if (!state?.work_session && !workbench) return [];
-  const descriptorByRef = new Map((state?.work_session?.selected_ref_descriptors ?? []).map(ref => [`${ref.kind}:${ref.id}`, ref]));
-  const refs = workbench?.selected_refs ?? state?.work_session?.selected_refs ?? [];
-  if (refs.length > 0) {
-    return refs.slice(0, 4).map(ref => {
-      const descriptor = descriptorByRef.get(`${ref.kind}:${ref.id}`);
-      return {
-        id: `${ref.kind}:${ref.id}`,
-        kind: ref.kind,
-        label: descriptor?.label ?? sessionRefFallbackLabel(ref.kind, ref.id, ref.label),
-        status: descriptor?.status,
-      };
-    });
-  }
-  const descriptors = state?.work_session?.selected_ref_descriptors ?? [];
-  if (descriptors.length > 0) {
-    return descriptors.slice(0, 4).map(ref => ({
-      id: `${ref.kind}:${ref.id}`,
-      kind: ref.kind,
-      label: ref.label,
-      status: ref.status,
-    }));
-  }
-  return [];
 }
 
 function strategicRefreshFromReadModel(
@@ -733,8 +698,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         return aTime - bTime;
       });
   }, [messages, eventPrefs, tempMutes]);
-  const sessionContextChips = useMemo(
-    () => buildSessionContextChips(currentStrategicState, strategicWorkbenchState),
+  const strategicContextDescriptor = useMemo(
+    () => buildStrategicContextDescriptor(currentStrategicState, strategicWorkbenchState),
     [currentStrategicState, strategicWorkbenchState],
   );
 
@@ -1860,7 +1825,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         onCancelReply={() => setReplyTo(null)}
         onSubmit={handleSubmit}
         chrome={conversationMode ? 'minimal' : 'full'}
-        sessionContextChips={conversationMode ? sessionContextChips : []}
+        strategicContext={conversationMode ? strategicContextDescriptor : null}
       />
     </div>
   );

@@ -1,7 +1,8 @@
 import { afterEach, describe, test, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act, createRef } from 'react';
-import { MessagesComposer, type MessagesComposerSessionChip } from './MessagesComposer';
+import { MessagesComposer } from './MessagesComposer';
+import type { StrategicContextDescriptorModel } from '../utils/strategicContextDescriptor';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 async function renderComposer(
@@ -10,7 +11,7 @@ async function renderComposer(
   lastArming: 'steering' | 'passive_note' | 'routine_event' | 'not_armed' | null = null,
   strategistBusy = false,
   chrome: 'full' | 'minimal' = 'full',
-  sessionContextChips: MessagesComposerSessionChip[] = [],
+  strategicContext: StrategicContextDescriptorModel | null = null,
 ) {
   const ref = createRef<HTMLTextAreaElement>();
   await act(async () => {
@@ -28,7 +29,7 @@ async function renderComposer(
         onCancelReply={() => {}}
         onSubmit={() => {}}
         chrome={chrome}
-        sessionContextChips={sessionContextChips}
+        strategicContext={strategicContext}
       />,
     );
   });
@@ -190,25 +191,32 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     await expectMinTouchTargetAt(375, async () => {});
   });
 
-  test('minimal chat composer context chips fit 375px without overflow', async () => {
+  test('minimal chat composer context descriptor fits 375px without overflow', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
       host.style.padding = '12px';
       document.body.appendChild(host);
       const r = createRoot(host);
       root = r;
-      await renderComposer(r, 'FEEDBACK', null, false, 'minimal', [
-        {
+      await renderComposer(r, 'FEEDBACK', null, false, 'minimal', {
+        modeLabel: 'Workday',
+        surfaceLabel: 'Pipeline',
+        contextLabel: 'Context ready',
+        contextTone: 'ready',
+        refCount: 1,
+        refs: [{
           id: 'knowledge_document:operator-notes',
           kind: 'knowledge_document',
           label: 'Operator notes for the local Strategic workday session',
           status: 'active',
-        },
-      ]);
+        }],
+      });
     });
     if (!host) throw new Error('Expected host to be mounted');
+    expect(host.textContent).toContain('Context');
+    expect(host.textContent).toContain('Workday');
+    expect(host.textContent).toContain('Pipeline');
     expect(host.textContent).toContain('Operator notes');
-    expect(host.textContent).toContain('active');
     await expectNoTextTruncationAt(375, async () => {});
     await expectMinTouchTargetAt(375, async () => {});
   });

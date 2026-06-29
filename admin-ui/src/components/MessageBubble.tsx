@@ -4,6 +4,8 @@ import { parseTimestamp } from '../utils/time';
 import { ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS } from './eventPrefs';
 import { MarkdownContent } from './MarkdownContent';
 import type { CitationState, ProjectMessage, ProjectMessageContext, ProvenanceWarnings } from '../types/messages';
+import { buildMessageStrategicContextDescriptor } from '../utils/strategicContextDescriptor';
+import { StrategicContextDescriptor } from './StrategicContextDescriptor';
 
 export type { ProjectMessage, ProjectMessageContext } from '../types/messages';
 
@@ -255,6 +257,9 @@ export function MessageBubble({
   const canChatReply = chatMode && !userMsg && !faded && !readOnly && msg.status === 'open' && actionMode !== 'none';
   const isResolving = resolvingId === msg.id;
   const taskId = msg.from_task_id;
+  const strategicContextReceipt = chatMode && userMsg
+    ? buildMessageStrategicContextDescriptor(msg.context)
+    : null;
 
   let replyContextMsg: ProjectMessage | null = null;
   let replyContextType: 'feedback' | 'question' | null = null;
@@ -372,6 +377,11 @@ export function MessageBubble({
           {showOpsChrome && <StaleCitationBadge msg={msg} />}
           {/* Context badges */}
           {showOpsChrome && <ContextBadges context={msg.context} fromType={msg.from_type} />}
+          {strategicContextReceipt && (
+            <div className="mt-2 border-t border-neutral-700/50 pt-1.5">
+              <StrategicContextDescriptor model={strategicContextReceipt} variant="receipt" />
+            </div>
+          )}
         </div>
 
         {/* Linked indicator (for linked messages) */}

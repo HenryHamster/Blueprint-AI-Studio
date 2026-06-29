@@ -226,6 +226,76 @@ describe('MessageBubble', () => {
     expect(screen.queryByTitle('Reply')).toBeNull();
   });
 
+  test('chat presentation shows operator Strategic context receipt when captured', () => {
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      actionMode: 'reply-only',
+      msg: makeMsg({
+        from_type: 'operator',
+        content: 'Use the current context.',
+        context: {
+          strategic_session: {
+            version: 1,
+            interaction_mode: 'continuous',
+            active_surface: 'pipeline',
+            context_package_id: 'strategic-context:proj-1',
+            selected_refs: [
+              { kind: 'artifact', id: 'artifact:latest-context', label: 'Latest context report' },
+            ],
+            captured_at: '2026-06-29T12:00:00Z',
+          },
+        },
+      }),
+    })} />);
+
+    const receipt = screen.getByTestId('strategic-context-receipt');
+    expect(receipt.textContent).toContain('Sent with context');
+    expect(receipt.textContent).toContain('Workday');
+    expect(receipt.textContent).toContain('Pipeline');
+    expect(receipt.textContent).toContain('Latest context report');
+  });
+
+  test('triage presentation keeps operator Strategic context receipt hidden', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        from_type: 'operator',
+        context: {
+          strategic_session: {
+            version: 1,
+            interaction_mode: 'continuous',
+            selected_refs: [
+              { kind: 'artifact', id: 'artifact:latest-context', label: 'Latest context report' },
+            ],
+          },
+        },
+      }),
+    })} />);
+
+    expect(screen.queryByTestId('strategic-context-receipt')).toBeNull();
+  });
+
+  test('chat receipt appears when the captured Strategic session only has a start time', () => {
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      msg: makeMsg({
+        from_type: 'operator',
+        context: {
+          strategic_session: {
+            version: 1,
+            interaction_mode: 'chat',
+            active_surface: 'strategic',
+            selected_refs: [],
+            session_started_at: '2026-06-29T12:00:00Z',
+          },
+        },
+      }),
+    })} />);
+
+    const receipt = screen.getByTestId('strategic-context-receipt');
+    expect(receipt.textContent).toContain('Sent with context');
+    expect(receipt.textContent).toContain('Chat');
+  });
+
   test('chat presentation omits task metadata when there is no task ref', () => {
     render(<MessageBubble {...makeProps({
       presentation: 'chat',
