@@ -1,0 +1,92 @@
+#!/bin/bash
+# Read-only context fetch tool — pull full detail for items shipped trimmed,
+# summarized, or only by reference. Reads ORCHESTRATOR_URL, AGENT_API_TOKEN from
+# env. project_id is baked in. All endpoints are GET (strictly read-only).
+KIND="${1:?Usage: fetch direction|playbook|section|knowledge|qualification|ci-compliance [id]}"
+ID="${2:-}"
+API="${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
+TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+PROJECT="37d445e1-0775-4403-bacf-1cd7ed129336"
+[ -n "$PROJECT" ] || { echo "[ERROR] no project_id available; ./fetch is unavailable in this workspace" >&2; exit 1; }
+
+# problem-model, qualification, ci-compliance, version-phase, vm-cost, and efficiency-snapshot
+# take no id; everything else requires one. For "message" the id may be a short
+# ref (first 8+ hex chars of the message UUID — the same ref operators see in
+# the admin UI) or a full UUID; the backend resolves it and fails loudly on
+# ambiguous/missing refs.
+case "$KIND" in
+  direction)  PATH_SUFFIX="directions/$ID" ;;
+  playbook)   PATH_SUFFIX="playbook/$ID" ;;
+  section)    PATH_SUFFIX="design-doc/$ID" ;;
+  knowledge)
+    shift
+    if [ -n "${1:-}" ] && [ "${1#--}" = "$1" ]; then
+      kresp=$(curl -sS --max-time 20 --connect-timeout 10 \
+        -X GET "$API/api/agent/knowledge-documents/$1" \
+        -H "X-Agent-Token: $TOKEN" -w '\n%{http_code}')
+    else
+      QARGS=()
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --topic)       QARGS+=(--data-urlencode "topic=${2:-}"); shift 2 ;;
+          --direction)   QARGS+=(--data-urlencode "direction=${2:-}"); shift 2 ;;
+          --source-kind) QARGS+=(--data-urlencode "source_kind=${2:-}"); shift 2 ;;
+          --q)           QARGS+=(--data-urlencode "q=${2:-}"); shift 2 ;;
+          --tag)         QARGS+=(--data-urlencode "tag=${2:-}"); shift 2 ;;
+          *) echo "[ERROR] fetch knowledge: unknown flag '$1' (use --topic/--direction/--q/--source-kind/--tag or a document id)" >&2; exit 1 ;;
+        esac
+      done
+      kresp=$(curl -sS --max-time 20 --connect-timeout 10 --get \
+        "${QARGS[@]}" "$API/api/agent/knowledge-documents" \
+        -H "X-Agent-Token: $TOKEN" -w '\n%{http_code}')
+    fi
+    kcode=$(printf '%s' "$kresp" | tail -n1)
+    kbody=$(printf '%s' "$kresp" | head -n -1)
+    if [ "$kcode" -ge 200 ] && [ "$kcode" -lt 300 ]; then printf '%s' "$kbody"; echo ""; exit 0; fi
+    printf '%s' "$kbody" >&2
+    echo "[ERROR] fetch knowledge failed (HTTP $kcode)" >&2
+    exit 1
+    ;;
+  qualification) PATH_SUFFIX="qualification" ;;
+  ci-compliance) PATH_SUFFIX="ci-compliance" ;;
+  problem-model|gap|message|version-phase|vm-cost|efficiency-snapshot) echo "Error: ./fetch '$KIND' is not permitted in this workspace (allowed: direction|playbook|section|knowledge|qualification|ci-compliance)." >&2; exit 1 ;;
+  *) echo "Unknown kind: $KIND (use direction|playbook|section|knowledge|qualification|ci-compliance)" >&2; exit 1 ;;
+esac
+
+if [ "$KIND" != "problem-model" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ -z "$ID" ]; then
+  echo "[ERROR] fetch $KIND requires an id argument" >&2
+  exit 1
+fi
+
+# Fetch with HTTP status awareness. Capture response body and status code
+# separately so we can surface HTTP errors clearly.
+response=$(curl -sS --max-time 20 --connect-timeout 10 \
+  -X GET "$API/api/agent/projects/$PROJECT/$PATH_SUFFIX" \
+  -H "X-Agent-Token: $TOKEN" \
+  -w '\n%{http_code}')
+http_code=$(printf '%s' "$response" | tail -n1)
+body=$(printf '%s' "$response" | head -n -1)
+
+# On 2xx: pass body through as today (success)
+if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+  printf '%s' "$body"
+  echo ""
+  exit 0
+fi
+
+# On 409: ambiguous ref or constraint violation. Surface the body (which contains
+# candidate refs and minimum hex length) with a clear ambiguity signal so the
+# agent knows to retry with a longer ref.
+if [ "$http_code" -eq 409 ]; then
+  printf '%s' "$body"
+  echo "[AMBIGUOUS] fetch $KIND: multiple candidates found; candidates and minimum ref length in response above" >&2
+  echo ""
+  exit 1
+fi
+
+# On any other non-2xx (404, 400, 5xx, etc.): surface the body and report error.
+# The agent can then decide how to handle missing/invalid refs.
+printf '%s' "$body" >&2
+echo "[ERROR] fetch $KIND failed (HTTP $http_code)" >&2
+echo ""
+exit 1

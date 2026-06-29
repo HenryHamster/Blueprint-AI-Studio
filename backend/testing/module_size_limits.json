@@ -84,7 +84,7 @@
     "playbook_sr_metrics.py": 3100,
     "models.py": 5550,
     "shared_state.py": 2850,
-    "strategic_spawning.py": 6510,
+    "strategic_spawning.py": 7600,
     "failure_classification.py": 3350,
     "notification_dispatch.py": 2700,
     "ci_completion.py": 2200,

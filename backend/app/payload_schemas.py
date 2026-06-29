@@ -467,6 +467,11 @@ class StrategicReviewPayload(_SystemPopulated):
     # legacy rows). Stays ``dict[str, Any] | None`` with extra='allow', so the
     # additive key needs no validation change.
     version_phase: dict[str, Any] | None = None
+    # Current integration-branch HEAD CI-compliance signal. Additive compact
+    # block: {head_sha, compliant, violation_count, violations, checked,
+    # limits_available}. Used by the strategist to spawn cap-bump remediation
+    # before asking for qualification.
+    ci_compliance: dict[str, Any] | None = None
     # Citable memo summaries (terminal reasoning artifacts spawned from dropped
     # research findings) for this cycle window. Optional + default-None so
     # existing consumers and tests are unaffected. Each entry contains at
