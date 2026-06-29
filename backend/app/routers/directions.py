@@ -36,6 +36,7 @@ from app.direction_lifecycle import _reset_outcome_detection_state
 from app.strategic_events import STRATEGIC_KIND_DIRECTIONS, emit_strategic_updated
 from app.capability_proof import enrich_problem_model_capability_proofs
 from app.direction_refractory import get_direction_refractory_info
+from app.project_message_projection import legacy_direction_message_dict
 from app.problem_model import compute_model_size_signal, ProblemModel
 
 logger = logging.getLogger(__name__)
@@ -1542,15 +1543,4 @@ async def list_messages(
     stmt = stmt.order_by(ProjectMessage.created_at.desc()).limit(50)
     result = await session.execute(stmt)
     msgs = result.scalars().all()
-    return [
-        {
-            "id": str(m.id),
-            "type": m.message_type,
-            "content": m.content,
-            "from": m.from_type,
-            "status": m.status,
-            "context": m.context,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
-        }
-        for m in msgs
-    ]
+    return [legacy_direction_message_dict(m) for m in msgs]

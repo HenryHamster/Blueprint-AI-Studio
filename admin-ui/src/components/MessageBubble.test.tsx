@@ -152,6 +152,45 @@ describe('MessageBubble', () => {
     }));
   });
 
+  test('chat presentation hides triage chrome while preserving reply', () => {
+    const onReply = vi.fn();
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      actionMode: 'reply-only',
+      msg: makeMsg({
+        message_type: 'BUG_REPORT',
+        from_type: 'strategic',
+        content: 'Please choose the next direction.',
+        context: {
+          event_type: 'failure_alert',
+          _provenance_warnings: {
+            citation_state: 'absent',
+            broken_refs: ['backend/app/models.py:Task'],
+          },
+        },
+      }),
+      onReply,
+    })} />);
+
+    expect(screen.getByText('Strategic')).toBeTruthy();
+    expect(screen.getByText('Please choose the next direction.')).toBeTruthy();
+    expect(screen.queryByText('Bug')).toBeNull();
+    expect(screen.queryByText('Failure alert')).toBeNull();
+    expect(screen.queryByText('cited code missing on HEAD')).toBeNull();
+    expect(screen.queryByTitle('Copy message ref')).toBeNull();
+    expect(screen.queryByTitle('Resolve')).toBeNull();
+    expect(screen.queryByTitle('Delete')).toBeNull();
+    expect(screen.queryByTitle('Create Direction')).toBeNull();
+
+    fireEvent.click(screen.getByTitle('Reply'));
+    expect(onReply).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'msg-1',
+      content: 'Please choose the next direction.',
+      from: 'Strategic',
+      message_type: 'BUG_REPORT',
+    }));
+  });
+
   test('shows resolved note when status is resolved with resolution', () => {
     render(<MessageBubble {...makeProps({
       msg: makeMsg({ status: 'resolved', resolution: 'Fixed in PR 123' }),

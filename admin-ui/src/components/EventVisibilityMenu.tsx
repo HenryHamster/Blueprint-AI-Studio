@@ -2,7 +2,7 @@ import { useMemo } from 'react';
 import { Settings } from 'lucide-react';
 import { parseTimestamp } from '../utils/time';
 import { type EventPref } from './eventPrefs';
-import { type ProjectMessage } from './MessageBubble';
+import type { ProjectMessage } from '../types/messages';
 
 interface EventVisibilityMenuProps {
   open: boolean;

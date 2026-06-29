@@ -31,6 +31,7 @@ from app.direction_outcomes import proven_merged_count, verified_merged_count
 from app.knowledge_query import build_compute_sweep_groups, build_sweep_knowledge_index
 from app.message_convergence import get_message_link, resolve_message_ref
 from app.models import Project, QualificationVerdict, ReleaseVersion, Task
+from app.project_message_projection import agent_fetch_message_dict
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
 from app.source_ref_validation import (
@@ -377,22 +378,12 @@ async def agent_fetch_message(
     too-short (400) refs, and matches across all statuses."""
     project = await _resolve_agent_project(project_id, token, session)
     msg = await resolve_message_ref(session, project.id, ref)
-    message_type = msg.message_type
-    type_value = (
-        message_type.value if hasattr(message_type, "value") else str(message_type)
-    )
     return {
         "status": "success",
-        "data": {
-            "id": str(msg.id),
-            "content": msg.content,
-            "type": type_value,
-            "from_type": msg.from_type,
-            "status": msg.status,
-            "resolution": msg.resolution,
-            "convergence_link": get_message_link(msg),
-            "created_at": msg.created_at.isoformat() if msg.created_at else None,
-        },
+        "data": agent_fetch_message_dict(
+            msg,
+            convergence_link=get_message_link(msg),
+        ),
     }
 
 

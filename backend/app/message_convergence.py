@@ -24,6 +24,7 @@ from fastapi import HTTPException
 from sqlmodel import select
 
 from app.models import MessageType, ProjectMessage
+from app.project_message_projection import enum_value
 from app.time_utils import _utcnow
 
 if TYPE_CHECKING:
@@ -197,17 +198,13 @@ def _message_ref_candidates(
 
     candidates: list[dict[str, str | None]] = []
     for msg in ordered:
-        msg_type = getattr(msg, "message_type", None)
-        type_value = (
-            msg_type.value if hasattr(msg_type, "value") else str(msg_type or "")
-        )
         candidates.append(
             {
                 "id": str(msg.id),
                 "ref": msg.id.hex[:prefix_len],
-                "type": type_value,
+                "type": enum_value(getattr(msg, "message_type", "")),
                 "from_type": str(getattr(msg, "from_type", "") or ""),
-                "status": str(getattr(msg, "status", "") or ""),
+                "status": enum_value(getattr(msg, "status", "")),
                 "created_at": msg.created_at.isoformat() if msg.created_at else None,
             }
         )

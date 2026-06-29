@@ -1,4 +1,5 @@
 import { apiFetch, type StrategicRefreshMarker } from './api';
+import type { ProjectMessagePreview } from './types/messages';
 
 export interface StrategicStateCycle {
   id: string;
@@ -31,19 +32,8 @@ export interface StrategicStateTask {
   created_at?: string | null;
 }
 
-export interface StrategicStateMessage {
-  id: string;
-  project_id: string;
-  message_type: string;
-  from_type: string;
-  from_task_id: string | null;
-  content: string;
-  context: Record<string, unknown>;
-  status: string;
-  resolution: string | null;
-  resolved_at: string | null;
-  created_at: string | null;
-}
+export type StrategicStateMessagePreview = ProjectMessagePreview;
+export type StrategicStateMessage = StrategicStateMessagePreview;
 
 export interface StrategicStateAttentionItem {
   id: string;

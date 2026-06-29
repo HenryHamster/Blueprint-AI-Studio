@@ -2,7 +2,8 @@ import { type Dispatch, type SetStateAction, type RefObject } from 'react';
 import { MessageSquare, AlertTriangle, HelpCircle, ChevronDown, ArrowDown, ChevronUp, Check, MoreVertical } from 'lucide-react';
 import { ROUTINE_EVENT_LABELS } from './eventPrefs';
 import { type RoutineRow, type MessageWithDivider, routineSummary, formatDailyDigestSummary, outcomeBreakdown, insertTimeDividers, formatTimestamp, formatSinceTimestamp } from './messageGrouping';
-import { type ProjectMessage, MessageBubble, type MessageBubbleProps } from './MessageBubble';
+import { MessageBubble, type MessageBubbleProps } from './MessageBubble';
+import type { ProjectMessage } from '../types/messages';
 import { MessagesSummaryCard } from './MessagesSummaryCard';
 import { type MessageSummaryCounts } from './useMessageList';
 import { type TemporaryMutes } from './temporaryMutes';
@@ -152,6 +153,7 @@ export function MessagesListView({
                   msg={item.msg}
                   faded={item.msg.status === 'resolved'}
                   allMessages={messages}
+                  presentation="chat"
                   {...bubbleProps}
                 />
               ),

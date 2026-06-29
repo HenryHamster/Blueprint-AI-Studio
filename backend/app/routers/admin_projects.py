@@ -44,6 +44,7 @@ from app.ci_resolution import (
 from app.capability_proof import enrich_problem_model_capability_proofs
 from app.message_convergence import LINKED_STATUS, OPEN_STATUS
 from app.operator_attention import build_operator_attention
+from app.project_message_projection import message_preview_dict
 from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
 from app.onboarding_proof import build_onboarding_proof_block
@@ -105,14 +106,6 @@ def _compact_text(value: Any, *, max_chars: int = 360) -> str | None:
     return f"{text[: max_chars - 1]}…"
 
 
-_MESSAGE_CONTEXT_PREVIEW_KEYS = (
-    "event_type",
-    "direction_id",
-    "task_id",
-    "source_task_id",
-    "dedupe_key",
-)
-
 _LIVE_STRATEGIC_TASK_STATUSES = frozenset(
     {
         TaskStatus.QUEUED,
@@ -130,25 +123,7 @@ def _is_live_strategic_task(task: Task | None) -> bool:
 
 
 def _message_preview(message: ProjectMessage) -> Dict[str, Any]:
-    raw_context = message.context or {}
-    context_preview = {
-        key: _compact_text(raw_context.get(key), max_chars=120)
-        for key in _MESSAGE_CONTEXT_PREVIEW_KEYS
-        if isinstance(raw_context, dict) and raw_context.get(key) is not None
-    }
-    return {
-        "id": str(message.id),
-        "project_id": str(message.project_id),
-        "message_type": _enum_value(message.message_type),
-        "from_type": message.from_type,
-        "from_task_id": str(message.from_task_id) if message.from_task_id else None,
-        "content": _compact_text(message.content, max_chars=280) or "",
-        "context": context_preview,
-        "status": message.status,
-        "resolution": message.resolution,
-        "resolved_at": message.resolved_at.isoformat() if message.resolved_at else None,
-        "created_at": message.created_at.isoformat() if message.created_at else None,
-    }
+    return message_preview_dict(message)
 
 
 def _task_summary(task: Task | None) -> Dict[str, Any] | None:

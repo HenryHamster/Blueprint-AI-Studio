@@ -10,7 +10,7 @@ import { type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes } from './t
 import { groupRoutineMessages, outcomeBreakdown, isFailingGroup } from './messageGrouping';
 import { loadLastSeen, saveLastSeen } from './lastSeen';
 import { fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './serverSync';
-import { type ProjectMessage } from './MessageBubble';
+import type { ProjectMessage } from '../types/messages';
 import { SaveViewDialog } from './SaveViewDialog';
 import { useMessageList } from './useMessageList';
 import { MessagesListView } from './MessagesListView';

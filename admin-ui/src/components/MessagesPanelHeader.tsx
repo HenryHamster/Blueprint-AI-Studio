@@ -3,7 +3,7 @@ import { X, MessageSquare, AlertTriangle, ChevronUp, Save, SlidersHorizontal } f
 import { type EventPref } from './eventPrefs';
 import { type MuteWindow } from './muteWindow';
 import { type SavedView } from './savedViews';
-import { type ProjectMessage } from './MessageBubble';
+import type { ProjectMessage } from '../types/messages';
 import { formatTimestamp } from './messageGrouping';
 import { MuteWindowMenu } from './MuteWindowMenu';
 import { EventVisibilityMenu } from './EventVisibilityMenu';

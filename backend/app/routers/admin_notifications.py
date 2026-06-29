@@ -33,6 +33,7 @@ from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
 from app.message_convergence import LINKED_STATUS
+from app.project_message_projection import admin_message_dict
 from app import notification_dispatch as _nd
 from app.playbook_storage import (
     _archive_least_useful_entry,
@@ -486,22 +487,7 @@ async def list_messages(
     messages = guaranteed_msgs + [m for m in paged if m.id not in guaranteed_ids]
 
     return {
-        "messages": [
-            {
-                "id": str(m.id),
-                "project_id": str(m.project_id),
-                "message_type": m.message_type,
-                "from_type": m.from_type,
-                "from_task_id": str(m.from_task_id) if m.from_task_id else None,
-                "content": m.content,
-                "context": m.context or {},
-                "status": m.status,
-                "resolution": m.resolution,
-                "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None,
-                "created_at": m.created_at.isoformat() if m.created_at else None,
-            }
-            for m in messages
-        ],
+        "messages": [admin_message_dict(m) for m in messages],
         "total": total,
     }
 

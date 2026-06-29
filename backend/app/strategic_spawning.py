@@ -97,6 +97,7 @@ from app.shared_state import (
 from app.time_utils import _utcnow, _coerce_naive_utc
 from app.vision_merge import REJECTED_EDITS_KEY
 from app.landed_signal import LANDED_ON_INTEGRATION_KEY
+from app.project_message_projection import agent_thread_message_dict
 
 logger = logging.getLogger(__name__)
 
@@ -2337,15 +2338,7 @@ async def _fetch_open_messages(
     )
     messages = [
         {
-            "id": str(m.id),
-            "type": m.message_type,
-            "content": m.content,
-            "context": m.context,
-            "from": m.from_type,
-            "status": m.status,
-            "resolution": m.resolution,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
-            "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None,
+            **agent_thread_message_dict(m),
             # Promote the reproduce-on-HEAD citation signal (stored on the
             # message context at ingestion) to the top level so a stale or
             # broken-citation bug report is VISIBLY discounted to the strategist
@@ -4729,20 +4722,7 @@ async def _spawn_strategic_review(
         .limit(15)
     )
     all_thread_msgs = list(reversed(thread_result.scalars().all()))  # chronological
-    conversation_thread = [
-        {
-            "id": str(m.id),
-            "type": m.message_type,
-            "content": m.content,
-            "context": m.context,
-            "from": m.from_type,
-            "status": m.status,
-            "resolution": m.resolution,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
-            "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None,
-        }
-        for m in all_thread_msgs
-    ]
+    conversation_thread = [agent_thread_message_dict(m) for m in all_thread_msgs]
     # The strategist's open-message inbox is its OWN authoritative status query
     # — NOT a slice of the conversation_thread above (capped at 15 by recency).
     # Deriving it from that slice meant any OPEN BUG_REPORT/BLOCKER older than
