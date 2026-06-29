@@ -1110,19 +1110,44 @@ describe('buildSweepComparisonSection', () => {
     expect(result).toBe('');
   });
 
-  it('returns empty string when arms have duplicate labels or ids', () => {
+  it('returns empty string when arms have duplicate labels', () => {
     expect(buildSweepComparisonSection({
       'sweep-duplicate-label': [
         { id: 'k-1', title: 'arm A', arm_label: 'same', criterion_met: true },
         { id: 'k-2', title: 'arm B', arm_label: 'same', criterion_met: false },
       ],
     })).toBe('');
-    expect(buildSweepComparisonSection({
-      'sweep-duplicate-id': [
-        { id: 'k-1', title: 'arm A', arm_label: 'a', criterion_met: true },
-        { id: 'k-1', title: 'arm B', arm_label: 'b', criterion_met: false },
+  });
+
+  it('renders single-document arms-block sweeps (duplicate doc id, distinct arm_label)', () => {
+    // build_compute_sweep_groups emits one row per per_arm_verdict entry, all sharing
+    // the same knowledge document id from base_entry. Arms are identified by arm_label.
+    const result = buildSweepComparisonSection({
+      'sweep-single-doc': [
+        {
+          id: 'k-shared',
+          title: 'Sweep result doc',
+          arm_label: 'approach-a',
+          criterion_met: true,
+          criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+          per_arm_verdicts: {
+            'approach-a': { value: 0.95, met: true },
+            'approach-b': { value: 0.87, met: false },
+          },
+        },
+        {
+          id: 'k-shared',
+          title: 'Sweep result doc',
+          arm_label: 'approach-b',
+          criterion_met: false,
+        },
       ],
-    })).toBe('');
+    });
+    expect(result).toContain('Sweep sweep-single-doc');
+    expect(result).toContain('Winner: **approach-a** (accuracy=0.95; margin=0.08 over approach-b=0.87)');
+    expect(result).toContain('margin: +0.08 accuracy over approach-b');
+    expect(result).toContain('**approach-a** [MET] [k-shared] (accuracy=0.95)');
+    expect(result).toContain('**approach-b** [NOT MET] [k-shared] (accuracy=0.87)');
   });
 
   it('returns empty string when criterion_met is not boolean', () => {

@@ -557,18 +557,16 @@ export function buildSweepComparisonSection(
       disposed.push({ sweepId, disposition: dispArm.sweep_disposition as Record<string, unknown> });
       continue;
     }
-    const ids = new Set<string>();
     const labels = new Set<string>();
     const identities = new Set<string>();
     const allVerdicted = arms.every(arm => {
       const armId = strVal(arm.id);
       const armLabel = strVal(arm.arm_label);
+      // identity = label when present; falls back to doc id. Arms sharing a doc id
+      // (single-document arms-block shape from build_compute_sweep_groups) are
+      // distinguished by arm_label, so duplicate doc ids are allowed when labels differ.
       const identity = armLabel || armId;
       if (!identity) return false;
-      if (armId) {
-        if (ids.has(armId)) return false;
-        ids.add(armId);
-      }
       if (armLabel) {
         if (labels.has(armLabel)) return false;
         labels.add(armLabel);
@@ -630,8 +628,9 @@ export function buildSweepComparisonSection(
       arm.met && arm.value !== null ? [{ id: arm.id, label: arm.label, value: arm.value }] : []
     ));
     const metricWinner = bestArmByMetric(metArms, direction);
+    const winnerKey = metricWinner ? (metricWinner.label || metricWinner.id) : '';
     const runnerUp = metricWinner && measuredArms.length > 1
-      ? measuredArms.find(arm => arm.id !== metricWinner.id) ?? null
+      ? measuredArms.find(arm => (arm.label || arm.id) !== winnerKey) ?? null
       : measuredArms[1] ?? null;
     const metLabels = armRows.filter(arm => arm.met).map(arm => arm.label);
     const winnerLabel = metricWinner
