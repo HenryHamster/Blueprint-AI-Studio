@@ -2495,6 +2495,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "summarize": _summarize_version_phase,
         "floor": _version_phase_floor,
     },
+    # Cycle-start SHA divergence check: present only when _resolve_candidate_currency
+    # resolves.  Small dict of scalars — no summarize_fn, drops whole under extreme
+    # pressure.  High priority so it ships alongside version_phase.
+    "payload_staleness": {"priority": "high"},
     # What is actually deployed (running live on the promotion target) vs what
     # has merged to the integration branch but is not yet promoted. High
     # priority: it is load-bearing for every runtime-metric judgment, and small.
@@ -4824,6 +4828,7 @@ async def _spawn_strategic_review(
     # gated on the per-project branch pair, not project.is_self_repo. Best-effort.
     _open_version = None
     _version_phase_block: dict | None = None
+    _currency: dict | None = None
     _integration_branch = get_project_integration_branch(project)
     _promotion_target = get_project_promotion_target(project)
     if _integration_branch != _promotion_target:
@@ -6022,6 +6027,19 @@ async def _spawn_strategic_review(
                     }
         except Exception:
             logger.exception("[STRATEGIC] build-stall hint build failed; continuing")
+    # Derive structured payload-staleness signal from the already-resolved
+    # _currency dict.  Exposes payload_compiled_sha, active_candidate_sha,
+    # integration_head_sha, and an explicit stale/current verdict at cycle start
+    # so the agent can detect stale-context before making portfolio decisions.
+    # Best-effort: _currency is None when GitHub was unreachable (no-op below).
+    _payload_staleness: dict | None = None
+    if _currency is not None:
+        _payload_staleness = {
+            "payload_compiled_sha": _currency["candidate_sha"],
+            "active_candidate_sha": _currency["head_sha"],
+            "integration_head_sha": _currency["head_sha"],
+            "stale": not _currency["current"],
+        }
     # Inject explicit list of failed approaches from retired directions so the
     # agent has a clear "do not re-propose" block in the prompt.
     _retired_summary = _build_retired_directions_summary(project)
@@ -6348,6 +6366,7 @@ async def _spawn_strategic_review(
             ),
             **({"drift_signals": drift_summary} if drift_summary else {}),
             **({"version_phase": _version_phase_block} if _version_phase_block else {}),
+            **({"payload_staleness": _payload_staleness} if _payload_staleness else {}),
             **({"ci_compliance": _ci_compliance_block} if _ci_compliance_block else {}),
             **(
                 {"deployment_state": _deployment_state_block}

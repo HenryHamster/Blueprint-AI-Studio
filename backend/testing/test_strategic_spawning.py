@@ -6860,6 +6860,130 @@ async def test_stabilize_carried_findings_degrades_when_sha_unresolvable(
 
 
 @pytest.mark.asyncio
+async def test_spawn_strategic_review_payload_staleness_stale_when_candidate_behind(
+    db_session, mocker, _lts_split_active
+):
+    """When the qualification candidate is BEHIND integration HEAD, the spawned
+    strategic_review payload must contain a payload_staleness block with stale=True,
+    payload_compiled_sha == candidate_sha, and active_candidate_sha == head_sha."""
+    await _ensure_releaseversion_table(db_session)
+    await _ensure_audit_finding_resolution_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "a" * 40
+    head = "b" * 40
+    version = _make_stabilize_version_with_candidate(candidate)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(mocker, resolved=("tok", "owner", "repo"), head_sha=head)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    staleness = payload.get("payload_staleness")
+    assert staleness is not None, "payload_staleness must be present when currency resolved"
+    assert staleness["stale"] is True, "stale must be True when candidate is behind HEAD"
+    assert staleness["payload_compiled_sha"] == candidate
+    assert staleness["active_candidate_sha"] == head
+    assert staleness["integration_head_sha"] == head
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_payload_staleness_current_when_candidate_matches_head(
+    db_session, mocker, _lts_split_active
+):
+    """When the qualification candidate equals the live HEAD, payload_staleness
+    must be present with stale=False."""
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    sha = "c" * 40
+    version = _make_stabilize_version_with_candidate(sha)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(mocker, resolved=("tok", "owner", "repo"), head_sha=sha)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    staleness = payload.get("payload_staleness")
+    assert staleness is not None, "payload_staleness must be present when currency resolved"
+    assert staleness["stale"] is False, "stale must be False when candidate equals HEAD"
+    assert staleness["active_candidate_sha"] == sha
+    assert staleness["integration_head_sha"] == sha
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_payload_staleness_absent_when_currency_indeterminate(
+    db_session, mocker, _lts_split_active
+):
+    """When _resolve_candidate_currency returns None (GitHub unreachable or no
+    candidate SHA), payload_staleness must be absent from the spawned payload."""
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "d" * 40
+    version = _make_stabilize_version_with_candidate(candidate)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    # resolved=None means _resolve_github_with_session returned None (no credentials)
+    # so _resolve_candidate_currency returns None -> _currency stays None.
+    _patch_candidate_currency(mocker, resolved=None, head_sha="e" * 40)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    assert "payload_staleness" not in payload, (
+        "payload_staleness must be absent when currency is indeterminate"
+    )
+
+
+@pytest.mark.asyncio
 async def test_stabilize_hint_names_hard_blocker_as_binding_constraint(
     db_session, mocker, _lts_split_active
 ):

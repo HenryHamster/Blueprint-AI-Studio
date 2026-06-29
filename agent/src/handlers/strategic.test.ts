@@ -187,6 +187,8 @@ vi.mock('./strategic-sections.js', () => ({
   ) => `DIRHEALTH(max=${maxActiveDirections},auth=${authoritative ? authoritative.active : undefined})`,
   buildSweepComparisonSection: () => '',
   buildCiComplianceSection: () => '',
+  buildPayloadStalenessSection: (staleness: Record<string, unknown> | undefined) =>
+    staleness && staleness.stale === true ? 'STALENESS(stale)' : '',
 }));
 
 vi.mock('../telemetry.js', () => ({

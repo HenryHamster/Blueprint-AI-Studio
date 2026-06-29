@@ -113,6 +113,7 @@ function buildStrategicFingerprintPrompt(
     availableCapabilitiesSection: p.availableCapabilitiesSection ? '<available-capabilities>' : '',
     sweepComparisonSection: p.sweepComparisonSection ? '<sweep-comparison>' : '',
     localRunnerSection: p.localRunnerSection ? '<local-runner>' : '',
+    payloadStalenessSection: p.payloadStalenessSection ? '<payload-staleness>' : '',
   };
   const prompt = buildThinkerPrompt(canonical);
   const withSuffix = promptSuffix
@@ -239,6 +240,13 @@ export interface ThinkerPromptParams {
    * constructions/tests that omit it still compile; '' renders nothing.
    */
   localRunnerSection?: string;
+  /**
+   * Payload currency check — present when the backend could compute SHA
+   * divergence between the compiled payload and the current integration HEAD.
+   * Optional so existing constructions/tests that omit it still compile;
+   * '' renders nothing (also omitted when staleness is absent or indeterminate).
+   */
+  payloadStalenessSection?: string;
 }
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
@@ -283,6 +291,7 @@ ${p.clockHeader}
 Self-repo: ${p.isSelfRepo ? 'true' : 'false'}
 ${p.userStateLine}
 ${p.packerMetaSection ? `\n${p.packerMetaSection}\n` : ''}
+${p.payloadStalenessSection ? `\n${p.payloadStalenessSection}\n` : ''}
 ${p.strategicContext ? `\n## Running Context (from prior cycles)\n${p.strategicContext}\n` : ''}
 ${p.problemModelSection}
 ${p.cycleStartReconciliationSection ? `\n${p.cycleStartReconciliationSection}\n` : ''}

@@ -17,7 +17,9 @@ import {
   buildDirHealthSummary,
   buildCiComplianceSection,
   buildSweepComparisonSection,
+  buildPayloadStalenessSection,
 } from './strategic-sections.js';
+import { buildThinkerPrompt } from '../prompts/thinker.js';
 
 describe('fmtScalar', () => {
   it('returns fallback for undefined/null', () => {
@@ -1728,5 +1730,92 @@ describe('buildSweepComparisonSection', () => {
     expect(result).toContain('Sweep sweep-completed');
     // Disposed sweep id must NOT appear under the completed sweeps section.
     expect(result).not.toContain('Sweep sweep-disposed');
+  });
+});
+
+describe('buildPayloadStalenessSection', () => {
+  const STALE_SHA = 'a'.repeat(40);
+  const HEAD_SHA = 'b'.repeat(40);
+
+  it('returns empty string for undefined', () => {
+    expect(buildPayloadStalenessSection(undefined)).toBe('');
+  });
+
+  it('returns empty string for object missing stale boolean', () => {
+    expect(buildPayloadStalenessSection({ payload_compiled_sha: STALE_SHA })).toBe('');
+    expect(buildPayloadStalenessSection({})).toBe('');
+  });
+
+  it('divergence rendered — stale=true shows ⚠ STALE block with truncated SHAs', () => {
+    const result = buildPayloadStalenessSection({
+      stale: true,
+      payload_compiled_sha: STALE_SHA,
+      active_candidate_sha: HEAD_SHA,
+    });
+    expect(result).toContain('⚠ STALE');
+    expect(result).toContain(STALE_SHA.slice(0, 12));
+    expect(result).toContain(HEAD_SHA.slice(0, 12));
+    expect(result).toContain('## Payload Currency (cycle-start check)');
+    expect(result).toContain('Do NOT treat unverified audit findings');
+  });
+
+  it('no false positive — stale=false shows CURRENT line, not ⚠ STALE', () => {
+    const result = buildPayloadStalenessSection({
+      stale: false,
+      payload_compiled_sha: STALE_SHA,
+      active_candidate_sha: STALE_SHA,
+    });
+    expect(result).not.toContain('⚠ STALE');
+    expect(result).toContain('CURRENT');
+    expect(result).toContain('## Payload Currency (cycle-start check)');
+  });
+
+  it('position in prompt — staleness section appears before problem model', () => {
+    const stalenessMarker = 'STALENESS_MARKER_XYZ';
+    const problemModelMarker = 'PROBLEM_MODEL_MARKER_XYZ';
+    const prompt = buildThinkerPrompt({
+      contextPrefix: '',
+      projectName: 'test',
+      clockHeader: '',
+      isSelfRepo: false,
+      userStateLine: '',
+      packerMetaSection: '',
+      payloadStalenessSection: stalenessMarker,
+      strategicContext: '',
+      problemModelSection: problemModelMarker,
+      problemModelRecovery: 'present',
+      cycleStartReconciliationSection: '',
+      reflectionSection: '',
+      selfImprovementBlock: '',
+      runningUpdateSection: '',
+      designDocJson: '',
+      visionJson: '',
+      outcomeSection: '',
+      previousDecisionOutcomes: '',
+      pastRetirementCritiquesSection: '',
+      retiredDirectionsSummarySection: '',
+      dirSummaryText: '',
+      dirHealthSummary: '',
+      userPausedSection: '',
+      rejectedProposalsSection: '',
+      operatorOverridesSection: '',
+      portfolioCompositionText: '',
+      modelHealthSection: '',
+      systemMaturitySection: '',
+      driftSection: '',
+      recentWorkSection: '',
+      feedbackSection: '',
+      questionSection: '',
+      threadSection: '',
+      taskId: 'test-task',
+      versionPhaseSection: '',
+      memoCitationsSection: '',
+      efficiencySnapshotSection: '',
+    });
+    const stalenessPos = prompt.indexOf(stalenessMarker);
+    const problemModelPos = prompt.indexOf(problemModelMarker);
+    expect(stalenessPos).toBeGreaterThan(-1);
+    expect(problemModelPos).toBeGreaterThan(-1);
+    expect(stalenessPos).toBeLessThan(problemModelPos);
   });
 });

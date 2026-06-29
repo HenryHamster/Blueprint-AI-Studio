@@ -1246,3 +1246,33 @@ export function buildDirHealthSummary(
     gaps.length > 0 ? `GAPS DETECTED: ${gaps.join(', ')}` : 'No critical gaps detected.',
   ].join('\n');
 }
+
+/**
+ * Render payload currency (cycle-start staleness check). When the strategic
+ * payload was compiled against an older qualification candidate than the current
+ * integration HEAD, audit findings are scored against stale code and must not
+ * be blindly trusted as current. Returns '' when staleness is absent or
+ * indeterminate (non-boolean stale field), so the section is omitted when the
+ * backend could not compute it (e.g. no version system, GitHub API unavailable).
+ */
+export function buildPayloadStalenessSection(staleness: Record<string, unknown> | undefined): string {
+  if (!staleness || typeof staleness !== 'object') return '';
+  if (typeof staleness.stale !== 'boolean') return '';
+
+  const payloadSha = typeof staleness.payload_compiled_sha === 'string'
+    ? staleness.payload_compiled_sha.slice(0, 12)
+    : '?';
+  const candidateSha = typeof staleness.active_candidate_sha === 'string'
+    ? staleness.active_candidate_sha.slice(0, 12)
+    : '?';
+
+  const lines: string[] = ['\n## Payload Currency (cycle-start check)'];
+  if (staleness.stale) {
+    lines.push(`⚠ STALE — this payload was compiled against candidate \`${payloadSha}\`, but the active qualification candidate is now \`${candidateSha}\`.`);
+    lines.push('Audit findings, CI compliance, and direction scores in this payload were evaluated against the OLDER candidate commit, not the current integration HEAD.');
+    lines.push('Do NOT treat unverified audit findings as current promotion blockers before confirming they still reproduce on current HEAD. Consider fetching a fresh qualification before acting on stale findings.');
+  } else {
+    lines.push(`Candidate is CURRENT — payload compiled against \`${candidateSha}\`, which matches the active qualification candidate. Audit findings are scored against live HEAD.`);
+  }
+  return lines.join('\n');
+}

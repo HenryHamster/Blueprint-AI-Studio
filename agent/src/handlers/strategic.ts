@@ -63,6 +63,7 @@ import {
   buildDirHealthSummary,
   buildSweepComparisonSection,
   buildCiComplianceSection,
+  buildPayloadStalenessSection,
 } from './strategic-sections.js';
 
 /**
@@ -588,6 +589,10 @@ export async function handleStrategic(
     const cycleStartReconciliationSection = buildCycleStartReconciliationSection(
       payload.cycle_start_reconciliation as Record<string, unknown> | undefined,
     );
+    const payloadStaleness = payload.payload_staleness && typeof payload.payload_staleness === 'object'
+      ? payload.payload_staleness as Record<string, unknown>
+      : undefined;
+    const payloadStalenessSection = buildPayloadStalenessSection(payloadStaleness);
     const pruneCandidatesSection = buildPruneCandidatesSection(
       payload.prune_candidates as Record<string, unknown> | undefined,
     );
@@ -698,6 +703,7 @@ prompts, schemas, tools, or orchestration.` : '';
       sweepComparisonSection: buildSweepComparisonSection(
         payload.compute_experiment_sweeps as Record<string, Array<Record<string, unknown>>> | undefined,
       ),
+      payloadStalenessSection,
     };
 
     const thinkerPrompt = buildThinkerPrompt(thinkerParams);

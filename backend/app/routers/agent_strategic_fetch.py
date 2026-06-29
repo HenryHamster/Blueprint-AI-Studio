@@ -637,6 +637,28 @@ async def agent_fetch_version_phase(
     if _current_version_data is not None and version_phase_criterion_coverage is not None:
         _current_version_data["criterion_coverage"] = version_phase_criterion_coverage
 
+    # Candidate-currency signal for the fetch/recovery path — same HEAD-vs-candidate
+    # comparison the spawn payload provides in payload_staleness.  Best-effort:
+    # a GitHub API failure must not break the endpoint.
+    candidate_currency: dict | None = None
+    if open_row is not None:
+        try:
+            from app.strategic_spawning import (  # noqa: PLC0415
+                _resolve_candidate_currency,
+                get_project_integration_branch,
+            )
+
+            _last_qual = open_row.last_qualification or {}
+            _integration_branch = get_project_integration_branch(project)
+            candidate_currency = await _resolve_candidate_currency(
+                session, project, _last_qual, _integration_branch
+            )
+        except Exception:
+            logger.exception(
+                "[AGENT_FETCH] candidate_currency resolve failed for project %s",
+                project_id,
+            )
+
     return {
         "status": "success",
         "data": {
@@ -646,6 +668,7 @@ async def agent_fetch_version_phase(
                 _compact_version_lifecycle(row, project) for row in recent_closed_rows
             ],
             "goal_coverage_drift": version_phase_drift,
+            **({"candidate_currency": candidate_currency} if candidate_currency is not None else {}),
         },
     }
 
