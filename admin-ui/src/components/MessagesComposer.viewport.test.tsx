@@ -7,7 +7,7 @@ import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } 
 async function renderComposer(
   root: Root,
   newType: string,
-  lastArming: 'steering' | 'passive_note' | 'routine_event' | null = null,
+  lastArming: 'steering' | 'passive_note' | 'routine_event' | 'not_armed' | null = null,
   strategistBusy = false,
   chrome: 'full' | 'minimal' = 'full',
 ) {
@@ -109,7 +109,7 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     await expectMinTouchTargetAt(375, async () => {});
   });
 
-  test('minimal chat composer hides type selector while preserving Strategic steering hint', async () => {
+  test('minimal chat composer keeps send affordance without persistent steering chrome', async () => {
     await expectNoOverflowAt(375, async () => {
       host = document.createElement('div');
       host.style.padding = '12px';
@@ -118,10 +118,72 @@ describe('MessagesComposer — steering hint viewport regression', () => {
       root = r;
       await renderComposer(r, 'FEEDBACK', null, false, 'minimal');
     });
-    expect(host!.textContent).toContain('Strategic');
     expect(host!.textContent).toContain('Send');
-    expect(host!.textContent).toContain('reaches the strategist soon');
+    expect(host!.textContent).not.toContain('Strategic');
+    expect(host!.textContent).not.toContain('reaches the strategist soon');
     expect(host!.textContent).not.toContain('won’t wake the strategist');
+    await expectNoTextTruncationAt(375, async () => {});
+    await expectMinTouchTargetAt(375, async () => {});
+  });
+
+  test('minimal chat composer still shows queued state when the strategist is busy', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderComposer(r, 'FEEDBACK', null, true, 'minimal');
+    });
+    expect(host!.textContent).toContain('Send');
+    expect(host!.textContent).toContain('queues for the next cycle');
+    expect(host!.textContent).not.toContain('Strategic');
+    await expectNoTextTruncationAt(375, async () => {});
+    await expectMinTouchTargetAt(375, async () => {});
+  });
+
+  test('minimal chat composer suppresses routine post-send hint chrome', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderComposer(r, 'FEEDBACK', 'routine_event', false, 'minimal');
+    });
+    expect(host!.textContent).toContain('Send');
+    expect(host!.textContent).not.toContain('Routine event');
+    expect(host!.textContent).not.toContain('won’t wake the strategist');
+    await expectNoTextTruncationAt(375, async () => {});
+    await expectMinTouchTargetAt(375, async () => {});
+  });
+
+  test('minimal chat composer prefers busy queued state over routine post-send hint', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderComposer(r, 'FEEDBACK', 'routine_event', true, 'minimal');
+    });
+    expect(host!.textContent).toContain('queues for the next cycle');
+    expect(host!.textContent).not.toContain('Routine event');
+    expect(host!.textContent).not.toContain('won’t wake the strategist');
+    await expectNoTextTruncationAt(375, async () => {});
+    await expectMinTouchTargetAt(375, async () => {});
+  });
+
+  test('minimal chat composer keeps not-armed warning visible', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderComposer(r, 'FEEDBACK', 'not_armed', false, 'minimal');
+    });
+    expect(host!.textContent).toContain('Couldn’t wake the strategist');
     await expectNoTextTruncationAt(375, async () => {});
     await expectMinTouchTargetAt(375, async () => {});
   });

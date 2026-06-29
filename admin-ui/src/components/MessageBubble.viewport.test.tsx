@@ -196,6 +196,6 @@ describe('MessageBubble — viewport regression', () => {
         );
       });
     });
-    if (host) expect(host.textContent).toContain('task task-abc');
+    if (host) expect(host.textContent).toContain('task-abc');
   });
 });

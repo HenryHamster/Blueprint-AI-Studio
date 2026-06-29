@@ -59,14 +59,14 @@ export function formatFromType(msg: ProjectMessage): string {
     const taskSlice = msg.from_task_id ? ` (${msg.from_task_id.slice(0, 8)})` : '';
     return `Agent${taskSlice}`;
   }
-  if (ft === 'strategic') return 'Strategic Review';
+  if (ft === 'strategic' || ft === 'strategist') return 'Strategic Review';
   if (ft === 'system') return 'System';
   return 'You';
 }
 
 function formatChatFromType(msg: ProjectMessage): string {
   const ft = (msg.from_type || '').toLowerCase();
-  if (ft === 'strategic') return 'Strategic';
+  if (ft === 'strategic' || ft === 'strategist') return 'Strategic';
   if (ft === 'system') return 'System';
   if (ft === 'agent') return 'Agent';
   return 'You';
@@ -74,7 +74,8 @@ function formatChatFromType(msg: ProjectMessage): string {
 
 // eslint-disable-next-line react-refresh/only-export-components
 export function isUserMessage(msg: ProjectMessage): boolean {
-  return (msg.from_type || '').toLowerCase() === 'user';
+  const ft = (msg.from_type || '').toLowerCase();
+  return ft === 'user' || ft === 'operator';
 }
 
 function asStringArray(value: unknown): string[] {
@@ -290,7 +291,7 @@ export function MessageBubble({
                   className="font-mono text-ui-md text-cyan-400 transition-colors hover:text-cyan-300"
                   title={`Open task ${taskId}`}
                 >
-                  task {taskId.slice(0, 8)}
+                  {taskId.slice(0, 8)}
                 </button>
               </>
             )}

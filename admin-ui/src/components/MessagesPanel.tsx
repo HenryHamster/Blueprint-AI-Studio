@@ -90,13 +90,6 @@ function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 
   return parts.join(' · ');
 }
 
-function formatContextPackageNumber(value: number | null | undefined): string {
-  const n = Number(value ?? 0);
-  if (!Number.isFinite(n)) return '0';
-  if (Math.abs(n) >= 1000) return `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k`;
-  return String(n);
-}
-
 function contextPackageTextTone(status?: string | null): string {
   if (status === 'building') return 'text-cyan-300';
   if (status === 'stale') return 'text-amber-300';
@@ -114,6 +107,21 @@ function attentionTextTone(level?: string | null): string {
   if (level === 'needs_operator') return 'text-amber-300';
   if (level === 'watch') return 'text-neutral-300';
   return 'text-emerald-300';
+}
+
+function isConversationMessage(
+  msg: ProjectMessage,
+  eventPrefs: Record<string, EventPref>,
+  tempMutes: TemporaryMutes,
+): boolean {
+  const fromType = (msg.from_type || '').toLowerCase();
+  const eventType = msg.context?.event_type;
+  const strategicOrigin = fromType === 'strategic' || fromType === 'strategist';
+  if (fromType === 'user' || fromType === 'operator') return true;
+  if (strategicOrigin && !eventType) return true;
+  if (msg.message_type === 'QUESTION' || msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT' || msg.message_type === 'FEEDBACK') return true;
+  if (eventType === 'question_answer' || eventType === 'feedback_acknowledgment') return true;
+  return effectiveSignal(msg, eventPrefs, tempMutes) === 'high';
 }
 
 function strategicRefreshFromReadModel(
@@ -274,7 +282,6 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const effectiveContextPackage = contextPackage ?? currentStrategicState?.context_package ?? null;
   const workbenchState = currentStrategicState?.workbench ?? null;
   const strategicAttention = currentStrategicState?.attention ?? null;
-  const strategicTaskCounts = currentStrategicState?.tasks.counts ?? null;
   const refreshStrategicState = onStrategicStateRefresh ?? onStrategicRefresh;
   const recordStrategicInteraction = useCallback(() => {
     if (!onStrategicInteraction) return;
@@ -284,9 +291,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   selectedProjectIdRef.current = selectedProjectId;
   const usesStrategicReadModelRef = useRef(usesStrategicReadModel);
   usesStrategicReadModelRef.current = usesStrategicReadModel;
-  const topAttentionItem = strategicAttention?.items[0] ?? null;
   const attentionNeeds = strategicAttention?.counts.needs_operator ?? 0;
-  const attentionWatch = strategicAttention?.counts.watch ?? 0;
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
   // Compose — initialized from the per-project draft (if any) so a reload restores it.
@@ -638,6 +643,16 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // surfaced types are included — matching App.tsx's closed-panel count exactly so the
   // badge does not jump when the operator opens the panel.
   const highSignalCount = countHighSignalMessages(messages, eventPrefs, tempMutes);
+  const conversationMessages = useMemo(() => {
+    return messages
+      .filter(msg => isConversationMessage(msg, eventPrefs, tempMutes))
+      .slice()
+      .sort((a, b) => {
+        const aTime = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
+        const bTime = b.created_at ? parseTimestamp(b.created_at).getTime() : 0;
+        return aTime - bTime;
+      });
+  }, [messages, eventPrefs, tempMutes]);
 
   const mutedCount = Object.values(eventPrefs).filter(v => v === 'mute').length;
 
@@ -948,7 +963,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const currentCount = highSignalOpen.length + routineOpen.length + visibleResolved.length;
+    const currentCount = conversationMode ? conversationMessages.length : highSignalOpen.length + routineOpen.length + visibleResolved.length;
     const isInitialLoad = prevMessageCountRef.current === 0 && currentCount > 0;
     if (isInitialLoad) {
       // First load — jump to bottom instantly
@@ -962,7 +977,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }
     // Don't scroll at all on polling refresh with same count — preserves position
     prevMessageCountRef.current = currentCount;
-  }, [highSignalOpen, routineOpen, visibleResolved]);
+  }, [conversationMode, conversationMessages.length, highSignalOpen, routineOpen, visibleResolved]);
 
   // Update parent with the high-signal count for the tab-title badge. highSignalCount is
   // countHighSignalMessages(messages), identical to the fetch callback and the closed-panel
@@ -1433,36 +1448,28 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         filterChrome={resolvedFilterChrome}
       />
 
-      {conversationMode && (effectiveContextPackage || currentStrategicState) && (
+      {conversationMode && (effectiveContextPackage || currentStrategicState || strategicRefresh || strategistActive) && (
         <div className="shrink-0 border-b border-neutral-800 bg-[#07090c] px-4 py-2 md:px-6" data-testid="strategic-context-package-strip">
-          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500">
-            <span className="shrink-0 font-semibold text-neutral-300">
-              {workbenchModeLabel(workbenchState?.interaction_mode)}
-            </span>
-            {effectiveContextPackage && (
-              <>
-                <span className="min-w-0 max-w-full truncate font-medium text-neutral-300">
-                  {effectiveContextPackage.title || 'Strategic context'}
-                </span>
-                <span className={contextPackageTextTone(effectiveContextPackage.status)}>
-                  {effectiveContextPackage.status || 'ready'}
-                </span>
-                {effectiveContextPackage.item_count ? <span>{formatContextPackageNumber(effectiveContextPackage.item_count)} items</span> : null}
-              </>
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500" aria-label="Strategic chat status">
+            <span className="shrink-0 font-semibold text-neutral-200">Strategic</span>
+            <span className="shrink-0 text-neutral-400">{workbenchModeLabel(workbenchState?.interaction_mode)}</span>
+            {strategistActive && (
+              <span className="text-cyan-300">{cycleProgress?.phase_label ?? 'Working'}</span>
             )}
-            {strategicAttention && (
+            {!strategistActive && strategicRefresh?.requested_at && (
+              <span className="text-amber-300">Steer queued</span>
+            )}
+            {!strategistActive && !strategicRefresh?.requested_at && strategicRefresh?.last_fired_at && (
+              <span className="text-emerald-300">Steer picked up · {timeAgo(strategicRefresh.last_fired_at)}</span>
+            )}
+            {effectiveContextPackage?.status && effectiveContextPackage.status !== 'ready' && (
+              <span className={contextPackageTextTone(effectiveContextPackage.status)}>
+                Context {effectiveContextPackage.status}
+              </span>
+            )}
+            {strategicAttention?.level === 'needs_operator' && attentionNeeds > 0 && (
               <span className={attentionTextTone(strategicAttention.level)}>
-                {strategicAttention.level === 'clear' ? 'clear' : `${attentionNeeds} needs / ${attentionWatch} watch`}
-              </span>
-            )}
-            {topAttentionItem && (
-              <span className="min-w-0 max-w-full truncate text-neutral-400">
-                {topAttentionItem.label}
-              </span>
-            )}
-            {strategicTaskCounts && (
-              <span>
-                {strategicTaskCounts.running} running / {strategicTaskCounts.queued} queued
+                {attentionNeeds} needs attention
               </span>
             )}
           </div>
@@ -1473,7 +1480,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           a receipt showing when a prior steer was picked up and acted upon. Hidden
           once the cycle starts (strategistActive), at which point "Strategist working…"
           takes over. Displays the queued directive excerpt and coalesce count. */}
-      {strategicRefresh && !strategistActive && (
+      {strategicRefresh && !strategistActive && !conversationMode && (
         <div className={`px-4 md:px-6 py-2 border-b ${strategicRefresh.requested_at ? 'border-neutral-800 bg-amber-950/40' : 'border-green-800 bg-emerald-950/40'} flex items-center gap-2 shrink-0`} role="status" aria-live="polite">
           <span className={`w-2 h-2 rounded-full ${strategicRefresh.requested_at ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'}`} aria-hidden="true" />
           <span className={`text-xs font-medium ${strategicRefresh.requested_at ? 'text-amber-300' : 'text-emerald-300'}`}>
@@ -1514,7 +1521,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       {/* Live strategist activity indicator — driven by strategic_cycle_started/completed
           WS events. Shows phase label and steering excerpt when the enriched event payload
           is available, otherwise falls back to the minimal "working" text. */}
-      {strategistActive && (
+      {strategistActive && !conversationMode && (
         <div className="px-4 md:px-6 py-2 border-b border-neutral-800 bg-indigo-950/40 flex items-start gap-2 shrink-0" role="status" aria-live="polite">
           <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse mt-0.5 shrink-0" aria-hidden="true" />
           <span className="text-xs text-indigo-300 font-medium min-w-0">
@@ -1537,34 +1544,37 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
             <span className="font-medium">
               {completionReceiptTone?.label ?? 'Cycle complete'}
             </span>
-            {lastCycleCompletion.failure_reason && (
+            {conversationMode && lastCycleCompletion.failure_reason && (
               <span className={`ml-1.5 ${completionReceiptTone?.message ?? 'text-emerald-400/80'}`}>{lastCycleCompletion.failure_reason.slice(0, 80)}</span>
             )}
-            {(lastCycleCompletion.created_count ?? 0) > 0 && (
+            {!conversationMode && lastCycleCompletion.failure_reason && (
+              <span className={`ml-1.5 ${completionReceiptTone?.message ?? 'text-emerald-400/80'}`}>{lastCycleCompletion.failure_reason.slice(0, 80)}</span>
+            )}
+            {!conversationMode && (lastCycleCompletion.created_count ?? 0) > 0 && (
               <span className="ml-1.5">· +{lastCycleCompletion.created_count} direction{lastCycleCompletion.created_count !== 1 ? 's' : ''}</span>
             )}
-            {(lastCycleCompletion.retired_count ?? 0) > 0 && (
+            {!conversationMode && (lastCycleCompletion.retired_count ?? 0) > 0 && (
               <span className="ml-1.5">· −{lastCycleCompletion.retired_count} retired</span>
             )}
-            {(lastCycleCompletion.staged_count ?? 0) > 0 && (
+            {!conversationMode && (lastCycleCompletion.staged_count ?? 0) > 0 && (
               <span className="ml-1.5">· {lastCycleCompletion.staged_count} direction{lastCycleCompletion.staged_count !== 1 ? 's' : ''} staged</span>
             )}
-            {(lastCycleCompletion.updated_count ?? 0) > 0 && (
+            {!conversationMode && (lastCycleCompletion.updated_count ?? 0) > 0 && (
               <span className="ml-1.5">· {lastCycleCompletion.updated_count} updated</span>
             )}
-            {(lastCycleCompletion.tasks_spawned ?? 0) > 0 && (
+            {!conversationMode && (lastCycleCompletion.tasks_spawned ?? 0) > 0 && (
               <span className="ml-1.5">· {lastCycleCompletion.tasks_spawned} task{lastCycleCompletion.tasks_spawned !== 1 ? 's' : ''} spawned</span>
             )}
-            {lastCycleCompletion.running_update_changed && (
+            {!conversationMode && lastCycleCompletion.running_update_changed && (
               <span className="ml-1.5">· running update written</span>
             )}
-            {lastCycleCompletion.problem_model_changed && (
+            {!conversationMode && lastCycleCompletion.problem_model_changed && (
               <span className="ml-1.5">· problem model updated</span>
             )}
-            {lastCycleCompletion.status_message && (
+            {!conversationMode && lastCycleCompletion.status_message && (
               <span className={`ml-1.5 ${completionReceiptTone?.message ?? 'text-emerald-400/80'} italic`}>{lastCycleCompletion.status_message.slice(0, 80)}</span>
             )}
-            {lastCycleCompletion.strategic_judgment_challenge && (
+            {!conversationMode && lastCycleCompletion.strategic_judgment_challenge && (
               <span className="ml-1.5 align-middle">
                 <StrategicChallengeChip summary={lastCycleCompletion.strategic_judgment_challenge} />
               </span>
@@ -1597,7 +1607,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         questionsRefEl={questionsRefEl}
         routineRefEl={routineRefEl}
         dividerDismissedRef={dividerDismissedRef}
-        messages={messages}
+        messages={conversationMode ? conversationMessages : messages}
         loading={loading}
         dividerTime={dividerTime}
         totalNewCount={totalNewCount}

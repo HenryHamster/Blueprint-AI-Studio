@@ -550,9 +550,9 @@ describe('MessagesPanel chrome modes', () => {
     vi.clearAllMocks();
   });
 
-  async function renderPanel(props: Partial<MessagesPanelProps> = {}) {
+  async function renderPanel(props: Partial<MessagesPanelProps> = {}, messages: _MockMsg[] = []) {
     _suppressSinceLastVisit('test-user@example.com', 'proj-1');
-    _mockMessagesFetch([]);
+    _mockMessagesFetch(messages);
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
@@ -637,9 +637,11 @@ describe('MessagesPanel chrome modes', () => {
     });
 
     const strip = el.querySelector('[data-testid="strategic-context-package-strip"]');
-    expect(strip?.textContent).toContain('Workbench context');
-    expect(strip?.textContent).toContain('ready');
-    expect(strip?.textContent).toContain('18 items');
+    expect(strip?.textContent).toContain('Strategic');
+    expect(strip?.textContent).toContain('Chat');
+    expect(strip?.textContent).not.toContain('Workbench context');
+    expect(strip?.textContent).not.toContain('ready');
+    expect(strip?.textContent).not.toContain('18 items');
     expect(strip?.textContent).not.toContain('canvas nodes');
   });
 
@@ -650,13 +652,132 @@ describe('MessagesPanel chrome modes', () => {
     });
 
     const strip = el.querySelector('[data-testid="strategic-context-package-strip"]');
+    expect(strip?.textContent).toContain('Strategic');
     expect(strip?.textContent).toContain('Check-in');
-    expect(strip?.textContent).toContain('Workbench context');
-    expect(strip?.textContent).toContain('ready');
-    expect(strip?.textContent).toContain('18 items');
-    expect(strip?.textContent).toContain('1 needs / 2 watch');
-    expect(strip?.textContent).toContain('Question waiting');
-    expect(strip?.textContent).toContain('3 running / 5 queued');
+    expect(strip?.textContent).toContain('1 needs attention');
+    expect(strip?.textContent).not.toContain('Workbench context');
+    expect(strip?.textContent).not.toContain('ready');
+    expect(strip?.textContent).not.toContain('18 items');
+    expect(strip?.textContent).not.toContain('Question waiting');
+    expect(strip?.textContent).not.toContain('3 running / 5 queued');
+  });
+
+  test('minimal chat chrome shows conversation messages chronologically without routine alerts', async () => {
+    const routine = makeMsg({
+      id: 'routine',
+      from_type: 'system',
+      message_type: 'NOTE',
+      content: 'pr merged successfully',
+      context: { event_type: 'pr_merged' },
+      created_at: '2026-06-01T10:03:00Z',
+    });
+    const strategicRoutine = makeMsg({
+      id: 'strategic-routine',
+      from_type: 'strategic',
+      message_type: 'NOTE',
+      content: 'cycle summary should stay out of chat',
+      context: { event_type: 'cycle_summary' },
+      created_at: '2026-06-01T10:04:00Z',
+    });
+    const strategic = makeMsg({
+      id: 'strategic',
+      from_type: 'strategist',
+      message_type: 'NOTE',
+      content: 'Strategic reply',
+      created_at: '2026-06-01T10:02:00Z',
+    });
+    const operator = makeMsg({
+      id: 'operator',
+      from_type: 'user',
+      message_type: 'FEEDBACK',
+      content: 'Operator steering',
+      created_at: '2026-06-01T10:00:00Z',
+    });
+    const question = makeMsg({
+      id: 'question',
+      from_type: 'agent',
+      message_type: 'QUESTION',
+      content: 'Should I keep this path?',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+
+    const el = await renderPanel({ filterChrome: 'minimal' }, [routine, strategicRoutine, strategic, operator, question]);
+
+    const text = el.textContent ?? '';
+    expect(text).toContain('Operator steering');
+    expect(text).toContain('Should I keep this path?');
+    expect(text).toContain('Strategic reply');
+    expect(text).not.toContain('pr merged successfully');
+    expect(text).not.toContain('cycle summary should stay out of chat');
+    expect(text.indexOf('Operator steering')).toBeLessThan(text.indexOf('Should I keep this path?'));
+    expect(text.indexOf('Should I keep this path?')).toBeLessThan(text.indexOf('Strategic reply'));
+  });
+
+  test('minimal chat chrome keeps queued and working state in the compact strip only', async () => {
+    const base = makeStrategicState();
+    const queuedState = makeStrategicState({
+      strategic: {
+        ...base.strategic,
+        refresh: {
+          pending: {
+            requested_at: '2026-06-01T10:00:00Z',
+            origin: 'operator',
+            reason: 'operator_message',
+            count: 1,
+          },
+          last_fired_at: null,
+          last_fired_origin: null,
+        },
+      },
+    });
+    const queuedEl = await renderPanel({
+      filterChrome: 'minimal',
+      strategicState: queuedState,
+    });
+
+    const queuedStrip = queuedEl.querySelector('[data-testid="strategic-context-package-strip"]');
+    expect(queuedStrip?.textContent).toContain('Steer queued');
+    expect(queuedEl.textContent).not.toContain('Strategic steer queued');
+    expect(queuedEl.textContent).not.toContain('Cancel');
+
+    await act(async () => { root?.unmount(); });
+    root = null;
+    host?.remove();
+    host = null;
+
+    const workingEl = await renderPanel({
+      filterChrome: 'minimal',
+      strategicState: makeStrategicState(),
+      strategistActive: true,
+      cycleProgress: { task_id: 't1', phase_label: 'Reviewing context' },
+    });
+    const workingStrip = workingEl.querySelector('[data-testid="strategic-context-package-strip"]');
+    expect(workingStrip?.textContent).toContain('Reviewing context');
+    expect(workingEl.textContent).not.toContain('Strategist: Reviewing context');
+    expect(workingEl.textContent).not.toContain('Strategic is working');
+  });
+
+  test('minimal chat chrome shows recent steer receipt in the compact strip', async () => {
+    const base = makeStrategicState();
+    const state = makeStrategicState({
+      strategic: {
+        ...base.strategic,
+        refresh: {
+          pending: null,
+          last_fired_at: new Date(Date.now() - 5 * 60_000).toISOString(),
+          last_fired_origin: 'operator',
+        },
+      },
+    });
+
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      strategicState: state,
+    });
+
+    const strip = el.querySelector('[data-testid="strategic-context-package-strip"]');
+    expect(strip?.textContent).toContain('Steer picked up');
+    expect(el.textContent).not.toContain('strategic cycle ran');
   });
 
   test('compact/full message chrome keeps the context package out of the legacy surface', async () => {
@@ -4771,7 +4892,7 @@ describe('MessagesPanel composer draft persistence', () => {
 
     const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
     expect(textarea.value).toBe('use the clean chat path');
-    expect(container.textContent).toContain('Strategic');
+    expect(container.textContent).toContain('Send');
     expect(container.textContent).not.toContain('Blocker');
 
     await act(async () => {

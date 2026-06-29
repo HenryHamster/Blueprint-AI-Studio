@@ -249,8 +249,11 @@ describe('MessagesPanel — viewport regression', () => {
 
     const strip = host!.querySelector('[data-testid="strategic-context-package-strip"]');
     expect(strip).not.toBeNull();
-    expect(strip!.textContent).toContain('42 items');
-    expect(strip!.textContent).toContain('2 needs / 5 watch');
+    expect(strip!.textContent).toContain('Strategic');
+    expect(strip!.textContent).toContain('Workday');
+    expect(strip!.textContent).toContain('2 needs attention');
+    expect(strip!.textContent).not.toContain('42 items');
+    expect(strip!.textContent).not.toContain('2 needs / 5 watch');
     expect(strip!.textContent).not.toContain('canvas nodes');
   });
 

@@ -204,9 +204,26 @@ describe('MessageBubble', () => {
       onOpenTask,
     })} />);
 
-    const taskButton = screen.getByText('task task-abc');
+    const taskButton = screen.getByText('task-abc');
     fireEvent.click(taskButton);
     expect(onOpenTask).toHaveBeenCalledWith('task-abcdef123456');
+  });
+
+  test('chat presentation treats operator from_type as the local speaker', () => {
+    const onReply = vi.fn();
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      actionMode: 'reply-only',
+      msg: makeMsg({
+        from_type: 'operator',
+        content: 'Keep this in the main plan.',
+      }),
+      onReply,
+    })} />);
+
+    expect(screen.getByText('Keep this in the main plan.')).toBeTruthy();
+    expect(screen.getByTestId('message-bubble').className).toContain('justify-end');
+    expect(screen.queryByTitle('Reply')).toBeNull();
   });
 
   test('chat presentation omits task metadata when there is no task ref', () => {
