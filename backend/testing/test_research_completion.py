@@ -14804,3 +14804,214 @@ async def test_exhaustion_autocomplete_reconciles_gap_active_moves(db_session):
         f"completed direction {direction_id!r} must appear in gap past_moves, "
         f"got past_moves={past_moves!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Criterion propagation: _handle_research_completion wires Direction.criterion_keys
+# into newly spawned Task.criterion_ids.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.mark.asyncio
+async def test_criterion_ids_propagated_from_parent_direction(db_session, mocker):
+    """_handle_research_completion sets criterion_ids on spawned tasks from the
+    parent direction's criterion_keys.  This guards the pre-fetch + assignment
+    path that was added alongside Direction.criterion_keys — a manually
+    constructed Task would not catch a regression here."""
+    from app.models import Direction as _Direction, ReleaseVersion
+    from app import acceptance_criteria as _ac
+    from test_autonomous_research import _active_direction, _patch_research_externals
+
+    direction_id = "d-crit-prop-01"
+    direction_data = _active_direction(direction_id, "Criterion propagation direction")
+    project = _Project(
+        name="CritProp Parent",
+        user_id="test-user-crit",
+        autonomous_enabled=True,
+        directions=[direction_data],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a release version and a criterion for it.
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    criterion = await _ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="All endpoints documented",
+        created_by="strategist",
+    )
+
+    # Create a Direction ORM row with criterion_keys set (as the link-direction
+    # endpoint would produce).
+    dir_row = _Direction(
+        project_id=project.id,
+        direction_key=direction_id,
+        data=direction_data,
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(dir_row)
+    await db_session.commit()
+
+    # Build a research task whose context carries the direction_id so
+    # _parent_direction_id is set during research_completion processing.
+    task = _Task(
+        project_id=project.id,
+        title="Research: Criterion propagation direction",
+        payloads=[{"type": "research", "directions": [direction_data], "base_branch": "main"}],
+        context={"research_depth": 0, "direction_id": direction_id},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    finding = {
+        "title": "Add endpoint docs",
+        "description": "Document the REST API",
+        "prompt": "Add OpenAPI docs for all endpoints",
+        "priority": "medium",
+        "scope": "small",
+        "risk": "low",
+        "type": "improvement",
+        "direction_id": direction_id,
+    }
+    _patch_research_externals(mocker)
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[finding])
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health", return_value=(False, None)
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "expected exactly one spawned child task"
+    child = children[0]
+    assert child.criterion_ids == [criterion.criterion_key], (
+        f"spawned task must inherit criterion_ids from parent direction; "
+        f"got {child.criterion_ids!r}"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_criterion_ids_propagated_from_finding_direction(db_session, mocker):
+    """When a finding carries its own direction_id (cross-direction spawn),
+    _handle_research_completion must load criterion_keys for THAT direction —
+    not just the parent direction — and set them on the spawned task."""
+    from app.models import Direction as _Direction, ReleaseVersion
+    from app import acceptance_criteria as _ac
+    from test_autonomous_research import _active_direction, _patch_research_externals
+
+    parent_dir_id = "d-crit-parent-02"
+    child_dir_id = "d-crit-child-02"
+
+    parent_direction_data = _active_direction(parent_dir_id, "Parent direction")
+    child_direction_data = _active_direction(child_dir_id, "Child direction")
+
+    project = _Project(
+        name="CritProp CrossDir",
+        user_id="test-user-crit2",
+        autonomous_enabled=True,
+        directions=[parent_direction_data, child_direction_data],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Criterion is linked to the CHILD direction (the finding-level direction).
+    criterion = await _ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Child direction criterion",
+        created_by="strategist",
+    )
+    child_dir_row = _Direction(
+        project_id=project.id,
+        direction_key=child_dir_id,
+        data=child_direction_data,
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    # Parent direction has NO criterion_keys.
+    parent_dir_row = _Direction(
+        project_id=project.id,
+        direction_key=parent_dir_id,
+        data=parent_direction_data,
+        status="active",
+        criterion_keys=[],
+    )
+    db_session.add(child_dir_row)
+    db_session.add(parent_dir_row)
+    await db_session.commit()
+
+    task = _Task(
+        project_id=project.id,
+        title="Research: Parent direction",
+        payloads=[
+            {"type": "research", "directions": [parent_direction_data], "base_branch": "main"}
+        ],
+        context={"research_depth": 0, "direction_id": parent_dir_id},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # The finding references the child direction (cross-direction spawn).
+    finding = {
+        "title": "Implement child feature",
+        "description": "Child direction work",
+        "prompt": "Implement the child direction feature",
+        "priority": "medium",
+        "scope": "small",
+        "risk": "low",
+        "type": "improvement",
+        "direction_id": child_dir_id,
+    }
+    _patch_research_externals(mocker)
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[finding])
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health", return_value=(False, None)
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "expected exactly one spawned child task"
+    child = children[0]
+    assert child.criterion_ids == [criterion.criterion_key], (
+        f"spawned task must inherit criterion_ids from the finding's direction "
+        f"(cross-direction); got {child.criterion_ids!r}"
+    )

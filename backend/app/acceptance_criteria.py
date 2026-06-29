@@ -22,8 +22,20 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# source_kind values that indicate a criterion is fully covered.
-_COVERED_SOURCE_KINDS: frozenset[str] = frozenset({"task_merge", "reachability"})
+def _evidence_proves_covered(e: CriterionEvidence) -> bool:
+    """Whether a single evidence record satisfies the 'covered' condition.
+
+    ``reachability`` is covered on its own; it represents the ancestry check
+    that says the merge really reached the integration branch.
+    ``task_merge`` requires ``proven=True`` in ``detail`` — a bare merge badge
+    without acceptance-proof is not sufficient to qualify the criterion.
+    All other source_kinds are not sufficient on their own.
+    """
+    if e.source_kind == "reachability":
+        return True
+    if e.source_kind == "task_merge":
+        return isinstance(e.detail, dict) and e.detail.get("proven") is True
+    return False
 
 
 def generate_criterion_key() -> str:
@@ -114,15 +126,113 @@ def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
     """Classify criterion coverage from its evidence list.
 
     Returns:
-      'covered'   — at least one record with source_kind in {'task_merge', 'reachability'}
+      'covered'   — at least one record satisfies the covered condition
+                    (``reachability`` always; ``task_merge`` only with
+                    ``detail["proven"] is True``)
       'partial'   — evidence exists but none satisfy the covered condition
       'uncovered' — no evidence at all
     """
     if not evidence:
         return "uncovered"
-    if any(e.source_kind in _COVERED_SOURCE_KINDS for e in evidence):
+    if any(_evidence_proves_covered(e) for e in evidence):
         return "covered"
     return "partial"
+
+
+async def get_criteria_by_keys(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    keys: list[str],
+    release_version_id: uuid.UUID | None = None,
+) -> list[VersionAcceptanceCriterion]:
+    """Return VersionAcceptanceCriterion rows matching the given criterion_key list.
+
+    When *release_version_id* is supplied the lookup is scoped to that version,
+    preventing stale keys from a closed version from matching.  Callers that
+    resolve keys on behalf of the current open version SHOULD pass it.
+    """
+    if not keys:
+        return []
+    conditions = [
+        VersionAcceptanceCriterion.project_id == project_id,
+        VersionAcceptanceCriterion.criterion_key.in_(keys),
+    ]
+    if release_version_id is not None:
+        conditions.append(
+            VersionAcceptanceCriterion.release_version_id == release_version_id
+        )
+    result = await session.execute(
+        select(VersionAcceptanceCriterion).where(*conditions)
+    )
+    return list(result.scalars().all())
+
+
+async def record_task_merge_evidence(
+    session: AsyncSession,
+    task: Any,
+    project_id: uuid.UUID,
+) -> int:
+    """Record task_merge evidence for each criterion a task carries, when proven.
+
+    No-op when ``task.criterion_ids`` is empty or the task's acceptance verdict
+    is absent or not ``proven=True``.  When it does write, it stamps a
+    proof-backed ``task_merge`` row (``detail["proven"] = True``) per criterion,
+    plus a companion ``reachability`` row.  Coverage flips to ``covered`` on
+    either signal alone — a proven ``task_merge`` row is itself sufficient;
+    the companion ``reachability`` row is recorded for audit completeness.
+    Best-effort: errors are logged and not re-raised so a failure here never
+    blocks merge finalization.
+
+    Returns the number of evidence rows recorded.
+    """
+    criterion_ids: list[str] = list(getattr(task, "criterion_ids", None) or [])
+    if not criterion_ids:
+        return 0
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY, acceptance_is_proven
+
+    verdict = (getattr(task, "context", None) or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    if not acceptance_is_proven(verdict):
+        return 0
+    try:
+        _release_version_id: uuid.UUID | None = None
+        try:
+            from app.release_version import current_open_version as _cur_open_ver
+
+            _open_ver = await _cur_open_ver(session, project_id)
+            if _open_ver is not None:
+                _release_version_id = _open_ver.id
+        except Exception:
+            pass
+        rows = await get_criteria_by_keys(
+            session, project_id, criterion_ids, release_version_id=_release_version_id
+        )
+        task_id_str = str(getattr(task, "id", "") or "")
+        recorded = 0
+        for row in rows:
+            await record_evidence(
+                session,
+                criterion_id=row.id,
+                project_id=project_id,
+                source_kind="task_merge",
+                source_id=task_id_str or None,
+                detail={"proven": True},
+            )
+            await record_evidence(
+                session,
+                criterion_id=row.id,
+                project_id=project_id,
+                source_kind="reachability",
+                source_id=task_id_str or None,
+                detail={"proven": True},
+            )
+            recorded += 1
+        return recorded
+    except Exception:
+        logger.exception(
+            "record_task_merge_evidence: failed for task %s",
+            getattr(task, "id", None),
+        )
+        return 0
 
 
 async def get_version_coverage_summary(

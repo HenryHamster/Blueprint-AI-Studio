@@ -3458,6 +3458,39 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         task.context = _ctx
         flag_modified(task, "context")
 
+    # Pre-fetch criterion_keys for every direction referenced by deduplicated
+    # findings (plus the parent direction).  A finding may carry its own
+    # direction_id that differs from _parent_direction_id; without this
+    # pre-fetch, _direction_criterion_cache would miss that key and the spawned
+    # task would inherit no criterion_ids even though its direction has some.
+    # Best-effort: a lookup failure leaves that direction absent from the cache.
+    _direction_criterion_cache: dict[str, list[str]] = {}
+    _dirs_to_prefetch: set[str] = set()
+    if _parent_direction_id:
+        _dirs_to_prefetch.add(_parent_direction_id)
+    for _, _pf_finding, _ in deduplicated:
+        _pf_did = _pf_finding.get("direction_id")
+        if _pf_did and isinstance(_pf_did, str):
+            _dirs_to_prefetch.add(_pf_did)
+    if _dirs_to_prefetch:
+        try:
+            from app.directions_repo import get_direction_row as _get_dir_row
+
+            for _pf_dir_id in _dirs_to_prefetch:
+                try:
+                    _pf_row = await _get_dir_row(session, task.project_id, _pf_dir_id)
+                    if _pf_row is not None and _pf_row.criterion_keys:
+                        _direction_criterion_cache[_pf_dir_id] = list(
+                            _pf_row.criterion_keys
+                        )
+                except Exception:
+                    logger.debug(
+                        "[RESEARCH] criterion_keys lookup failed for direction %s",
+                        _pf_dir_id,
+                    )
+        except Exception:
+            logger.debug("[RESEARCH] directions_repo import failed; criterion cache empty")
+
     for orig_i, finding, fhash in deduplicated:
         scope = finding.get("scope", DEFAULT_TASK_SCOPE)
         risk = finding.get("risk", "low")
@@ -4545,6 +4578,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
             if isinstance(v, str) and v.strip()
         }
+        # Inherit criterion_ids from the direction this task works on (best-effort).
+        # The cache was pre-fetched for the parent direction before the loop; a
+        # finding-level direction_id falls back to the parent direction's criteria.
+        _spawn_effective_dir_id = direction_id or parent_direction_id
+        _spawn_criterion_ids = _direction_criterion_cache.get(
+            _spawn_effective_dir_id or "", []
+        )
         new_task = Task(
             project_id=task.project_id,
             title=title,
@@ -4552,6 +4592,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             parent_task_id=task.id,
             payloads=[finding_payload],
             previous_error_fingerprint=_prev_fp_col,
+            criterion_ids=_spawn_criterion_ids,
             context={
                 "research_task_id": str(task.id),
                 "parent_research_task_id": str(task.id),

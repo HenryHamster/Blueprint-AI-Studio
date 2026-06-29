@@ -2103,6 +2103,20 @@ async def refresh_direction_outcomes_after_merge(
         )
         with contextlib.suppress(Exception):
             await session.rollback()
+    # Record criterion evidence for each criterion the task carried, when proven.
+    # Best-effort: a failure here must never break merge finalization.
+    try:
+        from app.acceptance_criteria import record_task_merge_evidence
+
+        await record_task_merge_evidence(session, task, task.project_id)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "[DIRECTION] criterion evidence recording failed for task %s: %r",
+            getattr(task, "id", None),
+            exc,
+        )
+        with contextlib.suppress(Exception):
+            await session.rollback()
 
 
 def _refresh_pipeline_scope_merge_rates(project: Project) -> None:
