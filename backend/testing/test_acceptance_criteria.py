@@ -1430,7 +1430,7 @@ async def test_attest_endpoint_happy_path(client: AsyncClient, db_session):
     )
 
     resp = await client.post(
-        f"/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/attest",
+        f"/api/admin/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/attest",
         json={"reason": "Direction retired; operator confirms criterion is satisfied"},
     )
     assert resp.status_code == 200, resp.text
@@ -1466,11 +1466,11 @@ async def test_attest_endpoint_get_criteria_shows_covered(client: AsyncClient, d
     criterion = await ac.create_criterion(db_session, project.id, version.id, "Stuck")
 
     await client.post(
-        f"/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/attest",
+        f"/api/admin/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/attest",
         json={"reason": "accepted by operator"},
     )
 
-    resp = await client.get(f"/projects/{project.id}/acceptance-criteria")
+    resp = await client.get(f"/api/admin/projects/{project.id}/acceptance-criteria")
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["covered"] == 1
@@ -1491,10 +1491,48 @@ async def test_attest_endpoint_empty_reason_rejected(client: AsyncClient, db_ses
     criterion = await ac.create_criterion(db_session, project.id, version.id, "X")
 
     resp = await client.post(
-        f"/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/attest",
+        f"/api/admin/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/attest",
         json={"reason": ""},
     )
     assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+async def test_attest_authorizes_before_body_validation(client: AsyncClient, db_session):
+    """Authorization is enforced before body validation.
+
+    A caller without project access calling attest with an empty reason
+    should get a 403/404 authorization rejection, not a 400 body error.
+    This verifies the check order: authorize first, then validate body.
+    """
+    # The test user (who created the project) has access, so we need a different
+    # authentication context to simulate an unauthorized caller. Create a project
+    # that the test user is NOT a member of.
+
+    # Create a project that the test user is NOT a member of
+    other_project = Project(name="Attest-OtherProject", user_id="other-owner")
+    db_session.add(other_project)
+    await db_session.commit()
+    await db_session.refresh(other_project)
+
+    other_version = ReleaseVersion(project_id=other_project.id, version_number=1, status="open")
+    db_session.add(other_version)
+    await db_session.commit()
+    await db_session.refresh(other_version)
+
+    other_criterion = await ac.create_criterion(
+        db_session, other_project.id, other_version.id, "Y"
+    )
+
+    # Call attest on the project where the test user has no access,
+    # with an invalid empty reason. Authorization should fail (404) before
+    # body validation would fail (400).
+    resp = await client.post(
+        f"/api/admin/projects/{other_project.id}/acceptance-criteria/{other_criterion.criterion_key}/attest",
+        json={"reason": ""},
+    )
+    # Should get 404 (no project access) not 400 (body error)
+    assert resp.status_code == 404, f"Expected 404 for no access, got {resp.status_code}: {resp.text}"
 
 
 @pytest.mark.asyncio
@@ -1506,7 +1544,7 @@ async def test_attest_endpoint_unknown_criterion_key(client: AsyncClient, db_ses
     await db_session.commit()
 
     resp = await client.post(
-        f"/projects/{project.id}/acceptance-criteria/c-deadbeef/attest",
+        f"/api/admin/projects/{project.id}/acceptance-criteria/c-deadbeef/attest",
         json={"reason": "valid reason"},
     )
     assert resp.status_code == 404, resp.text
@@ -1518,7 +1556,7 @@ async def test_attest_endpoint_no_open_version(client: AsyncClient, db_session):
     project = await _make_project_with_member(db_session, name="Attest-NoVersion")
 
     resp = await client.post(
-        f"/projects/{project.id}/acceptance-criteria/c-anykey/attest",
+        f"/api/admin/projects/{project.id}/acceptance-criteria/c-anykey/attest",
         json={"reason": "valid reason"},
     )
     assert resp.status_code == 409, resp.text

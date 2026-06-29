@@ -798,6 +798,44 @@ class TestGetAllProjects:
         assert counts["running"] == 0
         assert counts["total"] == 0
 
+    @pytest.mark.asyncio
+    async def test_task_status_counts_reconcile_cancelled(
+        self, client: AsyncClient, db_session
+    ):
+        """CANCELLED tasks appear in their own bucket and reconcile with total."""
+        from testing.factories import make_task
+
+        project = await _make_project(db_session, name="Cancelled Counts Project")
+        db_session.add_all(
+            [
+                make_task(project_id=project.id, status=TaskStatus.COMPLETED),
+                make_task(project_id=project.id, status=TaskStatus.CANCELLED),
+                make_task(project_id=project.id, status=TaskStatus.CANCELLED),
+            ]
+        )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/projects")
+        assert resp.status_code == 200
+        items = resp.json()["items"]
+        target = next(p for p in items if p["id"] == str(project.id))
+        counts = target["task_status_counts"]
+        assert counts["cancelled"] == 2
+        assert counts["completed"] == 1
+        assert counts["total"] == 3
+        # All named buckets must reconcile with total.
+        bucket_sum = (
+            counts["queued"]
+            + counts["running"]
+            + counts["evaluating"]
+            + counts["blocked"]
+            + counts["parked"]
+            + counts["failed"]
+            + counts["completed"]
+            + counts["cancelled"]
+        )
+        assert bucket_sum == counts["total"]
+
 
 class TestGetProject:
     @pytest.mark.asyncio

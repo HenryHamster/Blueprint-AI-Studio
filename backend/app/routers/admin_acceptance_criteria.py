@@ -233,9 +233,6 @@ async def attest_criterion(
     permanently uncoverable (e.g. its mapped direction retired).  The attestation
     is operator-only and is never called by autonomous agents.
     """
-    if not body.reason or not body.reason.strip():
-        raise HTTPException(status_code=400, detail="reason must not be empty")
-
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
@@ -244,6 +241,9 @@ async def attest_criterion(
     open_version = await current_open_version(session, project_id)
     if open_version is None:
         raise HTTPException(status_code=409, detail="No open release version")
+
+    if not body.reason or not body.reason.strip():
+        raise HTTPException(status_code=400, detail="reason must not be empty")
 
     existing = await ac.get_criteria_by_keys(
         session,

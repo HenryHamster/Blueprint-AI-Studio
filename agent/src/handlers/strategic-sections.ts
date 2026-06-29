@@ -788,6 +788,13 @@ export function buildOutcomeSection(outcomeEval: Record<string, unknown> | undef
       if (proposed.length > 0) lines.push(`Proposed (in-flight): ${proposed.join('; ')}`);
       const failedApproaches = Array.isArray(d.failed_approaches) ? d.failed_approaches as string[] : [];
       if (failedApproaches.length > 0) lines.push(`Failed approaches: ${failedApproaches.slice(0, 5).join('; ')}`);
+      if (d.outcome_scaffolding_flagged === true) {
+        lines.push('⚠ OUTCOME-SCAFFOLDING-FLAGGED: direction keeps shipping merges but confirmed findings have not grown — assess whether this is delivering real outcomes or churn scaffolding.');
+        const ev = d.outcome_scaffolding_evidence as Record<string, unknown> | undefined;
+        if (ev && typeof ev === 'object') {
+          lines.push(`  Scaffolding evidence: ${fmtScalar(ev.total_cycles)} cycles, ${fmtScalar(ev.lifetime_merged)} lifetime merged (rate=${fmtScalar(ev.lifetime_merge_rate)}), stagnant for ${fmtScalar(ev.progress_stagnant_cycles)} cycles`);
+        }
+      }
     }
   }
 

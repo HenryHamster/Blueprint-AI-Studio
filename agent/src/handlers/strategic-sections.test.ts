@@ -642,6 +642,44 @@ describe('buildOutcomeSection', () => {
     expect(result).toContain('Confirmed (shipped): faster queries');
   });
 
+  it('renders outcome_scaffolding_flagged warning with evidence', () => {
+    const result = buildOutcomeSection({
+      directions: [{
+        id: 'd-scaffold',
+        text: 'improve throughput',
+        status: 'active',
+        cycles: 15,
+        merged: 10,
+        failed: 2,
+        outcome_scaffolding_flagged: true,
+        outcome_scaffolding_evidence: {
+          total_cycles: 15,
+          lifetime_merged: 10,
+          lifetime_merge_rate: 0.667,
+          progress_stagnant_cycles: 5,
+        },
+      }],
+    });
+    expect(result).toContain('OUTCOME-SCAFFOLDING-FLAGGED');
+    expect(result).toContain('Scaffolding evidence: 15 cycles, 10 lifetime merged (rate=0.667), stagnant for 5 cycles');
+  });
+
+  it('omits outcome_scaffolding_flagged warning when flag is false or absent', () => {
+    const result = buildOutcomeSection({
+      directions: [{
+        id: 'd-normal',
+        text: 'normal direction',
+        status: 'active',
+        cycles: 5,
+        merged: 3,
+        failed: 1,
+        outcome_scaffolding_flagged: false,
+      }],
+    });
+    expect(result).not.toContain('OUTCOME-SCAFFOLDING-FLAGGED');
+    expect(result).not.toContain('Scaffolding evidence');
+  });
+
   it('truncates failed_approaches to 5', () => {
     const result = buildOutcomeSection({
       directions: [{

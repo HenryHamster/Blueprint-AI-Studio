@@ -5092,6 +5092,58 @@ async def test_strategic_review_omits_held_directions_when_none_held(db_session)
     assert "held_directions" not in payload
 
 
+@pytest.mark.asyncio
+async def test_strategic_review_skips_query_when_held_directions_filtered(db_session):
+    """When held directions exist but none belong to the current project,
+    the held_directions block is empty and the recent FAILED tasks query
+    is not executed (avoiding wasted DB work).
+    """
+    from app.shared_state import record_direction_result, DIRECTION_HOLD_THRESHOLD
+
+    _shared_state.direction_failure_streaks.clear()
+    direction_id_held = "d-held02"
+    other_project_id = str(uuid.uuid4())
+    project = _make_project(
+        directions=[
+            {"id": "d-active01", "status": "active", "text": "Active dir", "priority": "medium"}
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Record a held direction in shared state with a DIFFERENT project_id
+    # (simulating a held direction from another project).
+    try:
+        for _ in range(DIRECTION_HOLD_THRESHOLD):
+            record_direction_result(
+                direction_id_held,
+                success=False,
+                failure_class="CODE_ERROR",
+                project_id=other_project_id,
+            )
+        assert _shared_state.get_held_directions().get(direction_id_held)
+
+        spawned = await _spawn_strategic_review(project, db_session)
+        assert spawned is True
+
+        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        strategic_tasks = [
+            t
+            for t in result.scalars().all()
+            if t.first_payload.get("type") == "strategic_review"
+        ]
+        assert strategic_tasks
+        payload = strategic_tasks[0].payloads[0]
+        # The held_directions block should be empty or absent since the held
+        # direction belongs to a different project.
+        held = payload.get("held_directions", [])
+        assert isinstance(held, list) and len(held) == 0
+    finally:
+        _shared_state.direction_failure_streaks.clear()
+
+
 # ---------------------------------------------------------------------------
 # _build_failure_feedback_mitigation unit tests
 # ---------------------------------------------------------------------------

@@ -5330,53 +5330,59 @@ async def _spawn_strategic_review(
             _dir_text_map = {
                 d.get("id"): d for d in (project.directions or []) if d.get("id")
             }
-            # One bounded query for the project's recent FAILED tasks, then
-            # partition by direction_id in memory (mirrors the gathering logic
-            # in _spawn_direction_hold_investigation, copied here intentionally
-            # since that spawner is slated for deletion).
-            _recent_failed = (
-                (
-                    await session.execute(
-                        select(Task)
-                        .where(
-                            Task.project_id == project.id,
-                            Task.status == TaskStatus.FAILED,
+            # Pre-filter held directions to only those that belong to this project
+            # and exist in the current direction list. This avoids a wasted query
+            # when all held directions are from other projects or have been deleted.
+            _applicable_held_dirs = {
+                _did: _hold_info
+                for _did, _hold_info in _held.items()
+                if _hold_info.get("project_id") == _project_id_str
+                and _did in _dir_text_map
+            }
+            if _applicable_held_dirs:
+                # One bounded query for the project's recent FAILED tasks, then
+                # partition by direction_id in memory (mirrors the gathering logic
+                # in _spawn_direction_hold_investigation, copied here intentionally
+                # since that spawner is slated for deletion).
+                _recent_failed = (
+                    (
+                        await session.execute(
+                            select(Task)
+                            .where(
+                                Task.project_id == project.id,
+                                Task.status == TaskStatus.FAILED,
+                            )
+                            .order_by(Task.created_at.desc())
+                            .limit(60)
                         )
-                        .order_by(Task.created_at.desc())
-                        .limit(60)
                     )
+                    .scalars()
+                    .all()
                 )
-                .scalars()
-                .all()
-            )
-            for _did, _hold_info in _held.items():
-                if _hold_info.get("project_id") != _project_id_str:
-                    continue
-                _direction = _dir_text_map.get(_did)
-                if not _direction:
-                    continue
-                _dir_failures = [
-                    t
-                    for t in _recent_failed
-                    if (t.context or {}).get("direction_id") == _did
-                ][:5]
-                _failure_messages: list[str] = []
-                _fingerprints: list[str] = []
-                for t in _dir_failures:
-                    _err = (t.latest_status_message or "(no message)")[:240]
-                    _fingerprints.append(_error_fingerprint(_err))
-                    _failure_messages.append(_err)
-                _dominant_fp = _fingerprints[0] if _fingerprints else None
-                _held_directions_block.append(
-                    {
-                        "direction_id": _did,
-                        "direction_text": (_direction.get("text") or "?")[:300],
-                        "consecutive_failures": _hold_info.get("consecutive_failures"),
-                        "last_failure_class": _hold_info.get("last_failure_class"),
-                        "dominant_error_fingerprint": _dominant_fp,
-                        "recent_failure_messages": _failure_messages,
-                    }
-                )
+                for _did, _hold_info in _applicable_held_dirs.items():
+                    _direction = _dir_text_map.get(_did)
+                    _dir_failures = [
+                        t
+                        for t in _recent_failed
+                        if (t.context or {}).get("direction_id") == _did
+                    ][:5]
+                    _failure_messages: list[str] = []
+                    _fingerprints: list[str] = []
+                    for t in _dir_failures:
+                        _err = (t.latest_status_message or "(no message)")[:240]
+                        _fingerprints.append(_error_fingerprint(_err))
+                        _failure_messages.append(_err)
+                    _dominant_fp = _fingerprints[0] if _fingerprints else None
+                    _held_directions_block.append(
+                        {
+                            "direction_id": _did,
+                            "direction_text": (_direction.get("text") or "?")[:300],
+                            "consecutive_failures": _hold_info.get("consecutive_failures"),
+                            "last_failure_class": _hold_info.get("last_failure_class"),
+                            "dominant_error_fingerprint": _dominant_fp,
+                            "recent_failure_messages": _failure_messages,
+                        }
+                    )
     except Exception:
         logger.exception("[STRATEGIC] held-directions block build failed; continuing")
     # Post-promotion handoff — when a fresh version has just opened, it was

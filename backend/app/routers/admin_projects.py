@@ -403,6 +403,7 @@ async def get_all_projects(
                     "parked": 0,
                     "failed": 0,
                     "completed": 0,
+                    "cancelled": 0,
                     "total": 0,
                 }
             bucket = task_status_counts[proj_key]
@@ -422,6 +423,8 @@ async def get_all_projects(
                 bucket["failed"] += n
             elif status == TaskStatus.COMPLETED:
                 bucket["completed"] += n
+            elif status == TaskStatus.CANCELLED:
+                bucket["cancelled"] += n
 
     _empty_counts = {
         "queued": 0,
@@ -431,6 +434,7 @@ async def get_all_projects(
         "parked": 0,
         "failed": 0,
         "completed": 0,
+        "cancelled": 0,
         "total": 0,
     }
     return {
@@ -617,6 +621,7 @@ async def get_project_strategic_state(
         "parked": 0,
         "failed": 0,
         "completed": 0,
+        "cancelled": 0,
         "total": 0,
     }
     for status, count in task_status_rows:
@@ -636,6 +641,8 @@ async def get_project_strategic_state(
             task_counts["failed"] += n
         elif status == TaskStatus.COMPLETED:
             task_counts["completed"] += n
+        elif status == TaskStatus.CANCELLED:
+            task_counts["cancelled"] += n
 
     cost_total = (
         await session.execute(

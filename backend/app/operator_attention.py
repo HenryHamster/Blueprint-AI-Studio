@@ -33,14 +33,6 @@ _HIGH_SIGNAL_MESSAGE_TYPES = (
     MessageType.FEEDBACK,
 )
 _NEEDS_OPERATOR_MESSAGE_TYPES = (MessageType.QUESTION, MessageType.BLOCKER)
-_LIVE_TASK_STATUSES = (
-    TaskStatus.QUEUED,
-    TaskStatus.PROVISIONING,
-    TaskStatus.IN_PROGRESS,
-    TaskStatus.EVALUATING,
-    TaskStatus.BLOCKED,
-    TaskStatus.PARKED,
-)
 _APPROVAL_TASK_STATUSES = (
     TaskStatus.QUEUED,
     TaskStatus.PROVISIONING,
