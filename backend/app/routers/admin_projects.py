@@ -22,6 +22,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from app.database import get_session, resolve_dialect_name
 from app.shared_state import limiter
 from app.models import (
+    LocalRunner,
     ProjectMessage,
     StrategicCycle,
     Task,
@@ -48,6 +49,8 @@ from app.project_message_projection import message_preview_dict
 from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
 from app.onboarding_proof import build_onboarding_proof_block
+from app.routers.admin_runners import _RUNNER_LIVENESS_SECONDS, _runner_health
+from app.task_capabilities import STRATEGIC_TASK_TYPES
 
 router = APIRouter(
     prefix="/api/admin",
@@ -117,6 +120,21 @@ _LIVE_STRATEGIC_TASK_STATUSES = frozenset(
     }
 )
 
+_LOCAL_STRATEGIC_RUNNING_STATUSES = frozenset(
+    {
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+        TaskStatus.BLOCKED,
+        TaskStatus.PARKED,
+    }
+)
+
+_CORE_STRATEGIC_CYCLE_TASK_TYPES = frozenset(
+    task_type
+    for task_type in ("design_doc_update", "strategic_review")
+    if task_type in STRATEGIC_TASK_TYPES
+)
+
 
 def _is_live_strategic_task(task: Task | None) -> bool:
     return bool(task is not None and task.status in _LIVE_STRATEGIC_TASK_STATUSES)
@@ -138,6 +156,44 @@ def _task_summary(task: Task | None) -> Dict[str, Any] | None:
         "latest_status_message": task.latest_status_message,
         "started_at": task.started_at.isoformat() if task.started_at else None,
         "created_at": task.created_at.isoformat() if task.created_at else None,
+    }
+
+
+def _string_or_none(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _runner_target_id(task: Task | None) -> str | None:
+    if task is None:
+        return None
+    context = task.context or {}
+    runner_target_id = _string_or_none(context.get("runner_target_id"))
+    if runner_target_id:
+        return runner_target_id
+    vm_instance_id = _string_or_none(task.vm_instance_id)
+    if vm_instance_id and vm_instance_id.startswith("runner:"):
+        return _string_or_none(vm_instance_id.removeprefix("runner:"))
+    return None
+
+
+def _task_runtime_summary(task: Task | None) -> Dict[str, Any] | None:
+    if task is None:
+        return None
+    context = task.context or {}
+    return {
+        "provider": task.provider or _string_or_none(context.get("llm_provider")),
+        "model": task.model or _string_or_none(context.get("llm_model")),
+        "account_id": (
+            task.account_id
+            or task.llm_account_id
+            or _string_or_none(context.get("llm_account_id"))
+            or _string_or_none(context.get("max_plan_account_id"))
+        ),
+        "vm_instance_id": task.vm_instance_id,
+        "runner_target_id": _runner_target_id(task),
     }
 
 
@@ -182,6 +238,201 @@ def _cycle_summary(
         "vision_updated": cycle.vision_updated,
         "problem_model_changed": bool(metadata.get("problem_model_changed")),
         "running_update_changed": bool(metadata.get("running_update_changed")),
+    }
+
+
+def _runner_handles_any_strategic_work(runner: LocalRunner) -> bool:
+    task_types = (runner.capabilities or {}).get("task_types", "all")
+    if task_types == "all":
+        return True
+    if not isinstance(task_types, list):
+        return False
+    return any(
+        isinstance(task_type, str) and task_type in STRATEGIC_TASK_TYPES
+        for task_type in task_types
+    )
+
+
+def _runner_handles_task_types(
+    runner: LocalRunner,
+    required_task_types: frozenset[str],
+) -> bool:
+    task_types = (runner.capabilities or {}).get("task_types", "all")
+    if task_types == "all":
+        return True
+    if not isinstance(task_types, list):
+        return False
+    handled = {task_type for task_type in task_types if isinstance(task_type, str)}
+    return required_task_types.issubset(handled)
+
+
+def _runner_is_dispatch_eligible(
+    runner: LocalRunner,
+    health: Dict[str, Any],
+    required_task_types: frozenset[str],
+) -> bool:
+    if not _runner_handles_task_types(runner, required_task_types):
+        return False
+    if not health.get("is_live"):
+        return False
+    if health.get("agent_available") is False:
+        return False
+    available_slots = health.get("available_slots")
+    return available_slots is None or int(available_slots) > 0
+
+
+def _active_strategic_task_types(task: Task | None) -> frozenset[str]:
+    if task is None:
+        return _CORE_STRATEGIC_CYCLE_TASK_TYPES
+    payload = task.first_payload or {}
+    task_type = payload.get("type")
+    if isinstance(task_type, str) and task_type in STRATEGIC_TASK_TYPES:
+        return frozenset({task_type})
+    return _CORE_STRATEGIC_CYCLE_TASK_TYPES
+
+
+async def _strategic_runtime_summary(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    active_task: Task | None,
+) -> Dict[str, Any]:
+    """Project the existing local-runner state relevant to Strategic work."""
+
+    runner_rows = (
+        await session.execute(
+            select(LocalRunner)
+            .where(
+                LocalRunner.project_id == project_id,
+                LocalRunner.status != "deleted",
+            )
+            .order_by(
+                LocalRunner.last_seen_at.desc(),
+                LocalRunner.created_at.desc(),
+            )
+        )
+    ).scalars().all()
+    readiness_task_types = _active_strategic_task_types(active_task)
+    strategic_runners = [
+        runner for runner in runner_rows if _runner_handles_any_strategic_work(runner)
+    ]
+    readiness_capable_runners = [
+        runner
+        for runner in strategic_runners
+        if _runner_handles_task_types(runner, readiness_task_types)
+    ]
+    health_by_runner = {
+        str(runner.id): _runner_health(runner) for runner in strategic_runners
+    }
+
+    live_runner_count = sum(
+        1 for health in health_by_runner.values() if health.get("is_live")
+    )
+    readiness_health = [
+        health_by_runner[str(runner.id)] for runner in readiness_capable_runners
+    ]
+    readiness_live_runner_count = sum(
+        1 for health in readiness_health if health.get("is_live")
+    )
+    stale_runner_count = max(0, len(strategic_runners) - live_runner_count)
+    agent_unavailable_count = sum(
+        1
+        for health in readiness_health
+        if health.get("is_live") and health.get("agent_available") is False
+    )
+    busy_runner_count = sum(
+        1
+        for health in readiness_health
+        if health.get("is_live")
+        and health.get("agent_available") is not False
+        and health.get("available_slots") == 0
+    )
+    eligible_live_count = sum(
+        1
+        for runner in readiness_capable_runners
+        if _runner_is_dispatch_eligible(
+            runner,
+            health_by_runner[str(runner.id)],
+            readiness_task_types,
+        )
+    )
+
+    active_runner_id = _runner_target_id(active_task)
+    active_task_pinned = active_runner_id is not None
+    active_task_runtime = _task_runtime_summary(active_task)
+    active_runner_health = (
+        health_by_runner.get(active_runner_id) if active_runner_id else None
+    )
+    active_runner = next(
+        (
+            runner
+            for runner in strategic_runners
+            if active_runner_id and str(runner.id) == active_runner_id
+        ),
+        None,
+    )
+
+    fallback_reason = None
+    if active_task_pinned:
+        if active_runner is None:
+            mode = "pending_local"
+            fallback_reason = "runner_unavailable"
+        elif not _runner_handles_task_types(active_runner, readiness_task_types):
+            mode = "pending_local"
+            fallback_reason = "capability_mismatch"
+        elif not active_runner_health or not active_runner_health.get("is_live"):
+            mode = "pending_local"
+            fallback_reason = "runner_offline"
+        elif active_runner_health.get("agent_available") is False:
+            mode = "pending_local"
+            fallback_reason = "agent_unavailable"
+        elif (
+            active_task is not None
+            and active_task.status not in _LOCAL_STRATEGIC_RUNNING_STATUSES
+        ):
+            mode = "pending_local"
+            fallback_reason = "runner_claim_pending"
+        else:
+            mode = "local"
+    elif active_task is not None and active_task.vm_instance_id:
+        mode = "cloud"
+        fallback_reason = "cloud_dispatch"
+    elif eligible_live_count > 0:
+        mode = "local_ready"
+    elif not strategic_runners:
+        mode = "cloud"
+        fallback_reason = "no_runner"
+    elif not readiness_capable_runners:
+        mode = "pending_local"
+        fallback_reason = "capability_mismatch"
+    elif readiness_live_runner_count == 0:
+        mode = "pending_local"
+        fallback_reason = "runner_offline"
+    elif agent_unavailable_count > 0:
+        mode = "pending_local"
+        fallback_reason = "agent_unavailable"
+    elif busy_runner_count > 0:
+        mode = "pending_local"
+        fallback_reason = "at_capacity"
+    else:
+        mode = "pending_local"
+        fallback_reason = "runner_unavailable"
+
+    return {
+        "local_runner": {
+            "mode": mode,
+            "strategic_runner_count": len(strategic_runners),
+            "live_runner_count": live_runner_count,
+            "eligible_live_count": eligible_live_count,
+            "stale_runner_count": stale_runner_count,
+            "busy_runner_count": busy_runner_count,
+            "agent_unavailable_count": agent_unavailable_count,
+            "active_runner_id": active_runner_id,
+            "active_task_pinned": active_task_pinned,
+            "active_task_runtime": active_task_runtime,
+            "fallback_reason": fallback_reason,
+            "liveness_window_seconds": _RUNNER_LIVENESS_SECONDS,
+        }
     }
 
 
@@ -821,6 +1072,11 @@ async def get_project_strategic_state(
         task_counts=task_counts,
         attention=attention,
     )
+    runtime_summary = await _strategic_runtime_summary(
+        session,
+        project.id,
+        active_task=active_task,
+    )
 
     return {
         "project_id": str(project.id),
@@ -844,6 +1100,7 @@ async def get_project_strategic_state(
         },
         "attention": attention,
         "context_package": context_package,
+        "runtime": runtime_summary,
         "design": {
             "has_design_doc": bool(project.design_doc),
             "revision": ((project.design_doc or {}).get("_meta") or {}).get("revision")

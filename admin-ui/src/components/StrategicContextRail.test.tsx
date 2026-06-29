@@ -172,6 +172,28 @@ const STATE: StrategicStateResponse = {
       { id: 'runtime', label: 'Runtime', target: { surface: 'runtime', section: 'health' } },
     ],
   },
+  runtime: {
+    local_runner: {
+      mode: 'local',
+      strategic_runner_count: 1,
+      live_runner_count: 1,
+      eligible_live_count: 1,
+      stale_runner_count: 0,
+      busy_runner_count: 0,
+      agent_unavailable_count: 0,
+      active_runner_id: '11111111-1111-1111-1111-111111111111',
+      active_task_pinned: true,
+      active_task_runtime: {
+        provider: 'openai',
+        model: 'gpt-5.4',
+        account_id: 'acct-local',
+        vm_instance_id: 'runner:11111111-1111-1111-1111-111111111111',
+        runner_target_id: '11111111-1111-1111-1111-111111111111',
+      },
+      fallback_reason: null,
+      liveness_window_seconds: 300,
+    },
+  },
   design: {
     has_design_doc: true,
     revision: 4,
@@ -199,6 +221,7 @@ describe('StrategicContextRail', () => {
       onOpenProjectSection: vi.fn(),
       onOpenPipeline: vi.fn(),
       onOpenRuntimeHealth: vi.fn(),
+      onOpenRuntimeDevices: vi.fn(),
       ...overrides,
     };
     act(() => {
@@ -225,6 +248,9 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).toContain('Question waiting');
     expect(host.textContent).toContain('new');
     expect(host.textContent).toContain('linked messages');
+    expect(host.textContent).toContain('Local Strategic');
+    expect(host.textContent).toContain('Running on runner 11111111');
+    expect(host.textContent).toContain('gpt-5.4');
   });
 
   test('drills into existing workbench sections', () => {
@@ -235,11 +261,38 @@ describe('StrategicContextRail', () => {
     buttons.find(button => button.textContent?.includes('Directions'))?.click();
     buttons.find(button => button.textContent?.includes('Pipeline'))?.click();
     buttons.find(button => button.textContent?.includes('Runtime'))?.click();
+    buttons.find(button => button.textContent?.includes('Devices'))?.click();
 
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('problem-model');
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('directions');
     expect(props.onOpenPipeline).toHaveBeenCalled();
     expect(props.onOpenRuntimeHealth).toHaveBeenCalled();
+    expect(props.onOpenRuntimeDevices).toHaveBeenCalled();
+  });
+
+  test('shows local Strategic fallback without adding a second runner list', () => {
+    const noRunnerState: StrategicStateResponse = {
+      ...STATE,
+      runtime: {
+        local_runner: {
+          ...STATE.runtime!.local_runner!,
+          mode: 'cloud',
+          strategic_runner_count: 0,
+          live_runner_count: 0,
+          eligible_live_count: 0,
+          stale_runner_count: 0,
+          active_runner_id: null,
+          active_task_pinned: false,
+          active_task_runtime: null,
+          fallback_reason: 'no_runner',
+        },
+      },
+    };
+    const { host } = mount({ state: noRunnerState });
+
+    expect(host.textContent).toContain('Local Strategic');
+    expect(host.textContent).toContain('No local Strategic runner enrolled');
+    expect(Array.from(host.querySelectorAll('button')).filter(button => button.textContent?.includes('Devices'))).toHaveLength(1);
   });
 
   test('does not render a context package block before the backend descriptor exists', () => {

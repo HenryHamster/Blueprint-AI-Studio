@@ -87,6 +87,39 @@ export interface StrategicContextPackageDescriptor {
   drilldowns?: StrategicContextPackageDrilldown[];
 }
 
+export interface StrategicLocalRunnerRuntime {
+  provider?: string | null;
+  model?: string | null;
+  account_id?: string | null;
+  vm_instance_id?: string | null;
+  runner_target_id?: string | null;
+}
+
+export interface StrategicLocalRunnerState {
+  mode: 'local' | 'local_ready' | 'cloud' | 'pending_local' | 'unknown' | string;
+  strategic_runner_count: number;
+  live_runner_count: number;
+  eligible_live_count: number;
+  stale_runner_count: number;
+  busy_runner_count: number;
+  agent_unavailable_count: number;
+  active_runner_id?: string | null;
+  active_task_pinned: boolean;
+  active_task_runtime?: StrategicLocalRunnerRuntime | null;
+  fallback_reason?:
+    | 'no_runner'
+    | 'runner_offline'
+    | 'agent_unavailable'
+    | 'at_capacity'
+    | 'cloud_dispatch'
+    | 'capability_mismatch'
+    | 'runner_claim_pending'
+    | 'runner_unavailable'
+    | string
+    | null;
+  liveness_window_seconds: number;
+}
+
 export interface StrategicStateResponse {
   project_id: string;
   strategic: {
@@ -174,6 +207,9 @@ export interface StrategicStateResponse {
     items: StrategicStateAttentionItem[];
   };
   context_package?: StrategicContextPackageDescriptor | null;
+  runtime?: {
+    local_runner?: StrategicLocalRunnerState | null;
+  };
   design: {
     has_design_doc: boolean;
     revision?: number | null;

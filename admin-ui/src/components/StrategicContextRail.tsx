@@ -1,8 +1,9 @@
 import type { ReactNode } from 'react';
-import { ArrowUpRight, CircleAlert, FileText, GitBranch, Network, Radio } from 'lucide-react';
+import { ArrowUpRight, CircleAlert, Cpu, FileText, GitBranch, Network, Radio } from 'lucide-react';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import type {
   StrategicContextPackageDescriptor,
+  StrategicLocalRunnerState,
   StrategicStateAttentionItem,
   StrategicStateResponse,
 } from '../strategicStateApi';
@@ -20,6 +21,7 @@ interface StrategicContextRailProps {
   onOpenProjectSection: (section: ProjectTarget) => void;
   onOpenPipeline: () => void;
   onOpenRuntimeHealth: () => void;
+  onOpenRuntimeDevices?: () => void;
   onOpenTask?: (taskId: string) => void;
 }
 
@@ -45,6 +47,45 @@ function contextPackageTone(status?: string | null): { dot: string; text: string
   if (status === 'building') return { dot: 'bg-cyan-400', text: 'text-cyan-300', label: 'building' };
   if (status === 'stale') return { dot: 'bg-amber-300', text: 'text-amber-300', label: 'stale' };
   return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'ready' };
+}
+
+function pluralize(count: number, singular: string): string {
+  return `${count} ${singular}${count === 1 ? '' : 's'}`;
+}
+
+function shortId(value?: string | null): string | null {
+  return value ? value.slice(0, 8) : null;
+}
+
+function localRunnerTone(localRunner: StrategicLocalRunnerState): { dot: string; text: string; label: string } {
+  if (localRunner.mode === 'local') return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'local' };
+  if (localRunner.mode === 'local_ready') return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'ready' };
+  if (localRunner.mode === 'pending_local') return { dot: 'bg-amber-300', text: 'text-amber-300', label: 'waiting' };
+  if (localRunner.mode === 'cloud') return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'cloud' };
+  return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'unknown' };
+}
+
+function localRunnerDetail(localRunner: StrategicLocalRunnerState): string {
+  if (localRunner.mode === 'local') {
+    const parts = [
+      shortId(localRunner.active_runner_id) ? `runner ${shortId(localRunner.active_runner_id)}` : null,
+      localRunner.active_task_runtime?.model ?? null,
+    ].filter(Boolean);
+    return parts.length > 0 ? `Running on ${parts.join(' / ')}` : 'Current Strategic cycle is pinned locally';
+  }
+  if (localRunner.eligible_live_count > 0) {
+    return `${pluralize(localRunner.eligible_live_count, 'runner')} ready for Strategic work`;
+  }
+  if (localRunner.fallback_reason === 'no_runner') return 'No local Strategic runner enrolled';
+  if (localRunner.fallback_reason === 'runner_offline') {
+    return `${pluralize(localRunner.strategic_runner_count, 'runner')} enrolled, none live`;
+  }
+  if (localRunner.fallback_reason === 'agent_unavailable') return 'Runner live, agent unavailable';
+  if (localRunner.fallback_reason === 'at_capacity') return 'Runner busy with active work';
+  if (localRunner.fallback_reason === 'cloud_dispatch') return 'Current cycle already dispatched outside the runner';
+  if (localRunner.fallback_reason === 'capability_mismatch') return 'Runner does not cover the full Strategic cycle';
+  if (localRunner.fallback_reason === 'runner_claim_pending') return 'Pinned locally; waiting for runner claim';
+  return 'Local runner is not available for Strategic work';
 }
 
 function RailButton({
@@ -170,9 +211,11 @@ export function StrategicContextRail({
   onOpenProjectSection,
   onOpenPipeline,
   onOpenRuntimeHealth,
+  onOpenRuntimeDevices,
   onOpenTask,
 }: StrategicContextRailProps) {
   const activeCycle = state?.strategic.active_cycle ?? null;
+  const localRunner = state?.runtime?.local_runner ?? null;
   const pendingSteer = state?.strategic.refresh.pending ?? null;
   const latestCycle = state?.strategic.latest_cycle ?? null;
   const taskCounts = state?.tasks.counts;
@@ -202,6 +245,7 @@ export function StrategicContextRail({
     : pendingSteer?.excerpt
       ? pendingSteer.excerpt
       : latestCycle?.summary_text ?? lastCycleCompletion?.status_message ?? 'No active Strategic cycle';
+  const localRunnerStatus = localRunner ? localRunnerTone(localRunner) : null;
 
   function attentionItemAction(item: StrategicStateAttentionItem): (() => void) | undefined {
     if (item.kind === 'task') {
@@ -234,6 +278,26 @@ export function StrategicContextRail({
                 value={`${latestCycle.directions_created} opened / ${latestCycle.tasks_spawned} tasks`}
               />
             ) : null}
+          </div>
+        )}
+        {localRunner && localRunnerStatus && (
+          <div className="mt-3 border-t border-neutral-800 pt-3">
+            <div className="flex min-w-0 items-center gap-2">
+              <Cpu className="h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="truncate text-xs font-semibold text-neutral-100">Local Strategic</span>
+                  <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${localRunnerStatus.dot}`} aria-hidden="true" />
+                  <span className={`shrink-0 text-ui-sm font-semibold uppercase ${localRunnerStatus.text}`}>
+                    {localRunnerStatus.label}
+                  </span>
+                </div>
+                <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-neutral-500">
+                  {localRunnerDetail(localRunner)}
+                </p>
+              </div>
+              <RailButton onClick={onOpenRuntimeDevices ?? onOpenRuntimeHealth}>Devices</RailButton>
+            </div>
           </div>
         )}
         {attention && attention.level !== 'clear' && (

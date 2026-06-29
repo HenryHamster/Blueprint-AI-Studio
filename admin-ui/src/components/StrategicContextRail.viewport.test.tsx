@@ -140,6 +140,22 @@ const STATE: StrategicStateResponse = {
       { id: 'runtime', label: 'Runtime', target: { surface: 'runtime', section: 'health' } },
     ],
   },
+  runtime: {
+    local_runner: {
+      mode: 'local_ready',
+      strategic_runner_count: 1,
+      live_runner_count: 1,
+      eligible_live_count: 1,
+      stale_runner_count: 0,
+      busy_runner_count: 0,
+      agent_unavailable_count: 0,
+      active_runner_id: null,
+      active_task_pinned: false,
+      active_task_runtime: null,
+      fallback_reason: null,
+      liveness_window_seconds: 300,
+    },
+  },
   design: { has_design_doc: true, revision: 5 },
 };
 
@@ -167,6 +183,7 @@ describe('StrategicContextRail — viewport regression', () => {
           onOpenProjectSection={vi.fn()}
           onOpenPipeline={vi.fn()}
           onOpenRuntimeHealth={vi.fn()}
+          onOpenRuntimeDevices={vi.fn()}
         />,
       );
     });

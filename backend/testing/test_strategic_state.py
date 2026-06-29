@@ -7,6 +7,7 @@ from httpx import AsyncClient
 from app.models import (
     Alert,
     AlertSeverity,
+    LocalRunner,
     MessageType,
     MessagesLastSeen,
     Project,
@@ -204,6 +205,12 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     assert {m["status"] for m in data["messages"]["items"]} == {"open", "linked"}
     assert data["attention"]["level"] == "clear"
     assert data["attention"]["counts"]["needs_operator"] == 0
+    local_runner = data["runtime"]["local_runner"]
+    assert local_runner["mode"] == "cloud"
+    assert local_runner["fallback_reason"] == "no_runner"
+    assert local_runner["strategic_runner_count"] == 0
+    assert local_runner["active_task_pinned"] is False
+    assert local_runner["active_task_runtime"]["runner_target_id"] is None
     linked_preview = next(
         m for m in data["messages"]["items"] if m["status"] == "linked"
     )
@@ -243,6 +250,271 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     } == {"running-update", "problem-model", "directions", "design-doc"}
     assert "huge" not in package
     assert "A blocker is owned by a direction" not in str(package)
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_reports_active_local_strategic_runner(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="a" * 64,
+        hostname="desk-mini",
+        status="active",
+        last_seen_at=_utcnow(),
+        capabilities={
+            "task_types": ["design_doc_update", "strategic_review"],
+            "has_gpu": False,
+            "max_concurrent": 1,
+            "runner_preset": "strategic_local",
+            "workload": "strategic",
+            "agent_available": True,
+            "active_task_ids": [],
+        },
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    phase2_task = Task(
+        project_id=project.id,
+        title="Strategic review on local runner",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.IN_PROGRESS,
+        strategic_cycle_id="sc-local",
+        vm_instance_id=f"runner:{runner.id}",
+        context={
+            "runner_target_id": str(runner.id),
+            "llm_provider": "openai",
+            "llm_model": "gpt-5.4",
+            "llm_account_id": "acct-local",
+        },
+    )
+    db_session.add(phase2_task)
+    await db_session.commit()
+    await db_session.refresh(phase2_task)
+
+    active_cycle = StrategicCycle(
+        id="sc-local",
+        project_id=project.id,
+        outcome="phase2_running",
+        phase1_started_at=_utcnow() - timedelta(minutes=10),
+        phase1_completed_at=_utcnow() - timedelta(minutes=5),
+        phase2_started_at=_utcnow() - timedelta(minutes=5),
+        phase2_task_id=phase2_task.id,
+    )
+    db_session.add(active_cycle)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    local_runner = resp.json()["runtime"]["local_runner"]
+
+    assert local_runner["mode"] == "local"
+    assert local_runner["strategic_runner_count"] == 1
+    assert local_runner["live_runner_count"] == 1
+    assert local_runner["eligible_live_count"] == 1
+    assert local_runner["fallback_reason"] is None
+    assert local_runner["active_runner_id"] == str(runner.id)
+    assert local_runner["active_task_pinned"] is True
+    assert local_runner["active_task_runtime"] == {
+        "provider": "openai",
+        "model": "gpt-5.4",
+        "account_id": "acct-local",
+        "vm_instance_id": f"runner:{runner.id}",
+        "runner_target_id": str(runner.id),
+    }
+    assert local_runner["liveness_window_seconds"] == 300
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_reports_offline_strategic_runner(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    db_session.add(
+        LocalRunner(
+            project_id=project.id,
+            token_hash="b" * 64,
+            hostname="desk-mini",
+            status="active",
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={
+                "task_types": ["design_doc_update", "strategic_review"],
+                "has_gpu": False,
+                "max_concurrent": 1,
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    local_runner = resp.json()["runtime"]["local_runner"]
+
+    assert local_runner["mode"] == "pending_local"
+    assert local_runner["fallback_reason"] == "runner_offline"
+    assert local_runner["strategic_runner_count"] == 1
+    assert local_runner["live_runner_count"] == 0
+    assert local_runner["eligible_live_count"] == 0
+    assert local_runner["stale_runner_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_does_not_mark_partial_strategic_runner_ready(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    db_session.add(
+        LocalRunner(
+            project_id=project.id,
+            token_hash="c" * 64,
+            hostname="phase2-only",
+            status="active",
+            last_seen_at=_utcnow(),
+            capabilities={
+                "task_types": ["strategic_review"],
+                "has_gpu": False,
+                "max_concurrent": 1,
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    local_runner = resp.json()["runtime"]["local_runner"]
+
+    assert local_runner["mode"] == "pending_local"
+    assert local_runner["fallback_reason"] == "capability_mismatch"
+    assert local_runner["strategic_runner_count"] == 1
+    assert local_runner["live_runner_count"] == 1
+    assert local_runner["eligible_live_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_reports_stale_pinned_runner_as_pending(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="d" * 64,
+        hostname="stale-desk",
+        status="active",
+        last_seen_at=_utcnow() - timedelta(minutes=10),
+        capabilities={
+            "task_types": ["design_doc_update", "strategic_review"],
+            "has_gpu": False,
+            "max_concurrent": 1,
+            "runner_preset": "strategic_local",
+            "workload": "strategic",
+            "agent_available": True,
+        },
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    phase1_task = Task(
+        project_id=project.id,
+        title="Design doc update waiting on stale runner",
+        payloads=[{"type": "design_doc_update"}],
+        status=TaskStatus.PROVISIONING,
+        strategic_cycle_id="sc-stale-runner",
+        vm_instance_id=f"runner:{runner.id}",
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(phase1_task)
+    await db_session.commit()
+    await db_session.refresh(phase1_task)
+
+    active_cycle = StrategicCycle(
+        id="sc-stale-runner",
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_started_at=_utcnow() - timedelta(minutes=10),
+        phase1_task_id=phase1_task.id,
+    )
+    db_session.add(active_cycle)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    local_runner = resp.json()["runtime"]["local_runner"]
+
+    assert local_runner["mode"] == "pending_local"
+    assert local_runner["fallback_reason"] == "runner_offline"
+    assert local_runner["active_runner_id"] == str(runner.id)
+    assert local_runner["active_task_pinned"] is True
+    assert local_runner["live_runner_count"] == 0
+    assert local_runner["eligible_live_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_reports_live_pinned_task_waiting_for_runner_claim(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="e" * 64,
+        hostname="live-desk",
+        status="active",
+        last_seen_at=_utcnow(),
+        capabilities={
+            "task_types": ["design_doc_update", "strategic_review"],
+            "has_gpu": False,
+            "max_concurrent": 1,
+            "runner_preset": "strategic_local",
+            "workload": "strategic",
+            "agent_available": True,
+        },
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    phase1_task = Task(
+        project_id=project.id,
+        title="Design doc update pinned but not claimed",
+        payloads=[{"type": "design_doc_update"}],
+        status=TaskStatus.PROVISIONING,
+        strategic_cycle_id="sc-claim-pending",
+        vm_instance_id=f"runner:{runner.id}",
+        context={"runner_target_id": str(runner.id)},
+    )
+    db_session.add(phase1_task)
+    await db_session.commit()
+    await db_session.refresh(phase1_task)
+
+    active_cycle = StrategicCycle(
+        id="sc-claim-pending",
+        project_id=project.id,
+        outcome="phase1_running",
+        phase1_started_at=_utcnow() - timedelta(minutes=2),
+        phase1_task_id=phase1_task.id,
+    )
+    db_session.add(active_cycle)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    local_runner = resp.json()["runtime"]["local_runner"]
+
+    assert local_runner["mode"] == "pending_local"
+    assert local_runner["fallback_reason"] == "runner_claim_pending"
+    assert local_runner["active_runner_id"] == str(runner.id)
+    assert local_runner["active_task_pinned"] is True
+    assert local_runner["live_runner_count"] == 1
+    assert local_runner["eligible_live_count"] == 1
 
 
 @pytest.mark.asyncio

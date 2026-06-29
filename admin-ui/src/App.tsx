@@ -1359,6 +1359,10 @@ export default function App() {
                     setRuntimeSection('health');
                     handleTabChange('runtime');
                   }}
+                  onOpenRuntimeDevices={() => {
+                    setRuntimeSection('devices');
+                    handleTabChange('runtime');
+                  }}
                   onOpenTask={handleViewTaskById}
                 />
                 <TaskContextRail
