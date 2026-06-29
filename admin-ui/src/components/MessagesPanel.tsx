@@ -23,7 +23,7 @@ import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { DirectionsAddForm } from './DirectionsAddForm';
-import type { StrategicContextPackageDescriptor, StrategicStateResponse } from '../strategicStateApi';
+import type { StrategicContextPackageDescriptor, StrategicMessageTarget, StrategicStateResponse, StrategicWorkbenchState } from '../strategicStateApi';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -109,6 +109,14 @@ function attentionTextTone(level?: string | null): string {
   return 'text-emerald-300';
 }
 
+function messageReplyFromLabel(msg: ProjectMessage): string {
+  const fromType = (msg.from_type || '').toLowerCase();
+  if (fromType === 'strategic' || fromType === 'strategist') return 'Strategic';
+  if (fromType === 'agent') return 'Agent';
+  if (fromType === 'system') return 'System';
+  return 'Operator';
+}
+
 function isConversationMessage(
   msg: ProjectMessage,
   eventPrefs: Record<string, EventPref>,
@@ -122,6 +130,71 @@ function isConversationMessage(
   if (msg.message_type === 'QUESTION' || msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT' || msg.message_type === 'FEEDBACK') return true;
   if (eventType === 'question_answer' || eventType === 'feedback_acknowledgment') return true;
   return effectiveSignal(msg, eventPrefs, tempMutes) === 'high';
+}
+
+function buildMessageWorkbenchContext(
+  state?: StrategicStateResponse | null,
+  workbenchOverride?: StrategicWorkbenchState | null,
+): Record<string, unknown> | null {
+  const session = state?.work_session ?? null;
+  const workbench = workbenchOverride ?? state?.workbench ?? null;
+  if (!session && !workbench && !state?.context_package?.id) return null;
+  const selectedRefs = workbench?.selected_refs ?? session?.selected_refs ?? [];
+  const interactionMode = workbench?.interaction_mode ?? session?.mode ?? 'chat';
+  const activeSurface = workbench?.active_surface ?? session?.active_surface ?? 'strategic';
+  const sessionStartedAt = workbench?.session_started_at ?? session?.session_started_at ?? null;
+  const contextPackageId = session?.context_package_id ?? state?.context_package?.id ?? null;
+  const hasSignal =
+    selectedRefs.length > 0 ||
+    interactionMode !== 'chat' ||
+    activeSurface !== 'strategic' ||
+    Boolean(sessionStartedAt) ||
+    Boolean(contextPackageId);
+  if (!hasSignal) return null;
+  return {
+    version: 1,
+    interaction_mode: interactionMode,
+    active_surface: activeSurface,
+    selected_refs: selectedRefs,
+    session_started_at: sessionStartedAt,
+    context_package_id: contextPackageId,
+  };
+}
+
+function sessionRefFallbackLabel(kind: string, id: string, label?: string): string {
+  if (label?.trim()) return label.trim();
+  return `${kind.replace(/_/g, ' ')} ${id.slice(0, 8)}`;
+}
+
+function buildSessionContextChips(
+  state?: StrategicStateResponse | null,
+  workbenchOverride?: StrategicWorkbenchState | null,
+): Array<{ id: string; kind: string; label: string; status?: string | null }> {
+  const workbench = workbenchOverride ?? state?.workbench ?? null;
+  if (!state?.work_session && !workbench) return [];
+  const descriptorByRef = new Map((state?.work_session?.selected_ref_descriptors ?? []).map(ref => [`${ref.kind}:${ref.id}`, ref]));
+  const refs = workbench?.selected_refs ?? state?.work_session?.selected_refs ?? [];
+  if (refs.length > 0) {
+    return refs.slice(0, 4).map(ref => {
+      const descriptor = descriptorByRef.get(`${ref.kind}:${ref.id}`);
+      return {
+        id: `${ref.kind}:${ref.id}`,
+        kind: ref.kind,
+        label: descriptor?.label ?? sessionRefFallbackLabel(ref.kind, ref.id, ref.label),
+        status: descriptor?.status,
+      };
+    });
+  }
+  const descriptors = state?.work_session?.selected_ref_descriptors ?? [];
+  if (descriptors.length > 0) {
+    return descriptors.slice(0, 4).map(ref => ({
+      id: `${ref.kind}:${ref.id}`,
+      kind: ref.kind,
+      label: ref.label,
+      status: ref.status,
+    }));
+  }
+  return [];
 }
 
 function strategicRefreshFromReadModel(
@@ -193,6 +266,12 @@ export interface MessagesPanelProps {
   contextPackage?: StrategicContextPackageDescriptor | null;
   /** Strategic workbench read model, used by the minimal chat surface. */
   strategicState?: StrategicStateResponse | null;
+  /** Optimistic workbench session state from the shell; overrides stale read-model workbench refs. */
+  strategicWorkbenchState?: StrategicWorkbenchState | null;
+  /** One-shot target from the Strategic rail, used to reveal/reply to a specific message. */
+  targetMessage?: StrategicMessageTarget | null;
+  /** Called once the panel has consumed targetMessage. */
+  onTargetMessageHandled?: () => void;
   /** Refresh the Strategic read model after a chat action changes Strategic state. */
   onStrategicStateRefresh?: () => void | Promise<void>;
   /** Record a successful operator interaction with Strategic workbench state. */
@@ -272,7 +351,7 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, contextPackage, strategicState, onStrategicStateRefresh, onStrategicInteraction, onStrategicRefresh }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onStrategicRefresh }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -280,7 +359,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const currentStrategicState = strategicState?.project_id === selectedProjectId ? strategicState : null;
   const usesStrategicReadModel = currentStrategicState != null;
   const effectiveContextPackage = contextPackage ?? currentStrategicState?.context_package ?? null;
-  const workbenchState = currentStrategicState?.workbench ?? null;
+  const workbenchState = strategicWorkbenchState ?? currentStrategicState?.workbench ?? null;
   const strategicAttention = currentStrategicState?.attention ?? null;
   const refreshStrategicState = onStrategicStateRefresh ?? onStrategicRefresh;
   const recordStrategicInteraction = useCallback(() => {
@@ -306,6 +385,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // server idempotency key is the backstop for retries that do reach it).
   const submittingRef = useRef(false);
   const [replyTo, setReplyTo] = useState<{ id: string; content: string; from: string; message_type: string; status: string } | null>(null);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   // Real arming outcome the server reported for the last send (null before any
   // send, or after the operator changes the message type so the composer reverts
   // to a fresh type-based prediction).
@@ -653,8 +733,55 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         return aTime - bTime;
       });
   }, [messages, eventPrefs, tempMutes]);
+  const sessionContextChips = useMemo(
+    () => buildSessionContextChips(currentStrategicState, strategicWorkbenchState),
+    [currentStrategicState, strategicWorkbenchState],
+  );
 
   const mutedCount = Object.values(eventPrefs).filter(v => v === 'mute').length;
+
+  useEffect(() => {
+    if (!targetMessage?.messageId) return;
+    if (!conversationMode) {
+      onTargetMessageHandled?.();
+      return;
+    }
+    const target = conversationMessages.find(msg => msg.id === targetMessage.messageId)
+      ?? messages.find(msg => msg.id === targetMessage.messageId)
+      ?? null;
+    if (!target) {
+      if (!loading) onTargetMessageHandled?.();
+      return;
+    }
+    setHighlightedMessageId(target.id);
+    const node = scrollRef.current?.querySelector(`[data-message-id="${target.id}"]`);
+    node?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    if (targetMessage.action === 'reply' && target.message_type === 'QUESTION' && target.status === 'open') {
+      setReplyTo({
+        id: target.id,
+        content: target.content,
+        from: messageReplyFromLabel(target),
+        message_type: target.message_type,
+        status: target.status,
+      });
+      textareaRef.current?.focus();
+    }
+    onTargetMessageHandled?.();
+  }, [
+    conversationMessages,
+    conversationMode,
+    loading,
+    messages,
+    onTargetMessageHandled,
+    targetMessage?.action,
+    targetMessage?.messageId,
+  ]);
+
+  useEffect(() => {
+    if (!highlightedMessageId) return;
+    const timer = window.setTimeout(() => setHighlightedMessageId(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [highlightedMessageId]);
 
   // Persist + apply a mute-window change (arm/extend pass a window, clear passes null).
   // MuteWindowMenu owns its own open/close UI state and pushes changes back through here.
@@ -964,6 +1091,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     const el = scrollRef.current;
     if (!el) return;
     const currentCount = conversationMode ? conversationMessages.length : highSignalOpen.length + routineOpen.length + visibleResolved.length;
+    if (conversationMode && targetMessage?.messageId) {
+      prevMessageCountRef.current = currentCount;
+      return;
+    }
     const isInitialLoad = prevMessageCountRef.current === 0 && currentCount > 0;
     if (isInitialLoad) {
       // First load — jump to bottom instantly
@@ -977,7 +1108,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }
     // Don't scroll at all on polling refresh with same count — preserves position
     prevMessageCountRef.current = currentCount;
-  }, [conversationMode, conversationMessages.length, highSignalOpen, routineOpen, visibleResolved]);
+  }, [conversationMode, conversationMessages.length, highSignalOpen, routineOpen, targetMessage?.messageId, visibleResolved]);
 
   // Update parent with the high-signal count for the tab-title badge. highSignalCount is
   // countHighSignalMessages(messages), identical to the fetch callback and the closed-panel
@@ -1035,10 +1166,14 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       // via PATCH — the backend posts a question_answer NOTE (linked back to the
       // question) and marks the question resolved so the strategist sees it answered.
       if (replyTo && replyTo.message_type === 'QUESTION' && replyTo.status === 'open') {
+        const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
         const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${replyTo.id}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ resolution: newContent.trim() }),
+          body: JSON.stringify({
+            resolution: newContent.trim(),
+            ...(workbenchContext ? { workbench_context: workbenchContext } : {}),
+          }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         idempotencyKeyRef.current = null;
@@ -1058,6 +1193,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         context.reply_to = replyTo.id;
         context.reply_preview = replyTo.content.slice(0, 120);
       }
+      const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
       // Reuse the draft's key across a double-submit / retry so the backend
       // dedups; only mint a new one when the previous send fully succeeded.
       if (!idempotencyKeyRef.current) {
@@ -1073,6 +1209,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           content: submittedContent,
           idempotency_key: idempotencyKeyRef.current,
           ...(Object.keys(context).length > 0 ? { context } : {}),
+          ...(workbenchContext ? { workbench_context: workbenchContext } : {}),
         }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -1643,6 +1780,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         expandedGroupKeys={expandedGroupKeys}
         tempMutes={tempMutes}
         bubbleProps={bubbleProps}
+        highlightedMessageId={highlightedMessageId}
         onDismissDivider={dismissDivider}
         onShowOnlyNew={handleShowOnlyNew}
         setExpandedGroupKeys={setExpandedGroupKeys}
@@ -1722,6 +1860,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         onCancelReply={() => setReplyTo(null)}
         onSubmit={handleSubmit}
         chrome={conversationMode ? 'minimal' : 'full'}
+        sessionContextChips={conversationMode ? sessionContextChips : []}
       />
     </div>
   );

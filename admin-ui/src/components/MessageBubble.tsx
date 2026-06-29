@@ -194,6 +194,7 @@ export interface MessageBubbleProps {
   readOnly?: boolean;
   allMessages?: ProjectMessage[];
   presentation?: 'triage' | 'chat';
+  highlighted?: boolean;
   actionMode?: 'full' | 'reply-only' | 'none';
   resolvingId: string | null;
   resolveInput: string;
@@ -223,6 +224,7 @@ export function MessageBubble({
   readOnly = false,
   allMessages = [],
   presentation = 'triage',
+  highlighted = false,
   actionMode = 'full',
   resolvingId,
   resolveInput,
@@ -268,7 +270,11 @@ export function MessageBubble({
   }
 
   return (
-    <div data-testid="message-bubble" className={`group flex ${userMsg ? 'justify-end' : 'justify-start'} ${faded ? 'opacity-75' : ''}`}>
+    <div
+      data-testid="message-bubble"
+      data-message-id={msg.id}
+      className={`group flex scroll-mt-24 rounded-xl transition-colors ${userMsg ? 'justify-end' : 'justify-start'} ${faded ? 'opacity-75' : ''} ${highlighted ? 'bg-amber-400/5 ring-1 ring-amber-300/35' : ''}`}
+    >
       <div className={`${
         chatMode
           ? userMsg

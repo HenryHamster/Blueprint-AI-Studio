@@ -1,7 +1,7 @@
 import { afterEach, describe, test, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act, createRef } from 'react';
-import { MessagesComposer } from './MessagesComposer';
+import { MessagesComposer, type MessagesComposerSessionChip } from './MessagesComposer';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 
 async function renderComposer(
@@ -10,6 +10,7 @@ async function renderComposer(
   lastArming: 'steering' | 'passive_note' | 'routine_event' | 'not_armed' | null = null,
   strategistBusy = false,
   chrome: 'full' | 'minimal' = 'full',
+  sessionContextChips: MessagesComposerSessionChip[] = [],
 ) {
   const ref = createRef<HTMLTextAreaElement>();
   await act(async () => {
@@ -27,6 +28,7 @@ async function renderComposer(
         onCancelReply={() => {}}
         onSubmit={() => {}}
         chrome={chrome}
+        sessionContextChips={sessionContextChips}
       />,
     );
   });
@@ -184,6 +186,29 @@ describe('MessagesComposer — steering hint viewport regression', () => {
       await renderComposer(r, 'FEEDBACK', 'not_armed', false, 'minimal');
     });
     expect(host!.textContent).toContain('Couldn’t wake the strategist');
+    await expectNoTextTruncationAt(375, async () => {});
+    await expectMinTouchTargetAt(375, async () => {});
+  });
+
+  test('minimal chat composer context chips fit 375px without overflow', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderComposer(r, 'FEEDBACK', null, false, 'minimal', [
+        {
+          id: 'knowledge_document:operator-notes',
+          kind: 'knowledge_document',
+          label: 'Operator notes for the local Strategic workday session',
+          status: 'active',
+        },
+      ]);
+    });
+    if (!host) throw new Error('Expected host to be mounted');
+    expect(host.textContent).toContain('Operator notes');
+    expect(host.textContent).toContain('active');
     await expectNoTextTruncationAt(375, async () => {});
     await expectMinTouchTargetAt(375, async () => {});
   });

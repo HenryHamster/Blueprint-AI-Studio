@@ -56,6 +56,11 @@ export interface StrategicStateAttentionItem {
   event_type?: string | null;
 }
 
+export interface StrategicMessageTarget {
+  messageId: string;
+  action?: 'highlight' | 'reply';
+}
+
 export interface StrategicContextPackageSource {
   kind: string;
   count: number;

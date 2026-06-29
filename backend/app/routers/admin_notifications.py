@@ -83,6 +83,7 @@ class _MessageCreate(BaseModel):
 
 class _MessageResolve(BaseModel):
     resolution: Optional[str] = None
+    workbench_context: Optional[Dict[str, Any]] = None
 
 
 class _LastSeenUpdate(BaseModel):
@@ -709,6 +710,8 @@ async def resolve_message(
             status_code=400,
             detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
         )
+    if workbench_state_exceeds_max_bytes(payload.workbench_context):
+        raise HTTPException(status_code=400, detail=f"workbench_context exceeds {WORKBENCH_STATE_MAX_BYTES} byte limit")
     # Use update with status check for idempotency: only update if still open.
     # If a concurrent request also resolves before this one commits, the update
     # will find 0 rows and we return already_resolved for both paths.
@@ -728,13 +731,10 @@ async def resolve_message(
             try:
                 from app.notification_dispatch import post_question_answer as _post_qa
 
-                await _post_qa(
-                    session,
-                    msg.project_id,
-                    msg.id,
-                    resolution,
-                    from_type="user",
-                )
+                strategic_session = await build_message_strategic_session_snapshot(session, current_user["user_id"], msg.project_id, payload.workbench_context)
+                answer_msg = await _post_qa(session, msg.project_id, msg.id, resolution, from_type="user")
+                if strategic_session:
+                    answer_msg.context = {**(answer_msg.context or {}), "strategic_session": strategic_session}
                 await session.commit()
             except Exception:
                 logging.getLogger(__name__).warning(

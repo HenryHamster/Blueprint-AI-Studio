@@ -3,6 +3,13 @@ import { X, Send, Reply } from 'lucide-react';
 import { MessageTypeDropdown } from './MessageTypeDropdown';
 import { type ArmingOutcome, composerHintCopy } from './messageArming';
 
+export interface MessagesComposerSessionChip {
+  id: string;
+  kind: string;
+  label: string;
+  status?: string | null;
+}
+
 export interface MessagesComposerProps {
   textareaRef: RefObject<HTMLTextAreaElement | null>;
   newType: string;
@@ -13,6 +20,7 @@ export interface MessagesComposerProps {
   lastArming?: ArmingOutcome | null;
   /** Whether a strategic cycle is currently running (live WS-driven signal). */
   strategistBusy?: boolean;
+  sessionContextChips?: MessagesComposerSessionChip[];
   onChangeType: (value: string) => void;
   onChangeContent: (value: string) => void;
   onCancelReply: () => void;
@@ -36,6 +44,7 @@ export function MessagesComposer({
   replyTo,
   lastArming,
   strategistBusy,
+  sessionContextChips = [],
   onChangeType,
   onChangeContent,
   onCancelReply,
@@ -65,6 +74,20 @@ export function MessagesComposer({
       ? 'shrink-0 border-t border-neutral-800 bg-[#05080c] px-4 py-3 md:px-8'
       : 'px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50'
     }>
+      {minimal && sessionContextChips.length > 0 && (
+        <div className="mx-auto mb-2 flex w-full max-w-4xl flex-wrap items-center gap-1.5" data-testid="strategic-session-context-chips">
+          {sessionContextChips.map(chip => (
+            <span
+              key={chip.id}
+              className="min-w-0 max-w-full break-words rounded-md border border-neutral-700/70 bg-neutral-900 px-2 py-1 text-ui-md leading-snug text-neutral-300"
+              title={`${chip.kind.replace(/_/g, ' ')}: ${chip.label}`}
+            >
+              {chip.label}
+              {chip.status && <span className="ml-1 text-neutral-500">{chip.status}</span>}
+            </span>
+          ))}
+        </div>
+      )}
       {/* Reply quote bar */}
       {replyTo && (
         <div className={`${minimal ? 'mx-auto max-w-4xl' : ''} mb-2 flex items-center gap-2 rounded-r-lg border-l-2 border-blue-500/50 bg-neutral-800/60 px-3 py-1.5`}>

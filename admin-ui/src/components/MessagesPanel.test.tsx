@@ -662,6 +662,50 @@ describe('MessagesPanel chrome modes', () => {
     expect(strip?.textContent).not.toContain('3 running / 5 queued');
   });
 
+  test('minimal chat composer shows optimistic Strategic session context chips', async () => {
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      strategicState: makeStrategicState({
+        work_session: {
+          version: 1,
+          id: 'strategic-session:proj-1:2026-06-29T01:00:00Z',
+          mode: 'continuous',
+          active_surface: 'strategic',
+          session_started_at: '2026-06-29T01:00:00Z',
+          last_interaction_at: '2026-06-29T01:08:00Z',
+          context_package_id: 'strategic-context:proj-1',
+          attention_level: 'needs_operator',
+          selected_refs: [
+            { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
+          ],
+          selected_ref_descriptors: [
+            {
+              kind: 'knowledge_document',
+              id: 'knowledge:kdoc-1',
+              label: 'Operator notes',
+              status: 'active',
+            },
+          ],
+          curated_metrics: [],
+        },
+      }),
+      strategicWorkbenchState: {
+        version: 1,
+        interaction_mode: 'continuous',
+        active_surface: 'strategic',
+        selected_refs: [
+          { kind: 'artifact', id: 'artifact:operator-context-report', label: 'Latest context report' },
+        ],
+        session_started_at: '2026-06-29T01:00:00Z',
+        last_interaction_at: '2026-06-29T01:09:00Z',
+      },
+    });
+
+    const chips = el.querySelector('[data-testid="strategic-session-context-chips"]');
+    expect(chips?.textContent).toContain('Latest context report');
+    expect(chips?.textContent).not.toContain('Operator notes');
+  });
+
   test('minimal chat chrome shows conversation messages chronologically without routine alerts', async () => {
     const routine = makeMsg({
       id: 'routine',
@@ -711,6 +755,43 @@ describe('MessagesPanel chrome modes', () => {
     expect(text).not.toContain('cycle summary should stay out of chat');
     expect(text.indexOf('Operator steering')).toBeLessThan(text.indexOf('Should I keep this path?'));
     expect(text.indexOf('Should I keep this path?')).toBeLessThan(text.indexOf('Strategic reply'));
+  });
+
+  test('minimal chat target primes reply for an open question and highlights it', async () => {
+    const onTargetMessageHandled = vi.fn();
+    const scrollIntoView = vi.fn();
+    const scrollTo = vi.fn();
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    const originalScrollTo = HTMLElement.prototype.scrollTo;
+    Element.prototype.scrollIntoView = scrollIntoView;
+    HTMLElement.prototype.scrollTo = scrollTo;
+    const question = makeMsg({
+      id: 'question-target',
+      from_type: 'agent',
+      message_type: 'QUESTION',
+      content: 'Should I keep the local runner online?',
+      status: 'open',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+
+    try {
+      const el = await renderPanel({
+        filterChrome: 'minimal',
+        targetMessage: { messageId: 'question-target', action: 'reply' },
+        onTargetMessageHandled,
+      }, [question]);
+
+      await waitFor(() => expect(onTargetMessageHandled).toHaveBeenCalledTimes(1));
+      const bubble = el.querySelector('[data-message-id="question-target"]');
+      expect(bubble?.className).toContain('ring-1');
+      expect(scrollIntoView).toHaveBeenCalled();
+      expect(scrollTo).not.toHaveBeenCalled();
+      expect(el.textContent).toContain('Replying to Agent');
+      expect(el.textContent).toContain('Should I keep the local runner online?');
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+      HTMLElement.prototype.scrollTo = originalScrollTo;
+    }
   });
 
   test('minimal chat chrome keeps queued and working state in the compact strip only', async () => {
@@ -3825,7 +3906,7 @@ describe('MessagesPanel send arming receipt', () => {
     });
   }
 
-  function _setupQuestionAnswerMock(question: ProjectMessage): void {
+  function _setupQuestionAnswerMock(question: ProjectMessage, patchBodies: unknown[] = []): void {
     (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
       const urlStr = String(url);
       const method = (init as RequestInit | undefined)?.method ?? 'GET';
@@ -3833,6 +3914,7 @@ describe('MessagesPanel send arming receipt', () => {
         return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
       }
       if (urlStr.includes(`/api/admin/messages/${question.id}`) && method === 'PATCH') {
+        patchBodies.push(JSON.parse(String((init as RequestInit | undefined)?.body ?? '{}')));
         return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
       }
       if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
@@ -4018,12 +4100,23 @@ describe('MessagesPanel send arming receipt', () => {
       content: 'Should we keep the local runner active?',
       status: 'open',
     });
-    _setupQuestionAnswerMock(question);
+    const patchBodies: unknown[] = [];
+    _setupQuestionAnswerMock(question, patchBodies);
     const addToast = vi.fn();
     const onStrategicStateRefresh = vi.fn();
     const onStrategicInteraction = vi.fn();
     const el = await renderPanel(addToast, false, {
       strategicState: makeStrategicState(),
+      strategicWorkbenchState: {
+        version: 1,
+        interaction_mode: 'continuous',
+        active_surface: 'strategic',
+        selected_refs: [
+          { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
+        ],
+        session_started_at: '2026-06-29T01:00:00Z',
+        last_interaction_at: '2026-06-29T01:08:00Z',
+      },
       onStrategicStateRefresh,
       onStrategicInteraction,
     });
@@ -4034,6 +4127,18 @@ describe('MessagesPanel send arming receipt', () => {
     await typeAndSend(el, 'yes, keep it active');
 
     await waitFor(() => expect(addToast).toHaveBeenCalledWith('Question answered', 'success'));
+    expect(patchBodies[0]).toMatchObject({
+      resolution: 'yes, keep it active',
+      workbench_context: {
+        version: 1,
+        interaction_mode: 'continuous',
+        active_surface: 'strategic',
+        selected_refs: [
+          { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
+        ],
+        session_started_at: '2026-06-29T01:00:00Z',
+      },
+    });
     expect(onStrategicStateRefresh).toHaveBeenCalledTimes(1);
     expect(onStrategicInteraction).toHaveBeenCalledTimes(1);
   });
@@ -4886,6 +4991,40 @@ describe('MessagesPanel composer draft persistence', () => {
         showCloseButton={false}
         addToast={() => {}}
         onMessageCountChange={() => {}}
+        strategicState={makeStrategicState({
+          project_id: 'proj-draft',
+          work_session: {
+            version: 1,
+            id: 'strategic-session:proj-draft:2026-06-29T01:00:00Z',
+            mode: 'continuous',
+            active_surface: 'strategic',
+            session_started_at: '2026-06-29T01:00:00Z',
+            last_interaction_at: '2026-06-29T01:08:00Z',
+            context_package_id: 'strategic-context:proj-draft',
+            attention_level: 'watch',
+            selected_refs: [
+              { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
+            ],
+            selected_ref_descriptors: [
+              {
+                kind: 'knowledge_document',
+                id: 'knowledge:kdoc-1',
+                label: 'Operator notes',
+              },
+            ],
+            curated_metrics: [],
+          },
+        })}
+        strategicWorkbenchState={{
+          version: 1,
+          interaction_mode: 'continuous',
+          active_surface: 'strategic',
+          selected_refs: [
+            { kind: 'artifact', id: 'artifact:latest-context', label: 'Latest context report' },
+          ],
+          session_started_at: '2026-06-29T01:00:00Z',
+          last_interaction_at: '2026-06-29T01:09:00Z',
+        }}
       />,
     );
     await waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1));
@@ -4904,6 +5043,16 @@ describe('MessagesPanel composer draft persistence', () => {
       project_id: 'proj-draft',
       message_type: 'FEEDBACK',
       content: 'use the clean chat path',
+      workbench_context: {
+        version: 1,
+        interaction_mode: 'continuous',
+        active_surface: 'strategic',
+        selected_refs: [
+          { kind: 'artifact', id: 'artifact:latest-context', label: 'Latest context report' },
+        ],
+        session_started_at: '2026-06-29T01:00:00Z',
+        context_package_id: 'strategic-context:proj-draft',
+      },
     });
   });
 

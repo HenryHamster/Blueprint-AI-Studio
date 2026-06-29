@@ -4961,7 +4961,23 @@ class TestMessages:
 
         resp = await client.patch(
             f"/api/admin/messages/{question.id}",
-            json={"resolution": "Use approach A."},
+            json={
+                "resolution": "Use approach A.",
+                "workbench_context": {
+                    "version": 1,
+                    "interaction_mode": "continuous",
+                    "active_surface": "strategic",
+                    "selected_refs": [
+                        {
+                            "kind": "knowledge_document",
+                            "id": "knowledge:kdoc-1",
+                            "label": "Operator notes",
+                        },
+                    ],
+                    "session_started_at": "2026-06-29T01:00:00Z",
+                    "context_package_id": "strategic-context:test",
+                },
+            },
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "resolved"
@@ -4987,6 +5003,16 @@ class TestMessages:
         assert note.context.get("event_type") == "question_answer"
         assert note.context.get("reply_to") == str(question.id)
         assert note.context.get("answer") == "Use approach A."
+        session = note.context.get("strategic_session")
+        assert session["interaction_mode"] == "continuous"
+        assert session["context_package_id"] == "strategic-context:test"
+        assert session["selected_refs"] == [
+            {
+                "kind": "knowledge_document",
+                "id": "knowledge:kdoc-1",
+                "label": "Operator notes",
+            }
+        ]
 
     @pytest.mark.asyncio
     async def test_delete_message(self, client: AsyncClient, db_session):

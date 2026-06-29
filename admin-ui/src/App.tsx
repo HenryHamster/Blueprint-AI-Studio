@@ -53,6 +53,7 @@ import { ProjectWorkspace, RuntimeWorkspace, type ProjectManageSection, type Pro
 import { WorkbenchFrame, WorkbenchMetric, WorkbenchPanel, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
 import { useStrategicReadModel } from './hooks/useStrategicReadModel';
 import { useOperatorKeyboardShortcuts } from './hooks/useOperatorKeyboardShortcuts';
+import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
 import { updateStrategicWorkbenchState, type StrategicWorkbenchState } from './strategicStateApi';
 import { parseTimestamp } from './utils/time';
@@ -876,10 +877,9 @@ export default function App() {
   }, [s, persistStrategicWorkbench]);
 
   const focusStrategicComposer = useCallback(() => {
-    handleTabChange('chat');
-    setStrategicComposerFocusSignal(value => value + 1);
-    setCommandPaletteOpen(false);
+    handleTabChange('chat'); setStrategicComposerFocusSignal(value => value + 1); setCommandPaletteOpen(false);
   }, [handleTabChange]);
+  const strategicMessageTarget = useStrategicMessageTarget(() => handleTabChange('chat'), selectedProjectId);
   const currentStrategicInteractionMode = normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode);
   const setStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
     void persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' });
@@ -1430,7 +1430,8 @@ export default function App() {
                 cycleProgress={s.cycleProgress}
                 lastCycleCompletion={s.lastCycleCompletion}
                 focusComposerSignal={strategicComposerFocusSignal}
-                strategicState={strategicReadModel.data ?? null}
+                targetMessage={strategicMessageTarget.target} onTargetMessageHandled={strategicMessageTarget.clear}
+                strategicState={strategicReadModel.data ?? null} strategicWorkbenchState={strategicWorkbenchState}
                 onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
                 onStrategicInteraction={() => { void persistStrategicWorkbench({ active_surface: 'strategic' }); }}
               />
@@ -1467,7 +1468,7 @@ export default function App() {
                     setKnowledgeBrowserDirectionId(directionId ?? null);
                     s.setShowKnowledgeBrowser(true);
                   }}
-                  onOpenMessages={() => handleTabChange('chat')}
+                  onOpenMessages={strategicMessageTarget.open}
                   workbenchState={strategicWorkbenchState}
                   savingSessionRefs={savingStrategicWorkbench}
                   onUpdateSessionRefs={updateStrategicSessionRefs}

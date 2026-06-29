@@ -729,7 +729,7 @@ describe('StrategicContextRail', () => {
     expect(btn).toBeTruthy();
     btn?.click();
 
-    expect(onOpenMessages).toHaveBeenCalled();
+    expect(onOpenMessages).toHaveBeenCalledWith({ messageId: 'msg-1', action: 'reply' });
     expect(props.onOpenPipeline).not.toHaveBeenCalled();
   });
 

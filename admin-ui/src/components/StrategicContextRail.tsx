@@ -7,6 +7,7 @@ import type {
   StrategicContextPackageDrilldown,
   StrategicContextResourceRef,
   StrategicLocalRunnerState,
+  StrategicMessageTarget,
   StrategicRuntimeWorkState,
   StrategicStateAttentionItem,
   StrategicStateResponse,
@@ -40,7 +41,7 @@ interface StrategicContextRailProps {
   onOpenRuntimeDevices?: () => void;
   onOpenRuntimeCompute?: () => void;
   onOpenTask?: (taskId: string) => void;
-  onOpenMessages?: () => void;
+  onOpenMessages?: (target?: StrategicMessageTarget) => void;
   onOpenKnowledge?: (documentId?: string | null, directionId?: string | null) => void;
   workbenchState?: StrategicWorkbenchState | null;
   savingSessionRefs?: boolean;
@@ -668,7 +669,14 @@ export function StrategicContextRail({
       return onOpenTask ? () => onOpenTask(taskId) : onOpenPipeline;
     }
     if (item.kind === 'alert') return onOpenRuntimeHealth;
-    if (item.kind === 'message') return onOpenMessages ?? onOpenPipeline;
+    if (item.kind === 'message') {
+      if (!onOpenMessages) return onOpenPipeline;
+      const messageId = item.ref?.id;
+      return () => onOpenMessages(messageId ? {
+        messageId,
+        action: item.reason === 'question' ? 'reply' : 'highlight',
+      } : undefined);
+    }
     return undefined;
   }
 
@@ -689,7 +697,8 @@ export function StrategicContextRail({
       return;
     }
     if (target.surface === 'messages') {
-      (onOpenMessages ?? onOpenPipeline)();
+      if (onOpenMessages) onOpenMessages();
+      else onOpenPipeline();
       return;
     }
     if (target.surface === 'task') {

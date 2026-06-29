@@ -63,6 +63,7 @@ export interface MessagesListViewProps {
 
   // Shared bubble props
   bubbleProps: BubbleProps;
+  highlightedMessageId?: string | null;
 
   // Callbacks
   onDismissDivider: () => void;
@@ -120,6 +121,7 @@ export function MessagesListView({
   expandedGroupKeys,
   tempMutes,
   bubbleProps,
+  highlightedMessageId,
   onDismissDivider,
   onShowOnlyNew,
   setExpandedGroupKeys,
@@ -154,6 +156,7 @@ export function MessagesListView({
                   faded={item.msg.status === 'resolved'}
                   allMessages={messages}
                   presentation="chat"
+                  highlighted={item.msg.id === highlightedMessageId}
                   {...bubbleProps}
                 />
               ),
