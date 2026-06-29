@@ -27179,3 +27179,89 @@ class TestComputeGoalCoverageDrift:
         assert result["stale"] is True
         assert result["merges_since_grade"] == 10
         assert result["coverage"] is None
+
+    def test_not_applicable_status_non_stale(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="not_applicable",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "not_applicable"
+        assert result["stale"] is False
+
+    def test_not_applicable_status_stale_not_drifting(self):
+        """stale semantics do not apply to not_applicable — must stay not_applicable."""
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="not_applicable",
+            merges_since_grade=5,
+        )
+        assert result["signal"] == "not_applicable"
+
+    def test_superseded_exempt_status_non_stale(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="superseded_exempt",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "superseded_exempt"
+        assert result["stale"] is False
+
+    def test_superseded_exempt_status_stale_not_drifting(self):
+        """stale semantics do not apply to superseded_exempt — must stay superseded_exempt."""
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="superseded_exempt",
+            merges_since_grade=5,
+        )
+        assert result["signal"] == "superseded_exempt"
+
+    def test_unparseable_status_returns_no_grade_yet(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="unparseable",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "no_grade_yet"
+
+    def test_unknown_future_status_returns_no_grade_yet(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="future_status",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "no_grade_yet"
+
+    def test_pass_status_non_stale_returns_on_track(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="pass",
+            merge_grade_coverage=0.9,
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "on_track"
+
+    def test_fail_status_returns_drifting(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="fail",
+            merge_grade_coverage=0.4,
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "drifting"
