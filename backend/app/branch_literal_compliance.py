@@ -210,6 +210,76 @@ SURFACE_CONFIGS: dict[Surface, BranchLiteralSurfaceConfig] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# CI-compliance agent scan constants — single source of truth for the
+# ci_compliance evaluator's agent branch-literal check. These differ from the
+# shared AGENT_PATTERNS intentionally: the CI path enforces a broader rule
+# (== and != in addition to === and !==, plus 'master' in addition to 'main'
+# and 'automain') and strips parenthesized fallbacks rather than flagging them.
+# ---------------------------------------------------------------------------
+
+# Agent TS files scanned by the CI-compliance evaluator. Paths relative to
+# agent/src/.  Mirrors _TARGET_RELATIVE in test_agent_branch_invariants.py.
+AGENT_SOURCE_FILES: tuple[str, ...] = (
+    "handlers/review-fix.ts",
+    "handlers/specialized.ts",
+    "handlers/standard.ts",
+    "handlers/code-change.ts",
+    "prompt.ts",
+)
+
+# Equality/inequality comparison against a bare branch literal — broader than
+# the shared equality-main pattern (includes == / != and 'master').
+CI_AGENT_FORBIDDEN_RE: re.Pattern[str] = re.compile(
+    r"""(===|!==|==|!=)\s*['"](main|automain|master)['"]"""
+)
+
+# Parenthesized fallback expressions stripped BEFORE the forbidden regex runs
+# so ``(promotionTarget ?? 'main')`` is allowed rather than flagged.
+CI_AGENT_PAREN_FALLBACK_RE: re.Pattern[str] = re.compile(
+    r"""\(\s*[^()]*?\s*(\?\?|\|\|)\s*['"](?:main|automain|master)['"]\s*\)"""
+)
+
+
+def strip_typescript_with_linenos(src: str) -> list[tuple[int, str]]:
+    """Return ``(1-based lineno, text)`` pairs with TS/JS comments removed.
+
+    Handles ``//`` line comments and ``/* ... */`` block comments.  Used by
+    the CI-compliance evaluator to scan GitHub-fetched TS file text.
+    Mirrors ``_strip_comments`` in ``test_agent_branch_invariants.py``.
+    """
+    result: list[tuple[int, str]] = []
+    in_block = False
+    for i, line in enumerate(src.splitlines(), start=1):
+        stripped = line
+        if in_block:
+            end = stripped.find("*/")
+            if end == -1:
+                continue
+            stripped = stripped[end + 2 :]
+            in_block = False
+        while True:
+            start_idx = stripped.find("/*")
+            if start_idx == -1:
+                break
+            end_idx = stripped.find("*/", start_idx + 2)
+            if end_idx == -1:
+                stripped = stripped[:start_idx]
+                in_block = True
+                break
+            stripped = stripped[:start_idx] + stripped[end_idx + 2 :]
+        slash_idx = stripped.find("//")
+        if slash_idx != -1:
+            stripped = stripped[:slash_idx]
+        lstripped = stripped.lstrip()
+        if not lstripped:
+            continue
+        if lstripped.startswith("*"):
+            continue
+        result.append((i, stripped))
+    return result
+
+
 def _iter_source_files(root: Path, config: BranchLiteralSurfaceConfig) -> Iterable[Path]:
     for current_root, dirs, files in os.walk(root):
         dirs[:] = [d for d in dirs if d not in {"node_modules", "__pycache__"}]

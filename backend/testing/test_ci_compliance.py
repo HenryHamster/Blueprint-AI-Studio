@@ -443,6 +443,48 @@ def test_record_ci_compliance_noop_without_ref():
     assert ci_compliance.get_ci_compliance(project) == {}
 
 
+def test_ci_compliance_branch_literals_use_shared_scanner():
+    """ci_compliance sources branch-literal patterns from branch_literal_compliance.
+
+    Asserts that the local duplicate constant names no longer exist and that
+    ci_compliance imports pattern/allowlist objects from the shared module.
+    This is the acceptance gate for the dedup refactor — both production-code
+    and test changes must be present for this test to be meaningful.
+    """
+    from app import branch_literal_compliance
+
+    # Local duplicate names must not exist in ci_compliance.
+    assert not hasattr(ci_compliance, "_BACKEND_BRANCH_LITERAL_PATTERNS"), (
+        "local duplicate _BACKEND_BRANCH_LITERAL_PATTERNS must be removed"
+    )
+    assert not hasattr(ci_compliance, "_BACKEND_BRANCH_LITERAL_ALLOW"), (
+        "local duplicate _BACKEND_BRANCH_LITERAL_ALLOW must be removed"
+    )
+    assert not hasattr(ci_compliance, "_AGENT_FORBIDDEN_RE"), (
+        "local duplicate _AGENT_FORBIDDEN_RE must be removed"
+    )
+    assert not hasattr(ci_compliance, "_AGENT_PAREN_FALLBACK_RE"), (
+        "local duplicate _AGENT_PAREN_FALLBACK_RE must be removed"
+    )
+    assert not hasattr(ci_compliance, "_AGENT_BRANCH_LITERAL_REL_PATHS"), (
+        "local duplicate _AGENT_BRANCH_LITERAL_REL_PATHS must be removed"
+    )
+
+    # ci_compliance must reference the shared module's objects by identity.
+    assert ci_compliance.BACKEND_PATTERNS is branch_literal_compliance.BACKEND_PATTERNS
+    assert ci_compliance.SURFACE_CONFIGS is branch_literal_compliance.SURFACE_CONFIGS
+    assert ci_compliance.AGENT_SOURCE_FILES is branch_literal_compliance.AGENT_SOURCE_FILES
+    assert ci_compliance.CI_AGENT_FORBIDDEN_RE is branch_literal_compliance.CI_AGENT_FORBIDDEN_RE
+    assert (
+        ci_compliance.CI_AGENT_PAREN_FALLBACK_RE
+        is branch_literal_compliance.CI_AGENT_PAREN_FALLBACK_RE
+    )
+    assert (
+        ci_compliance.strip_typescript_with_linenos
+        is branch_literal_compliance.strip_typescript_with_linenos
+    )
+
+
 def test_record_ci_compliance_bounds_history():
     """The per-SHA map is bounded to _MAX_RECORDED_SHAS, evicting oldest."""
     project = Project(name="CI-Compliance Bound", user_id="test-user-123")

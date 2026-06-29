@@ -36,10 +36,17 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from typing import TYPE_CHECKING, Any
 
 from app import github
+from app.branch_literal_compliance import (
+    AGENT_SOURCE_FILES,
+    BACKEND_PATTERNS,
+    CI_AGENT_FORBIDDEN_RE,
+    CI_AGENT_PAREN_FALLBACK_RE,
+    SURFACE_CONFIGS,
+    strip_typescript_with_linenos,
+)
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -95,40 +102,6 @@ _SECTION_EXCLUDED: dict[str, Any] = {
     "frontend": _is_frontend_excluded,
 }
 
-# ---------------------------------------------------------------------------
-# Branch-literal scan: backend patterns
-# ---------------------------------------------------------------------------
-# Mirrors test_invariants.TestHardcodedBranchNames.test_no_hardcoded_main_branch_fallbacks
-_BACKEND_BRANCH_LITERAL_PATTERNS = [
-    re.compile(r"""else\s+['"](main|master)['"]"""),
-    re.compile(
-        r"""runtime_config\.get\(['"](integration_branch|promotion_target)['"]\s*,\s*['"]main['"]\)"""
-    ),
-    re.compile(r"""\bbranch\s*=\s*['"]main['"]"""),
-]
-# Files in backend/app/ that are allowed to contain branch literal patterns.
-_BACKEND_BRANCH_LITERAL_ALLOW = {"payload_schemas.py", "admin.py"}
-
-# ---------------------------------------------------------------------------
-# Branch-literal scan: agent patterns
-# ---------------------------------------------------------------------------
-# Mirrors test_agent_branch_invariants: equality/inequality comparison against
-# bare branch literals. Parenthesized fallbacks are stripped first.
-_AGENT_FORBIDDEN_RE = re.compile(
-    r"""(===|!==|==|!=)\s*['"](main|automain|master)['"]"""
-)
-_AGENT_PAREN_FALLBACK_RE = re.compile(
-    r"""\(\s*[^()]*?\s*(\?\?|\|\|)\s*['"](?:main|automain|master)['"]\s*\)"""
-)
-# Known agent TS files to scan. Mirrors _TARGET_RELATIVE in
-# test_agent_branch_invariants.py.
-_AGENT_BRANCH_LITERAL_REL_PATHS = [
-    "handlers/review-fix.ts",
-    "handlers/specialized.ts",
-    "handlers/standard.ts",
-    "handlers/code-change.ts",
-    "prompt.ts",
-]
 
 
 async def _load_size_limits_at_ref(
@@ -164,51 +137,13 @@ async def _load_size_limits_at_ref(
     return data if isinstance(data, dict) else {}
 
 
-def _strip_ts_comments(src: str) -> list[tuple[int, str]]:
-    """Return (lineno, text) pairs with TS/JS comment lines removed.
-
-    Handles ``//`` line comments and ``/* ... */`` block comments.
-    Mirrors test_agent_branch_invariants._strip_comments.
-    """
-    result: list[tuple[int, str]] = []
-    in_block = False
-    for i, line in enumerate(src.splitlines(), start=1):
-        stripped = line
-        if in_block:
-            end = stripped.find("*/")
-            if end == -1:
-                continue
-            stripped = stripped[end + 2:]
-            in_block = False
-        while True:
-            start = stripped.find("/*")
-            if start == -1:
-                break
-            end = stripped.find("*/", start + 2)
-            if end == -1:
-                stripped = stripped[:start]
-                in_block = True
-                break
-            stripped = stripped[:start] + stripped[end + 2:]
-        slash_idx = stripped.find("//")
-        if slash_idx != -1:
-            stripped = stripped[:slash_idx]
-        lstripped = stripped.lstrip()
-        if not lstripped:
-            continue
-        if lstripped.startswith("*"):
-            continue
-        result.append((i, stripped))
-    return result
-
-
 def _strip_agent_paren_fallbacks(line: str) -> str:
     """Remove parenthesized fallback expressions like ``(promotionTarget ?? 'main')``."""
     prev = None
     out = line
     while prev != out:
         prev = out
-        out = _AGENT_PAREN_FALLBACK_RE.sub("", out)
+        out = CI_AGENT_PAREN_FALLBACK_RE.sub("", out)
     return out
 
 
@@ -369,6 +304,9 @@ async def _scan_branch_literals(
     """
     violations: list[dict] = []
 
+    _backend_allow = SURFACE_CONFIGS["backend"].allowlisted_filenames
+    _backend_patterns = [p.regex for p in BACKEND_PATTERNS]
+
     # --- backend/app/*.py branch-literal scan ---
     backend_prefix = _SECTION_PREFIXES["backend"]
     backend_py_paths = [
@@ -380,7 +318,7 @@ async def _scan_branch_literals(
     for path in backend_py_paths:
         rel = path[len(backend_prefix):]
         fname = rel.rsplit("/", 1)[-1] if "/" in rel else rel
-        if fname in _BACKEND_BRANCH_LITERAL_ALLOW:
+        if fname in _backend_allow:
             continue
         try:
             text = await github.get_file_text_at_ref(
@@ -404,14 +342,14 @@ async def _scan_branch_literals(
             lstripped = line.lstrip()
             if lstripped.startswith("#") or "# noqa" in line:
                 continue
-            if any(pat.search(line) for pat in _BACKEND_BRANCH_LITERAL_PATTERNS):
+            if any(pat.search(line) for pat in _backend_patterns):
                 violations.append(
                     {"section": "backend", "rel": rel, "line": lineno, "text": line.strip()}
                 )
 
     # --- agent/src/ branch-literal scan (specific known files) ---
     agent_prefix = _SECTION_PREFIXES["agent"]
-    for agent_rel in _AGENT_BRANCH_LITERAL_REL_PATHS:
+    for agent_rel in AGENT_SOURCE_FILES:
         path = f"{agent_prefix}{agent_rel}"
         try:
             text = await github.get_file_text_at_ref(
@@ -431,9 +369,9 @@ async def _scan_branch_literals(
             continue
         if text is None:
             continue
-        for lineno, line in _strip_ts_comments(text):
+        for lineno, line in strip_typescript_with_linenos(text):
             cleaned = _strip_agent_paren_fallbacks(line)
-            if _AGENT_FORBIDDEN_RE.search(cleaned):
+            if CI_AGENT_FORBIDDEN_RE.search(cleaned):
                 violations.append(
                     {
                         "section": "agent",
