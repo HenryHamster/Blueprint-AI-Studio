@@ -10,6 +10,7 @@ from app.models import (
     LocalRunner,
     MessageType,
     MessagesLastSeen,
+    MessagesNoisePrefs,
     Project,
     ProjectMember,
     ProjectMessage,
@@ -540,6 +541,48 @@ async def test_strategic_state_marks_active_cycle_without_live_task_as_stale(
     assert active["stale"] is True
     assert resp.json()["strategic"]["active_task"] is None
     assert resp.json()["context_package"]["status"] == "stale"
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_includes_operator_workbench_state(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    db_session.add(
+        MessagesNoisePrefs(
+            user_id=TEST_USER_ID,
+            project_id=project.id,
+            prefs={
+                "_strategic_workbench": {
+                    "version": 1,
+                    "interaction_mode": "check_in",
+                    "active_surface": "pipeline",
+                    "selected_refs": [
+                        {
+                            "kind": "task",
+                            "id": "task-123",
+                            "label": "Review active wave",
+                        }
+                    ],
+                    "session_started_at": "2026-06-29T12:00:00",
+                    "last_interaction_at": "2026-06-29T12:03:00",
+                },
+                "cycle_summary": "routine",
+            },
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    workbench = resp.json()["workbench"]
+
+    assert workbench["interaction_mode"] == "check_in"
+    assert workbench["active_surface"] == "pipeline"
+    assert workbench["selected_refs"] == [
+        {"kind": "task", "id": "task-123", "label": "Review active wave"}
+    ]
+    assert "cycle_summary" not in workbench
 
 
 @pytest.mark.asyncio

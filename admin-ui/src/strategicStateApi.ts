@@ -120,6 +120,19 @@ export interface StrategicLocalRunnerState {
   liveness_window_seconds: number;
 }
 
+export interface StrategicWorkbenchState {
+  version: 1;
+  interaction_mode: 'chat' | 'check_in' | 'monitor' | 'continuous' | string;
+  active_surface: 'strategic' | 'pipeline' | 'project' | 'runtime' | string;
+  selected_refs: Array<{
+    kind: string;
+    id: string;
+    label?: string;
+  }>;
+  session_started_at?: string | null;
+  last_interaction_at?: string | null;
+}
+
 export interface StrategicStateResponse {
   project_id: string;
   strategic: {
@@ -210,6 +223,7 @@ export interface StrategicStateResponse {
   runtime?: {
     local_runner?: StrategicLocalRunnerState | null;
   };
+  workbench?: StrategicWorkbenchState | null;
   design: {
     has_design_doc: boolean;
     revision?: number | null;
@@ -229,4 +243,35 @@ export async function fetchStrategicState(
   );
   if (!res.ok) throw new Error(`Failed to fetch strategic state: ${res.status}`);
   return res.json() as Promise<StrategicStateResponse>;
+}
+
+export async function fetchStrategicWorkbenchState(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<StrategicWorkbenchState> {
+  const params = new URLSearchParams({ project_id: projectId });
+  const res = await apiFetch(
+    `/api/admin/messages/workbench-state?${params}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch Strategic workbench state: ${res.status}`);
+  const data = await res.json() as { workbench: StrategicWorkbenchState };
+  return data.workbench;
+}
+
+export async function updateStrategicWorkbenchState(
+  projectId: string,
+  workbench: Partial<StrategicWorkbenchState>,
+): Promise<StrategicWorkbenchState> {
+  const res = await apiFetch('/api/admin/messages/workbench-state', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ project_id: projectId, workbench }),
+  });
+  if (!res.ok) throw new Error(`Failed to update Strategic workbench state: ${res.status}`);
+  const data = await res.json() as { workbench: StrategicWorkbenchState };
+  return data.workbench;
 }

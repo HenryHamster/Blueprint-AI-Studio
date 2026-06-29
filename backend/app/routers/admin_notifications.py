@@ -24,7 +24,6 @@ from app.models import (
     MessageType,
     MESSAGE_CONTENT_MAX,
     MessagesLastSeen,
-    MessagesNoisePrefs,
     MessagesSavedViews,
     _utcnow,
 )
@@ -34,6 +33,17 @@ from app.admin import _get_user_project, _get_user_project_with_role, _user_proj
 from app.task_locking import lock_project_or_429
 from app.message_convergence import LINKED_STATUS
 from app.project_message_projection import admin_message_dict
+from app.messages_noise_prefs_store import (
+    get_messages_noise_prefs_row,
+    mutate_messages_noise_prefs,
+)
+from app.workbench_state import (
+    WORKBENCH_STATE_KEY,
+    WORKBENCH_STATE_MAX_BYTES,
+    get_strategic_workbench_state,
+    upsert_strategic_workbench_state,
+    workbench_state_size_bytes,
+)
 from app import notification_dispatch as _nd
 from app.playbook_storage import (
     _archive_least_useful_entry,
@@ -94,6 +104,11 @@ class _TempMutesUpdate(BaseModel):
 class _MuteWindowUpdate(BaseModel):
     project_id: str
     expires_at: Optional[int] = None  # ms epoch; None clears the mute window
+
+
+class _WorkbenchStateUpdate(BaseModel):
+    project_id: str
+    workbench: Dict[str, Any] = Field(default_factory=dict)
 
 
 class _AdminPlaybookSet(BaseModel):
@@ -166,7 +181,7 @@ _TEMP_MUTES_KEY = "_temp_mutes"
 _MUTE_WINDOW_KEY = "_mute_window"
 # These keys are owned by their own dedicated PUT endpoints; the noise-prefs
 # (event-visibility) endpoint must never write them, only preserve them.
-_RESERVED_PREFS_KEYS = (_TEMP_MUTES_KEY, _MUTE_WINDOW_KEY)
+_RESERVED_PREFS_KEYS = (_TEMP_MUTES_KEY, _MUTE_WINDOW_KEY, WORKBENCH_STATE_KEY)
 
 
 def append_routine_digest(project: Project, event_type: str, summary: str) -> None:
@@ -835,16 +850,14 @@ async def get_messages_noise_prefs(
         raise HTTPException(status_code=400, detail="Invalid project_id format")
     await _get_user_project(pid, current_user["user_id"], session)
 
-    row = (
-        await session.execute(
-            select(MessagesNoisePrefs).where(
-                MessagesNoisePrefs.user_id == current_user["user_id"],
-                MessagesNoisePrefs.project_id == pid,
-            )
-        )
-    ).scalar_one_or_none()
+    row = await get_messages_noise_prefs_row(
+        session,
+        current_user["user_id"],
+        pid,
+    )
 
-    return {"prefs": row.prefs if row is not None else {}}
+    prefs = dict(row.prefs or {}) if row is not None else {}
+    return {"prefs": {k: v for k, v in prefs.items() if k not in _RESERVED_PREFS_KEYS}}
 
 
 @router.put("/messages/noise-prefs")
@@ -863,15 +876,6 @@ async def put_messages_noise_prefs(
     if len(json.dumps(payload.prefs)) > 50_000:
         raise HTTPException(status_code=400, detail="Prefs too large (max 50KB)")
 
-    row = (
-        await session.execute(
-            select(MessagesNoisePrefs).where(
-                MessagesNoisePrefs.user_id == current_user["user_id"],
-                MessagesNoisePrefs.project_id == pid,
-            )
-        )
-    ).scalar_one_or_none()
-
     # This endpoint only owns event-type visibility prefs. Strip any reserved
     # keys from the incoming payload (they are owned by the temp-mutes and
     # mute-window endpoints) and preserve the existing reserved values so a
@@ -880,24 +884,72 @@ async def put_messages_noise_prefs(
         k: v for k, v in payload.prefs.items() if k not in _RESERVED_PREFS_KEYS
     }
 
-    if row is None:
-        row = MessagesNoisePrefs(
-            user_id=current_user["user_id"],
-            project_id=pid,
-            prefs=visibility,
-        )
-    else:
-        existing = dict(row.prefs or {})
+    def merge(existing: Dict[str, Any]) -> Dict[str, Any]:
         merged = dict(visibility)
         for key in _RESERVED_PREFS_KEYS:
             if key in existing:
                 merged[key] = existing[key]
-        row.prefs = merged
-        flag_modified(row, "prefs")
+        return merged
 
-    session.add(row)
+    await mutate_messages_noise_prefs(
+        session,
+        current_user["user_id"],
+        pid,
+        merge,
+    )
     await session.commit()
     return {"status": "ok"}
+
+
+# ── Strategic Workbench State Endpoints ──────────────────────────────────────
+
+
+@router.get("/messages/workbench-state")
+async def get_messages_workbench_state(
+    project_id: str = Query(...),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return this operator's small Strategic workbench state for a project."""
+    try:
+        pid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+    return {
+        "workbench": await get_strategic_workbench_state(
+            session, current_user["user_id"], pid
+        )
+    }
+
+
+@router.put("/messages/workbench-state")
+async def put_messages_workbench_state(
+    payload: _WorkbenchStateUpdate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Persist this operator's small Strategic workbench state for a project."""
+    try:
+        pid = uuid.UUID(payload.project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    if workbench_state_size_bytes(payload.workbench) > WORKBENCH_STATE_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail="Workbench state too large (max 50KB)",
+        )
+
+    state = await upsert_strategic_workbench_state(
+        session,
+        current_user["user_id"],
+        pid,
+        payload.workbench,
+    )
+    await session.commit()
+    return {"status": "ok", "workbench": state}
 
 
 # ── Messages Saved-Views Endpoints ──────────────────────────────────────────
@@ -984,14 +1036,11 @@ async def get_messages_temp_mutes(
         raise HTTPException(status_code=400, detail="Invalid project_id format")
     await _get_user_project(pid, current_user["user_id"], session)
 
-    row = (
-        await session.execute(
-            select(MessagesNoisePrefs).where(
-                MessagesNoisePrefs.user_id == current_user["user_id"],
-                MessagesNoisePrefs.project_id == pid,
-            )
-        )
-    ).scalar_one_or_none()
+    row = await get_messages_noise_prefs_row(
+        session,
+        current_user["user_id"],
+        pid,
+    )
 
     raw: Dict[str, int] = (row.prefs.get(_TEMP_MUTES_KEY) or {}) if row else {}
     now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
@@ -1014,28 +1063,17 @@ async def put_messages_temp_mutes(
     now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
     active = {et: exp for et, exp in payload.temp_mutes.items() if exp > now_ms}
 
-    row = (
-        await session.execute(
-            select(MessagesNoisePrefs).where(
-                MessagesNoisePrefs.user_id == current_user["user_id"],
-                MessagesNoisePrefs.project_id == pid,
-            )
-        )
-    ).scalar_one_or_none()
-
-    if row is None:
-        row = MessagesNoisePrefs(
-            user_id=current_user["user_id"],
-            project_id=pid,
-            prefs={_TEMP_MUTES_KEY: active},
-        )
-    else:
-        prefs = dict(row.prefs or {})
+    def merge(existing: Dict[str, Any]) -> Dict[str, Any]:
+        prefs = dict(existing)
         prefs[_TEMP_MUTES_KEY] = active
-        row.prefs = prefs
-        flag_modified(row, "prefs")
+        return prefs
 
-    session.add(row)
+    await mutate_messages_noise_prefs(
+        session,
+        current_user["user_id"],
+        pid,
+        merge,
+    )
     await session.commit()
     return {"status": "ok"}
 
@@ -1056,14 +1094,11 @@ async def get_messages_mute_window(
         raise HTTPException(status_code=400, detail="Invalid project_id format")
     await _get_user_project(pid, current_user["user_id"], session)
 
-    row = (
-        await session.execute(
-            select(MessagesNoisePrefs).where(
-                MessagesNoisePrefs.user_id == current_user["user_id"],
-                MessagesNoisePrefs.project_id == pid,
-            )
-        )
-    ).scalar_one_or_none()
+    row = await get_messages_noise_prefs_row(
+        session,
+        current_user["user_id"],
+        pid,
+    )
 
     stored = (row.prefs.get(_MUTE_WINDOW_KEY)) if row else None
     if not stored or not isinstance(stored, dict):
@@ -1091,28 +1126,17 @@ async def put_messages_mute_window(
         {"expires_at": payload.expires_at} if payload.expires_at is not None else None
     )
 
-    row = (
-        await session.execute(
-            select(MessagesNoisePrefs).where(
-                MessagesNoisePrefs.user_id == current_user["user_id"],
-                MessagesNoisePrefs.project_id == pid,
-            )
-        )
-    ).scalar_one_or_none()
-
-    if row is None:
-        row = MessagesNoisePrefs(
-            user_id=current_user["user_id"],
-            project_id=pid,
-            prefs={_MUTE_WINDOW_KEY: entry},
-        )
-    else:
-        prefs = dict(row.prefs or {})
+    def merge(existing: Dict[str, Any]) -> Dict[str, Any]:
+        prefs = dict(existing)
         prefs[_MUTE_WINDOW_KEY] = entry
-        row.prefs = prefs
-        flag_modified(row, "prefs")
+        return prefs
 
-    session.add(row)
+    await mutate_messages_noise_prefs(
+        session,
+        current_user["user_id"],
+        pid,
+        merge,
+    )
     await session.commit()
     return {"status": "ok"}
 

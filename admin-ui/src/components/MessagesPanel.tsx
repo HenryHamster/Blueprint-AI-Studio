@@ -23,7 +23,7 @@ import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { DirectionsAddForm } from './DirectionsAddForm';
-import type { StrategicContextPackageDescriptor } from '../strategicStateApi';
+import type { StrategicContextPackageDescriptor, StrategicStateResponse } from '../strategicStateApi';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -31,6 +31,7 @@ const DEFAULT_VIEW_ID = '__default__';
 // messages that grow without bound, and blocking stale receipts from resurfacing after
 // an operator cancels a fresh steer.
 const STEER_RECEIPT_MAX_AGE_MS = 7_200_000;
+const OPTIMISTIC_STRATEGIC_REFRESH_MAX_AGE_MS = 45_000;
 
 function getCompletionReceiptTone(status?: string | null): {
   banner: string;
@@ -102,6 +103,37 @@ function contextPackageTextTone(status?: string | null): string {
   return 'text-emerald-300';
 }
 
+function workbenchModeLabel(mode?: string | null): string {
+  if (mode === 'check_in') return 'Check-in';
+  if (mode === 'monitor') return 'Monitor';
+  if (mode === 'continuous') return 'Workday';
+  return 'Chat';
+}
+
+function attentionTextTone(level?: string | null): string {
+  if (level === 'needs_operator') return 'text-amber-300';
+  if (level === 'watch') return 'text-neutral-300';
+  return 'text-emerald-300';
+}
+
+function strategicRefreshFromReadModel(
+  state?: StrategicStateResponse | null,
+): StrategicRefreshMarker | null {
+  if (!state) return null;
+  const refresh = state.strategic.refresh;
+  if (refresh.pending) return refresh.pending;
+  if (refresh.last_fired_at && refresh.last_fired_origin === 'operator') {
+    const ageMs = Date.now() - parseTimestamp(refresh.last_fired_at).getTime();
+    if (!Number.isNaN(ageMs) && ageMs <= STEER_RECEIPT_MAX_AGE_MS) {
+      return {
+        last_fired_at: refresh.last_fired_at,
+        last_fired_origin: refresh.last_fired_origin,
+      };
+    }
+  }
+  return null;
+}
+
 function viewMatches(
   view: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean; showOnlyNew: boolean },
   state: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean; showOnlyNew: boolean },
@@ -151,6 +183,10 @@ export interface MessagesPanelProps {
   focusComposerSignal?: number;
   /** Compact Strategic context descriptor, shown only in the minimal chat surface. */
   contextPackage?: StrategicContextPackageDescriptor | null;
+  /** Strategic workbench read model, used by the minimal chat surface. */
+  strategicState?: StrategicStateResponse | null;
+  /** Refresh the Strategic read model after a chat action changes Strategic state. */
+  onStrategicStateRefresh?: () => void | Promise<void>;
 }
 
 type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean; criticalOnly: boolean };
@@ -224,11 +260,24 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, contextPackage }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, contextPackage, strategicState, onStrategicStateRefresh }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
   const conversationMode = resolvedFilterChrome === 'minimal';
+  const currentStrategicState = strategicState?.project_id === selectedProjectId ? strategicState : null;
+  const usesStrategicReadModel = currentStrategicState != null;
+  const effectiveContextPackage = contextPackage ?? currentStrategicState?.context_package ?? null;
+  const workbenchState = currentStrategicState?.workbench ?? null;
+  const strategicAttention = currentStrategicState?.attention ?? null;
+  const strategicTaskCounts = currentStrategicState?.tasks.counts ?? null;
+  const selectedProjectIdRef = useRef(selectedProjectId);
+  selectedProjectIdRef.current = selectedProjectId;
+  const usesStrategicReadModelRef = useRef(usesStrategicReadModel);
+  usesStrategicReadModelRef.current = usesStrategicReadModel;
+  const topAttentionItem = strategicAttention?.items[0] ?? null;
+  const attentionNeeds = strategicAttention?.counts.needs_operator ?? 0;
+  const attentionWatch = strategicAttention?.counts.watch ?? 0;
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
   // Compose — initialized from the per-project draft (if any) so a reload restores it.
@@ -304,6 +353,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // operator steering arms a cycle, cleared backend-side once the autonomous loop
   // consumes it. Drives the "strategic cycle pending" badge until then.
   const [strategicRefresh, setStrategicRefresh] = useState<StrategicRefreshMarker | null>(null);
+  const optimisticStrategicRefreshRef = useRef<StrategicRefreshMarker | null>(null);
   const completionReceiptTone = lastCycleCompletion ? getCompletionReceiptTone(lastCycleCompletion.status) : null;
   // In-flight guard for the "cancel armed steer" affordance on the pending badge.
   const [cancellingRefresh, setCancellingRefresh] = useState(false);
@@ -346,6 +396,57 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       dividerDismissedRef.current = true;
     }
   }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (!usesStrategicReadModel) return;
+    const readModelRefresh = strategicRefreshFromReadModel(currentStrategicState);
+    const optimisticRefresh = optimisticStrategicRefreshRef.current;
+    if (optimisticRefresh?.requested_at) {
+      const optimisticAgeMs = Date.now() - parseTimestamp(optimisticRefresh.requested_at).getTime();
+      const optimisticTime = parseTimestamp(optimisticRefresh.requested_at).getTime();
+      const readModelTime = readModelRefresh?.requested_at
+        ? parseTimestamp(readModelRefresh.requested_at).getTime()
+        : readModelRefresh?.last_fired_at
+          ? parseTimestamp(readModelRefresh.last_fired_at).getTime()
+          : NaN;
+      const keepFreshOptimistic =
+        !Number.isNaN(optimisticAgeMs) &&
+        optimisticAgeMs <= OPTIMISTIC_STRATEGIC_REFRESH_MAX_AGE_MS &&
+        !Number.isNaN(optimisticTime) &&
+        (Number.isNaN(readModelTime) || readModelTime < optimisticTime);
+      if (keepFreshOptimistic) {
+        setStrategicRefresh(optimisticRefresh);
+        return;
+      }
+      optimisticStrategicRefreshRef.current = null;
+    }
+    setStrategicRefresh(readModelRefresh);
+  }, [currentStrategicState, usesStrategicReadModel]);
+
+  useEffect(() => {
+    const optimisticRefresh = optimisticStrategicRefreshRef.current;
+    if (!optimisticRefresh?.requested_at || strategicRefresh !== optimisticRefresh) return;
+    const requestedAt = parseTimestamp(optimisticRefresh.requested_at).getTime();
+    if (Number.isNaN(requestedAt)) {
+      optimisticStrategicRefreshRef.current = null;
+      setStrategicRefresh(strategicRefreshFromReadModel(currentStrategicState));
+      return;
+    }
+    const delayMs = Math.max(
+      0,
+      requestedAt + OPTIMISTIC_STRATEGIC_REFRESH_MAX_AGE_MS - Date.now(),
+    );
+    const timer = window.setTimeout(() => {
+      if (optimisticStrategicRefreshRef.current !== optimisticRefresh) return;
+      optimisticStrategicRefreshRef.current = null;
+      setStrategicRefresh(previous =>
+        previous === optimisticRefresh
+          ? strategicRefreshFromReadModel(currentStrategicState)
+          : previous,
+      );
+    }, delayMs);
+    return () => window.clearTimeout(timer);
+  }, [currentStrategicState, strategicRefresh]);
 
   const handleShowOnlyNew = useCallback(() => {
     setShowOnlyNew(true);
@@ -391,7 +492,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     setEventPrefs(localPrefs);
     setTempMutes(loadTemporaryMutes(auth.currentUser?.email, selectedProjectId));
     setWebhookStats(null);
-    setStrategicRefresh(null);
+    optimisticStrategicRefreshRef.current = null;
+    if (!usesStrategicReadModel) setStrategicRefresh(null);
     setMuteWindow(loadMuteWindow(auth.currentUser?.email, selectedProjectId));
     const lastSeen = loadLastSeen(auth.currentUser?.email, selectedProjectId);
     setDividerTime(lastSeen);
@@ -797,35 +899,38 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       // AND fired within STEER_RECEIPT_MAX_AGE_MS (prevents stale receipts that grow without
       // bound, and prevents a just-cancelled steer from showing an old "picked up" receipt).
       // Non-critical: errors leave the prior marker state untouched.
-      try {
-        const visRes = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`);
-        if (visRes.ok) {
-          const proj = await visRes.json() as { vision?: { _strategic_refresh?: StrategicRefreshMarker | null; _strategic_refresh_last_fired_at?: string; _strategic_refresh_last_fired_origin?: string } };
-          const marker = proj.vision?._strategic_refresh;
-          const lastFiredAt = proj.vision?._strategic_refresh_last_fired_at;
-          const lastFiredOrigin = proj.vision?._strategic_refresh_last_fired_origin;
-          // Build marker state: include pending marker if present, or add receipt if it was
-          // operator-origin AND fired recently (within STEER_RECEIPT_MAX_AGE_MS).
-          if (marker && typeof marker === 'object') {
-            setStrategicRefresh(marker);
-          } else if (lastFiredAt && typeof lastFiredAt === 'string' && lastFiredOrigin === 'operator') {
-            const ageMs = Date.now() - parseTimestamp(lastFiredAt).getTime();
-            if (!isNaN(ageMs) && ageMs <= STEER_RECEIPT_MAX_AGE_MS) {
-              setStrategicRefresh({ last_fired_at: lastFiredAt, last_fired_origin: lastFiredOrigin });
+      if (!usesStrategicReadModel) {
+        try {
+          const visRes = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`);
+          if (visRes.ok) {
+            const proj = await visRes.json() as { vision?: { _strategic_refresh?: StrategicRefreshMarker | null; _strategic_refresh_last_fired_at?: string; _strategic_refresh_last_fired_origin?: string } };
+            if (usesStrategicReadModelRef.current || selectedProjectIdRef.current !== selectedProjectId) return;
+            const marker = proj.vision?._strategic_refresh;
+            const lastFiredAt = proj.vision?._strategic_refresh_last_fired_at;
+            const lastFiredOrigin = proj.vision?._strategic_refresh_last_fired_origin;
+            // Build marker state: include pending marker if present, or add receipt if it was
+            // operator-origin AND fired recently (within STEER_RECEIPT_MAX_AGE_MS).
+            if (marker && typeof marker === 'object') {
+              setStrategicRefresh(marker);
+            } else if (lastFiredAt && typeof lastFiredAt === 'string' && lastFiredOrigin === 'operator') {
+              const ageMs = Date.now() - parseTimestamp(lastFiredAt).getTime();
+              if (!isNaN(ageMs) && ageMs <= STEER_RECEIPT_MAX_AGE_MS) {
+                setStrategicRefresh({ last_fired_at: lastFiredAt, last_fired_origin: lastFiredOrigin });
+              } else {
+                setStrategicRefresh(null);
+              }
             } else {
               setStrategicRefresh(null);
             }
-          } else {
-            setStrategicRefresh(null);
           }
-        }
-      } catch { /* ignore */ }
+        } catch { /* ignore */ }
+      }
     } catch {
       addToastRef.current('Failed to load messages', 'error');
     } finally {
       setLoading(false);
     }
-  }, [selectedProjectId, onMessageCountChange, eventPrefs, searchQuery]);
+  }, [selectedProjectId, onMessageCountChange, eventPrefs, searchQuery, usesStrategicReadModel]);
 
   usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
 
@@ -919,6 +1024,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         setLastArming(null);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         addToast('Question answered', 'success');
+        void onStrategicStateRefresh?.();
         await fetchMessages();
         return;
       }
@@ -932,13 +1038,14 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       if (!idempotencyKeyRef.current) {
         idempotencyKeyRef.current = generateIdempotencyKey();
       }
+      const submittedContent = newContent.trim();
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           project_id: selectedProjectId,
           message_type: effectiveNewType,
-          content: newContent.trim(),
+          content: submittedContent,
           idempotency_key: idempotencyKeyRef.current,
           ...(Object.keys(context).length > 0 ? { context } : {}),
         }),
@@ -965,6 +1072,21 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       // partial outcome — the message saved, but the strategist was not woken.
       // Surface it as info, not a green success, so the receipt is truthful.
       addToast(armingToastCopy(arming), arming === 'not_armed' ? 'info' : 'success');
+      if (arming === 'steering') {
+        const optimisticRefresh = {
+          requested_at: new Date().toISOString(),
+          origin: 'operator',
+          reason: 'operator_message',
+          count: 1,
+          operator_count: 1,
+          excerpt: submittedContent,
+        };
+        optimisticStrategicRefreshRef.current = optimisticRefresh;
+        setStrategicRefresh(optimisticRefresh);
+        void onStrategicStateRefresh?.();
+      } else if (arming === 'duplicate') {
+        void onStrategicStateRefresh?.();
+      }
       await fetchMessages();
     } catch {
       addToast('Failed to send message', 'error');
@@ -984,7 +1106,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     try {
       const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/cancel-strategic-refresh`, { method: 'POST' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      optimisticStrategicRefreshRef.current = null;
       setStrategicRefresh(null);
+      void onStrategicStateRefresh?.();
       addToast('Strategic steer cancelled', 'success');
       await fetchMessages();
     } catch {
@@ -1292,16 +1416,38 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         filterChrome={resolvedFilterChrome}
       />
 
-      {conversationMode && contextPackage && (
+      {conversationMode && (effectiveContextPackage || currentStrategicState) && (
         <div className="shrink-0 border-b border-neutral-800 bg-[#07090c] px-4 py-2 md:px-6" data-testid="strategic-context-package-strip">
           <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500">
-            <span className="min-w-0 max-w-full truncate font-medium text-neutral-300">
-              {contextPackage.title || 'Strategic context'}
+            <span className="shrink-0 font-semibold text-neutral-300">
+              {workbenchModeLabel(workbenchState?.interaction_mode)}
             </span>
-            <span className={contextPackageTextTone(contextPackage.status)}>
-              {contextPackage.status || 'ready'}
-            </span>
-            {contextPackage.item_count ? <span>{formatContextPackageNumber(contextPackage.item_count)} items</span> : null}
+            {effectiveContextPackage && (
+              <>
+                <span className="min-w-0 max-w-full truncate font-medium text-neutral-300">
+                  {effectiveContextPackage.title || 'Strategic context'}
+                </span>
+                <span className={contextPackageTextTone(effectiveContextPackage.status)}>
+                  {effectiveContextPackage.status || 'ready'}
+                </span>
+                {effectiveContextPackage.item_count ? <span>{formatContextPackageNumber(effectiveContextPackage.item_count)} items</span> : null}
+              </>
+            )}
+            {strategicAttention && (
+              <span className={attentionTextTone(strategicAttention.level)}>
+                {strategicAttention.level === 'clear' ? 'clear' : `${attentionNeeds} needs / ${attentionWatch} watch`}
+              </span>
+            )}
+            {topAttentionItem && (
+              <span className="min-w-0 max-w-full truncate text-neutral-400">
+                {topAttentionItem.label}
+              </span>
+            )}
+            {strategicTaskCounts && (
+              <span>
+                {strategicTaskCounts.running} running / {strategicTaskCounts.queued} queued
+              </span>
+            )}
           </div>
         </div>
       )}

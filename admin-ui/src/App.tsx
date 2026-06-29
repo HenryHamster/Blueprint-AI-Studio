@@ -1338,7 +1338,8 @@ export default function App() {
                 cycleProgress={s.cycleProgress}
                 lastCycleCompletion={s.lastCycleCompletion}
                 focusComposerSignal={strategicComposerFocusSignal}
-                contextPackage={strategicReadModel.data?.context_package ?? null}
+                strategicState={strategicReadModel.data ?? null}
+                onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
               />
             )}
             rail={(

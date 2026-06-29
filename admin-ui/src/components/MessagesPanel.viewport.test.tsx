@@ -4,6 +4,7 @@ import { act } from 'react';
 import { MessagesPanel, type MessagesPanelProps } from './MessagesPanel';
 import type { ProjectMessage } from './MessageBubble';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt, stressStrings } from '../test/viewport';
+import type { StrategicStateResponse } from '../strategicStateApi';
 
 // React patches the input `value` setter on its prototype to track controlled-input
 // state. Assigning `input.value = 'x'` then dispatching an event won't trigger React's
@@ -163,31 +164,92 @@ describe('MessagesPanel — viewport regression', () => {
         variant: 'page',
         filterChrome: 'minimal',
         showCloseButton: false,
-        contextPackage: {
-          id: 'strategic-context:project-123',
-          title: 'Strategic context for a long-running local workday session',
-          status: 'ready',
-          item_count: 42,
-          token_count: null,
-          canvas: {
-            id: 'strategic-canvas:project-123',
-            title: 'Strategic context map',
-            kind: 'strategic_context',
-            node_count: null,
+        strategicState: {
+          project_id: 'project-123',
+          strategic: {
+            active_cycle: null,
+            active_task: null,
+            active_phase: null,
+            latest_cycle: null,
+            refresh: { pending: null, last_fired_at: null, last_fired_origin: null },
           },
-          sources: [
-            { kind: 'running_update', count: 1 },
-            { kind: 'problem_model', count: 7 },
-            { kind: 'tasks', count: 34 },
-          ],
-          drilldowns: [],
-        },
+          running_update: { excerpt: null, char_count: 0, acknowledged_at: null },
+          problem_model: {
+            active_gap_count: 0,
+            capability_count: 0,
+            pending_confirmation_count: 0,
+            top_gap: null,
+          },
+          directions: { total_count: 0, active_count: 0, paused_count: 0, primary: null },
+          messages: { counts: { open: 0, linked: 0 }, items: [] },
+          tasks: {
+            counts: {
+              queued: 17,
+              running: 4,
+              evaluating: 0,
+              blocked: 0,
+              failed: 0,
+              completed: 28,
+              total: 49,
+            },
+            cumulative_estimated_cost_usd: 0,
+          },
+          attention: {
+            level: 'needs_operator',
+            summary: '2 items need attention',
+            last_seen_at: null,
+            counts: {
+              needs_operator: 2,
+              watch: 5,
+              unread: 2,
+              questions: 1,
+              blockers: 1,
+              approvals: 0,
+              manual_directions: 0,
+              failed_tasks: 0,
+              blocked_tasks: 0,
+              parked_tasks: 0,
+            },
+            items: [{
+              id: 'message:long',
+              kind: 'message',
+              severity: 'needs_operator',
+              reason: 'question',
+              label: 'Question waiting about a very long local workday session',
+              ref: { kind: 'message', id: 'long', project_id: 'project-123' },
+            }],
+          },
+          context_package: {
+            id: 'strategic-context:project-123',
+            title: 'Strategic context for a long-running local workday session',
+            status: 'ready',
+            item_count: 42,
+            token_count: null,
+            canvas: null,
+            sources: [
+              { kind: 'running_update', count: 1 },
+              { kind: 'problem_model', count: 7 },
+              { kind: 'tasks', count: 34 },
+            ],
+            drilldowns: [],
+          },
+          workbench: {
+            version: 1,
+            interaction_mode: 'continuous',
+            active_surface: 'pipeline',
+            selected_refs: [],
+            session_started_at: null,
+            last_interaction_at: null,
+          },
+          design: { has_design_doc: false, revision: null },
+        } as StrategicStateResponse,
       });
     });
 
     const strip = host!.querySelector('[data-testid="strategic-context-package-strip"]');
     expect(strip).not.toBeNull();
     expect(strip!.textContent).toContain('42 items');
+    expect(strip!.textContent).toContain('2 needs / 5 watch');
     expect(strip!.textContent).not.toContain('canvas nodes');
   });
 

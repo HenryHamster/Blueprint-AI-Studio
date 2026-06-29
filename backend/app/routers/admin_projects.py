@@ -51,6 +51,7 @@ from app.capability_trial_verdict import get_trial_verdicts
 from app.onboarding_proof import build_onboarding_proof_block
 from app.routers.admin_runners import _RUNNER_LIVENESS_SECONDS, _runner_health
 from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.workbench_state import get_strategic_workbench_state
 
 router = APIRouter(
     prefix="/api/admin",
@@ -1077,6 +1078,11 @@ async def get_project_strategic_state(
         project.id,
         active_task=active_task,
     )
+    workbench_state = await get_strategic_workbench_state(
+        session,
+        current_user["user_id"],
+        project.id,
+    )
 
     return {
         "project_id": str(project.id),
@@ -1101,6 +1107,7 @@ async def get_project_strategic_state(
         "attention": attention,
         "context_package": context_package,
         "runtime": runtime_summary,
+        "workbench": workbench_state,
         "design": {
             "has_design_doc": bool(project.design_doc),
             "revision": ((project.design_doc or {}).get("_meta") or {}).get("revision")

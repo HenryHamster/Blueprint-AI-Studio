@@ -38,6 +38,7 @@ from app.models import (
     ProjectMessage,
     MessageType,
     MessagesLastSeen,
+    MessagesNoisePrefs,
     StrategicCycle,
     Direction,
     SystemMaturity,
@@ -5323,6 +5324,138 @@ class TestMessagesNoisePrefs:
         put_resp = await client.put(
             "/api/admin/messages/noise-prefs",
             json={"project_id": random_pid, "prefs": {}},
+        )
+        assert put_resp.status_code == 404
+
+
+class TestMessagesWorkbenchState:
+    @pytest.mark.asyncio
+    async def test_get_empty_returns_defaults(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        resp = await client.get(
+            f"/api/admin/messages/workbench-state?project_id={project.id}"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["workbench"] == {
+            "version": 1,
+            "interaction_mode": "chat",
+            "active_surface": "strategic",
+            "selected_refs": [],
+            "session_started_at": None,
+            "last_interaction_at": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_round_trip_sanitizes_and_timestamps(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        payload = {
+            "interaction_mode": "continuous",
+            "active_surface": "pipeline",
+            "selected_refs": [
+                {"kind": "task", "id": "task-1", "label": "Implement work session"},
+                {"kind": "message", "id": "msg-1", "label": "Operator steer"},
+                {"kind": "", "id": "ignored"},
+            ],
+        }
+        put_resp = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={"project_id": str(project.id), "workbench": payload},
+        )
+        assert put_resp.status_code == 200
+        stored = put_resp.json()["workbench"]
+        assert stored["interaction_mode"] == "continuous"
+        assert stored["active_surface"] == "pipeline"
+        assert stored["selected_refs"] == [
+            {"kind": "task", "id": "task-1", "label": "Implement work session"},
+            {"kind": "message", "id": "msg-1", "label": "Operator steer"},
+        ]
+        assert stored["session_started_at"]
+        assert stored["last_interaction_at"]
+
+        get_resp = await client.get(
+            f"/api/admin/messages/workbench-state?project_id={project.id}"
+        )
+        assert get_resp.status_code == 200
+        assert get_resp.json()["workbench"] == stored
+
+    @pytest.mark.asyncio
+    async def test_workbench_state_preserves_noise_pref_reserved_data(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "check_in",
+                    "active_surface": "strategic",
+                },
+            },
+        )
+        await client.put(
+            "/api/admin/messages/noise-prefs",
+            json={"project_id": str(project.id), "prefs": {"cycle_summary": "routine"}},
+        )
+        await client.put(
+            "/api/admin/messages/temp-mutes",
+            json={
+                "project_id": str(project.id),
+                "temp_mutes": {"pr_merged": 4_102_444_800_000},
+            },
+        )
+        await client.put(
+            "/api/admin/messages/mute-window",
+            json={"project_id": str(project.id), "expires_at": 4_102_444_800_000},
+        )
+
+        workbench_resp = await client.get(
+            f"/api/admin/messages/workbench-state?project_id={project.id}"
+        )
+        assert workbench_resp.json()["workbench"]["interaction_mode"] == "check_in"
+
+        noise_resp = await client.get(
+            f"/api/admin/messages/noise-prefs?project_id={project.id}"
+        )
+        assert noise_resp.json()["prefs"] == {"cycle_summary": "routine"}
+
+        row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.project_id == project.id,
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                )
+            )
+        ).scalar_one()
+        assert "_strategic_workbench" in row.prefs
+        assert row.prefs["cycle_summary"] == "routine"
+        assert row.prefs["_temp_mutes"] == {"pr_merged": 4_102_444_800_000}
+        assert row.prefs["_mute_window"] == {"expires_at": 4_102_444_800_000}
+
+    @pytest.mark.asyncio
+    async def test_payload_too_large_returns_400(self, client: AsyncClient, db_session):
+        project = await _make_project(db_session)
+        resp = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {"selected_refs": [{"kind": "task", "id": "x" * 60_000}]},
+            },
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_no_access_returns_404(self, client: AsyncClient, db_session):
+        random_pid = str(uuid.uuid4())
+        get_resp = await client.get(
+            f"/api/admin/messages/workbench-state?project_id={random_pid}"
+        )
+        assert get_resp.status_code == 404
+        put_resp = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={"project_id": random_pid, "workbench": {}},
         )
         assert put_resp.status_code == 404
 

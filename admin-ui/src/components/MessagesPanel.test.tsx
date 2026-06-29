@@ -7,6 +7,7 @@ import { classifySignalLevel, effectiveSignal, loadEventPrefs, saveEventPrefs, E
 import type { ProjectMessage } from './MessageBubble';
 import type { SavedView } from './MessagesPanel.utils';
 import { armingToastCopy, armingHintCopy, parseArmingOutcome, type ArmingOutcome } from './messageArming';
+import type { StrategicStateResponse } from '../strategicStateApi';
 
 // Full replacement (NOT a partial mock): the real `../firebase` calls
 // initializeApp()/getAuth() at module load, which we must not run in jsdom.
@@ -432,6 +433,106 @@ function makeMsg(overrides: Partial<ProjectMessage> = {}): ProjectMessage {
   };
 }
 
+function makeStrategicState(overrides: Partial<StrategicStateResponse> = {}): StrategicStateResponse {
+  return {
+    project_id: 'proj-1',
+    strategic: {
+      active_cycle: null,
+      active_task: null,
+      active_phase: null,
+      latest_cycle: null,
+      refresh: {
+        pending: null,
+        last_fired_at: null,
+        last_fired_origin: null,
+      },
+    },
+    running_update: {
+      excerpt: null,
+      char_count: 0,
+      acknowledged_at: null,
+    },
+    problem_model: {
+      active_gap_count: 0,
+      capability_count: 0,
+      pending_confirmation_count: 0,
+      top_gap: null,
+    },
+    directions: {
+      total_count: 0,
+      active_count: 0,
+      paused_count: 0,
+      primary: null,
+    },
+    messages: {
+      counts: { open: 0, linked: 0 },
+      items: [],
+    },
+    tasks: {
+      counts: {
+        queued: 5,
+        running: 3,
+        evaluating: 0,
+        blocked: 0,
+        failed: 0,
+        completed: 12,
+        total: 20,
+      },
+      cumulative_estimated_cost_usd: 1.25,
+    },
+    attention: {
+      level: 'needs_operator',
+      summary: '1 operator item needs attention',
+      last_seen_at: null,
+      counts: {
+        needs_operator: 1,
+        watch: 2,
+        unread: 1,
+        questions: 1,
+        blockers: 0,
+        approvals: 0,
+        manual_directions: 0,
+        failed_tasks: 0,
+        blocked_tasks: 0,
+        parked_tasks: 0,
+      },
+      items: [
+        {
+          id: 'message:msg-1',
+          kind: 'message',
+          severity: 'needs_operator',
+          reason: 'question',
+          label: 'Question waiting',
+          ref: { kind: 'message', id: 'msg-1', project_id: 'proj-1' },
+        },
+      ],
+    },
+    context_package: {
+      id: 'strategic-context:proj-1',
+      title: 'Workbench context',
+      status: 'ready',
+      item_count: 18,
+      token_count: null,
+      canvas: null,
+      sources: [],
+      drilldowns: [],
+    },
+    workbench: {
+      version: 1,
+      interaction_mode: 'check_in',
+      active_surface: 'strategic',
+      selected_refs: [],
+      session_started_at: null,
+      last_interaction_at: null,
+    },
+    design: {
+      has_design_doc: false,
+      revision: null,
+    },
+    ...overrides,
+  };
+}
+
 describe('MessagesPanel chrome modes', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -539,6 +640,22 @@ describe('MessagesPanel chrome modes', () => {
     expect(strip?.textContent).toContain('ready');
     expect(strip?.textContent).toContain('18 items');
     expect(strip?.textContent).not.toContain('canvas nodes');
+  });
+
+  test('minimal chat chrome can render the Strategic work session strip from read model state', async () => {
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      strategicState: makeStrategicState(),
+    });
+
+    const strip = el.querySelector('[data-testid="strategic-context-package-strip"]');
+    expect(strip?.textContent).toContain('Check-in');
+    expect(strip?.textContent).toContain('Workbench context');
+    expect(strip?.textContent).toContain('ready');
+    expect(strip?.textContent).toContain('18 items');
+    expect(strip?.textContent).toContain('1 needs / 2 watch');
+    expect(strip?.textContent).toContain('Question waiting');
+    expect(strip?.textContent).toContain('3 running / 5 queued');
   });
 
   test('compact/full message chrome keeps the context package out of the legacy surface', async () => {
@@ -3586,9 +3703,35 @@ describe('MessagesPanel send arming receipt', () => {
     });
   }
 
+  function _setupQuestionAnswerMock(question: ProjectMessage): void {
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes(`/api/admin/messages/${question.id}`) && method === 'PATCH') {
+        return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [question] }), { status: 200 });
+      }
+      if (method === 'GET' && (
+        urlStr.includes('/api/admin/messages/noise-prefs') ||
+        urlStr.includes('/api/admin/messages/saved-views') ||
+        urlStr.includes('/api/admin/messages/temp-mutes') ||
+        urlStr.includes('/api/admin/messages/mute-window')
+      )) {
+        return new Response('', { status: 404 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+  }
+
   async function renderPanel(
     addToast: (msg: string, level: string) => void,
     strategistActive = false,
+    props: Partial<MessagesPanelProps> = {},
   ) {
     _suppressSinceLastVisit('test-user@example.com', 'proj-1');
     host = document.createElement('div');
@@ -3603,6 +3746,7 @@ describe('MessagesPanel send arming receipt', () => {
           addToast={addToast as never}
           onMessageCountChange={() => {}}
           strategistActive={strategistActive}
+          {...props}
         />,
       );
     });
@@ -3651,6 +3795,122 @@ describe('MessagesPanel send arming receipt', () => {
     expect(text).toContain('steering the strategist');
     expect(severity).toBe('success');
     expect(hintText(el)).toBe(armingHintCopy('steering'));
+  });
+
+  test('steering send refreshes Strategic state and shows pending badge immediately', async () => {
+    _setupSendMock({ arming: 'steering' });
+    const addToast = vi.fn();
+    const onStrategicStateRefresh = vi.fn();
+    const el = await renderPanel(addToast, false, {
+      strategicState: makeStrategicState(),
+      onStrategicStateRefresh,
+    });
+
+    await typeAndSend(el, 'please prioritize the migration work');
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    expect(onStrategicStateRefresh).toHaveBeenCalledTimes(1);
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('please prioritize the migration work');
+  });
+
+  test('fresh optimistic steering badge survives a stale read-model response', async () => {
+    _setupSendMock({ arming: 'steering' });
+    const addToast = vi.fn();
+    const onStrategicStateRefresh = vi.fn();
+    const el = await renderPanel(addToast, false, {
+      strategicState: makeStrategicState(),
+      onStrategicStateRefresh,
+    });
+
+    await typeAndSend(el, 'please prioritize the migration work');
+    await waitFor(() => expect(el.textContent).toContain('Strategic cycle pending'));
+
+    await act(async () => {
+      root!.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast as never}
+          onMessageCountChange={() => {}}
+          strategicState={makeStrategicState()}
+          onStrategicStateRefresh={onStrategicStateRefresh}
+        />,
+      );
+    });
+
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('please prioritize the migration work');
+  });
+
+  test('fresh optimistic steering badge survives an older read-model marker', async () => {
+    _setupSendMock({ arming: 'steering' });
+    const addToast = vi.fn();
+    const staleMarkerAt = new Date(Date.now() - 60_000).toISOString();
+    const onStrategicStateRefresh = vi.fn();
+    const el = await renderPanel(addToast, false, {
+      strategicState: makeStrategicState(),
+      onStrategicStateRefresh,
+    });
+
+    await typeAndSend(el, 'please prioritize the migration work');
+    await waitFor(() => expect(el.textContent).toContain('please prioritize the migration work'));
+
+    await act(async () => {
+      root!.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast as never}
+          onMessageCountChange={() => {}}
+          strategicState={makeStrategicState({
+            strategic: {
+              ...makeStrategicState().strategic,
+              refresh: {
+                pending: {
+                  requested_at: staleMarkerAt,
+                  origin: 'operator',
+                  excerpt: 'older pre-send marker',
+                  operator_count: 1,
+                },
+                last_fired_at: null,
+                last_fired_origin: null,
+              },
+            },
+          })}
+          onStrategicStateRefresh={onStrategicStateRefresh}
+        />,
+      );
+    });
+
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('please prioritize the migration work');
+    expect(el.textContent).not.toContain('older pre-send marker');
+  });
+
+  test('answering a question refreshes Strategic state for attention counts', async () => {
+    const question = makeMsg({
+      id: 'q-refresh',
+      message_type: 'QUESTION',
+      from_type: 'agent',
+      content: 'Should we keep the local runner active?',
+      status: 'open',
+    });
+    _setupQuestionAnswerMock(question);
+    const addToast = vi.fn();
+    const onStrategicStateRefresh = vi.fn();
+    const el = await renderPanel(addToast, false, {
+      strategicState: makeStrategicState(),
+      onStrategicStateRefresh,
+    });
+
+    const replyBtn = [...el.querySelectorAll('button')].find(button => button.title === 'Reply');
+    expect(replyBtn).toBeTruthy();
+    await act(async () => { (replyBtn as HTMLButtonElement).click(); });
+    await typeAndSend(el, 'yes, keep it active');
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledWith('Question answered', 'success'));
+    expect(onStrategicStateRefresh).toHaveBeenCalledTimes(1);
   });
 
   test('passive_note send shows a success "won’t wake" toast', async () => {
@@ -4044,7 +4304,11 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
     });
   }
 
-  async function renderPanel(vision: Record<string, unknown> | null, strategistActive = false) {
+  async function renderPanel(
+    vision: Record<string, unknown> | null,
+    strategistActive = false,
+    props: Partial<MessagesPanelProps> = {},
+  ) {
     _suppressSinceLastVisit('test-user@example.com', 'proj-1');
     _mockWithVision(vision);
     host = document.createElement('div');
@@ -4059,6 +4323,7 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
           addToast={() => {}}
           onMessageCountChange={() => {}}
           strategistActive={strategistActive}
+          {...props}
         />,
       );
     });
@@ -4077,6 +4342,45 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
   test('hides pending badge when no marker is present', async () => {
     const el = await renderPanel({});
     expect(el.textContent).not.toContain('Strategic cycle pending');
+  });
+
+  test('falls back to legacy project vision while Strategic read model is loading', async () => {
+    const el = await renderPanel(
+      {
+        _strategic_refresh: {
+          requested_at: new Date(Date.now() - 60_000).toISOString(),
+          origin: 'operator',
+        },
+      },
+      false,
+      { strategicState: null },
+    );
+
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('operator');
+  });
+
+  test('shows pending badge from populated Strategic read model', async () => {
+    const state = makeStrategicState({
+      strategic: {
+        ...makeStrategicState().strategic,
+        refresh: {
+          pending: {
+            requested_at: new Date(Date.now() - 60_000).toISOString(),
+            origin: 'operator',
+            excerpt: 'Refresh from Strategic read model',
+            operator_count: 2,
+          },
+          last_fired_at: null,
+          last_fired_origin: null,
+        },
+      },
+    });
+    const el = await renderPanel({}, false, { strategicState: state });
+
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('Refresh from Strategic read model');
+    expect(el.textContent).toContain('+1 steer coalesced');
   });
 
   test('hides pending badge once the cycle is running (strategistActive)', async () => {
