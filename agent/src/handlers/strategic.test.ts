@@ -189,6 +189,8 @@ vi.mock('./strategic-sections.js', () => ({
   buildCiComplianceSection: () => '',
   buildPayloadStalenessSection: (staleness: Record<string, unknown> | undefined) =>
     staleness && staleness.stale === true ? 'STALENESS(stale)' : '',
+  buildHeldDirectionsSection: (held: Array<Record<string, unknown>> | undefined) =>
+    held && held.length ? `HELD(${held.length})` : '',
 }));
 
 vi.mock('../telemetry.js', () => ({
