@@ -1391,4 +1391,64 @@ describe('buildSweepComparisonSection', () => {
     expect(result).not.toContain('Sweep sweep-empty');
     expect(result).toContain('Sweep sweep-real');
   });
+
+  it('renders disposed-sweep block and omits synthesis mandate for sweeps with sweep_disposition', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-disposed': [
+        {
+          id: 'k-d1',
+          title: 'arm A',
+          arm_label: 'arm-a',
+          criterion_met: true,
+          sweep_disposition: { task_id: 'task-adopt-789', status: 'in_progress' },
+        },
+        {
+          id: 'k-d2',
+          title: 'arm B',
+          arm_label: 'arm-b',
+          criterion_met: false,
+        },
+      ],
+    });
+    // Disposition block is rendered with heading, sweep id, task id, and status.
+    expect(result).toContain('## Sweep dispositions in flight — do not re-synthesize');
+    expect(result).toContain('**sweep-disposed**');
+    expect(result).toContain('task-adopt-789');
+    expect(result).toContain('in_progress');
+    // Normal synthesis mandate must NOT appear — disposed sweeps must not be re-synthesized.
+    expect(result).not.toContain('## Completed experiment sweeps — synthesis required');
+    expect(result).not.toContain('exactly ONE follow-on move');
+  });
+
+  it('renders disposed sweeps and completed sweeps independently in the same output', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-disposed': [
+        {
+          id: 'k-d1',
+          title: 'arm A',
+          arm_label: 'arm-a',
+          criterion_met: true,
+          sweep_disposition: { task_id: 'task-xyz', status: 'pending' },
+        },
+        {
+          id: 'k-d2',
+          title: 'arm B',
+          arm_label: 'arm-b',
+          criterion_met: false,
+        },
+      ],
+      'sweep-completed': [
+        { id: 'k-c1', title: 'arm C1', arm_label: 'c1', criterion_met: true },
+        { id: 'k-c2', title: 'arm C2', arm_label: 'c2', criterion_met: false },
+      ],
+    });
+    // Disposition block rendered for disposed sweep.
+    expect(result).toContain('## Sweep dispositions in flight — do not re-synthesize');
+    expect(result).toContain('**sweep-disposed**: disposition task `task-xyz` (pending)');
+    // Completed sweep rendered with synthesis mandate.
+    expect(result).toContain('## Completed experiment sweeps — synthesis required');
+    expect(result).toContain('Sweep sweep-completed');
+    // Disposed sweep id must NOT appear under the completed sweeps section.
+    expect(result).not.toContain('Sweep sweep-disposed');
+  });
 });
