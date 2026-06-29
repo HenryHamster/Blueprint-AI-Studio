@@ -174,7 +174,7 @@ def compute_goal_coverage_drift(
 
     Return dict keys:
       ``signal``  — ``"on_track"`` | ``"drifting"`` | ``"no_grade_yet"`` |
-                    ``"not_applicable"``
+                    ``"not_applicable"`` | ``"superseded_exempt"``
       ``coverage``       — persisted coverage score (float | None)
       ``biggest_gap``    — persisted biggest-gap string (str | None)
       ``merges_since_grade`` — how many tasks merged since the grade was taken
@@ -197,6 +197,20 @@ def compute_goal_coverage_drift(
         }
 
     if merge_grade_status is None:
+        stale_cold_start = merges_since_grade >= _DRIFT_STALE_MERGE_THRESHOLD
+        if stale_cold_start:
+            return {
+                "signal": "drifting",
+                "coverage": None,
+                "biggest_gap": merge_grade_biggest_gap,
+                "merges_since_grade": merges_since_grade,
+                "stale": True,
+                "detail": (
+                    f"No merge-grade recorded yet, but {merges_since_grade} task(s) "
+                    "have merged since the version opened — goal coverage is unknown "
+                    "with material accumulated work (cold-start drift)."
+                ),
+            }
         return {
             "signal": "no_grade_yet",
             "coverage": None,
@@ -216,6 +230,36 @@ def compute_goal_coverage_drift(
         if ga_gap:
             biggest_gap = str(ga_gap).strip()[:_FINDING_SUMMARY_MAX]
 
+    if merge_grade_status == "not_applicable":
+        return {
+            "signal": "not_applicable",
+            "coverage": coverage,
+            "biggest_gap": biggest_gap,
+            "merges_since_grade": merges_since_grade,
+            "stale": False,
+            "detail": "Merge-grade was not applicable at grade time (goal was empty or contentless).",
+        }
+
+    if merge_grade_status == "superseded_exempt":
+        return {
+            "signal": "superseded_exempt",
+            "coverage": coverage,
+            "biggest_gap": biggest_gap,
+            "merges_since_grade": merges_since_grade,
+            "stale": False,
+            "detail": "Merge-grade was exempted as superseded; no coverage verdict available.",
+        }
+
+    if merge_grade_status not in ("pass", "fail"):
+        return {
+            "signal": "no_grade_yet",
+            "coverage": None,
+            "biggest_gap": biggest_gap,
+            "merges_since_grade": merges_since_grade,
+            "stale": False,
+            "detail": f"Merge-grade status '{merge_grade_status}' is not a positive verdict — no coverage signal.",
+        }
+
     if merge_grade_status == "fail":
         return {
             "signal": "drifting",
@@ -233,6 +277,7 @@ def compute_goal_coverage_drift(
             ),
         }
 
+    # merge_grade_status == "pass" only reaches here
     if stale:
         return {
             "signal": "drifting",

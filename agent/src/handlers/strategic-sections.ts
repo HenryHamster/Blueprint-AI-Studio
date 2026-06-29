@@ -129,8 +129,11 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     ? recon.capability_contradictions as Array<Record<string, unknown>> : [];
   const orphanedGaps = Array.isArray(recon.orphaned_gaps)
     ? recon.orphaned_gaps as Array<Record<string, unknown>> : [];
+  const staffedButDeferred = Array.isArray(recon.staffed_but_deferred) ? recon.staffed_but_deferred as Array<Record<string, unknown>> : [];
   const ungroundedDirs = Array.isArray(recon.ungrounded_directions)
     ? recon.ungrounded_directions as Array<Record<string, unknown>> : [];
+  const staleActiveMoves = Array.isArray(recon.stale_active_moves) ? recon.stale_active_moves as Array<Record<string, unknown>> : [];
+  const phantomRefs = Array.isArray(recon.phantom_direction_refs) ? recon.phantom_direction_refs as Array<Record<string, unknown>> : [];
   const pipeline = Array.isArray(recon.direction_pipeline)
     ? recon.direction_pipeline as Array<Record<string, unknown>> : [];
   const counts = (recon.counts && typeof recon.counts === 'object')
@@ -175,6 +178,14 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     }
   }
 
+  if (staffedButDeferred.length > 0) {
+    lines.push(`\n### Staffed-but-deferred gaps — contradictory staffing state (${fmtScalar(counts.staffed_but_deferred, String(staffedButDeferred.length))})`);
+    lines.push('These gaps have an active direction pointing at them while also carrying a deferral. Either remove the deferral or park/retarget the direction.');
+    for (const g of staffedButDeferred) {
+      lines.push(`- **${strVal(g.name, 'Unnamed gap')}** [${strVal(g.priority, 'medium')}] (gap ${strVal(g.gap_id, '?')}, status=${strVal(g.status, 'active')})`);
+    }
+  }
+
   // Active directions whose gap_id no longer resolves to an active gap.
   if (ungroundedDirs.length > 0) {
     lines.push(`\n### Ungrounded active directions — advance no tracked gap (${fmtScalar(counts.ungrounded_directions, String(ungroundedDirs.length))})`);
@@ -186,6 +197,23 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
         ? 'its gap_id no longer resolves to an active gap'
         : 'no gap_id linkage';
       lines.push(`- ${text} (id: ${did}) — ${reason}`);
+    }
+  }
+
+  if (staleActiveMoves.length > 0) {
+    lines.push(`\n### Stale gap active_moves — listed direction is no longer active (${fmtScalar(counts.stale_active_moves, String(staleActiveMoves.length))})`);
+    lines.push('These gap active_moves entries point at retired, completed, deleted, or otherwise non-active directions. Prune the stale IDs before trusting gap staffing.');
+    for (const g of staleActiveMoves) {
+      const staleIds = Array.isArray(g.stale_direction_ids) ? (g.stale_direction_ids as string[]).join(', ') : '?';
+      lines.push(`- **${strVal(g.gap_name, 'Unnamed gap')}** (gap ${strVal(g.gap_id, '?')}) — stale active_moves: ${staleIds}`);
+    }
+  }
+
+  if (phantomRefs.length > 0) {
+    lines.push(`\n### Phantom direction refs — prose cites missing directions (${fmtScalar(counts.phantom_direction_refs, String(phantomRefs.length))})`);
+    lines.push('These prose references do not resolve to any known direction. Rewrite the stale narrative or link it to a real direction.');
+    for (const p of phantomRefs) {
+      lines.push(`- ${strVal(p.direction_id, '?')} cited in ${strVal(p.cited_in, '?')}`);
     }
   }
 
@@ -446,6 +474,54 @@ function formatMetricNumber(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(4).replace(/\.?0+$/, '');
 }
 
+function metricDirection(operator: unknown): 'higher' | 'lower' | null {
+  const op = strVal(operator);
+  if (op === '>' || op === '>=') return 'higher';
+  if (op === '<' || op === '<=') return 'lower';
+  return null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function pickOwnVerdict(arm: Record<string, unknown>): Record<string, unknown> | null {
+  const verdicts = arm.per_arm_verdicts;
+  if (!isRecord(verdicts)) return null;
+  const armKey = strVal(arm.arm_label) || strVal(arm.id) || null;
+  if (armKey !== null && isRecord(verdicts[armKey])) return verdicts[armKey];
+  const verdictValues = Object.values(verdicts);
+  return verdictValues.length === 1 && isRecord(verdictValues[0])
+    ? verdictValues[0]
+    : null;
+}
+
+function bestArmByMetric(
+  arms: Array<{ id: string; label: string; value: number }>,
+  direction: 'higher' | 'lower' | null,
+): { id: string; label: string; value: number } | null {
+  if (arms.length === 0 || direction === null) return null;
+  return arms.reduce<{ id: string; label: string; value: number } | null>((best, arm) => {
+    if (best === null) return arm;
+    const better = direction === 'higher' ? arm.value > best.value : arm.value < best.value;
+    return better ? arm : best;
+  }, null);
+}
+
+function renderMetricTail(
+  metricName: string,
+  arm: { label: string; value: number },
+  runnerUp: { label: string; value: number } | null,
+  direction: 'higher' | 'lower' | null,
+): string {
+  const valuePart = `${metricName}=${formatMetricNumber(arm.value)}`;
+  if (!runnerUp || direction === null) return ` (${valuePart})`;
+  const margin = direction === 'higher'
+    ? arm.value - runnerUp.value
+    : runnerUp.value - arm.value;
+  return ` (${valuePart}; margin=${formatMetricNumber(Math.abs(margin))} over ${runnerUp.label}=${formatMetricNumber(runnerUp.value)})`;
+}
+
 /**
  * Render a mandatory synthesis block for fully-verdicted multi-arm compute-experiment
  * sweeps (all arms MET or NOT MET — no UNMEASURED or unavailable entries). A completed
@@ -521,13 +597,16 @@ export function buildSweepComparisonSection(
   }
 
   for (const { sweepId, arms } of completed) {
-    const criterion = arms.find(a => a.criterion && typeof a.criterion === 'object')?.criterion as Record<string, unknown> | undefined;
-    const verdicts = arms.find(a => a.per_arm_verdicts && typeof a.per_arm_verdicts === 'object')?.per_arm_verdicts as Record<string, Record<string, unknown>> | undefined;
-    const lowerIsBetter = strVal(criterion?.operator) === '<' || strVal(criterion?.operator) === '<=';
-    const metricName = strVal(criterion?.metric, 'value');
+    const criterion = arms.find(a => isRecord(a.criterion))?.criterion as Record<string, unknown> | undefined;
+    const direction = metricDirection(criterion?.operator);
+    const metric = strVal(criterion?.metric, 'value');
+    const sharedVerdicts = arms.find(a => isRecord(a.per_arm_verdicts))?.per_arm_verdicts as Record<string, Record<string, unknown>> | undefined;
+    type MeasuredArm = { id: string; label: string; value: number };
     const armRows = arms.map(arm => {
       const label = strVal(arm.arm_label) || strVal(arm.id);
-      const verdict = label && verdicts?.[label] ? verdicts[label] : undefined;
+      const verdict = label && sharedVerdicts?.[label]
+        ? sharedVerdicts[label]
+        : pickOwnVerdict(arm) ?? undefined;
       const value = typeof verdict?.value === 'number' ? verdict.value : Number(verdict?.value);
       return {
         label,
@@ -537,45 +616,45 @@ export function buildSweepComparisonSection(
         summary: strVal(arm.summary),
       };
     });
-    const measuredArms = armRows.filter(arm => arm.value !== null).sort((a, b) => {
-      const aValue = a.value ?? 0;
-      const bValue = b.value ?? 0;
-      const delta = lowerIsBetter ? (aValue - bValue) : (bValue - aValue);
-      return delta !== 0 ? delta : a.label.localeCompare(b.label);
+    const measuredArms: MeasuredArm[] = armRows.flatMap(arm => (
+      arm.value === null ? [] : [{ id: arm.id, label: arm.label, value: arm.value }]
+    )).sort((a, b) => {
+      const aValue = a.value;
+      const bValue = b.value;
+      if (direction === 'lower') {
+        return aValue !== bValue ? aValue - bValue : a.label.localeCompare(b.label);
+      }
+      return aValue !== bValue ? bValue - aValue : a.label.localeCompare(b.label);
     });
-    const nextMeasuredArm = measuredArms[1];
-    const metArms = armRows.filter(arm => arm.met && arm.value !== null);
-    const winningArm = metArms.length > 0
-      ? metArms.sort((a, b) => {
-          const aValue = a.value ?? 0;
-          const bValue = b.value ?? 0;
-          const delta = lowerIsBetter ? (aValue - bValue) : (bValue - aValue);
-          return delta !== 0 ? delta : a.label.localeCompare(b.label);
-        })[0]
-      : undefined;
+    const metArms: MeasuredArm[] = armRows.flatMap(arm => (
+      arm.met && arm.value !== null ? [{ id: arm.id, label: arm.label, value: arm.value }] : []
+    ));
+    const metricWinner = bestArmByMetric(metArms, direction);
+    const bestMeasuredArm = measuredArms[0] ?? null;
+    const runnerUp = metricWinner && measuredArms.length > 1
+      ? measuredArms.find(arm => arm.id !== metricWinner.id) ?? null
+      : measuredArms[1] ?? null;
     const metLabels = armRows.filter(arm => arm.met).map(arm => arm.label);
-    const winnerLabel = winningArm
-      ? winningArm.label
+    const winnerLabel = metricWinner
+      ? metricWinner.label
       : metLabels.length > 0
         ? metLabels.join(', ')
-      : 'none (all NOT MET)';
-    const renderMetricTail = (arm: { label: string; value: number | null }, runnerUp: { label: string; value: number | null } | undefined): string => {
-      if (arm.value === null) return '';
-      const valuePart = `${metricName}=${formatMetricNumber(arm.value)}`;
-      if (!runnerUp || runnerUp.value === null) return ` (${valuePart})`;
-      const margin = lowerIsBetter ? runnerUp.value - arm.value : arm.value - runnerUp.value;
-      return ` (${valuePart}; margin=${formatMetricNumber(Math.abs(margin))} over ${runnerUp.label}=${formatMetricNumber(runnerUp.value)})`;
-    };
+        : 'none (all NOT MET)';
 
     lines.push(`\n### Sweep ${sweepId}`);
     lines.push(
-      winningArm
-        ? `Winner: **${winnerLabel}**${renderMetricTail(winningArm, nextMeasuredArm)}`
+      metricWinner
+        ? `Winner: **${winnerLabel}**${renderMetricTail(metric, metricWinner, runnerUp, direction)}`
         : `Winner: **${winnerLabel}**`,
     );
-    if (!winningArm && measuredArms.length > 0) {
+    if (metricWinner && runnerUp) {
+      const margin = direction === 'lower'
+        ? runnerUp.value - metricWinner.value
+        : metricWinner.value - runnerUp.value;
+      lines.push(`margin: +${formatMetricNumber(margin)} ${metric} over ${runnerUp.label}`);
+    } else if (!metricWinner) {
       lines.push(
-        `Best measured arm: **${measuredArms[0].label}**${renderMetricTail(measuredArms[0], nextMeasuredArm)}`,
+        `Best measured arm: **${bestMeasuredArm.label}**${renderMetricTail(metric, bestMeasuredArm, runnerUp, direction)}`,
       );
     }
 

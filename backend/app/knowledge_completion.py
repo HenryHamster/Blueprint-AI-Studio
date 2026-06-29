@@ -2601,6 +2601,10 @@ def _qa_unavailable(reason: str) -> dict[str, Any]:
     }
 
 
+_QA_HISTORY_MAX_TURNS = 6
+_QA_HISTORY_TURN_MAX_CHARS = 1000
+
+
 def _build_compute_qa_prompt(
     task: Task,
     *,
@@ -2609,6 +2613,7 @@ def _build_compute_qa_prompt(
     cost: float | None,
     criterion: dict[str, Any] | None,
     evidence: dict[str, Any],
+    history: list[dict[str, Any]] | None = None,
 ) -> str:
     """Build a grounded Q&A prompt for a single question about a compute run."""
     payload = task.first_payload or {}
@@ -2631,6 +2636,22 @@ def _build_compute_qa_prompt(
         else ""
     )
     allowed = "\n".join(f"  - {c}" for c in evidence["citations"])
+
+    history_section = ""
+    if history:
+        turns = []
+        for turn in history:
+            q = str(turn.get("question") or "")[:_QA_HISTORY_TURN_MAX_CHARS]
+            a = str(turn.get("answer") or "")[:_QA_HISTORY_TURN_MAX_CHARS]
+            if q and a:
+                turns.append(f"Q: {q}\nA: {a}")
+        if turns:
+            history_section = (
+                "## Prior conversation (for context only — NOT evidence; do not cite from it)\n"
+                + "\n---\n".join(turns)
+                + "\n\n"
+            )
+
     return (
         "You are answering a question about a completed compute experiment. "
         "Answer ONLY based on the provided evidence; decline honestly if the "
@@ -2642,6 +2663,7 @@ def _build_compute_qa_prompt(
         f"Metrics:\n{metrics_lines}\n"
         f"{arms_section}"
         f"{log_section}"
+        f"{history_section}"
         f"Question: {question[:500]}\n\n"
         "Choose citations ONLY from this allowed list (copy verbatim):\n"
         f"{allowed}\n\n"
@@ -2659,6 +2681,7 @@ async def answer_compute_experiment_question(
     result_reference: str | None,
     session: AsyncSession,
     logs: str | None = None,
+    history: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Answer a free-form question grounded in a completed experiment's durable evidence.
 
@@ -2678,6 +2701,15 @@ async def answer_compute_experiment_question(
     )
     if evidence is None:
         return _qa_unavailable("no-evidence")
+    bounded_history: list[dict[str, Any]] | None = None
+    if history:
+        valid_turns = [
+            t for t in history
+            if isinstance(t, dict)
+            and isinstance(t.get("question"), str)
+            and isinstance(t.get("answer"), str)
+        ]
+        bounded_history = valid_turns[-_QA_HISTORY_MAX_TURNS:]
     prompt = _build_compute_qa_prompt(
         task,
         outcome=outcome,
@@ -2685,6 +2717,7 @@ async def answer_compute_experiment_question(
         criterion=criterion,
         evidence=evidence,
         question=question,
+        history=bounded_history,
     )
     allowed_set = set(evidence.get("citations", []))
     for attempt in range(2):

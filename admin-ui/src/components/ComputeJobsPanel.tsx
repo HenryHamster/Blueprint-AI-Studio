@@ -696,7 +696,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [askState, setAskState] = useState<Record<string, {
     question: string;
     submitting: boolean;
-    result: { answer: string | null; citations: string[]; grounding_miss: boolean; fallback_reason: string | null } | null;
+    thread: Array<{ question: string; result: { answer: string | null; citations: string[]; grounding_miss: boolean; fallback_reason: string | null } }>;
     error: string | null;
   }>>({});
 
@@ -922,14 +922,25 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const handleAsk = useCallback(async (jobId: string) => {
     const q = (askState[jobId]?.question ?? '').trim();
     if (!q) return;
-    setAskState((prev) => ({ ...prev, [jobId]: { ...(prev[jobId] ?? { question: q, submitting: false, result: null, error: null }), submitting: true, error: null, result: null } }));
+    const prevThread = askState[jobId]?.thread ?? [];
+    const history = prevThread.map((t) => ({ question: t.question, answer: t.result.answer ?? '' }));
+    setAskState((prev) => ({
+      ...prev,
+      [jobId]: { ...(prev[jobId] ?? { question: q, submitting: false, thread: [], error: null }), submitting: true, error: null },
+    }));
     try {
-      const result = await askComputeJob(jobId, q);
-      setAskState((prev) => ({ ...prev, [jobId]: { ...(prev[jobId] ?? { question: q, submitting: false, result: null, error: null }), submitting: false, result } }));
+      const result = await askComputeJob(jobId, q, history.length > 0 ? history : undefined);
+      setAskState((prev) => {
+        const cur = prev[jobId] ?? { question: q, submitting: false, thread: [], error: null };
+        return {
+          ...prev,
+          [jobId]: { ...cur, submitting: false, question: '', thread: [...(cur.thread ?? []), { question: q, result }] },
+        };
+      });
     } catch (e) {
       setAskState((prev) => ({
         ...prev,
-        [jobId]: { ...(prev[jobId] ?? { question: q, submitting: false, result: null, error: null }), submitting: false, error: e instanceof Error ? e.message : 'Ask failed' },
+        [jobId]: { ...(prev[jobId] ?? { question: q, submitting: false, thread: [], error: null }), submitting: false, error: e instanceof Error ? e.message : 'Ask failed' },
       }));
     }
   }, [askState]);
@@ -1858,7 +1869,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 );
               })()}
               {!active && (() => {
-                const ask = askState[job.id] ?? { question: '', submitting: false, result: null, error: null };
+                const ask = askState[job.id] ?? { question: '', submitting: false, thread: [], error: null };
 
                 // Suggest starter questions based on job content
                 const starterQuestions: string[] = [];
@@ -1911,7 +1922,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                           value={ask.question}
                           onChange={(e) => setAskState((prev) => ({
                             ...prev,
-                            [job.id]: { ...(prev[job.id] ?? { question: '', submitting: false, result: null, error: null }), question: e.target.value },
+                            [job.id]: { ...(prev[job.id] ?? { question: '', submitting: false, thread: [], error: null }), question: e.target.value },
                           }))}
                           placeholder={starterQuestions.length > 0 ? starterQuestions[0] : "Ask about this run…"}
                           disabled={ask.submitting}
@@ -1935,7 +1946,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                               type="button"
                               onClick={() => setAskState((prev) => ({
                                 ...prev,
-                                [job.id]: { ...(prev[job.id] ?? { question: '', submitting: false, result: null, error: null }), question: q },
+                                [job.id]: { ...(prev[job.id] ?? { question: '', submitting: false, thread: [], error: null }), question: q },
                               }))}
                               className="min-h-[44px] rounded border border-indigo-500/40 bg-indigo-500/10 px-2 py-1 text-ui-xs text-indigo-300 hover:bg-indigo-500/20 transition-colors"
                               data-testid="compute-ask-starter"
@@ -1949,29 +1960,68 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     {ask.error && (
                       <div className="mt-1 text-ui-sm text-red-300" data-testid="compute-ask-error">{ask.error}</div>
                     )}
-                    {ask.result && (
-                      <div className="mt-1.5 rounded border border-indigo-500/30 bg-indigo-500/10 px-2 py-1.5 text-ui-sm" data-testid="compute-ask-result">
-                        <div className="text-indigo-200 break-words whitespace-pre-wrap">{ask.result.answer}</div>
-                        {ask.result.citations.length > 0 && (
-                          <div className="mt-1 flex flex-col gap-0.5" data-testid="compute-ask-citations">
-                            <div className="text-indigo-300/70 text-ui-xs font-semibold">Evidence:</div>
-                            {ask.result.citations.map((c) => {
-                              const { label, value } = formatCitation(c);
-                              return (
-                                <div key={c} className="text-ui-xs text-indigo-300/80 rounded bg-indigo-500/20 px-1.5 py-0.5">
-                                  <span className="font-semibold">{label}:</span> {value}
-                                </div>
-                              );
-                            })}
-                            <div className="mt-0.5 text-ui-xs text-emerald-300/80" data-testid="compute-ask-grounded">✓ Grounded in run data</div>
-                          </div>
-                        )}
-                        {!ask.result.citations.length && ask.result.grounding_miss && (
-                          <div className="mt-1 text-ui-xs text-amber-300/70" data-testid="compute-ask-ungrounded">No evidence found for this question</div>
-                        )}
-                        {!ask.result.citations.length && !ask.result.grounding_miss && (
-                          <div className="mt-1 text-ui-xs text-neutral-400/70 italic" data-testid="compute-ask-no-citation-info">No citations provided</div>
-                        )}
+                    {(ask.thread ?? []).length > 0 && (
+                      <div className="mt-1.5 flex flex-col gap-2" data-testid="compute-ask-thread">
+                        {(ask.thread ?? []).map((turn, idx) => {
+                          const result = turn.result;
+                          return (
+                            <div key={idx} className="flex flex-col gap-0.5">
+                              <div className="text-ui-xs text-neutral-500 font-semibold" data-testid="compute-ask-thread-question">Q: {turn.question}</div>
+                              <div className={`rounded border px-2 py-1.5 text-ui-sm ${
+                                result.grounding_miss
+                                  ? 'border-amber-500/30 bg-amber-500/10'
+                                  : 'border-indigo-500/30 bg-indigo-500/10'
+                              }`} data-testid="compute-ask-result">
+                                {result.grounding_miss && (
+                                  <div className="mb-1 flex items-start gap-1.5 text-amber-200/80" data-testid="compute-ask-unverified-caution">
+                                    <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
+                                    <span className="text-ui-xs font-semibold">Unverified answer — no grounding found</span>
+                                  </div>
+                                )}
+                                <div className={`break-words whitespace-pre-wrap ${
+                                  result.grounding_miss ? 'text-amber-200' : 'text-indigo-200'
+                                }`}>{result.answer}</div>
+                                {result.citations.length > 0 && (
+                                  <div className="mt-1 flex flex-col gap-0.5" data-testid="compute-ask-citations">
+                                    <div className={`text-ui-xs font-semibold ${
+                                      result.grounding_miss ? 'text-amber-300/70' : 'text-indigo-300/70'
+                                    }`}>Evidence:</div>
+                                    {result.citations.map((c) => {
+                                      const { label, value } = formatCitation(c);
+                                      return (
+                                        <div key={c} className={`text-ui-xs rounded px-1.5 py-0.5 ${
+                                          result.grounding_miss
+                                            ? 'text-amber-300/80 bg-amber-500/20'
+                                            : 'text-indigo-300/80 bg-indigo-500/20'
+                                        }`}>
+                                          <span className="font-semibold">{label}:</span> {value}
+                                        </div>
+                                      );
+                                    })}
+                                    <div className="mt-0.5 text-ui-xs text-emerald-300/80" data-testid="compute-ask-grounded">✓ Grounded in run data</div>
+                                  </div>
+                                )}
+                                {!result.citations.length && result.grounding_miss && (
+                                  <div className="mt-1 text-ui-xs text-amber-300/70" data-testid="compute-ask-ungrounded">No evidence found for this question</div>
+                                )}
+                                {!result.citations.length && !result.grounding_miss && (
+                                  <div className="mt-1 text-ui-xs text-neutral-400/70 italic" data-testid="compute-ask-no-citation-info">No citations provided</div>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                        <button
+                          type="button"
+                          onClick={() => setAskState((prev) => ({
+                            ...prev,
+                            [job.id]: { question: '', submitting: false, thread: [], error: null },
+                          }))}
+                          className="self-start text-ui-xs text-neutral-500 hover:text-neutral-300 transition-colors"
+                          data-testid="compute-ask-clear"
+                        >
+                          Clear conversation
+                        </button>
                       </div>
                     )}
                   </div>

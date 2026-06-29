@@ -715,7 +715,9 @@ def _compute_sweep_doc_is_definitive(doc: KnowledgeDocument) -> bool:
     )
     if verdict.get("unavailable_cause"):
         return False
-    return isinstance(verdict.get("criterion_met"), bool)
+    if isinstance(verdict.get("criterion_met"), bool):
+        return True
+    return verdict.get("outcome") is not None
 
 
 async def build_compute_sweep_groups(
@@ -735,6 +737,31 @@ async def build_compute_sweep_groups(
     KnowledgeDocument. ``build_sweep_knowledge_index`` remains the raw per-sweep
     document listing; this payload is reserved for strategist-ready comparisons.
     """
+    docs_stmt = (
+        build_knowledge_documents_stmt(
+            project_id,
+            source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+        )
+        .where(KnowledgeDocument.sweep_id.is_not(None))
+        .order_by(KnowledgeDocument.sweep_id, KnowledgeDocument.created_at.desc())
+    )
+    doc_rows = (await session.execute(docs_stmt)).scalars().all()
+
+    by_sweep_docs: dict[str, list[KnowledgeDocument]] = {}
+    for doc in doc_rows:
+        sid = doc.sweep_id
+        if sid is None:
+            continue
+        by_sweep_docs.setdefault(sid, []).append(doc)
+
+    candidate_sweeps = {
+        sid: docs
+        for sid, docs in by_sweep_docs.items()
+        if len(docs) >= _SWEEP_MIN_DOCS
+    }
+    if not candidate_sweeps:
+        return {}
+
     task_stmt = (
         select(Task)
         .where(
@@ -763,18 +790,6 @@ async def build_compute_sweep_groups(
         planned.setdefault(sweep_id, {}).setdefault(arm_label, []).append(task)
         task_to_arm[task.id] = arm_label
 
-    if not planned:
-        return {}
-
-    doc_stmt = (
-        build_knowledge_documents_stmt(
-            project_id,
-            source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
-        )
-        .where(KnowledgeDocument.sweep_id.in_(list(planned.keys())))
-        .order_by(KnowledgeDocument.sweep_id, KnowledgeDocument.created_at.desc())
-    )
-    doc_rows = (await session.execute(doc_stmt)).scalars().all()
     docs_by_sweep_arm: dict[str, dict[str, KnowledgeDocument]] = {}
     for doc in doc_rows:
         if doc.source_task_id not in task_to_arm:
@@ -788,7 +803,15 @@ async def build_compute_sweep_groups(
         docs_by_sweep_arm.setdefault(sweep_id, {}).setdefault(arm_label, doc)
 
     complete: dict[str, list[dict]] = {}
-    for sweep_id, arms in planned.items():
+    for sweep_id, docs in candidate_sweeps.items():
+        arms = planned.get(sweep_id)
+        if not arms:
+            if direction_id is None:
+                complete[sweep_id] = [
+                    _knowledge_index_entry(doc, summary_chars) for doc in docs
+                ]
+            continue
+
         labels = [label for label in arms if label is not None]
         if len(labels) != len(arms) or len(set(labels)) < _SWEEP_MIN_DOCS:
             continue
@@ -845,7 +868,6 @@ async def build_compute_sweep_groups(
     for _sid, _disp in _disposition.items():
         if complete[_sid]:
             complete[_sid][0]["sweep_disposition"] = _disp
-
     # Sort sweeps by the created_at of their newest entry (descending).
     ordered = sorted(
         complete.items(),

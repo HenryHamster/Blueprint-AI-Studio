@@ -3213,3 +3213,64 @@ async def test_knowledge_documents_sweep_id_filter(
         headers={"x-agent-token": token},
     )
     assert res_all.json()["total"] == 3
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_cold_start_drift_counts_merges_since_open(
+    client: AsyncClient, db_session
+):
+    """Cold-start: no merge-grade verdict, but >=5 pr_merged tasks since version
+    open → goal_coverage_drift signal must be 'drifting' with stale=True.
+
+    Acceptance gate: named test in the task spec; asserts non-trivial behavior
+    exercised by production code in release_readiness + release_scoring.
+    """
+    from datetime import timezone
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-vp-cold-start"
+    )
+    version.goal = "Harden the release pipeline and improve coverage"
+    version.phase = "build"
+    # opened_at must be in the past so merged tasks are counted since it
+    version.opened_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    flag_modified(version, "goal")
+    flag_modified(version, "opened_at")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create 5 COMPLETED tasks with pr_merged=True, all after version.opened_at.
+    # count_merged_since uses updated_at >= since, then _task_completed_at check.
+    for i in range(5):
+        merged_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "fix"}],
+            status=TaskStatus.COMPLETED,
+            updated_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+            vm_instance_id=f"agent-vm-cold-merged-{i}",
+            context={"pr_merged": True},
+        )
+        db_session.add(merged_task)
+    await db_session.commit()
+
+    # No QualificationVerdict exists for this version → cold-start scenario.
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+
+    drift = body["data"].get("goal_coverage_drift")
+    assert drift is not None, "goal_coverage_drift must be present"
+    assert drift["signal"] == "drifting", (
+        f"expected 'drifting' for cold-start with 5 merges, got {drift['signal']!r}"
+    )
+    assert drift["stale"] is True
+    assert drift["coverage"] is None
+    assert drift["merges_since_grade"] >= 5

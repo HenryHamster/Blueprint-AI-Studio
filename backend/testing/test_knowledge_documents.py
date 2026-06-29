@@ -2903,6 +2903,297 @@ async def test_build_compute_sweep_groups_surfaces_per_arm_value_and_criterion(
         assert entry["per_arm_verdicts"]["treatment"]["met"] is True
 
 
+# ── build_compute_sweep_groups: planned-arm completeness gate ─────────────────
+
+
+async def _make_compute_sweep_task(
+    db_session,
+    *,
+    project_id,
+    sweep_id,
+    arm_label=None,
+    status=None,
+    direction_id=None,
+    created_at=None,
+):
+    """Persist a compute_experiment Task carrying sweep_id in its first payload."""
+    from app.models import TaskStatus
+
+    task = make_task(
+        project_id=project_id,
+        title=f"compute_experiment: arm {arm_label or sweep_id}",
+        status=status or TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "experiment": arm_label or "sweep-test",
+                "base_branch": "main",
+                "sweep_id": sweep_id,
+            }
+        ],
+    )
+    if created_at is not None:
+        task.created_at = created_at
+    if direction_id:
+        task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_blocks_incomplete_planned_arms(db_session):
+    """A sweep with 3 planned arms but only 2 usable docs is excluded.
+
+    The acceptance requirement for this task: the test must exercise the
+    completeness gate that prevents partial-sweep overclaim.
+    """
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project = make_project(name="SWGIncomplete")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Three planned arms — each backed by a Task row.
+    task_a = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-inc", arm_label="a"
+    )
+    task_b = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-inc", arm_label="b"
+    )
+    task_c = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-inc", arm_label="c"
+    )
+
+    # Only two arms produced usable docs (task_c is missing).
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_a.id,
+        title="arm a",
+        source_kind="compute_experiment",
+        sweep_id="sw-inc",
+        arm_label="a",
+        forward_quality_verdict=_acceptance_verdict(),
+        source_citations=["gs://bucket/a.json"],
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_b.id,
+        title="arm b",
+        source_kind="compute_experiment",
+        sweep_id="sw-inc",
+        arm_label="b",
+        forward_quality_verdict=_acceptance_verdict(),
+        source_citations=["gs://bucket/b.json"],
+    )
+    # task_c has no KnowledgeDocument — arm c never produced results.
+    _ = task_c  # referenced to make intent explicit
+
+    # The sweep has 2 docs (>= _SWEEP_MIN_DOCS) but the task manifest shows 3
+    # planned arms; the missing arm blocks the sweep.
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert groups == {}, (
+        "Sweep with an unrepresented planned arm must be excluded from sweep groups"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_blocks_when_arm_doc_unavailable(db_session):
+    """A sweep where one arm's doc carries unavailable_cause is excluded."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project = make_project(name="SWGUnavail")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_a = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-unav", arm_label="a"
+    )
+    task_b = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-unav", arm_label="b"
+    )
+
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_a.id,
+        title="arm a ok",
+        source_kind="compute_experiment",
+        sweep_id="sw-unav",
+        arm_label="a",
+        forward_quality_verdict=_acceptance_verdict(),
+        source_citations=["gs://bucket/a.json"],
+    )
+    # arm b's doc has unavailable_cause — not usable.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_b.id,
+        title="arm b unavailable",
+        source_kind="compute_experiment",
+        sweep_id="sw-unav",
+        arm_label="b",
+        forward_quality_verdict={"unavailable_cause": "analysis_timed_out"},
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert groups == {}, (
+        "Sweep with an unavailable arm doc must be excluded from sweep groups"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_respects_direction_scope_for_manifest(
+    db_session,
+):
+    """A same-sweep_id manifest in another direction must not block the scoped view."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project = make_project(name="SWGDirectionScoped")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_a = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-shared",
+        arm_label="a1",
+        direction_id="d-a",
+    )
+    task_b = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-shared",
+        arm_label="a2",
+        direction_id="d-a",
+    )
+    task_other = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-shared",
+        arm_label="b1",
+        direction_id="d-b",
+    )
+
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_a.id,
+        title="arm a1",
+        direction_id="d-a",
+        source_kind="compute_experiment",
+        sweep_id="sw-shared",
+        arm_label="a1",
+        forward_quality_verdict=_acceptance_verdict(),
+        source_citations=["gs://bucket/a1.json"],
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_b.id,
+        title="arm a2",
+        direction_id="d-a",
+        source_kind="compute_experiment",
+        sweep_id="sw-shared",
+        arm_label="a2",
+        forward_quality_verdict=_acceptance_verdict(),
+        source_citations=["gs://bucket/a2.json"],
+    )
+    # Same sweep_id in another direction, but no usable doc.
+    _ = task_other
+
+    groups = await build_compute_sweep_groups(
+        db_session,
+        project.id,
+        direction_id="d-a",
+    )
+    assert "sw-shared" in groups
+    assert {entry["direction_id"] for entry in groups["sw-shared"]} == {"d-a"}
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_allows_measured_only_doc(db_session):
+    """A measured-only doc (no unavailable_cause) does not block the sweep."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project = make_project(name="SWGMeasured")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_a = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-meas", arm_label="a"
+    )
+    task_b = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-meas", arm_label="b"
+    )
+
+    # arm a: acceptance verdict.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_a.id,
+        title="arm a",
+        source_kind="compute_experiment",
+        sweep_id="sw-meas",
+        arm_label="a",
+        forward_quality_verdict=_acceptance_verdict(),
+        source_citations=["gs://bucket/a.json"],
+    )
+    # arm b: deterministic/measured-only verdict — no unavailable_cause.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_b.id,
+        title="arm b measured",
+        source_kind="compute_experiment",
+        sweep_id="sw-meas",
+        arm_label="b",
+        forward_quality_verdict={"analysis_mode": "deterministic", "outcome": "SUCCESS"},
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-meas" in groups, (
+        "Sweep where all arms have usable (measured-only) docs must be included"
+    )
+    assert len(groups["sw-meas"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_falls_back_to_docs_only_when_no_task_manifest(
+    db_session,
+):
+    """When no Task rows carry the sweep_id, docs-only (>= 2) behavior is kept."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, web_task = await _make_web_research_task(
+        db_session, project_name="SWGFallback"
+    )
+    # Two compute docs with a sweep_id but sourced from a web_research task
+    # (type != 'compute_experiment') — no task manifest will be found.
+    for label in ("x", "y"):
+        await _make_knowledge_doc(
+            db_session,
+            project_id=project.id,
+            source_task_id=web_task.id,
+            title=f"arm {label}",
+            source_kind="compute_experiment",
+            sweep_id="sw-fallback",
+            arm_label=label,
+        )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-fallback" in groups, (
+        "Sweep with no task manifest must fall back to docs-only inclusion"
+    )
+
+
 @pytest.mark.asyncio
 async def test_analyze_unavailable_stamps_cause_on_existing_doc(
     db_session, _quiet_broadcast
