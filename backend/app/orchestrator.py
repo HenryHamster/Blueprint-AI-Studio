@@ -3472,8 +3472,9 @@ async def orchestrator_worker():
                 if _all_dep_uuids:
                     # Column projection for the dep batch: _check_candidate_task_deps
                     # reads status, context (_replaced_by_task_id / has_landed_signal /
-                    # is_genuine_code_dependency / verify_pr_merged), and payloads
-                    # (first_payload for _same_base_branch + task-type checks).
+                    # is_genuine_code_dependency / verify_pr_merged), parent_task_id
+                    # (lineage-parent landed fallback), and payloads (first_payload for
+                    # _same_base_branch + task-type checks).
                     # title is included so the cascade-cancel alert (raised from a
                     # separate session against the DETACHED prereq row) can read
                     # prereq_task.title without a raiseload DetachedInstanceError.
@@ -3487,6 +3488,7 @@ async def orchestrator_worker():
                         Task.context,
                         Task.payloads,
                         Task.project_id,
+                        Task.parent_task_id,
                         Task.title,
                         raiseload=True,
                     )
