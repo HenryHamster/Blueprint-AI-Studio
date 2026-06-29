@@ -2140,31 +2140,36 @@ async def refresh_direction_outcomes_after_merge(
     :func:`is_merged_completion`, so a single child's merge heals the whole
     cycle entry (picking up sibling PRs that landed since the last recompute).
 
-    No-op unless *task* carries both ``direction_id`` and ``research_task_id``.
+    Criterion evidence recording runs for any task that carries ``criterion_ids``
+    and a proven verdict, independent of whether the direction recompute ran.
+    The direction recompute additionally requires ``research_task_id``.
     Best-effort: a failure here must never break merge finalization, so errors
     are logged and the session is rolled back to keep the caller's scope clean.
     """
     import contextlib
     import logging
 
+    if task.project_id is None:
+        return
     ctx = task.context or {}
     direction_id = ctx.get("direction_id")
     research_task_id = ctx.get("research_task_id")
-    if not (direction_id and research_task_id) or task.project_id is None:
-        return
-    try:
-        await _update_direction_research_outcomes(
-            task.project_id, str(direction_id), str(research_task_id), session
-        )
-    except Exception as exc:  # noqa: BLE001 — best-effort; must not break merge finalize
-        logging.getLogger(__name__).warning(
-            "[DIRECTION] post-merge outcome refresh failed for task %s: %r",
-            getattr(task, "id", None),
-            exc,
-        )
-        with contextlib.suppress(Exception):
-            await session.rollback()
-    # Record criterion evidence for each criterion the task carried, when proven.
+    # Direction outcome recompute requires both IDs; skip if either is absent.
+    if direction_id and research_task_id:
+        try:
+            await _update_direction_research_outcomes(
+                task.project_id, str(direction_id), str(research_task_id), session
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort; must not break merge finalize
+            logging.getLogger(__name__).warning(
+                "[DIRECTION] post-merge outcome refresh failed for task %s: %r",
+                getattr(task, "id", None),
+                exc,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+    # Criterion evidence is independent of the direction recompute — record for
+    # any task that carries criterion_ids and a proven verdict.
     # Best-effort: a failure here must never break merge finalization.
     try:
         from app.acceptance_criteria import record_task_merge_evidence
