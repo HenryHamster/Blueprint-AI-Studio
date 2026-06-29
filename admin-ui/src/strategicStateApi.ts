@@ -1,0 +1,128 @@
+import { apiFetch, type StrategicRefreshMarker } from './api';
+
+export interface StrategicStateCycle {
+  id: string;
+  outcome: string;
+  has_active_task?: boolean;
+  stale?: boolean;
+  phase1_task_id: string | null;
+  phase2_task_id: string | null;
+  phase1_started_at: string | null;
+  phase1_completed_at: string | null;
+  phase2_started_at: string | null;
+  phase2_completed_at: string | null;
+  summary_text?: string | null;
+  failure_reason?: string | null;
+  directions_created: number;
+  directions_retired: number;
+  tasks_spawned: number;
+  vision_updated: boolean;
+  problem_model_changed: boolean;
+  running_update_changed: boolean;
+}
+
+export interface StrategicStateTask {
+  id: string;
+  status: string;
+  title?: string | null;
+  task_type?: string | null;
+  latest_status_message?: string | null;
+  started_at?: string | null;
+  created_at?: string | null;
+}
+
+export interface StrategicStateMessage {
+  id: string;
+  project_id: string;
+  message_type: string;
+  from_type: string;
+  from_task_id: string | null;
+  content: string;
+  context: Record<string, unknown>;
+  status: string;
+  resolution: string | null;
+  resolved_at: string | null;
+  created_at: string | null;
+}
+
+export interface StrategicStateResponse {
+  project_id: string;
+  strategic: {
+    active_cycle: StrategicStateCycle | null;
+    active_task: StrategicStateTask | null;
+    active_phase: 'design_doc_update' | 'strategic_review' | string | null;
+    latest_cycle: StrategicStateCycle | null;
+    refresh: {
+      pending: StrategicRefreshMarker | null;
+      last_fired_at?: string | null;
+      last_fired_origin?: string | null;
+    };
+  };
+  running_update: {
+    excerpt: string | null;
+    char_count: number;
+    acknowledged_at: string | null;
+  };
+  problem_model: {
+    revision?: number | null;
+    last_updated?: string | null;
+    current_focus?: string | null;
+    purpose?: string | null;
+    active_gap_count: number;
+    capability_count: number;
+    pending_confirmation_count: number;
+    top_gap: {
+      id: string;
+      name: string | null;
+      priority: string;
+      status: string;
+    } | null;
+  };
+  directions: {
+    total_count: number;
+    active_count: number;
+    paused_count: number;
+    primary: {
+      id: string;
+      text: string | null;
+      priority: string;
+      status: string;
+      mode?: string | null;
+    } | null;
+  };
+  messages: {
+    counts: { open: number; linked: number };
+    items: StrategicStateMessage[];
+  };
+  tasks: {
+    counts: {
+      queued: number;
+      running: number;
+      evaluating: number;
+      blocked: number;
+      failed: number;
+      completed: number;
+      total: number;
+    };
+    cumulative_estimated_cost_usd: number;
+  };
+  design: {
+    has_design_doc: boolean;
+    revision?: number | null;
+  };
+}
+
+export async function fetchStrategicState(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<StrategicStateResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-state`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch strategic state: ${res.status}`);
+  return res.json() as Promise<StrategicStateResponse>;
+}

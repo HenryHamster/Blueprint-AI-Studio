@@ -44,6 +44,7 @@ import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
 import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
+import { StrategicContextRail } from './components/StrategicContextRail';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
 import { BoardSavedViewsBar, type BoardFilterSnapshot } from './components/BoardSavedViewsBar';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
@@ -52,6 +53,7 @@ import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
 import { ProjectWorkspace, RuntimeWorkspace, type ProjectManageSection, type ProjectSection, type RuntimeSection, type RuntimeSettingsSection } from './components/OperatorWorkspaces';
 import { WorkbenchFrame, WorkbenchMetric, WorkbenchPanel, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
+import { useStrategicReadModel } from './hooks/useStrategicReadModel';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 
@@ -462,20 +464,7 @@ export default function App() {
 
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
-  const blockedTasks = useMemo(() => s.tasks.filter(t => t.status === 'BLOCKED'), [s.tasks]);
-  const failedTasksForProject = useMemo(() => s.tasks.filter(t => t.status === 'FAILED'), [s.tasks]);
-  const activeDirections = useMemo(() => directions.filter(d => {
-    const status = d.status?.toLowerCase();
-    return !d.held && status !== 'retired' && status !== 'done' && status !== 'completed';
-  }), [directions]);
-  const primaryDirection = activeDirections[0] ?? directions[0] ?? null;
-  const chatCanvasBars = useMemo(() => [
-    { key: 'active', label: 'active', value: runningTasks.length, className: 'bg-emerald-500' },
-    { key: 'queued', label: 'queued', value: queuedTasks.length, className: 'bg-neutral-500' },
-    { key: 'blocked', label: 'blocked', value: blockedTasks.length, className: 'bg-amber-400' },
-    { key: 'failed', label: 'failed', value: failedTasksForProject.length, className: 'bg-red-500' },
-  ], [runningTasks.length, queuedTasks.length, blockedTasks.length, failedTasksForProject.length]);
-  const chatCanvasMax = useMemo(() => Math.max(1, ...chatCanvasBars.map(item => item.value)), [chatCanvasBars]);
+  const strategicReadModel = useStrategicReadModel(s.selectedProjectId);
 
   const selectedTasks = useMemo(() => s.tasks.filter(t => s.selectedTaskIds.has(t.id)), [s.tasks, s.selectedTaskIds]);
   const cancellableTasks = useMemo(() => selectedTasks.filter(t => CANCELLABLE_STATUSES.has(t.status)), [selectedTasks]);
@@ -1245,103 +1234,23 @@ export default function App() {
               />
             )}
             rail={(
-              <div className="space-y-3">
-                <WorkbenchPanel title="Canvas" meta="live">
-                  <div className="rounded-md border border-neutral-800 bg-[#0b0f14] p-3">
-                    <div className="flex items-center justify-between gap-3">
-                      <h3 className="truncate text-xs font-semibold text-neutral-100">Pipeline + spend snapshot</h3>
-                      <span className="shrink-0 font-mono text-ui-md text-neutral-500">{filteredTasks.length}/{s.tasks.length}</span>
-                    </div>
-                    <div className="mt-3 grid grid-cols-3 gap-2">
-                      <WorkbenchMetric label="active" value={runningTasks.length} tone="good" />
-                      <WorkbenchMetric label="blocked" value={blockedTasks.length} tone={blockedTasks.length > 0 ? 'warn' : 'neutral'} />
-                      <WorkbenchMetric label="cost" value={`$${s.cumulativeCost.toFixed(2)}`} tone="neutral" />
-                    </div>
-                    <div className="mt-4 flex h-20 items-end gap-2 border-t border-neutral-800 pt-3" aria-label="Pipeline status snapshot">
-                      {chatCanvasBars.map(item => (
-                        <div key={item.key} className="flex min-w-0 flex-1 flex-col items-center gap-1">
-                          <div className="flex h-12 w-full items-end rounded-sm bg-neutral-900/70">
-                            <div
-                              className={`w-full rounded-sm ${item.className}`}
-                              style={{ height: `${Math.max(8, Math.round((item.value / chatCanvasMax) * 100))}%` }}
-                            />
-                          </div>
-                          <span className="truncate text-ui-md text-neutral-600">{item.label}</span>
-                        </div>
-                      ))}
-                    </div>
-                    <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
-                      <div className="rounded-md border border-neutral-800 bg-neutral-950/60 px-2 py-1.5">
-                        <div className="text-neutral-500">queued</div>
-                        <div className="mt-0.5 font-semibold text-neutral-200">{queuedTasks.length}</div>
-                      </div>
-                      <div className="rounded-md border border-neutral-800 bg-neutral-950/60 px-2 py-1.5">
-                        <div className="text-neutral-500">accounts</div>
-                        <div className="mt-0.5 font-semibold text-neutral-200">{s.maxPlanAccounts.length}</div>
-                      </div>
-                    </div>
-                  </div>
-                </WorkbenchPanel>
-                <WorkbenchPanel title="Context" meta="current project">
-                  <div className="divide-y divide-neutral-800 text-sm">
-                    <div className="pb-3">
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="text-xs font-semibold text-neutral-100">Running update</span>
-                        <span className={s.strategistActive ? 'text-xs text-indigo-300' : 'text-xs text-neutral-500'}>
-                          {s.strategistActive ? (s.cycleProgress?.phase_label ?? 'working') : 'idle'}
-                        </span>
-                      </div>
-                      <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-neutral-400">
-                        {s.lastCycleCompletion?.status_message ?? 'No recent strategic cycle receipt.'}
-                      </p>
-                    </div>
-                    <div className="py-3">
-                      <div className="text-xs font-semibold text-neutral-100">Selected direction</div>
-                      <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-neutral-400">
-                        {primaryDirection?.text ?? 'No active direction loaded for this project.'}
-                      </p>
-                    </div>
-                    <div className="pt-3">
-                      <div className="text-xs font-semibold text-neutral-100">Problem model</div>
-                      <p className="mt-1 text-xs leading-relaxed text-neutral-500">
-                        {selectedProject ? selectedProjectRepoLabel : 'Select a project'}
-                      </p>
-                      <div className="mt-3 flex flex-wrap gap-2">
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setProjectSection('running-update');
-                            handleTabChange('project');
-                          }}
-                          className="rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 py-1.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
-                        >
-                          Running update
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setProjectSection('directions');
-                            handleTabChange('project');
-                          }}
-                          className="rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 py-1.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
-                        >
-                          Directions
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setProjectSection('problem-model');
-                            handleTabChange('project');
-                          }}
-                          className="rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 py-1.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
-                        >
-                          Model
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                </WorkbenchPanel>
-              </div>
+              <StrategicContextRail
+                state={strategicReadModel.data}
+                loading={strategicReadModel.loading}
+                error={strategicReadModel.error}
+                strategistActive={s.strategistActive}
+                cycleProgress={s.cycleProgress}
+                lastCycleCompletion={s.lastCycleCompletion}
+                onOpenProjectSection={(section) => {
+                  setProjectSection(section);
+                  handleTabChange('project');
+                }}
+                onOpenPipeline={() => handleTabChange('pipeline')}
+                onOpenRuntimeHealth={() => {
+                  setRuntimeSection('health');
+                  handleTabChange('runtime');
+                }}
+              />
             )}
           />
         </WorkbenchSurface>

@@ -32,6 +32,7 @@ from app.auth import get_current_user
 from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
+from app.message_convergence import LINKED_STATUS
 from app import notification_dispatch as _nd
 from app.playbook_storage import (
     _archive_least_useful_entry,
@@ -417,10 +418,10 @@ async def list_messages(
         except (ValueError, TypeError):
             raise HTTPException(status_code=400, detail="Invalid project_id format")
     if status and status != "all":
-        if status not in ("open", "resolved"):
+        if status not in ("open", LINKED_STATUS, "resolved"):
             raise HTTPException(
                 status_code=400,
-                detail="Invalid status filter. Must be 'open', 'resolved', or 'all'",
+                detail="Invalid status filter. Must be 'open', 'linked', 'resolved', or 'all'",
             )
         filters.append(ProjectMessage.status == status)
     q_stripped = (q or "").strip()
@@ -439,7 +440,7 @@ async def list_messages(
     # Covers: user-authored, BLOCKER/FEEDBACK/BUG_REPORT, and system NOTE messages whose
     # event_type is classified as high_signal in the event-type snapshot.
     guaranteed_msgs: list = []
-    if status != "resolved":
+    if status in (None, "open", "all"):
         pid_uuid = uuid.UUID(project_id) if project_id else None
         # Cap at 100 to prevent unbounded result sets when high-signal volume is abnormally
         # high. Clients should treat the returned list as "up to 100 most recent" rather
