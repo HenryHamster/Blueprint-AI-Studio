@@ -2769,9 +2769,17 @@ async def test_code_failure_pause_does_not_increment_churn_count(db_session, moc
 
 
 @pytest.mark.asyncio
-async def test_churn_pause_count_resets_on_productive_cycle(db_session):
-    """apply_post_spawn_state resets churn_family_pause_count to 0 when a
-    direction ships a productive cycle (child tasks created)."""
+async def test_churn_pause_count_preserved_on_task_creating_cycle(db_session):
+    """apply_post_spawn_state must NOT reset churn_family_pause_count when a
+    direction merely creates child tasks.
+
+    Creating tasks is not the same as shipping merged PRs — unproductive/churning
+    directions routinely spawn tasks that never merge. The old reset-on-task-
+    creation behavior let a churn-paused (counter=1) direction wipe its counter
+    before the next lifecycle tick could advance it to the >=2 auto-retire fence,
+    freezing the zombie ladder one short of retirement. The counter is now only
+    incremented by direction_lifecycle.py and never reset externally, so it stays
+    unchanged across a task-creating (non-merging) cycle."""
     from app.research_direction_state import apply_post_spawn_state
     from test_autonomous_research import _active_direction, _make_research_task
 
@@ -2819,8 +2827,10 @@ async def test_churn_pause_count_resets_on_productive_cycle(db_session):
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d.get("churn_family_pause_count", 0) == 0, (
-        "a productive cycle should reset the zombie churn-pause counter"
+    assert d.get("churn_family_pause_count", 0) == 1, (
+        "a task-creating (non-merging) cycle must NOT reset the zombie churn-pause "
+        "counter — it stays at its pre-cycle value (1) so the retire ladder can "
+        "still reach the >=2 fence"
     )
 
 
@@ -3138,6 +3148,278 @@ async def test_lifetime_burn_no_retire_below_threshold(db_session, mocker):
     assert not d.get("auto_completed"), (
         "direction should NOT be auto-retired below the threshold"
     )
+
+
+@pytest.mark.asyncio
+async def test_lifetime_burn_auto_retire_full_path(db_session, mocker):
+    """End-to-end lifetime-burn retire driven entirely by real lifecycle ticks,
+    starting from counter=0 (NO hand-set lifetime_burn_pause_count).
+
+    This is the regression guard for the freeze-at-1 bug: lifetime-burn pauses set
+    needs_manual_intervention, which blocks the time-based auto-recovery branch, so
+    the direction can never re-enter the active loop where the counter used to be
+    incremented — it permanently stalled at 1 and the retire fence was unreachable.
+
+    Tick 1 (active): _check_direction_health returns a lifetime-burn pause reason →
+    counter advances 0->1, needs_manual_intervention set, status->paused.
+    Tick 2 (paused, past the 48h recovery window): the auto-recovery extend-pause
+    branch — the ONLY place a manual-held burn pause is re-touched — advances the
+    counter 1->2, hits _MAX_LIFETIME_BURN_PAUSE_CYCLES, and auto-retires the
+    direction with ZERO operator action.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    history, aggregate = _lifetime_burn_history(now)
+
+    direction = {
+        "id": "d-lb-e2e",
+        "text": "Lifetime-burn stuck direction (full path)",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": history,
+        "history_aggregate": aggregate,
+        "gap_id": "g-lb-e2e",
+        # No lifetime_burn_pause_count — start from 0 and let the machine advance it.
+    }
+    project = Project(
+        name="Lifetime Burn Full Path Test",
+        user_id="u-lb-e2e",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-lb-e2e",
+                    "name": "LB e2e gap",
+                    "status": "active",
+                    "active_moves": ["d-lb-e2e"],
+                    "past_moves": [],
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    # --- Tick 1: active direction trips the lifetime-burn backstop -> pause, count=1.
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", "tick 1 should pause the lifetime-burn direction"
+    assert d.get("lifetime_burn_pause_count") == 1, (
+        "counter should advance 0->1 on the first burn pause"
+    )
+    assert d.get("needs_manual_intervention") is True, (
+        "first burn pause sets the manual-hold flag (which blocks auto-recovery)"
+    )
+    assert not d.get("auto_completed"), "must NOT retire on the first pause (1 < 2)"
+
+    # --- Simulate 72h elapsed (past the 48h auto-recovery window).
+    project.directions[0]["paused_at"] = (
+        datetime.utcnow() - timedelta(hours=72)
+    ).isoformat()
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    # --- Tick 2: the manual-held burn pause hits the auto-recovery extend-pause
+    #     branch, which now advances the counter 1->2 and fires the retire ladder.
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now + timedelta(hours=73)
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "completed", (
+        "tick 2 must auto-retire the lifetime-burn direction via the extend path"
+    )
+    assert d.get("auto_completed") is True
+    assert "lifetime burn" in (d.get("auto_completed_reason") or "").lower(), (
+        f"reason should mention 'lifetime burn', got: {d.get('auto_completed_reason')!r}"
+    )
+    assert d.get("lifetime_burn_pause_count") == 2, (
+        "counter must advance to 2 (not freeze at 1) to reach the retire fence"
+    )
+    assert not d.get("needs_manual_intervention"), (
+        "manual-hold flag cleared on auto-retirement"
+    )
+    # Gap reconciled: direction left active_moves, recorded in past_moves.
+    gap = project.problem_model["gaps"][0]
+    assert "d-lb-e2e" not in gap["active_moves"], (
+        "retired direction removed from gap active_moves"
+    )
+    assert "d-lb-e2e" in gap["past_moves"], (
+        "retired direction recorded in gap past_moves"
+    )
+
+
+@pytest.mark.asyncio
+async def test_churn_family_auto_retire_full_path(db_session, mocker):
+    """End-to-end churn/unproductive retire driven by real lifecycle ticks with a
+    real apply_post_spawn_state call between ticks, starting from counter=0.
+
+    Reproduces the production freeze: a churn-paused direction (counter=1) runs a
+    research cycle that spawns child tasks. apply_post_spawn_state must NOT reset
+    churn_family_pause_count (creating tasks != shipping merges), so a subsequent
+    recovered-then-re-paused tick can still advance the counter to the >=2 retire
+    fence and auto-retire the zombie with ZERO operator action.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _make_research_task
+
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+
+    direction = {
+        "id": "d-churn-e2e",
+        "text": "Churn/unproductive stuck direction (full path)",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": _unproductive_history(now),
+        "gap_id": "g-churn-e2e",
+        # No churn_family_pause_count — start from 0 and let the machine advance it.
+    }
+    project = Project(
+        name="Churn Full Path Test",
+        user_id="u-churn-e2e",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-churn-e2e",
+                    "name": "Churn e2e gap",
+                    "status": "active",
+                    "active_moves": ["d-churn-e2e"],
+                    "past_moves": [],
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    # --- Tick 1: active -> Unproductive pause, counter 0->1.
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d["status"] == "paused", "tick 1 should pause the churn direction"
+    assert d.get("churn_family_pause_count") == 1, "counter advances 0->1 on first pause"
+    assert (d.get("paused_reason") or "").startswith("Unproductive:")
+    assert not d.get("auto_completed")
+
+    # --- A research cycle runs between lifecycle ticks and spawns a child task.
+    #     The fix under test: apply_post_spawn_state must NOT reset the churn counter
+    #     just because a task was created (a created task is not a merged PR).
+    task = await _make_research_task(project, project.directions[0], db_session)
+    child = Task(
+        project_id=project.id,
+        title="impl child (no merge)",
+        payloads=[{"type": "create", "base_branch": "main"}],
+        context={"direction_id": "d-churn-e2e"},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    await apply_post_spawn_state(
+        db_session, task, [], [child], [], [], [], [],
+        0, 0, 0, 0, 0, 0,
+        "research-branch", "main", 0, None,
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d.get("churn_family_pause_count") == 1, (
+        "apply_post_spawn_state must NOT reset the churn counter on a task-creating "
+        "(non-merging) cycle — that was the freeze-before-threshold bug"
+    )
+
+    # --- Simulate 72h elapsed so the direction auto-recovers on the next tick
+    #     (restore the paused state in case the research cycle touched it).
+    project.directions[0]["status"] = "paused"
+    project.directions[0]["auto_paused"] = True
+    project.directions[0]["paused_at"] = (
+        datetime.utcnow() - timedelta(hours=72)
+    ).isoformat()
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    # --- Tick 2: auto-recovery reactivates the direction (a churn-family pause sets
+    #     no manual hold). The grace period blocks an immediate re-pause this tick.
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now + timedelta(hours=73)
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d["status"] == "active", "tick 2 should auto-recover the churn direction"
+    assert d.get("churn_family_pause_count") == 1, "counter survives auto-recovery"
+
+    # --- A post-recovery research cycle finishes unproductively (completed, zero
+    #     merges). Its timestamp is after auto_recovered_at so the grace period lifts
+    #     and the next tick re-evaluates the churn-family health rules.
+    post_recovery_cycle = {
+        "timestamp": (datetime.utcnow() + timedelta(hours=1)).isoformat(),
+        "tasks_created": 2,
+        "tasks_completed": 2,
+        "tasks_failed": 0,
+        "tasks_failed_infra": 0,
+        "prs_merged": 0,
+    }
+    project.directions[0]["research_history"] = (
+        list(project.directions[0]["research_history"]) + [post_recovery_cycle]
+    )
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    # --- Tick 3: the recovered direction re-trips the churn-family rule, counter
+    #     advances 1->2, and the zombie retire ladder fires. ZERO operator action.
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now + timedelta(hours=74)
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d["status"] == "completed", (
+        "tick 3 must auto-retire the churn direction once the counter reaches the fence"
+    )
+    assert d.get("churn_family_pause_count") == 2, (
+        "counter must advance to 2 (not be reset by the intervening research cycle)"
+    )
+    assert d.get("auto_completed") is True
+    # Gap reconciled on terminal retirement.
+    gap = project.problem_model["gaps"][0]
+    assert "d-churn-e2e" not in gap["active_moves"]
+    assert "d-churn-e2e" in gap["past_moves"]
 
 
 @pytest.mark.asyncio

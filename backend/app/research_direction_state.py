@@ -561,12 +561,18 @@ async def apply_post_spawn_state(
                     # we don't keep surfacing stale rejected titles after recovery.
                     if len(dir_child_tasks) > 0 and d.get("deadlock_filtered_titles"):
                         del d["deadlock_filtered_titles"]
-                    # Reset the zombie-ladder churn-pause counter on a productive
-                    # cycle: a direction that recovered and shipped work is no
-                    # longer a recycling zombie, so it earns a clean slate before
-                    # the >=2 auto-retire fence (ref bf6d8788).
-                    if len(dir_child_tasks) > 0 and d.get("churn_family_pause_count"):
-                        d["churn_family_pause_count"] = 0
+                    # NOTE: churn_family_pause_count is intentionally NOT reset here.
+                    # Creating child tasks is not the same as shipping merged PRs —
+                    # unproductive/churning directions routinely spawn tasks that
+                    # never merge. apply_post_spawn_state runs between lifecycle
+                    # ticks, so resetting on mere task creation let a paused
+                    # (counter=1) direction wipe its counter before the next tick
+                    # could advance it to the >=2 auto-retire fence, freezing the
+                    # zombie ladder one short of retirement. The counter is now
+                    # incremented only by direction_lifecycle.py and never reset
+                    # externally; a genuinely healthy direction simply stops being
+                    # churn-paused, so a stale non-zero counter is harmless
+                    # (ref bf6d8788).
                     # Compact history entry — just counters and a short summary.
                     # Full details available via task API using task_id.
                     titles = finding_titles_by_dir.get(did, [])[:3]
