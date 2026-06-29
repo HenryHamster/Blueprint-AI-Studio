@@ -3338,6 +3338,7 @@ class TestBatchedDepRowsSurviveCommit:
                                 Task.context,
                                 Task.payloads,
                                 Task.project_id,
+                                Task.parent_task_id,
                                 raiseload=True,
                             )
                         )
@@ -3432,6 +3433,7 @@ class TestBatchedDepRowsSurviveCommit:
                                 Task.context,
                                 Task.payloads,
                                 Task.project_id,
+                                Task.parent_task_id,
                                 raiseload=True,
                             )
                         )
@@ -3488,6 +3490,7 @@ class TestBatchedDepRowsSurviveCommit:
                     Task.context,
                     Task.payloads,
                     Task.project_id,
+                    Task.parent_task_id,
                     raiseload=True,
                 )
             )
@@ -3499,11 +3502,118 @@ class TestBatchedDepRowsSurviveCommit:
                 f"Dep-batch projection must exclude '{heavy}' — "
                 "re-adding it reintroduces the over-fetch this projection removes."
             )
-        for required in ("status", "context", "payloads", "project_id"):
+        for required in (
+            "status",
+            "context",
+            "payloads",
+            "project_id",
+            "parent_task_id",
+        ):
             assert required in sql_text, (
                 f"Dep-batch projection must include '{required}' — "
                 "removing it will cause DetachedInstanceError in _check_candidate_task_deps."
             )
+
+    @pytest.mark.asyncio
+    async def test_detached_cross_base_dep_can_read_parent_task_id(self, db_session):
+        """Detached dep rows must include parent_task_id for lineage fallback.
+
+        Production loads dependency rows with load_only(..., raiseload=True) in a
+        separate session, then detaches them. A cross-base completed code dep whose
+        own landed signal has not propagated yet uses its immediate lineage parent
+        as a fallback. Omitting parent_task_id from the projection makes that read
+        lazy-load on a detached instance and crashes the dispatch cycle.
+        """
+        from sqlalchemy.orm import load_only as _load_only
+        from sqlmodel import select
+        from app.database import AsyncSessionLocal
+        from app.landed_signal import (
+            mark_landed_on_integration,
+            mark_unblocked_non_merge,
+        )
+        from app.orchestrator import _check_candidate_task_deps
+
+        project = make_project(name="Detached Lineage Dep", user_id="u1")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        lineage_parent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "research", "base_branch": "research/r1"}],
+            context={},
+            status=TaskStatus.COMPLETED,
+        )
+        mark_landed_on_integration(lineage_parent)
+        db_session.add(lineage_parent)
+        await db_session.commit()
+        await db_session.refresh(lineage_parent)
+
+        dep = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "research/r1"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.COMPLETED,
+            parent_task_id=lineage_parent.id,
+        )
+        mark_unblocked_non_merge(dep, reason="merged_pr_non_integration_branch")
+        db_session.add(dep)
+        await db_session.commit()
+        await db_session.refresh(dep)
+
+        dependent = make_task(
+            project_id=project.id,
+            payloads=[{"type": "create", "base_branch": "plan/bbb"}],
+            context={"related_files": ["backend/app/foo.py"]},
+            status=TaskStatus.QUEUED,
+            depends_on=[str(dep.id)],
+        )
+        db_session.add(dependent)
+        await db_session.commit()
+        await db_session.refresh(dependent)
+
+        async with AsyncSessionLocal() as dep_batch_session:
+            rows = (
+                (
+                    await dep_batch_session.execute(
+                        select(Task)
+                        .where(Task.id.in_([dep.id]))
+                        .options(
+                            _load_only(
+                                Task.id,
+                                Task.status,
+                                Task.context,
+                                Task.payloads,
+                                Task.project_id,
+                                Task.parent_task_id,
+                                Task.title,
+                                raiseload=True,
+                            )
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            dep_by_id = {dt.id: dt for dt in rows}
+            dep_batch_session.expunge_all()
+
+        # Expire the main-session instances. The detached dependency must still
+        # have every value _check_candidate_task_deps reads cached locally.
+        dependent.latest_status_message = "main session committed"
+        db_session.add(dependent)
+        await db_session.commit()
+
+        detached_dep = dep_by_id[dep.id]
+        assert detached_dep.parent_task_id == lineage_parent.id
+
+        async def _noop_verify(_task, _session):
+            return True
+
+        result, _ = await _check_candidate_task_deps(
+            dependent, [detached_dep], [dep.id], db_session, _noop_verify
+        )
+        assert result == "eligible"
 
     def test_collect_dep_uuids_dedupes_and_skips_malformed(self):
         from app.orchestrator_filters import collect_dep_uuids
