@@ -71,9 +71,10 @@ describe('useWorkbenchCommands', () => {
   function mount(overrides: Partial<Parameters<typeof useWorkbenchCommands>[0]> = {}) {
     host = document.createElement('div');
     document.body.appendChild(host);
-    root = createRoot(host);
+    const currentRoot = createRoot(host);
+    root = currentRoot;
     act(() => {
-      root!.render(<Harness {...overrides} />);
+      currentRoot.render(<Harness {...overrides} />);
     });
   }
 
@@ -172,18 +173,24 @@ describe('useWorkbenchCommands', () => {
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
-  test('routes refresh and project management commands through existing callbacks', () => {
+  test('routes refresh, task launch, settings, and project management commands through existing callbacks', () => {
     const refreshWorkbench = vi.fn();
+    const openNewTaskModal = vi.fn();
+    const openGlobalSettings = vi.fn();
     const openProjectManagement = vi.fn();
     const openProjectMembers = vi.fn();
     const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
-    mount({ refreshWorkbench, openProjectManagement, openProjectMembers, setCommandPaletteOpen });
+    mount({ refreshWorkbench, openNewTaskModal, openGlobalSettings, openProjectManagement, openProjectMembers, setCommandPaletteOpen });
 
     captured.find(command => command.id === 'workbench.refresh')?.run();
+    captured.find(command => command.id === 'task.new')?.run();
+    captured.find(command => command.id === 'settings.general')?.run();
     captured.find(command => command.id === 'project.switcher')?.run();
     captured.find(command => command.id === 'project.members')?.run();
 
     expect(refreshWorkbench).toHaveBeenCalledTimes(1);
+    expect(openNewTaskModal).toHaveBeenCalledTimes(1);
+    expect(openGlobalSettings).toHaveBeenCalledWith('general');
     expect(openProjectManagement).toHaveBeenCalledTimes(1);
     expect(openProjectMembers).toHaveBeenCalledTimes(1);
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
@@ -192,12 +199,13 @@ describe('useWorkbenchCommands', () => {
   test('exposes common keyboard shortcut hints for discoverability', () => {
     mount();
 
-    expect(captured.find(command => command.id === 'strategic.focus')?.shortcut).toBe('Global 1');
-    expect(captured.find(command => command.id === 'pipeline.flow')?.shortcut).toBe('Global 2');
-    expect(captured.find(command => command.id === 'project.update')?.shortcut).toBe('Global 3');
-    expect(captured.find(command => command.id === 'runtime.health')?.shortcut).toBe('Global 4');
-    expect(captured.find(command => command.id === 'task.new')?.shortcut).toBe('Global N');
-    expect(captured.find(command => command.id === 'workbench.refresh')?.shortcut).toBe('Global R');
+    expect(captured.find(command => command.id === 'strategic.focus')?.shortcut).toBe('1');
+    expect(captured.find(command => command.id === 'pipeline.flow')?.shortcut).toBe('2');
+    expect(captured.find(command => command.id === 'project.update')?.shortcut).toBe('3');
+    expect(captured.find(command => command.id === 'runtime.health')?.shortcut).toBe('4');
+    expect(captured.find(command => command.id === 'task.new')?.shortcut).toBe('N');
+    expect(captured.find(command => command.id === 'workbench.refresh')?.shortcut).toBe('R');
+    expect(captured.find(command => command.id === 'settings.general')?.shortcut).toBe('S');
   });
 
   test('disables design command when no design doc exists', () => {

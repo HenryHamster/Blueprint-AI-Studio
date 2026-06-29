@@ -23,6 +23,7 @@ import { useProjectsState } from './hooks/useProjectsState';
 import { useAlertsState } from './hooks/useAlertsState';
 import { useProjectConfig } from './hooks/useProjectConfig';
 import { resolveTaskCapabilities } from './taskCapabilities';
+import { isEditableShortcutEvent } from './hooks/keyboardTargets';
 
 export type { DeployState } from './types/settings';
 
@@ -390,11 +391,6 @@ export function useAppState() {
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.defaultPrevented) return;
 
-      const tag = document.activeElement?.tagName;
-      const targetTag = (e.target as HTMLElement)?.tagName;
-      const isInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
-        || targetTag === 'INPUT' || targetTag === 'TEXTAREA' || targetTag === 'SELECT';
-
       if (e.key === 'Escape') {
         if (showNewTaskModal) { setShowNewTaskModal(false); return; }
         if (logTask) { closeLogViewer(); return; }
@@ -410,7 +406,7 @@ export function useAppState() {
         return;
       }
 
-      if (isInput) return;
+      if (isEditableShortcutEvent(e)) return;
 
       switch (e.key) {
         case 'n':

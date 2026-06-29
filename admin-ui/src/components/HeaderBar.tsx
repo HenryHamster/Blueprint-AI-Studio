@@ -497,7 +497,7 @@ export function HeaderBar(props: HeaderBarProps) {
               >
                 <Command className="w-3.5 h-3.5" />
                 <kbd className="hidden rounded border border-neutral-700 bg-neutral-950 px-1 py-0.5 font-mono text-ui-sm text-neutral-500 xl:inline-block">
-                  Ctrl K
+                  Ctrl+K
                 </kbd>
               </button>
             )}
@@ -523,7 +523,6 @@ export function HeaderBar(props: HeaderBarProps) {
                 <span>{props.alertCount}</span>
               </button>
             )}
-            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
             <button
               onClick={onToggleResearchBrowser}
               title="Research findings"
@@ -539,7 +538,6 @@ export function HeaderBar(props: HeaderBarProps) {
                 </span>
               )}
             </button>
-            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
             <button
               onClick={onToggleKnowledgeBrowser}
               title="Knowledge library"
@@ -563,7 +561,6 @@ export function HeaderBar(props: HeaderBarProps) {
             )}
             {/* Activity */}
             {onOpenActivityFeed && (
-              /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
               <button
                 onClick={onOpenActivityFeed}
                 title="Chronological activity stream"
@@ -771,7 +768,7 @@ export function HeaderBar(props: HeaderBarProps) {
                     <Command className="w-4 h-4 shrink-0" />
                     <span>Command palette</span>
                     <kbd className="ml-auto rounded border border-neutral-700 bg-neutral-900 px-1.5 py-0.5 font-mono text-ui-sm text-neutral-500">
-                      Ctrl K
+                      Ctrl+K
                     </kbd>
                   </button>
                 )}
@@ -839,14 +836,14 @@ export function HeaderBar(props: HeaderBarProps) {
                   <div className="mx-2 mb-1 bg-neutral-800/50 rounded p-2">
                     <div className="space-y-1.5 text-xs">
                       {[
-                        ['Ctrl K', 'Command palette'],
+                        ['Ctrl+K', 'Command palette'],
                         ['N', 'New task'],
-                        ['R', 'Refresh tasks'],
-                        ['1', 'Strategic'],
+                        ['R', 'Refresh'],
+                        ['1', 'Strategic chat'],
                         ['2', 'Pipeline'],
-                        ['3', 'Project'],
+                        ['3', 'Project update'],
                         ['4', 'Runtime'],
-                        ['S', 'Toggle settings'],
+                        ['S', 'Settings'],
                         ['A', 'Archive (pipeline)'],
                         ['Esc', 'Close panel/modal'],
                         ['Del', 'Cancel selected (selection mode)'],

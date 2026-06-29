@@ -52,7 +52,7 @@ import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPa
 import { ProjectWorkspace, RuntimeWorkspace, type ProjectManageSection, type ProjectSection, type RuntimeSection, type RuntimeSettingsSection } from './components/OperatorWorkspaces';
 import { WorkbenchFrame, WorkbenchMetric, WorkbenchPanel, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
 import { useStrategicReadModel } from './hooks/useStrategicReadModel';
-import { useCommandPaletteShortcut } from './hooks/useCommandPaletteShortcut';
+import { useOperatorKeyboardShortcuts } from './hooks/useOperatorKeyboardShortcuts';
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
 import { updateStrategicWorkbenchState, type StrategicWorkbenchState } from './strategicStateApi';
 import { parseTimestamp } from './utils/time';
@@ -281,19 +281,6 @@ export default function App() {
     enabled: !!selectedProjectId && !messagesPanelOpen,
     deps: [selectedProjectId, messagesPanelOpen, s.user?.email],
   });
-
-  useEffect(() => {
-    function handleSearchShortcut(e: KeyboardEvent) {
-      if (e.key !== '/') return;
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-      if (s.showNewTaskModal || s.logTask || s.showResearchBrowser || s.showSettings) return;
-      e.preventDefault();
-      searchInputRef.current?.focus();
-    }
-    document.addEventListener('keydown', handleSearchShortcut);
-    return () => document.removeEventListener('keydown', handleSearchShortcut);
-  }, [s.showNewTaskModal, s.logTask, s.showResearchBrowser, s.showSettings]);
 
   // New project modal
   const [showNewProjectModal, setShowNewProjectModal] = useState(false);
@@ -601,18 +588,23 @@ export default function App() {
     downloadTaskCsv(orderedExportTasks, projectName);
   }, [orderedExportTasks, selectedProject?.github_repo, selectedProject?.name, s.selectedProjectId]);
 
+  const {
+    addToast: addTaskLookupToast,
+    handleViewLogs: openTaskLogs,
+    tasks: taskLookupTasks,
+  } = s;
   const handleViewTaskById = useCallback((taskId: string) => {
-    const target = s.tasks.find(t => t.id === taskId);
+    const target = taskLookupTasks.find(t => t.id === taskId);
     if (target) {
-      s.handleViewLogs(target);
+      openTaskLogs(target);
       return;
     }
     fetchTask(taskId)
-      .then(s.handleViewLogs)
+      .then(openTaskLogs)
       .catch(() => {
-        s.addToast('Could not load task — it may have been deleted', 'error');
+        addTaskLookupToast('Could not load task — it may have been deleted', 'error');
       });
-  }, [s.tasks, s.handleViewLogs, s.addToast]);
+  }, [addTaskLookupToast, openTaskLogs, taskLookupTasks]);
 
   const hasActiveFilters = s.tasks.length > 0 && (filteredTasks.length < s.tasks.length || s.failureClassFilter.length > 0);
   const visibleActiveTasks = useMemo(() => filteredTasks.filter(t => ACTIVE_PIPELINE_STATUSES.has(t.status)), [filteredTasks]);
@@ -900,22 +892,6 @@ export default function App() {
     s.setActiveTab('chat');
   }, [s, setStrategicInteractionMode]);
 
-  const commandPaletteShortcutEnabled = !commandPaletteOpen && !s.showNewTaskModal && !s.logTask && !s.showSettings &&
-    !s.showUserManagement && !s.showComposeDrawer && !s.showFleetDetail && !s.showDirections &&
-    !s.showMetrics && !showNewProjectModal && !setupProjectId && !s.confirmDialog &&
-    !showProjectManagement && !showProjectMembers;
-  const openCommandPalette = useCallback(() => {
-    s.setShowResearchBrowser(false);
-    s.setShowKnowledgeBrowser(false);
-    s.setShowAlertsPopover(false);
-    setShowActivityFeed(false);
-    setResearchBrowserDirectionId(null);
-    setKnowledgeBrowserDirectionId(null);
-    setKnowledgeBrowserInitialDocId(null);
-    setCommandPaletteOpen(true);
-  }, [s]);
-  useCommandPaletteShortcut(openCommandPalette, commandPaletteShortcutEnabled);
-
   const openGlobalSettings = useCallback((section: SectionId | null = null) => {
     setSettingsInitialSection(section);
     if (!s.showSettings) s.handleToggleSettings();
@@ -957,6 +933,27 @@ export default function App() {
     },
     openProjectManagement: () => setShowProjectManagement(true),
     openProjectMembers: () => setShowProjectMembers(true),
+  });
+
+  const { openCommandPalette } = useOperatorKeyboardShortcuts({
+    activeTab,
+    blockingModalOpen: Boolean(s.showNewTaskModal || s.logTask || s.showComposeDrawer || s.showFleetDetail || s.confirmDialog || showNewProjectModal || setupProjectId || showProjectManagement || showProjectMembers),
+    commandPaletteOpen,
+    commands: workbenchCommands,
+    searchInputRef,
+    searchShortcutBlocked: Boolean(s.showNewTaskModal || s.logTask || s.showResearchBrowser || s.showSettings),
+    selectedTaskCount: s.selectedTaskIds.size,
+    selectionMode: s.selectionMode,
+    setCommandPaletteOpen,
+    setKnowledgeBrowserDirectionId,
+    setKnowledgeBrowserInitialDocId,
+    setResearchBrowserDirectionId,
+    setShowActivityFeed,
+    setShowAlertsPopover: s.setShowAlertsPopover,
+    setShowKnowledgeBrowser: s.setShowKnowledgeBrowser,
+    setShowResearchBrowser: s.setShowResearchBrowser,
+    showSettings: s.showSettings,
+    toggleSettings: s.handleToggleSettings,
   });
 
   const pipelineSurfaceActions = (

@@ -5,16 +5,16 @@ interface SettingsAdvancedSectionProps {
 }
 
 const KEYBOARD_SHORTCUTS: [string, string][] = [
-  ['1', 'Kanban view'],
-  ['2', 'Pipeline view'],
+  ['Ctrl+K', 'Command palette'],
+  ['1', 'Strategic chat'],
+  ['2', 'Pipeline'],
+  ['3', 'Project update'],
+  ['4', 'Runtime'],
   ['/', 'Focus search'],
   ['N', 'New task'],
   ['R', 'Refresh'],
-  ['D', 'Directions panel'],
   ['S', 'Settings'],
-  ['M', 'Metrics'],
-  ['A', 'Archive'],
-  ['?', 'Shortcut help'],
+  ['A', 'Archive (pipeline)'],
   ['F', 'Fullscreen (in drawer)'],
   ['Esc', 'Close modal'],
 ];

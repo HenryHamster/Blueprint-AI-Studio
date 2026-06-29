@@ -1,0 +1,116 @@
+import { useCallback, useEffect, type RefObject } from 'react';
+import type { WorkbenchCommand } from '../components/CommandPalette';
+import type { PrimaryTab } from './useUIState';
+import { isEditableShortcutEvent } from './keyboardTargets';
+import { useCommandPaletteShortcut } from './useCommandPaletteShortcut';
+import { useWorkbenchShortcutRouter } from './useWorkbenchShortcutRouter';
+
+interface UseOperatorKeyboardShortcutsOptions {
+  activeTab: PrimaryTab;
+  blockingModalOpen: boolean;
+  commandPaletteOpen: boolean;
+  commands: WorkbenchCommand[];
+  searchInputRef: RefObject<HTMLInputElement | null>;
+  searchShortcutBlocked: boolean;
+  selectedTaskCount: number;
+  selectionMode: boolean;
+  setCommandPaletteOpen: (open: boolean) => void;
+  setKnowledgeBrowserDirectionId: (directionId: string | null) => void;
+  setKnowledgeBrowserInitialDocId: (documentId: string | null) => void;
+  setResearchBrowserDirectionId: (directionId: string | null) => void;
+  setShowActivityFeed: (show: boolean) => void;
+  setShowAlertsPopover: (show: boolean) => void;
+  setShowKnowledgeBrowser: (show: boolean) => void;
+  setShowResearchBrowser: (show: boolean) => void;
+  showSettings: boolean;
+  toggleSettings: () => void;
+}
+
+export function useOperatorKeyboardShortcuts({
+  activeTab,
+  blockingModalOpen,
+  commandPaletteOpen,
+  commands,
+  searchInputRef,
+  searchShortcutBlocked,
+  selectedTaskCount,
+  selectionMode,
+  setCommandPaletteOpen,
+  setKnowledgeBrowserDirectionId,
+  setKnowledgeBrowserInitialDocId,
+  setResearchBrowserDirectionId,
+  setShowActivityFeed,
+  setShowAlertsPopover,
+  setShowKnowledgeBrowser,
+  setShowResearchBrowser,
+  showSettings,
+  toggleSettings,
+}: UseOperatorKeyboardShortcutsOptions) {
+  const closeTransientTargets = useCallback(() => {
+    setShowResearchBrowser(false);
+    setShowKnowledgeBrowser(false);
+    setShowAlertsPopover(false);
+    setShowActivityFeed(false);
+    setResearchBrowserDirectionId(null);
+    setKnowledgeBrowserDirectionId(null);
+    setKnowledgeBrowserInitialDocId(null);
+  }, [
+    setKnowledgeBrowserDirectionId,
+    setKnowledgeBrowserInitialDocId,
+    setResearchBrowserDirectionId,
+    setShowActivityFeed,
+    setShowAlertsPopover,
+    setShowKnowledgeBrowser,
+    setShowResearchBrowser,
+  ]);
+
+  const closeTransientWorkbenchPanels = useCallback(() => {
+    closeTransientTargets();
+    if (showSettings) toggleSettings();
+  }, [closeTransientTargets, showSettings, toggleSettings]);
+
+  const openCommandPalette = useCallback(() => {
+    closeTransientTargets();
+    setCommandPaletteOpen(true);
+  }, [closeTransientTargets, setCommandPaletteOpen]);
+
+  useCommandPaletteShortcut(openCommandPalette, !commandPaletteOpen);
+
+  useEffect(() => {
+    function handleSearchShortcut(event: KeyboardEvent) {
+      if (event.key !== '/') return;
+      if (isEditableShortcutEvent(event)) return;
+      if (searchShortcutBlocked) return;
+      event.preventDefault();
+      searchInputRef.current?.focus();
+    }
+
+    document.addEventListener('keydown', handleSearchShortcut);
+    return () => document.removeEventListener('keydown', handleSearchShortcut);
+  }, [searchInputRef, searchShortcutBlocked]);
+
+  const shouldHandleWorkbenchShortcut = useCallback((commandId: string) => {
+    if (blockingModalOpen) return false;
+    if (commandId === 'workbench.refresh') {
+      if (selectionMode && selectedTaskCount > 0) return false;
+      return !showSettings;
+    }
+    if (commandId === 'pipeline.archive') return activeTab === 'pipeline';
+    if (commandId === 'settings.general') return !showSettings;
+    return true;
+  }, [
+    activeTab,
+    blockingModalOpen,
+    selectedTaskCount,
+    selectionMode,
+    showSettings,
+  ]);
+
+  useWorkbenchShortcutRouter(commands, {
+    enabled: !commandPaletteOpen,
+    onBeforeRun: closeTransientWorkbenchPanels,
+    shouldHandleShortcut: shouldHandleWorkbenchShortcut,
+  });
+
+  return { openCommandPalette };
+}

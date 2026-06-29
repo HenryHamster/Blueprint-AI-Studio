@@ -9,7 +9,9 @@ function Harness({ onOpen, enabled = true }: { onOpen: () => void; enabled?: boo
     <>
       <input aria-label="composer" />
       <textarea aria-label="notes" />
-      <div aria-label="rich composer" contentEditable />
+      <div aria-label="rich composer" contentEditable suppressContentEditableWarning tabIndex={0}>
+        Draft
+      </div>
     </>
   );
 }
@@ -33,9 +35,10 @@ describe('useCommandPaletteShortcut', () => {
   function mount(onOpen = vi.fn(), enabled = true) {
     host = document.createElement('div');
     document.body.appendChild(host);
-    root = createRoot(host);
+    const currentRoot = createRoot(host);
+    root = currentRoot;
     act(() => {
-      root!.render(<Harness onOpen={onOpen} enabled={enabled} />);
+      currentRoot.render(<Harness onOpen={onOpen} enabled={enabled} />);
     });
     return onOpen;
   }
@@ -45,6 +48,21 @@ describe('useCommandPaletteShortcut', () => {
     const event = new KeyboardEvent('keydown', {
       key: 'k',
       ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+
+    document.dispatchEvent(event);
+
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  test('opens on Meta+K from non-editing targets', () => {
+    const onOpen = mount();
+    const event = new KeyboardEvent('keydown', {
+      key: 'K',
+      metaKey: true,
       bubbles: true,
       cancelable: true,
     });
@@ -75,6 +93,39 @@ describe('useCommandPaletteShortcut', () => {
     }
 
     expect(onOpen).not.toHaveBeenCalled();
+  });
+
+  test('does not capture Ctrl+K while a text input is focused', () => {
+    const onOpen = mount();
+    host?.querySelector('input')?.focus();
+    const event = new KeyboardEvent('keydown', {
+      key: 'k',
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+
+    document.dispatchEvent(event);
+
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  test('does not capture Ctrl+K inside editable regions', () => {
+    const onOpen = mount();
+    const editor = host?.querySelector<HTMLElement>('[aria-label="rich composer"]');
+    editor?.focus();
+    const event = new KeyboardEvent('keydown', {
+      key: 'k',
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+
+    editor?.dispatchEvent(event);
+
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
   });
 
   test('does not capture Ctrl+K while disabled', () => {
