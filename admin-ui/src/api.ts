@@ -2375,6 +2375,9 @@ export interface PromotionReadiness {
   // `deploy_failed_count`, and `resolved_outcome_sample` are populated.
   ground_truth_validated?: boolean;
   caveat?: string;
+  // Acceptance caveat when merged work is satisfied-but-not-machine-proven;
+  // omitted when no caveat (all work proven or no unproven work present).
+  acceptance_caveat?: string | null;
   // The readiness window only measures DRY-RUN-regime verdicts, so it reflects
   // *current* readiness only pre-go-live. Once promotion is effectively enabled
   // the window is frozen pre-go-live history: regime='live', is_current_readiness=false.

@@ -114,7 +114,7 @@ describe('writeStrategicHelpers', () => {
     // The new subcommand maps `fetch message <ref>` to the read-only lookup
     // endpoint that resolves a short ref or full UUID backend-side.
     expect(content).toContain('message)    PATH_SUFFIX="messages/$ID"');
-    expect(content).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge|qualification|version-phase|vm-cost|efficiency-snapshot [id]');
+    expect(content).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance [id]');
     // Reuses the existing X-Agent-Token GET path — no new auth/curl block.
     expect(content).toContain('-H "X-Agent-Token: $TOKEN"');
     // The shared id-required guard covers `message`; version-phase is explicitly id-less.
@@ -128,7 +128,7 @@ describe('writeStrategicHelpers', () => {
     writeStrategicHelpers(taskId, projectId, testWorkspace);
 
     const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
-    expect(content).toContain('Usage: fetch problem-model|direction|playbook|gap|message|section|knowledge|qualification|version-phase|vm-cost|efficiency-snapshot [id]');
+    expect(content).toContain('Usage: fetch problem-model|direction|playbook|gap|message|section|knowledge|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance [id]');
     expect(content).toContain('problem-model) PATH_SUFFIX="problem-model"');
     expect(content).toContain('fetch $KIND requires an id argument');
   });
@@ -285,6 +285,22 @@ describe('writeStrategicHelpers', () => {
     expect(content).toContain('if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]');
     expect(content).toContain('exit 0');
   });
+
+  it('ci-compliance is a no-id verb with correct case arm, usage entry, and id guard exemption', () => {
+    const taskId = 'test-task-123';
+    const projectId = 'test-project-456';
+    writeStrategicHelpers(taskId, projectId, testWorkspace);
+
+    const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+    // ci-compliance appears in the usage string.
+    expect(content).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance [id]');
+    // ci-compliance has the correct case arm and PATH_SUFFIX.
+    expect(content).toContain('ci-compliance)        PATH_SUFFIX="ci-compliance"');
+    // ci-compliance is exempt from the id-required guard (no id needed).
+    expect(content).toContain('[ "$KIND" != "ci-compliance" ]');
+    // ci-compliance help text is meaningful.
+    expect(content).toContain('ci-compliance');
+  });
 });
 
 describe('writeFetchHelper (verb-subset read-only fetch)', () => {
@@ -311,7 +327,7 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     const viaStrategic = readFetch();
     expect(viaWriter).toBe(viaStrategic);
     // Spot-check the load-bearing usage + case lines the strategic suite pins.
-    expect(viaWriter).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge|qualification|version-phase|vm-cost|efficiency-snapshot [id]');
+    expect(viaWriter).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance [id]');
     expect(viaWriter).toContain('problem-model) PATH_SUFFIX="problem-model"');
     expect(viaWriter).toContain('message)    PATH_SUFFIX="messages/$ID"');
     expect(viaWriter).toContain('section)    PATH_SUFFIX="design-doc/$ID"');
@@ -338,7 +354,7 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     const content = readFetch();
     // playbook/message/section are full-vocabulary verbs not granted here — they
     // get an explicit reject branch rather than a generic "unknown kind".
-    expect(content).toContain('playbook|message|section|version-phase|vm-cost|efficiency-snapshot) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: problem-model|direction|gap|knowledge|qualification)."');
+    expect(content).toContain('playbook|message|section|version-phase|vm-cost|efficiency-snapshot|ci-compliance) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: problem-model|direction|gap|knowledge|qualification)."');
   });
 
   it('different subsets bake different verb vocabularies (plan subset)', () => {
@@ -349,7 +365,7 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     expect(content).toContain('playbook)   PATH_SUFFIX="playbook/$ID"');
     expect(content).toContain('Usage: fetch direction|playbook|section|knowledge|qualification [id]');
     // problem-model / gap / message are rejected here.
-    expect(content).toContain('problem-model|gap|message|version-phase|vm-cost|efficiency-snapshot) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|section|knowledge|qualification)."');
+    expect(content).toContain('problem-model|gap|message|version-phase|vm-cost|efficiency-snapshot|ci-compliance) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|section|knowledge|qualification)."');
   });
 
   it('different subsets bake different verb vocabularies (design-doc subset)', () => {
@@ -362,7 +378,7 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     expect(content).toContain('message)    PATH_SUFFIX="messages/$ID"');
     expect(content).toContain('Usage: fetch direction|playbook|gap|message|section|knowledge [id]');
     // problem-model and qualification are rejected here because they are not part of the design-doc subset.
-    expect(content).toContain('problem-model|qualification|version-phase|vm-cost|efficiency-snapshot) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|gap|message|section|knowledge)."');
+    expect(content).toContain('problem-model|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|gap|message|section|knowledge)."');
   });
 
   it('bakes the project id and escapes shell-injection attempts', () => {
@@ -412,7 +428,21 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     expect(content).not.toContain('  knowledge)\n    shift');
     expect(content).toContain('not permitted in this workspace');
     // The reject branch enumerates knowledge among the disallowed verbs.
-    expect(content).toMatch(/knowledge\|qualification\|version-phase\|vm-cost\|efficiency-snapshot\) echo "Error: \.\/fetch/);
+    expect(content).toMatch(/knowledge\|qualification\|version-phase\|vm-cost\|efficiency-snapshot\|ci-compliance\) echo "Error: \.\/fetch/);
+  });
+
+  it('ci-compliance is rejected in non-strategic subsets with a clear not-permitted message', () => {
+    // ci-compliance is a strategic-only verb; research/plan/design-doc subsets must
+    // reject it explicitly rather than silently passing to the "unknown kind" arm.
+    writeFetchHelper('t', 'proj-ci', testWorkspace, { verbs: RESEARCH_FETCH_VERBS });
+    const content = readFetch();
+    // ci-compliance must NOT appear as a granted case arm.
+    expect(content).not.toContain('ci-compliance)        PATH_SUFFIX="ci-compliance"');
+    // ci-compliance appears in the reject branch with the not-permitted message.
+    expect(content).toContain('not permitted in this workspace');
+    expect(content).toContain('ci-compliance');
+    // It is listed among the rejected verbs (not the allowed list).
+    expect(content).toContain('playbook|message|section|version-phase|vm-cost|efficiency-snapshot|ci-compliance) echo "Error: ./fetch');
   });
 });
 

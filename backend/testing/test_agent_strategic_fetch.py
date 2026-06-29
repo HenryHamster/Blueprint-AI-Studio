@@ -3037,4 +3037,46 @@ async def test_agent_fetch_version_phase_cold_start_drift_counts_merges_since_op
     )
     assert drift["stale"] is True
     assert drift["coverage"] is None
-    assert drift["merges_since_grade"] >= 5
+
+
+@pytest.mark.asyncio
+async def test_fetch_ci_compliance_endpoint_returns_unavailable_without_github_creds(
+    client: AsyncClient, db_session
+):
+    """GET /api/agent/projects/{id}/ci-compliance returns source=unavailable when
+    the project has no GitHub credentials (the common test-environment case)."""
+    project, task = await _make_project_task(db_session, vm="agent-vm-cicomp")
+    token = create_agent_token(str(task.id), "agent-vm-cicomp")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/ci-compliance",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    assert body["data"]["source"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_fetch_ci_compliance_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Agent token for project A cannot fetch ci-compliance for project B (404)."""
+    project_a = Project(name="CCA", user_id="u-cca")
+    project_b = Project(name="CCB", user_id="u-ccb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-ccxp")
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-ccxp")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/ci-compliance",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404

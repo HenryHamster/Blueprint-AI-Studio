@@ -1000,6 +1000,53 @@ export function buildDirSummaryText(
   return body;
 }
 
+/**
+ * Render the backend-computed CI compliance snapshot for the current integration
+ * branch HEAD. Surfaces module-size breaches and branch-literal offenders so the
+ * strategist sees compliance drift immediately instead of discovering it at
+ * qualification time. Returns '' when the payload field is absent/null.
+ */
+export function buildCiComplianceSection(ciCompliance: unknown): string {
+  if (!ciCompliance || typeof ciCompliance !== 'object') return '';
+  const c = ciCompliance as Record<string, unknown>;
+  // compact_ci_compliance shape: head_sha, compliant (bool), violations, branch_literal_violations
+  if (c.compliant === true) return '';
+
+  const lines: string[] = ['\n## CI Compliance (automain HEAD)'];
+  const headSha = strVal(c.head_sha);
+  lines.push(`Compliant: **no**${headSha ? `  (SHA: ${headSha.slice(0, 8)})` : ''}`);
+
+  const violations = Array.isArray(c.violations)
+    ? c.violations as Array<Record<string, unknown>>
+    : [];
+  if (violations.length > 0) {
+    lines.push('\n### Module-size violations (run `python3 backend/testing/check_size_limits.py --fix` to bump caps):');
+    for (const v of violations) {
+      const section = strVal(v.section, '?');
+      const rel = strVal(v.rel, '?');
+      const count = fmtScalar(v.count);
+      const cap = v.cap !== null && v.cap !== undefined ? fmtScalar(v.cap) : 'uncapped';
+      lines.push(`  - [${section}] ${rel}: ${count} lines (limit: ${cap})`);
+    }
+  }
+
+  const branchLiteralViolations = Array.isArray(c.branch_literal_violations)
+    ? c.branch_literal_violations as Array<Record<string, unknown>>
+    : [];
+  if (branchLiteralViolations.length > 0) {
+    lines.push('\n### Branch-literal violations (use `resolveBaseBranch()` instead):');
+    for (const v of branchLiteralViolations) {
+      const rel = strVal(v.rel, '?');
+      const line = fmtScalar(v.line);
+      const text = strVal(v.text, '');
+      lines.push(`  - ${rel}:${line}: ${text}`);
+    }
+  }
+
+  lines.push('\n_Compliance is checked against the live automain HEAD. Fix breaches before the next qualification attempt._');
+  return lines.join('\n');
+}
+
 export function buildDirHealthSummary(
   directionsSummary: Array<Record<string, unknown>>,
   maxActiveDirections: number,

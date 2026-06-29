@@ -61,6 +61,7 @@ import {
   buildDirSummaryText,
   buildDirHealthSummary,
   buildSweepComparisonSection,
+  buildCiComplianceSection,
 } from './strategic-sections.js';
 
 /**
@@ -307,6 +308,7 @@ export async function handleStrategic(
     const driftSection = buildDriftSection(driftSignals);
 
     const efficiencySnapshotSection = buildEfficiencySnapshotSection(payload.efficiency_snapshot);
+    const ciComplianceSection = buildCiComplianceSection(payload.ci_compliance);
 
     const outcomeEval = payload.outcome_evaluation as Record<string, unknown> | undefined;
     const outcomeSection = buildOutcomeSection(outcomeEval);
@@ -677,6 +679,7 @@ prompts, schemas, tools, or orchestration.` : '';
       versionPhaseSection: buildVersionPhaseSection(versionPhase),
       memoCitationsSection: buildMemoCitationsSection(payload.memo_citations),
       efficiencySnapshotSection,
+      ciComplianceSection,
       // Shared capability vocabulary + uniform provides_capability / prerequisite
       // declaration guidance, so the strategist draws cross-lane capability refs
       // from the same registry namespace every other task type uses.
