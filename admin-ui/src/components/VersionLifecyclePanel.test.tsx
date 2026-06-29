@@ -2149,6 +2149,33 @@ describe('VersionLifecyclePanel', () => {
       // Should show self-approval rate
       expect(screen.getByText(/100% self-approval rate/)).toBeInTheDocument();
     });
+
+    it('renders acceptance caveat on ready badge when present', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            promotion_readiness: makeReadiness({
+              ready: true,
+              ground_truth_validated: true,
+              validated_precision: 0.9,
+              resolved_outcome_sample: 10,
+              serving_confirmed_count: 9,
+              deploy_failed_count: 1,
+              acceptance_caveat: 'acceptance not fully proven — this version contains 2 satisfied-but-not-machine-proven task(s)',
+              caveat: 'validated against post-promotion outcomes',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      // Badge should be green (ready=true)
+      expect(screen.getByTestId('ready-badge')).toHaveClass('bg-emerald-500/10');
+      // Acceptance caveat should be displayed despite ready=true
+      expect(screen.getByTestId('acceptance-caveat-on-badge')).toBeInTheDocument();
+      expect(screen.getByTestId('acceptance-caveat-on-badge')).toHaveTextContent(/acceptance not fully proven/);
+    });
   });
 
   describe('post-promotion serving confirmation', () => {

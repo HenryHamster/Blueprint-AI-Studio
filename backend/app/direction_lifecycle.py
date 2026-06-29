@@ -550,9 +550,15 @@ async def _process_direction_lifecycle_locked(
         ):
             continue
         recovery_hours = default_recovery_hours
-        hours = (
-            _utcnow() - datetime.fromisoformat(d["paused_at"])
-        ).total_seconds() / 3600
+        try:
+            paused_dt = datetime.fromisoformat(d["paused_at"])
+        except (ValueError, TypeError):
+            did = d.get("id")
+            logger.warning(
+                f"[LIFECYCLE] Skipping auto-recovery for {did}: malformed paused_at {d['paused_at']!r}"
+            )
+            continue
+        hours = (_utcnow() - paused_dt).total_seconds() / 3600
         if hours < recovery_hours:
             continue
         if not d.get("needs_manual_intervention"):

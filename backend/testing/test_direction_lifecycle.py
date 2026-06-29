@@ -3139,3 +3139,103 @@ async def test_lifetime_burn_no_retire_below_threshold(db_session, mocker):
         "direction should NOT be auto-retired below the threshold"
     )
 
+
+@pytest.mark.asyncio
+async def test_malformed_paused_at_skips_only_bad_direction(db_session, mocker):
+    """Malformed paused_at on one direction does not abort auto-recovery for others.
+
+    When one paused direction carries a malformed paused_at timestamp, the lifecycle
+    sweep skips that direction gracefully and continues processing the rest, allowing
+    auto-recovery and other lifecycle logic to proceed. The bad direction remains
+    paused (state unchanged), while a valid direction with a recoverable pause_at
+    is auto-recovered normally.
+    """
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+
+    # Direction with malformed paused_at — should be skipped gracefully
+    bad_direction = {
+        "id": "d-malformed-pause",
+        "text": "Direction with malformed paused_at",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "Test pause",
+        "paused_at": "not-a-valid-iso-timestamp",  # malformed
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+
+    # Direction with valid paused_at that is past recovery window — should auto-recover
+    good_direction = {
+        "id": "d-valid-pause",
+        "text": "Direction with valid paused_at",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "Test pause",
+        "paused_at": (now - timedelta(hours=72)).isoformat(),  # 72h ago, past 48h recovery window
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [
+            {
+                "timestamp": (now - timedelta(days=1)).isoformat(),
+                "tasks_created": 2,
+                "tasks_completed": 2,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 1,
+            }
+        ],
+    }
+
+    project = Project(
+        name="Malformed Paused At Test",
+        user_id="u-malformed",
+        autonomous_enabled=True,
+        directions=[bad_direction, good_direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    # Process lifecycle — should not crash despite malformed paused_at
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    by_id = {d["id"]: d for d in project.directions}
+
+    # Bad direction should remain paused (skipped gracefully)
+    bad = by_id["d-malformed-pause"]
+    assert bad["status"] == "paused", (
+        "malformed paused_at direction should remain paused (skipped, not crashed)"
+    )
+    assert bad.get("auto_paused") is True
+    assert bad.get("paused_at") == "not-a-valid-iso-timestamp", (
+        "malformed paused_at should remain unchanged"
+    )
+
+    # Good direction should auto-recover (not skipped by the bad one)
+    good = by_id["d-valid-pause"]
+    assert good["status"] == "active", (
+        "valid paused_at direction should auto-recover despite sibling with malformed paused_at"
+    )
+    assert good.get("auto_paused") is None, (
+        "auto_paused should be cleared on auto-recovery"
+    )
+    assert good.get("paused_at") is None, (
+        "paused_at should be cleared on auto-recovery"
+    )
+    assert good.get("auto_recovered_at") is not None, (
+        "auto_recovered_at should be stamped on auto-recovery"
+    )
+
