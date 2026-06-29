@@ -1270,6 +1270,13 @@ class Task(SQLModel, table=True):
         sa_column=Column(Integer, nullable=False, server_default=text("1")),
     )
 
+    # Criterion keys this task provides evidence for (captured at dispatch).
+    # List of criterion_key strings from VersionAcceptanceCriterion.
+    criterion_ids: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
+    )
+
     @property
     def first_payload(self) -> Dict[str, Any]:
         """First payload dict, defaulting to empty dict if none exist.
@@ -3700,6 +3707,15 @@ class Direction(SQLModel, table=True):
         ),
     )
 
+    # Criterion keys this direction is mapped to (captured at assignment).
+    # List of criterion_key strings from VersionAcceptanceCriterion.
+    # server_default uses a string literal (not text()) because the `text` name
+    # is shadowed by the Direction.text field declared above in this class body.
+    criterion_keys: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default="'[]'"),
+    )
+
 
 class ReleaseVersion(SQLModel, table=True):
     """Release-version lifecycle record for automain → main promotion gating.
@@ -3968,6 +3984,117 @@ class ReleaseVersion(SQLModel, table=True):
             "version_number",
             name="uq_releaseversion_project_version",
         ),
+    )
+
+
+class VersionAcceptanceCriterion(SQLModel, table=True):
+    """A single verifiable acceptance criterion scoped to a release version.
+
+    Criteria are stable-ID records authored by the strategist or an operator
+    before a version opens for feature work.  Each criterion has a
+    ``criterion_key`` (e.g. ``c-<8hexchars>``) that is unique within the
+    version and that Direction.criterion_keys / Task.criterion_ids reference so
+    criterion coverage can be computed without joining on UUIDs.
+    """
+
+    __tablename__ = "versionacceptancecriterion"
+    __table_args__ = (
+        UniqueConstraint(
+            "release_version_id",
+            "criterion_key",
+            name="uq_vac_version_key",
+        ),
+        Index("ix_vac_version", "release_version_id"),
+        Index("ix_vac_project", "project_id"),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+    )
+
+    release_version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+    )
+
+    # Stable string ID, e.g. 'c-1a2b3c4d'.  Unique within the version.
+    criterion_key: str = Field(sa_column=Column(String(64), nullable=False))
+
+    # Human-readable criterion description.
+    text: str = Field(sa_column=Column(Text, nullable=False))
+
+    # Provenance: 'strategist' | 'operator' | etc. Nullable.
+    created_by: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+
+class CriterionEvidence(SQLModel, table=True):
+    """A single piece of evidence satisfying a VersionAcceptanceCriterion.
+
+    One criterion can accumulate many evidence rows over the version's lifetime
+    (e.g. multiple task merges, an operator attestation, a reachability signal).
+    Coverage is derived by querying whether at least one evidence row exists for
+    each criterion on the version.
+    """
+
+    __tablename__ = "criterionevidence"
+    __table_args__ = (
+        Index("ix_criterionevidence_criterion_id", "criterion_id"),
+        Index("ix_criterionevidence_project", "project_id"),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+    )
+
+    criterion_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("versionacceptancecriterion.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+    )
+
+    # 'task_merge' | 'operator' | 'reachability' | etc.
+    source_kind: str = Field(sa_column=Column(String(64), nullable=False))
+
+    # Task UUID (as string) or other source identifier.  Nullable.
+    source_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(255), nullable=True),
+    )
+
+    recorded_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    # Arbitrary evidence metadata (JSONB).
+    detail: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
     )
 
 
