@@ -27130,6 +27130,19 @@ class TestComputeGoalCoverageDrift:
         assert result["signal"] == "no_grade_yet"
         assert result["coverage"] is None
 
+    def test_ungraded_statuses_do_not_look_on_track(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        for status in ("not_applicable", "superseded_exempt"):
+            result = compute_goal_coverage_drift(
+                "Improve authentication coverage",
+                merge_grade_status=status,
+                merge_grade_coverage=0.91,
+                merges_since_grade=0,
+            )
+            assert result["signal"] == status
+            assert "passed" not in result["detail"].lower()
+
     def test_on_track_pass_grade_low_delta(self):
         from app.release_scoring import compute_goal_coverage_drift
 

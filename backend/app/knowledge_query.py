@@ -695,18 +695,23 @@ async def build_compute_sweep_groups(
 ) -> dict[str, list[dict]]:
     """Group compute_experiment docs by sweep_id for the strategist payload.
 
-    Returns ``{sweep_id: [entry, ...]}`` for sweeps that have at least
-    ``_SWEEP_MIN_DOCS`` docs (lone-arm sweeps already appear in the flat
-    knowledge_index). Bounded to ``limit`` distinct sweeps, newest-first.
-    Sweeps with no sweep_id are excluded.
+    Returns ``{sweep_id: [entry, ...]}`` for sweeps that pass the completeness
+    gate. Bounded to ``limit`` distinct sweeps, newest-first. Sweeps with no
+    sweep_id are excluded. Two paths populate the result:
 
-    Completeness gate: when compute_experiment Task rows for this project
-    carry a matching sweep_id in their first payload, every such task must
-    have a usable KnowledgeDocument (source_task_id match, no
+    1. Multi-doc path: sweeps with ``>= _SWEEP_MIN_DOCS`` KnowledgeDocuments.
+    2. Single-doc arms-block path: sweeps with exactly one KnowledgeDocument
+       whose ``per_arm_verdicts`` carries ``>= _SWEEP_MIN_DOCS`` arms, each
+       with a boolean ``met`` value. Used for single-task arms-block experiments
+       where all arm results are encoded in a single document.
+
+    Completeness gate (both paths): when compute_experiment Task rows for this
+    project carry a matching sweep_id in their first payload, every such task
+    must have a usable KnowledgeDocument (source_task_id match, no
     unavailable_cause) before the sweep is returned. Sweeps that fail this
     check are excluded so the strategist cannot synthesise from partial
     evidence. When no Task manifest is discoverable for a sweep, the
-    docs-only (>= _SWEEP_MIN_DOCS) behavior is preserved unchanged.
+    docs-only behavior is preserved unchanged.
     """
     stmt = build_knowledge_documents_stmt(
         project_id,
@@ -727,71 +732,155 @@ async def build_compute_sweep_groups(
             continue
         by_sweep_docs.setdefault(sid, []).append(doc)
 
+    if not by_sweep_docs:
+        return {}
+
     # Filter to sweeps with at least _SWEEP_MIN_DOCS docs.
     multi_docs = {
         sid: docs
         for sid, docs in by_sweep_docs.items()
         if len(docs) >= _SWEEP_MIN_DOCS
     }
-    if not multi_docs:
-        return {}
 
-    # Build the set of usable source_task_ids per sweep.
-    # A doc is usable when source_task_id is set and unavailable_cause is absent.
-    usable_task_ids: dict[str, set[str]] = {}
-    for sid, docs in multi_docs.items():
-        usable: set[str] = set()
-        for doc in docs:
-            if doc.source_task_id is None:
+    # Build the completeness-gated multi-doc set.  Skip the Task queries
+    # entirely when no sweep has >= _SWEEP_MIN_DOCS docs (avoids .in_([])).
+    multi: dict[str, list[dict]] = {}
+    if multi_docs:
+        # Build the set of usable source_task_ids per sweep.
+        # A doc is usable when source_task_id is set and unavailable_cause is absent.
+        usable_task_ids: dict[str, set[str]] = {}
+        for sid, docs in multi_docs.items():
+            usable: set[str] = set()
+            for doc in docs:
+                if doc.source_task_id is None:
+                    continue
+                fqv = (
+                    doc.forward_quality_verdict
+                    if isinstance(doc.forward_quality_verdict, dict)
+                    else {}
+                )
+                if not fqv.get("unavailable_cause"):
+                    usable.add(str(doc.source_task_id))
+            usable_task_ids[sid] = usable
+
+        from app.models import Task
+
+        task_stmt = select(Task.id, Task.payloads).where(
+            Task.project_id == project_id,
+            Task.payloads[0]["type"].as_string() == "compute_experiment",
+            Task.payloads[0]["sweep_id"].as_string().in_(list(multi_docs.keys())),
+        )
+        if direction_id:
+            task_stmt = task_stmt.where(Task.context["direction_id"].as_string() == direction_id)
+
+        task_rows = (await session.execute(task_stmt)).all()
+
+        # Group task_ids by sweep_id, only for the candidate sweep_ids.
+        tasks_by_sweep: dict[str, list[str]] = {}
+        for task_id, payloads in task_rows:
+            first = (payloads or [{}])[0]
+            tsid = first.get("sweep_id")
+            if tsid and tsid in multi_docs:
+                tasks_by_sweep.setdefault(tsid, []).append(str(task_id))
+
+        # Determine which sweeps pass the completeness gate.
+        complete_sids: set[str] = set()
+        for sid in multi_docs:
+            task_ids = tasks_by_sweep.get(sid)
+            if not task_ids:
+                # No Task manifest found for this sweep → docs-only fallback.
+                complete_sids.add(sid)
+            else:
+                # Every planned arm (task) must have a usable knowledge doc.
+                if all(tid in usable_task_ids[sid] for tid in task_ids):
+                    complete_sids.add(sid)
+
+        # Convert docs to entries only for sweeps that pass the completeness gate.
+        for sid, docs in multi_docs.items():
+            if sid not in complete_sids:
+                continue
+            # docs are already ordered newest-first from the query.
+            multi[sid] = [_knowledge_index_entry(doc, summary_chars) for doc in docs]
+
+    # Also include lone-doc sweeps whose per_arm_verdicts encode a fully-measured
+    # comparison (e.g. single-task arms-block experiments). Every arm must carry a
+    # boolean met value — any unmeasured arm disqualifies the entire group to prevent
+    # partial-sweep overclaim downstream.
+    # Task-manifest gate: when compute_experiment Task rows share the sweep_id, every
+    # such task must have a usable KnowledgeDocument — same invariant as the multi-doc
+    # gate above. Only when no manifest is found is the docs-only fallback preserved.
+    single_doc_candidates: dict[str, KnowledgeDocument] = {
+        sid: docs[0]
+        for sid, docs in by_sweep_docs.items()
+        if sid not in multi and len(docs) == 1
+    }
+
+    if single_doc_candidates:
+        from app.models import Task
+
+        single_usable: dict[str, set[str]] = {}
+        for sid, doc in single_doc_candidates.items():
+            usable: set[str] = set()
+            if doc.source_task_id is not None:
+                fqv = (
+                    doc.forward_quality_verdict
+                    if isinstance(doc.forward_quality_verdict, dict)
+                    else {}
+                )
+                if not fqv.get("unavailable_cause"):
+                    usable.add(str(doc.source_task_id))
+            single_usable[sid] = usable
+
+        single_task_stmt = select(Task.id, Task.payloads).where(
+            Task.project_id == project_id,
+            Task.payloads[0]["type"].as_string() == "compute_experiment",
+            Task.payloads[0]["sweep_id"].as_string().in_(list(single_doc_candidates.keys())),
+        )
+        if direction_id:
+            single_task_stmt = single_task_stmt.where(
+                Task.context["direction_id"].as_string() == direction_id
+            )
+
+        single_task_rows = (await session.execute(single_task_stmt)).all()
+        single_tasks_by_sweep: dict[str, list[str]] = {}
+        for task_id, payloads in single_task_rows:
+            first = (payloads or [{}])[0]
+            tsid = first.get("sweep_id")
+            if tsid and tsid in single_doc_candidates:
+                single_tasks_by_sweep.setdefault(tsid, []).append(str(task_id))
+
+        single_complete: set[str] = set()
+        for sid in single_doc_candidates:
+            task_ids = single_tasks_by_sweep.get(sid)
+            if not task_ids:
+                single_complete.add(sid)  # No manifest → docs-only fallback.
+            elif all(tid in single_usable[sid] for tid in task_ids):
+                single_complete.add(sid)
+
+        for sid, doc in single_doc_candidates.items():
+            if sid not in single_complete:
                 continue
             fqv = (
                 doc.forward_quality_verdict
                 if isinstance(doc.forward_quality_verdict, dict)
                 else {}
             )
-            if not fqv.get("unavailable_cause"):
-                usable.add(str(doc.source_task_id))
-        usable_task_ids[sid] = usable
-
-    from app.models import Task
-
-    task_stmt = select(Task.id, Task.payloads).where(
-        Task.project_id == project_id,
-        Task.payloads[0]["type"].as_string() == "compute_experiment",
-        Task.payloads[0]["sweep_id"].as_string().in_(list(multi_docs.keys())),
-    )
-    if direction_id:
-        task_stmt = task_stmt.where(Task.context["direction_id"].as_string() == direction_id)
-
-    task_rows = (await session.execute(task_stmt)).all()
-
-    # Group task_ids by sweep_id, only for the candidate sweep_ids.
-    tasks_by_sweep: dict[str, list[str]] = {}
-    for task_id, payloads in task_rows:
-        first = (payloads or [{}])[0]
-        tsid = first.get("sweep_id")
-        if tsid and tsid in multi_docs:
-            tasks_by_sweep.setdefault(tsid, []).append(str(task_id))
-
-    # Determine which sweeps pass the completeness gate.
-    complete_sids: set[str] = set()
-    for sid in multi_docs:
-        task_ids = tasks_by_sweep.get(sid)
-        if not task_ids:
-            # No Task manifest found for this sweep → docs-only fallback.
-            complete_sids.add(sid)
-        else:
-            # Every planned arm (task) must have a usable knowledge doc.
-            if all(tid in usable_task_ids[sid] for tid in task_ids):
-                complete_sids.add(sid)
-
-    # Convert docs to entries only for sweeps that pass the completeness gate.
-    multi: dict[str, list[dict]] = {}
-    for sid, docs in multi_docs.items():
-        if sid not in complete_sids:
-            continue
-        # docs are already ordered newest-first from the query.
-        multi[sid] = [_knowledge_index_entry(doc, summary_chars) for doc in docs]
+            verdicts = fqv.get("per_arm_verdicts")
+            if not isinstance(verdicts, dict):
+                continue
+            arm_items = list(verdicts.items())
+            if len(arm_items) < _SWEEP_MIN_DOCS:
+                continue
+            if not all(
+                isinstance(arm, dict) and arm.get("met") in (True, False)
+                for _, arm in arm_items
+            ):
+                continue
+            base_entry = _knowledge_index_entry(doc, summary_chars)
+            multi[sid] = [
+                {**base_entry, "arm_label": str(arm_name), "criterion_met": arm.get("met")}
+                for arm_name, arm in arm_items
+            ]
 
     if not multi:
         return {}
