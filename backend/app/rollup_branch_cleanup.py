@@ -302,6 +302,7 @@ async def _cleanup_branches(task: Task, session: AsyncSession) -> None:
                 (
                     await session.execute(
                         select(Task).where(
+                            Task.project_id == task.project_id,
                             Task.payloads[0]["base_branch"].as_string() == staging,
                             Task.status.notin_(
                                 [

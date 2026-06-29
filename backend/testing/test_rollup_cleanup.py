@@ -860,6 +860,58 @@ async def test_cleanup_guard4_terminal_base_branch_targeter_still_deletes(
     )
 
 
+@pytest.mark.asyncio
+async def test_cleanup_guard4_scoped_to_project_not_cross_project(cleanup_db, mocker):
+    """Guard 4 query is scoped to the parent task's project — a non-terminal task
+    in a *different* project that happens to reference the same branch name does
+    not block staging deletion."""
+    # Project A: has the parent research task and no live grandchild targeter.
+    project_a = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db,
+        project_a.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={"research_branch": "research/aabbccdd"},
+    )
+
+    # Project B: a separate project whose non-terminal task happens to carry the
+    # same base_branch value — must NOT influence project A's cleanup.
+    project_b = await _make_project(cleanup_db)
+    await _make_task(
+        cleanup_db,
+        project_b.id,
+        task_type="fix",
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "unrelated fix",
+                "base_branch": "research/aabbccdd",
+            }
+        ],
+    )
+
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+
+    await _cleanup_branches(parent, cleanup_db)
+
+    # The cross-project task must not block deletion of project A's branch.
+    mock_delete.assert_called_once_with(
+        "gh-token", "owner", "repo", "research/aabbccdd"
+    )
+
+
 # ── _verify_pr_merged helpers ─────────────────────────────────────────────────
 
 
