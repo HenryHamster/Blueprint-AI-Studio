@@ -36,13 +36,15 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import TYPE_CHECKING, Any
 
 from app import github
 from app.branch_literal_compliance import (
-    AGENT_SOURCE_FILES,
+    AGENT_PATTERNS,
+    AGENT_SOURCE_FILES,  # noqa: F401 — re-exported for module-level identity checks
     BACKEND_PATTERNS,
-    CI_AGENT_FORBIDDEN_RE,
+    CI_AGENT_FORBIDDEN_RE,  # noqa: F401 — re-exported for module-level identity checks
     CI_AGENT_PAREN_FALLBACK_RE,
     SURFACE_CONFIGS,
     strip_typescript_with_linenos,
@@ -102,6 +104,14 @@ _SECTION_EXCLUDED: dict[str, Any] = {
     "frontend": _is_frontend_excluded,
 }
 
+# Supplemental agent patterns: extend canonical AGENT_PATTERNS with loose
+# equality (==|!=, not ===|!==) for main/automain and all equality ops for
+# master. The lookbehind/lookahead anchors prevent double-counting with the
+# canonical equality-main pattern (===|!==).
+_AGENT_SUPPLEMENTAL_PATTERNS: list[tuple[str, re.Pattern]] = [
+    ("equality-loose-main", re.compile(r"""(?<![=!])(?:==|!=)(?!=)\s*['"](main|automain)['"]""")),
+    ("equality-master", re.compile(r"""(?:===|!==|==|!=)\s*['"]master['"]""")),
+]
 
 
 async def _load_size_limits_at_ref(
@@ -347,10 +357,24 @@ async def _scan_branch_literals(
                     {"section": "backend", "rel": rel, "line": lineno, "text": line.strip()}
                 )
 
-    # --- agent/src/ branch-literal scan (specific known files) ---
+    # --- agent/src/ branch-literal scan (tree-based discovery) ---
+    agent_config = SURFACE_CONFIGS["agent"]
     agent_prefix = _SECTION_PREFIXES["agent"]
-    for agent_rel in AGENT_SOURCE_FILES:
-        path = f"{agent_prefix}{agent_rel}"
+    agent_ts_paths = [
+        entry["path"]
+        for entry in tree_paths
+        if entry["path"].startswith(agent_prefix)
+        and entry["path"].endswith(".ts")
+        and not any(
+            entry["path"].endswith(suffix) for suffix in agent_config.exclude_suffixes
+        )
+    ]
+    _agent_allowset = {
+        f"{entry.path}::{entry.line}::{entry.pattern}"
+        for entry in agent_config.allowlist
+    }
+    for path in agent_ts_paths:
+        agent_rel = path[len(agent_prefix):]
         try:
             text = await github.get_file_text_at_ref(
                 path,
@@ -371,15 +395,30 @@ async def _scan_branch_literals(
             continue
         for lineno, line in strip_typescript_with_linenos(text):
             cleaned = _strip_agent_paren_fallbacks(line)
-            if CI_AGENT_FORBIDDEN_RE.search(cleaned):
-                violations.append(
-                    {
-                        "section": "agent",
-                        "rel": agent_rel,
-                        "line": lineno,
-                        "text": line.strip(),
-                    }
-                )
+            for pat in AGENT_PATTERNS:
+                if pat.regex.search(cleaned):
+                    allow_key = f"{agent_rel}::{lineno}::{pat.name}"
+                    if allow_key not in _agent_allowset:
+                        violations.append(
+                            {
+                                "section": "agent",
+                                "rel": agent_rel,
+                                "line": lineno,
+                                "text": line.strip(),
+                            }
+                        )
+            for pat_name, pat_re in _AGENT_SUPPLEMENTAL_PATTERNS:
+                if pat_re.search(cleaned):
+                    allow_key = f"{agent_rel}::{lineno}::{pat_name}"
+                    if allow_key not in _agent_allowset:
+                        violations.append(
+                            {
+                                "section": "agent",
+                                "rel": agent_rel,
+                                "line": lineno,
+                                "text": line.strip(),
+                            }
+                        )
 
     return violations
 

@@ -306,7 +306,6 @@ async def test_evaluator_flags_agent_branch_literal(mocker):
         "  if (baseBranch === 'main') { return; }\n"
         "}\n"
     )
-    # Branch-literal scan for agent uses known file paths (not tree-based).
     agent_path = "agent/src/handlers/review-fix.ts"
     bodies = {
         ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json(),
@@ -321,7 +320,8 @@ async def test_evaluator_flags_agent_branch_literal(mocker):
     mocker.patch.object(
         ci_compliance.github,
         "list_repo_tree_paths_at_ref",
-        new=_fake_tree(_EMPTY_TREE),  # empty tree: no backend .py files to scan
+        # Tree-based agent scan requires the file to appear in the repo tree.
+        new=_fake_tree([{"path": agent_path, "size": 120}]),
     )
 
     result = await ci_compliance.evaluate_ci_compliance_at_ref(
@@ -358,7 +358,9 @@ async def test_evaluator_allows_paren_fallback_in_agent(mocker):
     mocker.patch.object(
         ci_compliance.github,
         "list_repo_tree_paths_at_ref",
-        new=_fake_tree(_EMPTY_TREE),
+        # Tree-based agent scan: file must appear in tree. Paren fallback should
+        # be stripped before pattern matching so the guard does not fire.
+        new=_fake_tree([{"path": agent_path, "size": 100}]),
     )
 
     result = await ci_compliance.evaluate_ci_compliance_at_ref(
@@ -498,3 +500,352 @@ def test_record_ci_compliance_bounds_history():
     # Oldest evicted, newest retained.
     assert "sha0000" not in stored
     assert f"sha{total - 1:04d}" in stored
+
+
+@pytest.mark.asyncio
+async def test_evaluator_flags_backend_display_string_branch_literal(mocker):
+    """display-main-range pattern in backend/app/ triggers a branch-literal violation."""
+    offending_body = (
+        "def release_title(base, head):\n"
+        "    title = f'Merge main...{head}'\n"
+        "    return title\n"
+    )
+    tree = [{"path": "backend/app/release_mod.py", "size": 100}]
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json(),
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 50)),
+        "backend/app/release_mod.py": offending_body,
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github, "list_repo_tree_paths_at_ref", new=_fake_tree(tree)
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is False
+    backend_lit = [
+        v for v in result["branch_literal_violations"] if v["section"] == "backend"
+    ]
+    assert len(backend_lit) >= 1
+    assert backend_lit[0]["rel"] == "release_mod.py"
+    assert "main..." in backend_lit[0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_evaluator_flags_agent_assign_branch_literal(mocker):
+    """Agent assign-branch pattern (branch = 'main') triggers a violation."""
+    offending_ts = (
+        "function checkout(opts) {\n"
+        "  const branch = 'main';\n"
+        "  return branch;\n"
+        "}\n"
+    )
+    agent_path = "agent/src/handlers/standard.ts"
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json(),
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 50)),
+        agent_path: offending_ts,
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github,
+        "list_repo_tree_paths_at_ref",
+        new=_fake_tree([{"path": agent_path, "size": 90}]),
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is False
+    agent_violations = [
+        v for v in result["branch_literal_violations"] if v["section"] == "agent"
+    ]
+    assert len(agent_violations) >= 1
+    assert agent_violations[0]["rel"] == "handlers/standard.ts"
+
+
+@pytest.mark.asyncio
+async def test_evaluator_flags_agent_object_branch_literal(mocker):
+    """Agent object-baseBranch pattern (baseBranch: 'main') triggers a violation."""
+    offending_ts = (
+        "function buildPayload(ref: string) {\n"
+        "  return { baseBranch: 'main', ref };\n"
+        "}\n"
+    )
+    agent_path = "agent/src/handlers/specialized.ts"
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json(),
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 50)),
+        agent_path: offending_ts,
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github,
+        "list_repo_tree_paths_at_ref",
+        new=_fake_tree([{"path": agent_path, "size": 90}]),
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is False
+    agent_violations = [
+        v for v in result["branch_literal_violations"] if v["section"] == "agent"
+    ]
+    assert len(agent_violations) >= 1
+    assert agent_violations[0]["rel"] == "handlers/specialized.ts"
+
+
+@pytest.mark.asyncio
+async def test_evaluator_flags_agent_bare_fallback_literal(mocker):
+    """A bare ``?? 'main'`` (not inside parens) in agent source is a violation."""
+    offending_ts = (
+        "function getBase(opts: any) {\n"
+        "  const base = opts.base ?? 'main';\n"
+        "  return base;\n"
+        "}\n"
+    )
+    agent_path = "agent/src/handlers/code-change.ts"
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json(),
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 50)),
+        agent_path: offending_ts,
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github,
+        "list_repo_tree_paths_at_ref",
+        new=_fake_tree([{"path": agent_path, "size": 90}]),
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is False
+    agent_violations = [
+        v for v in result["branch_literal_violations"] if v["section"] == "agent"
+    ]
+    assert len(agent_violations) >= 1
+    assert agent_violations[0]["rel"] == "handlers/code-change.ts"
+
+
+@pytest.mark.asyncio
+async def test_evaluator_scans_non_listed_agent_ts_file(mocker):
+    """Tree-based agent scan catches violations in files outside the old fixed-path list."""
+    offending_ts = (
+        "function helper(branch: string) {\n"
+        "  if (branch === 'main') { return true; }\n"
+        "}\n"
+    )
+    # This file was NOT in the old _AGENT_BRANCH_LITERAL_REL_PATHS fixed list.
+    agent_path = "agent/src/helpers/branch-utils.ts"
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json(),
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 50)),
+        agent_path: offending_ts,
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github,
+        "list_repo_tree_paths_at_ref",
+        new=_fake_tree([{"path": agent_path, "size": 90}]),
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    assert result["compliant"] is False
+    agent_violations = [
+        v for v in result["branch_literal_violations"] if v["section"] == "agent"
+    ]
+    assert len(agent_violations) >= 1
+    assert agent_violations[0]["rel"] == "helpers/branch-utils.ts"
+
+
+async def _scan_agent_ts(mocker, agent_path: str, offending_ts: str):
+    """Run the evaluator over a single agent .ts file, returning agent violations."""
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json(),
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 50)),
+        agent_path: offending_ts,
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github,
+        "list_repo_tree_paths_at_ref",
+        new=_fake_tree([{"path": agent_path, "size": 90}]),
+    )
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+    return [
+        v for v in result["branch_literal_violations"] if v["section"] == "agent"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_supplemental_loose_equality_main(mocker):
+    """Loose-equality (``== 'main'``) — not covered by canonical ===/!== — is flagged.
+
+    The canonical AGENT_PATTERNS['equality-main'] only matches ===/!==, so this
+    supplemental-only pattern is the sole reason this line is caught.
+    """
+    offending_ts = (
+        "function helper(branch: string) {\n"
+        "  if (branch == 'main') { return true; }\n"
+        "}\n"
+    )
+    agent_path = "agent/src/helpers/loose-eq.ts"
+    agent_violations = await _scan_agent_ts(mocker, agent_path, offending_ts)
+    assert len(agent_violations) == 1
+    assert agent_violations[0]["rel"] == "helpers/loose-eq.ts"
+    assert agent_violations[0]["line"] == 2
+
+
+@pytest.mark.asyncio
+async def test_supplemental_equality_master(mocker):
+    """Equality against 'master' (any operator) — supplemental-only — is flagged."""
+    offending_ts = (
+        "function helper(branch: string) {\n"
+        "  if (branch === 'master') { return true; }\n"
+        "}\n"
+    )
+    agent_path = "agent/src/helpers/master-eq.ts"
+    agent_violations = await _scan_agent_ts(mocker, agent_path, offending_ts)
+    assert len(agent_violations) == 1
+    assert agent_violations[0]["rel"] == "helpers/master-eq.ts"
+    assert agent_violations[0]["line"] == 2
+
+
+@pytest.mark.asyncio
+async def test_strict_equality_main_not_double_counted(mocker):
+    """``=== 'main'`` is flagged exactly once — the canonical pattern, not doubled.
+
+    Guards the regression where 'equality-loose-main' (``==``) matched the ``==``
+    substring inside ``===``, producing two violations for one offending line. The
+    anchored regex must NOT fire inside ===/!==.
+    """
+    offending_ts = (
+        "function helper(branch: string) {\n"
+        "  if (branch === 'main') { return true; }\n"
+        "}\n"
+    )
+    agent_path = "agent/src/helpers/strict-eq.ts"
+    agent_violations = await _scan_agent_ts(mocker, agent_path, offending_ts)
+    assert len(agent_violations) == 1
+    assert agent_violations[0]["rel"] == "helpers/strict-eq.ts"
+    assert agent_violations[0]["line"] == 2
+
+
+@pytest.mark.asyncio
+async def test_strict_inequality_main_not_double_counted(mocker):
+    """``!== 'main'`` is flagged exactly once — the loose ``!=`` regex must not fire."""
+    offending_ts = (
+        "function helper(branch: string) {\n"
+        "  if (branch !== 'main') { return true; }\n"
+        "}\n"
+    )
+    agent_path = "agent/src/helpers/strict-neq.ts"
+    agent_violations = await _scan_agent_ts(mocker, agent_path, offending_ts)
+    assert len(agent_violations) == 1
+    assert agent_violations[0]["rel"] == "helpers/strict-neq.ts"
+    assert agent_violations[0]["line"] == 2
+
+
+@pytest.mark.asyncio
+async def test_supplemental_pattern_respects_allowlist(mocker):
+    """An allowlist entry for a supplemental pattern suppresses its violation.
+
+    Mirrors the canonical AGENT_PATTERNS allowlist behaviour: a
+    path::line::pattern entry in SURFACE_CONFIGS['agent'].allowlist must
+    suppress a supplemental ('equality-loose-main') match too.
+    """
+    import dataclasses
+
+    from app.branch_literal_compliance import (
+        SURFACE_CONFIGS,
+        BranchLiteralAllowEntry,
+    )
+
+    offending_ts = (
+        "function helper(branch: string) {\n"
+        "  if (branch == 'main') { return true; }\n"
+        "}\n"
+    )
+    agent_path = "agent/src/helpers/allowlisted.ts"
+    allow_entry = BranchLiteralAllowEntry(
+        path="helpers/allowlisted.ts",
+        line=2,
+        pattern="equality-loose-main",
+        rationale="test allowlist of supplemental pattern",
+    )
+    patched_agent = dataclasses.replace(
+        SURFACE_CONFIGS["agent"], allowlist=(allow_entry,)
+    )
+    mocker.patch.dict(
+        ci_compliance.SURFACE_CONFIGS, {"agent": patched_agent}, clear=False
+    )
+
+    agent_violations = await _scan_agent_ts(mocker, agent_path, offending_ts)
+    assert agent_violations == []
+
+
+@pytest.mark.asyncio
+async def test_evaluator_allows_agent_allowlisted_entry(mocker):
+    """Violations at allowlisted path+line+pattern in SURFACE_CONFIGS are suppressed."""
+    from app.branch_literal_compliance import SURFACE_CONFIGS
+
+    agent_config = SURFACE_CONFIGS["agent"]
+    # Pick the first allowlist entry as the test target.
+    allow_entry = agent_config.allowlist[0]
+    # Build a source with the flagged pattern on the exact allowlisted line.
+    lines = [""] * allow_entry.line
+    lines[allow_entry.line - 1] = "  const b = opts.base ?? 'main';"
+    offending_ts = "\n".join(lines)
+
+    agent_path = f"agent/src/{allow_entry.path}"
+    bodies = {
+        ci_compliance._MODULE_SIZE_LIMITS_PATH: _limits_json(),
+        f"backend/app/{_CAPPED_REL}": "\n".join("x" for _ in range(_CAP - 50)),
+        agent_path: offending_ts,
+    }
+    mocker.patch.object(
+        ci_compliance.github, "get_file_text_at_ref", new=_fake_reader(bodies)
+    )
+    mocker.patch.object(
+        ci_compliance.github,
+        "list_repo_tree_paths_at_ref",
+        new=_fake_tree([{"path": agent_path, "size": len(offending_ts)}]),
+    )
+
+    result = await ci_compliance.evaluate_ci_compliance_at_ref(
+        token="t", owner="o", repo="r", ref=_HEAD_SHA, project_id="p"
+    )
+
+    agent_violations = [
+        v
+        for v in result["branch_literal_violations"]
+        if v["section"] == "agent" and v["line"] == allow_entry.line
+    ]
+    assert agent_violations == [], (
+        f"allowlisted entry at {allow_entry.path}:{allow_entry.line} must not trigger a violation"
+    )
