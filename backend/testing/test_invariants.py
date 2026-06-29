@@ -16,6 +16,10 @@ from pathlib import Path
 
 import pytest
 
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
 # auth.py raises ValueError at module load if these are absent; keeping them
 # here lets the route-table invariant run in standalone mode without the
 # backend test conftest.
@@ -4280,33 +4284,20 @@ class TestBaseBranchFallback:
 
     def test_no_hardcoded_main_branch_fallbacks(self):
         """No production module under backend/app/ may use defensive 'main' fallbacks."""
-        import os
+        from app.branch_literal_compliance import scan_branch_literal_surface
 
-        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
-        allow_list = {"payload_schemas.py", "admin.py"}
-        patterns = [
-            re.compile(r'else\s+["\']main["\']'),
-            re.compile(r'else\s+["\']master["\']'),
-            re.compile(
-                r'runtime_config\.get\(["\'](?:integration_branch|promotion_target)["\'],\s*["\']main["\']\)'
-            ),
-            re.compile(r'\bbranch\s*=\s*["\']main["\']'),
+        app_dir = Path(__file__).resolve().parents[1] / "app"
+        result = scan_branch_literal_surface("backend", app_dir)
+        offenders = [
+            f"  {o.path}:{o.line}: {o.snippet}"
+            for o in result.offenders
+            if o.pattern in {
+                "assign-branch-main",
+                "python-else-main",
+                "python-else-master",
+                "runtime-config-main",
+            }
         ]
-        offenders: list[str] = []
-        for root, _dirs, files in os.walk(app_dir):
-            for fname in files:
-                if not fname.endswith(".py"):
-                    continue
-                if fname in allow_list:
-                    continue
-                fpath = os.path.join(root, fname)
-                with open(fpath, encoding="utf-8") as f:
-                    for lineno, line in enumerate(f, start=1):
-                        if line.lstrip().startswith("#") or "# noqa" in line:
-                            continue
-                        if any(pattern.search(line) for pattern in patterns):
-                            rel = os.path.relpath(fpath, app_dir)
-                            offenders.append(f"  {rel}:{lineno}: {line.rstrip()}")
         assert not offenders, (
             "Found hardcoded branch fallbacks in backend/app/.\n"
             "Replace defensive 'main' defaults with project-aware resolution.\n"
@@ -4326,31 +4317,15 @@ class TestBaseBranchFallback:
         Log format strings are intentionally excluded — they are internal and
         not shown to operators in the UI.
         """
-        import os
+        from app.branch_literal_compliance import scan_branch_literal_surface
 
-        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
-        # Match literal 'main...' or 'main -> automain' in task display field assignments.
-        patterns = [
-            re.compile(
-                r"""(?:title|description|message)\s*=\s*f?['""][^'"]*\bmain\.\.\."""
-            ),
-            re.compile(
-                r"""(?:title|description|message)\s*=\s*f?['""][^'"]*\bmain\s*->\s*automain"""
-            ),
+        app_dir = Path(__file__).resolve().parents[1] / "app"
+        result = scan_branch_literal_surface("backend", app_dir)
+        offenders = [
+            f"  {o.path}:{o.line}: {o.snippet}"
+            for o in result.offenders
+            if o.pattern in {"display-main-automain", "display-main-range"}
         ]
-        offenders: list[str] = []
-        for root, _dirs, files in os.walk(app_dir):
-            for fname in files:
-                if not fname.endswith(".py"):
-                    continue
-                fpath = os.path.join(root, fname)
-                with open(fpath, encoding="utf-8") as f:
-                    for lineno, line in enumerate(f, start=1):
-                        if line.lstrip().startswith("#") or "# noqa" in line:
-                            continue
-                        if any(pattern.search(line) for pattern in patterns):
-                            rel = os.path.relpath(fpath, app_dir)
-                            offenders.append(f"  {rel}:{lineno}: {line.rstrip()}")
         assert not offenders, (
             "Found hardcoded branch names in task display fields (title=/description=/message=) "
             "in backend/app/.\n"
@@ -4358,6 +4333,48 @@ class TestBaseBranchFallback:
             "instead of embedding literal 'main...' or 'main -> automain'.\n"
             "Offenders:\n" + "\n".join(offenders)
         )
+
+
+class TestBranchLiteralComplianceScanner:
+    def test_scanner_reports_structured_offenders_across_backend_agent_frontend(
+        self, tmp_path
+    ):
+        from app.branch_literal_compliance import scan_branch_literal_compliance
+
+        backend_app = tmp_path / "backend" / "app"
+        agent_src = tmp_path / "agent" / "src"
+        admin_src = tmp_path / "admin-ui" / "src"
+        backend_app.mkdir(parents=True)
+        agent_src.mkdir(parents=True)
+        admin_src.mkdir(parents=True)
+
+        (backend_app / "worker.py").write_text(
+            'branch = "main"\n'
+            'description="audit main -> automain back-merge"\n',
+            encoding="utf-8",
+        )
+        (agent_src / "runner.ts").write_text(
+            "const baseBranch = task.baseBranch ?? 'main';\n",
+            encoding="utf-8",
+        )
+        (admin_src / "Panel.tsx").write_text(
+            "const promotionTarget = project.promotionTarget || 'automain';\n",
+            encoding="utf-8",
+        )
+
+        offenders = [
+            offender
+            for result in scan_branch_literal_compliance(tmp_path)
+            for offender in result.offenders
+        ]
+
+        assert [(o.surface, o.path, o.line, o.pattern) for o in offenders] == [
+            ("backend", "worker.py", 1, "assign-branch-main"),
+            ("backend", "worker.py", 2, "display-main-automain"),
+            ("agent", "runner.ts", 1, "fallback-main"),
+            ("admin-ui", "Panel.tsx", 1, "fallback-main"),
+        ]
+        assert offenders[0].snippet == 'branch = "main"'
 
 
 # ── Self-repo branch resolution guard ──────────────────────────────────────

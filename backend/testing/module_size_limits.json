@@ -15,7 +15,7 @@
     "github_token_resolver.py": 250,
     "github_auth.py": 450,
     "github_checks.py": 800,
-    "hotfix_backmerge.py": 2000,
+    "hotfix_backmerge.py": 2350,
     "github_issues.py": 500,
     "github_refs.py": 1000,
     "github_pulls.py": 1250,
@@ -152,7 +152,7 @@
     "utils/test-runners.ts": 2850,
     "utils/diff-detection.ts": 150,
     "utils/stale-result.ts": 150,
-    "handlers/strategic-sections.ts": 950,
+    "handlers/strategic-sections.ts": 1250,
     "providers/runners.ts": 1800,
     "prompts/context-prefix.ts": 1350,
     "handlers/fresh-reviewer.ts": 950

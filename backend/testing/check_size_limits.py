@@ -316,16 +316,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--repo-root",
         dest="repo_root",
-        default=_DEFAULT_REPO_ROOT,
+        default=None,
         help="repo root used to resolve section source trees (default: inferred)",
     )
     args = parser.parse_args(argv)
+    repo_root_explicit = args.repo_root is not None
+    if args.repo_root is None:
+        args.repo_root = _DEFAULT_REPO_ROOT
 
     data = load_limits(args.json_path)
     # The environment-specific frontend escape hatches (ADMIN_UI_SRC /
-    # /admin-ui/src) apply only to the real run rooted at the default repo
-    # root. An explicit --repo-root means hermetic resolution under that root.
-    use_env_overrides = os.path.normpath(args.repo_root) == _DEFAULT_REPO_ROOT
+    # /admin-ui/src) apply only to the real run when the caller did not pass an
+    # explicit --repo-root. An explicit root means hermetic resolution under
+    # that checkout, even if it happens to equal the default path.
+    use_env_overrides = not repo_root_explicit
     checked, skipped = evaluate(
         data, args.sections, args.repo_root, use_env_overrides=use_env_overrides
     )
@@ -347,7 +351,10 @@ def main(argv: list[str] | None = None) -> int:
     for section in args.sections:
         if section in skipped:
             continue
-        root = resolve_section_root(section, args.repo_root)
+        # Keep the uncapped scan on the same root resolution path as evaluate().
+        root = resolve_section_root(
+            section, args.repo_root, use_env_overrides=use_env_overrides
+        )
         if root is None:
             continue
         suffixes, is_excluded = _SECTION_SCAN[section]
