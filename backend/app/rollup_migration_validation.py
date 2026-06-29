@@ -579,14 +579,95 @@ async def check_qualification_migration_identity(
     # known divergence was waved through (it self-clears once the version
     # promotes and the branches agree).
     if authorized:
-        return (
-            "ok",
+        auth_note = (
             f"authorized reconciled Alembic revision-identity divergence(s) vs "
             f"deployed promotion target '{promotion_target}' (handled by deploy-"
             f"time reconciliation, non-blocking): "
-            + "; ".join(r["message"] for r in authorized),
+            + "; ".join(r["message"] for r in authorized)
         )
-    return ("ok", None)
+    else:
+        auth_note = None
+
+    # Body-immutability guard: the filename-identity checks above are blind to an
+    # IN-PLACE edit where the same migration file exists on both refs under the
+    # same name but with a different body. Alembic considers such a migration
+    # already-applied and silently skips it, so the schema change is never
+    # applied — deploy-fatal corruption. Fetch each migration shared by basename
+    # between the candidate and the promotion target; if any body differs, block.
+    # A failed or empty fetch returns 'defer' (migration safety unknown) — never
+    # 'ok'. Mirrors the identical block in _validate_rollup_migration_chain.
+    target_basenames = {os.path.basename(fn) for fn in target_filenames}
+    shared_basenames = [
+        os.path.basename(fn)
+        for fn in candidate_filenames
+        if os.path.basename(fn) in target_basenames
+    ]
+    if shared_basenames:
+        deployed_sources: dict[str, str] = {}
+        candidate_sources: dict[str, str] = {}
+        for basename in shared_basenames:
+            full_path = f"{_ALEMBIC_VERSIONS_DIR}/{basename}"
+            try:
+                deployed_text = await github.get_file_text_at_ref(
+                    full_path,
+                    token=gh_token,
+                    owner=owner,
+                    repo=repo,
+                    ref=promotion_target,
+                )
+            except Exception as e:
+                return (
+                    "defer",
+                    f"could not fetch migration '{basename}' from promotion "
+                    f"target '{promotion_target}' for body-immutability check "
+                    f"at qualification: {type(e).__name__}: {e}",
+                )
+            if not deployed_text:
+                return (
+                    "defer",
+                    f"empty response fetching migration '{basename}' from "
+                    f"promotion target '{promotion_target}' — deferring "
+                    f"body-immutability check at qualification",
+                )
+            deployed_sources[basename] = deployed_text
+
+            try:
+                candidate_text = await github.get_file_text_at_ref(
+                    full_path,
+                    token=gh_token,
+                    owner=owner,
+                    repo=repo,
+                    ref=candidate_ref,
+                )
+            except Exception as e:
+                return (
+                    "defer",
+                    f"could not fetch migration '{basename}' from candidate "
+                    f"'{candidate_ref}' for body-immutability check at "
+                    f"qualification: {type(e).__name__}: {e}",
+                )
+            if not candidate_text:
+                return (
+                    "defer",
+                    f"empty response fetching migration '{basename}' from "
+                    f"candidate '{candidate_ref}' — deferring body-immutability "
+                    f"check at qualification",
+                )
+            candidate_sources[basename] = candidate_text
+
+        content_edits = find_deployed_migration_content_edits(
+            deployed_sources, candidate_sources
+        )
+        if content_edits:
+            return (
+                "block",
+                f"deployed migration body modified in-place on candidate "
+                f"'{candidate_ref}' vs promotion target '{promotion_target}' "
+                f"— deployed migrations are immutable once applied: "
+                + "; ".join(content_edits),
+            )
+
+    return ("ok", auth_note)
 
 
 async def _validate_migration_chain_post_merge(
