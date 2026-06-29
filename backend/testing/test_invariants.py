@@ -564,7 +564,7 @@ class TestSchemaRevisionSync:
         import glob as globmod
 
         from app.main import EXPECTED_SCHEMA_REVISION
-        from app.migration_chain import build_migration_chain, find_heads
+        from app.migration_chain import validate_standalone_chain
 
         migrations_dir = os.path.join(
             os.path.dirname(__file__), "..", "alembic", "versions"
@@ -577,16 +577,12 @@ class TestSchemaRevisionSync:
             with open(f) as fh:
                 sources[os.path.basename(f)] = fh.read()
 
-        chain, _dups, _unp = build_migration_chain(sources)
-        heads = find_heads(chain)
-        assert len(heads) == 1, (
-            f"Migration chain has {len(heads)} structural heads: {heads}. "
-            "Cannot determine EXPECTED_SCHEMA_REVISION until the chain is linear."
+        errors = validate_standalone_chain(
+            sources, expected_schema_revision=EXPECTED_SCHEMA_REVISION
         )
-        structural_head = heads[0]
-        assert structural_head == EXPECTED_SCHEMA_REVISION, (
-            f"EXPECTED_SCHEMA_REVISION is '{EXPECTED_SCHEMA_REVISION}' but structural "
-            f"chain head is '{structural_head}'. Bump EXPECTED_SCHEMA_REVISION in main.py."
+        assert not errors, (
+            "Migration chain invariant violations detected:\n"
+            + "\n".join(f"  • {e}" for e in errors)
         )
 
     def test_task_context_size_constraint_exists_in_migration(self):

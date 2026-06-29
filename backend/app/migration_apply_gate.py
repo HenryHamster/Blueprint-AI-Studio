@@ -70,7 +70,11 @@ from sqlmodel import SQLModel
 
 import app.github as github
 from app.deploy_smoketest import reflect_schema_drift
-from app.migration_chain import build_migration_chain, find_heads
+from app.migration_chain import (
+    build_migration_chain,
+    find_filename_revision_mismatches,
+    find_heads,
+)
 from app.migration_reconciliation import reconcile_pre_renumber_divergence
 
 logger = logging.getLogger(__name__)
@@ -643,6 +647,13 @@ def _check_structural_defects(candidate_sources: dict[str, str]) -> Verdict | No
     Returns a ``('block', reason)`` verdict when a structural defect is found,
     or ``None`` when the chain is structurally sound.
     """
+    _mismatches = find_filename_revision_mismatches(candidate_sources)
+    if _mismatches:
+        return (
+            "block",
+            "candidate migration chain has filename/revision mismatches: "
+            + "; ".join(_mismatches),
+        )
     _chain, _duplicates, _ = build_migration_chain(candidate_sources)
     if _duplicates:
         return (
