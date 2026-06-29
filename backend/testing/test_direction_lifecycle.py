@@ -3423,6 +3423,93 @@ async def test_churn_family_auto_retire_full_path(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_auto_retire_records_retired_memory_before_prune(db_session, mocker):
+    """Lifecycle auto-retire must write _recently_retired_directions to project.vision
+    on the same tick that marks the direction completed, before the next prune pass
+    removes it from project.directions.
+
+    Uses the zombie retire path (churn_family_pause_count already at threshold-1) so a
+    single tick exercises the real production retire code without hand-setting the
+    terminal counter.  A second lifecycle tick then prunes the completed direction,
+    confirming the memory survives.
+    """
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    direction = {
+        "id": "d-retire-mem",
+        "text": "Retire memory test direction to verify vision write on auto-retire",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": _unproductive_history(now),
+        "churn_family_pause_count": 1,  # one prior pause; next pause retires
+        "gap_id": "g-retire-mem",
+    }
+    project = Project(
+        name="Retire Memory Test",
+        user_id="u-retire-mem",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-retire-mem",
+                    "name": "Retire mem gap",
+                    "status": "active",
+                    "active_moves": ["d-retire-mem"],
+                    "past_moves": [],
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    # Single lifecycle tick: direction trips Unproductive pause with churn_count already
+    # at 1, advances to 2 (>= _MAX_CHURN_PAUSE_CYCLES), triggering zombie auto-retire.
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "completed", "direction must be auto-retired by lifecycle tick"
+    assert d.get("auto_completed") is True
+
+    # The retired memory must be written to vision on the SAME tick as the retire.
+    retired_memory = (project.vision or {}).get("_recently_retired_directions") or []
+    assert any(mem.get("id") == "d-retire-mem" for mem in retired_memory), (
+        f"_recently_retired_directions must contain the auto-retired direction "
+        f"before the next prune tick; got: {retired_memory}"
+    )
+    entry = next(m for m in retired_memory if m.get("id") == "d-retire-mem")
+    assert "auto_retired" in (entry.get("reason") or ""), (
+        f"reason must identify auto-retire source; got: {entry.get('reason')!r}"
+    )
+
+    # Confirm memory survives the prune pass (next tick removes the completed direction).
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now + timedelta(hours=1)
+    )
+    await db_session.refresh(project)
+    assert not any(d.get("id") == "d-retire-mem" for d in (project.directions or [])), (
+        "completed direction must be pruned on the next lifecycle tick"
+    )
+    survived_memory = (project.vision or {}).get("_recently_retired_directions") or []
+    assert any(mem.get("id") == "d-retire-mem" for mem in survived_memory), (
+        "retired memory must survive the prune tick"
+    )
+
+
+@pytest.mark.asyncio
 async def test_malformed_paused_at_skips_only_bad_direction(db_session, mocker):
     """Malformed paused_at on one direction does not abort auto-recovery for others.
 

@@ -160,6 +160,7 @@ from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/call
 from app.task_locking import (
     with_design_doc_locked,
     with_directions_locked,
+    with_problem_model_locked,
     with_vision_locked,
 )
 from app.plan_completion import (
@@ -948,6 +949,31 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
     await with_directions_locked(
         session, task.project_id, _apply_no_findings_refractory
     )
+
+    # Reconcile problem-model gap staffing when the direction was auto-completed.
+    # The no-findings path bypasses _apply_direction_state_updates, so gap
+    # reconciliation would otherwise be skipped — leaving the direction in
+    # active_moves until the next lifecycle prune removes the completed entry.
+    if _auto_complete_info:
+        from app.problem_model import reconcile_gaps_for_retired_directions  # noqa: PLC0415
+
+        _reconcile_now = _utcnow().isoformat()
+        _retired_id = direction_id
+
+        def _apply_gap_reconcile_no_findings(pm: dict) -> None:
+            reconcile_gaps_for_retired_directions(pm, [_retired_id], _reconcile_now)
+
+        try:
+            await with_problem_model_locked(
+                session, task.project_id, _apply_gap_reconcile_no_findings
+            )
+        except Exception as _gap_exc:
+            logger.warning(
+                "[NO_FINDINGS] Gap reconcile failed for auto-completed direction "
+                "%s: %s",
+                direction_id,
+                _gap_exc,
+            )
 
     for info in _auto_complete_info:
         from app.models import Alert, AlertSeverity  # noqa: PLC0415

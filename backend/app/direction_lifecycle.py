@@ -324,6 +324,21 @@ async def _directed_research_recently_completed(
     return any(_derive_completed_at(task) >= cutoff for task in completed)
 
 
+def _record_auto_retired_memory(project: Project, d: dict, reason: str) -> None:
+    """Write a compact retired-direction entry to project.vision for cross-cycle dedup.
+
+    Called at every lifecycle-driven terminal retirement so the strategist dedup
+    check can block same-gap or text-overlap re-spawns even after direction pruning.
+    Caller is responsible for session.add(project) and await session.commit().
+    """
+    from app.strategic_completion import record_retired_direction_memory  # noqa: PLC0415
+
+    vision = dict(project.vision or {})
+    record_retired_direction_memory(vision, d, reason=reason)
+    project.vision = vision
+    flag_modified(project, "vision")
+
+
 async def _process_direction_lifecycle(
     project: Project,
     session: AsyncSession,
@@ -491,6 +506,7 @@ async def _process_direction_lifecycle_locked(
         # by id — authoritative helper so a missing/stale gap_id cannot leave the
         # direction as phantom active staff.
         _reconcile_retired_gap(did)
+        _record_auto_retired_memory(project, d, "auto_retired_lifetime_burn")
 
     # Prune dead directions (expired/completed/rejected) to prevent JSON bloat.
     # "staged" directions are inert-by-design (begin-after-current-version-
@@ -1190,6 +1206,7 @@ async def _process_direction_lifecycle_locked(
                 # onto the authoritative id-match helper so a missing/stale
                 # gap_id no longer hides a staffing entry. Fail-open.
                 _reconcile_retired_gap(did)
+                _record_auto_retired_memory(project, d, "auto_retired_zombie")
                 directions_modified = True
                 continue  # terminal — skip active_directions.append
             # Lifetime-burn auto-retire ladder (5th ladder): a direction that has
@@ -1251,6 +1268,7 @@ async def _process_direction_lifecycle_locked(
                 # staffing — same terminal invariant the zombie/strategic
                 # retires preserve. Fail-open.
                 _reconcile_retired_gap(did)
+                _record_auto_retired_memory(project, d, "auto_retired_code_failure")
                 directions_modified = True
             # The auto-paused direction's diagnosis-research spawn was removed
             # with the detect->investigate->fix apparatus strip. The pause itself
@@ -1459,6 +1477,7 @@ async def _process_direction_lifecycle_locked(
                         # was staffing — same terminal invariant the
                         # zombie/strategic retires preserve. Fail-open.
                         _reconcile_retired_gap(did)
+                        _record_auto_retired_memory(project, d, "auto_retired_scaffolding")
                         # Persist the completion: without this the in-memory
                         # status="completed" mutation is silently lost on a tick
                         # where the flagged-cycles counter did not advance (no

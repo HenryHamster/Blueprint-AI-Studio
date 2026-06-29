@@ -13656,12 +13656,15 @@ class TestStampNoFindingsRefractory:
 
     def _run(self, project, coro):
         import asyncio
-        from unittest.mock import patch
+        from unittest.mock import patch, AsyncMock
 
         async def _mock_wdl(session, project_id, mutate_fn):
             mutate_fn(project.directions)
 
-        with patch("app.research_completion.with_directions_locked", _mock_wdl):
+        with (
+            patch("app.research_completion.with_directions_locked", _mock_wdl),
+            patch("app.research_completion.with_problem_model_locked", AsyncMock()),
+        ):
             asyncio.get_event_loop().run_until_complete(coro)
 
     def test_first_unproductive_cycle_not_marked_saturated(self):
@@ -13962,6 +13965,97 @@ class TestStampNoFindingsRefractory:
         direction2 = project2.directions[0]
         assert direction2.get("status") != "completed", (
             "A budget-paused (cost_pause_evidence) direction must NOT be auto-completed"
+        )
+
+    def test_no_findings_auto_completion_reconciles_gap_staffing(self):
+        """Auto-completing a direction via the no-findings path must reconcile
+        problem-model gap staffing — pruning the direction from active_moves
+        and recording a GapDeferral when it was the last active move.
+
+        The lifecycle and strategic-completion retire paths both call
+        reconcile_gaps_for_retired_directions when retiring a direction; the
+        no-findings auto-complete path must do so too, or the next lifecycle
+        prune can remove the completed direction from project.directions while
+        the problem model still lists it in gap.active_moves.
+        """
+        from app.research_completion import _stamp_no_findings_refractory
+        import asyncio
+        from unittest.mock import patch
+
+        direction_id = "d-gap-test"
+        gap_id = "g-test-gap"
+
+        # Build a saturated direction that will auto-complete via the verified merge path.
+        history = [
+            {"prs_merged": 1, "verified_prs_merged": 1},
+            {"prs_merged": 1, "verified_prs_merged": 1},
+            {"prs_merged": 1, "verified_prs_merged": 1},
+        ]
+        project = MagicMock()
+        project.directions = [
+            {
+                "id": direction_id,
+                "text": "Gap-staffed direction",
+                "status": "active",
+                "gap_id": gap_id,
+                "research_history": history,
+                "history_aggregate": {},
+                "consecutive_unproductive_cycles": 2,
+            }
+        ]
+
+        # problem_model with a gap that has the direction in active_moves.
+        pm: dict = {
+            "gaps": [
+                {
+                    "id": gap_id,
+                    "name": "Test gap",
+                    "status": "active",
+                    "active_moves": [direction_id],
+                    "past_moves": [],
+                }
+            ]
+        }
+
+        captured_pm_calls: list[dict] = []
+
+        async def _mock_wdl(sess, pid, mutate_fn):
+            mutate_fn(project.directions)
+
+        async def _mock_wpml(sess, pid, mutate_fn):
+            mutate_fn(pm)
+            captured_pm_calls.append(dict(pm))
+
+        task = self._make_task(direction_id=direction_id)
+        session = self._make_session()
+
+        with (
+            patch("app.research_completion.with_directions_locked", _mock_wdl),
+            patch("app.research_completion.with_problem_model_locked", _mock_wpml),
+        ):
+            asyncio.get_event_loop().run_until_complete(
+                _stamp_no_findings_refractory(task, session)
+            )
+
+        # The direction must have been auto-completed to trigger gap reconciliation.
+        direction = project.directions[0]
+        assert direction.get("status") == "completed", (
+            "Direction must have been auto-completed to trigger gap reconciliation"
+        )
+
+        # with_problem_model_locked must have been called.
+        assert captured_pm_calls, (
+            "with_problem_model_locked must be called when a direction is auto-completed"
+        )
+
+        # The gap's active_moves must no longer contain the completed direction.
+        gap = pm["gaps"][0]
+        assert direction_id not in gap.get("active_moves", []), (
+            "auto-completed direction must be pruned from gap.active_moves"
+        )
+        # The direction must be recorded in past_moves.
+        assert direction_id in gap.get("past_moves", []), (
+            "auto-completed direction must be moved to gap.past_moves"
         )
 
 
