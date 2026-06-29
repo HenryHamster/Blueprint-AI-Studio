@@ -1658,6 +1658,55 @@ async def test_ask_compute_job_no_evidence_declines_honestly(
 
 
 @pytest.mark.asyncio
+async def test_ask_compute_job_metric_only_job_answers_grounded(
+    client: AsyncClient, db_session
+):
+    """Metric-only terminal jobs without artifact_id still support grounded Q&A."""
+    project = await _make_project(db_session, name="Ask Metric Only")
+    await _add_member(db_session, project.id, "member")
+    _task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS"}},
+        result_reference=None,
+        polling_metadata={"result_metrics": {"accuracy": 0.95}},
+    )
+
+    metric_citation = f"compute-job:{job.id}#metric:accuracy=0.95"
+
+    class _FakeContent:
+        text = (
+            f'{{"answer": "The run achieved 0.95 accuracy.", '
+            f'"citations": ["{metric_citation}"]}}'
+        )
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+
+    class _FakeMessages:
+        async def create(self, **kwargs):
+            return _FakeResponse()
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    with (
+        patch("anthropic.AsyncAnthropic", return_value=_FakeClient()),
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "What accuracy did it reach?"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["answer"] == "The run achieved 0.95 accuracy."
+    assert body["grounding_miss"] is False
+    assert body["citations"] == [metric_citation]
+
+
+@pytest.mark.asyncio
 async def test_ask_endpoint_returns_grounded_answer_and_rejects_ungrounded(
     client: AsyncClient, db_session
 ):

@@ -1655,12 +1655,15 @@ async def _gather_compute_evidence(
                 except (TypeError, ValueError):
                     file_count = 0
 
-    # The durable artifact location is the canonical evidence pointer. Prefer the
-    # job's own result_reference, then the artifact rows. No durable artifact
-    # location at all (empty / failed job) ⇒ nothing to analyse; fall back.
+    # The durable artifact location is the canonical evidence pointer when one
+    # exists. Metric-only runner/local jobs can still be questioned directly from
+    # their preserved result_metrics even if no artifact row was produced.
     job_reference = (job.result_reference or "").strip() or None
     artifact_uri = artifact_uri or job_reference or storage_uri
-    if artifact_uri is None or not _is_durable_citation(artifact_uri):
+    has_metric_evidence = bool(metrics)
+    if artifact_uri is None and not has_metric_evidence:
+        return None
+    if artifact_uri is not None and not _is_durable_citation(artifact_uri):
         return None
     if file_count <= 0 and not metrics:
         # No durable files survived AND no preserved metric — nothing the LLM can
@@ -1686,9 +1689,15 @@ async def _gather_compute_evidence(
             seen.add(value)
             supplementary.append(value)
 
-    _add_real(artifact_uri)
-    if storage_uri and storage_uri != artifact_uri:
-        _add_real(storage_uri)
+    def _add_metric(value: str | None) -> None:
+        if value and value not in seen:
+            seen.add(value)
+            real_evidence.append(value)
+
+    if artifact_uri is not None:
+        _add_real(artifact_uri)
+        if storage_uri and storage_uri != artifact_uri:
+            _add_real(storage_uri)
 
     # Signed download URLs are transient (they expire); include them in the LLM
     # prompt as supplementary context but NOT in real_evidence so a signed URL
@@ -1703,22 +1712,23 @@ async def _gather_compute_evidence(
 
     # Per-metric references: each preserved numeric metric, pinned to the durable
     # artifact bundle, is a citation resolving to durable measured evidence.
+    metric_root = artifact_uri or job_reference or f"compute-job:{job.id}"
     for name, value in metrics.items():
-        _add_real(f"{artifact_uri}#metric:{name}={value}")
+        _add_metric(f"{metric_root}#metric:{name}={value}")
     if isinstance(criterion, dict):
         c_metric = criterion.get("metric")
         c_value = criterion.get("value")
         if c_metric and c_value is not None:
-            _add_real(f"{artifact_uri}#metric:{c_metric}={c_value}")
+            _add_metric(f"{metric_root}#metric:{c_metric}={c_value}")
 
     # Per-arm citations: each arm in a multi-arm sweep is a distinct citable unit
     # so operators can ask "which arm won?" and get a grounded answer.
     if isinstance(arms, dict):
         for arm_name in arms:
-            _add_real(f"{artifact_uri}#arms:{arm_name}")
+            _add_metric(f"{metric_root}#arms:{arm_name}")
     elif isinstance(arms, list):
         for i in range(len(arms)):
-            _add_real(f"{artifact_uri}#arms:{i}")
+            _add_metric(f"{metric_root}#arms:{i}")
 
     if not real_evidence:
         return None
