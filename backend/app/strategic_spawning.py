@@ -5300,16 +5300,6 @@ async def _spawn_strategic_review(
             }
     except Exception:
         logger.exception("[STRATEGIC] fleet utilization snapshot failed; continuing")
-    # CI-compliance signal: module-size + branch-literal guardrail status for the
-    # current integration branch HEAD.  Best-effort; None when GitHub credentials
-    # are unavailable (no GitHub repo configured) or the read fails.
-    _ci_compliance: dict | None = None
-    try:
-        from app.ci_compliance import get_or_compute_ci_compliance
-
-        _ci_compliance = await get_or_compute_ci_compliance(project, session)
-    except Exception:
-        logger.exception("[STRATEGIC] CI compliance check failed; continuing")
     # Held-directions block — directions that hit the consecutive-failure hold
     # threshold (3 consecutive CODE_ERROR failures; see
     # shared_state.record_direction_result). Surfaces the held flag, the

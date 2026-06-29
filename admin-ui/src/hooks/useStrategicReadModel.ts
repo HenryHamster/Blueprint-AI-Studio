@@ -16,6 +16,7 @@ export function useStrategicReadModel(projectId: string | null) {
   const refresh = useCallback(
     async (signal?: AbortSignal) => {
       if (!projectId) return;
+      if (signal?.aborted) return;
       setLoading(prev => prev || data == null);
       try {
         const next = await fetchStrategicState(projectId, signal);

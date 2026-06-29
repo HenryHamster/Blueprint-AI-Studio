@@ -6173,8 +6173,8 @@ async def test_version_phase_block_carries_criterion_coverage(
         db_session,
         criterion_id=c_covered.id,
         project_id=project.id,
-        source_kind="task_merge",
-        source_id="pr-101",
+        source_kind="operator_attestation",
+        source_id="attest-1",
     )
     await ac.record_evidence(
         db_session,
@@ -6217,6 +6217,18 @@ async def test_version_phase_block_carries_criterion_coverage(
     floor = _version_phase_floor(vp)
     assert floor["criterion_coverage"]["total"] == 3
     assert "criteria" not in floor["criterion_coverage"]
+
+    # stuck_count survives compaction — the uncovered criterion has no direction
+    # mapping so its stuck_reason is "no_mapping" and stuck_count is 1.
+    assert coverage["stuck_count"] == 1, "stuck_count must be carried in the raw payload"
+    assert normal["criterion_coverage"]["stuck_count"] == 1, "stuck_count must survive _summarize_version_phase"
+    assert floor["criterion_coverage"]["stuck_count"] == 1, "stuck_count must survive _version_phase_floor"
+    # Per-criterion stuck_reason is in the criteria list (not the floor path).
+    stuck_entry = by_key[c_uncovered.criterion_key]
+    assert stuck_entry["stuck_reason"] == "no_mapping", "uncovered criterion with no direction should be no_mapping"
+    # Covered and partial criteria have stuck_reason=None.
+    assert by_key[c_covered.criterion_key]["stuck_reason"] is None
+    assert by_key[c_partial.criterion_key]["stuck_reason"] is None
 
 
 @pytest.mark.asyncio

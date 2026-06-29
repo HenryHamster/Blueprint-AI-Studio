@@ -1441,3 +1441,35 @@ async def test_admin_messages_accepts_linked_status_filter(
     data = resp.json()
     assert data["total"] == 1
     assert [m["content"] for m in data["messages"]] == ["Linked issue"]
+
+
+@pytest.mark.asyncio
+async def test_direction_attention_detail_uses_intervention_reason(
+    client: AsyncClient, db_session
+):
+    """Direction items with needs_manual_intervention_reason use the reason as
+    the attention detail instead of the generic direction text."""
+    project = await _make_project(db_session)
+    specific_reason = "Remediation failed after 3 attempts — fingerprint: err-abc123"
+    project.directions = [
+        {
+            "id": "d-intervention",
+            "text": "Generic direction text that should NOT appear in detail.",
+            "priority": "critical",
+            "status": "active",
+            "needs_manual_intervention": True,
+            "needs_manual_intervention_reason": specific_reason,
+        }
+    ]
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    attention = resp.json()["attention"]
+
+    direction_items = [
+        item for item in attention["items"] if item["kind"] == "direction"
+    ]
+    assert len(direction_items) == 1
+    assert direction_items[0]["detail"] == specific_reason
