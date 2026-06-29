@@ -207,6 +207,7 @@ export interface MessageBubbleProps {
   faded?: boolean;
   readOnly?: boolean;
   allMessages?: ProjectMessage[];
+  actionMode?: 'full' | 'reply-only' | 'none';
   resolvingId: string | null;
   resolveInput: string;
   deletingIds: Set<string>;
@@ -234,6 +235,7 @@ export function MessageBubble({
   faded = false,
   readOnly = false,
   allMessages = [],
+  actionMode = 'full',
   resolvingId,
   resolveInput,
   deletingIds,
@@ -300,7 +302,7 @@ export function MessageBubble({
               <span> · {formatAge(msg.created_at)}</span>
             </span>
             <span className="flex-1" />
-            <CopyableMessageRef msgId={msg.id} />
+            {actionMode === 'full' && <CopyableMessageRef msgId={msg.id} />}
           </div>
           {/* Reply context for feedback acknowledgment and question answer */}
           {replyContextMsg && (
@@ -367,9 +369,9 @@ export function MessageBubble({
         )}
 
         {/* Action buttons (open messages only, not faded, not read-only grouped rows, not linked) */}
-        {!faded && !readOnly && msg.status === 'open' && (
+        {!faded && !readOnly && msg.status === 'open' && actionMode !== 'none' && (
           <div className={`flex items-center gap-1 mt-1 ${userMsg ? 'self-end mr-1' : 'self-start ml-1'}`}>
-            {selectMode && msg.message_type === 'FEEDBACK' && (
+            {selectMode && actionMode === 'full' && msg.message_type === 'FEEDBACK' && (
               <button
                 onClick={() => onToggleSelect(msg.id)}
                 className={`p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center ${
@@ -386,7 +388,7 @@ export function MessageBubble({
             >
               <Reply className="w-3.5 h-3.5" />
             </button>
-            {msg.message_type === 'FEEDBACK' && !selectMode && (
+            {actionMode === 'full' && msg.message_type === 'FEEDBACK' && !selectMode && (
               <button
                 onClick={() => onCreateDirection(msg)}
                 disabled={creatingDirectionIds.has(msg.id)}
@@ -396,7 +398,7 @@ export function MessageBubble({
                 <PlusCircle className="w-3.5 h-3.5" />
               </button>
             )}
-            {(msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT') && investigatingId !== msg.id && !investigatingIds.has(msg.id) && (
+            {actionMode === 'full' && (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT') && investigatingId !== msg.id && !investigatingIds.has(msg.id) && (
               <button
                 onClick={() => onStartInvestigate(msg.id)}
                 disabled={investigatingIds.has(msg.id)}
@@ -406,7 +408,7 @@ export function MessageBubble({
                 <AlertTriangle className="w-3.5 h-3.5" />
               </button>
             )}
-            {investigatingId === msg.id && (
+            {actionMode === 'full' && investigatingId === msg.id && (
               <div className="flex items-center gap-1 bg-neutral-900 border border-neutral-700 rounded-lg px-2 py-1 ml-1">
                 <span className="text-xs text-neutral-400 whitespace-nowrap">Spawn investigation?</span>
                 <button
@@ -426,7 +428,7 @@ export function MessageBubble({
                 </button>
               </div>
             )}
-            {!isResolving ? (
+            {actionMode === 'full' && (!isResolving ? (
               <button
                 onClick={() => onStartResolve(msg.id)}
                 title="Resolve"
@@ -461,7 +463,8 @@ export function MessageBubble({
                   <X className="w-3 h-3" />
                 </button>
               </div>
-            )}
+            ))}
+            {actionMode === 'full' && (
             <button
               onClick={() => onDelete(msg.id)}
               disabled={deletingIds.has(msg.id)}
@@ -470,6 +473,7 @@ export function MessageBubble({
             >
               <Trash2 className="w-3.5 h-3.5" />
             </button>
+            )}
           </div>
         )}
       </div>

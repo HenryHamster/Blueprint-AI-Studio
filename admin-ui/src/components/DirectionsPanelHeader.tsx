@@ -15,6 +15,9 @@ export interface DirectionsPanelHeaderProps {
   designDoc: Record<string, unknown>;
   runningUpdate: string | null;
   triggerCycle: (phase: 'design_doc' | 'strategic_review' | 'full') => void;
+  showTitle?: boolean;
+  showCycleControls?: boolean;
+  showTabs?: boolean;
 }
 
 /**
@@ -32,6 +35,9 @@ export function DirectionsPanelHeader({
   designDoc,
   runningUpdate,
   triggerCycle,
+  showTitle = true,
+  showCycleControls = true,
+  showTabs = true,
 }: DirectionsPanelHeaderProps) {
   const getStatusColor = (status?: string) => {
     switch (status) {
@@ -47,9 +53,11 @@ export function DirectionsPanelHeader({
         return 'bg-neutral-950/60 text-neutral-400 border-neutral-900/50';
     }
   };
+  if (!showTitle && !showCycleControls && !showTabs) return null;
   return (
     <>
       {/* Header */}
+      {showTitle && (
       <div className="flex items-center justify-between px-5 py-3 border-b border-neutral-800 shrink-0">
         <div className="flex items-center gap-2">
           <h2 className="text-sm font-semibold text-neutral-100 uppercase tracking-wider">Strategic</h2>
@@ -63,8 +71,10 @@ export function DirectionsPanelHeader({
           )}
         </div>
       </div>
+      )}
 
       {/* Spawn triggers */}
+      {showCycleControls && (
       <div className="px-5 py-2 border-b border-neutral-800 shrink-0 flex items-center gap-2">
         <div className="shrink-0 flex items-center gap-1">
           <button
@@ -93,6 +103,7 @@ export function DirectionsPanelHeader({
           </button>
         </div>
       </div>
+      )}
 
       {/* Tabs — horizontal-scroll strip so the dense tab row never forces the
           panel wide on narrow viewports: the strip's box stays within the
@@ -101,6 +112,7 @@ export function DirectionsPanelHeader({
           legitimately extend past the fold inside the scroll region (same pattern
           as HeaderBar's primary-tab nav). Each button is shrink-0 + whitespace-
           nowrap so it keeps its label and scrolls rather than squishing. */}
+      {showTabs && (
       <div
         data-viewport-allow-overflow
         data-viewport-allow-truncation
@@ -163,6 +175,7 @@ export function DirectionsPanelHeader({
           })()}
         </button>
       </div>
+      )}
     </>
   );
 }

@@ -1,18 +1,24 @@
 import { useMemo, useRef, useEffect, useState, useCallback } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { Activity, AlertCircle, LayoutList, CheckSquare, Microscope, BookOpen } from 'lucide-react';
+import {
+  Activity,
+  AlertCircle,
+  BookOpen,
+  CheckSquare,
+  LayoutList,
+  Microscope,
+} from 'lucide-react';
 import { ColumnsPicker } from './components/ColumnsPicker';
 import type { ColumnPref } from './components/ColumnsPicker';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
 import { matchesTaskTypeFilter, resolveTaskCapabilities, TaskCapabilitiesProvider } from './taskCapabilities';
 import { usePoller, DEFAULT_POLL_MS } from './hooks/usePoller';
-import { DirectionsPanel } from './components/DirectionsPanel';
 import TaskStreamPanel from './components/TaskStreamPanel';
 import { ResearchBrowser } from './components/ResearchBrowser';
 import { KnowledgeBrowser } from './components/KnowledgeBrowser';
 import { PipelineView } from './components/PipelineView';
-import { StrategicCockpit, type StrategicCockpitDirection } from './components/StrategicCockpit';
+import type { StrategicCockpitDirection } from './components/StrategicCockpit';
 import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask, apiFetch, API_BASE_URL } from './api';
 import { countHighSignalMessages, countNewSinceLastVisit, loadLastSeen, fetchBackendLastSeen, resolveLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
@@ -20,20 +26,16 @@ import { type SrInvestigationSignal } from './components/SrTrendBreakdown';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
 import { AlertsPopover } from './components/AlertsPopover';
-import { ComposeDrawer } from './components/ComposeDrawer';
 import { FleetDetailDrawer } from './components/FleetDetailDrawer';
 import { NewTaskModal } from './components/NewTaskModal';
 import { NewProjectModal } from './components/NewProjectModal';
 import { ProjectManagementModal } from './components/ProjectManagementModal';
 import { HeaderBar } from './components/HeaderBar';
 import type { SectionId } from './components/SettingsDropdown';
-import MetricsDashboard from './components/MetricsDashboard';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
-import { DashboardHome } from './components/DashboardHome';
-import { ConsoleHome } from './components/ConsoleHome';
-import { ComputeJobsPanel } from './components/ComputeJobsPanel';
-import { defaultComputeExperimentForm } from './hooks/useTaskModal';
+import type { SettingsSectionRouterProps } from './components/SettingsSectionRouter';
 import type { PrimaryTab } from './hooks/useUIState';
+import { defaultComputeExperimentForm } from './hooks/useTaskModal';
 import { BulkActionBar } from './components/BulkActionBar';
 import { KanbanBoard } from './components/KanbanBoard';
 import type { KanbanColumn, SortBy } from './components/KanbanBoard';
@@ -50,6 +52,8 @@ import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 import type { Task } from './components/TaskCard';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
+import { ProjectWorkspace, RuntimeWorkspace, type ProjectManageSection, type ProjectSection, type RuntimeSection, type RuntimeSettingsSection } from './components/OperatorWorkspaces';
+import { WorkbenchFrame, WorkbenchMetric, WorkbenchPanel, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 
@@ -67,6 +71,9 @@ const COLUMNS: KanbanColumn[] = [
 const SORT_KEY = 'blueprint-admin:kanban-sort';
 const CANCELLABLE_STATUSES = new Set(['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING', 'BLOCKED', 'PARKED']);
 const TERMINAL_STATUSES = new Set(['COMPLETED', 'CANCELLED', 'FAILED']);
+const ACTIVE_PIPELINE_STATUSES = new Set(['IN_PROGRESS', 'PROVISIONING', 'EVALUATING']);
+
+type PipelineSection = 'flow' | 'board' | 'archive';
 
 
 
@@ -163,39 +170,23 @@ export default function App() {
 
   // Fetch open message count periodically (when panel is closed the callback won't fire)
   const selectedProjectId = s.selectedProjectId;
-  const showMessages = s.showMessages;
   const activeTab: PrimaryTab = s.activeTab;
+  const messagesPanelOpen = activeTab === 'chat';
 
   const [directions, setDirections] = useState<StrategicCockpitDirection[]>([]);
-  const [directionsLoading, setDirectionsLoading] = useState(false);
-  const [directionsError, setDirectionsError] = useState<string | null>(null);
-  const [cockpitTasks, setCockpitTasks] = useState<Task[]>([]);
-  const [cockpitTasksLoading, setCockpitTasksLoading] = useState(false);
-  const [cockpitTasksError, setCockpitTasksError] = useState<string | null>(null);
   useEffect(() => {
     setDirections([]);
-    setDirectionsError(null);
-    setDirectionsLoading(false);
   }, [selectedProjectId]);
-  useEffect(() => {
-    setCockpitTasks([]);
-    setCockpitTasksError(null);
-    setCockpitTasksLoading(activeTab === 'cockpit');
-  }, [selectedProjectId, activeTab]);
   usePoller(async (signal) => {
     if (!selectedProjectId) {
       setDirections([]);
-      setDirectionsError(null);
-      setDirectionsLoading(false);
       return;
     }
     const pid = selectedProjectId;
-    setDirectionsLoading(true);
     try {
       const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(pid)}/directions`, undefined, 2, 30000, signal);
       if (signal.aborted) return;
       if (!res.ok) {
-        setDirectionsError('Direction data unavailable');
         return;
       }
       const data: unknown = await res.json();
@@ -221,53 +212,20 @@ export default function App() {
           };
         })
         .filter((d): d is StrategicCockpitDirection => d !== null));
-      setDirectionsError(null);
-    } catch {
-      if (!signal.aborted) setDirectionsError('Direction data unavailable');
-    } finally {
-      if (!signal.aborted) setDirectionsLoading(false);
-    }
+    } catch { /* ignore; the pipeline filter can operate without direction labels */ }
   }, {
     intervalMs: DEFAULT_POLL_MS,
-    enabled: activeTab === 'cockpit' || activeTab === 'board',
-    deps: [selectedProjectId, activeTab],
-  });
-
-  usePoller(async (signal) => {
-    if (activeTab !== 'cockpit') return;
-    setCockpitTasksLoading(true);
-    const query = new URLSearchParams({ archived: 'false', limit: '500' });
-    if (selectedProjectId) query.set('project_id', selectedProjectId);
-    try {
-      const res = await apiFetch(`/api/admin/tasks?${query.toString()}`, undefined, 2, 30000, signal);
-      if (signal.aborted) return;
-      if (!res.ok) {
-        setCockpitTasksError('Cockpit task snapshot unavailable');
-        return;
-      }
-      const data = await res.json();
-      if (signal.aborted) return;
-      const nextTasks: Task[] = Array.isArray(data) ? data : (data.tasks ?? []);
-      setCockpitTasks(nextTasks);
-      setCockpitTasksError(null);
-    } catch {
-      if (!signal.aborted) setCockpitTasksError('Cockpit task snapshot unavailable');
-    } finally {
-      if (!signal.aborted) setCockpitTasksLoading(false);
-    }
-  }, {
-    intervalMs: DEFAULT_POLL_MS,
-    enabled: activeTab === 'cockpit',
+    enabled: activeTab === 'pipeline',
     deps: [selectedProjectId, activeTab],
   });
 
   // Clear message count when panel opens
   useEffect(() => {
-    if (showMessages) {
+    if (messagesPanelOpen) {
       setOpenMessageCount(0);
       setNewSinceLastVisit(0);
     }
-  }, [showMessages]);
+  }, [messagesPanelOpen]);
 
   // Load noise prefs from localStorage when the project changes; refresh from server async.
   useEffect(() => {
@@ -294,10 +252,10 @@ export default function App() {
 
   // Re-read prefs from localStorage when panel closes (operator may have changed prefs while it was open).
   useEffect(() => {
-    if (showMessages || !selectedProjectId) return;
+    if (messagesPanelOpen || !selectedProjectId) return;
     closedPanelNoisePrefsRef.current = loadEventPrefs(s.user?.email, selectedProjectId);
     closedPanelTempMutesRef.current = loadTemporaryMutes(s.user?.email, selectedProjectId);
-  }, [showMessages, selectedProjectId, s.user?.email]);
+  }, [messagesPanelOpen, selectedProjectId, s.user?.email]);
   usePoller(async (signal) => {
     if (!selectedProjectId) return;
     const pid = selectedProjectId; // narrowed to string
@@ -321,8 +279,8 @@ export default function App() {
     } catch { /* ignore */ }
   }, {
     intervalMs: DEFAULT_POLL_MS,
-    enabled: !!selectedProjectId && !showMessages,
-    deps: [selectedProjectId, showMessages, s.user?.email],
+    enabled: !!selectedProjectId && !messagesPanelOpen,
+    deps: [selectedProjectId, messagesPanelOpen, s.user?.email],
   });
 
   useEffect(() => {
@@ -525,6 +483,8 @@ export default function App() {
 
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
+  const blockedTasks = useMemo(() => s.tasks.filter(t => t.status === 'BLOCKED'), [s.tasks]);
+  const failedTasksForProject = useMemo(() => s.tasks.filter(t => t.status === 'FAILED'), [s.tasks]);
 
   const selectedTasks = useMemo(() => s.tasks.filter(t => s.selectedTaskIds.has(t.id)), [s.tasks, s.selectedTaskIds]);
   const cancellableTasks = useMemo(() => selectedTasks.filter(t => CANCELLABLE_STATUSES.has(t.status)), [selectedTasks]);
@@ -585,16 +545,415 @@ export default function App() {
     downloadTaskCsv(orderedExportTasks, projectName);
   }, [orderedExportTasks, selectedProject?.github_repo, selectedProject?.name, s.selectedProjectId]);
 
+  const handleViewTaskById = useCallback((taskId: string) => {
+    const target = s.tasks.find(t => t.id === taskId);
+    if (target) {
+      s.handleViewLogs(target);
+      return;
+    }
+    fetchTask(taskId)
+      .then(s.handleViewLogs)
+      .catch(() => {
+        s.addToast('Could not load task — it may have been deleted', 'error');
+      });
+  }, [s.tasks, s.handleViewLogs, s.addToast]);
+
   const hasActiveFilters = s.tasks.length > 0 && (filteredTasks.length < s.tasks.length || s.failureClassFilter.length > 0);
+  const visibleActiveTasks = useMemo(() => filteredTasks.filter(t => ACTIVE_PIPELINE_STATUSES.has(t.status)), [filteredTasks]);
+  const visibleQueuedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'QUEUED'), [filteredTasks]);
+  const visibleBlockedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'BLOCKED' || (t.status === 'QUEUED' && !!t.depends_on && t.depends_on.length > 0)), [filteredTasks]);
+  const visibleFailedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'FAILED'), [filteredTasks]);
+  const visibleTerminalTasks = useMemo(() => filteredTasks.filter(t => TERMINAL_STATUSES.has(t.status)), [filteredTasks]);
+  const pipelineAttentionTasks = useMemo(() => {
+    const priority = (task: Task) => {
+      if (task.status === 'FAILED') return 5;
+      if (task.status === 'BLOCKED') return 4;
+      if (stuckTaskIds.has(task.id)) return 3;
+      if (ACTIVE_PIPELINE_STATUSES.has(task.status)) return 2;
+      return 1;
+    };
+    return [...filteredTasks]
+      .filter(t => t.status === 'FAILED' || t.status === 'BLOCKED' || stuckTaskIds.has(t.id) || ACTIVE_PIPELINE_STATUSES.has(t.status))
+      .sort((a, b) => priority(b) - priority(a) || parseTimestamp(b.created_at).getTime() - parseTimestamp(a.created_at).getTime())
+      .slice(0, 5);
+  }, [filteredTasks, stuckTaskIds]);
+  const openPipelineTask = useMemo(() => {
+    if (!s.logTask) return null;
+    if (s.selectedProjectId && s.logTask.project_id !== s.selectedProjectId) return null;
+    return s.logTask;
+  }, [s.logTask, s.selectedProjectId]);
 
-  const [showAnalytics, setShowAnalytics] = useState(false);
+  const [pipelineSection, setPipelineSection] = useState<PipelineSection>('flow');
+  const [projectSection, setProjectSection] = useState<ProjectSection>('running-update');
+  const [projectManageSection, setProjectManageSection] = useState<ProjectManageSection>('overview');
+  const [runtimeSection, setRuntimeSection] = useState<RuntimeSection>('health');
+  const [runtimeConfigSection, setRuntimeConfigSection] = useState<RuntimeSettingsSection>('orchestrator');
+  const { setActiveTab: setPrimaryTab, setViewMode: setTaskViewMode } = s;
+  useEffect(() => {
+    if (activeTab !== 'pipeline') return;
+    if (s.showArchive) {
+      setPipelineSection('archive');
+      return;
+    }
+    setPipelineSection(s.viewMode === 'kanban' ? 'board' : 'flow');
+  }, [activeTab, s.showArchive, s.viewMode]);
+  useEffect(() => {
+    if (activeTab === 'cockpit') {
+      setProjectSection('running-update');
+      setPrimaryTab('project');
+      return;
+    }
+    if (activeTab === 'directions') {
+      setProjectSection('directions');
+      setPrimaryTab('project');
+      return;
+    }
+    if (activeTab === 'home') {
+      setRuntimeSection('health');
+      setPrimaryTab('runtime');
+      return;
+    }
+    if (activeTab === 'compute') {
+      setRuntimeSection('compute');
+      setPrimaryTab('runtime');
+      return;
+    }
+    if (activeTab === 'board') {
+      setPipelineSection('board');
+      setTaskViewMode('kanban');
+      setPrimaryTab('pipeline');
+    }
+  }, [activeTab, setPrimaryTab, setTaskViewMode]);
+  const allModelOptions = useMemo(() => {
+    const models = new Set<string>();
+    Object.values(s.providerTierModelMap).forEach(tiers => {
+      Object.values(tiers).forEach(model => { if (model) models.add(model); });
+    });
+    Object.values(s.taskTypeModelPreferences).forEach(prefs => {
+      prefs.forEach(pref => { if (pref.model) models.add(pref.model); });
+    });
+    Object.values(s.providerSettingsDefaults).forEach(config => {
+      if (typeof config.model === 'string') models.add(config.model);
+    });
+    return Array.from(models).sort();
+  }, [s.providerTierModelMap, s.taskTypeModelPreferences, s.providerSettingsDefaults]);
+  const [healthCheckUrlsInput, setHealthCheckUrlsInput] = useState(() => s.healthCheckUrls.join('\n'));
+  useEffect(() => {
+    setHealthCheckUrlsInput(s.healthCheckUrls.join('\n'));
+  }, [s.healthCheckUrls]);
+  const settingsRouterProps: Omit<SettingsSectionRouterProps, 'activeSection'> = {
+    isAdmin: s.userRole === 'admin',
+    onNavigateToSection: () => undefined,
+    onToggleSettings: s.handleToggleSettings,
+    allModelOptions,
+    healthCheckUrlsInput,
+    onHealthCheckUrlsInputChange: setHealthCheckUrlsInput,
+    onUpdateHealthCheckUrls: s.updateHealthCheckUrls,
+    defaultTaskType: s.defaultTaskType,
+    onUpdateDefaultTaskType: s.setDefaultTaskType,
+    viewMode: s.viewMode,
+    onSetViewMode: s.setViewMode,
+    refreshInterval: s.refreshInterval,
+    onUpdateRefreshInterval: s.setRefreshInterval,
+    pageSize: s.limit,
+    onUpdatePageSize: s.setLimit,
+    apiHealthy: s.apiHealthy,
+    wsConnected: s.wsConnected,
+    lastFetchTime: s.lastFetchTime,
+    notifyOnComplete: s.notifyOnComplete,
+    onUpdateNotifyOnComplete: s.setNotifyOnComplete,
+    notifyOnFail: s.notifyOnFail,
+    onUpdateNotifyOnFail: s.setNotifyOnFail,
+    notifyOnApprovalNeeded: s.notifyOnApprovalNeeded,
+    onUpdateNotifyOnApprovalNeeded: s.setNotifyOnApprovalNeeded,
+    soundOnComplete: s.soundOnComplete,
+    onUpdateSoundOnComplete: s.setSoundOnComplete,
+    notifyOnHighSignalMessage: s.notifyOnHighSignalMessage,
+    onUpdateNotifyOnHighSignalMessage: s.setNotifyOnHighSignalMessage,
+    maxConcurrentVMs: s.maxConcurrentVMs,
+    onUpdateMaxVMs: s.updateMaxVMs,
+    maxRetries: s.maxRetries,
+    onUpdateMaxRetries: s.updateMaxRetries,
+    requireApprovalGates: s.requireApprovalGates,
+    onUpdateRequireApprovalGates: s.updateRequireApprovalGates,
+    autoArchiveEnabled: s.autoArchiveEnabled,
+    onUpdateAutoArchiveEnabled: s.updateAutoArchiveEnabled,
+    autoArchiveTerminalAfterDays: s.autoArchiveTerminalAfterDays,
+    onUpdateAutoArchiveTerminalAfterDays: s.updateAutoArchiveTerminalAfterDays,
+    autoArchiveMaxTerminalTasksPerProject: s.autoArchiveMaxTerminalTasksPerProject,
+    onUpdateAutoArchiveMaxTerminalTasksPerProject: s.updateAutoArchiveMaxTerminalTasksPerProject,
+    autoArchiveIntervalMinutes: s.autoArchiveIntervalMinutes,
+    onUpdateAutoArchiveIntervalMinutes: s.updateAutoArchiveIntervalMinutes,
+    maxAutonomousTasksPerHour: s.maxAutonomousTasksPerHour,
+    onUpdateMaxAutonomousRate: s.handleUpdateMaxAutonomousRate,
+    maxGlobalAutonomousTasksPerHour: s.maxGlobalAutonomousTasksPerHour,
+    onUpdateMaxGlobalAutonomousRate: s.updateMaxGlobalAutonomousRate,
+    maxPipelineSlots: s.maxPipelineSlots,
+    onUpdateMaxPipelineSlots: s.updateMaxPipelineSlots,
+    reservedSlotsForTypes: s.reservedSlotsForTypes,
+    onUpdateReservedSlotsForTypes: s.updateReservedSlotsForTypes,
+    evaluatingPipelineTimeoutMinutes: s.evaluatingPipelineTimeoutMinutes,
+    onUpdateEvaluatingPipelineTimeout: s.updateEvaluatingPipelineTimeout,
+    evaluatingFailHours: s.evaluatingFailHours,
+    onUpdateEvaluatingFailHours: s.updateEvaluatingFailHours,
+    ciBackstopTimeoutMinutes: s.ciBackstopTimeoutMinutes,
+    onUpdateCiBackstopTimeout: s.updateCiBackstopTimeout,
+    autonomousResearchIntervalMinutes: s.autonomousResearchIntervalMinutes,
+    onUpdateAutonomousResearchInterval: s.handleUpdateAutonomousResearchInterval,
+    directionCooldownMinutes: s.directionCooldownMinutes,
+    onUpdateDirectionCooldownMinutes: s.handleUpdateDirectionCooldownMinutes,
+    strategicResearchFrequency: s.strategicResearchFrequency,
+    onUpdateStrategicResearchFrequency: s.handleUpdateStrategicResearchFrequency,
+    anyAutonomousEnabled: s.projects.some(p => p.autonomous_enabled),
+    onPauseAllAutonomous: s.handlePauseAllAutonomous,
+    onRestartOrchestrator: s.handleRestartOrchestrator,
+    githubAccount: s.githubAccount,
+    onConnectGitHub: s.connectGitHub,
+    maxPlanAccounts: s.maxPlanAccounts,
+    onToggleAccount: s.toggleMaxPlanAccount,
+    onRemoveAccount: s.removeMaxPlanAccount,
+    onResetRateLimits: s.resetAccountRateLimits,
+    onRefreshAccountModels: s.refreshAccountModels,
+    onUpdateAccount: s.updateMaxPlanAccount,
+    onUpdateAccountCaps: s.updateAccountCaps,
+    showUserManagement: s.showUserManagement,
+    onToggleUserManagement: () => s.setShowUserManagement(prev => !prev),
+    showProjectMembers,
+    onToggleProjectMembers: () => setShowProjectMembers(prev => !prev),
+    selectedProjectMyRole: selectedProject?.my_role ?? null,
+    newAccountName: s.newAccountName,
+    setNewAccountName: s.setNewAccountName,
+    newAccountProvider: s.newAccountProvider,
+    setNewAccountProvider: s.setNewAccountProvider,
+    newAccountAuthMode: s.newAccountAuthMode,
+    setNewAccountAuthMode: s.setNewAccountAuthMode,
+    newAccountToken: s.newAccountToken,
+    setNewAccountToken: s.setNewAccountToken,
+    newAccountProviderMetadata: s.newAccountProviderMetadata,
+    setNewAccountProviderMetadata: s.setNewAccountProviderMetadata,
+    newAccountClaudeConfigJson: s.newAccountClaudeConfigJson,
+    setNewAccountClaudeConfigJson: s.setNewAccountClaudeConfigJson,
+    newAccountDailyTaskCap: s.newAccountDailyTaskCap,
+    setNewAccountDailyTaskCap: s.setNewAccountDailyTaskCap,
+    newAccountMaxConcurrentTasks: s.newAccountMaxConcurrentTasks,
+    setNewAccountMaxConcurrentTasks: s.setNewAccountMaxConcurrentTasks,
+    newAccountAutoDisableAfterRateLimits: s.newAccountAutoDisableAfterRateLimits,
+    setNewAccountAutoDisableAfterRateLimits: s.setNewAccountAutoDisableAfterRateLimits,
+    onAddAccount: s.addMaxPlanAccount,
+    providers: s.providers,
+    providerSettingsDefaults: s.providerSettingsDefaults,
+    taskTypeProviderOverrides: s.taskTypeProviderOverrides,
+    providerSettingsByEffort: s.providerSettingsByEffort,
+    onUpdateProviderSettingsDefaults: s.updateProviderSettingsDefaults,
+    onUpdateTaskTypeProviderOverrides: s.updateTaskTypeProviderOverrides,
+    onUpdateProviderSettingsByEffort: s.updateProviderSettingsByEffort,
+    providerSelectionMode: s.providerSelectionMode,
+    onUpdateProviderSelectionMode: s.updateProviderSelectionMode,
+    taskTypeCategories: s.taskTypeCategories,
+    onUpdateTaskTypeCategories: s.updateTaskTypeCategories,
+    categoryRouting: s.categoryRouting,
+    onUpdateCategoryRouting: s.updateCategoryRouting,
+    taskTypeRouting: s.taskTypeRouting,
+    onUpdateTaskTypeRouting: s.updateTaskTypeRouting,
+    deployState: s.deployState,
+    onPausePipeline: s.handlePausePipeline,
+    onResumePipeline: s.handleResumePipeline,
+    onResetHealth: s.handleResetHealth,
+    onRollback: s.handleRollback,
+    onMarkStable: s.handleMarkStable,
+    onRepairState: s.handleRepairState,
+    failedRollback: s.failedRollback,
+    zoneHealth: s.zoneHealth,
+    notificationConfig: s.notificationConfig,
+    onUpdateNotificationConfig: s.updateNotificationConfig,
+    dailyCostCeilingUsd: s.dailyCostCeilingUsd,
+    onUpdateDailyCostCeiling: s.updateDailyCostCeiling,
+    selectedProjectId: s.selectedProjectId,
+    selectedProjectOwner: selectedProject?.github_owner ?? null,
+    selectedProjectRepo: selectedProject?.github_repo ?? null,
+    selectedProjectIsSelfRepo: selectedProject?.is_self_repo ?? false,
+    selectedProjectRole: selectedProject?.my_role ?? null,
+    buildConfig: s.buildConfig,
+    onUpdateBuildConfig: s.handleUpdateBuildConfig,
+    onDetectBuildConfig: s.handleDetectBuildConfig,
+    autoRemediationConfig: s.autoRemediationConfig,
+    autoRemediationStats: s.autoRemediationStats,
+    onUpdateAutoRemediationConfig: s.handleUpdateAutoRemediationConfig,
+    issueImplementationConfig: s.issueImplementationConfig,
+    onUpdateIssueImplementationConfig: s.handleUpdateIssueImplementationConfig,
+    autoReviewConfig: s.autoReviewConfig,
+    onUpdateAutoReviewConfig: s.handleUpdateAutoReviewConfig,
+    resourceEnvelopeData: s.resourceEnvelopeData,
+    resourceEnvelopeLoading: s.resourceEnvelopeLoading,
+    resourceEnvelopeError: s.resourceEnvelopeError,
+    onUpdateResourceEnvelope: s.handleUpdateResourceEnvelope,
+    integrationBranchData: s.integrationBranchData,
+    onUpdateIntegrationBranch: s.handleUpdateIntegrationBranch,
+    promotionTargetData: s.promotionTargetData,
+    onUpdatePromotionTarget: s.handleUpdatePromotionTarget,
+  };
 
-  // activeTab drives the primary nav; 'cockpit' renders the strategic landing
-  // surface, 'home' keeps the existing console, 'board' renders the kanban/pipeline
-  // views, and 'directions' renders DirectionsPanel in page mode.
+  // activeTab drives the four operator modes: Chat, Pipeline, Project, Runtime.
   const handleTabChange = (tab: PrimaryTab) => {
+    if (tab !== 'chat') s.setShowMessages(false);
+    if (tab !== 'pipeline') {
+      s.setShowArchive(false);
+    }
     s.setActiveTab(tab);
   };
+
+  const pipelineSurfaceActions = (
+    <>
+      <span className="hidden items-center rounded-md border border-neutral-800 bg-neutral-950/80 px-2 py-1 text-xs text-neutral-500 md:inline-flex">
+        {filteredTasks.length}/{s.tasks.length}
+      </span>
+      <button
+        type="button"
+        onClick={() => s.setShowResearchBrowser(prev => !prev)}
+        aria-pressed={s.showResearchBrowser}
+        className={`relative inline-flex min-h-9 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium transition-colors ${
+          s.showResearchBrowser
+            ? 'border-cyan-500/40 bg-cyan-500/10 text-cyan-300'
+            : 'border-neutral-800 bg-neutral-950/70 text-neutral-500 hover:border-neutral-700 hover:text-neutral-300'
+        }`}
+        title="Research Findings"
+      >
+        <Microscope className="h-3.5 w-3.5" />
+        <span className="hidden sm:inline">Research</span>
+        {pendingFindingsCount > 0 && (
+          <span className="ml-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-cyan-400 px-1 text-ui-2xs font-bold leading-none text-neutral-950">
+            {pendingFindingsCount}
+          </span>
+        )}
+      </button>
+      <button
+        type="button"
+        onClick={() => s.setShowKnowledgeBrowser(prev => !prev)}
+        aria-pressed={s.showKnowledgeBrowser}
+        className={`inline-flex min-h-9 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium transition-colors ${
+          s.showKnowledgeBrowser
+            ? 'border-violet-500/40 bg-violet-500/10 text-violet-300'
+            : 'border-neutral-800 bg-neutral-950/70 text-neutral-500 hover:border-neutral-700 hover:text-neutral-300'
+        }`}
+        title="Knowledge Library"
+      >
+        <BookOpen className="h-3.5 w-3.5" />
+        <span className="hidden sm:inline">Knowledge</span>
+      </button>
+    </>
+  );
+
+  const pipelineFilterStrip = (
+    <div className="shrink-0 border-b border-neutral-800 bg-[#07090c] px-3 py-2 md:px-4">
+      <div className="flex min-w-0 flex-wrap items-center gap-2">
+        <SearchFilterBar
+          searchQuery={s.searchQuery}
+          onSearchChange={s.setSearchQuery}
+          taskTypeFilter={s.taskTypeFilter}
+          onTypeFilterChange={s.setTaskTypeFilter}
+          statusFilter={s.statusFilter}
+          onStatusFilterChange={s.setStatusFilter}
+          failureClassFilter={s.failureClassFilter}
+          onFailureClassFilterChange={s.setFailureClassFilter}
+          dateRange={s.dateRange}
+          onDateRangeChange={s.setDateRange}
+          blockedFilter={s.blockedFilter}
+          onBlockedFilterChange={s.setBlockedFilter}
+          directionFilter={s.directionFilter}
+          onDirectionFilterChange={s.setDirectionFilter}
+          directions={directions}
+          onDownloadCsv={handleDownloadTasksCsv}
+          inputRef={searchInputRef}
+        />
+        {s.viewMode === 'kanban' && (
+          <SingleSelectDropdown
+            options={[
+              { label: 'Newest first', value: 'newest' },
+              { label: 'Oldest first', value: 'oldest' },
+              { label: 'Type', value: 'type' },
+              { label: 'Title', value: 'title' },
+              { label: 'Longest running', value: 'duration' },
+              { label: 'Most retried', value: 'attempts' },
+            ]}
+            value={sortBy}
+            onChange={v => setSortBy(v as SortBy)}
+          />
+        )}
+        {s.viewMode === 'kanban' && (
+          <ColumnsPicker prefs={effectiveColumnPrefs} onPrefsChange={s.setColumnPrefs} columns={COLUMNS} />
+        )}
+        {s.viewMode === 'kanban' && (
+          <button
+            type="button"
+            onClick={() => s.setCompactMode(v => !v)}
+            title={s.compactMode ? 'Switch to normal density' : 'Switch to compact density'}
+            className={`inline-flex min-h-11 items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+              s.compactMode
+                ? 'border-amber-500/40 bg-amber-500/20 text-amber-400'
+                : 'border-neutral-800/50 bg-neutral-900/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+            }`}
+          >
+            <LayoutList className="h-3.5 w-3.5" />
+            {s.compactMode ? 'Compact' : 'Normal'}
+          </button>
+        )}
+        {s.viewMode === 'kanban' && (
+          <button
+            type="button"
+            onClick={s.toggleSelectionMode}
+            title={s.selectionMode ? 'Exit selection mode' : 'Select tasks for bulk actions'}
+            className={`inline-flex min-h-11 items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+              s.selectionMode
+                ? 'border-amber-500/40 bg-amber-500/20 text-amber-400'
+                : 'border-neutral-800/50 bg-neutral-900/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
+            }`}
+          >
+            <CheckSquare className="h-3.5 w-3.5" />
+            {s.selectionMode ? 'Selecting' : 'Select'}
+          </button>
+        )}
+      </div>
+
+      <div className="mt-2 min-w-0">
+        <BoardSavedViewsBar
+          key={`${s.user?.email ?? 'anon'}:${s.selectedProjectId ?? 'none'}`}
+          userId={s.user?.email}
+          projectId={s.selectedProjectId}
+          current={boardFilterSnapshot}
+          onApply={applyBoardView}
+        />
+        <QuickFilterPresets
+          statusFilter={s.statusFilter}
+          dateRange={s.dateRange}
+          requiresApproval={s.requiresApproval}
+          blockedFilter={s.blockedFilter}
+          stuckFilter={s.stuckFilter}
+          stuckCount={stuckTaskIds.size}
+          stuckCount1h={stuckCount1h}
+          stuckMinSeconds={s.stuckMinSeconds}
+          searchQuery={s.searchQuery}
+          failureClassFilter={s.failureClassFilter}
+          setFailureClassFilter={s.setFailureClassFilter}
+          setStatusFilter={s.setStatusFilter}
+          setTaskTypeFilter={s.setTaskTypeFilter}
+          setDateRange={s.setDateRange}
+          setRequiresApproval={s.setRequiresApproval}
+          setBlockedFilter={s.setBlockedFilter}
+          setStuckFilter={s.setStuckFilter}
+          setStuckMinSeconds={s.setStuckMinSeconds}
+          setSearchQuery={s.setSearchQuery}
+        />
+      </div>
+    </div>
+  );
+
+  const pipelinePagination = (
+    <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />
+  );
+
+  const selectedProjectRepoLabel = selectedProject
+    ? `${selectedProject.github_owner}/${selectedProject.github_repo}`
+    : null;
 
   if (s.authLoading) {
     return (
@@ -653,7 +1012,7 @@ export default function App() {
   return (
     <ErrorBoundary>
     <TaskCapabilitiesProvider contract={s.taskCapabilityContract}>
-    <div className="flex flex-col bg-neutral-950 text-neutral-200 font-sans p-3 md:p-6 min-h-screen md:h-screen md:overflow-hidden">
+    <div className="flex flex-col bg-[#08090b] text-neutral-200 font-sans p-2 md:p-4 min-h-screen md:h-screen md:overflow-hidden">
       {s.refreshing && (
         <div className="fixed top-0 left-0 right-0 z-50 h-0.5 bg-neutral-800 overflow-hidden">
           <div className="h-full w-2/5 bg-amber-500" style={{ animation: 'progress-slide 1.2s ease-in-out infinite' }} />
@@ -691,11 +1050,6 @@ export default function App() {
         onToggleKnowledgeBrowser={() => s.setShowKnowledgeBrowser(prev => !prev)}
         showArchive={s.showArchive}
         onToggleArchive={() => s.setShowArchive(!s.showArchive)}
-        showMessages={s.showMessages || s.showComposeDrawer}
-        onToggleMessages={() => {
-          if (s.showMessages) { s.setShowMessages(false); }
-          else { s.setShowComposeDrawer(prev => !prev); }
-        }}
         alertCount={combinedAlerts.length}
         alertMaxSeverity={alertMaxSeverity}
         showAlertsPopover={s.showAlertsPopover}
@@ -794,9 +1148,6 @@ export default function App() {
         onUpdateTaskTypeRouting={s.updateTaskTypeRouting}
         providerSettingsByEffort={s.providerSettingsByEffort}
         onUpdateProviderSettingsByEffort={s.updateProviderSettingsByEffort}
-        showMetrics={s.showMetrics}
-        onToggleMetrics={() => s.setShowMetrics(prev => !prev)}
-        metricsHistory={s.metricsHistory}
         refreshInterval={s.refreshInterval}
         onUpdateRefreshInterval={s.setRefreshInterval}
         pageSize={s.limit}
@@ -858,25 +1209,6 @@ export default function App() {
         pipelineThrottle={s.pipelineThrottle}
       />
 
-      <div
-        className="overflow-hidden transition-all duration-300 ease-in-out shrink-0"
-        style={{ maxHeight: s.showMetrics ? '700px' : '0px', opacity: s.showMetrics ? 1 : 0 }}
-      >
-        <ErrorBoundary level="panel">
-          <MetricsDashboard
-            metricsHistory={s.metricsHistory}
-            cumulativeCost={s.cumulativeCost}
-            cumulativeVmHours={s.cumulativeVmHours}
-            maxConcurrentVMs={s.maxConcurrentVMs}
-            tasks={s.tasks}
-            metricsWindow={s.metricsWindow}
-            onWindowChange={s.setMetricsWindow}
-            projectId={s.selectedProjectId ?? undefined}
-          />
-        </ErrorBoundary>
-      </div>
-
-
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
         const projectId = s.selectedProjectId;
         return (
@@ -910,6 +1242,7 @@ export default function App() {
         </div>
       )}
 
+      <WorkbenchFrame>
       {s.showUserManagement && s.userRole === 'admin' ? (
         <UserManagement
           users={s.allowedUsers}
@@ -919,21 +1252,71 @@ export default function App() {
           onRemove={s.removeAllowedUser}
           onClose={() => s.setShowUserManagement(false)}
         />
-      ) : s.showMessages ? (
-        <MessagesPanel
-          selectedProjectId={s.selectedProjectId}
-          githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
-          defaultBranch={s.promotionTargetData?.promotion_target || s.integrationBranchData?.integration_branch || undefined}
-          onClose={() => s.setShowMessages(false)}
-          addToast={s.addToast}
-          onMessageCountChange={handleMessageCountChange}
-          onOpenTask={handleViewTask}
-          notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
-          strategistActive={s.strategistActive}
-          cycleProgress={s.cycleProgress}
-          lastCycleCompletion={s.lastCycleCompletion}
-        />
-      ) : s.showArchive ? (
+      ) : activeTab === 'chat' ? (
+        <WorkbenchSurface title="Strategic" flush>
+          <WorkbenchSplit
+            main={(
+              <MessagesPanel
+                selectedProjectId={s.selectedProjectId}
+                githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
+                defaultBranch={s.promotionTargetData?.promotion_target || s.integrationBranchData?.integration_branch || undefined}
+                variant="page"
+                filterChrome="minimal"
+                showCloseButton={false}
+                addToast={s.addToast}
+                onMessageCountChange={handleMessageCountChange}
+                onOpenTask={handleViewTask}
+                notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
+                strategistActive={s.strategistActive}
+                cycleProgress={s.cycleProgress}
+                lastCycleCompletion={s.lastCycleCompletion}
+              />
+            )}
+            rail={(
+              <div className="space-y-3">
+                <WorkbenchPanel title="Pipeline" meta={`${filteredTasks.length}/${s.tasks.length}`}>
+                  <div className="grid grid-cols-2 gap-2">
+                    <WorkbenchMetric label="active" value={runningTasks.length} tone="good" />
+                    <WorkbenchMetric label="queued" value={queuedTasks.length} tone="neutral" />
+                    <WorkbenchMetric label="blocked" value={blockedTasks.length} tone={blockedTasks.length > 0 ? 'warn' : 'neutral'} />
+                    <WorkbenchMetric label="failed" value={failedTasksForProject.length} tone={failedTasksForProject.length > 0 ? 'bad' : 'neutral'} />
+                  </div>
+                </WorkbenchPanel>
+                <WorkbenchPanel title="Strategic" meta={s.strategistActive ? 'running' : 'idle'}>
+                  <div className="space-y-2 text-sm">
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-neutral-500">cycle</span>
+                      <span className={s.strategistActive ? 'text-indigo-300' : 'text-neutral-300'}>
+                        {s.strategistActive ? (s.cycleProgress?.phase_label ?? 'working') : 'idle'}
+                      </span>
+                    </div>
+                    {s.lastCycleCompletion?.status_message && (
+                      <p className="text-xs leading-relaxed text-neutral-400">{s.lastCycleCompletion.status_message.slice(0, 180)}</p>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setProjectSection('running-update');
+                        handleTabChange('project');
+                      }}
+                      className="text-xs font-medium text-neutral-300 underline-offset-4 hover:text-neutral-100 hover:underline"
+                    >
+                      Open running update
+                    </button>
+                  </div>
+                </WorkbenchPanel>
+                <WorkbenchPanel title="Runtime" meta={s.wsConnected ? 'connected' : 'offline'}>
+                  <div className="space-y-2 text-sm text-neutral-400">
+                    <div className="flex justify-between gap-3"><span className="text-neutral-500">API</span><span className={s.apiHealthy ? 'text-emerald-300' : 'text-red-300'}>{s.apiHealthy ? 'healthy' : 'unhealthy'}</span></div>
+                    <div className="flex justify-between gap-3"><span className="text-neutral-500">accounts</span><span>{s.maxPlanAccounts.length}</span></div>
+                    <div className="flex justify-between gap-3"><span className="text-neutral-500">cost</span><span>${s.cumulativeCost.toFixed(2)}</span></div>
+                  </div>
+                </WorkbenchPanel>
+              </div>
+            )}
+          />
+        </WorkbenchSurface>
+      ) : activeTab !== 'pipeline' && s.showArchive ? (
         <ArchiveView
           archiveTasks={s.archiveTasks}
           archiveLoading={s.archiveLoading}
@@ -956,313 +1339,295 @@ export default function App() {
           setArchiveSortOrder={s.setArchiveSortOrder}
           onPurgeArchive={s.handlePurgeArchive}
         />
-      ) : activeTab === 'cockpit' ? (
+      ) : activeTab === 'project' ? (
         <ErrorBoundary level="panel">
-          <StrategicCockpit
-            projectName={selectedProject?.name ?? (selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : null)}
+          <ProjectWorkspace
+            projectSection={projectSection}
+            onProjectSectionChange={setProjectSection}
+            projectManageSection={projectManageSection}
+            onProjectManageSectionChange={setProjectManageSection}
+            selectedProject={selectedProject ?? null}
             selectedProjectId={s.selectedProjectId}
-            tasks={cockpitTasks}
-            directions={directions}
-            alerts={combinedAlerts}
-            tasksLoading={cockpitTasksLoading}
-            tasksError={cockpitTasksError}
-            directionsLoading={directionsLoading}
-            directionsError={directionsError}
-            strategistActive={s.strategistActive}
-            cycleProgress={s.cycleProgress}
-            lastCycleCompletion={s.lastCycleCompletion}
-            onOpenComposer={() => s.setShowMessages(true)}
-            onOpenDirections={() => s.setActiveTab('directions')}
-            onOpenResearch={(directionId) => {
-              setResearchBrowserDirectionId(directionId ?? null);
-              s.setShowResearchBrowser(true);
-            }}
-            onCreateTask={s.openNewTaskModal}
-            onViewTask={s.handleViewLogs}
-          />
-        </ErrorBoundary>
-      ) : activeTab === 'directions' ? (
-        <ErrorBoundary level="panel">
-          <DirectionsPanel
-            addToast={s.addToast}
-            selectedProjectId={s.selectedProjectId}
+            selectedProjectRepoLabel={selectedProjectRepoLabel}
             projects={s.projects}
+            settingsRouterProps={settingsRouterProps}
+            addToast={s.addToast}
             fetchDirectionsRef={s.fetchDirectionsRef}
             strategistActive={s.strategistActive}
             cycleProgress={s.cycleProgress}
             lastCycleCompletion={s.lastCycleCompletion}
+            onOpenProjectManagement={() => setShowProjectManagement(true)}
+            onOpenProjectMembers={() => setShowProjectMembers(true)}
             onViewFindings={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
             onViewKnowledge={(dirId) => { setKnowledgeBrowserDirectionId(dirId); s.setShowKnowledgeBrowser(true); }}
-            onNavigateToTask={(taskId) => {
-              const target = s.tasks.find(t => t.id === taskId);
-              if (target) s.handleViewLogs(target);
-              else fetchTask(taskId).then(s.handleViewLogs).catch(() => { s.addToast('Could not load task — it may have been deleted', 'error'); });
-            }}
+            onNavigateToTask={handleViewTaskById}
           />
         </ErrorBoundary>
-      ) : activeTab === 'compute' ? (
+      ) : activeTab === 'runtime' ? (
         <ErrorBoundary level="panel">
-          <ComputeJobsPanel
-            projectId={s.selectedProjectId}
-            onNavigateToTask={(taskId) => {
-              const target = s.tasks.find(t => t.id === taskId);
-              if (target) s.handleViewLogs(target);
-              else fetchTask(taskId).then(s.handleViewLogs).catch(() => { s.addToast('Could not load task — it may have been deleted', 'error'); });
-            }}
-            onLaunchCompute={() => {
-              s.setComputeExperiment(defaultComputeExperimentForm());
-              s.openPrefilledTaskModal({ taskType: 'compute_experiment', title: '', prompt: '' });
-            }}
-            onDuplicateTask={async (taskId) => {
-              const target = s.tasks.find(t => t.id === taskId);
-              if (target) {
-                s.openDuplicateTaskModal(target);
-              } else {
-                fetchTask(taskId).then(s.openDuplicateTaskModal).catch(() => { s.addToast('Could not load task — it may have been deleted', 'error'); });
-              }
-            }}
-            onApproveExperiment={s.handleApprove}
-            onDismissExperiment={s.handleDismiss}
-            onNavigateToKnowledge={(docId) => { setKnowledgeBrowserInitialDocId(docId); s.setShowKnowledgeBrowser(true); }}
-          />
-        </ErrorBoundary>
-      ) : activeTab === 'home' ? (
-        <ErrorBoundary level="panel">
-          <ConsoleHome
+          <RuntimeWorkspace
+            runtimeSection={runtimeSection}
+            onRuntimeSectionChange={setRuntimeSection}
+            runtimeConfigSection={runtimeConfigSection}
+            onRuntimeConfigSectionChange={setRuntimeConfigSection}
             selectedProjectId={s.selectedProjectId}
+            selectedProjectRepoLabel={selectedProjectRepoLabel}
+            projects={s.projects}
+            tasks={s.tasks}
             scopedActiveCount={s.scopedActiveCount}
             scopedQueuedCount={s.scopedQueuedCount}
             globalActiveCount={s.globalActiveCount}
             globalQueuedCount={s.globalQueuedCount}
-            tasks={s.tasks}
+            userRole={s.userRole}
+            apiHealthy={s.apiHealthy}
+            wsConnected={s.wsConnected}
+            settingsRouterProps={settingsRouterProps}
             onViewTask={s.handleViewLogs}
-            onShowAnalytics={() => setShowAnalytics(true)}
+            onViewTaskById={handleViewTaskById}
             onOpenFleet={() => s.setShowFleetDetail(true)}
             onCreateTask={s.openNewTaskModal}
+            onLaunchCompute={() => {
+              s.setComputeExperiment(defaultComputeExperimentForm());
+              s.openPrefilledTaskModal({ taskType: 'compute_experiment', title: '', prompt: '' });
+            }}
+            onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
+            onConfigureTargets={handleConfigureTargets}
+            onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task - investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })}
+            onPanelReviewPr={(pr) => s.openPrefilledTaskModal({ taskType: 'panel_review', title: `Panel review PR #${pr.pr_number}`, prompt: '', prNumber: pr.pr_number, prBranch: pr.pr_branch, baseBranch: pr.pr_base_branch })}
+            onApproveExperiment={s.handleApprove}
+            onDismissExperiment={s.handleDismiss}
+            onNavigateToKnowledge={(docId) => { setKnowledgeBrowserInitialDocId(docId); s.setShowKnowledgeBrowser(true); }}
+            onRestartOrchestrator={s.handleRestartOrchestrator}
           />
         </ErrorBoundary>
       ) : (
-        <>
-          {/* Board toolbar: segmented Kanban|Pipeline toggle + Research/Knowledge buttons */}
-          <div className="flex items-center gap-1 shrink-0 mb-1">
-            <div className="flex bg-neutral-900 border border-neutral-800 rounded-md p-0.5 shrink-0" role="group" aria-label="Board view">
-              {(['kanban', 'pipeline'] as const).map(mode => (
-                <button
-                  key={mode}
-                  onClick={() => s.setViewMode(mode)}
-                  className={`px-3 py-0.5 rounded text-xs font-medium transition-colors ${
-                    s.viewMode === mode
-                      ? 'bg-neutral-700 text-neutral-100 shadow-sm'
-                      : 'text-neutral-500 hover:text-neutral-300'
-                  }`}
-                >
-                  {mode.charAt(0).toUpperCase() + mode.slice(1)}
-                </button>
-              ))}
-            </div>
-            <div className="flex-1" />
-            {/* eslint-disable-next-line viewport/min-touch-target */}
-            <button
-              onClick={() => s.setShowResearchBrowser(prev => !prev)}
-              className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors relative ${
-                s.showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
-              }`}
-              title="Research Findings"
-            >
-              <Microscope className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Research</span>
-              {pendingFindingsCount > 0 && (
-                <span className="ml-0.5 bg-cyan-500 text-black text-ui-2xs font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
-                  {pendingFindingsCount}
-                </span>
-              )}
-            </button>
-            {/* eslint-disable-next-line viewport/min-touch-target */}
-            <button
-              onClick={() => s.setShowKnowledgeBrowser(prev => !prev)}
-              className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors ${
-                s.showKnowledgeBrowser ? 'text-violet-400 bg-violet-500/10' : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
-              }`}
-              title="Knowledge Library"
-            >
-              <BookOpen className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Knowledge</span>
-            </button>
-          </div>
-
-          <div className="flex items-center gap-2 shrink-0 mb-1 flex-wrap">
-            <SearchFilterBar
-              searchQuery={s.searchQuery}
-              onSearchChange={s.setSearchQuery}
-              taskTypeFilter={s.taskTypeFilter}
-              onTypeFilterChange={s.setTaskTypeFilter}
-              statusFilter={s.statusFilter}
-              onStatusFilterChange={s.setStatusFilter}
-              failureClassFilter={s.failureClassFilter}
-              onFailureClassFilterChange={s.setFailureClassFilter}
-              dateRange={s.dateRange}
-              onDateRangeChange={s.setDateRange}
-              blockedFilter={s.blockedFilter}
-              onBlockedFilterChange={s.setBlockedFilter}
-              directionFilter={s.directionFilter}
-              onDirectionFilterChange={s.setDirectionFilter}
-              directions={directions}
-              onDownloadCsv={handleDownloadTasksCsv}
-              inputRef={searchInputRef}
-            />
-            {s.viewMode === 'kanban' && (
-              <SingleSelectDropdown
-                options={[
-                  { label: 'Newest first', value: 'newest' },
-                  { label: 'Oldest first', value: 'oldest' },
-                  { label: 'Type', value: 'type' },
-                  { label: 'Title', value: 'title' },
-                  { label: 'Longest running', value: 'duration' },
-                  { label: 'Most retried', value: 'attempts' },
-                ]}
-                value={sortBy}
-                onChange={v => setSortBy(v as SortBy)}
-              />
-            )}
-            {s.viewMode === 'kanban' && (
-              <ColumnsPicker prefs={effectiveColumnPrefs} onPrefsChange={s.setColumnPrefs} columns={COLUMNS} />
-            )}
-            {s.viewMode === 'kanban' && (
-            <button
-              onClick={() => s.setCompactMode(v => !v)}
-              title={s.compactMode ? 'Switch to normal density' : 'Switch to compact density'}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                s.compactMode
-                  ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
-                  : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
-              }`}
-            >
-              <LayoutList className="w-3.5 h-3.5" />
-              {s.compactMode ? 'Compact' : 'Normal'}
-            </button>
-            )}
-            {s.viewMode === 'kanban' && (
-            <button
-              onClick={s.toggleSelectionMode}
-              title={s.selectionMode ? 'Exit selection mode' : 'Select tasks for bulk actions'}
-              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors ${
-                s.selectionMode
-                  ? 'bg-amber-500/20 border-amber-500/40 text-amber-400'
-                  : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
-              }`}
-            >
-              <CheckSquare className="w-3.5 h-3.5" />
-              {s.selectionMode ? 'Selecting' : 'Select'}
-            </button>
-            )}
-            <div className="flex-1" />
-            <span className="text-xs text-neutral-500">{filteredTasks.length} of {s.tasks.length}</span>
-          </div>
-
-          {/* Named saved filter views */}
-          <BoardSavedViewsBar
-            key={`${s.user?.email ?? 'anon'}:${s.selectedProjectId ?? 'none'}`}
-            userId={s.user?.email}
-            projectId={s.selectedProjectId}
-            current={boardFilterSnapshot}
-            onApply={applyBoardView}
-          />
-
-          {/* Quick-filter preset buttons */}
-          <QuickFilterPresets
-            statusFilter={s.statusFilter}
-            dateRange={s.dateRange}
-            requiresApproval={s.requiresApproval}
-            blockedFilter={s.blockedFilter}
-            stuckFilter={s.stuckFilter}
-            stuckCount={stuckTaskIds.size}
-            stuckCount1h={stuckCount1h}
-            stuckMinSeconds={s.stuckMinSeconds}
-            searchQuery={s.searchQuery}
-            failureClassFilter={s.failureClassFilter}
-            setFailureClassFilter={s.setFailureClassFilter}
-            setStatusFilter={s.setStatusFilter}
-            setTaskTypeFilter={s.setTaskTypeFilter}
-            setDateRange={s.setDateRange}
-            setRequiresApproval={s.setRequiresApproval}
-            setBlockedFilter={s.setBlockedFilter}
-            setStuckFilter={s.setStuckFilter}
-            setStuckMinSeconds={s.setStuckMinSeconds}
-            setSearchQuery={s.setSearchQuery}
-          />
-
-          {s.viewMode === 'kanban' ? (
-            <ErrorBoundary level="panel">
-            <KanbanBoard
-              tasks={filteredTasks}
-              columns={visibleColumns}
-              loading={s.initialLoading}
-              maxRetries={s.maxRetries}
-              actionLoadingMap={s.actionLoadingMap}
-              compact={s.compactMode}
-              sortBy={sortBy}
-              selectionMode={s.selectionMode}
-              selectedTaskIds={s.selectedTaskIds}
-              onToggleTaskSelection={s.toggleTaskSelection}
-              onCtrlClick={(taskId) => { if (!s.selectionMode) s.setSelectionMode(true); s.toggleTaskSelection(taskId); }}
-              onBulkToggle={s.bulkColumnToggle}
-              onShiftSelect={s.shiftSelectRange}
-              hasActiveFilters={hasActiveFilters}
-              onArchiveColumn={(taskIds, columnLabel) => {
-                s.setConfirmDialog({
-                  title: `Archive all ${columnLabel} tasks?`,
-                  message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} in the ${columnLabel} column. They can be viewed and unarchived from the Archive view.`,
-                  confirmLabel: `Archive ${columnLabel}`,
-                  onConfirm: () => s.handleBulkArchiveColumn(taskIds),
-                });
+        <WorkbenchSurface
+          title="Pipeline"
+          tabs={[
+            { id: 'flow', label: 'Flow' },
+            { id: 'board', label: 'Board' },
+            { id: 'archive', label: 'Archive' },
+          ]}
+          activeTab={pipelineSection}
+          onTabChange={(id) => {
+            setPipelineSection(id);
+            s.setShowArchive(id === 'archive');
+            if (id === 'flow') s.setViewMode('pipeline');
+            if (id === 'board') s.setViewMode('kanban');
+          }}
+          actions={pipelineSurfaceActions}
+          flush
+        >
+          {pipelineSection === 'archive' && s.showArchive ? (
+            <ArchiveView
+              archiveTasks={s.archiveTasks}
+              archiveLoading={s.archiveLoading}
+              archivePage={s.archivePage}
+              archivePageSize={s.archivePageSize}
+              archiveStatusFilter={s.archiveStatusFilter}
+              archiveSearchQuery={s.archiveSearchQuery}
+              archiveDateRange={s.archiveDateRange}
+              archiveTotalTasks={s.archiveTotalTasks}
+              setShowArchive={(show) => {
+                s.setShowArchive(show);
+                if (!show) {
+                  setPipelineSection('flow');
+                  s.setViewMode('pipeline');
+                }
               }}
-              onApprove={s.handleApprove}
-              onRequestChanges={s.handleRequestChanges}
-              onCancel={s.handleCancel}
-              onRetry={s.handleRetry}
-              onEditPrompt={s.handleEditPrompt}
-              onDismiss={s.handleDismiss}
-              onArchive={s.handleArchiveTask}
-              onViewLogs={s.handleViewLogs}
-              onTrack={s.trackTask}
-              trackedTaskIds={s.trackedTaskIds}
-              onDuplicate={s.openDuplicateTaskModal}
-              searchQuery={s.searchQuery}
-              onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
+              setArchivePage={s.setArchivePage}
+              setArchivePageSize={s.setArchivePageSize}
+              setArchiveStatusFilter={s.setArchiveStatusFilter}
+              setArchiveSearchQuery={s.setArchiveSearchQuery}
+              setArchiveDateRange={s.setArchiveDateRange}
+              handleViewLogs={s.handleViewLogs}
+              onRetryTask={s.handleRetry}
+              onUnarchiveTask={s.handleUnarchiveTask}
+              archiveSortOrder={s.archiveSortOrder}
+              setArchiveSortOrder={s.setArchiveSortOrder}
+              onPurgeArchive={s.handlePurgeArchive}
             />
-            </ErrorBoundary>
           ) : s.viewMode === 'pipeline' ? (
-            <ErrorBoundary level="panel">
-            <main className="flex-1 overflow-hidden flex flex-col">
-              <PipelineView
-                tasks={filteredTasks}
-                hasActiveFilters={hasActiveFilters}
-                onViewLogs={s.handleViewLogs}
-                onNavigateToParent={(parentTaskId) => {
-                  navigator.clipboard.writeText(parentTaskId).then(() => {
-                    s.addToast('Parent task ID copied — use search to find it', 'info');
-                  }).catch(() => {
-                    s.addToast(`Could not copy to clipboard — parent task ID: ${parentTaskId}`, 'error');
-                  });
-                }}
-                onClearWaveDeps={s.selectedProjectId ? (() => { const pid = s.selectedProjectId; return pid ? () => s.handleClearWaveDeps(pid) : undefined; })() : undefined}
-                onArchiveGroup={(taskIds) => {
-                  s.setConfirmDialog({
-                    title: 'Archive this group?',
-                    message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} (parent + children). They can be viewed and unarchived from the Archive view.`,
-                    confirmLabel: 'Archive group',
-                    onConfirm: () => s.handleBulkArchiveColumn(taskIds),
-                  });
-                }}
-                onUnarchiveTask={s.handleUnarchiveTask}
-              />
-            </main>
-            </ErrorBoundary>
-          ) : null}
+            <WorkbenchSplit
+              main={(
+                <div className="flex h-full min-h-0 flex-col">
+                  {pipelineFilterStrip}
+                  <ErrorBoundary level="panel">
+                    <main className="flex min-h-0 flex-1 flex-col overflow-hidden px-3 py-3 md:px-4">
+                      <PipelineView
+                        tasks={filteredTasks}
+                        hasActiveFilters={hasActiveFilters}
+                        onViewLogs={s.handleViewLogs}
+                        onNavigateToParent={(parentTaskId) => {
+                          navigator.clipboard.writeText(parentTaskId).then(() => {
+                            s.addToast('Parent task ID copied — use search to find it', 'info');
+                          }).catch(() => {
+                            s.addToast(`Could not copy to clipboard — parent task ID: ${parentTaskId}`, 'error');
+                          });
+                        }}
+                        onClearWaveDeps={s.selectedProjectId ? (() => { const pid = s.selectedProjectId; return pid ? () => s.handleClearWaveDeps(pid) : undefined; })() : undefined}
+                        onArchiveGroup={(taskIds) => {
+                          s.setConfirmDialog({
+                            title: 'Archive this group?',
+                            message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} (parent + children). They can be viewed and unarchived from the Archive view.`,
+                            confirmLabel: 'Archive group',
+                            onConfirm: () => s.handleBulkArchiveColumn(taskIds),
+                          });
+                        }}
+                        onUnarchiveTask={s.handleUnarchiveTask}
+                      />
+                    </main>
+                  </ErrorBoundary>
+                  {pipelinePagination}
+                </div>
+              )}
+              rail={(
+                <div className="space-y-3">
+                  <WorkbenchPanel title="Pipeline" meta={hasActiveFilters ? 'filtered' : 'live'}>
+                    <div className="grid grid-cols-2 gap-2">
+                      <WorkbenchMetric label="active" value={visibleActiveTasks.length} tone="good" />
+                      <WorkbenchMetric label="queued" value={visibleQueuedTasks.length} tone="neutral" />
+                      <WorkbenchMetric label="blocked" value={visibleBlockedTasks.length} tone={visibleBlockedTasks.length > 0 ? 'warn' : 'neutral'} />
+                      <WorkbenchMetric label="failed" value={visibleFailedTasks.length} tone={visibleFailedTasks.length > 0 ? 'bad' : 'neutral'} />
+                    </div>
+                    <div className="mt-3 flex items-center justify-between rounded-md border border-neutral-800 bg-neutral-900/40 px-3 py-2 text-xs">
+                      <span className="text-neutral-500">terminal</span>
+                      <span className="font-medium text-neutral-200">{visibleTerminalTasks.length}</span>
+                    </div>
+                  </WorkbenchPanel>
 
-          <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />
-        </>
+                  <WorkbenchPanel title="Open Task" meta={openPipelineTask?.status ?? 'none'}>
+                    {openPipelineTask ? (
+                      <div className="space-y-3 text-sm">
+                        <button
+                          type="button"
+                          onClick={() => s.handleViewLogs(openPipelineTask)}
+                          className="block w-full text-left text-sm font-medium leading-snug text-neutral-100 hover:text-cyan-300"
+                        >
+                          {openPipelineTask.title || openPipelineTask.id}
+                        </button>
+                        <div className="grid grid-cols-2 gap-2 text-xs">
+                          <div className="rounded-md border border-neutral-800 bg-neutral-900/40 px-2 py-1.5">
+                            <div className="text-neutral-500">type</div>
+                            <div className="mt-0.5 truncate text-neutral-200">{openPipelineTask.task_type || 'create'}</div>
+                          </div>
+                          <div className="rounded-md border border-neutral-800 bg-neutral-900/40 px-2 py-1.5">
+                            <div className="text-neutral-500">created</div>
+                            <div className="mt-0.5 truncate text-neutral-200">{parseTimestamp(openPipelineTask.created_at).toLocaleDateString()}</div>
+                          </div>
+                        </div>
+                        {openPipelineTask.latest_status_message && (
+                          <p className="rounded-md border border-neutral-800 bg-neutral-900/40 p-2 text-xs leading-relaxed text-neutral-400">
+                            {openPipelineTask.latest_status_message.slice(0, 180)}
+                          </p>
+                        )}
+                      </div>
+                    ) : (
+                      <div className="py-6 text-center text-xs text-neutral-600">No task open.</div>
+                    )}
+                  </WorkbenchPanel>
+
+                  <WorkbenchPanel title="Attention" meta={pipelineAttentionTasks.length}>
+                    {pipelineAttentionTasks.length > 0 ? (
+                      <div className="space-y-2">
+                        {pipelineAttentionTasks.map(task => (
+                          <button
+                            key={task.id}
+                            type="button"
+                            onClick={() => s.handleViewLogs(task)}
+                            className={`block w-full rounded-md border px-3 py-2 text-left transition-colors hover:border-neutral-600 hover:bg-neutral-900 ${
+                              task.status === 'FAILED'
+                                ? 'border-red-500/30 bg-red-500/5'
+                                : task.status === 'BLOCKED'
+                                  ? 'border-amber-500/30 bg-amber-500/5'
+                                  : 'border-neutral-800 bg-neutral-900/40'
+                            }`}
+                          >
+                            <div className="flex min-w-0 items-center justify-between gap-2">
+                              <span className="truncate text-ui-sm font-medium uppercase tracking-wide text-neutral-500">{task.status}</span>
+                              <span className="shrink-0 font-mono text-ui-sm text-neutral-600">{task.id.slice(0, 8)}</span>
+                            </div>
+                            <div className="mt-1 truncate text-xs font-medium text-neutral-200">{task.title || task.id}</div>
+                            {task.latest_status_message && (
+                              <div className="mt-0.5 truncate text-ui-sm text-neutral-500">{task.latest_status_message}</div>
+                            )}
+                          </button>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="py-6 text-center text-xs text-neutral-600">No active blockers.</div>
+                    )}
+                  </WorkbenchPanel>
+                </div>
+              )}
+            />
+          ) : (
+            <div className="flex h-full min-h-0 flex-col">
+              {pipelineFilterStrip}
+              <ErrorBoundary level="panel">
+                <div className="min-h-0 flex-1 overflow-hidden px-3 py-3 md:px-4">
+                  <KanbanBoard
+                    tasks={filteredTasks}
+                    columns={visibleColumns}
+                    loading={s.initialLoading}
+                    maxRetries={s.maxRetries}
+                    actionLoadingMap={s.actionLoadingMap}
+                    compact={s.compactMode}
+                    sortBy={sortBy}
+                    selectionMode={s.selectionMode}
+                    selectedTaskIds={s.selectedTaskIds}
+                    onToggleTaskSelection={s.toggleTaskSelection}
+                    onCtrlClick={(taskId) => { if (!s.selectionMode) s.setSelectionMode(true); s.toggleTaskSelection(taskId); }}
+                    onBulkToggle={s.bulkColumnToggle}
+                    onShiftSelect={s.shiftSelectRange}
+                    hasActiveFilters={hasActiveFilters}
+                    onArchiveColumn={(taskIds, columnLabel) => {
+                      s.setConfirmDialog({
+                        title: `Archive all ${columnLabel} tasks?`,
+                        message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} in the ${columnLabel} column. They can be viewed and unarchived from the Archive view.`,
+                        confirmLabel: `Archive ${columnLabel}`,
+                        onConfirm: () => s.handleBulkArchiveColumn(taskIds),
+                      });
+                    }}
+                    onApprove={s.handleApprove}
+                    onRequestChanges={s.handleRequestChanges}
+                    onCancel={s.handleCancel}
+                    onRetry={s.handleRetry}
+                    onEditPrompt={s.handleEditPrompt}
+                    onDismiss={s.handleDismiss}
+                    onArchive={s.handleArchiveTask}
+                    onViewLogs={s.handleViewLogs}
+                    onTrack={s.trackTask}
+                    trackedTaskIds={s.trackedTaskIds}
+                    onDuplicate={s.openDuplicateTaskModal}
+                    searchQuery={s.searchQuery}
+                    onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
+                  />
+                </div>
+              </ErrorBoundary>
+              {pipelinePagination}
+            </div>
+          )}
+        </WorkbenchSurface>
       )}
+      </WorkbenchFrame>
+
+      <WorkbenchStatusBar
+        left={(
+          <>
+            <span>{selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : 'No project selected'}</span>
+            <span>{activeTab}</span>
+            <span>{s.wsConnected ? 'ws connected' : 'ws offline'}</span>
+          </>
+        )}
+        right={(
+          <>
+            <span>{s.globalActiveCount} active</span>
+            <span>{s.globalQueuedCount} queued</span>
+            <span>${s.cumulativeCost.toFixed(2)}</span>
+          </>
+        )}
+      />
 
       {s.showNewTaskModal && (
         <NewTaskModal
@@ -1437,23 +1802,6 @@ export default function App() {
         />
       )}
 
-      {showAnalytics && (
-        <div className="fixed inset-0 z-[60] bg-black/60 flex items-start justify-center overflow-y-auto p-4" onClick={(e) => { if (e.target === e.currentTarget) setShowAnalytics(false); }}>
-          <div className="relative w-full max-w-6xl bg-neutral-950 rounded-xl border border-neutral-800 shadow-2xl my-8">
-            <div className="flex items-center justify-between px-6 py-4 border-b border-neutral-800">
-              <h2 className="text-sm font-semibold text-neutral-200">Detailed Analytics</h2>
-              {/* eslint-disable-next-line viewport/min-touch-target */}
-              <button onClick={() => setShowAnalytics(false)} className="text-neutral-500 hover:text-neutral-300 transition-colors text-xs px-2 py-1">Close</button>
-            </div>
-            <div className="p-4">
-              <ErrorBoundary level="panel">
-                <DashboardHome tasks={s.tasks} selectedProjectId={s.selectedProjectId} projects={s.projects} globalActiveCount={s.globalActiveCount} globalQueuedCount={s.globalQueuedCount} scopedActiveCount={s.scopedActiveCount} scopedQueuedCount={s.scopedQueuedCount} onViewTask={s.handleViewLogs} onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }} onConfigureTargets={handleConfigureTargets} onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task — investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })} onPanelReviewPr={(pr) => s.openPrefilledTaskModal({ taskType: 'panel_review', title: `Panel review PR #${pr.pr_number}`, prompt: '', prNumber: pr.pr_number, prBranch: pr.pr_branch, baseBranch: pr.pr_base_branch })} userRole={s.userRole} />
-              </ErrorBoundary>
-            </div>
-          </div>
-        </div>
-      )}
-
       {s.selectionMode && s.selectedTaskIds.size > 0 && (
         <BulkActionBar
           selectedCount={s.selectedTaskIds.size}
@@ -1500,20 +1848,6 @@ export default function App() {
           onSpawnSrInvestigation={s.selectedProjectId ? handleSpawnSrInvestigation : undefined}
           activeInvestigationTaskIds={srInvestigationTaskIds}
           onClose={() => s.setShowAlertsPopover(false)}
-        />
-      )}
-
-      {s.showComposeDrawer && (
-        <ComposeDrawer
-          projectId={s.selectedProjectId}
-          userEmail={s.user?.email ?? ''}
-          onOpenFullPanel={() => {
-            s.setShowComposeDrawer(false);
-            s.setShowMessages(true);
-          }}
-          onClose={() => s.setShowComposeDrawer(false)}
-          addToast={s.addToast}
-          strategistActive={s.strategistActive}
         />
       )}
 

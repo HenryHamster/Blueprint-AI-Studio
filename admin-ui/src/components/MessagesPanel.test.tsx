@@ -2,7 +2,7 @@ import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { render, waitFor } from '@testing-library/react';
-import { MessagesPanel } from './MessagesPanel';
+import { MessagesPanel, type MessagesPanelProps } from './MessagesPanel';
 import { classifySignalLevel, effectiveSignal, loadEventPrefs, saveEventPrefs, EVENT_PREFS_KEY, eventPrefsKey, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, isCriticalSeverity, loadTemporaryMutes, saveTemporaryMutes, isEventTypeTemporarilyMuted } from './MessagesPanel.utils';
 import type { ProjectMessage } from './MessageBubble';
 import type { SavedView } from './MessagesPanel.utils';
@@ -431,6 +431,89 @@ function makeMsg(overrides: Partial<ProjectMessage> = {}): ProjectMessage {
     ...overrides,
   };
 }
+
+describe('MessagesPanel chrome modes', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => { localStorage.clear(); });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  async function renderPanel(props: Partial<MessagesPanelProps> = {}) {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetch([]);
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          {...props}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  function filterToggle(el: HTMLElement): HTMLButtonElement | undefined {
+    return [...el.querySelectorAll('button')]
+      .find(button => button.title === 'Show filters and saved views' || button.title === 'Hide filters and saved views') as HTMLButtonElement | undefined;
+  }
+
+  test('page default omits close chrome and collapses filters', async () => {
+    const el = await renderPanel();
+
+    expect(el.querySelector('[aria-label="Close messages panel"]')).toBeNull();
+    expect(el.querySelector('input[placeholder="Search messages..."]')).toBeNull();
+    expect(el.querySelector('[data-testid="saved-views-tab-strip"]')).toBeNull();
+
+    const toggle = filterToggle(el);
+    if (!toggle) throw new Error('filter toggle not found');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+
+    await act(async () => { toggle.click(); });
+
+    expect(el.querySelector('input[placeholder="Search messages..."]')).toBeTruthy();
+    expect(el.querySelector('[data-testid="saved-views-tab-strip"]')).toBeTruthy();
+    expect(filterToggle(el)?.getAttribute('aria-expanded')).toBe('true');
+  });
+
+  test('legacy onClose usage keeps full controls and close action', async () => {
+    const onClose = vi.fn();
+    const el = await renderPanel({ onClose });
+
+    const closeButton = el.querySelector('[aria-label="Close messages panel"]') as HTMLButtonElement | null;
+    if (!closeButton) throw new Error('close button not found');
+    expect(el.querySelector('input[placeholder="Search messages..."]')).toBeTruthy();
+    expect(el.querySelector('[data-testid="saved-views-tab-strip"]')).toBeTruthy();
+    expect(filterToggle(el)).toBeUndefined();
+
+    await act(async () => { closeButton.click(); });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  test('page variant uses page chrome even when onClose is provided', async () => {
+    const el = await renderPanel({ onClose: vi.fn(), variant: 'page' });
+
+    expect(el.querySelector('[aria-label="Close messages panel"]')).toBeNull();
+    expect(el.querySelector('input[placeholder="Search messages..."]')).toBeNull();
+    expect(filterToggle(el)?.getAttribute('aria-expanded')).toBe('false');
+  });
+});
 
 describe('MessagesPanel grouping', () => {
   let root: Root | null = null;

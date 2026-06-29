@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Compass, Microscope, BookOpen, Archive, Plus, MoreHorizontal, Settings, MessageSquare, Bell, BarChart2 } from 'lucide-react';
+import { Activity, Compass, Microscope, BookOpen, Plus, MoreHorizontal, Settings, Bell } from 'lucide-react';
 import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
@@ -31,8 +31,6 @@ export interface HeaderBarProps {
   onToggleKnowledgeBrowser: () => void;
   showArchive: boolean;
   onToggleArchive: () => void;
-  showMessages: boolean;
-  onToggleMessages: () => void;
   onOpenActivityFeed?: () => void;
   openMessageCount: number;
   newSinceLastVisitCount?: number;
@@ -143,9 +141,6 @@ export interface HeaderBarProps {
   onUpdateTaskTypeRouting: (value: Record<string, TaskTypeRoutingEntry>) => Promise<void>;
   providerSettingsByEffort: ProviderSettingsByEffort;
   onUpdateProviderSettingsByEffort: (value: ProviderSettingsByEffort) => Promise<void>;
-  showMetrics: boolean;
-  onToggleMetrics: () => void;
-  metricsHistory: { timestamp: number; completedCount: number }[];
   refreshInterval: number;
   onUpdateRefreshInterval: (value: number) => void;
   pageSize: number;
@@ -232,12 +227,10 @@ export function HeaderBar(props: HeaderBarProps) {
     onToggleResearchBrowser,
     showKnowledgeBrowser,
     onToggleKnowledgeBrowser,
-    showArchive,
-    onToggleArchive,
-    showMessages,
-    onToggleMessages,
     onOpenActivityFeed,
     onOpenNewTaskModal,
+    openMessageCount,
+    newSinceLastVisitCount,
     wsRef,
     showSettings,
     onToggleSettings,
@@ -333,8 +326,6 @@ export function HeaderBar(props: HeaderBarProps) {
     taskTypeProviderOverrides,
     onUpdateProviderSettingsDefaults,
     onUpdateTaskTypeProviderOverrides,
-    showMetrics,
-    onToggleMetrics,
     refreshInterval,
     onUpdateRefreshInterval,
     pageSize,
@@ -411,16 +402,16 @@ export function HeaderBar(props: HeaderBarProps) {
         </div>
       )}
 
-      {/* Unified top bar: one coherent band. flex-wrap so that when the LEFT
-          (project switcher) and RIGHT (actions) clusters can't both fit beside
-          the scrolling tab nav on a narrow viewport, the RIGHT cluster wraps to
-          a second row instead of overflowing horizontally. The nav is flex-1
-          (flex-basis 0%) so it never forces a wrap by itself; this keeps the bar
-          a single row whenever it fits and degrades to two rows only when the
-          fixed clusters genuinely exceed the width — independent of font metrics. */}
-      <header className="flex flex-wrap items-center gap-2 border-b border-neutral-800/60 pb-1 mb-1">
+      {/* Unified top bar: compact global shell with fixed utility clusters and a scrolling tab strip. */}
+      <header className="mb-2 flex flex-wrap items-center gap-2 rounded-md border border-neutral-800/80 bg-[#05070a] px-2 py-1.5 shadow-[0_1px_0_rgba(255,255,255,0.04)] md:flex-nowrap">
         {/* LEFT: ProjectSwitcher + Manage projects slot */}
-        <div className="flex items-center gap-1 shrink-0">
+        <div className="flex min-w-0 shrink-0 items-center gap-1.5">
+          <div className="hidden items-center gap-2 pr-1 sm:flex">
+            <span className="flex h-8 w-8 items-center justify-center rounded-md border border-neutral-800 bg-[#0b0f14] text-neutral-300 shadow-inner shadow-black/20">
+              <Compass className="h-3.5 w-3.5" />
+            </span>
+            <span className="text-sm font-semibold tracking-normal text-neutral-100">Blueprint</span>
+          </div>
           <ProjectSwitcherDropdown
             projects={props.projects}
             selectedProjectId={props.selectedProjectId}
@@ -430,7 +421,7 @@ export function HeaderBar(props: HeaderBarProps) {
             /* eslint-disable-next-line viewport/min-touch-target */
             <button
               onClick={props.onManageProjects}
-              className="text-xs text-neutral-600 hover:text-neutral-400 px-2 py-1 rounded transition-colors"
+              className="hidden rounded px-2 py-1 text-xs text-neutral-600 transition-colors hover:bg-neutral-900 hover:text-neutral-300 sm:inline-flex"
               title="Manage projects"
             >
               Manage
@@ -446,38 +437,46 @@ export function HeaderBar(props: HeaderBarProps) {
         <nav
           data-viewport-allow-overflow
           data-viewport-allow-truncation
-          className="flex items-center gap-0.5 flex-1 overflow-x-auto min-w-0 mx-1"
+          className="order-3 flex min-w-0 flex-1 basis-full items-center gap-0.5 overflow-x-auto rounded-md border border-neutral-800 bg-[#0b0f14] p-0.5 sm:order-none sm:mx-1 sm:basis-0"
         >
-          {(['cockpit', 'board', 'directions', 'compute', 'home'] as const).map(tab => {
+          {(['chat', 'pipeline', 'project', 'runtime'] as const).map(tab => {
             const isActive = props.activeTab === tab;
+            const chatBadgeCount = tab === 'chat'
+              ? Math.max(openMessageCount ?? 0, newSinceLastVisitCount ?? 0)
+              : 0;
             return (
               <button
                 key={tab}
                 onClick={() => props.onTabChange(tab)}
-                className={`px-3 py-1.5 min-h-[44px] md:min-h-0 rounded-md text-sm font-medium transition-colors whitespace-nowrap ${
+                className={`inline-flex min-h-[44px] shrink-0 items-center rounded px-2.5 py-1 text-sm font-semibold transition-colors whitespace-nowrap md:min-h-0 ${
                   isActive
-                    ? 'bg-neutral-800 text-neutral-100'
-                    : 'text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800/50'
+                    ? 'bg-neutral-800 text-neutral-100 shadow-[0_1px_0_rgba(255,255,255,0.06)]'
+                    : 'text-neutral-500 hover:bg-neutral-900 hover:text-neutral-300'
                 }`}
               >
                 {tab.charAt(0).toUpperCase() + tab.slice(1)}
+                {chatBadgeCount > 0 && (
+                  <span className="ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-ui-sm font-bold leading-none text-black">
+                    {chatBadgeCount > 99 ? '99+' : chatBadgeCount}
+                  </span>
+                )}
               </button>
             );
           })}
         </nav>
 
         {/* RIGHT: Icon cluster + SettingsDropdown + mobile controls + Launch Task */}
-        <div className="flex items-center gap-1 ml-auto shrink-0">
+        <div className="ml-auto flex shrink-0 items-center gap-1">
 
           {/* Desktop icon cluster */}
-          <div className="hidden md:flex items-center gap-0.5">
+          <div className="hidden items-center gap-0.5 rounded-md border border-neutral-800 bg-[#0b0f14] p-0.5 md:flex">
             {/* Alerts — only when active alerts exist */}
             {(props.alertCount ?? 0) > 0 && (
               /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
               <button
                 onClick={props.onToggleAlertsPopover}
                 title={`${props.alertCount} alert${(props.alertCount ?? 0) > 1 ? 's' : ''}`}
-                className={`p-2 rounded-md text-xs transition-colors flex items-center gap-1 ${
+                className={`flex h-8 items-center gap-1 rounded px-2 text-xs transition-colors ${
                   props.showAlertsPopover
                     ? (props.alertMaxSeverity === 'ERROR' ? 'text-red-400 bg-red-500/10'
                       : props.alertMaxSeverity === 'WARNING' ? 'text-amber-400 bg-amber-500/10'
@@ -493,70 +492,33 @@ export function HeaderBar(props: HeaderBarProps) {
                 <span>{props.alertCount}</span>
               </button>
             )}
-            {/* Archive */}
-            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-            <button
-              onClick={onToggleArchive}
-              title="Archive"
-              className={`p-2 rounded-md text-xs transition-colors flex items-center ${showArchive ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
-            >
-              <Archive className="w-4 h-4" />
-            </button>
-            {/* Messages */}
-            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-            <button
-              onClick={onToggleMessages}
-              title="Compose message"
-              className={`p-2 rounded-md text-xs transition-colors flex items-center relative ${showMessages ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
-            >
-              <MessageSquare className="w-4 h-4" />
-              {props.openMessageCount > 0 && (
-                <span className="ml-0.5 bg-blue-500 text-white text-ui-2xs font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center">
-                  {props.openMessageCount > 9 ? '9+' : props.openMessageCount}
-                </span>
-              )}
-              {!showMessages && (props.newSinceLastVisitCount ?? 0) > 0 && (
-                <span className="ml-0.5 bg-amber-500 text-black text-ui-2xs font-bold w-4 h-4 rounded-full leading-none flex items-center justify-center" title={`${props.newSinceLastVisitCount} new since last visit`}>
-                  {(props.newSinceLastVisitCount ?? 0) > 9 ? '9+' : props.newSinceLastVisitCount}
-                </span>
-              )}
-            </button>
             {/* Activity */}
             {onOpenActivityFeed && (
               /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
               <button
                 onClick={onOpenActivityFeed}
                 title="Chronological activity stream"
-                className="p-2 rounded-md text-xs transition-colors flex items-center gap-1.5 text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800"
+                className="flex h-8 w-8 items-center justify-center rounded text-xs text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
               >
                 <Activity className="w-4 h-4" />
               </button>
             )}
-            {/* Metrics toggle */}
-            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
-            <button
-              onClick={onToggleMetrics}
-              title="Toggle metrics dashboard"
-              className={`p-2 rounded-md text-xs transition-colors flex items-center ${showMetrics ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
-            >
-              <BarChart2 className="w-4 h-4" />
-            </button>
             {/* Health pill — expands/collapses the full OrchestratorHealthBar */}
             {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
             <button
               onClick={() => setHealthExpanded(prev => !prev)}
               title={healthExpanded ? 'Hide health panel' : 'Show orchestrator health'}
-              className={`p-2 rounded-md text-xs transition-colors flex items-center gap-1 ${healthExpanded ? 'text-neutral-200 bg-neutral-800' : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'}`}
+              className={`flex h-8 items-center gap-1 rounded px-2 text-xs transition-colors ${healthExpanded ? 'text-neutral-200 bg-neutral-800' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'}`}
             >
               <span className={`w-2 h-2 rounded-full shrink-0 ${healthDotColor}`} />
-              <span className="hidden xl:inline">Health</span>
+              <span className="hidden font-mono xl:inline">health</span>
             </button>
           </div>
 
           {/* SettingsDropdown — always in DOM so its fixed overlay renders when triggered from mobile menu.
               The trigger button is hidden on mobile via triggerClassName; the fixed panel bypasses parent display:none. */}
           <SettingsDropdown
-            triggerClassName="hidden md:inline-flex"
+            triggerClassName="hidden md:inline-flex h-9 w-9 items-center justify-center rounded-md border border-neutral-800 bg-[#0b0f14] hover:bg-neutral-900"
           showSettings={showSettings}
           onToggleSettings={onToggleSettings}
           settingsRef={settingsRef}
@@ -725,13 +687,13 @@ export function HeaderBar(props: HeaderBarProps) {
           <div className="relative md:hidden" ref={mobileMenuRef}>
             <button
               onClick={() => setShowMobileMenu(prev => !prev)}
-              className="bg-neutral-800 hover:bg-neutral-700 text-neutral-300 p-3 min-w-[44px] min-h-[44px] rounded text-xs transition-colors border border-neutral-700 flex items-center justify-center"
+              className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-md border border-neutral-800 bg-[#0b0f14] p-3 text-xs text-neutral-300 transition-colors hover:bg-neutral-900"
               title="More options"
             >
               <MoreHorizontal className="w-4 h-4" />
             </button>
             {showMobileMenu && (
-              <div className="absolute right-0 top-full mt-2 w-56 bg-neutral-900 border border-neutral-700 rounded-lg shadow-2xl p-2 z-50">
+              <div className="absolute right-0 top-full z-50 mt-2 max-h-[calc(100vh-96px)] w-60 overflow-auto rounded-md border border-neutral-800 bg-[#0b0f14] p-2 shadow-2xl">
                 <button
                   onClick={() => { onToggleResearchBrowser(); setShowMobileMenu(false); }}
                   className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
@@ -751,30 +713,6 @@ export function HeaderBar(props: HeaderBarProps) {
                   <BookOpen className="w-4 h-4 shrink-0" />
                   <span>Knowledge Library</span>
                 </button>
-                <button
-                  onClick={() => { onToggleArchive(); setShowMobileMenu(false); }}
-                  className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showArchive ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
-                >
-                  <Archive className="w-4 h-4 shrink-0" />
-                  <span>Archive</span>
-                </button>
-                <button
-                  onClick={() => { onToggleMessages(); setShowMobileMenu(false); }}
-                  className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showMessages ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
-                >
-                  <MessageSquare className="w-4 h-4 shrink-0" />
-                  <span>Messages</span>
-                  {props.openMessageCount > 0 && (
-                    <span className="ml-auto bg-blue-500 text-white text-ui-xs font-bold px-1.5 py-0.5 rounded-full leading-none">
-                      {props.openMessageCount > 9 ? '9+' : props.openMessageCount}
-                    </span>
-                  )}
-                  {!showMessages && (props.newSinceLastVisitCount ?? 0) > 0 && (
-                    <span className="ml-auto bg-amber-500 text-black text-ui-xs font-bold px-1.5 py-0.5 rounded-full leading-none">
-                      {(props.newSinceLastVisitCount ?? 0) > 9 ? '9+' : props.newSinceLastVisitCount} new
-                    </span>
-                  )}
-                </button>
                 {onOpenActivityFeed && (
                   <button
                     onClick={() => { onOpenActivityFeed(); setShowMobileMenu(false); }}
@@ -784,20 +722,23 @@ export function HeaderBar(props: HeaderBarProps) {
                     <span>Activity stream</span>
                   </button>
                 )}
-                <button
-                  onClick={() => { props.onTabChange('cockpit'); setShowMobileMenu(false); }}
-                  className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
-                >
-                  <Compass className="w-4 h-4 shrink-0" />
-                  <span>Cockpit</span>
-                </button>
-                <button
-                  onClick={() => { props.onTabChange('directions'); setShowMobileMenu(false); }}
-                  className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
-                >
-                  <Compass className="w-4 h-4 shrink-0" />
-                  <span>Directions</span>
-                </button>
+                {(['chat', 'pipeline', 'project', 'runtime'] as const).map(tab => (
+                  <button
+                    key={tab}
+                    onClick={() => { props.onTabChange(tab); setShowMobileMenu(false); }}
+                    className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${
+                      props.activeTab === tab ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-300 hover:bg-neutral-800'
+                    }`}
+                  >
+                    <Compass className="w-4 h-4 shrink-0" />
+                    <span>{tab.charAt(0).toUpperCase() + tab.slice(1)}</span>
+                    {tab === 'chat' && (openMessageCount > 0 || (newSinceLastVisitCount ?? 0) > 0) && (
+                      <span className="ml-auto bg-amber-500 text-black text-ui-xs font-bold px-1.5 py-0.5 rounded-full leading-none">
+                        {Math.max(openMessageCount, newSinceLastVisitCount ?? 0)}
+                      </span>
+                    )}
+                  </button>
+                ))}
                 <button
                   onClick={() => setShowMobileShortcuts(prev => !prev)}
                   className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
@@ -812,14 +753,12 @@ export function HeaderBar(props: HeaderBarProps) {
                       {[
                         ['N', 'New task'],
                         ['R', 'Refresh tasks'],
-                        ['1', 'Kanban view'],
-                        ['2', 'Pipeline view'],
-                        ['3', 'Cockpit'],
-                        ['D', 'Directions tab'],
+                        ['1', 'Chat'],
+                        ['2', 'Pipeline'],
+                        ['3', 'Project'],
+                        ['4', 'Runtime'],
                         ['S', 'Toggle settings'],
-                        ['M', 'Toggle metrics'],
-                        ['A', 'Toggle activity feed'],
-                        ['?', 'This help'],
+                        ['A', 'Archive (pipeline)'],
                         ['Esc', 'Close panel/modal'],
                         ['Del', 'Cancel selected (selection mode)'],
                         ['R*', 'Retry selected (selection mode)'],
@@ -848,10 +787,11 @@ export function HeaderBar(props: HeaderBarProps) {
           {/* Launch Task CTA — always visible (primary action) */}
           <button
             onClick={onOpenNewTaskModal}
-            className="bg-white hover:bg-neutral-200 text-neutral-950 px-4 py-2 min-h-[44px] md:min-h-0 rounded text-xs font-semibold transition-colors shadow-sm flex items-center gap-2 h-fit"
+            className="flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-700 bg-neutral-100 px-3 py-2 text-xs font-semibold text-neutral-950 shadow-sm transition-colors hover:bg-white md:min-h-0 md:h-9 md:px-2.5 md:py-0"
           >
             <Plus className="w-3.5 h-3.5" />
-            Launch Task
+            <span className="hidden sm:inline">New task</span>
+            <span className="sm:hidden">New</span>
           </button>
         </div>
       </header>

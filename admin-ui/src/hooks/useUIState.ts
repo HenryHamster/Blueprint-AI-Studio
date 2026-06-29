@@ -1,9 +1,18 @@
 import { useState, useRef, useReducer, useCallback } from 'react';
 
-export type PrimaryTab = 'cockpit' | 'home' | 'board' | 'directions' | 'compute';
+export type PrimaryTab =
+  | 'chat'
+  | 'pipeline'
+  | 'project'
+  | 'runtime'
+  | 'cockpit'
+  | 'home'
+  | 'board'
+  | 'directions'
+  | 'compute';
 
 export function useUIState() {
-  const [activeTab, setActiveTab] = useState<PrimaryTab>('cockpit');
+  const [activeTab, setActiveTab] = useState<PrimaryTab>('chat');
   // Panel visibility
   const [showResearchBrowser, setShowResearchBrowser] = useState(false);
   const [showKnowledgeBrowser, setShowKnowledgeBrowser] = useState(false);

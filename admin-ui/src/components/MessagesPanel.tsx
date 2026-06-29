@@ -14,7 +14,7 @@ import { type ProjectMessage } from './MessageBubble';
 import { SaveViewDialog } from './SaveViewDialog';
 import { useMessageList } from './useMessageList';
 import { MessagesListView } from './MessagesListView';
-import { MessagesPanelHeader, type WebhookStats } from './MessagesPanelHeader';
+import { MessagesPanelHeader, type MessagesPanelFilterChrome, type WebhookStats } from './MessagesPanelHeader';
 import { MessagesComposer } from './MessagesComposer';
 import { armingToastCopy, parseArmingOutcome, type ArmingOutcome } from './messageArming';
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
@@ -106,15 +106,27 @@ function viewMatches(
   return true;
 }
 
-interface MessagesPanelProps {
+export type MessagesPanelVariant = 'modal' | 'page';
+
+export interface MessagesPanelProps {
   selectedProjectId: string | null;
   githubRepo?: string | null;
   defaultBranch?: string;
-  onClose: () => void;
+  onClose?: () => void;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onMessageCountChange?: (count: number) => void;
   onOpenTask?: (taskId: string) => void;
   notifyOnHighSignalMessage?: boolean;
+  /**
+   * `modal` preserves the legacy full header when `onClose` is supplied.
+   * `page` makes MessagesPanel suitable as a primary page: no close button by
+   * default and compact filter/saved-view chrome unless overridden below.
+   */
+  variant?: MessagesPanelVariant;
+  /** Controls whether filter/search/saved-view tools are always visible or collapsed behind a header toggle. */
+  filterChrome?: MessagesPanelFilterChrome;
+  /** Overrides the close button default derived from `variant` and `onClose`. */
+  showCloseButton?: boolean;
   /** Live signal: whether a strategic cycle is currently running for this project. */
   strategistActive?: boolean;
   /** Phase-level detail about the currently running cycle, if any. */
@@ -194,7 +206,11 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, strategistActive, cycleProgress, lastCycleCompletion }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion }: MessagesPanelProps) {
+  const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
+  const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
+  const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
+  const conversationMode = resolvedFilterChrome === 'minimal';
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
   // Compose — initialized from the per-project draft (if any) so a reload restores it.
@@ -1172,6 +1188,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   }
 
   const bubbleProps = {
+    actionMode: conversationMode ? 'reply-only' as const : 'full' as const,
     resolvingId,
     resolveInput,
     deletingIds,
@@ -1244,6 +1261,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         }}
         onOpenMutedPrefs={() => setShowPrefsPanel(true)}
         onClose={onClose}
+        showCloseButton={resolvedShowCloseButton}
+        filterChrome={resolvedFilterChrome}
       />
 
       {/* Strategic-refresh indicator: either pending (armed but not yet fired) or
@@ -1368,6 +1387,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
       {/* Messages list — chat-style scroll area */}
       <MessagesListView
+        presentation={conversationMode ? 'conversation' : 'triage'}
         scrollRef={scrollRef}
         blockersRefEl={blockersRefEl}
         questionsRefEl={questionsRefEl}

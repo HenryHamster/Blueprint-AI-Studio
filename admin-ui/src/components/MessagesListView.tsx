@@ -20,6 +20,7 @@ function TimeDividerRow({ label, className }: { label: string; className?: strin
 }
 
 export interface MessagesListViewProps {
+  presentation?: 'triage' | 'conversation';
   // Refs
   scrollRef: RefObject<HTMLDivElement | null>;
   blockersRefEl: RefObject<HTMLDivElement | null>;
@@ -83,6 +84,7 @@ export interface MessagesListViewProps {
  * scroll-down button. Renders entirely from props — owns no list-derivation logic.
  */
 export function MessagesListView({
+  presentation = 'triage',
   scrollRef,
   blockersRefEl,
   questionsRefEl,
@@ -129,6 +131,46 @@ export function MessagesListView({
   handleBulkDeleteResolved,
   scrollToBottom,
 }: MessagesListViewProps) {
+  if (presentation === 'conversation') {
+    return (
+      <div ref={scrollRef} className="relative flex-1 overflow-y-auto px-4 py-5 md:px-8 md:py-6 custom-scrollbar">
+        <div className="mx-auto flex w-full max-w-4xl flex-col gap-4">
+          {loading ? (
+            <p className="py-8 text-center text-xs text-neutral-500">Loading...</p>
+          ) : messages.length === 0 ? (
+            <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
+              <MessageSquare className="mb-3 h-8 w-8 opacity-40" />
+              <p className="text-sm">No messages yet</p>
+            </div>
+          ) : (
+            insertTimeDividers(messages).map((item, idx) =>
+              item.kind === 'divider' ? (
+                <TimeDividerRow key={`divider-conversation-${idx}`} label={item.label} className="my-1" />
+              ) : (
+                <MessageBubble
+                  key={item.msg.id}
+                  msg={item.msg}
+                  faded={item.msg.status === 'resolved'}
+                  allMessages={messages}
+                  {...bubbleProps}
+                />
+              ),
+            )
+          )}
+        </div>
+        {showScrollDown && (
+          <button
+            onClick={scrollToBottom}
+            className="absolute bottom-24 left-1/2 flex min-h-11 min-w-11 -translate-x-1/2 items-center justify-center rounded-full border border-neutral-700 bg-neutral-900 p-2 text-neutral-400 shadow-lg transition-colors hover:bg-neutral-800 hover:text-neutral-200"
+            aria-label="Scroll to latest message"
+          >
+            <ArrowDown className="h-4 w-4" />
+          </button>
+        )}
+      </div>
+    );
+  }
+
   return (
     <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 md:px-6 py-4 space-y-3 relative">
       {/* Prominent banner: X new since {time} with action buttons */}

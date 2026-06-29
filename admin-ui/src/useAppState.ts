@@ -404,8 +404,6 @@ export function useAppState() {
         if (showActivityFeed) { setShowActivityFeed(false); return; }
         if (showMessages) { setShowMessages(false); return; }
         if (showArchive) { setShowArchive(false); return; }
-        if (activeTab === 'directions') { setActiveTab('cockpit'); return; }
-        if (showMetrics) { setShowMetrics(false); return; }
         if (showSettings) { setShowSettings(false); return; }
         return;
       }
@@ -414,7 +412,7 @@ export function useAppState() {
 
       switch (e.key) {
         case 'n':
-          if (!showNewTaskModal && !logTask && !showResearchBrowser && activeTab !== 'directions' && !showSettings) {
+          if (!showNewTaskModal && !logTask && !showResearchBrowser && !showSettings) {
             openNewTaskModal();
           }
           break;
@@ -433,7 +431,7 @@ export function useAppState() {
                 },
               });
             }
-          } else if (!showNewTaskModal && !logTask && !showResearchBrowser && activeTab !== 'directions' && !showSettings) {
+          } else if (!showNewTaskModal && !logTask && !showResearchBrowser && !showSettings) {
             fetchTasks();
           }
           break;
@@ -459,28 +457,32 @@ export function useAppState() {
           }
           break;
         case '1':
-          setViewMode('kanban');
-          setActiveTab('board');
+          setShowMessages(false);
+          setShowArchive(false);
+          setActiveTab('chat');
           break;
         case '2':
           setViewMode('pipeline');
-          setActiveTab('board');
+          setShowMessages(false);
+          setShowArchive(false);
+          setActiveTab('pipeline');
           break;
         case '3':
-          setActiveTab('cockpit');
+          setShowMessages(false);
+          setShowArchive(false);
+          setActiveTab('project');
           break;
-        case 'd':
-          setActiveTab('directions');
+        case '4':
+          setShowMessages(false);
+          setShowArchive(false);
+          setActiveTab('runtime');
           break;
         case 's':
           setShowSettings(prev => !prev);
           break;
-        case 'm':
-          setShowMetrics(prev => !prev);
-          break;
         case 'a':
         case 'A':
-          if (!showNewTaskModal && !logTask && !showResearchBrowser && activeTab !== 'directions' && !showSettings) {
+          if (!showNewTaskModal && !logTask && !showResearchBrowser && activeTab === 'pipeline' && !showSettings) {
             setShowArchive(!showArchive);
           }
           break;
@@ -489,7 +491,7 @@ export function useAppState() {
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showMessages, activeTab, showMetrics, showSettings, showArchive, selectionMode, selectedTaskIds, tasks]);
+  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showMessages, activeTab, showSettings, showArchive, selectionMode, selectedTaskIds, tasks]);
 
   // ── Cross-domain glue handlers ────────────────────────────────────────────
 

@@ -1933,7 +1933,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         <button
                           type="submit"
                           disabled={ask.submitting || !ask.question.trim()}
-                          className="min-h-[44px] rounded bg-indigo-500/20 px-3 text-ui-sm font-semibold text-indigo-200 hover:bg-indigo-500/30 transition-colors disabled:opacity-50"
+                          className="min-h-[44px] min-w-[44px] rounded bg-indigo-500/20 px-3 text-ui-sm font-semibold text-indigo-200 hover:bg-indigo-500/30 transition-colors disabled:opacity-50"
                           data-testid="compute-ask-submit"
                         >
                           {ask.submitting ? 'Asking…' : 'Ask'}
