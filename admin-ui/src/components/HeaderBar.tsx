@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Compass, Microscope, BookOpen, MoreHorizontal, Settings, Bell, Plus } from 'lucide-react';
+import { Activity, Command, Compass, Microscope, BookOpen, MoreHorizontal, Settings, Bell, Plus } from 'lucide-react';
 import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
@@ -208,6 +208,7 @@ export interface HeaderBarProps {
   activeTab: PrimaryTab;
   onTabChange: (tab: PrimaryTab) => void;
   onMessageStrategic?: () => void;
+  onOpenCommandPalette?: () => void;
   // Unified top bar — HealthPill
   health: OrchestratorHealth | null;
   detailedHealth: DetailedHealth | null;
@@ -485,6 +486,21 @@ export function HeaderBar(props: HeaderBarProps) {
 
           {/* Desktop icon cluster */}
           <div className="hidden items-center gap-0.5 rounded-md border border-neutral-800 bg-[#0b0f14] p-0.5 md:flex">
+            {props.onOpenCommandPalette && (
+              /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
+              <button
+                type="button"
+                onClick={props.onOpenCommandPalette}
+                title="Open command palette (Ctrl+K)"
+                aria-label="Open command palette"
+                className="flex h-8 items-center gap-1 rounded px-2 text-xs font-semibold text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-100"
+              >
+                <Command className="w-3.5 h-3.5" />
+                <kbd className="hidden rounded border border-neutral-700 bg-neutral-950 px-1 py-0.5 font-mono text-ui-sm text-neutral-500 xl:inline-block">
+                  Ctrl K
+                </kbd>
+              </button>
+            )}
             {/* Alerts — only when active alerts exist */}
             {(props.alertCount ?? 0) > 0 && (
               /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
@@ -747,6 +763,18 @@ export function HeaderBar(props: HeaderBarProps) {
             </button>
             {showMobileMenu && (
               <div className="absolute right-0 top-full z-50 mt-2 max-h-[calc(100vh-96px)] w-60 overflow-auto rounded-md border border-neutral-800 bg-[#0b0f14] p-2 shadow-2xl">
+                {props.onOpenCommandPalette && (
+                  <button
+                    onClick={() => { props.onOpenCommandPalette?.(); setShowMobileMenu(false); }}
+                    className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
+                  >
+                    <Command className="w-4 h-4 shrink-0" />
+                    <span>Command palette</span>
+                    <kbd className="ml-auto rounded border border-neutral-700 bg-neutral-900 px-1.5 py-0.5 font-mono text-ui-sm text-neutral-500">
+                      Ctrl K
+                    </kbd>
+                  </button>
+                )}
                 <button
                   onClick={() => { onToggleResearchBrowser(); setShowMobileMenu(false); }}
                   className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
@@ -811,6 +839,7 @@ export function HeaderBar(props: HeaderBarProps) {
                   <div className="mx-2 mb-1 bg-neutral-800/50 rounded p-2">
                     <div className="space-y-1.5 text-xs">
                       {[
+                        ['Ctrl K', 'Command palette'],
                         ['N', 'New task'],
                         ['R', 'Refresh tasks'],
                         ['1', 'Strategic'],

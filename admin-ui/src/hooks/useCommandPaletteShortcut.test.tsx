@@ -64,10 +64,24 @@ describe('useCommandPaletteShortcut', () => {
     expect(onOpen).toHaveBeenCalledTimes(1);
   });
 
-  test('ignores unrelated keys and disabled state', () => {
+  test('does not capture Ctrl+K while disabled', () => {
+    const onOpen = mount(vi.fn(), false);
+    const event = new KeyboardEvent('keydown', {
+      key: 'k',
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+
+    document.dispatchEvent(event);
+
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  test('ignores unrelated keys', () => {
     const onOpen = mount(vi.fn(), false);
 
-    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true }));
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'j', ctrlKey: true, bubbles: true }));
 
     expect(onOpen).not.toHaveBeenCalled();

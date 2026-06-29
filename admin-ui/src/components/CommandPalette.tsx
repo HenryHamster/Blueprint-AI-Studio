@@ -279,6 +279,11 @@ export function CommandPalette({
                           </span>
                         )}
                       </span>
+                      {command.shortcut && (
+                        <kbd className="hidden shrink-0 rounded border border-neutral-700 bg-neutral-950/80 px-1.5 py-0.5 font-mono text-ui-md text-neutral-500 sm:inline-block">
+                          {command.shortcut}
+                        </kbd>
+                      )}
                     </button>
                   </div>
                 );

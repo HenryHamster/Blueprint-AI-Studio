@@ -305,6 +305,39 @@ describe('HeaderBar — viewport regression', () => {
     expect(onOpenActivityFeed).toHaveBeenCalledOnce();
   });
 
+  test('desktop command palette launcher calls its opener', async () => {
+    const onOpenCommandPalette = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenCommandPalette={onOpenCommandPalette} />); });
+    const commandButton = host.querySelector<HTMLButtonElement>('button[title="Open command palette (Ctrl+K)"]');
+    expect(commandButton).toBeTruthy();
+    await act(async () => { commandButton?.click(); });
+    expect(onOpenCommandPalette).toHaveBeenCalledOnce();
+  });
+
+  test('mobile menu exposes command palette action', async () => {
+    const onOpenCommandPalette = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.minHeight = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenCommandPalette={onOpenCommandPalette} />); });
+    const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
+    await act(async () => { hamburger?.click(); });
+
+    const commandButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.includes('Command palette'));
+    expect(commandButton).toBeTruthy();
+    await act(async () => { commandButton?.click(); });
+    expect(onOpenCommandPalette).toHaveBeenCalledOnce();
+  });
+
   test('pipeline tab shows attention badge from existing count prop', async () => {
     host = document.createElement('div');
     host.style.padding = '12px';

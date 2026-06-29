@@ -65,6 +65,19 @@ describe('CommandPalette', () => {
     expect(screen.queryByRole('button', { name: /Open task drawer/i })).toBeNull();
   });
 
+  test('renders command shortcuts when provided', () => {
+    render(
+      <CommandPalette
+        open
+        commands={makeCommands()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('O')).toBeInTheDocument();
+    expect(screen.getByText('S')).toBeInTheDocument();
+  });
+
   test('runs the active command with keyboard navigation and Enter', async () => {
     const user = userEvent.setup();
     const commands = makeCommands();

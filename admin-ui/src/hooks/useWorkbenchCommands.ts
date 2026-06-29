@@ -33,6 +33,9 @@ interface UseWorkbenchCommandsOptions {
   setShowKnowledgeBrowser: (show: boolean) => void;
   openNewTaskModal: () => void;
   openGlobalSettings: (section: SectionId | null) => void;
+  refreshWorkbench: () => void;
+  openProjectManagement: () => void;
+  openProjectMembers: () => void;
 }
 
 export function useWorkbenchCommands({
@@ -61,10 +64,17 @@ export function useWorkbenchCommands({
   setShowKnowledgeBrowser,
   openNewTaskModal,
   openGlobalSettings,
+  refreshWorkbench,
+  openProjectManagement,
+  openProjectMembers,
 }: UseWorkbenchCommandsOptions): WorkbenchCommand[] {
   return useMemo(() => {
     const projectDisabled = !selectedProjectId;
     const closePalette = () => setCommandPaletteOpen(false);
+    const runAndClose = (run: () => void) => {
+      run();
+      closePalette();
+    };
     const openProjectSection = (section: ProjectSection) => {
       setProjectSection(section);
       handleTabChange('project');
@@ -91,8 +101,18 @@ export function useWorkbenchCommands({
         section: 'Strategic',
         detail: selectedProjectRepoLabel ?? 'Open the Strategic conversation',
         keywords: ['chat', 'message', 'steer', 'strategist'],
+        shortcut: 'Global 1',
         disabled: projectDisabled,
         run: focusStrategicComposer,
+      },
+      {
+        id: 'workbench.refresh',
+        label: 'Refresh workbench',
+        section: 'Workbench',
+        detail: 'Tasks and Strategic context',
+        keywords: ['reload', 'sync', 'status'],
+        shortcut: 'Global R',
+        run: () => runAndClose(refreshWorkbench),
       },
       {
         id: 'pipeline.flow',
@@ -100,6 +120,7 @@ export function useWorkbenchCommands({
         section: 'Pipeline',
         detail: `${visibleActiveCount} active, ${visibleQueuedCount} queued`,
         keywords: ['tasks', 'flow', 'monitor'],
+        shortcut: 'Global 2',
         run: () => openPipelineSection('flow'),
       },
       {
@@ -116,6 +137,7 @@ export function useWorkbenchCommands({
         section: 'Pipeline',
         detail: 'Terminal and archived work',
         keywords: ['archived', 'terminal'],
+        shortcut: 'Global A',
         run: () => openPipelineSection('archive'),
       },
       {
@@ -124,6 +146,7 @@ export function useWorkbenchCommands({
         section: 'Project',
         detail: selectedProjectRepoLabel ?? 'Project context',
         keywords: ['status', 'context', 'brief'],
+        shortcut: 'Global 3',
         disabled: projectDisabled,
         run: () => openProjectSection('running-update'),
       },
@@ -164,11 +187,29 @@ export function useWorkbenchCommands({
         run: () => openProjectSection('manage'),
       },
       {
+        id: 'project.members',
+        label: 'Open project members',
+        section: 'Project',
+        detail: 'Access for the selected project',
+        keywords: ['access', 'team', 'users'],
+        disabled: projectDisabled,
+        run: () => runAndClose(openProjectMembers),
+      },
+      {
+        id: 'project.switcher',
+        label: 'Manage projects',
+        section: 'Project',
+        detail: 'Create, archive, restore, or delete projects',
+        keywords: ['project management', 'archive', 'delete'],
+        run: () => runAndClose(openProjectManagement),
+      },
+      {
         id: 'runtime.health',
         label: 'Open runtime health',
         section: 'Runtime',
         detail: apiHealthy ? 'API healthy' : 'API degraded',
         keywords: ['devices', 'runner', 'orchestrator'],
+        shortcut: 'Global 4',
         run: () => openRuntimeSection('health'),
       },
       {
@@ -249,6 +290,7 @@ export function useWorkbenchCommands({
         section: 'Pipeline',
         detail: 'Launch a manual operator task',
         keywords: ['new', 'launch'],
+        shortcut: 'Global N',
         disabled: projectDisabled,
         run: () => {
           openNewTaskModal();
@@ -261,6 +303,7 @@ export function useWorkbenchCommands({
         section: 'Workbench',
         detail: 'Defaults, notifications, and controls',
         keywords: ['preferences', 'config'],
+        shortcut: 'Global S',
         run: () => openGlobalSettings('general'),
       },
     ];
@@ -275,7 +318,10 @@ export function useWorkbenchCommands({
     maxPlanAccountCount,
     openGlobalSettings,
     openNewTaskModal,
+    openProjectManagement,
+    openProjectMembers,
     problemModelRevision,
+    refreshWorkbench,
     selectedProjectId,
     selectedProjectRepoLabel,
     setCommandPaletteOpen,

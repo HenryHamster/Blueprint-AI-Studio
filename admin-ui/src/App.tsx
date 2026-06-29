@@ -819,11 +819,8 @@ export default function App() {
   const commandPaletteShortcutEnabled = Boolean(
     !s.showNewTaskModal &&
     !s.logTask &&
-    !s.showResearchBrowser &&
-    !s.showKnowledgeBrowser &&
     !s.showSettings &&
     !s.showUserManagement &&
-    !s.showAlertsPopover &&
     !s.showComposeDrawer &&
     !s.showFleetDetail &&
     !s.showDirections &&
@@ -831,14 +828,20 @@ export default function App() {
     !showNewProjectModal &&
     !setupProjectId &&
     !s.confirmDialog &&
-    !showActivityFeed &&
     !showProjectManagement &&
     !showProjectMembers &&
     !commandPaletteOpen
   );
   const openCommandPalette = useCallback(() => {
+    s.setShowResearchBrowser(false);
+    s.setShowKnowledgeBrowser(false);
+    s.setShowAlertsPopover(false);
+    setShowActivityFeed(false);
+    setResearchBrowserDirectionId(null);
+    setKnowledgeBrowserDirectionId(null);
+    setKnowledgeBrowserInitialDocId(null);
     setCommandPaletteOpen(true);
-  }, []);
+  }, [s]);
   useCommandPaletteShortcut(openCommandPalette, commandPaletteShortcutEnabled);
 
   const openGlobalSettings = useCallback((section: SectionId | null = null) => {
@@ -873,6 +876,12 @@ export default function App() {
     setShowKnowledgeBrowser: s.setShowKnowledgeBrowser,
     openNewTaskModal: s.openNewTaskModal,
     openGlobalSettings,
+    refreshWorkbench: () => {
+      void s.fetchTasks();
+      void strategicReadModel.refresh();
+    },
+    openProjectManagement: () => setShowProjectManagement(true),
+    openProjectMembers: () => setShowProjectMembers(true),
   });
 
   const pipelineSurfaceActions = (
@@ -1255,6 +1264,7 @@ export default function App() {
         activeTab={activeTab}
         onTabChange={handleTabChange}
         onMessageStrategic={focusStrategicComposer}
+        onOpenCommandPalette={openCommandPalette}
         health={s.orchestratorHealth}
         detailedHealth={s.detailedHealth}
         pipelineThrottle={s.pipelineThrottle}
