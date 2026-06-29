@@ -751,6 +751,34 @@ describe('buildContextPrefix — compute experiment sweeps', () => {
     expect(prefix).not.toContain('[NOT MET]');
   });
 
+  it('omits sweeps that already have a disposition task in flight', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        compute_experiment_sweeps: {
+          'sweep-disposed': [
+            {
+              id: 'kd-disposed-1',
+              title: 'Disposed arm A',
+              arm_label: 'a',
+              criterion_met: true,
+              sweep_disposition: { task_id: 'task-1', status: 'running' },
+            },
+            {
+              id: 'kd-disposed-2',
+              title: 'Disposed arm B',
+              arm_label: 'b',
+              criterion_met: false,
+            },
+          ],
+        },
+      }],
+    });
+    expect(prefix).not.toContain('## Completed experiment sweeps');
+    expect(prefix).not.toContain('sweep-disposed');
+    expect(prefix).not.toContain('Disposed arm A');
+  });
+
   it('omits sweep section when compute_experiment_sweeps is absent', () => {
     const prefix = buildContextPrefix({
       payloads: [{ type: 'strategic_review', knowledge_index: [] }],

@@ -1147,6 +1147,15 @@ describe('buildSweepComparisonSection', () => {
     expect(result).toBe('');
   });
 
+  it('returns empty string for single-arm sweeps', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-single': [
+        { id: 'k-r', title: 'arm R', arm_label: 'r', criterion_met: true },
+      ],
+    });
+    expect(result).toBe('');
+  });
+
   it('returns empty string when an arm is unavailable', () => {
     const result = buildSweepComparisonSection({
       'sweep-2': [
@@ -1155,6 +1164,90 @@ describe('buildSweepComparisonSection', () => {
       ],
     });
     expect(result).toBe('');
+  });
+
+  it('returns empty string when arms have duplicate labels', () => {
+    expect(buildSweepComparisonSection({
+      'sweep-duplicate-label': [
+        { id: 'k-1', title: 'arm A', arm_label: 'same', criterion_met: true },
+        { id: 'k-2', title: 'arm B', arm_label: 'same', criterion_met: false },
+      ],
+    })).toBe('');
+  });
+
+  it('renders single-document arms-block sweeps (duplicate doc id, distinct arm_label)', () => {
+    // build_compute_sweep_groups emits one row per per_arm_verdict entry, all sharing
+    // the same knowledge document id from base_entry. Arms are identified by arm_label.
+    const result = buildSweepComparisonSection({
+      'sweep-single-doc': [
+        {
+          id: 'k-shared',
+          title: 'Sweep result doc',
+          arm_label: 'approach-a',
+          criterion_met: true,
+          criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+          per_arm_verdicts: {
+            'approach-a': { value: 0.95, met: true },
+            'approach-b': { value: 0.87, met: false },
+          },
+        },
+        {
+          id: 'k-shared',
+          title: 'Sweep result doc',
+          arm_label: 'approach-b',
+          criterion_met: false,
+        },
+      ],
+    });
+    expect(result).toContain('Sweep sweep-single-doc');
+    expect(result).toContain('Winner: **approach-a** (accuracy=0.95; margin=0.08 over approach-b=0.87)');
+    expect(result).toContain('margin: +0.08 accuracy over approach-b');
+    expect(result).toContain('**approach-a** [MET] [k-shared] (accuracy=0.95)');
+    expect(result).toContain('**approach-b** [NOT MET] [k-shared] (accuracy=0.87)');
+  });
+
+  it('returns empty string when criterion_met is not boolean', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-string-verdict': [
+        { id: 'k-1', title: 'arm A', arm_label: 'a', criterion_met: true },
+        { id: 'k-2', title: 'arm B', arm_label: 'b', criterion_met: 'false' },
+      ],
+    });
+    expect(result).toBe('');
+  });
+
+  it('renders metric values and best-arm margin for completed sweeps', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-abc': [
+        {
+          id: 'k-met',
+          title: 'Approach A: fast tokenizer',
+          arm_label: 'fast-tokenizer',
+          criterion_met: true,
+          criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+          per_arm_verdicts: {
+            'fast-tokenizer': { value: 0.93, met: true },
+            'slow-tokenizer': { value: 0.88, met: false },
+          },
+          summary: 'Achieved 98% accuracy at 2x throughput',
+        },
+        {
+          id: 'k-not',
+          title: 'Approach B: slow tokenizer',
+          arm_label: 'slow-tokenizer',
+          criterion_met: false,
+          summary: 'Only reached 85% accuracy',
+        },
+      ],
+    });
+    expect(result).toContain('## Completed experiment sweeps — synthesis required');
+    expect(result).toContain('Sweep sweep-abc');
+    expect(result).toContain('Winner: **fast-tokenizer** (accuracy=0.93; margin=0.05 over slow-tokenizer=0.88)');
+    expect(result).toContain('margin: +0.05 accuracy over slow-tokenizer');
+    expect(result).toContain('**fast-tokenizer** [MET] [k-met] (accuracy=0.93)');
+    expect(result).toContain('**slow-tokenizer** [NOT MET] [k-not] (accuracy=0.88)');
+    expect(result).toContain('exactly ONE follow-on move');
+    expect(result).toContain('./fetch knowledge');
   });
 
   it('names the winning arm by measured value and renders the numeric margin', () => {
@@ -1186,20 +1279,10 @@ describe('buildSweepComparisonSection', () => {
         },
       ],
     });
-    // Section header present
-    expect(result).toContain('## Completed experiment sweeps — synthesis required');
-    // Sweep id present
-    expect(result).toContain('Sweep sweep-abc');
-    // Names the winning arm by the measured value, not the array order.
-    expect(result).toContain('Winner: **beta** (loss=0.81)');
+    expect(result).toContain('Winner: **beta** (loss=0.81; margin=0.13 over alpha=0.94)');
     expect(result).toContain('margin: +0.13 loss over alpha');
-    // Both arms listed with verdicts
     expect(result).toContain('**alpha** [NOT MET]');
     expect(result).toContain('**beta** [MET]');
-    // Demands a follow-on move
-    expect(result).toContain('exactly ONE follow-on move');
-    // Refers to fetch for full analysis
-    expect(result).toContain('./fetch knowledge');
   });
 
   it('shows "none (all NOT MET)" as winner when no arm met the criterion', () => {
@@ -1211,19 +1294,21 @@ describe('buildSweepComparisonSection', () => {
           arm_label: 'a',
           criterion_met: false,
           criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
-          per_arm_verdicts: { a: { value: 0.82, met: false }, b: { value: 0.87, met: false } },
+          per_arm_verdicts: {
+            a: { value: 0.82, met: false },
+            b: { value: 0.79, met: false },
+          },
         },
         {
           id: 'k-b',
           title: 'arm B',
           arm_label: 'b',
           criterion_met: false,
-          criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
-          per_arm_verdicts: { a: { value: 0.82, met: false }, b: { value: 0.87, met: false } },
         },
       ],
     });
     expect(result).toContain('Winner: **none (all NOT MET)**');
+    expect(result).toContain('Best measured arm: **a** (accuracy=0.82; margin=0.03 over b=0.79)');
     expect(result).toContain('Winning: 0/2 arm(s) MET, 2/2 NOT MET');
   });
 
@@ -1239,9 +1324,22 @@ describe('buildSweepComparisonSection', () => {
     expect(result).not.toContain('margin:');
   });
 
+  it('does not dereference a missing measured arm when all label-only arms are NOT MET', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-label-only-all-fail': [
+        { id: 'k-a', title: 'arm A', arm_label: 'a', criterion_met: false, summary: 'No pass' },
+        { id: 'k-b', title: 'arm B', arm_label: 'b', criterion_met: false, summary: 'No pass' },
+      ],
+    });
+    expect(result).toContain('Winner: **none (all NOT MET)**');
+    expect(result).toContain('Best measured arm: none (no numeric metric values available)');
+    expect(result).toContain('**a** [NOT MET] [k-a]');
+    expect(result).toContain('**b** [NOT MET] [k-b]');
+  });
+
   it('omits the margin when there is only one numeric arm', () => {
     const result = buildSweepComparisonSection({
-      'sweep-single': [
+      'sweep-one-numeric': [
         {
           id: 'k-solo',
           title: 'Solo arm',
@@ -1250,6 +1348,13 @@ describe('buildSweepComparisonSection', () => {
           criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
           per_arm_verdicts: { solo: { value: 0.97, met: true } },
           summary: 'Single-arm completion',
+        },
+        {
+          id: 'k-unmeasured',
+          title: 'Unmeasured arm',
+          arm_label: 'unmeasured',
+          criterion_met: false,
+          summary: 'No metric value',
         },
       ],
     });
@@ -1274,16 +1379,76 @@ describe('buildSweepComparisonSection', () => {
     expect(result).toContain('Winner: **y2**');
   });
 
-  it('skips sweeps with no arms', () => {
+  it('skips sweeps with fewer than two arms', () => {
     const result = buildSweepComparisonSection({
       'sweep-empty': [],
       'sweep-real': [
-        { id: 'k-r', title: 'arm R', arm_label: 'r', criterion_met: true },
+        { id: 'k-r1', title: 'arm R1', arm_label: 'r1', criterion_met: true },
+        { id: 'k-r2', title: 'arm R2', arm_label: 'r2', criterion_met: false },
       ],
     });
-    // Only the real sweep with a verdicted arm should appear
+    // Only the real comparative sweep should appear.
     expect(result).not.toContain('Sweep sweep-empty');
-    // But the section still renders (sweep-real has 1 arm MET; single-arm sweeps are valid)
     expect(result).toContain('Sweep sweep-real');
+  });
+
+  it('renders disposed-sweep block and omits synthesis mandate for sweeps with sweep_disposition', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-disposed': [
+        {
+          id: 'k-d1',
+          title: 'arm A',
+          arm_label: 'arm-a',
+          criterion_met: true,
+          sweep_disposition: { task_id: 'task-adopt-789', status: 'in_progress' },
+        },
+        {
+          id: 'k-d2',
+          title: 'arm B',
+          arm_label: 'arm-b',
+          criterion_met: false,
+        },
+      ],
+    });
+    // Disposition block is rendered with heading, sweep id, task id, and status.
+    expect(result).toContain('## Sweep dispositions in flight — do not re-synthesize');
+    expect(result).toContain('**sweep-disposed**');
+    expect(result).toContain('task-adopt-789');
+    expect(result).toContain('in_progress');
+    // Normal synthesis mandate must NOT appear — disposed sweeps must not be re-synthesized.
+    expect(result).not.toContain('## Completed experiment sweeps — synthesis required');
+    expect(result).not.toContain('exactly ONE follow-on move');
+  });
+
+  it('renders disposed sweeps and completed sweeps independently in the same output', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-disposed': [
+        {
+          id: 'k-d1',
+          title: 'arm A',
+          arm_label: 'arm-a',
+          criterion_met: true,
+          sweep_disposition: { task_id: 'task-xyz', status: 'pending' },
+        },
+        {
+          id: 'k-d2',
+          title: 'arm B',
+          arm_label: 'arm-b',
+          criterion_met: false,
+        },
+      ],
+      'sweep-completed': [
+        { id: 'k-c1', title: 'arm C1', arm_label: 'c1', criterion_met: true },
+        { id: 'k-c2', title: 'arm C2', arm_label: 'c2', criterion_met: false },
+      ],
+    });
+    // Disposition block rendered for disposed sweep.
+    expect(result).toContain('## Sweep dispositions in flight — do not re-synthesize');
+    expect(result).toContain('**sweep-disposed**: disposition task `task-xyz` (pending)');
+    // Completed sweep rendered with synthesis mandate.
+    expect(result).toContain('## Completed experiment sweeps — synthesis required');
+    expect(result).toContain('Sweep sweep-completed');
+    // Disposed sweep id must NOT appear under the completed sweeps section.
+    expect(result).not.toContain('Sweep sweep-disposed');
   });
 });

@@ -27,6 +27,7 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
 from app.database import get_session
+from app.knowledge_query import build_compute_sweep_groups, build_sweep_knowledge_index
 from app.message_convergence import get_message_link, resolve_message_ref
 from app.models import Project, QualificationVerdict, ReleaseVersion, Task
 from app.routers.agent import verify_agent_token
@@ -736,39 +737,47 @@ async def agent_fetch_capability_trials(
     }
 
 
-@router.get("/projects/{project_id}/ci-compliance")
+@router.get("/projects/{project_id}/compute-sweeps")
 @limiter.limit("60/minute")
-async def agent_fetch_ci_compliance(
+async def agent_fetch_compute_sweeps(
     request: Request,
     project_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ):
-    """Return CI-compliance status for the project's current integration branch HEAD.
+    """Return grouped compute-experiment sweep evidence for the project.
 
-    Checks module-size guardrails (capped files in module_size_limits.json)
-    and branch-literal guardrails (agent handler TS files) via GitHub snapshot
-    reads.  Results are SHA-keyed and cached in-memory so a stable HEAD costs
-    only one snapshot round-trip per backend restart.
-
-    Returns ``{"status": "success", "data": {"source": "unavailable"}}`` when
-    GitHub credentials are unavailable (e.g. project has no GitHub repo
-    configured); otherwise returns the full compliance dict with
-    ``module_size``, ``branch_literal``, ``overall``, and ``sha`` fields.
+    Returns ``{sweep_id: [entry, ...]}`` for sweeps that have at least two
+    documents (the same grouping that the strategic payload packs under
+    ``compute_experiment_sweeps``). Used for recovery when that field was
+    dropped under budget pressure. Read-only; cross-project access returns 404.
     """
-    from app.ci_compliance import (  # noqa: PLC0415
-        compact_ci_compliance,
-        get_or_compute_ci_compliance,
-    )
+    await _resolve_agent_project(project_id, token, session)
+    groups = await build_compute_sweep_groups(session, project_id)
+    return {"status": "success", "data": groups}
 
-    project = await _resolve_agent_project(project_id, token, session)
-    envelope = await get_or_compute_ci_compliance(project, session)
-    if not isinstance(envelope, dict) or envelope.get("status") != "success":
-        return {"status": "success", "data": {"source": "unavailable"}}
-    compact = compact_ci_compliance(envelope.get("data"))
-    if compact is None:
-        return {"status": "success", "data": {"source": "unavailable"}}
-    return {"status": "success", "data": compact}
+
+@router.get("/projects/{project_id}/compute-sweeps/{sweep_id}")
+@limiter.limit("60/minute")
+async def agent_fetch_compute_sweep(
+    request: Request,
+    project_id: uuid.UUID,
+    sweep_id: str,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return all compute-experiment docs for a single sweep, oldest-first.
+
+    Covers both per-arm docs (arm_label set) and the sweep-aggregate doc
+    (arm_label null). Used when the strategist needs to recover the full arm
+    evidence for one sweep without fetching all groups. Read-only; cross-project
+    access returns 404.
+    """
+    await _resolve_agent_project(project_id, token, session)
+    docs = await build_sweep_knowledge_index(session, project_id, sweep_id)
+    if not docs:
+        raise HTTPException(status_code=404, detail="Sweep not found")
+    return {"status": "success", "data": docs}
 
 
 @router.get("/projects/{project_id}/gaps/{gap_id}")

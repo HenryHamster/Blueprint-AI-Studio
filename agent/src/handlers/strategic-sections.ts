@@ -470,15 +470,15 @@ function countOrLocal(value: unknown, fallback: number): number {
   return Number.isFinite(parsed) ? parsed : fallback;
 }
 
+function formatMetricNumber(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(4).replace(/\.?0+$/, '');
+}
+
 function metricDirection(operator: unknown): 'higher' | 'lower' | null {
   const op = strVal(operator);
   if (op === '>' || op === '>=') return 'higher';
   if (op === '<' || op === '<=') return 'lower';
   return null;
-}
-
-function fmtMetricNumber(value: number): string {
-  return Number.isInteger(value) ? String(value) : value.toFixed(6).replace(/\.?0+$/, '');
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -494,6 +494,32 @@ function pickOwnVerdict(arm: Record<string, unknown>): Record<string, unknown> |
   return verdictValues.length === 1 && isRecord(verdictValues[0])
     ? verdictValues[0]
     : null;
+}
+
+function bestArmByMetric(
+  arms: Array<{ id: string; label: string; value: number }>,
+  direction: 'higher' | 'lower' | null,
+): { id: string; label: string; value: number } | null {
+  if (arms.length === 0 || direction === null) return null;
+  return arms.reduce<{ id: string; label: string; value: number } | null>((best, arm) => {
+    if (best === null) return arm;
+    const better = direction === 'higher' ? arm.value > best.value : arm.value < best.value;
+    return better ? arm : best;
+  }, null);
+}
+
+function renderMetricTail(
+  metricName: string,
+  arm: { label: string; value: number },
+  runnerUp: { label: string; value: number } | null,
+  direction: 'higher' | 'lower' | null,
+): string {
+  const valuePart = `${metricName}=${formatMetricNumber(arm.value)}`;
+  if (!runnerUp || direction === null) return ` (${valuePart})`;
+  const margin = direction === 'higher'
+    ? arm.value - runnerUp.value
+    : runnerUp.value - arm.value;
+  return ` (${valuePart}; margin=${formatMetricNumber(Math.abs(margin))} over ${runnerUp.label}=${formatMetricNumber(runnerUp.value)})`;
 }
 
 /**
@@ -518,89 +544,145 @@ export function buildSweepComparisonSection(
   // Collect fully-verdicted sweeps: every arm is MET (criterion_met===true) or
   // NOT MET (criterion_met===false). Arms that are UNMEASURED (null) or unavailable
   // disqualify the sweep — the strategist cannot synthesize without all verdicts.
+  // Sweeps that already have a disposition task in flight are tracked separately so
+  // the strategist is not prompted to re-synthesize them.
   type FullSweep = { sweepId: string; arms: Array<Record<string, unknown>> };
+  type DisposedSweep = { sweepId: string; disposition: Record<string, unknown> };
   const completed: FullSweep[] = [];
+  const disposed: DisposedSweep[] = [];
   for (const [sweepId, arms] of Object.entries(sweepMap)) {
     if (!Array.isArray(arms) || arms.length === 0) continue;
+    const dispArm = arms.find(a => a.sweep_disposition != null && typeof a.sweep_disposition === 'object' && !Array.isArray(a.sweep_disposition));
+    if (dispArm) {
+      disposed.push({ sweepId, disposition: dispArm.sweep_disposition as Record<string, unknown> });
+      continue;
+    }
+    const labels = new Set<string>();
+    const identities = new Set<string>();
     const allVerdicted = arms.every(arm => {
+      const armId = strVal(arm.id);
+      const armLabel = strVal(arm.arm_label);
+      // identity = label when present; falls back to doc id. Arms sharing a doc id
+      // (single-document arms-block shape from build_compute_sweep_groups) are
+      // distinguished by arm_label, so duplicate doc ids are allowed when labels differ.
+      const identity = armLabel || armId;
+      if (!identity) return false;
+      if (armLabel) {
+        if (labels.has(armLabel)) return false;
+        labels.add(armLabel);
+      }
+      if (identities.has(identity)) return false;
+      identities.add(identity);
       if (strVal(arm.unavailable_cause)) return false;
       return arm.criterion_met === true || arm.criterion_met === false;
     });
-    if (allVerdicted) completed.push({ sweepId, arms });
+    if (allVerdicted && identities.size >= 2) completed.push({ sweepId, arms });
   }
 
-  if (completed.length === 0) return '';
+  if (completed.length === 0 && disposed.length === 0) return '';
 
-  const lines: string[] = ['\n## Completed experiment sweeps — synthesis required'];
-  lines.push(
-    'Every arm below is fully verdicted. For EACH sweep you MUST (in Section 3): ' +
-    '(1) name the winning arm and state by how much it won, ' +
-    '(2) state what the result implies, and ' +
-    '(3) propose exactly ONE follow-on move: adopt the winning arm in an implementation direction, ' +
-    'commission a deeper follow-on experiment to resolve remaining ambiguity, or close the hypothesis as settled. ' +
-    'Do NOT leave a completed sweep without a move.',
-  );
+  const lines: string[] = [];
+  if (completed.length > 0) {
+    lines.push('\n## Completed experiment sweeps — synthesis required');
+    lines.push(
+      'Every arm below is fully verdicted. For EACH sweep you MUST (in Section 3): ' +
+      '(1) name the winning arm and state by how much it won, ' +
+      '(2) state what the result implies, and ' +
+      '(3) propose exactly ONE follow-on move: adopt the winning arm in an implementation direction, ' +
+      'commission a deeper follow-on experiment to resolve remaining ambiguity, or close the hypothesis as settled. ' +
+      'Do NOT leave a completed sweep without a move.',
+    );
+  }
 
   for (const { sweepId, arms } of completed) {
-    const winningArms = arms.filter(a => a.criterion_met === true);
-    const losingArms = arms.filter(a => a.criterion_met === false);
-    const criterion = arms.find(a => isRecord(a.criterion))?.criterion;
-    const direction = isRecord(criterion) ? metricDirection(criterion.operator) : null;
-    const metric = isRecord(criterion) ? strVal(criterion.metric) : '';
-    const measuredArms = direction && metric ? arms.flatMap((arm) => {
-      const verdict = pickOwnVerdict(arm);
-      const rawValue = verdict?.value;
-      const value = typeof rawValue === 'number' ? rawValue : Number(rawValue);
-      const id = strVal(arm.id);
+    const criterion = arms.find(a => isRecord(a.criterion))?.criterion as Record<string, unknown> | undefined;
+    const direction = metricDirection(criterion?.operator);
+    const metric = strVal(criterion?.metric, 'value');
+    const sharedVerdicts = arms.find(a => isRecord(a.per_arm_verdicts))?.per_arm_verdicts as Record<string, Record<string, unknown>> | undefined;
+    type MeasuredArm = { id: string; label: string; value: number };
+    const armRows = arms.map(arm => {
       const label = strVal(arm.arm_label) || strVal(arm.id);
-      return Number.isFinite(value) && label ? [{ id, label, value }] : [];
-    }) : [];
-    let metricWinner: { id: string; label: string; value: number } | null = null;
-    if (winningArms.length > 0 && measuredArms.length > 0) {
-      for (const arm of measuredArms) {
-        if (!metricWinner) {
-          metricWinner = arm;
-          continue;
-        }
-        const better = direction === 'higher' ? arm.value > metricWinner.value : arm.value < metricWinner.value;
-        if (better) metricWinner = arm;
+      const verdict = label && sharedVerdicts?.[label]
+        ? sharedVerdicts[label]
+        : pickOwnVerdict(arm) ?? undefined;
+      const value = typeof verdict?.value === 'number' ? verdict.value : Number(verdict?.value);
+      return {
+        label,
+        id: strVal(arm.id),
+        met: verdict?.met === true || arm.criterion_met === true,
+        value: Number.isFinite(value) ? value : null,
+        summary: strVal(arm.summary),
+      };
+    });
+    const measuredArms: MeasuredArm[] = armRows.flatMap(arm => (
+      arm.value === null ? [] : [{ id: arm.id, label: arm.label, value: arm.value }]
+    )).sort((a, b) => {
+      const aValue = a.value;
+      const bValue = b.value;
+      if (direction === 'lower') {
+        return aValue !== bValue ? aValue - bValue : a.label.localeCompare(b.label);
       }
-    }
-    const winnerLabel = winningArms.length > 0
-      ? (metricWinner
-        ? metricWinner.label
-        : winningArms.map(a => strVal(a.arm_label) || strVal(a.id)).join(', '))
-      : 'none (all NOT MET)';
+      return aValue !== bValue ? bValue - aValue : a.label.localeCompare(b.label);
+    });
+    const metArms: MeasuredArm[] = armRows.flatMap(arm => (
+      arm.met && arm.value !== null ? [{ id: arm.id, label: arm.label, value: arm.value }] : []
+    ));
+    const metricWinner = bestArmByMetric(metArms, direction);
+    const winnerKey = metricWinner ? (metricWinner.label || metricWinner.id) : '';
     const runnerUp = metricWinner && measuredArms.length > 1
-      ? measuredArms.filter(arm => arm.id !== metricWinner.id).reduce<{ id: string; label: string; value: number } | null>((best, arm) => {
-        if (best === null) return arm;
-        const better = direction === 'higher' ? arm.value > best.value : arm.value < best.value;
-        return better ? arm : best;
-      }, null)
-      : null;
+      ? measuredArms.find(arm => (arm.label || arm.id) !== winnerKey) ?? null
+      : measuredArms[1] ?? null;
+    const metLabels = armRows.filter(arm => arm.met).map(arm => arm.label);
+    const winnerLabel = metricWinner
+      ? metricWinner.label
+      : metLabels.length > 0
+        ? metLabels.join(', ')
+        : 'none (all NOT MET)';
 
     lines.push(`\n### Sweep ${sweepId}`);
-    lines.push(`Winner: **${winnerLabel}**${metricWinner ? ` (${metric}=${fmtMetricNumber(metricWinner.value)})` : ''}`);
+    lines.push(
+      metricWinner
+        ? `Winner: **${winnerLabel}**${renderMetricTail(metric, metricWinner, runnerUp, direction)}`
+        : `Winner: **${winnerLabel}**`,
+    );
     if (metricWinner && runnerUp) {
-      const margin = direction === 'higher'
-        ? metricWinner.value - runnerUp.value
-        : runnerUp.value - metricWinner.value;
-      lines.push(`margin: +${fmtMetricNumber(margin)} ${metric} over ${runnerUp.label}`);
+      const margin = direction === 'lower'
+        ? runnerUp.value - metricWinner.value
+        : metricWinner.value - runnerUp.value;
+      lines.push(`margin: +${formatMetricNumber(margin)} ${metric} over ${runnerUp.label}`);
+    } else if (!metricWinner) {
+      if (measuredArms.length > 0) {
+        const measuredFallback = measuredArms[0];
+        lines.push(
+          `Best measured arm: **${measuredFallback.label}**${renderMetricTail(metric, measuredFallback, runnerUp, direction)}`,
+        );
+      } else {
+        lines.push('Best measured arm: none (no numeric metric values available)');
+      }
     }
 
-    for (const arm of arms) {
-      const armId = strVal(arm.id);
-      const armLabel = strVal(arm.arm_label) || armId;
-      const verdict = arm.criterion_met === true ? 'MET' : 'NOT MET';
-      const summary = strVal(arm.summary);
-      const summaryTail = summary ? ` — ${summary.slice(0, 200)}` : '';
-      lines.push(`- **${armLabel}** [${verdict}] [${armId}]${summaryTail}`);
+    for (const arm of armRows) {
+      const armLabel = arm.label || arm.id;
+      const verdict = arm.met ? 'MET' : 'NOT MET';
+      const metricTail = arm.value === null ? '' : ` (${strVal(criterion?.metric, 'value')}=${formatMetricNumber(arm.value)})`;
+      const summaryTail = arm.summary ? ` — ${arm.summary.slice(0, 200)}` : '';
+      lines.push(`- **${armLabel}** [${verdict}] [${arm.id}]${metricTail}${summaryTail}`);
     }
 
     lines.push(
       `Use \`./fetch knowledge <id>\` for each arm's full analysis before concluding. ` +
-      `Winning: ${winningArms.length}/${arms.length} arm(s) MET, ${losingArms.length}/${arms.length} NOT MET.`,
+      `Winning: ${armRows.filter(a => a.met).length}/${armRows.length} arm(s) MET, ${armRows.filter(a => !a.met).length}/${armRows.length} NOT MET.`,
     );
+  }
+
+  if (disposed.length > 0) {
+    lines.push('\n## Sweep dispositions in flight — do not re-synthesize');
+    lines.push('These sweeps are fully verdicted but already have a disposition task in progress. Skip re-synthesis and wait for the follow-on to complete.');
+    for (const { sweepId, disposition } of disposed) {
+      const status = typeof disposition.status === 'string' ? disposition.status : 'unknown';
+      const taskId = typeof disposition.task_id === 'string' ? disposition.task_id : 'n/a';
+      lines.push(`- **${sweepId}**: disposition task \`${taskId}\` (${status})`);
+    }
   }
 
   return lines.join('\n');

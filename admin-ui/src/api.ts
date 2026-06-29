@@ -3352,7 +3352,10 @@ export interface ComputeSweepKnowledgeEntry {
   id: string;
   title: string;
   summary?: string | null;
-  acceptance_grade?: string | null;
+  compute_acceptance_grade?: 'acceptance' | 'measured_only' | null;
+  criterion_met?: boolean | null;
+  criterion?: ComputeSuccessCriterion | null;
+  per_arm_verdicts?: Record<string, { value: number | null; met: boolean | null; cost_usd: number | null }> | null;
   arm_label?: string | null;
   created_at?: string | null;
   source_kind?: string | null;

@@ -459,9 +459,14 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         sweepLines.push(
           'Comparative arm results from completed multi-arm compute experiments. Use `./fetch knowledge <id>` to retrieve the full analysis body for any arm.',
         );
+        let renderedSweepCount = 0;
         for (const sweepId of sweepIds) {
           const arms = sweepMap[sweepId];
           if (!Array.isArray(arms) || arms.length === 0) continue;
+          if (arms.some(arm => arm.sweep_disposition != null && typeof arm.sweep_disposition === 'object' && !Array.isArray(arm.sweep_disposition))) {
+            continue;
+          }
+          renderedSweepCount += 1;
           sweepLines.push(`\n### Sweep ${sweepId}`);
           for (const arm of arms) {
             const id = strVal(arm.id);
@@ -486,8 +491,10 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
             if (summary) sweepLines.push(`  ${summary}`);
           }
         }
-        sweepLines.push('');
-        prefix += sweepLines.join('\n') + '\n';
+        if (renderedSweepCount > 0) {
+          sweepLines.push('');
+          prefix += sweepLines.join('\n') + '\n';
+        }
       }
     }
   }

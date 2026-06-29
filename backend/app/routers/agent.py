@@ -5245,6 +5245,9 @@ async def agent_list_knowledge_documents(
     finding_hash: str | None = Query(
         default=None, description="Exact originating research finding hash filter"
     ),
+    sweep_id: str | None = Query(
+        default=None, description="Exact sweep_id filter (compute experiment sweeps)"
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
@@ -5257,8 +5260,9 @@ async def agent_list_knowledge_documents(
     newest-first, limit/offset paginated) but scopes to the token's task project
     — never a URL-supplied project — so an agent cannot read another project's
     documents. The list shape omits the markdown body; use get-by-id for the
-    full document. The new ``direction`` / ``source_kind`` filters are additive:
-    omitting them preserves the prior behavior and response shape exactly.
+    full document. The new ``direction`` / ``source_kind`` / ``sweep_id`` filters
+    are additive: omitting them preserves the prior behavior and response shape
+    exactly.
     """
     project_id = await _resolve_token_project_id(session, token)
     return await kq_list_knowledge_documents(
@@ -5272,6 +5276,7 @@ async def agent_list_knowledge_documents(
         origin_state=origin_state,
         challenge_state=challenge_state,
         finding_hash=finding_hash,
+        sweep_id=sweep_id,
         limit=limit,
         offset=offset,
     )

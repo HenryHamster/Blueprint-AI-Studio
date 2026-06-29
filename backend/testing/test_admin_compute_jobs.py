@@ -1461,8 +1461,24 @@ async def test_aggregate_summary_endpoint_empty_project(
 # ---------------------------------------------------------------------------
 
 
-async def _seed_sweep_doc(session, project, task, *, sweep_id, arm_label):
-    """Seed a compute-experiment KnowledgeDocument with sweep metadata."""
+async def _seed_sweep_doc(session, project, *, sweep_id, arm_label, criterion_met=True):
+    """Seed one planned compute arm and its matching KnowledgeDocument."""
+    task = Task(
+        project_id=project.id,
+        title=f"sweep task {arm_label}",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "sweep_id": sweep_id,
+                "experiment": arm_label,
+            }
+        ],
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
     doc = KnowledgeDocument(
         project_id=project.id,
         source_task_id=task.id,
@@ -1473,6 +1489,10 @@ async def _seed_sweep_doc(session, project, task, *, sweep_id, arm_label):
         topic="exp",
         sweep_id=sweep_id,
         arm_label=arm_label,
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": criterion_met,
+        },
     )
     session.add(doc)
     await session.commit()
@@ -1485,18 +1505,11 @@ async def test_sweep_groups_endpoint_viewer_ok(client: AsyncClient, db_session):
     """A viewer can retrieve sweep groups; response shape includes sweep_id key."""
     project = await _make_project(db_session, name="Sweep Groups Viewer")
     await _add_member(db_session, project.id, "viewer")
-    task = Task(
-        project_id=project.id,
-        title="sweep task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "compute_experiment"}],
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
     # Two arms in one sweep — minimum for build_compute_sweep_groups to include it.
-    await _seed_sweep_doc(db_session, project, task, sweep_id="sw-abc", arm_label="baseline")
-    await _seed_sweep_doc(db_session, project, task, sweep_id="sw-abc", arm_label="treatment")
+    await _seed_sweep_doc(db_session, project, sweep_id="sw-abc", arm_label="baseline")
+    await _seed_sweep_doc(
+        db_session, project, sweep_id="sw-abc", arm_label="treatment"
+    )
 
     resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups")
     assert resp.status_code == 200
@@ -1507,6 +1520,34 @@ async def test_sweep_groups_endpoint_viewer_ok(client: AsyncClient, db_session):
     assert len(groups["sw-abc"]) == 2
     arm_labels = {e["arm_label"] for e in groups["sw-abc"]}
     assert arm_labels == {"baseline", "treatment"}
+
+
+@pytest.mark.asyncio
+async def test_sweep_groups_endpoint_omits_incomplete_planned_sweep(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session, name="Sweep Groups Incomplete")
+    await _add_member(db_session, project.id, "viewer")
+    await _seed_sweep_doc(db_session, project, sweep_id="sw-missing", arm_label="baseline")
+    missing_task = Task(
+        project_id=project.id,
+        title="missing sweep task",
+        status=TaskStatus.FAILED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "sweep_id": "sw-missing",
+                "experiment": "treatment",
+            }
+        ],
+    )
+    db_session.add(missing_task)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups")
+    assert resp.status_code == 200
+    assert resp.json()["sweep_groups"] == {}
 
 
 @pytest.mark.asyncio
