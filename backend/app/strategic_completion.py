@@ -1287,9 +1287,12 @@ async def _apply_qualify_request(
     It is the agent's signal that an ``open`` version in ``stabilize`` is
     release-ready (automain-lts-plan-v1.md Phase 3). When valid, looks up the
     open ``ReleaseVersion``, gates on
-    ``phase == "stabilize"``, and calls ``release_qualifier.run_qualification``
+    ``phase == "stabilize"``, verifies the current automain HEAD is not blocked
+    by CI-compliance violations, and calls ``release_qualifier.run_qualification``
     (which snapshots the candidate SHA + spawns the audit/smoketest children;
-    the caller's surrounding commit persists its version-row writes).
+    the caller's surrounding commit persists its version-row writes). When
+    CI-compliance blocks qualification, the cap-bump remediation task is spawned
+    before returning.
 
     Silently no-ops when ``request`` is None/not a dict, there is no open
     ``ReleaseVersion``, or that version is not in ``stabilize``. All errors are
@@ -1324,6 +1327,54 @@ async def _apply_qualify_request(
                 open_ver.phase,
             )
             return
+        try:
+            from app import ci_compliance as _ci_compliance
+            from app.strategic_spawning import (
+                _maybe_spawn_ci_compliance_cap_bump_fix,
+                ci_compliance_qualify_gate,
+            )
+
+            status = await _ci_compliance.ensure_current_ci_compliance(
+                session, project
+            )
+            if status.get("status") == "success":
+                gate = ci_compliance_qualify_gate(project, status.get("head_sha"))
+                if gate.get("blocked"):
+                    spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(
+                        session, project, gate
+                    )
+                    logger.info(
+                        "[STRATEGIC] Task %s (%s path): qualify_request for "
+                        "project %s version v%d blocked by CI-compliance "
+                        "violations=%s head=%s cap_bump_task=%s (reason=%r)",
+                        task.id,
+                        path,
+                        project.id,
+                        open_ver.version_number,
+                        gate.get("violation_count", 0),
+                        gate.get("head_sha"),
+                        getattr(spawned, "id", None),
+                        reason,
+                    )
+                    return
+            else:
+                logger.info(
+                    "[STRATEGIC] Task %s (%s path): CI-compliance status "
+                    "unavailable for project %s before qualify_request "
+                    "(reason=%s); failing open",
+                    task.id,
+                    path,
+                    project.id,
+                    status.get("reason"),
+                )
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] Task %s (%s path): CI-compliance qualify gate "
+                "failed for project %s; failing open",
+                task.id,
+                path,
+                project.id,
+            )
         result = await _rq.run_qualification(session, project.id, open_ver)
         logger.info(
             "[STRATEGIC] Task %s (%s path): qualify_request ran qualification "

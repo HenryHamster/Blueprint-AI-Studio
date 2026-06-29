@@ -2501,6 +2501,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "summarize": _summarize_version_phase,
         "floor": _version_phase_floor,
     },
+    "ci_compliance": {"priority": "high"},
     # What is actually deployed (running live on the promotion target) vs what
     # has merged to the integration branch but is not yet promoted. High
     # priority: it is load-bearing for every runtime-metric judgment, and small.
@@ -4139,6 +4140,161 @@ async def _resolve_candidate_currency(
         "candidate_sha": candidate_sha,
         "head_sha": head_sha,
     }
+
+
+def ci_compliance_qualify_gate(
+    project: Project,
+    head_sha: str | None = None,
+) -> dict[str, Any]:
+    """Return whether current CI-compliance violations block qualification."""
+    records = project.ci_compliance or {}
+    selected_sha = head_sha
+    if selected_sha is None and isinstance(records, dict) and records:
+        selected_sha = next(reversed(records))
+    record = records.get(selected_sha) if selected_sha else None
+    if not isinstance(record, dict):
+        return {
+            "blocked": False,
+            "head_sha": selected_sha,
+            "violations": [],
+            "violation_count": 0,
+            "branch_literal_violations": [],
+            "branch_literal_violation_count": 0,
+            "reason": "ci_compliance_record_missing",
+        }
+    violations = record.get("violations") if isinstance(record.get("violations"), list) else []
+    branch_literal_violations = (
+        record.get("branch_literal_violations")
+        if isinstance(record.get("branch_literal_violations"), list)
+        else []
+    )
+    blocked = record.get("compliant") is False and (
+        bool(violations) or bool(branch_literal_violations)
+    )
+    return {
+        "blocked": blocked,
+        "head_sha": selected_sha,
+        "violations": violations,
+        "violation_count": len(violations),
+        "branch_literal_violations": branch_literal_violations,
+        "branch_literal_violation_count": len(branch_literal_violations),
+        "compliant": record.get("compliant"),
+    }
+
+
+async def _maybe_spawn_ci_compliance_cap_bump_fix(
+    session: AsyncSession,
+    project: Project,
+    gate: dict[str, Any],
+) -> Task | None:
+    """Spawn one cap-bump remediation task for a non-compliant HEAD."""
+    if not gate.get("blocked"):
+        return None
+    head_sha = gate.get("head_sha")
+    if not isinstance(head_sha, str) or not head_sha:
+        return None
+
+    active_statuses = {
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+        TaskStatus.BLOCKED,
+        TaskStatus.PARKED,
+    }
+    rows = (
+        await session.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.status.in_(active_statuses),
+            )
+        )
+    ).scalars().all()
+    for task in rows:
+        context = task.context or {}
+        if (
+            context.get("spawned_by") == "ci_compliance_cap_bump_gate"
+            and context.get("head_sha") == head_sha
+        ):
+            return task
+
+    violations = gate.get("violations") if isinstance(gate.get("violations"), list) else []
+    branch_literal_violations = (
+        gate.get("branch_literal_violations")
+        if isinstance(gate.get("branch_literal_violations"), list)
+        else []
+    )
+    violation_lines = "\n".join(
+        f"- {v.get('section')}/{v.get('rel')}: {v.get('count')} lines"
+        + (f" > cap {v.get('cap')}" if v.get("cap") is not None else " (uncapped)")
+        for v in violations
+        if isinstance(v, dict)
+    )
+    branch_literal_lines = "\n".join(
+        f"- {v.get('section')}/{v.get('rel')}:{v.get('line')}: {v.get('text')}"
+        for v in branch_literal_violations
+        if isinstance(v, dict)
+    )
+    prompt_parts = [
+        "Automain HEAD is failing the CI-compliance guardrail.",
+    ]
+    if violations:
+        prompt_parts += [
+            "Size violations (run `python3 backend/testing/check_size_limits.py --fix` "
+            "from the repo root and commit the updated `backend/testing/module_size_limits.json`):",
+            violation_lines or "- see ci_compliance payload",
+        ]
+    if branch_literal_violations:
+        prompt_parts += [
+            "Branch-literal violations (remove hardcoded branch names from the listed files):",
+            branch_literal_lines,
+        ]
+    prompt_parts.append(f"\nHEAD: {head_sha}")
+    prompt = "\n".join(prompt_parts)
+    payload = validate_internal_payload(
+        {
+            "type": "create",
+            "title": "Bump CI-compliance size caps",
+            "prompt": prompt,
+            "base_branch": get_project_integration_branch(project),
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_ci_compliance_gate.py",
+            },
+        },
+        "strategic_spawning:ci_compliance_cap_bump",
+    )
+    task = Task(
+        project_id=project.id,
+        title=f"Fix CI-compliance cap bump for {head_sha[:8]}",
+        description=(
+            "Run backend/testing/check_size_limits.py --fix and commit the "
+            "resulting size-cap update."
+        ),
+        payloads=[payload],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        context={
+            "spawned_by": "ci_compliance_cap_bump_gate",
+            "ci_compliance_cap_bump": True,
+            "head_sha": head_sha,
+            "violation_count": gate.get("violation_count", 0),
+        },
+    )
+    session.add(task)
+    await session.flush()
+    session.add(
+        TaskHistory(
+            task_id=task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "CI_COMPLIANCE_CAP_BUMP_GATE",
+                "head_sha": head_sha,
+            },
+        )
+    )
+    return task
 
 
 async def _spawn_strategic_review(
@@ -6005,6 +6161,24 @@ async def _spawn_strategic_review(
     _local_runner_status["require_local_runner"] = resolve_project_require_local_runner(
         project
     )
+    _ci_compliance_block: dict[str, Any] | None = None
+    try:
+        from app import ci_compliance as _ci_compliance
+
+        _ci_status = await _ci_compliance.ensure_current_ci_compliance(session, project)
+        if _ci_status.get("status") == "success":
+            _ci_compliance_block = _ci_compliance.compact_ci_compliance(
+                _ci_status.get("data")
+            )
+            _ci_gate = ci_compliance_qualify_gate(
+                project, _ci_status.get("head_sha")
+            )
+            if _ci_gate.get("blocked"):
+                await _maybe_spawn_ci_compliance_cap_bump_fix(
+                    session, project, _ci_gate
+                )
+    except Exception:
+        logger.exception("[STRATEGIC] ci_compliance signal build failed; continuing")
     _active_direction_ids = [
         d.get("id")
         for d in (project.directions or [])
@@ -6148,6 +6322,7 @@ async def _spawn_strategic_review(
             ),
             **({"drift_signals": drift_summary} if drift_summary else {}),
             **({"version_phase": _version_phase_block} if _version_phase_block else {}),
+            **({"ci_compliance": _ci_compliance_block} if _ci_compliance_block else {}),
             **(
                 {"deployment_state": _deployment_state_block}
                 if _deployment_state_block
