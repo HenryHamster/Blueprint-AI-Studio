@@ -2964,8 +2964,8 @@ describe('ComputeJobsPanel render + kill', () => {
       },
     });
     fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
-    const { container } = render(<ComputeJobsPanel projectId="proj-1" />);
-    const input = container.querySelector('[data-testid="compute-ask-input"]') as HTMLInputElement;
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input') as HTMLInputElement;
     // Placeholder includes first starter question suggestion
     expect(input.placeholder).toContain('f1_score');
   });

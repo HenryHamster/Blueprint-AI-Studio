@@ -1898,13 +1898,14 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                 const formatCitation = (c: string): { label: string; value: string } => {
                   // Citations are typically "source:identifier" format
                   // e.g., "result_metrics:accuracy" or "arm:control"
-                  const parts = c.split(':');
-                  if (parts.length >= 2) {
-                    const source = parts[0];
-                    const key = parts.slice(1).join(':');
+                  if (c.includes('://')) {
+                    return { label: 'evidence', value: c };
+                  }
+                  const splitAt = c.indexOf(':');
+                  if (splitAt > 0) {
                     return {
-                      label: source,
-                      value: key,
+                      label: c.slice(0, splitAt),
+                      value: c.slice(splitAt + 1),
                     };
                   }
                   return { label: 'evidence', value: c };

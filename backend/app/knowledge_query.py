@@ -752,12 +752,54 @@ async def build_compute_sweep_groups(
         build_knowledge_documents_stmt(
             project_id,
             source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
-            direction=direction_id,
         )
         .where(KnowledgeDocument.sweep_id.is_not(None))
         .order_by(KnowledgeDocument.sweep_id, KnowledgeDocument.created_at.desc())
     )
-    doc_rows = (await session.execute(docs_stmt)).scalars().all()
+    all_doc_rows = (await session.execute(docs_stmt)).scalars().all()
+
+    all_sweep_ids: set[str] = set()
+    for doc in all_doc_rows:
+        sid = doc.sweep_id
+        if sid is None:
+            continue
+        all_sweep_ids.add(sid)
+
+    if not all_sweep_ids:
+        return {}
+
+    task_stmt = select(Task).where(
+        Task.project_id == project_id,
+        Task.payloads[0]["type"].as_string() == SourceKind.COMPUTE_EXPERIMENT.value,
+        Task.payloads[0]["sweep_id"].as_string().in_(list(all_sweep_ids)),
+    )
+    if direction_id:
+        task_stmt = task_stmt.where(
+            Task.context["direction_id"].as_string() == direction_id
+        )
+    tasks = (await session.execute(task_stmt)).scalars().all()
+
+    planned: dict[str, dict[str | None, list[Task]]] = {}
+    task_to_arm: dict[uuid.UUID, str | None] = {}
+    for task in tasks:
+        payload = task.first_payload or {}
+        raw_sweep_id = payload.get("sweep_id") or None
+        sweep_id = (str(raw_sweep_id).strip()[:128] if raw_sweep_id else None) or None
+        if sweep_id is None:
+            continue
+        arm_label = derive_compute_arm_label_from_payload(payload)
+        planned.setdefault(sweep_id, {}).setdefault(arm_label, []).append(task)
+        task_to_arm[task.id] = arm_label
+
+    if direction_id:
+        scoped_task_ids = set(task_to_arm)
+        doc_rows = [
+            doc
+            for doc in all_doc_rows
+            if doc.direction_id == direction_id or doc.source_task_id in scoped_task_ids
+        ]
+    else:
+        doc_rows = all_doc_rows
 
     by_sweep_docs: dict[str, list[KnowledgeDocument]] = {}
     for doc in doc_rows:
@@ -779,30 +821,6 @@ async def build_compute_sweep_groups(
         for sid, docs in by_sweep_docs.items()
         if len(docs) == 1
     }
-    candidate_sweep_ids = set(multi_docs) | set(single_doc_candidates)
-
-    task_stmt = select(Task).where(
-        Task.project_id == project_id,
-        Task.payloads[0]["type"].as_string() == SourceKind.COMPUTE_EXPERIMENT.value,
-        Task.payloads[0]["sweep_id"].as_string().in_(list(candidate_sweep_ids)),
-    )
-    if direction_id:
-        task_stmt = task_stmt.where(
-            Task.context["direction_id"].as_string() == direction_id
-        )
-    tasks = (await session.execute(task_stmt)).scalars().all()
-
-    planned: dict[str, dict[str | None, list[Task]]] = {}
-    task_to_arm: dict[uuid.UUID, str | None] = {}
-    for task in tasks:
-        payload = task.first_payload or {}
-        raw_sweep_id = payload.get("sweep_id") or None
-        sweep_id = (str(raw_sweep_id).strip()[:128] if raw_sweep_id else None) or None
-        if sweep_id is None:
-            continue
-        arm_label = derive_compute_arm_label_from_payload(payload)
-        planned.setdefault(sweep_id, {}).setdefault(arm_label, []).append(task)
-        task_to_arm[task.id] = arm_label
 
     docs_by_sweep_arm: dict[str, dict[str, KnowledgeDocument]] = {}
     for doc in doc_rows:
