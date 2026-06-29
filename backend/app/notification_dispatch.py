@@ -38,8 +38,8 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 
-# Module-level throttle tracking: event_type -> last dispatch monotonic time (seconds)
-_last_dispatch_time: dict[str, float] = {}
+# Module-level throttle tracking: (project_id, event_type) -> last dispatch monotonic time (seconds)
+_last_dispatch_time: dict[tuple[str, str], float] = {}
 
 # Delivery stats — module-level counters
 total_dispatched: int = 0
@@ -408,13 +408,14 @@ async def dispatch_external_notification(
             logger.warning(f"[NOTIFY] Rejecting internal webhook URL host: {_host}")
             return
 
-        # Per-event throttle: drop if last dispatch was too recent
+        # Per-project/event throttle: one noisy project must not suppress another.
         now = time.monotonic()
-        last = _last_dispatch_time.get(event_type, 0.0)
+        throttle_key = (str(project_id), event_type)
+        last = _last_dispatch_time.get(throttle_key, 0.0)
         if throttle_seconds > 0 and (now - last) < throttle_seconds:
             return
 
-        _last_dispatch_time[event_type] = now
+        _last_dispatch_time[throttle_key] = now
 
         # Drain any due retries before making the new request
         await _drain_retry_queue(webhook_url)

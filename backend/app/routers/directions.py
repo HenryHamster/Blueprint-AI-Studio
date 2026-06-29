@@ -1423,8 +1423,9 @@ async def create_message(
             detail="Workbench context too large (max 50KB)",
         )
 
+    raw_message_type = str(payload.message_type or "NOTE").upper()
     try:
-        msg_type = MessageType(payload.message_type)
+        msg_type = MessageType(raw_message_type)
     except ValueError:
         raise HTTPException(
             status_code=400, detail=f"Invalid message type: {payload.message_type}"

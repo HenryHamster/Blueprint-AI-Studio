@@ -269,6 +269,33 @@ async def test_legacy_project_message_create_snapshots_strategic_session(
 
 
 @pytest.mark.asyncio
+async def test_legacy_project_message_create_normalizes_message_type_case(
+    client: AsyncClient,
+    db_session,
+):
+    project = await _make_project(db_session)
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/messages",
+        json={
+            "message_type": "feedback",
+            "content": "Lowercase type should match the canonical message route.",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    msg = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.id == uuid.UUID(resp.json()["id"])
+            )
+        )
+    ).scalar_one()
+    assert msg.message_type == MessageType.FEEDBACK
+    assert msg.content == "Lowercase type should match the canonical message route."
+
+
+@pytest.mark.asyncio
 async def test_legacy_project_message_create_rejects_oversized_workbench_context(
     client: AsyncClient,
     db_session,

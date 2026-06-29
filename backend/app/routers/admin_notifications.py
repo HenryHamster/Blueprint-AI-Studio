@@ -37,6 +37,11 @@ from app.messages_noise_prefs_store import (
     get_messages_noise_prefs_row,
     mutate_messages_noise_prefs,
 )
+from app.messages_last_seen import (
+    naive_utc_to_epoch_ms,
+    timestamp_ms_to_naive_utc,
+    upsert_messages_last_seen,
+)
 from app.workbench_state import (
     WORKBENCH_STATE_KEY, WORKBENCH_STATE_MAX_BYTES,
     build_message_strategic_session_snapshot, get_strategic_workbench_state,
@@ -546,8 +551,13 @@ async def create_message(
             status_code=400,
             detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
         )
-    # Cap context size to prevent storage abuse
-    ctx = payload.context or {}
+    # Cap context size to prevent storage abuse. ``event_type`` is a trusted
+    # system-message field; preserve any operator-supplied value under a
+    # non-reserved key so user messages cannot masquerade as routine events.
+    ctx = dict(payload.context or {})
+    user_supplied_event_type = ctx.pop("event_type", None)
+    if user_supplied_event_type is not None:
+        ctx["user_event_type"] = str(user_supplied_event_type)[:120]
     if len(json.dumps(ctx)) > 50_000:
         raise HTTPException(status_code=400, detail="Context too large (max 50KB)")
     if workbench_state_exceeds_max_bytes(payload.workbench_context):
@@ -606,34 +616,13 @@ async def create_message(
         idempotency_key=idem_key,
     )
     session.add(msg)
-    event_type = ctx.get("event_type")
-    # Wrap the routine-digest append together with the commit so a concurrent
-    # same-key insert is caught wherever the pending ``msg`` actually flushes.
-    # Under READ COMMITTED a competitor can commit the duplicate after this
-    # request's idempotency pre-check passed, and the unique violation then
-    # surfaces either at the explicit ``commit`` below OR earlier, when
-    # ``lock_project_or_429``'s SELECT autoflushes ``msg`` — so catching only
-    # the commit would let the autoflush variant escape as a 500.
     try:
-        if event_type and event_type in ROUTINE_EVENT_TYPES:
-            # The routine-digest append is a read-modify-write on running_update,
-            # which races with concurrent message creates and with the agent's
-            # locked set_running_update reconciliation. Acquire the project row
-            # lock (matching the codebase's existing idiom) so the append reads a
-            # fresh, committed running_update and serializes against other
-            # writers; without it, a stale read could silently drop a digest line
-            # or clobber the agent's reconciled document. populate_existing on the
-            # locked read refreshes the identity-mapped project loaded by
-            # _get_user_project.
-            locked_project = await lock_project_or_429(session, project_id)
-            append_routine_digest(locked_project, event_type, content)
         await session.commit()
     except IntegrityError:
         # Concurrency backstop: two simultaneous sends sharing the same key
         # both passed the pre-insert query, but the partial unique index lets
-        # only one row land. Roll back (discarding any routine-digest append so
-        # the duplicate does not double-apply it) and return the winner so the
-        # loser is still an idempotent success rather than a 500.
+        # only one row land. Roll back and return the winner so the loser is
+        # still an idempotent success rather than a 500.
         await session.rollback()
         if idem_key:
             existing = (
@@ -680,7 +669,6 @@ async def create_message(
         session,
         project_id,
         MessageType(msg_type),
-        event_type=event_type,
         message_content=content,
     )
     if arming == ARMING_STEERING:
@@ -727,18 +715,48 @@ async def resolve_message(
     )
     await session.commit()
     if result.rowcount > 0:
-        if msg.message_type == MessageType.QUESTION and resolution:
+        if resolution and msg.message_type in (
+            MessageType.QUESTION,
+            MessageType.FEEDBACK,
+        ):
             try:
-                from app.notification_dispatch import post_question_answer as _post_qa
+                from app.notification_dispatch import (
+                    post_feedback_acknowledgment as _post_feedback_ack,
+                    post_question_answer as _post_qa,
+                )
 
-                strategic_session = await build_message_strategic_session_snapshot(session, current_user["user_id"], msg.project_id, payload.workbench_context)
-                answer_msg = await _post_qa(session, msg.project_id, msg.id, resolution, from_type="user")
+                strategic_session = await build_message_strategic_session_snapshot(
+                    session,
+                    current_user["user_id"],
+                    msg.project_id,
+                    payload.workbench_context,
+                )
+                if msg.message_type == MessageType.QUESTION:
+                    reply_msg = await _post_qa(
+                        session,
+                        msg.project_id,
+                        msg.id,
+                        resolution,
+                        from_type="user",
+                    )
+                else:
+                    reply_msg = await _post_feedback_ack(
+                        session,
+                        msg.project_id,
+                        msg.id,
+                        resolution,
+                    )
                 if strategic_session:
-                    answer_msg.context = {**(answer_msg.context or {}), "strategic_session": strategic_session}
+                    reply_msg.context = {
+                        **(reply_msg.context or {}),
+                        "strategic_session": strategic_session,
+                    }
                 await session.commit()
             except Exception:
                 logging.getLogger(__name__).warning(
-                    "post_question_answer failed for message %s", msg.id, exc_info=True
+                    "post resolution reply failed for message %s",
+                    msg.id,
+                    exc_info=True,
                 )
         return {"id": str(msg.id), "status": "resolved"}
     else:
@@ -786,7 +804,7 @@ async def get_messages_last_seen(
                 )
             )
         ).scalar_one_or_none()
-        return {"last_seen_at": int(max_ts.timestamp() * 1000) if max_ts else None}
+        return {"last_seen_at": naive_utc_to_epoch_ms(max_ts)}
 
     try:
         pid = uuid.UUID(project_id)
@@ -805,7 +823,7 @@ async def get_messages_last_seen(
 
     if row is None:
         return {"last_seen_at": None}
-    return {"last_seen_at": int(row.last_seen_at.timestamp() * 1000)}
+    return {"last_seen_at": naive_utc_to_epoch_ms(row.last_seen_at)}
 
 
 @router.put("/messages/last-seen")
@@ -821,33 +839,15 @@ async def put_messages_last_seen(
         raise HTTPException(status_code=400, detail="Invalid project_id format")
     await _get_user_project(pid, current_user["user_id"], session)
 
-    new_ts = datetime.fromtimestamp(
-        payload.timestamp / 1000.0, tz=timezone.utc
-    ).replace(tzinfo=None)
-
-    row = (
-        await session.execute(
-            select(MessagesLastSeen).where(
-                MessagesLastSeen.user_id == current_user["user_id"],
-                MessagesLastSeen.project_id == pid,
-            )
-        )
-    ).scalar_one_or_none()
-
-    if row is None:
-        row = MessagesLastSeen(
-            user_id=current_user["user_id"],
-            project_id=pid,
-            last_seen_at=new_ts,
-            updated_at=new_ts,
-        )
-    else:
-        row.last_seen_at = new_ts
-        row.updated_at = _utcnow()
-
-    session.add(row)
+    new_ts = timestamp_ms_to_naive_utc(payload.timestamp)
+    stored_ts = await upsert_messages_last_seen(
+        session,
+        current_user["user_id"],
+        pid,
+        new_ts,
+    )
     await session.commit()
-    return {"status": "ok", "last_seen_at": int(new_ts.timestamp() * 1000)}
+    return {"status": "ok", "last_seen_at": naive_utc_to_epoch_ms(stored_ts)}
 
 
 # ── Messages Noise-Prefs Endpoints ───────────────────────────────────────────
@@ -1191,7 +1191,7 @@ async def get_last_visit_timestamp(
             )
         )
     ).scalar_one_or_none()
-    return {"last_visit_at": int(max_ts.timestamp() * 1000) if max_ts else None}
+    return {"last_visit_at": naive_utc_to_epoch_ms(max_ts)}
 
 
 @router.put("/last-visit-timestamp")
@@ -1210,30 +1210,15 @@ async def put_last_visit_timestamp(
     except (ValueError, TypeError):
         raise HTTPException(status_code=400, detail="Invalid project_id format")
     await _get_user_project(pid, current_user["user_id"], session)
-    new_ts = datetime.fromtimestamp(
-        payload.timestamp / 1000.0, tz=timezone.utc
-    ).replace(tzinfo=None)
-    row = (
-        await session.execute(
-            select(MessagesLastSeen).where(
-                MessagesLastSeen.user_id == current_user["user_id"],
-                MessagesLastSeen.project_id == pid,
-            )
-        )
-    ).scalar_one_or_none()
-    if row is None:
-        row = MessagesLastSeen(
-            user_id=current_user["user_id"],
-            project_id=pid,
-            last_seen_at=new_ts,
-            updated_at=new_ts,
-        )
-    else:
-        row.last_seen_at = new_ts
-        row.updated_at = _utcnow()
-    session.add(row)
+    new_ts = timestamp_ms_to_naive_utc(payload.timestamp)
+    stored_ts = await upsert_messages_last_seen(
+        session,
+        current_user["user_id"],
+        pid,
+        new_ts,
+    )
     await session.commit()
-    return {"status": "ok", "last_visit_at": int(new_ts.timestamp() * 1000)}
+    return {"status": "ok", "last_visit_at": naive_utc_to_epoch_ms(stored_ts)}
 
 
 # ── Admin Playbook Endpoints ──────────────────────────────────────────────────

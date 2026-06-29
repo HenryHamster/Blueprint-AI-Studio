@@ -4040,10 +4040,10 @@ class TestMessages:
         assert len(msg.content) == MESSAGE_CONTENT_MAX
 
     @pytest.mark.asyncio
-    async def test_create_routine_message_appends_running_update(
+    async def test_user_message_event_type_is_namespaced_not_routine_digest(
         self, client: AsyncClient, db_session
     ):
-        """Creating a NOTE with a routine event_type appends a digest to running_update."""
+        """User context cannot claim the trusted system event_type contract."""
         project = await _make_project(db_session)
 
         resp = await client.post(
@@ -4055,11 +4055,14 @@ class TestMessages:
                 "context": {"event_type": "pr_merged"},
             },
         )
-        assert resp.status_code == 200
+        assert resp.status_code == 200, resp.text
         await db_session.refresh(project)
-        assert project.running_update is not None
-        assert "pr_merged" in project.running_update
-        assert "PR #123 merged into main" in project.running_update
+        assert project.running_update is None
+
+        msg = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
+        assert msg is not None
+        assert msg.context.get("event_type") is None
+        assert msg.context.get("user_event_type") == "pr_merged"
 
     async def _reload_vision(self, db_session, project_id) -> dict:
         """Re-read the project's vision JSON after an endpoint commit.
@@ -4160,12 +4163,10 @@ class TestMessages:
         assert strategic_refresh_pending(vision) is False
 
     @pytest.mark.asyncio
-    async def test_canonical_routine_event_does_not_arm_refresh(
+    async def test_user_feedback_with_reserved_event_type_still_arms_refresh(
         self, client: AsyncClient, db_session
     ):
-        """A system/routine digest-event message must NOT wake the strategist,
-        even though it is not a NOTE-typed message, because routine digests are
-        automated, not human steering."""
+        """A user message cannot suppress arming by spoofing a routine event_type."""
         from app.strategic_trigger import strategic_refresh_pending
 
         project = await _make_project(db_session)
@@ -4179,10 +4180,15 @@ class TestMessages:
             },
         )
         assert resp.status_code == 200, resp.text
-        assert resp.json()["arming"] == "routine_event"
+        assert resp.json()["arming"] == "steering"
 
         vision = await self._reload_vision(db_session, project.id)
-        assert strategic_refresh_pending(vision) is False
+        assert strategic_refresh_pending(vision) is True
+
+        msg = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
+        assert msg is not None
+        assert msg.context.get("event_type") is None
+        assert msg.context.get("user_event_type") == "review_feedback"
 
     @pytest.mark.asyncio
     async def test_canonical_message_arm_failure_reports_not_armed(
@@ -4295,18 +4301,15 @@ class TestMessages:
         assert refresh_breaker_applies(vision) is False
 
     @pytest.mark.asyncio
-    async def test_create_routine_message_acquires_project_lock(
+    async def test_user_message_reserved_event_type_skips_project_lock(
         self, client: AsyncClient, db_session
     ):
-        """A routine event_type append goes through the project row lock."""
+        """User-supplied event_type is not a trusted routine digest and does not lock."""
         project = await _make_project(db_session)
 
         import app.routers.admin_notifications as notif
 
-        real_lock = notif.lock_project_or_429
-        with patch.object(
-            notif, "lock_project_or_429", AsyncMock(side_effect=real_lock)
-        ) as spy:
+        with patch.object(notif, "lock_project_or_429", AsyncMock()) as spy:
             resp = await client.post(
                 "/api/admin/messages",
                 json={
@@ -4317,9 +4320,7 @@ class TestMessages:
                 },
             )
         assert resp.status_code == 200
-        spy.assert_awaited_once()
-        # The locked read is for THIS project.
-        assert spy.await_args.args[1] == project.id
+        spy.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_create_non_routine_message_skips_project_lock(
@@ -4341,91 +4342,6 @@ class TestMessages:
             )
         assert resp.status_code == 200
         spy.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_create_routine_message_does_not_clobber_concurrent_rewrite(
-        self, client: AsyncClient, db_session
-    ):
-        """The locked re-read picks up a concurrently-committed running_update.
-
-        Simulates the agent's locked set_running_update committing a reconciled
-        document AFTER the handler's access-check read but BEFORE the digest
-        append. Because the append now operates on the row-locked re-read (not
-        the stale access-check instance), the agent's document survives and the
-        digest line is appended onto it — no lost update.
-        """
-        project = await _make_project(db_session)
-
-        import app.routers.admin_notifications as notif
-
-        async def _stale_access_check(pid, user_id, session):
-            # The handler used to append onto whatever this returned. Hand it a
-            # stale running_update to prove that value is NOT what gets written.
-            stale = await session.get(Project, pid)
-            stale.running_update = "STALE-BASELINE-FROM-ACCESS-CHECK"
-            return stale
-
-        async def _commit_agent_doc_then_lock(session, pid):
-            # Stand in for the agent committing its reconciled document just
-            # before we take the lock.
-            agent_proj = await session.get(Project, pid)
-            agent_proj.running_update = "AGENT-RECONCILED-DOC"
-            await session.commit()
-            return await real_lock(session, pid)
-
-        real_lock = notif.lock_project_or_429
-        with (
-            patch.object(
-                notif, "_get_user_project", AsyncMock(side_effect=_stale_access_check)
-            ),
-            patch.object(
-                notif,
-                "lock_project_or_429",
-                AsyncMock(side_effect=_commit_agent_doc_then_lock),
-            ),
-        ):
-            resp = await client.post(
-                "/api/admin/messages",
-                json={
-                    "project_id": str(project.id),
-                    "message_type": "NOTE",
-                    "content": "operator digest line",
-                    "context": {"event_type": "pr_merged"},
-                },
-            )
-        assert resp.status_code == 200
-        await db_session.refresh(project)
-        # Agent's reconciled document survived; the stale value was discarded.
-        assert "AGENT-RECONCILED-DOC" in project.running_update
-        assert "STALE-BASELINE-FROM-ACCESS-CHECK" not in project.running_update
-        # The new digest line was appended onto the reconciled document.
-        assert "operator digest line" in project.running_update
-
-    @pytest.mark.asyncio
-    async def test_create_two_routine_messages_keeps_both_lines(
-        self, client: AsyncClient, db_session
-    ):
-        """Two sequential routine appends both survive (no lost digest line)."""
-        project = await _make_project(db_session)
-
-        for content, evt in (
-            ("first digest line", "pr_merged"),
-            ("second digest line", "auto_fix_result"),
-        ):
-            resp = await client.post(
-                "/api/admin/messages",
-                json={
-                    "project_id": str(project.id),
-                    "message_type": "NOTE",
-                    "content": content,
-                    "context": {"event_type": evt},
-                },
-            )
-            assert resp.status_code == 200
-
-        await db_session.refresh(project)
-        assert "first digest line" in project.running_update
-        assert "second digest line" in project.running_update
 
     # ── Idempotent steering-message creation ─────────────────────────────────
 
@@ -4592,11 +4508,10 @@ class TestMessages:
         assert all(r.idempotency_key is None for r in rows)
 
     @pytest.mark.asyncio
-    async def test_idempotent_duplicate_skips_routine_digest(
+    async def test_idempotent_duplicate_with_reserved_event_type_skips_digest(
         self, client: AsyncClient, db_session
     ):
-        """A routine-event message POSTed twice with one key appends its digest
-        line exactly once — the duplicate skips the running_update append."""
+        """Duplicate user sends converge, and spoofed event_type still writes no digest."""
         project = await _make_project(db_session)
         key = str(uuid.uuid4())
         body = {
@@ -4614,9 +4529,7 @@ class TestMessages:
         assert first.json()["id"] == second.json()["id"]
 
         await db_session.refresh(project)
-        assert project.running_update is not None
-        # Appended exactly once despite two POSTs.
-        assert project.running_update.count("PR #864 merged into main") == 1
+        assert project.running_update is None
 
         rows = (
             (
@@ -4630,6 +4543,8 @@ class TestMessages:
             .all()
         )
         assert len(rows) == 1
+        assert rows[0].context.get("event_type") is None
+        assert rows[0].context.get("user_event_type") == "pr_merged"
 
     @pytest.mark.asyncio
     async def test_idempotent_concurrent_insert_recovers_to_200(
@@ -4642,43 +4557,44 @@ class TestMessages:
         the already-committed row — instead of surfacing the IntegrityError as
         a 500.
 
-        The ``lock_project_or_429`` call (reached only for a routine-event
-        message) is the seam between the pre-check and the commit; we patch it
-        to commit a conflicting row via an INDEPENDENT session, exactly
-        modelling the concurrent in-flight duplicate.
+        Patch AsyncSession.commit to inject a winning row just before the route
+        commits its pending message, exactly modelling an in-flight duplicate.
         """
         from conftest import TestingSessionLocal
-        import app.routers.admin_notifications as notif
+        from sqlalchemy.ext.asyncio import AsyncSession as SQLAlchemyAsyncSession
 
         project = await _make_project(db_session)
         key = str(uuid.uuid4())
-        real_lock = notif.lock_project_or_429
         injected = {"done": False}
+        original_commit = SQLAlchemyAsyncSession.commit
 
-        async def _commit_conflict_then_lock(session, pid):
+        async def _commit_conflict_before_pending_message_commit(session):
             # Stand in for a concurrent request that won the race: persist the
             # same-key row in a separate transaction so this request's pending
             # INSERT violates the unique index on commit.
-            if not injected["done"]:
+            if not injected["done"] and any(
+                isinstance(obj, ProjectMessage) and obj.idempotency_key == key
+                for obj in session.new
+            ):
                 injected["done"] = True
                 async with TestingSessionLocal() as other:
                     other.add(
                         ProjectMessage(
-                            project_id=pid,
+                            project_id=project.id,
                             message_type=MessageType.NOTE,
                             from_type="user",
                             content="winner of the race",
-                            context={"event_type": "pr_merged"},
+                            context={"user_event_type": "pr_merged"},
                             idempotency_key=key,
                         )
                     )
-                    await other.commit()
-            return await real_lock(session, pid)
+                    await original_commit(other)
+            return await original_commit(session)
 
         with patch.object(
-            notif,
-            "lock_project_or_429",
-            AsyncMock(side_effect=_commit_conflict_then_lock),
+            SQLAlchemyAsyncSession,
+            "commit",
+            _commit_conflict_before_pending_message_commit,
         ):
             resp = await client.post(
                 "/api/admin/messages",
@@ -5015,6 +4931,71 @@ class TestMessages:
         ]
 
     @pytest.mark.asyncio
+    async def test_resolve_feedback_posts_feedback_acknowledgment_note(
+        self, client: AsyncClient, db_session
+    ):
+        """Resolving FEEDBACK creates a durable acknowledgment linked to the original."""
+        project = await _make_project(db_session)
+        feedback = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.FEEDBACK,
+            from_type="user",
+            content="Please make the deploy summary clearer.",
+            status="open",
+        )
+        db_session.add(feedback)
+        await db_session.commit()
+        await db_session.refresh(feedback)
+
+        resp = await client.patch(
+            f"/api/admin/messages/{feedback.id}",
+            json={
+                "resolution": "Deploy summary now cites the active release.",
+                "workbench_context": {
+                    "interaction_mode": "check_in",
+                    "active_surface": "pipeline",
+                    "selected_refs": [
+                        {
+                            "kind": "release",
+                            "id": "release:v2",
+                            "label": "v2 release",
+                        }
+                    ],
+                },
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "resolved"
+        await db_session.refresh(feedback)
+        assert feedback.status == "resolved"
+        assert feedback.resolution == "Deploy summary now cites the active release."
+
+        notes = (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.message_type == MessageType.NOTE,
+                    ProjectMessage.from_type == "system",
+                )
+            )
+        ).scalars().all()
+        assert len(notes) == 1
+        note = notes[0]
+        assert note.context.get("event_type") == "feedback_acknowledgment"
+        assert note.context.get("reply_to") == str(feedback.id)
+        assert (
+            note.context.get("resolution")
+            == "Deploy summary now cites the active release."
+        )
+        session = note.context.get("strategic_session")
+        assert session["interaction_mode"] == "check_in"
+        assert session["active_surface"] == "pipeline"
+        assert session["selected_refs"] == [
+            {"kind": "release", "id": "release:v2", "label": "v2 release"}
+        ]
+
+    @pytest.mark.asyncio
     async def test_delete_message(self, client: AsyncClient, db_session):
         """Can delete an existing message."""
         project = await _make_project(db_session)
@@ -5302,6 +5283,28 @@ class TestMessagesLastSeen:
         assert get_resp.json()["last_seen_at"] == ts
 
     @pytest.mark.asyncio
+    async def test_get_last_seen_treats_persisted_naive_datetime_as_utc(
+        self, client: AsyncClient, db_session
+    ):
+        """NaiveUTCDateTime rows are UTC, not host-local wall-clock values."""
+        project = await _make_project(db_session)
+        db_session.add(
+            MessagesLastSeen(
+                user_id=TEST_USER_ID,
+                project_id=project.id,
+                last_seen_at=datetime(1970, 1, 1),
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/messages/last-seen?project_id={project.id}"
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["last_seen_at"] == 0
+
+    @pytest.mark.asyncio
     async def test_update_advances_timestamp(self, client: AsyncClient, db_session):
         """A second PUT overwrites the previous value."""
         project = await _make_project(db_session)
@@ -5319,6 +5322,87 @@ class TestMessagesLastSeen:
             f"/api/admin/messages/last-seen?project_id={project.id}"
         )
         assert get_resp.json()["last_seen_at"] == ts2
+
+    @pytest.mark.asyncio
+    async def test_stale_update_does_not_regress_timestamp(
+        self, client: AsyncClient, db_session
+    ):
+        """A delayed older PUT cannot move last-seen backwards and re-mark read messages unread."""
+        project = await _make_project(db_session)
+        older, newer = 1_700_000_000_000, 1_700_000_060_000
+
+        await client.put(
+            "/api/admin/messages/last-seen",
+            json={"project_id": str(project.id), "timestamp": newer},
+        )
+        stale_resp = await client.put(
+            "/api/admin/messages/last-seen",
+            json={"project_id": str(project.id), "timestamp": older},
+        )
+        get_resp = await client.get(
+            f"/api/admin/messages/last-seen?project_id={project.id}"
+        )
+
+        assert stale_resp.status_code == 200
+        assert stale_resp.json()["last_seen_at"] == newer
+        assert get_resp.json()["last_seen_at"] == newer
+
+    @pytest.mark.asyncio
+    async def test_stale_identity_map_update_does_not_regress_timestamp(
+        self, db_session
+    ):
+        """A stale session cannot overwrite a newer committed last-seen value."""
+        from conftest import TestingSessionLocal
+        from app.messages_last_seen import upsert_messages_last_seen
+
+        project = await _make_project(db_session)
+        initial = datetime(2026, 1, 1, 12, 0, 0)
+        stale_ts = initial + timedelta(minutes=5)
+        newer_ts = initial + timedelta(minutes=10)
+        db_session.add(
+            MessagesLastSeen(
+                user_id=TEST_USER_ID,
+                project_id=project.id,
+                last_seen_at=initial,
+            )
+        )
+        await db_session.commit()
+
+        async with TestingSessionLocal() as stale_session:
+            stale_row = (
+                await stale_session.execute(
+                    select(MessagesLastSeen).where(
+                        MessagesLastSeen.user_id == TEST_USER_ID,
+                        MessagesLastSeen.project_id == project.id,
+                    )
+                )
+            ).scalar_one()
+            assert stale_row.last_seen_at == initial
+            await stale_session.commit()
+
+            async with TestingSessionLocal() as fresh_session:
+                stored = await upsert_messages_last_seen(
+                    fresh_session, TEST_USER_ID, project.id, newer_ts
+                )
+                await fresh_session.commit()
+                assert stored == newer_ts
+
+            stored = await upsert_messages_last_seen(
+                stale_session, TEST_USER_ID, project.id, stale_ts
+            )
+            await stale_session.commit()
+
+        async with TestingSessionLocal() as verify_session:
+            final_ts = (
+                await verify_session.execute(
+                    select(MessagesLastSeen.last_seen_at).where(
+                        MessagesLastSeen.user_id == TEST_USER_ID,
+                        MessagesLastSeen.project_id == project.id,
+                    )
+                )
+            ).scalar_one()
+        assert stored == newer_ts
+        assert final_ts == newer_ts
 
     @pytest.mark.asyncio
     async def test_no_access_returns_404(self, client: AsyncClient, db_session):
@@ -5412,6 +5496,28 @@ class TestLastVisitTimestamp:
 
         resp = await client.get("/api/admin/last-visit-timestamp")
         assert resp.json()["last_visit_at"] == ts2
+
+    @pytest.mark.asyncio
+    async def test_put_does_not_regress_existing_last_visit_timestamp(
+        self, client: AsyncClient, db_session
+    ):
+        """The home-panel last-visit writer shares the monotonic MessagesLastSeen contract."""
+        project = await _make_project(db_session)
+        older, newer = 1_700_000_000_000, 1_700_000_060_000
+
+        await client.put(
+            "/api/admin/last-visit-timestamp",
+            json={"project_id": str(project.id), "timestamp": newer},
+        )
+        stale_resp = await client.put(
+            "/api/admin/last-visit-timestamp",
+            json={"project_id": str(project.id), "timestamp": older},
+        )
+        get_resp = await client.get("/api/admin/last-visit-timestamp")
+
+        assert stale_resp.status_code == 200
+        assert stale_resp.json()["last_visit_at"] == newer
+        assert get_resp.json()["last_visit_at"] == newer
 
     @pytest.mark.asyncio
     async def test_put_no_access_returns_404(self, client: AsyncClient, db_session):
@@ -17144,6 +17250,56 @@ async def test_strategic_api_output_update_events_include_live_linkage(
     assert emit.await_args_list[2].kwargs["cycle_id"] == cycle.id
     assert emit.await_args_list[2].kwargs["op"] == "set_running_update"
     assert emit.await_args_list[2].kwargs["running_update_changed"] is True
+
+
+@pytest.mark.asyncio
+async def test_strategic_create_message_rejects_oversized_context(
+    client: AsyncClient, db_session
+):
+    from app.auth import create_agent_token
+
+    project = Project(name="Strategic Message Context", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-strategic-message-context",
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id),
+        "vm-strategic-message-context",
+        task_type="strategic_review",
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "Context should be bounded.",
+                "context": {"blob": "z" * 60_000},
+            },
+        },
+    )
+
+    assert resp.status_code == 400, resp.text
+    assert "context too large" in resp.json()["error"]["message"].lower()
+    rows = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalars().all()
+    assert rows == []
 
 
 class TestTriggerSelfAudit:

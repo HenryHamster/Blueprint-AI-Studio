@@ -2962,6 +2962,63 @@ async def test_strategic_resolve_question_posts_answer_note(
 
 
 @pytest.mark.asyncio
+async def test_strategic_resolve_feedback_posts_acknowledgment_note(
+    client: AsyncClient, db_session
+):
+    """resolve_message on a FEEDBACK message posts a feedback_acknowledgment NOTE."""
+    project, task = await _make_project_task(db_session)
+    msg = await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.FEEDBACK,
+        from_type="user",
+        content="Please clarify the rollout note.",
+        status="open",
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "resolve_message",
+            "data": {
+                "message_id": str(msg.id),
+                "resolution": "Rollout note now names the release owner.",
+            },
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["status"] == "ok"
+
+    from sqlalchemy import select
+    from app.models import ProjectMessage
+
+    notes = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.message_type == MessageType.NOTE,
+                ProjectMessage.from_type == "system",
+            )
+        )
+    ).scalars().all()
+    matching = [
+        n
+        for n in notes
+        if isinstance(n.context, dict)
+        and n.context.get("event_type") == "feedback_acknowledgment"
+        and n.context.get("reply_to") == str(msg.id)
+        and n.context.get("resolution") == "Rollout note now names the release owner."
+    ]
+    assert len(matching) == 1, (
+        f"Expected 1 feedback_acknowledgment NOTE, got {len(matching)}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_agent_fetch_version_phase_surfaces_goal_coverage_drift(
     client: AsyncClient, db_session
 ):

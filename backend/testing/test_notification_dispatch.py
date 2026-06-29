@@ -254,6 +254,33 @@ async def test_get_notification_stats_per_project_failure():
     assert unknown_stats["last_failure_at"] is None
 
 
+@pytest.mark.asyncio
+async def test_dispatch_throttle_is_project_scoped():
+    _reset_stats()
+    pid = uuid.uuid4()
+    other_pid = uuid.uuid4()
+    deliver = AsyncMock(return_value=200)
+
+    with (
+        patch(
+            "app.shared_state.runtime_config",
+            _make_runtime_config(throttle_seconds=60),
+        ),
+        patch("app.notification_dispatch._attempt_delivery", new=deliver),
+        patch("app.notification_dispatch._drain_retry_queue", new=AsyncMock()),
+    ):
+        await dispatch_external_notification(pid, "test_event", {"k": "first"})
+        await dispatch_external_notification(pid, "test_event", {"k": "suppressed"})
+        await dispatch_external_notification(other_pid, "test_event", {"k": "other"})
+
+    assert deliver.await_count == 2
+    pstats = get_notification_stats(project_id=pid)
+    other_stats = get_notification_stats(project_id=other_pid)
+    assert pstats["total_dispatched"] == 1
+    assert other_stats["total_dispatched"] == 1
+    assert get_notification_stats()["total_dispatched"] == 2
+
+
 # ---------------------------------------------------------------------------
 # Retry queue bounds
 # ---------------------------------------------------------------------------

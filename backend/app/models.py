@@ -2800,7 +2800,7 @@ class ProjectMessage(SQLModel, table=True):
     context: Dict[str, Any] = Field(
         default_factory=dict, sa_column=Column(JSONB, nullable=True, default={})
     )
-    status: str = Field(default="open")  # "open" | "resolved"
+    status: str = Field(default="open")  # "open" | "linked" | "resolved"
     resolution: str | None = None
     # Client-supplied idempotency key. A double-click / network retry of a
     # send that already succeeded server-side carries the same key, so the

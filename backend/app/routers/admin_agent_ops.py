@@ -99,6 +99,7 @@ logger = logging.getLogger(__name__)
 # uses this marker to include the sibling /api/agent endpoints in the same
 # auth scan as the admin routes.
 ADMIN_AGENT_OPS_MODULE = __name__
+STRATEGIC_MESSAGE_CONTEXT_MAX_BYTES = 50_000
 
 
 def _cap_str(
@@ -1838,6 +1839,18 @@ async def strategic_operation(
         except ValueError:
             msg_type = MessageType.NOTE
         msg_ctx = data.get("context") or {}
+        if not isinstance(msg_ctx, dict):
+            raise HTTPException(
+                status_code=400, detail="Message context must be an object"
+            )
+        if (
+            len(json.dumps(msg_ctx, separators=(",", ":"), default=str).encode("utf-8"))
+            > STRATEGIC_MESSAGE_CONTEXT_MAX_BYTES
+        ):
+            raise HTTPException(
+                status_code=400, detail="Message context too large (max 50KB)"
+            )
+        msg_ctx = dict(msg_ctx)
         # Reproduce-on-HEAD citation grounding for strategist-authored bug-class
         # messages: a strategist-emitted BUG_REPORT/BLOCKER citing code already
         # fixed/refactored away would re-enter the strategist inbox fully
@@ -1923,23 +1936,30 @@ async def strategic_operation(
         msg.resolved_at = _utcnow()
         session.add(msg)
         await session.commit()
-        if msg.message_type == MessageType.QUESTION:
+        if msg.message_type in (MessageType.QUESTION, MessageType.FEEDBACK):
             try:
-                from app.notification_dispatch import post_question_answer as _post_qa
-
-                await _post_qa(
-                    session,
-                    project.id,
-                    msg.id,
-                    msg.resolution or "Addressed by strategic review",
-                    task.id,
+                from app.notification_dispatch import (
+                    post_feedback_acknowledgment as _post_feedback_ack,
+                    post_question_answer as _post_qa,
                 )
+
+                resolution = msg.resolution or "Addressed by strategic review"
+                if msg.message_type == MessageType.QUESTION:
+                    await _post_qa(session, project.id, msg.id, resolution, task.id)
+                else:
+                    await _post_feedback_ack(
+                        session,
+                        project.id,
+                        msg.id,
+                        resolution,
+                        task.id,
+                    )
                 await session.commit()
             except Exception:
                 import logging
 
                 logging.getLogger(__name__).warning(
-                    "post_question_answer failed for message %s", msg.id, exc_info=True
+                    "post resolution reply failed for message %s", msg.id, exc_info=True
                 )
         return _resp(
             {"status": "ok", "op": "resolve_message", "message_id": str(msg.id)}
