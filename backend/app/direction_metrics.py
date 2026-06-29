@@ -151,6 +151,12 @@ _HISTORY_AGG_DEFAULTS = {
     # _compute_lifetime_burn_metrics reads this so a degraded merge does not
     # suppress lifetime non-merge burn even after its cycle is evicted.
     "total_verified_prs_merged": 0,
+    # Ancestry-confirmed subset of total_prs_merged: cycles where the merge
+    # commit was confirmed reachable from the integration branch (explicit
+    # landed_on_integration=True). Legacy-0 fallback on eviction: pre-reachability
+    # entries have unknown reachability, so they contribute 0 here, keeping the
+    # aggregate honest rather than inflating with unconfirmed ancestry.
+    "total_reachable_prs_merged": 0,
     # Credit-gate lifetime stranded count: confirmed-unreachable merges that are
     # subtracted from total_verified_prs_merged to get the credit-eligible total
     # after a cycle is evicted from research_history. Folded by
@@ -486,6 +492,9 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         agg["total_verified_prs_merged"] += ev.get(
             "verified_prs_merged", ev.get("prs_merged", 0)
         )
+        # Legacy-0 fallback: pre-reachability entries lack the key; contribute 0
+        # so the aggregate stays honest (unknown ancestry ≠ confirmed reachable).
+        agg["total_reachable_prs_merged"] += ev.get("reachable_prs_merged", 0)
         # Preserve the credit-gate discount so confirmed-stranded merges remain
         # excluded from the credit-eligible total after their cycle is evicted.
         agg["total_stranded_prs_merged"] += int(ev.get("stranded_prs_merged") or 0)

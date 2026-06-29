@@ -784,20 +784,6 @@ describe('buildDirSummaryText', () => {
     expect(result).toContain('2 proven (1 consumed downstream)');
   });
 
-  it('renders verified vs badge-only merge credit when verified_prs_merged is present and less than prs_merged', () => {
-    const result = buildDirSummaryText([{
-      id: 'd-credit',
-      text: 'direction with badge split',
-      status: 'active',
-      priority: 'high',
-      total_cycles: 3,
-      prs_merged: 5,
-      verified_prs_merged: 3,
-    }]);
-    expect(result).toContain('5 merged (3 verified, 2 badge-only)');
-    expect(result).not.toContain('5 merged\n');
-  });
-
   it('renders plain merged when verified_prs_merged equals prs_merged (no badge-only noise)', () => {
     const result = buildDirSummaryText([{
       id: 'd-allverified',
@@ -841,6 +827,86 @@ describe('buildDirSummaryText', () => {
     expect(result).toContain('2 merged');
     expect(result).not.toContain('0 proven');
     expect(result).not.toContain('consumed downstream');
+  });
+
+  it('renders verified annotation when verified < merged', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-verified',
+      text: 'direction with verified split',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 3,
+      prs_merged: 5,
+      verified_prs_merged: 3,
+    }]);
+    expect(result).toContain('5 merged (3 verified)');
+  });
+
+  it('omits verified annotation when verified equals merged', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-all-verified',
+      text: 'complete credit direction',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 2,
+      prs_merged: 4,
+      verified_prs_merged: 4,
+    }]);
+    expect(result).toContain('4 merged');
+    expect(result).not.toContain('4 merged (');
+  });
+
+  it('omits verified annotation when field is absent', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-legacy-no-verified',
+      text: 'legacy direction',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 1,
+      prs_merged: 3,
+    }]);
+    expect(result).toContain('3 merged');
+    expect(result).not.toContain('3 merged (');
+  });
+
+  it('renders reachable-vs-badge split when reachable_prs_merged is present', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-reachable',
+      text: 'ancestry tracking direction',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 4,
+      prs_merged: 5,
+      reachable_prs_merged: 3,
+    }]);
+    expect(result).toContain('5 merged (3 reachable, 2 badge-only)');
+  });
+
+  it('omits reachable split when field is absent or zero', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-legacy-no-reachable',
+      text: 'original direction',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 2,
+      prs_merged: 2,
+    }]);
+    expect(result).toContain('2 merged');
+    expect(result).not.toContain('2 merged (');
+  });
+
+  it('combines verified and reachable annotations with semicolon separator', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-both',
+      text: 'direction with both verified and reachable',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 5,
+      prs_merged: 6,
+      verified_prs_merged: 4,
+      reachable_prs_merged: 5,
+    }]);
+    expect(result).toContain('6 merged (4 verified; 5 reachable, 1 badge-only)');
   });
 
   it('shows SATURATED flag when applicable', () => {

@@ -587,6 +587,18 @@ def test_declared_merged_count_helper():
     assert declared_merged_count({}) == 0
 
 
+def test_reachable_merged_count_helper():
+    """reachable_merged_count reads reachable_prs_merged; returns None for legacy."""
+    from app.direction_outcomes import reachable_merged_count
+
+    # New entry with field present → returns int.
+    assert reachable_merged_count({"reachable_prs_merged": 3}) == 3
+    assert reachable_merged_count({"reachable_prs_merged": 0}) == 0
+    # Legacy entry (field absent) → None, never fabricates zero or raw count.
+    assert reachable_merged_count({"prs_merged": 4, "verified_prs_merged": 4}) is None
+    assert reachable_merged_count({}) is None
+
+
 @pytest.mark.asyncio
 async def test_conversion_rate_excludes_degraded_unverified_merge(
     db_session: AsyncSession,
@@ -6754,3 +6766,110 @@ async def test_scope_breakdown_skips_ineligible_task_types(db_session: AsyncSess
     assert tb["web_research"]["created"] == 1
     assert tb["design"]["created"] == 1
     assert tb["compute_experiment"]["created"] == 1
+
+
+# ---------------------------------------------------------------------------
+# reachable_prs_merged tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reachable_prs_merged_excludes_confirmed_non_landing(
+    db_session: AsyncSession,
+):
+    """reachable_prs_merged counts only explicit landed_on_integration=True.
+
+    Acceptance requirement (named_test gate): confirmed non-landings
+    (landed_on_integration=False) must NOT inflate prs_merged OR
+    reachable_prs_merged; indeterminate/badge-only merges (key absent) must
+    still count in prs_merged but NOT in reachable_prs_merged.
+    """
+    direction_id = "d-reachable-core"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=4)
+    ]
+    await db_session.flush()
+
+    # (a) Reachable: explicit landed_on_integration=True → counts in both.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True, "direction_id": direction_id},
+        title="reachable-merge",
+    )
+    # (b) Badge-only / indeterminate: pr_merged=True, key absent → counts in
+    #     prs_merged only (indeterminate ancestry still gets credit).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "direction_id": direction_id},
+        title="badge-only-merge",
+    )
+    # (c) Confirmed non-landing: explicit False → excluded from BOTH.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": False, "direction_id": direction_id},
+        title="stranded-merge",
+    )
+    # (d) FAILED task: never merged, never counts.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"direction_id": direction_id},
+        title="failed-task",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # (a) + (b) count in prs_merged; (c) does NOT (is_merged_completion=False).
+    assert entry["prs_merged"] == 2, (
+        "confirmed non-landing must NOT inflate prs_merged"
+    )
+    # Only (a) is ancestry-confirmed.
+    assert entry["reachable_prs_merged"] == 1, (
+        "only explicit landed_on_integration=True counts as reachable"
+    )
+    # Invariant: reachable ≤ prs_merged.
+    assert entry["reachable_prs_merged"] <= entry["prs_merged"]
+    assert acceptance_metric_invariant_violations(entry) == []
+
+
+@pytest.mark.asyncio
+async def test_reachable_prs_merged_invariant_guard(db_session: AsyncSession):
+    """acceptance_metric_invariant_violations flags reachable > prs_merged."""
+    # Pure-dict check: the guard must catch the reachable > prs_merged drift.
+    bad = {"prs_merged": 1, "reachable_prs_merged": 2}
+    violations = acceptance_metric_invariant_violations(bad)
+    assert any("reachable" in v for v in violations), (
+        f"expected reachable-exceeds-prs_merged violation, got: {violations}"
+    )
+
+    # Clean entry: field present, within bounds.
+    ok = {"prs_merged": 3, "reachable_prs_merged": 2}
+    assert acceptance_metric_invariant_violations(ok) == []
+
+    # Legacy entry (field absent): guard skips reachable check, no spurious violation.
+    legacy = {"prs_merged": 5}
+    assert acceptance_metric_invariant_violations(legacy) == []

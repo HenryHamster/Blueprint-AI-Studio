@@ -22,6 +22,7 @@ from app.direction_metrics import _compute_direction_quality_score
 from app.direction_outcomes import (
     declared_merged_count,
     proven_merged_count,
+    reachable_merged_count,
     verified_merged_count,
 )
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
@@ -4424,6 +4425,18 @@ async def _spawn_strategic_review(
         total_consumed_merged = sum(
             h.get("acceptance_consumed_merged", 0) for h in history
         ) + (agg.get("total_acceptance_consumed_merged", 0) or 0)
+        # Ancestry-reachable lifetime merge total — returns None for legacy entries
+        # (unknown reachability); aggregate falls back to 0. Only included in
+        # stat_entry when at least one history entry has reachable_prs_merged.
+        _reachable_counts = [reachable_merged_count(h) for h in history]
+        _any_reachable_recorded = any(c is not None for c in _reachable_counts) or bool(
+            agg.get("total_reachable_prs_merged")
+        )
+        total_reachable_merged: int | None = None
+        if _any_reachable_recorded:
+            total_reachable_merged = sum(
+                c for c in _reachable_counts if c is not None
+            ) + (agg.get("total_reachable_prs_merged", 0) or 0)
         # Declaration coverage = declared / merged-write, recomputed from summed
         # counts (not averaged per-cycle fractions) so it survives eviction.
         total_declared_merged = sum(declared_merged_count(h) for h in history) + (
@@ -4511,6 +4524,7 @@ async def _spawn_strategic_review(
             "consumed_prs_merged": total_consumed_merged,
             "acceptance_declaration_coverage": acceptance_declaration_coverage,
             "tasks_failed": total_failed,
+            **({"reachable_prs_merged": total_reachable_merged} if total_reachable_merged is not None else {}),
             "possibly_saturated": d.get("possibly_saturated", False),
         }
         # Surface the direction→gap linkage so the strategic agent can reconcile

@@ -14764,3 +14764,66 @@ async def test_spawn_strategic_review_omits_ci_compliance_when_unavailable(
     assert "ci_compliance" not in payload, (
         "ci_compliance should be absent when ensure_current_ci_compliance is unavailable"
     )
+
+
+@pytest.mark.asyncio
+async def test_direction_stats_reachable_prs_merged_in_stat_entry(db_session):
+    """reachable_prs_merged is surfaced in directions_summary stat_entry and survives compaction.
+
+    A direction with at least one history entry that carries reachable_prs_merged
+    should expose the lifetime reachable total. A direction with only legacy history
+    entries (no reachable_prs_merged field) should omit the key rather than fabricate 0.
+    """
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-reachable01",
+                "status": "active",
+                "text": "Direction with reachable credit",
+                "priority": "medium",
+                # 3 merged, 2 ancestry-confirmed reachable.
+                "research_history": [
+                    {
+                        "prs_merged": 3,
+                        "verified_prs_merged": 3,
+                        "reachable_prs_merged": 2,
+                    }
+                ],
+            },
+            {
+                "id": "d-legacy-noreachable",
+                "status": "active",
+                "text": "Direction with legacy entry (no reachable field)",
+                "priority": "medium",
+                # Pre-reachability: reachable_prs_merged key absent.
+                "research_history": [{"prs_merged": 4, "verified_prs_merged": 4}],
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+
+    reachable_dir = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-reachable01"
+    )
+    assert reachable_dir["reachable_prs_merged"] == 2, (
+        "reachable_prs_merged must appear in stat_entry and survive compaction"
+    )
+    assert reachable_dir["reachable_prs_merged"] <= reachable_dir["prs_merged"]
+
+    legacy_dir = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-legacy-noreachable"
+    )
+    assert "reachable_prs_merged" not in legacy_dir, (
+        "legacy directions without reachable_prs_merged must not fabricate a value"
+    )

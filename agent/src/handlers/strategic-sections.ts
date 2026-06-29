@@ -967,14 +967,36 @@ export function buildDirSummaryText(
   const body = directionsSummary.map((d, i) => {
     const parts = [`${fmtScalar(d.total_cycles, '0')} cycles`];
     if (d.prs_merged) {
-      const rawMerged = Number(d.prs_merged);
-      const verifiedMerged = typeof d.verified_prs_merged === 'number' ? d.verified_prs_merged : undefined;
-      if (verifiedMerged !== undefined && verifiedMerged < rawMerged) {
-        const badgeOnly = Math.max(0, rawMerged - verifiedMerged);
-        parts.push(`${rawMerged} merged (${verifiedMerged} verified, ${badgeOnly} badge-only)`);
-      } else {
-        parts.push(`${fmtScalar(d.prs_merged)} merged`);
+      const prs_merged = Number(d.prs_merged);
+      const verified = d.verified_prs_merged !== undefined && d.verified_prs_merged !== null
+        ? Number(d.verified_prs_merged)
+        : 0;
+      const reachable = d.reachable_prs_merged !== undefined && d.reachable_prs_merged !== null
+        ? Number(d.reachable_prs_merged)
+        : 0;
+
+      let mergedText = `${prs_merged} merged`;
+      const annotations: string[] = [];
+
+      // Add verified annotation if present and less than prs_merged
+      if (verified > 0 && verified < prs_merged) {
+        annotations.push(`${verified} verified`);
       }
+
+      // Add reachable-vs-badge split if reachable is present.
+      // "badge-only" here means merged but NOT ancestry-reachable (prs_merged - reachable).
+      // The backend also defines badge_only_prs_merged = prs_merged - verified_prs_merged
+      // (a different axis); the agent does not consume that field for this text.
+      if (reachable > 0) {
+        const badgeOnly = Math.max(0, prs_merged - reachable);
+        annotations.push(`${reachable} reachable, ${badgeOnly} badge-only`);
+      }
+
+      if (annotations.length > 0) {
+        mergedText += ` (${annotations.join('; ')})`;
+      }
+
+      parts.push(mergedText);
     }
     const proven = Number(d.proven_prs_merged ?? 0);
     const consumed = Number(d.consumed_prs_merged ?? 0);

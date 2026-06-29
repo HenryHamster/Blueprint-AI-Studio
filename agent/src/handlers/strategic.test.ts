@@ -209,6 +209,7 @@ import {
   handleStrategic,
 } from './strategic.js';
 import { runClaudeCode, apiPost, setCurrentPromptFingerprint, sendHeartbeatSync } from '../index.js';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 import { VmConfigMissingError } from '../providers/runners.js';
 import {
   computeStrategicPromptFingerprint,
@@ -1121,8 +1122,8 @@ describe('handleStrategic prompt_suffix wiring', () => {
       capturedThinkerParams as unknown as ThinkerPromptParams,
       `\n\nAdditional instructions:\n${suffix}`,
     );
-    expect(vi.mocked(setCurrentPromptFingerprint)).toHaveBeenCalledWith(expected);
-    expect(vi.mocked(sendHeartbeatSync)).toHaveBeenCalledWith(
+    expectCalledWith(setCurrentPromptFingerprint, expected);
+    expectCalledWith(sendHeartbeatSync,
       'task-fingerprint',
       'Cloning owner/repo for research...',
       { prompt_fingerprint: expected },

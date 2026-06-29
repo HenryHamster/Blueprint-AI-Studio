@@ -37,7 +37,7 @@ from app.acceptance_gate import (
     acceptance_was_declared,
     classify_merged_acceptance,
 )
-from app.landed_signal import is_merged_completion
+from app.landed_signal import LANDED_ON_INTEGRATION_KEY, is_merged_completion
 from app.models import (
     Artifact,
     ArtifactType,
@@ -224,6 +224,25 @@ def consumed_merged_count(entry: dict) -> int:
     return int(entry.get("acceptance_consumed_merged") or 0)
 
 
+def reachable_merged_count(entry: dict) -> int | None:
+    """Ancestry-reachable merged-PR count for a research_history entry.
+
+    Returns the subset of ``prs_merged`` whose persisted task context carries
+    ``landed_on_integration=True`` — confirming the merge commit was an ancestor
+    of the integration branch at the time it was stamped. Distinct from
+    :func:`verified_merged_count`: reachability is about ancestry confirmation,
+    not verification quality.
+
+    Returns ``None`` for legacy entries written before ``reachable_prs_merged``
+    was recorded — the reachability of those merges is genuinely unknown, and
+    fabricating zero would misrepresent the historical data. Callers that render
+    a reachable-vs-badge split must omit it when this returns ``None``.
+    """
+    if "reachable_prs_merged" not in entry:
+        return None
+    return int(entry.get("reachable_prs_merged") or 0)
+
+
 def declared_merged_count(entry: dict) -> int:
     """Plan-time-declared merged-PR count for a research_history entry.
 
@@ -286,6 +305,17 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
         violations.append(f"verified ({verified}) exceeds prs_merged ({prs_merged})")
     if declared > prs_merged:
         violations.append(f"declared ({declared}) exceeds prs_merged ({prs_merged})")
+
+    # reachable_prs_merged must be a non-negative subset of prs_merged. Only
+    # checked when the field is present — legacy entries without it are skipped.
+    if "reachable_prs_merged" in entry:
+        reachable = int(entry.get("reachable_prs_merged") or 0)
+        if reachable < 0:
+            violations.append(f"reachable ({reachable}) is negative")
+        if reachable > prs_merged:
+            violations.append(
+                f"reachable ({reachable}) exceeds prs_merged ({prs_merged})"
+            )
 
     coverage = entry.get("acceptance_declaration_coverage")
     if "acceptance_merged_write_total" in entry:
@@ -538,6 +568,9 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     },
     "verified_prs_merged": {
         "consumer": "verified_merged_count (this module), digest_metrics.py, strategic_spawning.py"
+    },
+    "reachable_prs_merged": {
+        "consumer": "reachable_merged_count (this module), strategic_spawning.py (stat_entry reachable_prs_merged), strategic_payload_compaction.py (_compact_direction_summary_entry)"
     },
     # --- Acceptance aggregates: now wired to decision + reader-facing consumers. ---
     # These expose proven-by-evidence and declaration-coverage truth distinct
@@ -1188,6 +1221,16 @@ async def _update_direction_research_outcomes(
         aggregate_buckets["proven"]
         + aggregate_buckets["satisfied_unproven"]
         + aggregate_buckets["undeclared"]
+    )
+    # reachable_prs_merged: the ancestry-confirmed subset of prs_merged — tasks
+    # whose persisted context carries landed_on_integration=True (explicit True,
+    # NOT the legacy pr_merged fallback). Badge-only/indeterminate merges (key
+    # absent but pr_merged=True) are NOT counted here, but they STILL count in
+    # prs_merged because indeterminate ancestry must not silently drop credit.
+    entry["reachable_prs_merged"] = sum(
+        1
+        for ct in _merged_rows
+        if (ct.context or {}).get(LANDED_ON_INTEGRATION_KEY) is True
     )
     # Honest proven-by-evidence + declaration-coverage aggregates. These are
     # STRICTLY ADDITIVE: they do not change verified_prs_merged or prs_merged —
