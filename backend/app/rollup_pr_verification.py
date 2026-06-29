@@ -162,6 +162,8 @@ async def verify_rollup_merge_landed(
     )
     mark_stranded_non_landing(task, reason=reason)
     logger.error("[ROLLUP_ANCESTRY] %s task=%s", reason, getattr(task, "id", None))
+    from app.direction_outcomes import discount_stranded_pr_from_direction_credit
+    await discount_stranded_pr_from_direction_credit(task, session)
     try:
         await _maybe_create_failure_alert(task, session, reason)
     except Exception as exc:  # noqa: BLE001 — alert failure must not undo the gate

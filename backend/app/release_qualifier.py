@@ -1599,7 +1599,9 @@ _BLOCKER_LABELS: dict[str, str] = {
         "production's recorded schema state (deploy-fatal drift)"
     ),
     "criterion_coverage_incomplete": (
-        "one or more version acceptance criteria remain uncovered"
+        "one or more version acceptance criteria remain uncovered; stuck "
+        "criteria (no direction mapping, or all mapped directions retired) need "
+        "direction remapping or operator attestation to clear"
     ),
     "merge_grade_misses": (
         "the merged diffs 'misses' the version goal per the blind merge-grade "

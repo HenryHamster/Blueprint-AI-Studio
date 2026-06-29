@@ -2180,6 +2180,74 @@ async def refresh_direction_outcomes_after_merge(
             await session.rollback()
 
 
+async def discount_stranded_pr_from_direction_credit(
+    task: Task, session: AsyncSession
+) -> None:
+    """Persist a confirmed non-landing discount to the direction's research-history entry.
+
+    Called after :func:`~app.landed_signal.mark_stranded_non_landing` has set
+    ``landed_on_integration=False`` on a task whose PR was previously
+    badge-counted (``pr_merged=True``) and may already have been accumulated
+    into the cycle's ``prs_merged``/``verified_prs_merged`` count by an earlier
+    :func:`_update_direction_research_outcomes` pass.
+
+    Increments ``stranded_prs_merged`` on the matching ``research_history`` entry
+    so that :func:`credit_gate_merged_count` subtracts the stale credit without
+    requiring a full outcome recompute.  Only increments when the task actually
+    carried ``pr_merged=True`` — a task that was never badge-counted needs no
+    correction.
+
+    Idempotent: stamps ``stranded_discount_applied=True`` on ``task.context``
+    after the first successful discount so repeated rollup-management cycles
+    that re-enter the stranded-PR path are no-ops and cannot over-subtract
+    direction credit.
+
+    Best-effort: failures are logged and the session rolled back so the caller's
+    stranding operation (``mark_stranded_non_landing``) is not disrupted.
+    """
+    import contextlib
+    import logging
+
+    ctx = task.context or {}
+    direction_id = ctx.get("direction_id")
+    research_task_id = ctx.get("research_task_id")
+    if not (direction_id and research_task_id) or task.project_id is None:
+        return
+    if not ctx.get("pr_merged"):
+        # Never badge-counted; no stale credit to retract.
+        return
+    if ctx.get("stranded_discount_applied"):
+        # Idempotency guard: discount already applied on a prior cycle; skip.
+        return
+    try:
+
+        def _apply_stranded_discount(dirs: list) -> None:
+            for d in dirs:
+                if d.get("id") != str(direction_id):
+                    continue
+                history = list(d.get("research_history", []))
+                for idx, h in enumerate(history):
+                    if h.get("task_id") == str(research_task_id):
+                        current = int(h.get("stranded_prs_merged") or 0)
+                        history[idx] = {**h, "stranded_prs_merged": current + 1}
+                        break
+                d["research_history"] = history
+                break
+
+        await with_directions_locked(session, task.project_id, _apply_stranded_discount)
+        # Stamp the idempotency flag so repeated rollup-management cycles are no-ops.
+        task.context = {**ctx, "stranded_discount_applied": True}
+        await session.commit()
+    except Exception as exc:  # noqa: BLE001 — best-effort; must not undo stranding
+        logging.getLogger(__name__).warning(
+            "[DIRECTION] stranded-PR credit discount failed for task %s: %r",
+            getattr(task, "id", None),
+            exc,
+        )
+        with contextlib.suppress(Exception):
+            await session.rollback()
+
+
 def _refresh_pipeline_scope_merge_rates(project: Project) -> None:
     """Publish project-wide scope merge rates to runtime_config.
 

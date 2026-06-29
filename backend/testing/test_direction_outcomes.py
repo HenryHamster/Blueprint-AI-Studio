@@ -519,6 +519,276 @@ async def test_pr_metrics_exclude_non_merge_unblocks(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_confirmed_non_landing_discounts_credit_gate(db_session: AsyncSession):
+    """A badge-counted task confirmed non-landing via ancestry reduces credit_gate_merged_count.
+
+    Regression: stranded_prs_merged was never written, so confirmed non-landings
+    remained visible to steering decisions via the stale prs_merged count.
+    """
+    from app.direction_outcomes import (
+        credit_gate_merged_count,
+        discount_stranded_pr_from_direction_credit,
+    )
+    from app.landed_signal import mark_stranded_non_landing
+
+    direction_id = "d-stranded-credit"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    await db_session.flush()
+
+    # Task badge-counted (pr_merged=True) before stranding is discovered.
+    stranded_task = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="stranded",
+    )
+    # A second task that landed cleanly on integration.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="landed",
+    )
+    await db_session.flush()
+
+    # Initial recompute: both tasks count before stranding is known.
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 2
+    assert credit_gate_merged_count(entry) == 2
+
+    # Ancestry check later confirms the first PR never reached integration.
+    mark_stranded_non_landing(stranded_task, reason="rollup->integration merge not an ancestor")
+    await db_session.flush()
+
+    # discount_stranded_pr_from_direction_credit persists stranded_prs_merged so
+    # credit_gate_merged_count subtracts the confirmed non-landing from credit.
+    await discount_stranded_pr_from_direction_credit(stranded_task, db_session)
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry.get("stranded_prs_merged") == 1
+    assert credit_gate_merged_count(entry) == 1  # 2 verified - 1 stranded
+
+
+@pytest.mark.asyncio
+async def test_discount_stranded_pr_is_idempotent(db_session: AsyncSession):
+    """discount_stranded_pr_from_direction_credit must not over-subtract on repeated calls.
+
+    Regression: rollup-management cycles re-enter the merged-PR classification
+    block while the parent remains in EVALUATING, calling discount repeatedly and
+    driving credit_gate_merged_count below the legitimate count.
+    """
+    from app.direction_outcomes import (
+        credit_gate_merged_count,
+        discount_stranded_pr_from_direction_credit,
+    )
+    from app.landed_signal import mark_stranded_non_landing
+
+    direction_id = "d-idempotent-discount"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=3)]
+    await db_session.flush()
+
+    stranded_task = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="stranded",
+    )
+    # A second task that landed cleanly.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="landed",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+
+    mark_stranded_non_landing(stranded_task, reason="not reachable from integration")
+    await db_session.flush()
+
+    # Simulate N rollup-management cycles all calling discount on the same task.
+    for _ in range(3):
+        await discount_stranded_pr_from_direction_credit(stranded_task, db_session)
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # stranded_prs_merged must be exactly 1, not 3.
+    assert entry.get("stranded_prs_merged") == 1
+    assert credit_gate_merged_count(entry) == 1  # 2 prs_merged - 1 stranded
+    # Idempotency flag must be set on the task context.
+    assert stranded_task.context.get("stranded_discount_applied") is True
+
+
+@pytest.mark.asyncio
+async def test_discount_stranded_pr_guards(db_session: AsyncSession):
+    """discount_stranded_pr_from_direction_credit early-return guards fire correctly."""
+    from app.direction_outcomes import discount_stranded_pr_from_direction_credit
+
+    direction_id = "d-guards"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=1)]
+    await db_session.flush()
+
+    # Guard 1: pr_merged=False — task was never badge-counted; must not touch history.
+    no_badge_task = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": False,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="no-badge",
+    )
+    await db_session.flush()
+    await discount_stranded_pr_from_direction_credit(no_badge_task, db_session)
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry.get("stranded_prs_merged") is None  # untouched
+
+    # Guard 2: missing direction_id — should return without error.
+    bare_task = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},  # no direction_id / research_task_id
+        title="bare",
+    )
+    await db_session.flush()
+    await discount_stranded_pr_from_direction_credit(bare_task, db_session)
+    # No exception raised and history still untouched.
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry.get("stranded_prs_merged") is None
+
+
+@pytest.mark.asyncio
+async def test_verify_rollup_merge_landed_stranded_invokes_discount(
+    db_session: AsyncSession, mocker
+):
+    """verify_rollup_merge_landed's ancestry-failure path must call discount_stranded_pr.
+
+    Integration test: the wiring from rollup_pr_verification into
+    discount_stranded_pr_from_direction_credit is exercised end-to-end by
+    stubbing only the GitHub I/O layer (is_ancestor_of -> False).
+    """
+    from app.direction_outcomes import credit_gate_merged_count
+    from app.rollup_pr_verification import verify_rollup_merge_landed
+
+    direction_id = "d-verify-wiring"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    await db_session.flush()
+
+    child_task = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="rollup-task",
+    )
+    await db_session.flush()
+
+    # Seed prs_merged=1 so there is credit to subtract.
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    # Stub GitHub I/O: is_ancestor_of returns False (definitive non-landing).
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch("app.github.is_ancestor_of", return_value=False)
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+
+    result = await verify_rollup_merge_landed(
+        child_task,
+        project,
+        db_session,
+        pr_number=1,
+        merge_commit_sha="abc1234",
+        integration_branch="main",
+        source="test",
+    )
+
+    assert result == "stranded"
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # Discount must have been applied exactly once.
+    assert entry.get("stranded_prs_merged") == 1
+    assert credit_gate_merged_count(entry) == 0  # 1 prs_merged - 1 stranded
+    # Idempotency flag must be set.
+    assert child_task.context.get("stranded_discount_applied") is True
+
+
+@pytest.mark.asyncio
 async def test_conversion_rate_division_by_zero(db_session: AsyncSession):
     """verified_prs_merged is computed correctly even when tasks_created is 0."""
     direction_id = "d-zerodiv"

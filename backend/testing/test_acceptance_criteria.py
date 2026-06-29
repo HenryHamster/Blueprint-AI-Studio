@@ -11,7 +11,8 @@ Exercises :mod:`app.acceptance_criteria`:
   * _apply_new_acceptance_criteria creates criteria from the strategist path;
   * criterion_ids are propagated from direction to spawned task;
   * test_criterion_evidence_recorded_on_task_merge verifies merge evidence flow;
-  * GET /version-lifecycle includes criterion_coverage on current_version and history entries.
+  * GET /version-lifecycle includes criterion_coverage on current_version and history entries;
+  * operator_attestation source_kind satisfies coverage and the attest endpoint records it.
 """
 
 from __future__ import annotations
@@ -397,7 +398,161 @@ async def test_coverage_summary_empty(db_session):
     assert summary["covered"] == 0
     assert summary["partial"] == 0
     assert summary["uncovered"] == 0
+    assert summary["stuck_count"] == 0
     assert summary["criteria"] == []
+
+
+# ---------------------------------------------------------------------------
+# stuck-criterion diagnosis (_classify_stuck_reasons / get_version_coverage_summary)
+# ---------------------------------------------------------------------------
+
+
+def _make_direction(project_id, key_suffix, criterion_keys, status):
+    return Direction(
+        project_id=project_id,
+        direction_key=f"d-{key_suffix}",
+        data={"id": f"d-{key_suffix}", "text": "dir", "status": status},
+        status=status,
+        text="dir",
+        criterion_keys=list(criterion_keys),
+    )
+
+
+@pytest.mark.asyncio
+async def test_stuck_reason_no_mapping(db_session):
+    """Uncovered criterion with no Direction referencing its key → 'no_mapping'."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Unmapped")
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[c1.criterion_key]["coverage"] == "uncovered"
+    assert by_key[c1.criterion_key]["stuck_reason"] == "no_mapping"
+    assert summary["stuck_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stuck_reason_direction_retired(db_session):
+    """Uncovered criterion whose only mapping is retired → 'direction_retired'."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Retired-mapped")
+
+    for i, status in enumerate(("expired", "retired", "superseded", "completed")):
+        db_session.add(
+            _make_direction(project.id, f"ret{i}", [c1.criterion_key], status)
+        )
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[c1.criterion_key]["stuck_reason"] == "direction_retired"
+    assert summary["stuck_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_stuck_reason_none_when_active_direction(db_session):
+    """Uncovered criterion with an active mapping → stuck_reason None, not counted."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Active-mapped")
+
+    db_session.add(_make_direction(project.id, "act1", [c1.criterion_key], "active"))
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[c1.criterion_key]["coverage"] == "uncovered"
+    assert by_key[c1.criterion_key]["stuck_reason"] is None
+    assert summary["stuck_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stuck_reason_mixed_directions_active_wins(db_session):
+    """One retired + one active mapping → not stuck (active wins)."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Mixed-mapped")
+
+    db_session.add(_make_direction(project.id, "mret", [c1.criterion_key], "retired"))
+    db_session.add(_make_direction(project.id, "mact", [c1.criterion_key], "active"))
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[c1.criterion_key]["stuck_reason"] is None
+    assert summary["stuck_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_covered_criterion_has_no_stuck_reason(db_session):
+    """A covered criterion carries stuck_reason None regardless of direction status."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Covered")
+    await ac.record_evidence(
+        db_session,
+        criterion_id=c1.id,
+        project_id=project.id,
+        source_kind="task_merge",
+        detail={"proven": True},
+    )
+    # Even with a retired mapping, a covered criterion is never stuck.
+    db_session.add(_make_direction(project.id, "cret", [c1.criterion_key], "retired"))
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[c1.criterion_key]["coverage"] == "covered"
+    assert by_key[c1.criterion_key]["stuck_reason"] is None
+    assert summary["stuck_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stuck_count_aggregates_across_criteria(db_session):
+    """stuck_count counts only the stuck uncovered criteria across a mix."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    c_no_map = await ac.create_criterion(db_session, project.id, version.id, "NoMap")
+    c_retired = await ac.create_criterion(db_session, project.id, version.id, "Retired")
+    c_active = await ac.create_criterion(db_session, project.id, version.id, "Active")
+    c_covered = await ac.create_criterion(db_session, project.id, version.id, "Covered")
+
+    db_session.add(
+        _make_direction(project.id, "agret", [c_retired.criterion_key], "superseded")
+    )
+    db_session.add(
+        _make_direction(project.id, "agact", [c_active.criterion_key], "active")
+    )
+    await ac.record_evidence(
+        db_session,
+        criterion_id=c_covered.id,
+        project_id=project.id,
+        source_kind="reachability",
+    )
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[c_no_map.criterion_key]["stuck_reason"] == "no_mapping"
+    assert by_key[c_retired.criterion_key]["stuck_reason"] == "direction_retired"
+    assert by_key[c_active.criterion_key]["stuck_reason"] is None
+    assert by_key[c_covered.criterion_key]["stuck_reason"] is None
+    # no_map + retired are stuck; active and covered are not.
+    assert summary["stuck_count"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -1231,3 +1386,139 @@ class TestVersionLifecycleCriterionCoverage:
         assert coverage["uncovered"] == 1
         assert len(coverage["criteria"]) == 1
         assert coverage["criteria"][0]["text"] == "Shipped criterion"
+
+
+# ---------------------------------------------------------------------------
+# operator_attestation coverage and attest endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_operator_attestation_covers_criterion():
+    """operator_attestation source_kind must satisfy _evidence_proves_covered unconditionally.
+
+    This is the named acceptance test for the operator-attestation waiver feature.
+    It verifies that an operator_attestation evidence record flips coverage to
+    'covered' regardless of what detail it carries, mirroring the reachability
+    behaviour.  A criterion with only operator_attestation evidence must NOT
+    remain 'partial' or 'uncovered'.
+    """
+    ev_no_detail = _make_evidence("operator_attestation")
+    assert ac._evidence_proves_covered(ev_no_detail) is True
+
+    ev_with_detail = _make_evidence("operator_attestation", detail={"reason": "accepted"})
+    assert ac._evidence_proves_covered(ev_with_detail) is True
+
+    assert ac.compute_criterion_coverage([ev_no_detail]) == "covered"
+    assert ac.compute_criterion_coverage([ev_with_detail]) == "covered"
+
+    # A mix of non-covering evidence plus operator_attestation must still be covered.
+    ev_partial = _make_evidence("task_merge")  # no proven=True → not covering on its own
+    assert ac.compute_criterion_coverage([ev_partial, ev_with_detail]) == "covered"
+
+
+@pytest.mark.asyncio
+async def test_attest_endpoint_happy_path(client: AsyncClient, db_session):
+    """POST .../attest records operator_attestation evidence and coverage flips to 'covered'."""
+    project = await _make_project_with_member(db_session, name="Attest-Happy")
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Stuck criterion"
+    )
+
+    resp = await client.post(
+        f"/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/attest",
+        json={"reason": "Direction retired; operator confirms criterion is satisfied"},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["criterion_key"] == criterion.criterion_key
+    assert data["coverage"] == "covered"
+
+    # Verify evidence persisted with the correct source_kind and detail.
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) == 1
+    assert evidence[0].source_kind == "operator_attestation"
+    assert evidence[0].detail == {"reason": "Direction retired; operator confirms criterion is satisfied"}
+    assert evidence[0].source_id == _TEST_USER_ID
+
+    # GET coverage summary must now show 'covered'.
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[criterion.criterion_key]["coverage"] == "covered"
+    assert summary["covered"] == 1
+    assert summary["uncovered"] == 0
+
+
+@pytest.mark.asyncio
+async def test_attest_endpoint_get_criteria_shows_covered(client: AsyncClient, db_session):
+    """GET /acceptance-criteria returns coverage='covered' after an attestation."""
+    project = await _make_project_with_member(db_session, name="Attest-GetCoverage")
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Stuck")
+
+    await client.post(
+        f"/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/attest",
+        json={"reason": "accepted by operator"},
+    )
+
+    resp = await client.get(f"/projects/{project.id}/acceptance-criteria")
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["covered"] == 1
+    assert data["uncovered"] == 0
+    by_key = {c["criterion_key"]: c for c in data["criteria"]}
+    assert by_key[criterion.criterion_key]["coverage"] == "covered"
+
+
+@pytest.mark.asyncio
+async def test_attest_endpoint_empty_reason_rejected(client: AsyncClient, db_session):
+    """POST .../attest with an empty reason returns 400."""
+    project = await _make_project_with_member(db_session, name="Attest-EmptyReason")
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "X")
+
+    resp = await client.post(
+        f"/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/attest",
+        json={"reason": ""},
+    )
+    assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+async def test_attest_endpoint_unknown_criterion_key(client: AsyncClient, db_session):
+    """POST .../attest with an unknown criterion_key returns 404."""
+    project = await _make_project_with_member(db_session, name="Attest-UnknownKey")
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/projects/{project.id}/acceptance-criteria/c-deadbeef/attest",
+        json={"reason": "valid reason"},
+    )
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_attest_endpoint_no_open_version(client: AsyncClient, db_session):
+    """POST .../attest returns 409 when the project has no open release version."""
+    project = await _make_project_with_member(db_session, name="Attest-NoVersion")
+
+    resp = await client.post(
+        f"/projects/{project.id}/acceptance-criteria/c-anykey/attest",
+        json={"reason": "valid reason"},
+    )
+    assert resp.status_code == 409, resp.text

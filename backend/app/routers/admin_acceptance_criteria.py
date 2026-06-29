@@ -1,10 +1,11 @@
 """Admin endpoints for version-scoped acceptance criteria management.
 
 Provides:
-  GET    /api/admin/projects/{project_id}/acceptance-criteria          — list criteria for open version
-  POST   /api/admin/projects/{project_id}/acceptance-criteria          — create a criterion
-  DELETE /api/admin/projects/{project_id}/acceptance-criteria/{key}    — delete a criterion
-  POST   /api/admin/projects/{project_id}/acceptance-criteria/link-direction — link criteria keys to a direction
+  GET    /api/admin/projects/{project_id}/acceptance-criteria                          — list criteria for open version
+  POST   /api/admin/projects/{project_id}/acceptance-criteria                          — create a criterion
+  DELETE /api/admin/projects/{project_id}/acceptance-criteria/{key}                    — delete a criterion
+  POST   /api/admin/projects/{project_id}/acceptance-criteria/link-direction           — link criteria keys to a direction
+  POST   /api/admin/projects/{project_id}/acceptance-criteria/{criterion_key}/attest   — operator attestation waiver
 """
 
 import logging
@@ -20,7 +21,7 @@ from app import acceptance_criteria as ac
 from app.admin import _get_user_project_with_role
 from app.auth import get_current_user
 from app.database import get_session
-from app.models import Direction
+from app.models import CriterionEvidence, Direction
 
 router = APIRouter(prefix="/api/admin")
 logger = logging.getLogger(__name__)
@@ -212,3 +213,66 @@ async def link_criteria_to_direction(
         "direction_key": body.direction_key,
         "criterion_keys": deduped_keys,
     }
+
+
+class AttestRequest(BaseModel):
+    reason: str = Field(...)
+
+
+@router.post("/projects/{project_id}/acceptance-criteria/{criterion_key}/attest")
+async def attest_criterion(
+    project_id: uuid.UUID,
+    criterion_key: str,
+    body: AttestRequest,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Record an operator attestation that a stuck criterion is intentionally accepted.
+
+    This waiver path allows operators to unblock qualification when a criterion is
+    permanently uncoverable (e.g. its mapped direction retired).  The attestation
+    is operator-only and is never called by autonomous agents.
+    """
+    if not body.reason or not body.reason.strip():
+        raise HTTPException(status_code=400, detail="reason must not be empty")
+
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(status_code=409, detail="No open release version")
+
+    existing = await ac.get_criteria_by_keys(
+        session,
+        project_id,
+        [criterion_key],
+        release_version_id=open_version.id,
+    )
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Criterion key not found in open version: {criterion_key}",
+        )
+
+    row = existing[0]
+    evidence = CriterionEvidence(
+        criterion_id=row.id,
+        project_id=project_id,
+        source_kind="operator_attestation",
+        source_id=current_user["user_id"],
+        detail={"reason": body.reason},
+    )
+    session.add(evidence)
+    await session.commit()
+
+    logger.info(
+        "[AC] Operator attestation recorded: project=%s criterion=%s user=%s reason=%r",
+        project_id,
+        criterion_key,
+        current_user["user_id"],
+        body.reason,
+    )
+    return {"status": "ok", "criterion_key": criterion_key, "coverage": "covered"}

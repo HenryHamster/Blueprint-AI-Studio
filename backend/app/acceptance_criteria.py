@@ -16,23 +16,35 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import func
 from sqlmodel import select
 
-from app.models import CriterionEvidence, VersionAcceptanceCriterion
+from app.models import CriterionEvidence, Direction, VersionAcceptanceCriterion
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
+# Mirror of research_direction_state.RETIRED_DIRECTION_STATUSES. Defined locally
+# (rather than imported at module load) because research_direction_state pulls in
+# heavy modules and acceptance_criteria is imported early by release_qualifier —
+# importing it at top-level risks an import cycle. The set is tiny and stable.
+_RETIRED_DIRECTION_STATUSES = frozenset(
+    {"expired", "retired", "superseded", "completed"}
+)
+
 def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     """Whether a single evidence record satisfies the 'covered' condition.
 
     ``reachability`` is covered on its own; it represents the ancestry check
     that says the merge really reached the integration branch.
+    ``operator_attestation`` is covered on its own; the operator has explicitly
+    accepted the criterion, overriding any stuck-criterion deadlock.
     ``task_merge`` requires ``proven=True`` in ``detail`` — a bare merge badge
     without acceptance-proof is not sufficient to qualify the criterion.
     All other source_kinds are not sufficient on their own.
     """
     if e.source_kind == "reachability":
+        return True
+    if e.source_kind == "operator_attestation":
         return True
     if e.source_kind == "task_merge":
         return isinstance(e.detail, dict) and e.detail.get("proven") is True
@@ -352,6 +364,58 @@ async def delete_criterion(
     return True
 
 
+async def _classify_stuck_reasons(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    uncovered_keys: list[str],
+) -> dict[str, str | None]:
+    """Diagnose WHY each uncovered criterion is uncovered.
+
+    Returns a mapping ``criterion_key -> stuck_reason`` where ``stuck_reason`` is:
+
+      ``"no_mapping"``        — no Direction in the project lists this key in its
+                                ``criterion_keys``;
+      ``"direction_retired"`` — at least one Direction maps this key but *every*
+                                mapping Direction has a retired status
+                                (``expired``/``retired``/``superseded``/``completed``);
+      ``None``                — at least one *active* (non-retired) Direction maps
+                                this key, so the criterion is in-progress, not stuck.
+
+    A single bulk query fetches every project Direction, then classification
+    happens in Python — no N+1. The empty-``criterion_keys`` filter and the
+    per-key membership test both run on the deserialized Python list rather than
+    via a DB-specific JSONB operator, so the helper is portable across Postgres
+    (production) and SQLite (some tests) — ``jsonb <> varchar`` is not a valid
+    Postgres operator, and JSONB containment is not available in SQLite.
+    """
+    if not uncovered_keys:
+        return {}
+
+    result = await session.execute(
+        select(Direction).where(Direction.project_id == project_id)
+    )
+    directions = list(result.scalars().all())
+
+    # Build key -> set of statuses of the directions that reference it.
+    # Directions with an empty criterion_keys list contribute nothing.
+    key_statuses: dict[str, set[str]] = defaultdict(set)
+    for direction in directions:
+        keys = direction.criterion_keys or []
+        for key in keys:
+            key_statuses[key].add(direction.status)
+
+    reasons: dict[str, str | None] = {}
+    for key in uncovered_keys:
+        statuses = key_statuses.get(key)
+        if not statuses:
+            reasons[key] = "no_mapping"
+        elif statuses <= _RETIRED_DIRECTION_STATUSES:
+            reasons[key] = "direction_retired"
+        else:
+            reasons[key] = None
+    return reasons
+
+
 async def get_version_coverage_summary(
     session: AsyncSession,
     release_version_id: uuid.UUID,
@@ -365,16 +429,26 @@ async def get_version_coverage_summary(
             'covered': N,
             'partial': N,
             'uncovered': N,
+            'stuck_count': N,
             'criteria': [
                 {
                     'criterion_key': str,
                     'text': str,
                     'coverage': 'covered' | 'partial' | 'uncovered',
                     'evidence_count': int,
+                    'stuck_reason': 'no_mapping' | 'direction_retired' | None,
                 },
                 ...
             ],
         }
+
+    ``stuck_reason`` is only non-``None`` for *uncovered* criteria that have no
+    active Direction mapping (see :func:`_classify_stuck_reasons`); covered and
+    partial criteria always carry ``None``. ``stuck_count`` is the number of
+    uncovered criteria whose ``stuck_reason`` is non-``None`` — i.e. criteria
+    that need direction remapping or operator attestation to ever become
+    covered. These fields are strictly additive; the pre-existing keys are
+    unchanged.
     """
     counts: dict[str, int] = {"covered": 0, "partial": 0, "uncovered": 0}
     criteria_detail = []
@@ -400,16 +474,41 @@ async def get_version_coverage_summary(
         if evidence is not None:
             evidence_by_criterion[criterion.id].append(evidence)
 
+    coverage_by_criterion: dict[uuid.UUID, str] = {}
     for criterion in criteria_in_order:
         evidence = evidence_by_criterion.get(criterion.id, [])
         coverage = compute_criterion_coverage(evidence)
+        coverage_by_criterion[criterion.id] = coverage
         counts[coverage] += 1
+
+    # Diagnose uncovered criteria: which ones are stuck (no active direction) vs.
+    # merely in-progress. project_id is derived from a loaded criterion row —
+    # every criterion carries it — so the public signature stays unchanged.
+    uncovered_keys = [
+        c.criterion_key
+        for c in criteria_in_order
+        if coverage_by_criterion[c.id] == "uncovered"
+    ]
+    stuck_reasons: dict[str, str | None] = {}
+    if uncovered_keys:
+        stuck_reasons = await _classify_stuck_reasons(
+            session, criteria_in_order[0].project_id, uncovered_keys
+        )
+
+    stuck_count = 0
+    for criterion in criteria_in_order:
+        evidence = evidence_by_criterion.get(criterion.id, [])
+        coverage = coverage_by_criterion[criterion.id]
+        stuck_reason = stuck_reasons.get(criterion.criterion_key)
+        if stuck_reason is not None:
+            stuck_count += 1
         criteria_detail.append(
             {
                 "criterion_key": criterion.criterion_key,
                 "text": criterion.text,
                 "coverage": coverage,
                 "evidence_count": len(evidence),
+                "stuck_reason": stuck_reason,
             }
         )
 
@@ -418,5 +517,6 @@ async def get_version_coverage_summary(
         "covered": counts["covered"],
         "partial": counts["partial"],
         "uncovered": counts["uncovered"],
+        "stuck_count": stuck_count,
         "criteria": criteria_detail,
     }
