@@ -1070,11 +1070,45 @@ describe('buildSweepComparisonSection', () => {
     expect(result).toBe('');
   });
 
+  it('returns empty string for single-arm sweeps', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-single': [
+        { id: 'k-r', title: 'arm R', arm_label: 'r', criterion_met: true },
+      ],
+    });
+    expect(result).toBe('');
+  });
+
   it('returns empty string when an arm is unavailable', () => {
     const result = buildSweepComparisonSection({
       'sweep-2': [
         { id: 'k-3', title: 'arm A', arm_label: 'arm-a', criterion_met: true },
         { id: 'k-4', title: 'arm B', arm_label: 'arm-b', criterion_met: false, unavailable_cause: 'compute_failed' },
+      ],
+    });
+    expect(result).toBe('');
+  });
+
+  it('returns empty string when arms have duplicate labels or ids', () => {
+    expect(buildSweepComparisonSection({
+      'sweep-duplicate-label': [
+        { id: 'k-1', title: 'arm A', arm_label: 'same', criterion_met: true },
+        { id: 'k-2', title: 'arm B', arm_label: 'same', criterion_met: false },
+      ],
+    })).toBe('');
+    expect(buildSweepComparisonSection({
+      'sweep-duplicate-id': [
+        { id: 'k-1', title: 'arm A', arm_label: 'a', criterion_met: true },
+        { id: 'k-1', title: 'arm B', arm_label: 'b', criterion_met: false },
+      ],
+    })).toBe('');
+  });
+
+  it('returns empty string when criterion_met is not boolean', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-string-verdict': [
+        { id: 'k-1', title: 'arm A', arm_label: 'a', criterion_met: true },
+        { id: 'k-2', title: 'arm B', arm_label: 'b', criterion_met: 'false' },
       ],
     });
     expect(result).toBe('');
@@ -1164,16 +1198,16 @@ describe('buildSweepComparisonSection', () => {
     expect(result).toContain('Winner: **y2**');
   });
 
-  it('skips sweeps with no arms', () => {
+  it('skips sweeps with fewer than two arms', () => {
     const result = buildSweepComparisonSection({
       'sweep-empty': [],
       'sweep-real': [
-        { id: 'k-r', title: 'arm R', arm_label: 'r', criterion_met: true },
+        { id: 'k-r1', title: 'arm R1', arm_label: 'r1', criterion_met: true },
+        { id: 'k-r2', title: 'arm R2', arm_label: 'r2', criterion_met: false },
       ],
     });
-    // Only the real sweep with a verdicted arm should appear
+    // Only the real comparative sweep should appear.
     expect(result).not.toContain('Sweep sweep-empty');
-    // But the section still renders (sweep-real has 1 arm MET; single-arm sweeps are valid)
     expect(result).toContain('Sweep sweep-real');
   });
 });

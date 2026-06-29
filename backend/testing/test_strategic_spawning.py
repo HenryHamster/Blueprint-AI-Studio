@@ -776,7 +776,9 @@ async def _seed_sweep_arm(
     sweep_id,
     arm_label,
     title="Arm doc",
-    criterion_met=None,
+    criterion_met=True,
+    direction_id=None,
+    persist_doc=True,
 ):
     """Persist one compute_experiment KnowledgeDocument carrying sweep identity.
 
@@ -789,12 +791,22 @@ async def _seed_sweep_arm(
         project_id=project.id,
         title="compute src",
         status=TaskStatus.COMPLETED,
-        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "sweep_id": sweep_id,
+                "experiment": arm_label,
+            }
+        ],
+        context=({"direction_id": direction_id} if direction_id else {}),
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
     )
     session.add(task)
     await session.commit()
     await session.refresh(task)
+    if not persist_doc:
+        return None
     forward_quality_verdict = {"analysis_mode": "deterministic", "criterion_met": criterion_met}
     doc = KnowledgeDocument(
         project_id=project.id,
@@ -865,6 +877,36 @@ async def test_spawn_review_omits_sweep_groups_when_none(db_session):
     await _seed_legacy_cycles(db_session, project)
     # A single-arm sweep is not comparative → no group emitted.
     await _seed_sweep_arm(db_session, project, sweep_id="sw-solo", arm_label="only")
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "strategic_review"
+    )
+    assert "compute_experiment_sweeps" not in payload
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_omits_incomplete_planned_sweep(db_session):
+    """A planned arm without a usable document keeps the sweep out of payloads."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+    await _seed_sweep_arm(
+        db_session, project, sweep_id="sw-incomplete", arm_label="baseline"
+    )
+    await _seed_sweep_arm(
+        db_session,
+        project,
+        sweep_id="sw-incomplete",
+        arm_label="treatment",
+        persist_doc=False,
+    )
 
     spawned = await _spawn_strategic_review(project, db_session)
     assert spawned is True

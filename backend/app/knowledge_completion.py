@@ -55,6 +55,7 @@ from app.schemas import sanitize_rpc_diagnostic
 from app.knowledge_query import (
     KnowledgeSubstance,
     classify_knowledge_acceptance,
+    derive_compute_arm_label_from_payload,
     knowledge_substance_has_durable_compute_grounding,
 )
 from app.models import (
@@ -2112,8 +2113,7 @@ async def _persist_compute_knowledge_document(
     payload = task.first_payload or {}
     raw_sweep_id = payload.get("sweep_id") or None
     sweep_id_val = (str(raw_sweep_id).strip()[:128] if raw_sweep_id else None) or None
-    raw_arm = payload.get("experiment") or payload.get("arm_label") or None
-    arm_label_val = (str(raw_arm).strip()[:256] if raw_arm else None) or None
+    arm_label_val = derive_compute_arm_label_from_payload(payload)
 
     title = document["title"]
     summary = document["summary"]

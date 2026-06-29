@@ -481,11 +481,28 @@ export function buildSweepComparisonSection(
       disposed.push({ sweepId, disposition: dispArm.sweep_disposition as Record<string, unknown> });
       continue;
     }
+    const ids = new Set<string>();
+    const labels = new Set<string>();
+    const identities = new Set<string>();
     const allVerdicted = arms.every(arm => {
+      const armId = strVal(arm.id);
+      const armLabel = strVal(arm.arm_label);
+      const identity = armLabel || armId;
+      if (!identity) return false;
+      if (armId) {
+        if (ids.has(armId)) return false;
+        ids.add(armId);
+      }
+      if (armLabel) {
+        if (labels.has(armLabel)) return false;
+        labels.add(armLabel);
+      }
+      if (identities.has(identity)) return false;
+      identities.add(identity);
       if (strVal(arm.unavailable_cause)) return false;
       return arm.criterion_met === true || arm.criterion_met === false;
     });
-    if (allVerdicted) completed.push({ sweepId, arms });
+    if (allVerdicted && identities.size >= 2) completed.push({ sweepId, arms });
   }
 
   if (completed.length === 0 && disposed.length === 0) return '';
