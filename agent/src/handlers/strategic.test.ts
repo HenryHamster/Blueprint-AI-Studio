@@ -33,13 +33,17 @@ vi.mock('../workspacePrep.js', () => ({
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock('../prompt.js', () => ({
-  buildContextPrefix: () => '',
-  configureAgentPermissions: () => [],
-  writePlaybookHelper: vi.fn(),
-  writeMessagesHelper: vi.fn(),
-  DEFAULT_TOOL_GUIDANCE: 'Tool guidance: ...',
-}));
+vi.mock('../prompt.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../prompt.js')>();
+  return {
+    ...actual,
+    buildContextPrefix: () => '',
+    configureAgentPermissions: () => [],
+    writePlaybookHelper: vi.fn(),
+    writeMessagesHelper: vi.fn(),
+    DEFAULT_TOOL_GUIDANCE: 'Tool guidance: ...',
+  };
+});
 
 // Default challenge record the mocked runStrategicChallenge resolves with. Tests
 // that care about the challenge override it per-case via mockResolvedValueOnce.
@@ -111,18 +115,22 @@ vi.mock('./research-direction-context.js', () => ({
   formatRetiredDirectionsSummary: () => '',
 }));
 
-vi.mock('../prompts/thinker.js', () => ({
-  computeResearchPlanPromptFingerprint: () => 'fp',
-  buildThinkerPrompt: (p: Record<string, unknown>) => {
-    capturedThinkerParams = p;
-    return 'BASE_THINKER_PROMPT';
-  },
-  // Capture the rendered prompt, then short-circuit so the executor pass never runs.
-  runThinkerWithGate: vi.fn((prompt: string) => {
-    capturedThinkerPrompt = prompt;
-    return Promise.resolve({ ok: false });
-  }),
-}));
+vi.mock('../prompts/thinker.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../prompts/thinker.js')>();
+  return {
+    ...actual,
+    computeResearchPlanPromptFingerprint: () => 'fp',
+    buildThinkerPrompt: (p: Record<string, unknown>) => {
+      capturedThinkerParams = p;
+      return 'BASE_THINKER_PROMPT';
+    },
+    // Capture the rendered prompt, then short-circuit so the executor pass never runs.
+    runThinkerWithGate: vi.fn((prompt: string) => {
+      capturedThinkerPrompt = prompt;
+      return Promise.resolve({ ok: false });
+    }),
+  };
+});
 
 vi.mock('./research-plan.js', () => ({
   buildStrategicCompletionLogs: () => ({ logs: '' }),
@@ -177,6 +185,7 @@ vi.mock('./strategic-sections.js', () => ({
     maxActiveDirections: number,
     authoritative?: { active: number; paused: number },
   ) => `DIRHEALTH(max=${maxActiveDirections},auth=${authoritative ? authoritative.active : undefined})`,
+  buildSweepComparisonSection: () => '',
 }));
 
 vi.mock('../telemetry.js', () => ({
@@ -198,9 +207,13 @@ import {
   renderDesignDocIndexOverview,
   handleStrategic,
 } from './strategic.js';
-import { runClaudeCode, apiPost } from '../index.js';
+import { runClaudeCode, apiPost, setCurrentPromptFingerprint, sendHeartbeatSync } from '../index.js';
 import { VmConfigMissingError } from '../providers/runners.js';
-import { runThinkerWithGate } from '../prompts/thinker.js';
+import {
+  computeStrategicPromptFingerprint,
+  runThinkerWithGate,
+  type ThinkerPromptParams,
+} from '../prompts/thinker.js';
 import { runStrategicChallenge } from './strategic-helpers.js';
 import { recordFormatMiss, recordFormatRepairAttempt } from '../telemetry.js';
 
@@ -309,6 +322,63 @@ describe('renderStrategicPromptSuffix', () => {
   it('returns empty string when prompt_suffix is absent', () => {
     expect(renderStrategicPromptSuffix({})).toBe('');
     expect(renderStrategicPromptSuffix({ prompt_suffix: '' })).toBe('');
+  });
+});
+
+describe('strategic prompt fingerprinting', () => {
+  const base: ThinkerPromptParams = {
+    contextPrefix: '',
+    projectName: 'Test Project',
+    clockHeader: 'Clock: 2026-05-04',
+    isSelfRepo: false,
+    userStateLine: 'User last active: today',
+    packerMetaSection: '',
+    strategicContext: '',
+    problemModelSection: '## Your current understanding (problem_model)\n```json\n{\n  "fingerprint": "strategic-prompt"\n}\n```',
+    problemModelRecovery: 'present',
+    reflectionSection: '## What you previously said was hard\n_(no prior)_',
+    selfImprovementBlock: '',
+    runningUpdateSection: '## Running update (living document — rewrite, don\'t append)\n_(empty)_',
+    designDocJson: '',
+    visionJson: '',
+    outcomeSection: '',
+    previousDecisionOutcomes: '',
+    pastRetirementCritiquesSection: '',
+    retiredDirectionsSummarySection: '',
+    dirSummaryText: 'No active directions.',
+    dirHealthSummary: 'Active: 0/10 slots.',
+    userPausedSection: '',
+    rejectedProposalsSection: '',
+    operatorOverridesSection: '',
+    portfolioCompositionText: 'No active directions — portfolio is empty.',
+    modelHealthSection: '',
+    systemMaturitySection: '',
+    driftSection: '',
+    recentWorkSection: '',
+    feedbackSection: '',
+    questionSection: '',
+    threadSection: '',
+    taskId: 'test-task-123',
+    versionPhaseSection: '',
+    memoCitationsSection: '',
+    efficiencySnapshotSection: '',
+  };
+
+  it('strategic_prompt_fingerprint_changes_with_strategic_prompt_content', () => {
+    const withoutSuffix = computeStrategicPromptFingerprint(base, '');
+    const withSuffix = computeStrategicPromptFingerprint({
+      ...base,
+      stagedDirectionsSection: '## Staged for next version\n- d-x [high] — work (auto-activates when v3 promotes)',
+    }, 'deployment framing');
+    const contentChanged = computeStrategicPromptFingerprint(
+      { ...base, projectName: 'Another Project', clockHeader: 'Later clock', userStateLine: 'User last active: yesterday', taskId: 'other-task' },
+      '',
+    );
+
+    expect(withoutSuffix).toHaveLength(12);
+    expect(withSuffix).toHaveLength(12);
+    expect(withoutSuffix).not.toBe(withSuffix);
+    expect(withoutSuffix).toBe(contentChanged);
   });
 });
 
@@ -1010,6 +1080,8 @@ describe('handleStrategic design_doc index rendering', () => {
 describe('handleStrategic prompt_suffix wiring', () => {
   beforeEach(() => {
     capturedThinkerPrompt = undefined;
+    vi.mocked(setCurrentPromptFingerprint).mockClear();
+    vi.mocked(sendHeartbeatSync).mockClear();
   });
 
   it('appends backend prompt_suffix content to the rendered thinker prompt', async () => {
@@ -1030,6 +1102,30 @@ describe('handleStrategic prompt_suffix wiring', () => {
     // ...and the backend-supplied guidance reaches the rendered prompt.
     expect(capturedThinkerPrompt).toContain('Additional instructions:');
     expect(capturedThinkerPrompt).toContain(suffix);
+  });
+
+  it('records the strategic fingerprint in prompt telemetry and heartbeat metadata', async () => {
+    const suffix = 'STABILIZE GUIDANCE: audit finding F-123.';
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      prompt_suffix: suffix,
+    };
+    const statusRef = { value: '' };
+
+    await handleStrategic(
+      'task-fingerprint', payload, {}, 'tok', 'owner', 'repo', null, statusRef,
+    );
+
+    const expected = computeStrategicPromptFingerprint(
+      capturedThinkerParams as unknown as ThinkerPromptParams,
+      `\n\nAdditional instructions:\n${suffix}`,
+    );
+    expect(vi.mocked(setCurrentPromptFingerprint)).toHaveBeenCalledWith(expected);
+    expect(vi.mocked(sendHeartbeatSync)).toHaveBeenCalledWith(
+      'task-fingerprint',
+      'Cloning owner/repo for research...',
+      { prompt_fingerprint: expected },
+    );
   });
 
   it('leaves the thinker prompt unchanged when prompt_suffix is absent', async () => {
@@ -1287,6 +1383,166 @@ describe('handleStrategic create-direction recovery prompt', () => {
     expect(recoveryPrompt).not.toContain('system_id');
 
     // Restore shared default for subsequent tests
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+});
+
+describe('handleStrategic direction-op post-check: all portfolio verbs', () => {
+  // Required calls output shared across tests — satisfies the required-calls check
+  // so only the direction-op post-check fires as call 1.
+  const requiredCallsOutput =
+    './strategic set-problem-model "..." \n' +
+    './strategic set-running-update /tmp/running_update_task-portfolio-verbs.md\n' +
+    './strategic set-retirement-critiques \'{"no_eligible_retirements": true}\'';
+
+  it('retries_when_thinker_recommended_stage_or_retire_is_skipped: retire-direction recommended but skipped triggers retry', async () => {
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText:
+        'Some analysis text.\n\n## Structured Output\n\nretire-direction: d-abc123 — stale direction\n',
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: requiredCallsOutput, lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-portfolio-verbs',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    expect(vi.mocked(runClaudeCode).mock.calls).toHaveLength(2);
+    const recoveryPrompt = vi.mocked(runClaudeCode).mock.calls[1]?.[0];
+    expect(recoveryPrompt).toBeDefined();
+    expect(recoveryPrompt).toContain('retire-direction');
+
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  it('update-direction recommended but skipped triggers retry with update-direction in prompt', async () => {
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText:
+        'Analysis.\n\n## Structured Output\n\nupdate-direction: d-xyz — priority bump\n',
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: requiredCallsOutput, lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-portfolio-verbs',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    expect(vi.mocked(runClaudeCode).mock.calls).toHaveLength(2);
+    const recoveryPrompt = vi.mocked(runClaudeCode).mock.calls[1]?.[0];
+    expect(recoveryPrompt).toBeDefined();
+    expect(recoveryPrompt).toContain('update-direction');
+
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  it('stage-direction recommended but skipped triggers retry; stage_direction in output suppresses retry', async () => {
+    // First: stage-direction recommended but executor output has no op → triggers retry
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText:
+        'Analysis.\n\n## Structured Output\n\nstage-direction: d-staged — next version\n',
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: requiredCallsOutput, lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-portfolio-verbs',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    expect(vi.mocked(runClaudeCode).mock.calls).toHaveLength(2);
+    const recoveryPrompt = vi.mocked(runClaudeCode).mock.calls[1]?.[0];
+    expect(recoveryPrompt).toContain('stage-direction');
+
+    // Second: stage_direction op present in output → no spurious retry
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText:
+        'Analysis.\n\n## Structured Output\n\nstage-direction: d-staged — next version\n',
+    });
+    const outputWithStageOp =
+      requiredCallsOutput +
+      '\n{"op":"stage_direction","status":"ok","direction_id":"d-staged"}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: outputWithStageOp, lastResultText: '' });
+
+    await handleStrategic(
+      'task-portfolio-verbs',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    // Only one call: the executor. No recovery call.
+    expect(vi.mocked(runClaudeCode).mock.calls).toHaveLength(1);
+
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  it('approve-direction and reject-direction recommended but skipped triggers retry', async () => {
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText:
+        'Analysis.\n\n## Structured Output\n\napprove-direction: d-qa1\nreject-direction: d-qa2\n',
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: requiredCallsOutput, lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-portfolio-verbs',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    expect(vi.mocked(runClaudeCode).mock.calls).toHaveLength(2);
+    const recoveryPrompt = vi.mocked(runClaudeCode).mock.calls[1]?.[0];
+    expect(recoveryPrompt).toContain('approve-direction');
+    expect(recoveryPrompt).toContain('reject-direction');
+
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
   });
 });

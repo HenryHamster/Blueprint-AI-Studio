@@ -38,6 +38,97 @@ export function computeResearchPlanPromptFingerprint(mode: 'plan' | 'research'):
   return createHash('sha256').update(blocks.join('\n\n')).digest('hex').slice(0, 12);
 }
 
+function buildStrategicProblemModelSection(problemModelRecovery: ThinkerPromptParams['problemModelRecovery']): string {
+  if (problemModelRecovery === 'fetch') {
+    return [
+      '## Your current understanding (problem_model)',
+      '_**Your durable problem_model EXISTS but was not shipped in full this cycle** — the packer dropped or summarized it under the byte budget (see "Context not shipped this cycle" above). This is NOT the first cycle. Before you submit ANY problem_model update you MUST run `./fetch problem-model` to retrieve the full current model, then EDIT it — never replace it from scratch, or you will wipe real durable capabilities, gaps, and friction._',
+    ].join('\n');
+  }
+  if (problemModelRecovery === 'empty') {
+    return [
+      '## Your current understanding (problem_model)',
+      '_(empty — this is the first cycle. Bootstrap from the other sections below.)_',
+    ].join('\n');
+  }
+  return [
+    '## Your current understanding (problem_model)',
+    '```json',
+    '{',
+    '  "fingerprint": "strategic-prompt"',
+    '}',
+    '```',
+  ].join('\n');
+}
+
+function buildStrategicFingerprintPrompt(
+  p: ThinkerPromptParams,
+  promptSuffix: string,
+): string {
+  const canonical: ThinkerPromptParams = {
+    ...p,
+    contextPrefix: '',
+    projectName: '<project>',
+    clockHeader: '<clock>',
+    isSelfRepo: p.isSelfRepo,
+    userStateLine: '<user-state>',
+    gapMemoryTrimmedGapIds: p.gapMemoryTrimmedGapIds && p.gapMemoryTrimmedGapIds.length > 0
+      ? ['<trimmed-gap>']
+      : [],
+    packerMetaSection: p.packerMetaSection ? '<packer-meta>' : '',
+    strategicContext: p.strategicContext ? '<strategic-context>' : '',
+    problemModelSection: buildStrategicProblemModelSection(p.problemModelRecovery),
+    cycleStartReconciliationSection: p.cycleStartReconciliationSection ? '<cycle-start-reconciliation>' : '',
+    reflectionSection: '<reflection>',
+    selfImprovementBlock: p.selfImprovementBlock ? '<self-improvement>' : '',
+    runningUpdateSection: '<running-update>',
+    runningUpdateSupersededSection: p.runningUpdateSupersededSection ? '<running-update-superseded>' : '',
+    designDocJson: '<design-doc>',
+    visionJson: p.visionJson ? '<vision>' : '',
+    outcomeSection: p.outcomeSection ? '<outcome>' : '',
+    previousDecisionOutcomes: p.previousDecisionOutcomes ? '<previous-decision-outcomes>' : '',
+    pastRetirementCritiquesSection: p.pastRetirementCritiquesSection ? '<past-retirement-critiques>' : '',
+    retiredDirectionsSummarySection: p.retiredDirectionsSummarySection ? '<retired-directions-summary>' : '',
+    dirSummaryText: '<dir-summary>',
+    dirHealthSummary: '<dir-health>',
+    stagedDirectionsSection: p.stagedDirectionsSection ? '<staged-directions>' : '',
+    userPausedSection: p.userPausedSection ? '<user-paused>' : '',
+    rejectedProposalsSection: p.rejectedProposalsSection ? '<rejected-proposals>' : '',
+    operatorOverridesSection: p.operatorOverridesSection ? '<operator-overrides>' : '',
+    portfolioCompositionText: '<portfolio-composition>',
+    modelHealthSection: p.modelHealthSection ? '<model-health>' : '',
+    pruneCandidatesSection: p.pruneCandidatesSection ? '<prune-candidates>' : '',
+    systemMaturitySection: p.systemMaturitySection ? '<system-maturity>' : '',
+    driftSection: p.driftSection ? '<drift>' : '',
+    recentWorkSection: '<recent-work>',
+    feedbackSection: '<feedback>',
+    questionSection: '<question>',
+    threadSection: '<thread>',
+    taskId: '<task>',
+    versionPhaseSection: p.versionPhaseSection ? '<version-phase>' : '',
+    memoCitationsSection: p.memoCitationsSection ? '<memo-citations>' : '',
+    efficiencySnapshotSection: p.efficiencySnapshotSection ? '<efficiency-snapshot>' : '',
+    availableCapabilitiesSection: p.availableCapabilitiesSection ? '<available-capabilities>' : '',
+    sweepComparisonSection: p.sweepComparisonSection ? '<sweep-comparison>' : '',
+    localRunnerSection: p.localRunnerSection ? '<local-runner>' : '',
+  };
+  const prompt = buildThinkerPrompt(canonical);
+  const withSuffix = promptSuffix
+    ? `${prompt}\n\nAdditional instructions:\n<strategic-prompt-suffix>`
+    : prompt;
+  return withSuffix;
+}
+
+export function computeStrategicPromptFingerprint(
+  p: ThinkerPromptParams,
+  promptSuffix = '',
+): string {
+  return createHash('sha256')
+    .update(buildStrategicFingerprintPrompt(p, promptSuffix))
+    .digest('hex')
+    .slice(0, 12);
+}
+
 // ── Exported for testing: thinker prompt builder ────────────────────────────
 
 export interface ThinkerPromptParams {
@@ -461,9 +552,35 @@ export async function runThinkerWithGate(
   if (fs.existsSync(problemModelPath)) {
     try {
       const fileContent = fs.readFileSync(problemModelPath, 'utf8');
-      JSON.parse(fileContent);
-      problemModelParseable = true;
-      sendLog(ws, `[INFO] Problem model file exists on disk and is valid JSON; skipping repair reopen.\n`);
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const parsed = JSON.parse(fileContent);
+      // Validate the problem_model structure: reject schema-template placeholders
+      // and ensure it's a valid object (not null, array, or primitive).
+      if (parsed != null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const intent = (parsed as Record<string, unknown>).intent as Record<string, unknown> | undefined;
+        // If intent is present, validate intent.purpose is not a placeholder.
+        if (intent != null) {
+          const purpose = typeof intent.purpose === 'string' ? intent.purpose.trim() : '';
+          const isSchemaPlaceholder = purpose === '' || purpose === '...' || /^<[^>]+>$/.test(purpose);
+          if (isSchemaPlaceholder) {
+            sendLog(
+              ws,
+              `[WARNING] Problem model file exists but intent.purpose is a schema placeholder: "${purpose}"; triggering repair.\n`,
+            );
+            problemModelParseable = false;
+          } else {
+            problemModelParseable = true;
+            sendLog(ws, `[INFO] Problem model file exists on disk and is valid; skipping repair reopen.\n`);
+          }
+        } else {
+          // Partial updates may omit intent — that's legitimate.
+          problemModelParseable = true;
+          sendLog(ws, `[INFO] Problem model file exists on disk and is valid; skipping repair reopen.\n`);
+        }
+      } else {
+        sendLog(ws, `[WARNING] Problem model file exists but is not a valid object structure.\n`);
+        problemModelParseable = false;
+      }
     } catch (e) {
       sendLog(ws, `[WARNING] Problem model file exists but is invalid JSON: ${String(e)}\n`);
       problemModelParseable = false;
@@ -639,6 +756,70 @@ export async function runThinkerWithGate(
         });
       } catch (e) {
         sendLog(ws, `[ERROR] Failed to post thinker gate failure: ${String(e)}\n`);
+      }
+      return { ok: false };
+    }
+  }
+
+  // Validate the final problem_model file content: ensure it's not just valid JSON
+  // but also a valid problem_model structure (not a schema placeholder or invalid object).
+  if (fs.existsSync(problemModelPath)) {
+    try {
+      const finalContent = fs.readFileSync(problemModelPath, 'utf8');
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const finalModel = JSON.parse(finalContent);
+      if (finalModel != null && typeof finalModel === 'object' && !Array.isArray(finalModel)) {
+        const intent = (finalModel as Record<string, unknown>).intent as Record<string, unknown> | undefined;
+        // If intent is present, it must have a valid non-placeholder purpose.
+        if (intent != null) {
+          const purpose = typeof intent.purpose === 'string' ? intent.purpose.trim() : '';
+          const isSchemaPlaceholder = purpose === '' || purpose === '...' || /^<[^>]+>$/.test(purpose);
+          if (isSchemaPlaceholder) {
+            sendLog(
+              ws,
+              `\n[ERROR] Final problem_model file has invalid intent.purpose after all retry attempts: "${purpose}"\n`,
+            );
+            try {
+              await persistAndPostStatus(taskId, {
+                task_id: taskId,
+                status: 'FAILED',
+                artifact_type: 'ERROR_LOG',
+                logs: `Problem model validation failed: intent.purpose is a schema placeholder "${purpose}"`,
+                failure_category: 'strategic_thinker_artifacts_missing',
+              });
+            } catch (e) {
+              sendLog(ws, `[ERROR] Failed to post validation failure: ${String(e)}\n`);
+            }
+            return { ok: false };
+          }
+        }
+      } else {
+        sendLog(ws, `\n[ERROR] Final problem_model file is not a valid object structure.\n`);
+        try {
+          await persistAndPostStatus(taskId, {
+            task_id: taskId,
+            status: 'FAILED',
+            artifact_type: 'ERROR_LOG',
+            logs: 'Problem model validation failed: not a valid object structure',
+            failure_category: 'strategic_thinker_artifacts_missing',
+          });
+        } catch (e) {
+          sendLog(ws, `[ERROR] Failed to post validation failure: ${String(e)}\n`);
+        }
+        return { ok: false };
+      }
+    } catch (e) {
+      sendLog(ws, `\n[ERROR] Final problem_model file is invalid JSON: ${String(e)}\n`);
+      try {
+        await persistAndPostStatus(taskId, {
+          task_id: taskId,
+          status: 'FAILED',
+          artifact_type: 'ERROR_LOG',
+          logs: `Problem model validation failed: invalid JSON - ${String(e)}`,
+          failure_category: 'strategic_thinker_artifacts_missing',
+        });
+      } catch (e2) {
+        sendLog(ws, `[ERROR] Failed to post validation failure: ${String(e2)}\n`);
       }
       return { ok: false };
     }

@@ -5201,6 +5201,107 @@ async def test_set_retirement_critiques_invalid_dict_returns_400(
     assert resp.status_code == 400, resp.text
 
 
+@pytest.mark.asyncio
+async def test_set_retirement_critiques_rejects_empty_list(client, db_session, mocker):
+    """HTTP API: an empty list returns 400 — not silently stored as no-op."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="RC-EMPTY",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-rc-empty",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-rc-empty", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_retirement_critiques",
+            "data": [],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "no_eligible_retirements" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_set_retirement_critiques_rejects_all_malformed(client, db_session, mocker):
+    """HTTP API: a list where every item is missing required fields returns 400."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="RC-MALFORMED",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-rc-malformed",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-rc-malformed", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_retirement_critiques",
+            "data": [
+                {"direction_id": "d-123"},  # missing what_it_addressed/pattern/lesson
+                {"lesson": "something"},  # missing direction_id/what_it_addressed/pattern
+            ],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "no_eligible_retirements" in resp.text
+
+
 # ── set_evidence_progress HTTP API path ────────────────────────────────────────
 
 

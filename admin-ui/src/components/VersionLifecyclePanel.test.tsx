@@ -3572,4 +3572,99 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.queryByTestId('changelog-toggle')).not.toBeInTheDocument();
     });
   });
+
+  describe('smoketest disabled indicator', () => {
+    it('renders "smoke disabled" instead of "smoke 0%" when smoketest_enabled is false on last_qualification', () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          last_qualification: makeQualification({
+            sub_scores: { audit: 0.90, test_erosion: 0.85, smoketest: 0.0 },
+            smoketest_enabled: false,
+          }),
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      expect(screen.getByText('smoke disabled')).toBeInTheDocument();
+      expect(screen.queryByText(/smoke \d+%/)).not.toBeInTheDocument();
+    });
+
+    it('renders "smoke XX%" normally when smoketest_enabled is true', () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          last_qualification: makeQualification({
+            sub_scores: { audit: 0.90, test_erosion: 0.85, smoketest: 0.80 },
+            smoketest_enabled: true,
+          }),
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      expect(screen.getByText('smoke 80%')).toBeInTheDocument();
+      expect(screen.queryByText('smoke disabled')).not.toBeInTheDocument();
+    });
+
+    it('renders "smoke XX%" normally when smoketest_enabled is absent (legacy record)', () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          last_qualification: makeQualification({
+            sub_scores: { audit: 0.90, test_erosion: 0.85, smoketest: 0.75 },
+          }),
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      expect(screen.getByText('smoke 75%')).toBeInTheDocument();
+      expect(screen.queryByText('smoke disabled')).not.toBeInTheDocument();
+    });
+
+    it('renders "s:—" in verdict history sub-scores when smoketest_enabled is false', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [
+          {
+            id: 'v-1',
+            release_version_id: 'rv1',
+            candidate_sha: 'abcdef123456',
+            confidence: 0.88,
+            sub_scores: { audit: 0.90, test_erosion: 0.85, smoketest: 0.0 },
+            smoketest_enabled: false,
+            blocker: null,
+            audit_missing_reason: null,
+            would_promote: false,
+            promotion_enabled: false,
+            terminal_status: 'not_promoted',
+            threshold: 0.9,
+            started_at: null,
+            finalized_at: '2026-01-01T00:00:00Z',
+            created_at: '2026-01-01T00:00:00Z',
+          },
+        ],
+        total: 1,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const history = await screen.findByTestId('verdict-history');
+      expect(history).toBeInTheDocument();
+      // The compact sub-score should show "s:—" not "s:0" when smoke is disabled.
+      expect(history.textContent).toContain('s:—');
+      expect(history.textContent).not.toContain('s:0');
+    });
+  });
 });

@@ -1096,6 +1096,66 @@ class TestLocalRunnerStatusForStrategist:
         assert status["active_gpu"] == 1
 
 
+    def test_local_runner_status_registered_in_strategic_schema(self):
+        """Regression guard: local_runner_status must be in _STRATEGIC_REVIEW_SCHEMA
+        with priority 'medium' so the packer does not silently downgrade it to 'low'."""
+        from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+
+        entry = _STRATEGIC_REVIEW_SCHEMA.get("local_runner_status")
+        assert entry is not None, (
+            "local_runner_status is missing from _STRATEGIC_REVIEW_SCHEMA; "
+            "pack_under_budget will default it to 'low' priority and may drop it "
+            "under budget pressure even when it is the context preventing unsuitable "
+            "GPU experiment proposals"
+        )
+        assert entry.get("priority") == "medium", (
+            f"local_runner_status priority should be 'medium', got {entry.get('priority')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_strategic_review_payload_keeps_local_runner_status(self, db_session):
+        """local_runner_status must survive budget pressure in pack_under_budget.
+
+        Constructs a near-budget payload with local_runner_status present and
+        confirms the packer includes it in the result (not in _packer_meta dropped).
+        """
+        from app.payload_schemas import pack_under_budget
+        from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+
+        runner_status = {
+            "ever_registered": True,
+            "active_total": 0,
+            "active_gpu": 0,
+            "require_local_runner": False,
+        }
+        # Build a payload that is large but not over budget so the packer runs
+        # its priority logic.  Fill a medium-priority sibling (conversation_thread)
+        # with enough data to make the test non-trivial but keep total well under budget.
+        payload = {
+            "type": "strategic_review",
+            "project_name": "test-project",
+            "base_branch": "main",
+            "research_mode": "strategic",
+            "is_self_repo": False,
+            "enable_self_improvement": False,
+            "model": "claude-sonnet-4-5",
+            "effort": "high",
+            "vision": {"purpose": "test"},
+            "direction_counts": {"active": 2, "paused": 0, "total": 2, "max_active": 5},
+            "max_active_directions": 5,
+            "local_runner_status": runner_status,
+        }
+        packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+        dropped_keys = {d["key"] for d in packed.get("_packer_meta", {}).get("dropped", [])}
+        assert "local_runner_status" not in dropped_keys, (
+            "local_runner_status was dropped by pack_under_budget; "
+            f"_packer_meta.dropped = {packed['_packer_meta']['dropped']}"
+        )
+        assert packed.get("local_runner_status") == runner_status, (
+            "local_runner_status value was not preserved correctly in the packed payload"
+        )
+
+
 class TestRegistryPasswordErasedOnTerminalFinalization:
     @pytest.mark.asyncio
     async def test_password_erased_from_polling_metadata_on_finalization(

@@ -1023,6 +1023,41 @@ async def apply_post_spawn_state(
                 )
                 await session.commit()
 
+                # Reconcile problem-model gaps for the directions auto-completed
+                # on this pass. Mirrors the strategic-completion _apply_gap_reconcile
+                # pattern: prune each completed id from its gap's active_moves,
+                # union into past_moves, and record a GapDeferral when the gap is
+                # left unstaffed. Fail-open: a malformed/empty problem model must
+                # never block the completion that already committed above.
+                _completed_ids_for_reconcile = [
+                    _did for _, _did in _pending_archived_diagnoses
+                ]
+                _reconcile_now_iso = _utcnow().isoformat()
+                try:
+                    from app.problem_model import (
+                        reconcile_gaps_for_retired_directions,
+                    )
+                    from app.task_locking import with_problem_model_locked
+
+                    def _apply_research_gap_reconcile(pm: dict) -> None:
+                        reconcile_gaps_for_retired_directions(
+                            pm, _completed_ids_for_reconcile, _reconcile_now_iso
+                        )
+
+                    await with_problem_model_locked(
+                        session,
+                        task.project_id,
+                        _apply_research_gap_reconcile,
+                    )
+                    await session.commit()
+                except Exception as _reconcile_exc:
+                    logger.warning(
+                        "[RESEARCH] Gap reconciliation failed for auto-completed "
+                        "directions %s (non-fatal): %s",
+                        _completed_ids_for_reconcile,
+                        _reconcile_exc,
+                    )
+
     # Process direction notes — append to the target direction's notes list
     if direction_notes:
         # Deferred import of strategic caps — shared with main.py

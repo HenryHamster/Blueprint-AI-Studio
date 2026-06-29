@@ -491,6 +491,11 @@ class StrategicReviewPayload(_SystemPopulated):
     # can open a foundation direction or record an explicit retirement. Optional +
     # default None; injected only when demand is non-empty.
     missing_capability_demand: dict[str, Any] | None = None
+    # Live local-runner availability (ever_registered, active_total, active_gpu,
+    # require_local_runner). Surfaced only when the project has ever registered a
+    # runner OR declares the enforce-local policy. Optional + default None so
+    # existing payloads without it still validate identically.
+    local_runner_status: dict[str, Any] | None = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):

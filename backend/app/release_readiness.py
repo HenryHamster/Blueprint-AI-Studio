@@ -478,6 +478,11 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         ),
         "test_erosion_detail": qual.get("test_erosion_detail"),
         "smoketest_detail": qual.get("smoketest_detail"),
+        # Per-attempt smoketest enablement flag — False when the smoketest
+        # dimension was disabled for this run (the sub_score is then
+        # zero-weighted and the 0.0 placeholder should not be shown as an
+        # active lane).  None on legacy records that predate this field.
+        "smoketest_enabled": qual.get("smoketest_enabled"),
         "audit_reconciliation": _recon_out,
         "audit_leg_proof": _audit_leg_proof,
         "promotion_pr_url": qual.get("promotion_pr_url"),
@@ -564,6 +569,11 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "challenger_refuted_audit_findings": verdict.challenger_refuted_audit_findings,
         "test_erosion_detail": verdict.test_erosion_detail,
         "smoketest_detail": verdict.smoketest_detail,
+        # Per-attempt smoketest enablement flag read from sub_scores JSON
+        # (embedded at verdict-recording time).  None on legacy rows that
+        # predate the field; False means the dimension was disabled and the
+        # 0.0 sub-score placeholder should not be rendered as an active lane.
+        "smoketest_enabled": _sub(verdict, "smoketest_enabled"),
         "audit_reconciliation": _vrecon_out,
         "audit_leg_proof": _v_audit_leg_proof,
         # Blind merge-grade goal-coverage verdict (dir d-c0fe439f).

@@ -2132,6 +2132,10 @@ export interface VersionQualification {
   migration_apply_safety_detail?: string | null;
   test_erosion_detail?: Record<string, unknown> | null;
   smoketest_detail?: Record<string, unknown> | null;
+  // Whether the smoketest dimension was enabled for this qualification run.
+  // False means the dimension was disabled and the 0.0 sub-score is a
+  // zero-weighted placeholder, not an active lane. Null/absent on legacy records.
+  smoketest_enabled?: boolean | null;
   promotion_pr_url?: string | null;
   promotion_conflict?: boolean | null;
   promotion_error_detail?: string | null;
@@ -2721,6 +2725,10 @@ export interface QualificationVerdictRecord {
   migration_apply_safety_detail?: string | null;
   test_erosion_detail?: Record<string, unknown> | null;
   smoketest_detail?: Record<string, unknown> | null;
+  // Whether the smoketest dimension was enabled for this qualification run.
+  // False means the 0.0 sub-score is a zero-weighted placeholder, not an
+  // active lane. Null/absent on legacy verdict rows that predate this field.
+  smoketest_enabled?: boolean | null;
   audit_reconciliation?: AuditReconciliation | null;
   would_promote: boolean | null;
   promotion_enabled: boolean | null;

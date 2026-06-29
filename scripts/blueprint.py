@@ -1497,6 +1497,12 @@ def cmd_directions(args: argparse.Namespace) -> None:
         _directions_add(args)
     elif sub == "update":
         _directions_update(args)
+    elif sub == "retarget":
+        _directions_retarget(args)
+    elif sub == "activate":
+        _directions_activate(args)
+    elif sub == "cancel":
+        _directions_cancel(args)
     elif sub == "unhold":
         _directions_unhold(args)
     else:
@@ -1508,12 +1514,20 @@ def _directions_list(args: argparse.Namespace) -> None:
     resp = api("GET", f"/api/admin/projects/{pid}/directions")
     directions = resp.get("directions", []) if isinstance(resp, dict) else resp
 
-    show_all = getattr(args, "all", False)
-    if not show_all:
+    if getattr(args, "staged", False):
+        directions = [d for d in directions if d.get("status") == "staged"]
+    elif not getattr(args, "all", False):
         directions = [d for d in directions
-                      if d.get("status") in ("active", "proposed")]
+                      if d.get("status") in ("active", "proposed", "staged")]
 
     _emit(args, {"directions": directions}, _render_directions_list)
+
+
+def _staged_direction_marker(d: dict) -> str | None:
+    if d.get("status") != "staged":
+        return None
+    target = d.get("staged_for_version")
+    return f"staged→v{target}" if target is not None else "staged (unpinned)"
 
 
 def _render_directions_list(data: dict) -> None:
@@ -1530,6 +1544,7 @@ def _render_directions_list(data: dict) -> None:
         history = d.get("research_history") or []
         notes = d.get("notes") or []
         held = d.get("held", False)
+        staged_marker = _staged_direction_marker(d)
         flags = []
         if d.get("possibly_complete"):
             flags.append("possibly_complete")
@@ -1540,20 +1555,31 @@ def _render_directions_list(data: dict) -> None:
         if d.get("pending_update"):
             flags.append("pending_update")
         flag_str = f"  [{', '.join(flags)}]" if flags else ""
-        print(f"  {did[:12]}  [{prio:6}] {status:8}  {text}{flag_str}"
+        staged_str = f"  {staged_marker}" if staged_marker else ""
+        print(f"  {did[:12]}  [{prio:6}] {status:8}  {text}{staged_str}{flag_str}"
               f"  ({len(history)} cycles, {len(notes)} notes)")
 
 
-def _directions_show(args: argparse.Namespace) -> None:
+def _resolve_direction(args: argparse.Namespace, direction_id: str, *, require_staged: bool = False) -> dict:
     pid = get_project_id(getattr(args, "project_id", None))
     resp = api("GET", f"/api/admin/projects/{pid}/directions")
     directions = resp.get("directions", []) if isinstance(resp, dict) else resp
-    id_arg = args.direction_id
-    matches = [d for d in directions if (d.get("id") or "").startswith(id_arg)]
+    matches = [d for d in directions if (d.get("id") or "").startswith(direction_id)]
     if not matches:
-        print(f"Direction not found: {id_arg}", file=sys.stderr)
+        print(f"Direction not found: {direction_id}", file=sys.stderr)
         sys.exit(1)
-    d = matches[0]
+    if len(matches) > 1:
+        print(f"Direction prefix is ambiguous: {direction_id}", file=sys.stderr)
+        sys.exit(1)
+    direction = matches[0]
+    if require_staged and direction.get("status") != "staged":
+        print(f"Direction is not staged: {direction.get('id', direction_id)}", file=sys.stderr)
+        sys.exit(1)
+    return direction
+
+
+def _directions_show(args: argparse.Namespace) -> None:
+    d = _resolve_direction(args, args.direction_id)
     _emit(args, d, _render_direction_detail)
 
 
@@ -1569,6 +1595,12 @@ def _render_direction_detail(d: dict) -> None:
     if d.get("status") == "paused" or d.get("paused_reason"):
         print(f"  Paused why: {d.get('paused_reason', '(none recorded)')}")
         print(f"  Paused at:  {(d.get('paused_at') or '?')[:19]}")
+    if d.get("status") == "staged":
+        staged_for_version = d.get("staged_for_version")
+        staged_for = f"v{staged_for_version}" if staged_for_version is not None else "unpinned"
+        print(f"  Staged for: {staged_for}")
+        print(f"  Staged at:  {(d.get('staged_at') or '?')[:19]}")
+        print(f"  Waiting age: {_age_str(d.get('staged_at'))}")
     if d.get("needs_manual_intervention"):
         print(f"  ** NEEDS MANUAL INTERVENTION "
               f"(since {(d.get('needs_manual_intervention_at') or '?')[:19]})")
@@ -1626,6 +1658,7 @@ def _directions_add(args: argparse.Namespace) -> None:
         )
         sys.exit(1)
     text = args.text
+    staged = getattr(args, "staged", False)
     priority = getattr(args, "priority", "medium") or "medium"
     paths = getattr(args, "paths", None) or []
     completion_criteria = getattr(args, "completion_criteria", None)
@@ -1634,14 +1667,17 @@ def _directions_add(args: argparse.Namespace) -> None:
         body["paths"] = paths
     if completion_criteria:
         body["completion_criteria"] = completion_criteria
-    if not _confirm(f"Add direction: {text[:60]}?", getattr(args, "yes", False)):
+    if staged:
+        body["staged"] = True
+    if not _confirm(f"Add {'staged ' if staged else ''}direction: {text[:60]}?",
+                    getattr(args, "yes", False)):
         print("Aborted.")
         return
     pid = get_project_id(getattr(args, "project_id", None))
     result = api("POST", f"/api/admin/projects/{pid}/directions", body)
     d = result.get("direction", {})
     _emit(args, result, lambda r: print(
-        f"Added {d.get('id', '?')} [{priority}]: {text[:80]}"
+        f"Added {d.get('id', '?')} [{priority}]{' (staged)' if staged else ''}: {text[:80]}"
     ))
 
 
@@ -1657,8 +1693,11 @@ def _directions_update(args: argparse.Namespace) -> None:
         sys.exit(1)
 
     pid = get_project_id(getattr(args, "project_id", None))
-    did = args.direction_id
+    d = _resolve_direction(args, args.direction_id,
+                           require_staged=getattr(args, "staged_for_version", None) is not None)
+    did = d["id"]
     reset_all = getattr(args, "reset_all", False)
+    staged_for_version = getattr(args, "staged_for_version", None)
 
     patch: dict = {}
     if getattr(args, "text", None):
@@ -1667,6 +1706,8 @@ def _directions_update(args: argparse.Namespace) -> None:
         patch["priority"] = args.priority
     if getattr(args, "status", None):
         patch["status"] = args.status
+    if staged_for_version is not None:
+        patch["staged_for_version"] = staged_for_version
     if getattr(args, "reset_context", False) or reset_all:
         patch["research_context"] = (
             "## Established Findings\n\n## Failed Approaches\n\n## Open Questions\n"
@@ -1674,27 +1715,72 @@ def _directions_update(args: argparse.Namespace) -> None:
     if getattr(args, "reset_history", False) or reset_all:
         patch["research_history"] = []
     if getattr(args, "reset_agent_notes", False) or reset_all:
-        # Fetch current direction to filter out agent-added notes
-        resp = api("GET", f"/api/admin/projects/{pid}/directions")
-        directions = resp.get("directions", []) if isinstance(resp, dict) else resp
-        direction_data = next(
-            (d for d in directions if (d.get("id") or "").startswith(did)), None
-        )
-        notes = (direction_data.get("notes") or []) if direction_data else []
+        # Filter out agent-added notes from the resolved direction.
+        notes = (d.get("notes") or [])
         patch["notes"] = [n for n in notes if not n.get("added_by_task")]
 
     if not patch:
-        print("Nothing to update. Use --text, --priority, --status, or a reset flag.",
+        print("Nothing to update. Use --text, --priority, --status, --staged-for-version,"
+              " or a reset flag.",
               file=sys.stderr)
         sys.exit(1)
 
-    if not _confirm(f"Update direction {did}?", getattr(args, "yes", False)):
+    is_retarget = list(patch.keys()) == ["staged_for_version"]
+    if not _confirm(
+        f"Retarget staged direction {did} to v{staged_for_version}?"
+        if is_retarget else f"Update direction {did}?",
+        getattr(args, "yes", False),
+    ):
         print("Aborted.")
         return
 
     result = api("PATCH", f"/api/admin/projects/{pid}/directions/{did}", patch)
     _emit(args, result, lambda r: print(
-        f"Updated {did}: {', '.join(patch.keys())}"
+        f"Retargeted {did} to v{staged_for_version}"
+        if is_retarget else f"Updated {did}: {', '.join(patch.keys())}"
+    ))
+
+
+def _directions_retarget(args: argparse.Namespace) -> None:
+    _require_write_config("directions retarget")
+    pid = get_project_id(getattr(args, "project_id", None))
+    d = _resolve_direction(args, args.direction_id, require_staged=True)
+    did = d["id"]
+    version = args.version
+    if not _confirm(f"Retarget staged direction {did} to v{version}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("PATCH", f"/api/admin/projects/{pid}/directions/{did}", {
+        "staged_for_version": version,
+    })
+    _emit(args, result, lambda r: print(f"Retargeted {did} to v{version}"))
+
+
+def _directions_activate(args: argparse.Namespace) -> None:
+    _require_write_config("directions activate")
+    pid = get_project_id(getattr(args, "project_id", None))
+    d = _resolve_direction(args, args.direction_id, require_staged=True)
+    did = d["id"]
+    if not _confirm(f"Activate staged direction {did} now?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("PATCH", f"/api/admin/projects/{pid}/directions/{did}", {
+        "status": "active",
+    })
+    _emit(args, result, lambda r: print(f"Activated staged direction {did}"))
+
+
+def _directions_cancel(args: argparse.Namespace) -> None:
+    _require_write_config("directions cancel")
+    pid = get_project_id(getattr(args, "project_id", None))
+    d = _resolve_direction(args, args.direction_id, require_staged=True)
+    did = d["id"]
+    if not _confirm(f"Cancel staged direction {did}?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("DELETE", f"/api/admin/projects/{pid}/directions/{did}")
+    _emit(args, result, lambda r: print(
+        f"Cancelled staged direction {did}: {r.get('message', 'removed')}"
     ))
 
 
@@ -1706,9 +1792,11 @@ def _directions_unhold(args: argparse.Namespace) -> None:
             "read-only (agent-JWT fallback). Provide an admin API key "
             "(BLUEPRINT_API_KEY / .blueprint-config.json) to mutate.",
             file=sys.stderr,
-        )
+            )
         sys.exit(1)
-    did = args.direction_id
+    pid = get_project_id(getattr(args, "project_id", None))
+    d = _resolve_direction(args, args.direction_id)
+    did = d["id"]
     if not _confirm(f"Clear hold on direction {did}?", getattr(args, "yes", False)):
         print("Aborted.")
         return
@@ -2275,6 +2363,82 @@ def _confirm(prompt: str, assume_yes: bool) -> bool:
     return answer in ("y", "yes")
 
 
+def _staged_activated_by_cut(staged: list, version_number: int) -> list:
+    """Return staged directions that a cut of ``version_number`` will activate."""
+    return [
+        s for s in (staged or [])
+        if s and (s.get("staged_for_version") is None or s.get("staged_for_version") <= version_number)
+    ]
+
+
+def _cut_confirmation_prompt(pid: str) -> str:
+    """Build the version-cut confirmation prompt from lifecycle state.
+
+    Falls back to the generic confirmation when the lifecycle read is
+    unavailable or too incomplete to safely describe consequences.
+    """
+    lifecycle, err = _safe_read(f"/api/admin/projects/{pid}/version-lifecycle")
+    if err:
+        return "About to abandon the open version and open the next. Proceed?"
+
+    lifecycle = lifecycle or {}
+    cv = lifecycle.get("current_version") or {}
+    version_number = cv.get("version_number")
+    if version_number is None:
+        return "About to abandon the open version and open the next. Proceed?"
+
+    staged = lifecycle.get("staged_directions") or []
+    activating = _staged_activated_by_cut(staged, version_number)
+    in_flight = cv.get("in_flight_task_count")
+    qual_state_raw = cv.get("qualification_state")
+    if isinstance(qual_state_raw, dict):
+        qual_state = qual_state_raw
+        qual_state_name = qual_state.get("state")
+        promotion_pr_number = qual_state.get("promotion_pr_number")
+    else:
+        qual_state = {}
+        qual_state_name = qual_state_raw if isinstance(qual_state_raw, str) else None
+        promotion_pr_number = None
+
+    lines = [f"About to abandon v{version_number} and open the next version.", "This cut will:"]
+    if activating:
+        lines.append(
+            f"- Start {len(activating)} staged direction{'s' if len(activating) != 1 else ''} immediately "
+            "(rather than waiting for a clean promotion):"
+        )
+        for direction in activating:
+            text = direction.get("text") or "(no description)"
+            lines.append(f"  - {text}")
+    else:
+        lines.append("- No staged directions will activate.")
+
+    if in_flight is None:
+        lines.append("- In-flight task count unavailable.")
+    elif in_flight > 0:
+        lines.append(
+            f"- {in_flight} in-flight task{'s' if in_flight != 1 else ''} will NOT be stopped - "
+            "they keep running and land against the new version."
+        )
+    else:
+        lines.append("- No tasks are currently in flight.")
+
+    if qual_state_name == "promotion_in_flight":
+        pr_label = f" #{promotion_pr_number}" if promotion_pr_number else ""
+        lines.append(
+            f"- Promotion PR{pr_label} is open and auto-merging - this cut will be rejected until it "
+            "lands or is canceled."
+        )
+    elif qual_state_name == "promotion_check_wait":
+        pr_label = f" #{promotion_pr_number}" if promotion_pr_number else ""
+        lines.append(
+            f"- Migration-carrying promotion PR{pr_label} is open and waiting for required checks - "
+            "Blueprint retries the merge automatically; this cut will be rejected until it lands or is canceled."
+        )
+
+    lines.append("Proceed?")
+    return "\n".join(lines)
+
+
 # action -> (HTTP method, path-template, summary, body-builder)
 # path-template is formatted with {pid}. body-builder takes args -> dict|None.
 _PROMOTE_RECOVER_ACTIONS = {
@@ -2331,7 +2495,8 @@ def cmd_promote_recover(args: argparse.Namespace) -> None:
     path = path_tmpl.format(pid=pid)
     body = build_body(args)
 
-    if not _confirm(f"About to {summary}. Proceed?", getattr(args, "yes", False)):
+    prompt = _cut_confirmation_prompt(pid) if action == "cut" else f"About to {summary}. Proceed?"
+    if not _confirm(prompt, getattr(args, "yes", False)):
         print("Aborted.")
         return
 
@@ -4821,6 +4986,8 @@ def build_parser() -> argparse.ArgumentParser:
                                       help="List active/proposed directions.")
     p_dirs_list.add_argument("--all", action="store_true",
                              help="Include paused/completed/expired directions.")
+    p_dirs_list.add_argument("--staged", action="store_true",
+                             help="Show only staged directions.")
 
     p_dirs_show = dirs_sub.add_parser("show", parents=[common],
                                       help="Show one direction in detail.")
@@ -4835,6 +5002,8 @@ def build_parser() -> argparse.ArgumentParser:
                             help="File paths associated with this direction.")
     p_dirs_add.add_argument("--completion-criteria", dest="completion_criteria",
                             metavar="TEXT", help="Completion criteria text.")
+    p_dirs_add.add_argument("--staged", action="store_true",
+                            help="Create the direction staged against the open version.")
     p_dirs_add.add_argument("--yes", action="store_true",
                             help="Skip the confirmation prompt.")
 
@@ -4848,6 +5017,9 @@ def build_parser() -> argparse.ArgumentParser:
                                choices=["active", "paused", "completed",
                                         "staged", "proposed", "expired"],
                                help="New status.")
+    p_dirs_update.add_argument("--staged-for-version", dest="staged_for_version",
+                               type=int, metavar="INT",
+                               help="Retarget a staged direction to version INT.")
     p_dirs_update.add_argument("--reset-context", dest="reset_context",
                                action="store_true",
                                help="Wipe research_context back to blank template.")
@@ -4868,6 +5040,26 @@ def build_parser() -> argparse.ArgumentParser:
     p_dirs_unhold.add_argument("direction_id", help="Direction id or prefix.")
     p_dirs_unhold.add_argument("--yes", action="store_true",
                                help="Skip the confirmation prompt.")
+
+    p_dirs_retarget = dirs_sub.add_parser("retarget", parents=[common],
+                                          help="Retarget a staged direction.")
+    p_dirs_retarget.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_retarget.add_argument("version", type=int,
+                                 help="New version to stage against.")
+    p_dirs_retarget.add_argument("--yes", action="store_true",
+                                 help="Skip the confirmation prompt.")
+
+    p_dirs_activate = dirs_sub.add_parser("activate", parents=[common],
+                                          help="Activate a staged direction immediately.")
+    p_dirs_activate.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_activate.add_argument("--yes", action="store_true",
+                                  help="Skip the confirmation prompt.")
+
+    p_dirs_cancel = dirs_sub.add_parser("cancel", parents=[common],
+                                        help="Cancel a staged direction.")
+    p_dirs_cancel.add_argument("direction_id", help="Direction id or prefix.")
+    p_dirs_cancel.add_argument("--yes", action="store_true",
+                                help="Skip the confirmation prompt.")
 
     # promote-recover
     p_pr = sub.add_parser("promote-recover", parents=[common],

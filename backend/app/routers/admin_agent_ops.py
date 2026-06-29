@@ -2846,6 +2846,16 @@ async def strategic_operation(
                             "lesson": lesson[:300],
                         }
                     )
+            if not cleaned:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "set_retirement_critiques: list must contain at least one valid "
+                        "critique object (with direction_id, what_it_addressed, "
+                        'pattern_that_produced_it, and lesson). Use '
+                        '{"no_eligible_retirements": true} when no retirements exist.'
+                    ),
+                )
             critiques = cleaned
         else:
             raise HTTPException(
