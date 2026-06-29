@@ -1,4 +1,5 @@
 import type { TaskType } from '../taskCapabilities';
+import type { ProjectMessagePreview } from './messages';
 
 export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'BLOCKED' | 'PARKED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type { TaskType };
@@ -89,6 +90,53 @@ export interface TaskArtifact {
   logs?: string | null;
   iteration: number;
   created_at?: string | null;
+}
+
+export interface TaskSideboardContext {
+  project: {
+    id: string;
+    name?: string | null;
+    repo?: string | null;
+  };
+  purpose?: string | null;
+  strategic: {
+    direction: {
+      id: string;
+      text?: string | null;
+      priority?: string | null;
+      status?: string | null;
+    } | null;
+    cycle: {
+      id: string;
+      phase: 'design_doc_update' | 'strategic_review' | string | null;
+      outcome: string;
+    } | null;
+  };
+  pipeline: {
+    parent_task_id?: string | null;
+    child_count: number;
+    dependency_count: number;
+    blocked_reason?: string | null;
+  };
+  artifacts: {
+    total: number;
+    by_type: Record<string, number>;
+    primary_pr_url?: string | null;
+    primary_commit?: string | null;
+  };
+  messages: {
+    total_recent: number;
+    items: ProjectMessagePreview[];
+  };
+  links: Array<{
+    id: string;
+    label: string;
+    target: {
+      surface: string;
+      section?: string | null;
+      id?: string | null;
+    };
+  }>;
 }
 
 export interface Task {
@@ -245,6 +293,7 @@ export interface Task {
   // Transitional state: agent run completed but post-commit side effects
   // (PR submission, child task spawns, merge) haven't fired yet.
   post_commit_pending?: boolean | null;
+  sideboard_context?: TaskSideboardContext | null;
 }
 
 export interface EdgeConsidered {

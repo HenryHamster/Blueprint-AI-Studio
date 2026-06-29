@@ -1,0 +1,164 @@
+import { describe, expect, test, vi } from 'vitest';
+import { render, screen } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { TaskContextRail } from './TaskContextRail';
+import type { Task } from '../types/task';
+
+function makeTask(overrides: Partial<Task> = {}): Task {
+  return {
+    id: 'task-12345678',
+    project_id: 'proj-1',
+    title: 'Implement active work context',
+    description: 'Task description',
+    status: 'IN_PROGRESS',
+    task_type: 'create',
+    created_by: 'ORCHESTRATOR',
+    requires_approval: false,
+    created_at: '2026-06-29T12:00:00Z',
+    started_at: '2026-06-29T12:05:00Z',
+    latest_status_message: 'Reviewing the operator sideboard.',
+    payloads: [{ type: 'create' }],
+    context: {},
+    sideboard_context: {
+      project: { id: 'proj-1', name: 'Blueprint', repo: 'HenryHamster/BlueprintAIStudio' },
+      purpose: 'Active work context',
+      strategic: {
+        direction: {
+          id: 'd-1',
+          text: 'Keep active work tied to Strategic context.',
+          priority: 'high',
+          status: 'active',
+        },
+        cycle: null,
+      },
+      pipeline: {
+        parent_task_id: null,
+        child_count: 2,
+        dependency_count: 0,
+        blocked_reason: null,
+      },
+      artifacts: {
+        total: 1,
+        by_type: { PULL_REQUEST: 1 },
+        primary_pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/42',
+        primary_commit: null,
+      },
+      messages: { total_recent: 0, items: [] },
+      links: [],
+    },
+    ...overrides,
+  };
+}
+
+describe('TaskContextRail', () => {
+  test('renders the current task context and opens details', async () => {
+    const user = userEvent.setup();
+    const onOpenTask = vi.fn();
+    render(
+      <TaskContextRail
+        currentTask={makeTask()}
+        attentionTasks={[]}
+        trackedTaskIds={new Set()}
+        onOpenTask={onOpenTask}
+      />,
+    );
+
+    expect(screen.getByText('Task context')).toBeInTheDocument();
+    expect(screen.getByText('Implement active work context')).toBeInTheDocument();
+    expect(screen.getByText('Reviewing the operator sideboard.')).toBeInTheDocument();
+    expect(screen.getByText('Keep active work tied to Strategic context.')).toBeInTheDocument();
+    expect(screen.getByText('2 child tasks')).toBeInTheDocument();
+
+    await user.click(screen.getByText('Details'));
+    expect(onOpenTask).toHaveBeenCalledWith(expect.objectContaining({ id: 'task-12345678' }));
+  });
+
+  test('renders attention tasks when no task is currently open', async () => {
+    const user = userEvent.setup();
+    const onOpenTask = vi.fn();
+    const failed = makeTask({
+      id: 'task-failed',
+      title: 'Fix failed run',
+      status: 'FAILED',
+      latest_status_message: 'Tests failed.',
+    });
+    render(
+      <TaskContextRail
+        currentTask={null}
+        attentionTasks={[failed]}
+        onOpenTask={onOpenTask}
+      />,
+    );
+
+    expect(screen.getByText('Fix failed run')).toBeInTheDocument();
+    await user.click(screen.getByText('Fix failed run'));
+    expect(onOpenTask).toHaveBeenCalledWith(expect.objectContaining({ id: 'task-failed' }));
+  });
+
+  test('keeps other attention tasks visible without duplicating the current task', () => {
+    const task = makeTask();
+    render(
+      <TaskContextRail
+        currentTask={task}
+        attentionTasks={[task, makeTask({ id: 'task-blocked', title: 'Blocked task', status: 'BLOCKED' })]}
+        onOpenTask={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByText('Implement active work context')).toHaveLength(1);
+    expect(screen.getByText('Needs attention')).toBeInTheDocument();
+    expect(screen.getByText('Blocked task')).toBeInTheDocument();
+  });
+
+  test('renders a quiet empty state', () => {
+    render(<TaskContextRail currentTask={null} attentionTasks={[]} onOpenTask={vi.fn()} />);
+
+    expect(screen.getByText('No task selected.')).toBeInTheDocument();
+  });
+
+  test('pipeline and track actions use existing callbacks', async () => {
+    const user = userEvent.setup();
+    const onOpenPipeline = vi.fn();
+    const onTrackTask = vi.fn();
+    const task = makeTask();
+    render(
+      <TaskContextRail
+        currentTask={task}
+        attentionTasks={[]}
+        trackedTaskIds={new Set()}
+        onOpenTask={vi.fn()}
+        onOpenPipeline={onOpenPipeline}
+        onTrackTask={onTrackTask}
+      />,
+    );
+
+    await user.click(screen.getByText('Pipeline'));
+    await user.click(screen.getByText('Track'));
+    expect(onOpenPipeline).toHaveBeenCalled();
+    expect(onTrackTask).toHaveBeenCalledWith(task);
+  });
+
+  test('prefers exact sideboard child count over capped child task ids', () => {
+    render(
+      <TaskContextRail
+        currentTask={makeTask({
+          child_task_ids: Array.from({ length: 1000 }, (_, idx) => `child-${idx}`),
+          sideboard_context: {
+            ...makeTask().sideboard_context!,
+            pipeline: {
+              parent_task_id: null,
+              child_count: 1002,
+              dependency_count: 0,
+              blocked_reason: null,
+            },
+          },
+        })}
+        attentionTasks={[]}
+        onOpenTask={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('1002 child tasks')).toBeInTheDocument();
+    expect(screen.queryByText('1000 child tasks')).not.toBeInTheDocument();
+  });
+});

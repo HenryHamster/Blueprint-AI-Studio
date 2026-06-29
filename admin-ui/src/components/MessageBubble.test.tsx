@@ -191,6 +191,33 @@ describe('MessageBubble', () => {
     }));
   });
 
+  test('chat presentation renders a compact task metadata affordance', () => {
+    const onOpenTask = vi.fn();
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      actionMode: 'reply-only',
+      msg: makeMsg({
+        from_type: 'agent',
+        from_task_id: 'task-abcdef123456',
+        content: 'Task-linked update.',
+      }),
+      onOpenTask,
+    })} />);
+
+    const taskButton = screen.getByText('task task-abc');
+    fireEvent.click(taskButton);
+    expect(onOpenTask).toHaveBeenCalledWith('task-abcdef123456');
+  });
+
+  test('chat presentation omits task metadata when there is no task ref', () => {
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      msg: makeMsg({ from_task_id: null }),
+    })} />);
+
+    expect(screen.queryByText(/task /)).toBeNull();
+  });
+
   test('shows resolved note when status is resolved with resolution', () => {
     render(<MessageBubble {...makeProps({
       msg: makeMsg({ status: 'resolved', resolution: 'Fixed in PR 123' }),

@@ -280,6 +280,20 @@ export function MessageBubble({
             <span className="font-medium text-neutral-400">{formatChatFromType(msg)}</span>
             <span aria-hidden="true">·</span>
             <span>{formatAge(msg.created_at)}</span>
+            {taskId && onOpenTask && (
+              <>
+                <span aria-hidden="true">·</span>
+                <button
+                  type="button"
+                  onClick={() => onOpenTask(taskId)}
+                  data-viewport-allow-small-target
+                  className="font-mono text-ui-md text-cyan-400 transition-colors hover:text-cyan-300"
+                  title={`Open task ${taskId}`}
+                >
+                  task {taskId.slice(0, 8)}
+                </button>
+              </>
+            )}
             {canChatReply && (
               <button
                 onClick={() => onReply({ id: msg.id, content: msg.content, from: formatChatFromType(msg), message_type: msg.message_type, status: msg.status })}

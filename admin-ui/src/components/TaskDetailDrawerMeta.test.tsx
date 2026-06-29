@@ -61,6 +61,109 @@ function mergeTestArtifact(verdict: Record<string, unknown>, iteration = 1) {
   return { artifact_type: 'MERGE_TEST_RESULT', logs: JSON.stringify(verdict), iteration };
 }
 
+describe('DetailsTab — sideboard context', () => {
+  afterEach(() => {
+    vi.mocked(authGet).mockResolvedValue(new Response(JSON.stringify({ stats: {} }), { status: 200 }));
+    cleanup();
+  });
+
+  it('renders bounded task sideboard context', () => {
+    const onNavigateToTask = vi.fn();
+    render(
+      <DetailsTab
+        task={makeTask({
+          id: 'task-sideboard',
+          project_id: 'proj-1',
+          sideboard_context: {
+            project: { id: 'proj-1', name: 'Blueprint', repo: 'HenryHamster/BlueprintAIStudio' },
+            purpose: 'Task sideboard integration',
+            strategic: {
+              direction: {
+                id: 'd-active',
+                text: 'Keep active work tied to the operator sideboard.',
+                priority: 'high',
+                status: 'active',
+              },
+              cycle: { id: 'sc-1', phase: 'strategic_review', outcome: 'phase2_running' },
+              parent_strategic_task_id: 'sc-1',
+            },
+            pipeline: {
+              parent_task_id: 'parent-task-123456',
+              child_count: 2,
+              dependency_count: 1,
+              blocked_reason: 'Waiting for reviewer feedback.',
+            },
+            artifacts: {
+              total: 1,
+              by_type: { PULL_REQUEST: 1 },
+              primary_pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/42',
+              primary_commit: 'abcdef1234567890',
+            },
+            messages: {
+              total_recent: 1,
+              items: [{
+                id: 'msg-1',
+                project_id: 'proj-1',
+                message_type: 'NOTE',
+                from_type: 'agent',
+                from_task_id: 'task-sideboard',
+                content: 'Recent task update',
+                context: {},
+                status: 'open',
+                resolution: null,
+                resolved_at: null,
+                created_at: '2026-06-29T12:00:00Z',
+              }],
+            },
+            links: [],
+          },
+        })}
+        onNavigateToTask={onNavigateToTask}
+      />,
+    );
+
+    expect(screen.getByText('Context')).toBeInTheDocument();
+    expect(screen.getByText('HenryHamster/BlueprintAIStudio')).toBeInTheDocument();
+    expect(screen.getByText('Task sideboard integration')).toBeInTheDocument();
+    expect(screen.getByText('Keep active work tied to the operator sideboard.')).toBeInTheDocument();
+    expect(screen.getByText('sc-1')).toBeInTheDocument();
+    expect(screen.getByText('strategic review')).toBeInTheDocument();
+    expect(screen.getByText('phase2_running')).toBeInTheDocument();
+    expect(screen.getByText('1 dependencies')).toBeInTheDocument();
+    expect(screen.getByText('2 children')).toBeInTheDocument();
+    expect(screen.getByText('Waiting for reviewer feedback.')).toBeInTheDocument();
+    expect(screen.getByText('pull request 1')).toBeInTheDocument();
+    expect(screen.getByText('abcdef123456')).toBeInTheDocument();
+    expect(screen.getByText('Recent task update')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('parent parent-t'));
+    expect(onNavigateToTask).toHaveBeenCalledWith('parent-task-123456');
+  });
+
+  it('falls back to legacy direction lookup when sideboard context is absent', async () => {
+    vi.mocked(authGet).mockImplementation(async (url: string) => {
+      if (url.includes('/directions')) {
+        return new Response(JSON.stringify({
+          directions: [{ id: 'd-legacy', text: 'Legacy direction text' }],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ stats: {} }), { status: 200 });
+    });
+
+    render(
+      <DetailsTab
+        task={makeTask({
+          project_id: 'proj-legacy',
+          context: { direction_id: 'd-legacy' },
+        })}
+      />,
+    );
+
+    expect(await screen.findByText('Legacy direction text')).toBeInTheDocument();
+    expect(screen.getByText('d-legacy')).toBeInTheDocument();
+  });
+});
+
 describe('DetailsTab — parked wake registration', () => {
   afterEach(() => cleanup());
 

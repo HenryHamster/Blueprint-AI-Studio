@@ -171,4 +171,31 @@ describe('MessageBubble — viewport regression', () => {
     await expectNoTextTruncationAt(420, async () => {});
     await expectMinTouchTargetAt(420, async () => {});
   });
+
+  test('chat task metadata fits 375px without overflow', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(
+          <MessageBubble
+            {...makeProps({
+              presentation: 'chat',
+              actionMode: 'reply-only',
+              onOpenTask: () => {},
+              msg: makeMsg({
+                from_type: 'strategic',
+                from_task_id: 'task-abcdef1234567890',
+                content: 'This is a long Strategic task-linked update that should wrap cleanly while the compact task metadata remains usable.',
+              }),
+            })}
+          />,
+        );
+      });
+    });
+    if (host) expect(host.textContent).toContain('task task-abc');
+  });
 });

@@ -44,6 +44,7 @@ from app.models import (
     ProjectMessage,
     Artifact,
     ArtifactType,
+    StrategicCycle,
     TaskWakeRegistration,
     DeploymentState,
     DeploymentStatus,
@@ -75,6 +76,7 @@ from app.schemas import (
     TaskEvaluationSummaryItem,
     redact_task_payloads,
 )
+from app.project_message_projection import compact_text, message_preview_dict
 from app.task_outcomes import build_task_evaluation_summary
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
@@ -1151,6 +1153,172 @@ def _status_values(statuses: tuple[TaskStatus, ...]) -> list[str]:
     return [_status_value(status) for status in statuses]
 
 
+def _task_direction_id(task: Task) -> str | None:
+    ctx = task.context if isinstance(task.context, dict) else {}
+    payload = task.first_payload if isinstance(task.first_payload, dict) else {}
+    value = ctx.get("direction_id") or payload.get("direction_id")
+    return str(value) if value else None
+
+
+def _find_task_direction_ref(task: Task, project: Project | None) -> dict[str, Any] | None:
+    direction_id = _task_direction_id(task)
+    if not direction_id:
+        return None
+    directions = project.directions if project and isinstance(project.directions, list) else []
+    row = next(
+        (
+            direction
+            for direction in directions
+            if isinstance(direction, dict) and str(direction.get("id") or "") == direction_id
+        ),
+        None,
+    )
+    if not row:
+        return {
+            "id": direction_id,
+            "text": None,
+            "priority": None,
+            "status": None,
+        }
+    return {
+        "id": direction_id,
+        "text": compact_text(row.get("text"), max_chars=240),
+        "priority": row.get("priority"),
+        "status": row.get("status") or "active",
+    }
+
+
+def _task_artifact_sideboard_summary(
+    artifacts: list[Artifact],
+    *,
+    primary_pr_url: str | None,
+    primary_commit: str | None,
+) -> dict[str, Any]:
+    by_type: dict[str, int] = {}
+    commit = primary_commit
+    for artifact in artifacts:
+        kind = str(_enum_value(artifact.artifact_type))
+        by_type[kind] = by_type.get(kind, 0) + 1
+        if commit is None and artifact.commit_hash:
+            commit = artifact.commit_hash
+    return {
+        "total": len(artifacts),
+        "by_type": by_type,
+        "primary_pr_url": primary_pr_url,
+        "primary_commit": commit,
+    }
+
+
+def _strategic_cycle_sideboard_ref(
+    task: Task,
+    cycle: StrategicCycle | None,
+) -> dict[str, Any] | None:
+    if cycle is None:
+        return None
+    phase = None
+    if cycle.phase1_task_id == task.id:
+        phase = "design_doc_update"
+    elif cycle.phase2_task_id == task.id:
+        phase = "strategic_review"
+    return {
+        "id": cycle.id,
+        "phase": phase,
+        "outcome": cycle.outcome,
+    }
+
+
+def _task_sideboard_context(
+    task: Task,
+    *,
+    project: Project | None,
+    artifacts: list[Artifact],
+    child_count: int,
+    related_messages: list[ProjectMessage],
+    cycle: StrategicCycle | None,
+    primary_pr_url: str | None,
+    primary_commit: str | None,
+) -> dict[str, Any]:
+    repo = None
+    if project and project.github_owner and project.github_repo:
+        repo = f"{project.github_owner}/{project.github_repo}"
+    problem_model = project.problem_model if project and isinstance(project.problem_model, dict) else {}
+    intent = problem_model.get("intent") if isinstance(problem_model.get("intent"), dict) else {}
+    purpose = compact_text(
+        intent.get("current_focus") or intent.get("purpose"),
+        max_chars=220,
+    )
+    dependency_count = len(task.depends_on or [])
+    pipeline = {
+        "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
+        "child_count": child_count,
+        "dependency_count": dependency_count,
+        "blocked_reason": compact_text(
+            task.blocked_reason or task.park_reason,
+            max_chars=220,
+        ),
+    }
+    links: list[dict[str, Any]] = [
+        {
+            "id": "pipeline",
+            "label": "Pipeline",
+            "target": {"surface": "pipeline", "id": str(task.id)},
+        }
+    ]
+    if pipeline["parent_task_id"]:
+        links.append(
+            {
+                "id": "parent_task",
+                "label": "Parent",
+                "target": {"surface": "task", "id": pipeline["parent_task_id"]},
+            }
+        )
+    direction = _find_task_direction_ref(task, project)
+    if direction:
+        links.append(
+            {
+                "id": "direction",
+                "label": "Direction",
+                "target": {
+                    "surface": "project",
+                    "section": "directions",
+                    "id": direction["id"],
+                },
+            }
+        )
+    if primary_pr_url:
+        links.append(
+            {
+                "id": "pull_request",
+                "label": "PR",
+                "target": {"surface": "external", "id": primary_pr_url},
+            }
+        )
+
+    return {
+        "project": {
+            "id": str(project.id) if project else str(task.project_id),
+            "name": project.name if project else None,
+            "repo": repo,
+        },
+        "purpose": purpose,
+        "strategic": {
+            "direction": direction,
+            "cycle": _strategic_cycle_sideboard_ref(task, cycle),
+        },
+        "pipeline": pipeline,
+        "artifacts": _task_artifact_sideboard_summary(
+            artifacts,
+            primary_pr_url=primary_pr_url,
+            primary_commit=primary_commit,
+        ),
+        "messages": {
+            "total_recent": len(related_messages),
+            "items": [message_preview_dict(message) for message in related_messages],
+        },
+        "links": links,
+    }
+
+
 def _task_has_cancel_pr_context_reference(task: Task) -> bool:
     ctx = task.context or {}
     if not isinstance(ctx, dict):
@@ -1340,6 +1508,14 @@ async def get_task(
     _raw_child_ids = child_ids_result.scalars().all()
     child_task_ids_truncated = len(_raw_child_ids) > _CHILD_ID_LIMIT
     child_task_ids = [str(row) for row in _raw_child_ids[:_CHILD_ID_LIMIT]]
+    child_count = int(
+        (
+            await session.execute(
+                select(func.count(Task.id)).where(Task.parent_task_id == tid)
+            )
+        ).scalar_one()
+        or 0
+    )
 
     wake_registration_result = await session.execute(
         select(TaskWakeRegistration)
@@ -1348,6 +1524,53 @@ async def get_task(
         .limit(1)
     )
     wake_registration = wake_registration_result.scalars().first()
+
+    project = await session.get(Project, task.project_id)
+    cycle = (
+        await session.execute(
+            select(StrategicCycle)
+            .where(
+                StrategicCycle.project_id == task.project_id,
+                (StrategicCycle.phase1_task_id == tid)
+                | (StrategicCycle.phase2_task_id == tid),
+            )
+            .order_by(StrategicCycle.updated_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if cycle is None and task.strategic_cycle_id:
+        cycle = (
+            await session.execute(
+                select(StrategicCycle)
+                .where(
+                    StrategicCycle.id == task.strategic_cycle_id,
+                    StrategicCycle.project_id == task.project_id,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    related_messages = (
+        await session.execute(
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == task.project_id,
+                ProjectMessage.from_task_id == tid,
+            )
+            .order_by(ProjectMessage.created_at.desc())
+            .limit(5)
+        )
+    ).scalars().all()
+    sideboard_context = _task_sideboard_context(
+        task,
+        project=project,
+        artifacts=artifacts,
+        child_count=child_count,
+        related_messages=related_messages,
+        cycle=cycle,
+        primary_pr_url=pr_url,
+        primary_commit=commit_hash,
+    )
 
     task_type = (task.first_payload).get("type", "create")
     return {
@@ -1428,6 +1651,7 @@ async def get_task(
         "api_call_summary": task.api_call_summary,
         **_task_llm_cost_fields(task),
         "post_commit_pending": task.post_commit_pending,
+        "sideboard_context": sideboard_context,
     }
 
 

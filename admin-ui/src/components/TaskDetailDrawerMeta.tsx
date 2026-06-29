@@ -8,6 +8,7 @@ import { TaskFixLoopPanel } from './TaskFixLoopPanel';
 import { SelfReviewPanel } from './TaskDetailDrawerSelfReview';
 import { TaskDiagnosticsPanel, TaskErrorLogsPanel } from './TaskDetailDrawerDiagnostics';
 import { FailureDetailPanel, TeardownForensicsPanel } from './TaskDetailDrawerFailureDetail';
+import { TaskSideboardContextSection } from './TaskDetailDrawerSideboardContext';
 import type { AdversarialGateDiagnostic, PanelReviewVerdict, Task } from '../types/task';
 import { CopyableId, SectionHeader, DetailRow, DirectionsSection, DependencyItem } from './TaskDetailDrawerPrimitives';
 import {
@@ -57,11 +58,12 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
 
   const provenanceCtx = task.context as Record<string, unknown> | undefined;
   const provenanceDirectionId = provenanceCtx?.direction_id as string | undefined;
+  const hasSideboardDirection = Boolean(task.sideboard_context?.strategic.direction);
   const llmProvider = typeof provenanceCtx?.llm_provider === 'string' ? provenanceCtx.llm_provider : null;
   const llmModel = typeof provenanceCtx?.llm_model === 'string' ? provenanceCtx.llm_model : null;
 
   useEffect(() => {
-    if (!provenanceDirectionId || !task.project_id) return;
+    if (!provenanceDirectionId || !task.project_id || hasSideboardDirection) return;
     authGet(`${API_BASE_URL}/api/admin/projects/${task.project_id}/directions`)
       .then(r => r.json())
       .then(data => {
@@ -73,10 +75,11 @@ export function DetailsTab({ task, tasks, gcpProjectId, onNavigateToTask }: { ta
         }
       })
       .catch(() => {});
-  }, [task.project_id, provenanceDirectionId]);
+  }, [task.project_id, provenanceDirectionId, hasSideboardDirection]);
 
   return (
     <div className="flex-1 overflow-y-auto p-4 custom-scrollbar space-y-1">
+      <TaskSideboardContextSection task={task} onNavigateToTask={onNavigateToTask} />
       <SectionHeader>Identifiers</SectionHeader>
       <DetailRow label="Task ID"><CopyableId value={task.id} /></DetailRow>
       {task.created_by && (

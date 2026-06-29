@@ -20,6 +20,7 @@ interface StrategicContextRailProps {
   onOpenProjectSection: (section: ProjectTarget) => void;
   onOpenPipeline: () => void;
   onOpenRuntimeHealth: () => void;
+  onOpenTask?: (taskId: string) => void;
 }
 
 function formatCost(value: number | undefined): string {
@@ -169,6 +170,7 @@ export function StrategicContextRail({
   onOpenProjectSection,
   onOpenPipeline,
   onOpenRuntimeHealth,
+  onOpenTask,
 }: StrategicContextRailProps) {
   const activeCycle = state?.strategic.active_cycle ?? null;
   const pendingSteer = state?.strategic.refresh.pending ?? null;
@@ -202,7 +204,9 @@ export function StrategicContextRail({
       : latestCycle?.summary_text ?? lastCycleCompletion?.status_message ?? 'No active Strategic cycle';
 
   function attentionItemAction(item: StrategicStateAttentionItem): (() => void) | undefined {
-    if (item.kind === 'task') return onOpenPipeline;
+    if (item.kind === 'task') {
+      return onOpenTask && item.ref?.id ? () => onOpenTask(item.ref.id) : onOpenPipeline;
+    }
     if (item.kind === 'direction') return () => onOpenProjectSection('directions');
     if (item.kind === 'alert' && item.task_id) return onOpenPipeline;
     if (item.kind === 'alert') return onOpenRuntimeHealth;

@@ -289,6 +289,35 @@ describe('StrategicContextRail', () => {
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('directions');
   });
 
+  test('task attention items open the task drawer when task navigation is available', () => {
+    const attentionState: StrategicStateResponse = {
+      ...STATE,
+      attention: {
+        ...STATE.attention!,
+        items: [
+          {
+            id: 'task:task-1:failed_task',
+            kind: 'task',
+            severity: 'watch',
+            reason: 'failed_task',
+            label: 'Task failed',
+            detail: 'Viewport test failed.',
+            ref: { kind: 'task', id: 'task-1', project_id: 'proj-1' },
+          },
+        ],
+      },
+    };
+    const onOpenTask = vi.fn();
+    const { host, props } = mount({ state: attentionState, onOpenTask });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Task failed'))
+      ?.click();
+
+    expect(onOpenTask).toHaveBeenCalledWith('task-1');
+    expect(props.onOpenPipeline).not.toHaveBeenCalled();
+  });
+
   test('alert attention items drill into runtime health', () => {
     const attentionState: StrategicStateResponse = {
       ...STATE,

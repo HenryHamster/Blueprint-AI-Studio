@@ -45,6 +45,7 @@ import { ProjectMembers } from './components/ProjectMembers';
 import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
 import { StrategicContextRail } from './components/StrategicContextRail';
+import { TaskContextRail } from './components/TaskContextRail';
 import { CommandPalette } from './components/CommandPalette';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
 import { BoardSavedViewsBar, type BoardFilterSnapshot } from './components/BoardSavedViewsBar';
@@ -1331,23 +1332,34 @@ export default function App() {
               />
             )}
             rail={(
-              <StrategicContextRail
-                state={strategicReadModel.data}
-                loading={strategicReadModel.loading}
-                error={strategicReadModel.error}
-                strategistActive={s.strategistActive}
-                cycleProgress={s.cycleProgress}
-                lastCycleCompletion={s.lastCycleCompletion}
-                onOpenProjectSection={(section) => {
-                  setProjectSection(section);
-                  handleTabChange('project');
-                }}
-                onOpenPipeline={() => handleTabChange('pipeline')}
-                onOpenRuntimeHealth={() => {
-                  setRuntimeSection('health');
-                  handleTabChange('runtime');
-                }}
-              />
+              <div className="space-y-3">
+                <StrategicContextRail
+                  state={strategicReadModel.data}
+                  loading={strategicReadModel.loading}
+                  error={strategicReadModel.error}
+                  strategistActive={s.strategistActive}
+                  cycleProgress={s.cycleProgress}
+                  lastCycleCompletion={s.lastCycleCompletion}
+                  onOpenProjectSection={(section) => {
+                    setProjectSection(section);
+                    handleTabChange('project');
+                  }}
+                  onOpenPipeline={() => handleTabChange('pipeline')}
+                  onOpenRuntimeHealth={() => {
+                    setRuntimeSection('health');
+                    handleTabChange('runtime');
+                  }}
+                  onOpenTask={handleViewTaskById}
+                />
+                <TaskContextRail
+                  currentTask={openPipelineTask}
+                  attentionTasks={pipelineAttentionTasks}
+                  trackedTaskIds={s.trackedTaskIds}
+                  onOpenTask={s.handleViewLogs}
+                  onOpenPipeline={() => handleTabChange('pipeline')}
+                  onTrackTask={s.trackTask}
+                />
+              </div>
             )}
           />
         </WorkbenchSurface>
@@ -1535,68 +1547,14 @@ export default function App() {
                     </div>
                   </WorkbenchPanel>
 
-                  <WorkbenchPanel title="Open Task" meta={openPipelineTask?.status ?? 'none'}>
-                    {openPipelineTask ? (
-                      <div className="space-y-3 text-sm">
-                        <button
-                          type="button"
-                          onClick={() => s.handleViewLogs(openPipelineTask)}
-                          className="block w-full text-left text-sm font-medium leading-snug text-neutral-100 hover:text-cyan-300"
-                        >
-                          {openPipelineTask.title || openPipelineTask.id}
-                        </button>
-                        <div className="grid grid-cols-2 gap-2 text-xs">
-                          <div className="rounded-md border border-neutral-800 bg-neutral-900/40 px-2 py-1.5">
-                            <div className="text-neutral-500">type</div>
-                            <div className="mt-0.5 truncate text-neutral-200">{openPipelineTask.task_type || 'create'}</div>
-                          </div>
-                          <div className="rounded-md border border-neutral-800 bg-neutral-900/40 px-2 py-1.5">
-                            <div className="text-neutral-500">created</div>
-                            <div className="mt-0.5 truncate text-neutral-200">{parseTimestamp(openPipelineTask.created_at).toLocaleDateString()}</div>
-                          </div>
-                        </div>
-                        {openPipelineTask.latest_status_message && (
-                          <p className="rounded-md border border-neutral-800 bg-neutral-900/40 p-2 text-xs leading-relaxed text-neutral-400">
-                            {openPipelineTask.latest_status_message.slice(0, 180)}
-                          </p>
-                        )}
-                      </div>
-                    ) : (
-                      <div className="py-6 text-center text-xs text-neutral-600">No task open.</div>
-                    )}
-                  </WorkbenchPanel>
-
-                  <WorkbenchPanel title="Attention" meta={pipelineAttentionTasks.length}>
-                    {pipelineAttentionTasks.length > 0 ? (
-                      <div className="space-y-2">
-                        {pipelineAttentionTasks.map(task => (
-                          <button
-                            key={task.id}
-                            type="button"
-                            onClick={() => s.handleViewLogs(task)}
-                            className={`block w-full rounded-md border px-3 py-2 text-left transition-colors hover:border-neutral-600 hover:bg-neutral-900 ${
-                              task.status === 'FAILED'
-                                ? 'border-red-500/30 bg-red-500/5'
-                                : task.status === 'BLOCKED'
-                                  ? 'border-amber-500/30 bg-amber-500/5'
-                                  : 'border-neutral-800 bg-neutral-900/40'
-                            }`}
-                          >
-                            <div className="flex min-w-0 items-center justify-between gap-2">
-                              <span className="truncate text-ui-sm font-medium uppercase tracking-wide text-neutral-500">{task.status}</span>
-                              <span className="shrink-0 font-mono text-ui-sm text-neutral-600">{task.id.slice(0, 8)}</span>
-                            </div>
-                            <div className="mt-1 truncate text-xs font-medium text-neutral-200">{task.title || task.id}</div>
-                            {task.latest_status_message && (
-                              <div className="mt-0.5 truncate text-ui-sm text-neutral-500">{task.latest_status_message}</div>
-                            )}
-                          </button>
-                        ))}
-                      </div>
-                    ) : (
-                      <div className="py-6 text-center text-xs text-neutral-600">No active blockers.</div>
-                    )}
-                  </WorkbenchPanel>
+                  <TaskContextRail
+                    currentTask={openPipelineTask}
+                    attentionTasks={pipelineAttentionTasks}
+                    trackedTaskIds={s.trackedTaskIds}
+                    onOpenTask={s.handleViewLogs}
+                    onOpenPipeline={() => handleTabChange('pipeline')}
+                    onTrackTask={s.trackTask}
+                  />
                 </div>
               )}
             />

@@ -38,6 +38,7 @@ from app.models import (
     ProjectMessage,
     MessageType,
     MessagesLastSeen,
+    StrategicCycle,
     Direction,
     SystemMaturity,
     WakeDeliveryState,
@@ -20836,6 +20837,215 @@ class TestPostCommitPendingField:
         resp = await client.get(f"/api/admin/tasks/{task.id}")
         assert resp.status_code == 200, resp.text
         assert resp.json()["post_commit_pending"] is False
+
+    @pytest.mark.asyncio
+    async def test_task_detail_includes_bounded_sideboard_context(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="Workbench Project")
+        project.github_owner = "HenryHamster"
+        project.github_repo = "BlueprintAIStudio"
+        project.directions = [
+            {
+                "id": "d-active",
+                "text": "Keep active work tied to the operator sideboard.",
+                "priority": "high",
+                "status": "active",
+            }
+        ]
+        project.problem_model = {
+            "intent": {
+                "current_focus": "Task sideboard integration",
+                "purpose": "Keep active work understandable.",
+            },
+            "huge": "x" * 5000,
+        }
+        db_session.add(project)
+        task = Task(
+            project_id=project.id,
+            title="Integrate task sideboard",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create", "direction_id": "d-active"}],
+            context={"direction_id": "d-active", "design_doc": {"huge": "y" * 5000}},
+            blocked_reason="Waiting for reviewer feedback.",
+        )
+        parent = Task(
+            project_id=project.id,
+            title="Parent task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+        )
+        db_session.add(parent)
+        await db_session.commit()
+        await db_session.refresh(parent)
+        task.parent_task_id = parent.id
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        child = Task(
+            project_id=project.id,
+            title="Child task",
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "fix"}],
+            parent_task_id=task.id,
+        )
+        artifact_pr = Artifact(
+            task_id=task.id,
+            artifact_type=ArtifactType.PULL_REQUEST,
+            pr_url="https://github.com/HenryHamster/BlueprintAIStudio/pull/42",
+            commit_hash="abc123",
+            repo_url="https://github.com/HenryHamster/BlueprintAIStudio",
+        )
+        cycle = StrategicCycle(
+            id="sc-sideboard",
+            project_id=project.id,
+            outcome="phase2_running",
+            phase2_task_id=task.id,
+        )
+        message = ProjectMessage(
+            project_id=project.id,
+            from_task_id=task.id,
+            from_type="agent",
+            message_type=MessageType.NOTE,
+            content="Task update " + ("extra " * 200),
+            context={"event_type": "task_update", "huge": "z" * 5000},
+        )
+        db_session.add_all([child, artifact_pr, cycle, message])
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        sideboard = resp.json()["sideboard_context"]
+
+        assert sideboard["project"] == {
+            "id": str(project.id),
+            "name": "Workbench Project",
+            "repo": "HenryHamster/BlueprintAIStudio",
+        }
+        assert sideboard["purpose"] == "Task sideboard integration"
+        assert sideboard["strategic"]["direction"]["id"] == "d-active"
+        assert sideboard["strategic"]["direction"]["text"].startswith("Keep active work")
+        assert sideboard["strategic"]["cycle"] == {
+            "id": "sc-sideboard",
+            "phase": "strategic_review",
+            "outcome": "phase2_running",
+        }
+        assert sideboard["pipeline"]["parent_task_id"] == str(parent.id)
+        assert sideboard["pipeline"]["child_count"] == 1
+        assert sideboard["pipeline"]["dependency_count"] == 0
+        assert sideboard["pipeline"]["blocked_reason"] == "Waiting for reviewer feedback."
+        assert sideboard["artifacts"]["total"] == 1
+        assert sideboard["artifacts"]["by_type"] == {
+            "PULL_REQUEST": 1,
+        }
+        assert sideboard["artifacts"]["primary_pr_url"].endswith("/pull/42")
+        assert sideboard["artifacts"]["primary_commit"] == "abc123"
+        assert sideboard["messages"]["total_recent"] == 1
+        assert len(sideboard["messages"]["items"][0]["content"]) <= 280
+        assert sideboard["messages"]["items"][0]["context"] == {"event_type": "task_update"}
+        assert {link["id"] for link in sideboard["links"]} >= {
+            "pipeline",
+            "parent_task",
+            "direction",
+            "pull_request",
+        }
+        assert "problem_model" not in sideboard
+        assert "design_doc" not in str(sideboard)
+        assert "huge" not in str(sideboard)
+
+    @pytest.mark.asyncio
+    async def test_task_detail_sideboard_context_handles_plain_task(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="Plain task",
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        sideboard = resp.json()["sideboard_context"]
+
+        assert sideboard["project"]["id"] == str(project.id)
+        assert sideboard["project"]["name"] == project.name
+        assert sideboard["project"]["repo"] is None
+        assert sideboard["purpose"] is None
+        assert sideboard["strategic"]["direction"] is None
+        assert sideboard["strategic"]["cycle"] is None
+        assert sideboard["pipeline"]["parent_task_id"] is None
+        assert sideboard["pipeline"]["child_count"] == 0
+        assert sideboard["pipeline"]["dependency_count"] == 0
+        assert sideboard["artifacts"]["total"] == 0
+        assert sideboard["messages"] == {"total_recent": 0, "items": []}
+
+    @pytest.mark.asyncio
+    async def test_task_detail_sideboard_child_count_stays_exact_when_child_ids_truncated(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="High fanout parent",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create"}],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        db_session.add_all(
+            [
+                Task(
+                    project_id=project.id,
+                    title=f"Child {idx}",
+                    status=TaskStatus.QUEUED,
+                    payloads=[{"type": "fix"}],
+                    parent_task_id=task.id,
+                )
+                for idx in range(1002)
+            ]
+        )
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        assert len(body["child_task_ids"]) == 1000
+        assert body["child_task_ids_truncated"] is True
+        assert body["sideboard_context"]["pipeline"]["child_count"] == 1002
+
+    @pytest.mark.asyncio
+    async def test_task_detail_sideboard_cycle_fallback_is_project_scoped(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session, name="Primary Project")
+        other_project = await _make_project(db_session, name="Other Project")
+        task = Task(
+            project_id=project.id,
+            title="Task with stale cycle pointer",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create"}],
+            strategic_cycle_id="sc-other-project",
+        )
+        other_cycle = StrategicCycle(
+            id="sc-other-project",
+            project_id=other_project.id,
+            outcome="completed",
+        )
+        db_session.add_all([task, other_cycle])
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+
+        assert resp.json()["sideboard_context"]["strategic"]["cycle"] is None
 
 
 class TestApprovalNeededFilter:
