@@ -46,6 +46,8 @@ _APPROVAL_TASK_STATUSES = (
     TaskStatus.PROVISIONING,
     TaskStatus.IN_PROGRESS,
     TaskStatus.EVALUATING,
+    TaskStatus.BLOCKED,
+    TaskStatus.PARKED,
 )
 _MAX_ATTENTION_ITEMS = 8
 _ACTIONABLE_ALERT_SEVERITIES = (AlertSeverity.ERROR, AlertSeverity.WARNING)
@@ -302,11 +304,23 @@ async def build_operator_attention(
                     else_=0,
                 )).label("failed"),
                 func.sum(case(
-                    (Task.status == TaskStatus.BLOCKED, 1),
+                    (
+                        and_(
+                            Task.status == TaskStatus.BLOCKED,
+                            Task.requires_approval.is_not(True),
+                        ),
+                        1,
+                    ),
                     else_=0,
                 )).label("blocked"),
                 func.sum(case(
-                    (Task.status == TaskStatus.PARKED, 1),
+                    (
+                        and_(
+                            Task.status == TaskStatus.PARKED,
+                            Task.requires_approval.is_not(True),
+                        ),
+                        1,
+                    ),
                     else_=0,
                 )).label("parked"),
             )
@@ -381,6 +395,7 @@ async def build_operator_attention(
                     Task.project_id == project.id,
                     Task.archived.is_(False),
                     Task.status.in_([TaskStatus.BLOCKED, TaskStatus.PARKED]),
+                    Task.requires_approval.is_not(True),
                 )
                 .order_by(Task.updated_at.desc())
                 .limit(4)

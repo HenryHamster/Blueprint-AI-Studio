@@ -371,6 +371,68 @@ describe('StrategicContextRail', () => {
     expect(props.onOpenPipeline).not.toHaveBeenCalled();
   });
 
+  test('message attention item is navigable', () => {
+    const attentionState: StrategicStateResponse = {
+      ...STATE,
+      attention: {
+        ...STATE.attention!,
+        items: [
+          {
+            id: 'message:msg-1',
+            kind: 'message',
+            severity: 'needs_operator',
+            reason: 'question',
+            label: 'Question waiting',
+            detail: 'Keep local Strategic enabled during the workday?',
+            unread: true,
+            created_at: '2026-06-29T01:05:00Z',
+            ref: { kind: 'message', id: 'msg-1', project_id: 'proj-1' },
+          },
+        ],
+      },
+    };
+    const onOpenMessages = vi.fn();
+    const { host, props } = mount({ state: attentionState, onOpenMessages });
+
+    const btn = Array.from(host.querySelectorAll('button')).find(b =>
+      b.textContent?.includes('Question waiting'),
+    );
+    expect(btn).toBeTruthy();
+    btn?.click();
+
+    expect(onOpenMessages).toHaveBeenCalled();
+    expect(props.onOpenPipeline).not.toHaveBeenCalled();
+  });
+
+  test('message attention item falls back to pipeline when onOpenMessages is absent', () => {
+    const attentionState: StrategicStateResponse = {
+      ...STATE,
+      attention: {
+        ...STATE.attention!,
+        items: [
+          {
+            id: 'message:msg-2',
+            kind: 'message',
+            severity: 'needs_operator',
+            reason: 'blocker',
+            label: 'Blocker reported',
+            detail: 'CI is broken.',
+            ref: { kind: 'message', id: 'msg-2', project_id: 'proj-1' },
+          },
+        ],
+      },
+    };
+    const { host, props } = mount({ state: attentionState });
+
+    const btn = Array.from(host.querySelectorAll('button')).find(b =>
+      b.textContent?.includes('Blocker reported'),
+    );
+    expect(btn).toBeTruthy();
+    btn?.click();
+
+    expect(props.onOpenPipeline).toHaveBeenCalled();
+  });
+
   test('alert attention items drill into runtime health', () => {
     const attentionState: StrategicStateResponse = {
       ...STATE,

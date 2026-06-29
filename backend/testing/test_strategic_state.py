@@ -815,9 +815,11 @@ async def test_operator_attention_surfaces_bug_and_feedback_as_watch_items(
 
 
 @pytest.mark.asyncio
-async def test_operator_attention_blocked_approval_task_counted_once(
+async def test_operator_attention_approval_precedence_over_blocked(
     client: AsyncClient, db_session
 ):
+    """Approval-required BLOCKED/PARKED tasks must appear only in the approval
+    bucket — not double-counted in blocked_tasks/parked_tasks or watch."""
     project = await _make_project(db_session)
     blocked_approval_task = Task(
         project_id=project.id,
@@ -851,19 +853,134 @@ async def test_operator_attention_blocked_approval_task_counted_once(
     assert resp.status_code == 200
     attention = resp.json()
 
-    assert attention["counts"]["approvals"] == 1
-    assert attention["counts"]["blocked_tasks"] == 1
-    assert attention["counts"]["parked_tasks"] == 1
-    assert attention["counts"]["needs_operator"] == 1
-    assert attention["counts"]["watch"] == 2
+    # All three approval tasks counted under approvals/needs_operator only
+    assert attention["counts"]["approvals"] == 3
+    assert attention["counts"]["blocked_tasks"] == 0
+    assert attention["counts"]["parked_tasks"] == 0
+    assert attention["counts"]["needs_operator"] == 3
+    assert attention["counts"]["watch"] == 0
 
     item_ids = {item["id"] for item in attention["items"]}
+    # All three surface as approval_required items
     assert f"task:{regular_approval_task.id}:approval_required" in item_ids
-    assert f"task:{blocked_approval_task.id}:blocked_task" in item_ids
-    assert f"task:{parked_approval_task.id}:parked_task" in item_ids
+    assert f"task:{blocked_approval_task.id}:approval_required" in item_ids
+    assert f"task:{parked_approval_task.id}:approval_required" in item_ids
+    # None surface as blocked_task / parked_task
+    assert f"task:{blocked_approval_task.id}:blocked_task" not in item_ids
+    assert f"task:{parked_approval_task.id}:parked_task" not in item_ids
 
-    assert f"task:{blocked_approval_task.id}:approval_required" not in item_ids
-    assert f"task:{parked_approval_task.id}:approval_required" not in item_ids
+
+@pytest.mark.asyncio
+async def test_operator_attention_pure_blocked_not_requiring_approval_stays_in_watch(
+    client: AsyncClient, db_session
+):
+    """A BLOCKED task with requires_approval=False must remain in blocked_count/watch,
+    confirming the approval-precedence guard only fires on requires_approval=True."""
+    project = await _make_project(db_session)
+    plain_blocked = Task(
+        project_id=project.id,
+        title="Blocked without approval flag",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.BLOCKED,
+        requires_approval=False,
+        blocked_reason="Waiting for a project setting.",
+    )
+    db_session.add(plain_blocked)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["approvals"] == 0
+    assert attention["counts"]["blocked_tasks"] == 1
+    assert attention["counts"]["needs_operator"] == 0
+    assert attention["counts"]["watch"] == 1
+
+    item_ids = {item["id"] for item in attention["items"]}
+    assert f"task:{plain_blocked.id}:blocked_task" in item_ids
+    assert f"task:{plain_blocked.id}:approval_required" not in item_ids
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_no_last_seen_all_messages_unread(
+    client: AsyncClient, db_session
+):
+    """When no MessagesLastSeen row exists, every high-signal non-user message is unread."""
+    project = await _make_project(db_session)
+    for i in range(3):
+        db_session.add(ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="agent",
+            content=f"Open question {i}",
+            status="open",
+        ))
+    db_session.add(ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BLOCKER,
+        from_type="system",
+        content="System blocker",
+        status="open",
+    ))
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["last_seen_at"] is None
+    # 3 questions + 1 blocker = 4 high-signal messages, all unread
+    assert attention["counts"]["unread"] == 4
+    # Every rendered message item should have unread=True
+    message_items = [item for item in attention["items"] if item["kind"] == "message"]
+    assert all(item["unread"] is True for item in message_items)
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_last_seen_boundary_exact_created_at_is_not_unread(
+    client: AsyncClient, db_session
+):
+    """Messages created exactly AT last_seen_at are NOT unread; only strictly after."""
+    project = await _make_project(db_session)
+    boundary_time = _utcnow()
+    exact_msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="agent",
+        content="Created exactly at boundary — should not be unread.",
+        status="open",
+        created_at=boundary_time,
+    )
+    after_msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="agent",
+        content="Created strictly after boundary — should be unread.",
+        status="open",
+        created_at=boundary_time + timedelta(seconds=1),
+    )
+    db_session.add_all([exact_msg, after_msg])
+    db_session.add(MessagesLastSeen(
+        user_id=TEST_USER_ID,
+        project_id=project.id,
+        last_seen_at=boundary_time,
+    ))
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    # Only after_msg is strictly after last_seen_at
+    assert attention["counts"]["unread"] == 1
+    items_by_msg_id = {
+        item["ref"]["id"]: item
+        for item in attention["items"]
+        if item["kind"] == "message"
+    }
+    assert items_by_msg_id[str(exact_msg.id)]["unread"] is False
+    assert items_by_msg_id[str(after_msg.id)]["unread"] is True
 
 
 @pytest.mark.asyncio

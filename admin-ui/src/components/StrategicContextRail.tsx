@@ -23,6 +23,7 @@ interface StrategicContextRailProps {
   onOpenRuntimeHealth: () => void;
   onOpenRuntimeDevices?: () => void;
   onOpenTask?: (taskId: string) => void;
+  onOpenMessages?: () => void;
 }
 
 function formatCost(value: number | undefined): string {
@@ -213,6 +214,7 @@ export function StrategicContextRail({
   onOpenRuntimeHealth,
   onOpenRuntimeDevices,
   onOpenTask,
+  onOpenMessages,
 }: StrategicContextRailProps) {
   const activeCycle = state?.strategic.active_cycle ?? null;
   const localRunner = state?.runtime?.local_runner ?? null;
@@ -254,6 +256,7 @@ export function StrategicContextRail({
     if (item.kind === 'direction') return () => onOpenProjectSection('directions');
     if (item.kind === 'alert' && item.task_id) return onOpenPipeline;
     if (item.kind === 'alert') return onOpenRuntimeHealth;
+    if (item.kind === 'message') return onOpenMessages ?? onOpenPipeline;
     return undefined;
   }
 

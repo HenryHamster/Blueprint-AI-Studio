@@ -1364,6 +1364,7 @@ export default function App() {
                     handleTabChange('runtime');
                   }}
                   onOpenTask={handleViewTaskById}
+                  onOpenMessages={() => handleTabChange('chat')}
                 />
                 <TaskContextRail
                   currentTask={openPipelineTask}
