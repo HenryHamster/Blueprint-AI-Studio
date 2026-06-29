@@ -699,3 +699,11 @@ async def ensure_current_ci_compliance(
         "data": stored,
         "computed": computed,
     }
+
+
+async def get_or_compute_ci_compliance(
+    project: "Project",
+    session: "AsyncSession",
+) -> dict[str, Any] | None:
+    """Backward-compatible wrapper for legacy callers."""
+    return await ensure_current_ci_compliance(session, project)

@@ -2501,7 +2501,6 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "summarize": _summarize_version_phase,
         "floor": _version_phase_floor,
     },
-    "ci_compliance": {"priority": "high"},
     # What is actually deployed (running live on the promotion target) vs what
     # has merged to the integration branch but is not yet promoted. High
     # priority: it is load-bearing for every runtime-metric judgment, and small.
@@ -2518,6 +2517,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "priority": "medium",
         "summarize": _summarize_efficiency_snapshot,
     },
+    # CI-compliance signal for the current integration branch HEAD: module-size
+    # guardrail breaches and branch-literal violations. Low priority — advisory
+    # signal that degrades before load-bearing state. Dropped whole under budget;
+    # full detail fetchable via ./fetch ci-compliance.
+    "ci_compliance": {"priority": "low"},
     # Held-directions block: directions that have hit the consecutive-failure
     # hold threshold. Low priority — purely observational planning context the
     # strategic agent reads to decide whether to refine/retire a stuck direction.
@@ -5279,6 +5283,16 @@ async def _spawn_strategic_review(
             }
     except Exception:
         logger.exception("[STRATEGIC] fleet utilization snapshot failed; continuing")
+    # CI-compliance signal: module-size + branch-literal guardrail status for the
+    # current integration branch HEAD.  Best-effort; None when GitHub credentials
+    # are unavailable (no GitHub repo configured) or the read fails.
+    _ci_compliance: dict | None = None
+    try:
+        from app.ci_compliance import get_or_compute_ci_compliance
+
+        _ci_compliance = await get_or_compute_ci_compliance(project, session)
+    except Exception:
+        logger.exception("[STRATEGIC] CI compliance check failed; continuing")
     # Held-directions block — directions that hit the consecutive-failure hold
     # threshold (3 consecutive CODE_ERROR failures; see
     # shared_state.record_direction_result). Surfaces the held flag, the
