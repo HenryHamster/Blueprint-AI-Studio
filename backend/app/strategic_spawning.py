@@ -4998,6 +4998,20 @@ async def _spawn_strategic_review(
                 logger.exception(
                     "[STRATEGIC] goal_coverage_drift fetch failed; continuing"
                 )
+            try:
+                if _open_version is not None:
+                    from app.acceptance_criteria import get_version_coverage_summary
+
+                    _coverage = await get_version_coverage_summary(
+                        session, _open_version.id
+                    )
+                    if _version_phase_block is None:
+                        _version_phase_block = {}
+                    _version_phase_block["criterion_coverage"] = _coverage
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] criterion_coverage fetch failed; continuing"
+                )
         except Exception:
             logger.exception("[STRATEGIC] version_phase block build failed; continuing")
     # Deployment-state block — only under an LTS split (integration branch !=

@@ -230,6 +230,7 @@ async def _serialize_version_history_entry(
     merged_count: Optional[int] = None
     merged_task_count: Optional[int] = None
     acceptance_aggregate: Optional[dict[str, Any]] = None
+    criterion_coverage: Optional[dict[str, Any]] = None
     if session is not None and project_id is not None:
         version_until = _closed_version_until(version)
         merged_count = await count_merged_since(
@@ -245,6 +246,17 @@ async def _serialize_version_history_entry(
             aggregate_serving_status=aggregate["serving_status"],
             acceptance_aggregate=acceptance_aggregate,
         )
+        try:
+            from app import acceptance_criteria as _acceptance_criteria  # noqa: PLC0415
+
+            criterion_coverage = await _acceptance_criteria.get_version_coverage_summary(
+                session, version.id
+            )
+        except Exception:
+            logger.exception(
+                "[VERSION_HISTORY] criterion coverage compute failed for version %s",
+                version.id,
+            )
 
     return {
         "id": str(version.id),
@@ -305,6 +317,7 @@ async def _serialize_version_history_entry(
         "merged_count": merged_count,
         "merged_task_count": merged_task_count,
         "acceptance_aggregate": acceptance_aggregate,
+        "criterion_coverage": criterion_coverage,
     }
 
 
@@ -524,6 +537,21 @@ async def get_version_lifecycle(
                     project_id,
                 )
 
+        criterion_coverage: Optional[Dict[str, Any]] = None
+        if open_row is not None:
+            try:
+                from app import acceptance_criteria as _acceptance_criteria  # noqa: PLC0415
+
+                criterion_coverage = await _acceptance_criteria.get_version_coverage_summary(
+                    session, open_row.id
+                )
+            except Exception:
+                logger.exception(
+                    "[VERSION_LIFECYCLE] criterion coverage compute failed "
+                    "for project %s; serving lifecycle without the signal",
+                    project_id,
+                )
+
         current_version_out: Optional[Dict[str, Any]] = None
         if open_row is not None:
             merged_count = await count_merged_since(
@@ -694,6 +722,12 @@ async def get_version_lifecycle(
                 # True when the version has more than _TASKS_MERGED_LIMIT merged
                 # tasks; the UI can show a "showing N of total" indicator.
                 "tasks_merged_has_more": tasks_merged_has_more,
+                # Version-scoped acceptance criterion coverage (additive; nullable
+                # when the signal could not be computed). Shape:
+                # {total, covered, partial, uncovered, criteria:[{criterion_key,
+                # text, coverage, evidence_count}]}. total=0 with empty criteria
+                # list when no criteria are defined.
+                "criterion_coverage": criterion_coverage,
             }
 
         history_rows = (

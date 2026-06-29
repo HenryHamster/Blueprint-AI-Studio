@@ -3316,3 +3316,157 @@ async def test_fetch_ci_compliance_rejects_cross_project(
         headers={"x-agent-token": token},
     )
     assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# criterion_coverage in version-phase endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_surfaces_criterion_coverage(
+    client: AsyncClient, db_session
+):
+    """version_phase endpoint includes criterion_coverage in current_version for
+    an open version that has acceptance criteria with recorded evidence.
+
+    Asserts: counts are accurate (covered/partial/uncovered), per-criterion
+    entries are present with the correct coverage classification and evidence
+    count, and backward-compat keys (goal_coverage_drift, recent_versions) are
+    still present.
+
+    Acceptance requirement: test_agent_fetch_version_phase_surfaces_criterion_coverage
+    must run green under a real merge-test verdict.
+    """
+    from app.acceptance_criteria import create_criterion, record_evidence
+
+    project = Project(name="CovTest", user_id="test-user-covtest")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-cov")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=10,
+        status="open",
+        opened_at=datetime(2026, 1, 1),
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create two criteria: one will be covered, one uncovered.
+    c_covered = await create_criterion(
+        db_session, project.id, version.id, "Ship the new auth layer"
+    )
+    c_uncovered = await create_criterion(
+        db_session, project.id, version.id, "Harden CI pipeline"
+    )
+
+    # Record a task_merge evidence for c_covered → classified 'covered'.
+    await record_evidence(
+        db_session,
+        c_covered.id,
+        project.id,
+        source_kind="task_merge",
+        source_id="pr-101",
+    )
+    # No evidence for c_uncovered → classified 'uncovered'.
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+
+    data = body["data"]
+    assert data["source"] == "open_version"
+    current = data["current_version"]
+    assert current is not None
+
+    # criterion_coverage must be present with correct scalar counts.
+    coverage = current.get("criterion_coverage")
+    assert coverage is not None, "criterion_coverage must be present for open version"
+    assert coverage["total"] == 2
+    assert coverage["covered"] == 1
+    assert coverage["partial"] == 0
+    assert coverage["uncovered"] == 1
+
+    # Per-criterion entries must be present and correctly classified.
+    criteria_list = coverage.get("criteria")
+    assert isinstance(criteria_list, list), "criteria list must be present"
+    assert len(criteria_list) == 2
+    by_key = {c["criterion_key"]: c for c in criteria_list}
+    assert by_key[c_covered.criterion_key]["coverage"] == "covered"
+    assert by_key[c_covered.criterion_key]["evidence_count"] == 1
+    assert by_key[c_uncovered.criterion_key]["coverage"] == "uncovered"
+    assert by_key[c_uncovered.criterion_key]["evidence_count"] == 0
+
+    # Backward-compat: existing top-level keys must remain present.
+    assert "goal_coverage_drift" in data
+    assert "recent_versions" in data
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_criterion_coverage_empty_degrades_gracefully(
+    client: AsyncClient, db_session
+):
+    """version_phase endpoint returns criterion_coverage with zero counts and an
+    empty criteria list when the open version has no acceptance criteria at all.
+    The endpoint must not raise an error."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-cov-empty"
+    )
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+
+    data = body["data"]
+    assert data["source"] == "open_version"
+    current = data["current_version"]
+    assert current is not None
+
+    # With no criteria rows the summary is all zeros and empty list — not an error.
+    coverage = current.get("criterion_coverage")
+    assert coverage is not None, "criterion_coverage present even with no criteria"
+    assert coverage["total"] == 0
+    assert coverage["covered"] == 0
+    assert coverage["partial"] == 0
+    assert coverage["uncovered"] == 0
+    assert coverage.get("criteria") == []
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_criterion_coverage_absent_when_no_open_version(
+    client: AsyncClient, db_session
+):
+    """When there is no open version, current_version is None and criterion_coverage
+    is absent from the response (no errors, source=no_open_version)."""
+    project, task = await _make_project_task(db_session, vm="agent-vm-cov-noversion")
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    data = body["data"]
+    assert data["source"] == "no_open_version"
+    assert data["current_version"] is None
+    # criterion_coverage is absent when there is no open version.
+    assert "criterion_coverage" not in (data.get("current_version") or {})

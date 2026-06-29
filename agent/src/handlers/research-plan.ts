@@ -718,6 +718,52 @@ function formatQualificationDetails(qualification: Record<string, unknown>): str
   return lines;
 }
 
+function formatCriterionCoverage(versionPhase: Record<string, unknown>): string[] {
+  const coverageRaw = versionPhase.criterion_coverage;
+  if (!coverageRaw || typeof coverageRaw !== 'object' || Array.isArray(coverageRaw)) return [];
+
+  const coverage = coverageRaw as Record<string, unknown>;
+  const total = typeof coverage.total === 'number' ? coverage.total : null;
+  const covered = typeof coverage.covered === 'number' ? coverage.covered : null;
+  const partial = typeof coverage.partial === 'number' ? coverage.partial : null;
+  const uncovered = typeof coverage.uncovered === 'number' ? coverage.uncovered : null;
+  if (total === null || total <= 0 || covered === null || partial === null || uncovered === null) return [];
+
+  const lines = [
+    `**Acceptance criteria coverage (canonical): ${covered}/${total} covered, ${partial} partial, ${uncovered} uncovered.**`,
+    `Canonical release-readiness path: close uncovered and partial acceptance criteria with evidence; legacy goal/proven heuristics below are secondary context only.`,
+  ];
+
+  if (Array.isArray(coverage.criteria)) {
+    const criteriaLines: string[] = [];
+    for (const item of coverage.criteria) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const criterion = item as Record<string, unknown>;
+      const criterionCoverage = typeof criterion.coverage === 'string' ? criterion.coverage.trim() : '';
+      if (criterionCoverage !== 'uncovered' && criterionCoverage !== 'partial') continue;
+
+      const key = typeof criterion.criterion_key === 'string' && criterion.criterion_key.trim()
+        ? criterion.criterion_key.trim()
+        : null;
+      const text = typeof criterion.text === 'string' && criterion.text.trim()
+        ? criterion.text.trim()
+        : null;
+      if (!key || !text) continue;
+
+      const evidenceCount = typeof criterion.evidence_count === 'number'
+        ? `, evidence=${criterion.evidence_count}`
+        : '';
+      criteriaLines.push(`  - ${key}: ${criterionCoverage}${evidenceCount} — ${text}`);
+    }
+    if (criteriaLines.length > 0) {
+      lines.push(`Acceptance criteria needing evidence:`);
+      lines.push(...criteriaLines);
+    }
+  }
+
+  return lines;
+}
+
 /**
  * Builds the version-phase status block for the strategic thinker prompt.
  * Explains the current phase, what each phase means, and instructs the agent
@@ -772,6 +818,7 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   if (tasksMergedThisVersion !== null) {
     parts.push(`Tasks merged this version: ${tasksMergedThisVersion}`);
   }
+  parts.push(...formatCriterionCoverage(versionPhase));
   if (lastQualification) {
     // Compact one-line summary: status, then confidence / candidate_sha /
     // blocker when present. Keeps the prompt small while surfacing whether a
@@ -823,7 +870,7 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
       if (typeof drift.merges_since_grade === 'number') driftBits.push(`merges_since_grade=${drift.merges_since_grade}`);
       if (drift.stale === true) driftBits.push(`stale=true`);
       const driftDetail = typeof drift.detail === 'string' && drift.detail ? drift.detail : null;
-      const driftLine = `Goal-coverage drift: ${driftBits.join(', ')}`;
+      const driftLine = `Legacy heuristic - Goal-coverage drift: ${driftBits.join(', ')}`;
       if (driftSignal === 'drifting') {
         parts.push(`**${driftLine}** ← accumulated work diverging from version goal; course-correct or propose a goal amendment before qualification deadlock`);
       } else {
@@ -844,7 +891,7 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
         if (typeof ga.coverage === 'number') gaBits.push(`coverage=${ga.coverage}`);
         if (typeof ga.biggest_gap === 'string' && ga.biggest_gap) gaBits.push(`biggest_gap=${ga.biggest_gap}`);
         if (typeof ga.goal_alignment === 'string' && ga.goal_alignment) gaBits.push(`alignment=${ga.goal_alignment}`);
-        parts.push(`Last qualification goal alignment: ${gaBits.join(', ')}`);
+        parts.push(`Legacy heuristic - Last qualification goal alignment: ${gaBits.join(', ')}`);
       }
     }
   }
@@ -934,7 +981,7 @@ If you decide to flip the phase, emit a \`version_phase_decision\` field in your
 If you are staying in the current phase, do NOT emit \`version_phase_decision\` — omitting it means "no change."
 
 **Requesting qualification (stabilize only):**
-When the version is in **stabilize** and you judge it ready for release — hardening is sufficient, known issues are addressed, and the qualification criteria look achievable — request qualification. The orchestrator then snapshots the integration branch and runs the automated release qualifier (CI, test-erosion, audit, smoketest). Emit a \`qualify_request\` field in your Section 6 problem_model update (a top-level JSON field alongside the model):
+When the version is in **stabilize** and you judge it ready for release — hardening is sufficient, known issues are addressed, and the canonical acceptance criteria above are covered or have a credible closure path — request qualification. Treat uncovered or partial acceptance criteria as the primary release-readiness work queue; legacy goal-alignment and drift heuristics are secondary context. The orchestrator then snapshots the integration branch and runs the automated release qualifier (CI, test-erosion, audit, smoketest). Emit a \`qualify_request\` field in your Section 6 problem_model update (a top-level JSON field alongside the model):
 \`\`\`json
 {
   "qualify_request": {

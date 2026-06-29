@@ -14,6 +14,7 @@ _VERSION_PHASE_RECENT_VERSIONS_CAP = 3
 _VERSION_PHASE_RECENT_VERSIONS_FLOOR_CAP = 2
 _VERSION_PHASE_TEXT_CAP = 500
 _VERSION_PHASE_TEXT_FLOOR_CAP = 240
+_VERSION_PHASE_CRITERIA_CAP = 20
 _DIRECTION_SUMMARY_TEXT_CAP = 260
 _DIRECTION_SUMMARY_LONG_TEXT_CAP = 420
 _DIRECTION_SUMMARY_LIST_CAP = 3
@@ -411,6 +412,19 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
     drift = _compact_scalar_mapping(block.get("goal_coverage_drift"), text_cap=text_cap)
     if drift:
         out["goal_coverage_drift"] = drift
+    coverage = block.get("criterion_coverage")
+    if isinstance(coverage, dict):
+        compact_coverage: dict[str, Any] = {}
+        for key in ("total", "covered", "partial", "uncovered"):
+            if key in coverage:
+                compact_coverage[key] = coverage[key]
+        if not floor:
+            # Normal path: include per-criterion list capped to bounded length.
+            criteria = coverage.get("criteria")
+            if isinstance(criteria, list):
+                compact_coverage["criteria"] = criteria[:_VERSION_PHASE_CRITERIA_CAP]
+        if compact_coverage:
+            out["criterion_coverage"] = compact_coverage
     for key in (
         "last_qualification_candidate_currency",
         "stabilize_stall",

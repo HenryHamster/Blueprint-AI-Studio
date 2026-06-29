@@ -1956,6 +1956,116 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('Do NOT rush to qualify');
   });
 
+  it('renders criterion coverage counts and uncovered/partial criteria as the canonical acceptance contract', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      criterion_coverage: {
+        total: 7,
+        covered: 3,
+        partial: 2,
+        uncovered: 2,
+        criteria: [
+          {
+            criterion_key: 'AC-1',
+            text: 'Release qualifier consumes per-criterion evidence.',
+            coverage: 'covered',
+            evidence_count: 4,
+          },
+          {
+            criterion_key: 'AC-2',
+            text: 'Strategist can see uncovered acceptance criteria.',
+            coverage: 'partial',
+            evidence_count: 1,
+          },
+          {
+            criterion_key: 'AC-3',
+            text: 'Qualification blocks on missing canonical evidence.',
+            coverage: 'uncovered',
+            evidence_count: 0,
+          },
+        ],
+      },
+    });
+
+    expect(result).toContain('Acceptance criteria coverage (canonical): 3/7 covered, 2 partial, 2 uncovered');
+    expect(result).toContain('Canonical release-readiness path: close uncovered and partial acceptance criteria with evidence');
+    expect(result).toContain('Acceptance criteria needing evidence:');
+    expect(result).toContain('AC-2: partial, evidence=1 — Strategist can see uncovered acceptance criteria.');
+    expect(result).toContain('AC-3: uncovered, evidence=0 — Qualification blocks on missing canonical evidence.');
+    expect(result).not.toContain('AC-1: covered');
+  });
+
+  it('renders counts-only criterion coverage without requiring a criteria list', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'build',
+      criterion_coverage: {
+        total: 4,
+        covered: 1,
+        partial: 1,
+        uncovered: 2,
+      },
+    });
+
+    expect(result).toContain('Acceptance criteria coverage (canonical): 1/4 covered, 1 partial, 2 uncovered');
+    expect(result).not.toContain('Acceptance criteria needing evidence:');
+  });
+
+  it('omits absent, zero-total, and malformed criterion coverage without crashing', () => {
+    const absent = buildVersionPhaseSection({ version_number: 5, phase: 'build' });
+    const zeroTotal = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'build',
+      criterion_coverage: {
+        total: 0,
+        covered: 0,
+        partial: 0,
+        uncovered: 0,
+      },
+    });
+    const malformed = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'build',
+      criterion_coverage: {
+        total: 3,
+        covered: '1',
+        partial: 1,
+        uncovered: 1,
+      },
+    });
+
+    expect(absent).not.toContain('Acceptance criteria coverage');
+    expect(zeroTotal).not.toContain('Acceptance criteria coverage');
+    expect(malformed).not.toContain('Acceptance criteria coverage');
+  });
+
+  it('renders criterion coverage before legacy drift and goal-alignment signals', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'build',
+      criterion_coverage: {
+        total: 3,
+        covered: 1,
+        partial: 1,
+        uncovered: 1,
+      },
+      goal_coverage_drift: {
+        signal: 'drifting',
+        coverage: 0.45,
+      },
+      last_qualification: {
+        status: 'not_promoted',
+        goal_alignment: {
+          status: 'partial',
+        },
+      },
+    });
+
+    expect(result.indexOf('Acceptance criteria coverage (canonical)')).toBeLessThan(result.indexOf('Legacy heuristic - Goal-coverage drift'));
+    expect(result.indexOf('Acceptance criteria coverage (canonical)')).toBeLessThan(result.indexOf('Legacy heuristic - Last qualification goal alignment'));
+  });
+
   it('renders a drifting goal_coverage_drift signal with emphasis and biggest_gap', () => {
     const result = buildVersionPhaseSection({
       version_number: 5,
@@ -1973,6 +2083,7 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('biggest_gap=feature Y not covered');
     expect(result).toContain('merges_since_grade=3');
     expect(result).toContain('stale=true');
+    expect(result).toContain('Legacy heuristic - Goal-coverage drift');
     expect(result).toContain('course-correct or propose a goal amendment');
     expect(result).toContain('Drift detail: Accumulated work deviates from frozen goal');
   });
@@ -1990,6 +2101,7 @@ describe('buildVersionPhaseSection', () => {
       },
     });
     expect(result).toContain('Goal-coverage drift: signal=on_track');
+    expect(result).toContain('Legacy heuristic - Goal-coverage drift');
     expect(result).not.toContain('course-correct or propose a goal amendment');
   });
 
@@ -2021,6 +2133,7 @@ describe('buildVersionPhaseSection', () => {
       },
     });
     expect(result).toContain('Last qualification goal alignment: status=partial');
+    expect(result).toContain('Legacy heuristic - Last qualification goal alignment');
     expect(result).toContain('coverage=0.6');
     expect(result).toContain('biggest_gap=feature Y not shipped');
   });

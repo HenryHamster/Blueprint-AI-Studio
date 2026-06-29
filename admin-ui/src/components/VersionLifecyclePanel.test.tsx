@@ -3598,6 +3598,84 @@ describe('VersionLifecyclePanel', () => {
 
       expect(screen.queryByTestId('changelog-toggle')).not.toBeInTheDocument();
     });
+
+    it('renders criterion coverage panel with each criterion when criterion_coverage has criteria', async () => {
+      const coverage: api.VersionCriterionCoverage = {
+        total: 3,
+        covered: 1,
+        partial: 1,
+        uncovered: 1,
+        criteria: [
+          { criterion_key: 'k1', text: 'Must pass all tests', coverage: 'covered', evidence_count: 2 },
+          { criterion_key: 'k2', text: 'Performance within budget', coverage: 'partial', evidence_count: 1 },
+          { criterion_key: 'k3', text: 'Security audit complete', coverage: 'uncovered', evidence_count: 0 },
+        ],
+      };
+      const TASKS: api.ChangelogEntry[] = [
+        { task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null },
+      ];
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: coverage,
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+      expect(await screen.findByTestId('criterion-coverage-panel')).toBeInTheDocument();
+      expect(screen.getByText('Must pass all tests')).toBeInTheDocument();
+      expect(screen.getByText('Performance within budget')).toBeInTheDocument();
+      expect(screen.getByText('Security audit complete')).toBeInTheDocument();
+      expect(screen.getByTestId('criterion-row-k1')).toBeInTheDocument();
+      expect(screen.getByTestId('criterion-row-k2')).toBeInTheDocument();
+      expect(screen.getByTestId('criterion-row-k3')).toBeInTheDocument();
+    });
+
+    it('does not render criterion coverage panel when criterion_coverage is null', async () => {
+      const TASKS: api.ChangelogEntry[] = [
+        { task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null },
+      ];
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: null,
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+      await screen.findByTestId('version-summary-panel');
+      expect(screen.queryByTestId('criterion-coverage-panel')).not.toBeInTheDocument();
+    });
+
+    it('does not render criterion coverage panel when criterion_coverage is absent', async () => {
+      const TASKS: api.ChangelogEntry[] = [
+        { task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null },
+      ];
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+      await screen.findByTestId('version-summary-panel');
+      expect(screen.queryByTestId('criterion-coverage-panel')).not.toBeInTheDocument();
+    });
   });
 
   describe('smoketest disabled indicator', () => {

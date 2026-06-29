@@ -2,21 +2,25 @@
 # Read-only context fetch tool — pull full detail for items shipped trimmed,
 # summarized, or only by reference. Reads ORCHESTRATOR_URL, AGENT_API_TOKEN from
 # env. project_id is baked in. All endpoints are GET (strictly read-only).
-KIND="${1:?Usage: fetch direction|playbook|section|knowledge|qualification|ci-compliance [id]}"
+KIND="${1:?Usage: fetch problem-model|direction|playbook|gap|message|section|knowledge|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance [id]}"
 ID="${2:-}"
 API="${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 PROJECT="37d445e1-0775-4403-bacf-1cd7ed129336"
 [ -n "$PROJECT" ] || { echo "[ERROR] no project_id available; ./fetch is unavailable in this workspace" >&2; exit 1; }
 
-# problem-model, qualification, ci-compliance, version-phase, vm-cost, and efficiency-snapshot
-# take no id; everything else requires one. For "message" the id may be a short
+# problem-model, compute-sweeps, qualification, version-phase, vm-cost,
+# efficiency-snapshot, and ci-compliance take no id; everything else requires
+# one. compute-sweeps accepts an optional sweep_id. For "message" the id may be a short
 # ref (first 8+ hex chars of the message UUID — the same ref operators see in
 # the admin UI) or a full UUID; the backend resolves it and fails loudly on
 # ambiguous/missing refs.
 case "$KIND" in
+  problem-model) PATH_SUFFIX="problem-model" ;;
   direction)  PATH_SUFFIX="directions/$ID" ;;
   playbook)   PATH_SUFFIX="playbook/$ID" ;;
+  gap)        PATH_SUFFIX="gaps/$ID" ;;
+  message)    PATH_SUFFIX="messages/$ID" ;;
   section)    PATH_SUFFIX="design-doc/$ID" ;;
   knowledge)
     shift
@@ -47,13 +51,16 @@ case "$KIND" in
     echo "[ERROR] fetch knowledge failed (HTTP $kcode)" >&2
     exit 1
     ;;
+  compute-sweeps) PATH_SUFFIX="compute-sweeps${ID:+/$ID}" ;;
   qualification) PATH_SUFFIX="qualification" ;;
+  version-phase) PATH_SUFFIX="version-phase" ;;
+  vm-cost) PATH_SUFFIX="vm-cost" ;;
+  efficiency-snapshot) PATH_SUFFIX="efficiency-snapshot" ;;
   ci-compliance) PATH_SUFFIX="ci-compliance" ;;
-  problem-model|gap|message|version-phase|vm-cost|efficiency-snapshot) echo "Error: ./fetch '$KIND' is not permitted in this workspace (allowed: direction|playbook|section|knowledge|qualification)." >&2; exit 1 ;;
-  *) echo "Unknown kind: $KIND (use direction|playbook|section|knowledge|qualification|ci-compliance)" >&2; exit 1 ;;
+  *) echo "Unknown kind: $KIND (use problem-model|direction|playbook|gap|message|section|knowledge|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance)" >&2; exit 1 ;;
 esac
 
-if [ "$KIND" != "problem-model" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ -z "$ID" ]; then
+if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ -z "$ID" ]; then
   echo "[ERROR] fetch $KIND requires an id argument" >&2
   exit 1
 fi

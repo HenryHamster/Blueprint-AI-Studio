@@ -6110,6 +6110,100 @@ async def test_version_phase_block_carries_goal_coverage_drift(
 
 
 @pytest.mark.asyncio
+async def test_version_phase_block_carries_criterion_coverage(
+    db_session, mocker, _lts_split_active
+):
+    """The initial strategic payload carries criterion_coverage for the open
+    version and the signal survives version_phase compaction/floor trimming."""
+    from datetime import datetime
+
+    from app import acceptance_criteria as ac
+    from app.models import ReleaseVersion
+    from app.strategic_payload_compaction import (
+        _summarize_version_phase,
+        _version_phase_floor,
+    )
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.utcnow().replace(tzinfo=None)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        phase="build",
+        status="open",
+        opened_at=now,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    c_covered = await ac.create_criterion(
+        db_session, project.id, version.id, "Ship the new auth layer"
+    )
+    c_partial = await ac.create_criterion(
+        db_session, project.id, version.id, "Harden CI pipeline"
+    )
+    c_uncovered = await ac.create_criterion(
+        db_session, project.id, version.id, "Document the rollout"
+    )
+    await ac.record_evidence(
+        db_session,
+        criterion_id=c_covered.id,
+        project_id=project.id,
+        source_kind="task_merge",
+        source_id="pr-101",
+    )
+    await ac.record_evidence(
+        db_session,
+        criterion_id=c_partial.id,
+        project_id=project.id,
+        source_kind="operator",
+        source_id="note-7",
+    )
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    vp = payload.get("version_phase")
+    assert vp is not None, "version_phase block should be present"
+    coverage = vp.get("criterion_coverage")
+    assert coverage is not None, "criterion_coverage should be present in version_phase"
+    assert coverage["total"] == 3
+    assert coverage["covered"] == 1
+    assert coverage["partial"] == 1
+    assert coverage["uncovered"] == 1
+    by_key = {entry["criterion_key"]: entry for entry in coverage["criteria"]}
+    assert by_key[c_covered.criterion_key]["coverage"] == "covered"
+    assert by_key[c_partial.criterion_key]["coverage"] == "partial"
+    assert by_key[c_uncovered.criterion_key]["coverage"] == "uncovered"
+
+    normal = _summarize_version_phase(vp)
+    assert normal["criterion_coverage"]["total"] == 3
+    assert len(normal["criterion_coverage"]["criteria"]) == 3
+
+    floor = _version_phase_floor(vp)
+    assert floor["criterion_coverage"]["total"] == 3
+    assert "criteria" not in floor["criterion_coverage"]
+
+
+@pytest.mark.asyncio
 async def test_version_phase_recent_versions_use_aggregate_pending_truth(
     db_session, mocker, _lts_split_active
 ):

@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import secrets
 import uuid
+from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
 from sqlmodel import select
@@ -148,13 +149,32 @@ async def get_version_coverage_summary(
             ],
         }
     """
-    criteria = await get_criteria_for_version(session, release_version_id)
-
     counts: dict[str, int] = {"covered": 0, "partial": 0, "uncovered": 0}
     criteria_detail = []
 
-    for criterion in criteria:
-        evidence = await get_evidence_for_criterion(session, criterion.id)
+    result = await session.execute(
+        select(VersionAcceptanceCriterion, CriterionEvidence)
+        .outerjoin(
+            CriterionEvidence,
+            CriterionEvidence.criterion_id == VersionAcceptanceCriterion.id,
+        )
+        .where(VersionAcceptanceCriterion.release_version_id == release_version_id)
+        .order_by(VersionAcceptanceCriterion.created_at, CriterionEvidence.recorded_at)
+    )
+
+    criteria_in_order: list[VersionAcceptanceCriterion] = []
+    evidence_by_criterion: dict[uuid.UUID, list[CriterionEvidence]] = defaultdict(list)
+    seen_criteria: set[uuid.UUID] = set()
+
+    for criterion, evidence in result.all():
+        if criterion.id not in seen_criteria:
+            seen_criteria.add(criterion.id)
+            criteria_in_order.append(criterion)
+        if evidence is not None:
+            evidence_by_criterion[criterion.id].append(evidence)
+
+    for criterion in criteria_in_order:
+        evidence = evidence_by_criterion.get(criterion.id, [])
         coverage = compute_criterion_coverage(evidence)
         counts[coverage] += 1
         criteria_detail.append(
@@ -167,7 +187,7 @@ async def get_version_coverage_summary(
         )
 
     return {
-        "total": len(criteria),
+        "total": len(criteria_in_order),
         "covered": counts["covered"],
         "partial": counts["partial"],
         "uncovered": counts["uncovered"],

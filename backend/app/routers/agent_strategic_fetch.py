@@ -587,15 +587,37 @@ async def agent_fetch_version_phase(
                 project_id,
             )
 
+    # Criterion coverage for the open version (ADDITIVE). Best-effort: failure
+    # degrades to criterion_coverage absent from current_version without breaking
+    # the read. Gives the agent the canonical per-criterion coverage ledger when
+    # the spawn payload was trimmed or dropped under budget pressure.
+    version_phase_criterion_coverage: dict | None = None
+    if open_row is not None:
+        try:
+            from app.acceptance_criteria import (  # noqa: PLC0415
+                get_version_coverage_summary,
+            )
+
+            version_phase_criterion_coverage = await get_version_coverage_summary(
+                session, open_row.id
+            )
+        except Exception:
+            logger.exception(
+                "[AGENT_FETCH] criterion_coverage compute failed for project %s",
+                project_id,
+            )
+
+    _current_version_data = (
+        _compact_version_lifecycle(open_row, project) if open_row is not None else None
+    )
+    if _current_version_data is not None and version_phase_criterion_coverage is not None:
+        _current_version_data["criterion_coverage"] = version_phase_criterion_coverage
+
     return {
         "status": "success",
         "data": {
             "source": "open_version" if open_row is not None else "no_open_version",
-            "current_version": (
-                _compact_version_lifecycle(open_row, project)
-                if open_row is not None
-                else None
-            ),
+            "current_version": _current_version_data,
             "recent_versions": [
                 _compact_version_lifecycle(row, project) for row in recent_closed_rows
             ],

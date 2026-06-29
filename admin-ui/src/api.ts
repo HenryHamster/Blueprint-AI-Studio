@@ -2234,6 +2234,21 @@ export interface ChangelogEntry {
   pr_url?: string | null;
 }
 
+export interface CriterionCoverageEntry {
+  criterion_key: string;
+  text: string;
+  coverage: 'covered' | 'partial' | 'uncovered';
+  evidence_count: number;
+}
+
+export interface VersionCriterionCoverage {
+  total: number;
+  covered: number;
+  partial: number;
+  uncovered: number;
+  criteria: CriterionCoverageEntry[];
+}
+
 export interface CurrentVersion {
   version_number: number;
   phase: string;
@@ -2310,6 +2325,8 @@ export interface CurrentVersion {
   tasks_merged_has_more?: boolean;
   /** Acceptance-criteria bucket counts for all merged tasks in this version. */
   acceptance_aggregate?: Record<string, number> | null;
+  /** Version-scoped criterion coverage derived from the canonical acceptance contract. */
+  criterion_coverage?: VersionCriterionCoverage | null;
 }
 
 export interface RecentVersion {
@@ -2349,6 +2366,8 @@ export interface RecentVersion {
   merged_count?: number | null;
   merged_task_count?: number | null;
   acceptance_aggregate?: Record<string, number> | null;
+  /** Version-scoped criterion coverage derived from the canonical acceptance contract. */
+  criterion_coverage?: VersionCriterionCoverage | null;
 }
 
 export interface PromotionReadinessConfidence {
