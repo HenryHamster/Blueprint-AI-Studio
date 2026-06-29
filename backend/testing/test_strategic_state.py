@@ -543,6 +543,96 @@ async def test_operator_attention_surfaces_bug_and_feedback_as_watch_items(
 
 
 @pytest.mark.asyncio
+async def test_operator_attention_blocked_approval_task_counted_once(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    blocked_approval_task = Task(
+        project_id=project.id,
+        title="Blocked but needs approval",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.BLOCKED,
+        requires_approval=True,
+        blocked_reason="Waiting for approval",
+    )
+    parked_approval_task = Task(
+        project_id=project.id,
+        title="Parked but needs approval",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.PARKED,
+        requires_approval=True,
+        park_reason="Approval pending",
+    )
+    regular_approval_task = Task(
+        project_id=project.id,
+        title="Regular approval task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=True,
+    )
+    db_session.add_all(
+        [blocked_approval_task, parked_approval_task, regular_approval_task]
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["approvals"] == 1
+    assert attention["counts"]["blocked_tasks"] == 1
+    assert attention["counts"]["parked_tasks"] == 1
+    assert attention["counts"]["needs_operator"] == 1
+    assert attention["counts"]["watch"] == 2
+
+    item_ids = {item["id"] for item in attention["items"]}
+    assert f"task:{regular_approval_task.id}:approval_required" in item_ids
+    assert f"task:{blocked_approval_task.id}:blocked_task" in item_ids
+    assert f"task:{parked_approval_task.id}:parked_task" in item_ids
+
+    assert f"task:{blocked_approval_task.id}:approval_required" not in item_ids
+    assert f"task:{parked_approval_task.id}:approval_required" not in item_ids
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_first_visit_all_messages_unread(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    first_visit_message = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="agent",
+        content="Does the operator need to review this on first visit?",
+        status="open",
+    )
+    context_direction = {
+        "id": "d-context",
+        "text": "Direction inherited manual intervention from its context.",
+        "priority": "critical",
+        "status": "active",
+        "context": {"needs_manual_intervention": True},
+    }
+    project.directions = [*(project.directions or []), context_direction]
+    db_session.add(project)
+    db_session.add(first_visit_message)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+    item_ids = {item["id"] for item in attention["items"]}
+
+    assert attention["last_seen_at"] is None
+    assert attention["counts"]["unread"] == 1
+    assert f"message:{first_visit_message.id}" in item_ids
+    assert "direction:d-context:manual_intervention" in item_ids
+    assert next(
+        item for item in attention["items"] if item["id"] == f"message:{first_visit_message.id}"
+    )["unread"] is True
+
+
+@pytest.mark.asyncio
 async def test_admin_messages_accepts_linked_status_filter(
     client: AsyncClient, db_session
 ):

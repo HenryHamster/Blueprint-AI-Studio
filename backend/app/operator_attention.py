@@ -9,7 +9,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import func
+from sqlalchemy import and_, case, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -41,6 +41,12 @@ _LIVE_TASK_STATUSES = (
     TaskStatus.BLOCKED,
     TaskStatus.PARKED,
 )
+_APPROVAL_TASK_STATUSES = (
+    TaskStatus.QUEUED,
+    TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
+)
 _MAX_ATTENTION_ITEMS = 8
 _ACTIONABLE_ALERT_SEVERITIES = (AlertSeverity.ERROR, AlertSeverity.WARNING)
 
@@ -62,7 +68,9 @@ def _direction_manual_intervention(direction: Any) -> bool:
     if direction.get("needs_manual_intervention") is True:
         return True
     context = direction.get("context")
-    return isinstance(context, dict) and context.get("needs_manual_intervention") is True
+    if not isinstance(context, dict):
+        return False
+    return context.get("needs_manual_intervention") is True
 
 
 def _direction_priority(direction: dict[str, Any]) -> int:
@@ -276,27 +284,44 @@ async def build_operator_attention(
         if message.message_type in (MessageType.BUG_REPORT, MessageType.FEEDBACK)
     ]
 
-    async def _count_tasks(*filters: Any) -> int:
-        return int(
-            (
-                await session.execute(
-                    select(func.count()).select_from(Task).where(
-                        Task.project_id == project.id,
-                        Task.archived.is_(False),
-                        *filters,
-                    )
-                )
-            ).scalar()
-            or 0
+    task_count_result = (
+        await session.execute(
+            select(
+                func.sum(case(
+                    (
+                        and_(
+                            Task.requires_approval.is_(True),
+                            Task.status.in_(list(_APPROVAL_TASK_STATUSES)),
+                        ),
+                        1,
+                    ),
+                    else_=0,
+                )).label("approval"),
+                func.sum(case(
+                    (Task.status == TaskStatus.FAILED, 1),
+                    else_=0,
+                )).label("failed"),
+                func.sum(case(
+                    (Task.status == TaskStatus.BLOCKED, 1),
+                    else_=0,
+                )).label("blocked"),
+                func.sum(case(
+                    (Task.status == TaskStatus.PARKED, 1),
+                    else_=0,
+                )).label("parked"),
+            )
+            .select_from(Task)
+            .where(
+                Task.project_id == project.id,
+                Task.archived.is_(False),
+            )
         )
+    ).one()
 
-    approval_count = await _count_tasks(
-        Task.requires_approval.is_(True),
-        Task.status.in_(list(_LIVE_TASK_STATUSES)),
-    )
-    failed_count = await _count_tasks(Task.status == TaskStatus.FAILED)
-    blocked_count = await _count_tasks(Task.status == TaskStatus.BLOCKED)
-    parked_count = await _count_tasks(Task.status == TaskStatus.PARKED)
+    approval_count = int(task_count_result.approval or 0)
+    failed_count = int(task_count_result.failed or 0)
+    blocked_count = int(task_count_result.blocked or 0)
+    parked_count = int(task_count_result.parked or 0)
 
     alert_count_rows = (
         await session.execute(
@@ -323,7 +348,7 @@ async def build_operator_attention(
                     Task.project_id == project.id,
                     Task.archived.is_(False),
                     Task.requires_approval.is_(True),
-                    Task.status.in_(list(_LIVE_TASK_STATUSES)),
+                    Task.status.in_(list(_APPROVAL_TASK_STATUSES)),
                 )
                 .order_by(Task.priority.asc(), Task.created_at.asc())
                 .limit(4)
