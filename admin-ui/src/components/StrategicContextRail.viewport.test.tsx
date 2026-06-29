@@ -114,6 +114,32 @@ const STATE: StrategicStateResponse = {
       },
     ],
   },
+  context_package: {
+    id: 'strategic-context:proj-1',
+    title: 'Strategic context',
+    status: 'ready',
+    updated_at: '2026-06-29T01:10:00Z',
+    token_count: null,
+    item_count: 41,
+    sources: [
+      { kind: 'running_update', count: 1 },
+      { kind: 'problem_model', count: 9 },
+      { kind: 'directions', count: 2 },
+      { kind: 'tasks', count: 29 },
+    ],
+    canvas: {
+      id: 'strategic-canvas:proj-1',
+      title: 'Strategic context map',
+      kind: 'strategic_context',
+      node_count: null,
+    },
+    drilldowns: [
+      { id: 'running_update', label: 'Update', target: { surface: 'project', section: 'running-update' } },
+      { id: 'problem_model', label: 'Model', target: { surface: 'project', section: 'problem-model' } },
+      { id: 'pipeline', label: 'Pipeline', target: { surface: 'pipeline' } },
+      { id: 'runtime', label: 'Runtime', target: { surface: 'runtime', section: 'health' } },
+    ],
+  },
   design: { has_design_doc: true, revision: 5 },
 };
 

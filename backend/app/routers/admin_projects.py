@@ -282,6 +282,144 @@ def _running_update_summary(project: Project) -> Dict[str, Any]:
     }
 
 
+def _isoformat_source_time(value: Any) -> str | None:
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    text = _compact_text(value, max_chars=80)
+    return text
+
+
+def _context_source(kind: str, count: int) -> Dict[str, Any] | None:
+    if count <= 0:
+        return None
+    return {"kind": kind, "count": int(count)}
+
+
+def _strategic_context_package_summary(
+    project: Project,
+    *,
+    active_cycle: Dict[str, Any] | None,
+    active_task: Task | None,
+    latest_cycle: StrategicCycle | None,
+    running_update: Dict[str, Any],
+    problem_model: Dict[str, Any],
+    directions: Dict[str, Any],
+    message_counts: Dict[str, int],
+    task_counts: Dict[str, int],
+    attention: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    """Describe the current Strategic context without embedding large source docs."""
+
+    attention_counts = (
+        attention.get("counts", {}) if isinstance(attention, dict) else {}
+    )
+    model_count = (
+        int(problem_model.get("active_gap_count") or 0)
+        + int(problem_model.get("capability_count") or 0)
+        + int(problem_model.get("pending_confirmation_count") or 0)
+    )
+    attention_count = int(attention_counts.get("needs_operator") or 0) + int(
+        attention_counts.get("watch") or 0
+    )
+    sources = [
+        source
+        for source in [
+            _context_source(
+                "running_update",
+                1 if running_update.get("char_count") else 0,
+            ),
+            _context_source("problem_model", model_count),
+            _context_source("directions", int(directions.get("active_count") or 0)),
+            _context_source(
+                "messages",
+                int(message_counts.get("open") or 0)
+                + int(message_counts.get("linked") or 0),
+            ),
+            _context_source("tasks", int(task_counts.get("total") or 0)),
+            _context_source("attention", attention_count),
+            _context_source("design", 1 if project.design_doc else 0),
+        ]
+        if source is not None
+    ]
+    source_item_count = sum(int(source["count"]) for source in sources)
+    title = (
+        problem_model.get("current_focus")
+        or problem_model.get("purpose")
+        or ((directions.get("primary") or {}).get("text") if directions else None)
+        or project.name
+    )
+    active_stale = bool(active_cycle and active_cycle.get("stale"))
+    status = (
+        "stale"
+        if active_stale
+        else "building"
+        if active_task is not None
+        or bool((project.vision or {}).get("_strategic_refresh"))
+        else "ready"
+    )
+    latest_time = (
+        _isoformat_source_time(active_task.updated_at if active_task else None)
+        or _isoformat_source_time(active_task.started_at if active_task else None)
+        or _isoformat_source_time(latest_cycle.completed_at if latest_cycle else None)
+        or _isoformat_source_time(problem_model.get("last_updated"))
+        or _isoformat_source_time(project.created_at)
+    )
+    drilldowns = [
+        {
+            "id": "running_update",
+            "label": "Update",
+            "target": {"surface": "project", "section": "running-update"},
+        },
+        {
+            "id": "problem_model",
+            "label": "Model",
+            "target": {"surface": "project", "section": "problem-model"},
+        },
+        {
+            "id": "directions",
+            "label": "Directions",
+            "target": {"surface": "project", "section": "directions"},
+        },
+        {
+            "id": "pipeline",
+            "label": "Pipeline",
+            "target": {"surface": "pipeline"},
+        },
+        {
+            "id": "runtime",
+            "label": "Runtime",
+            "target": {"surface": "runtime", "section": "health"},
+        },
+    ]
+    if project.design_doc:
+        drilldowns.append(
+            {
+                "id": "design",
+                "label": "Design",
+                "target": {"surface": "project", "section": "design-doc"},
+            }
+        )
+
+    return {
+        "id": f"strategic-context:{project.id}",
+        "title": _compact_text(title, max_chars=100) or "Strategic context",
+        "status": status,
+        "updated_at": latest_time,
+        "token_count": None,
+        "item_count": source_item_count,
+        "sources": sources,
+        "canvas": {
+            "id": f"strategic-canvas:{project.id}",
+            "title": "Strategic context map",
+            "kind": "strategic_context",
+            "node_count": None,
+        },
+        "drilldowns": drilldowns,
+    }
+
+
 def _strategic_refresh_summary(vision: Dict[str, Any] | None) -> Dict[str, Any]:
     vision = vision or {}
     marker = vision.get("_strategic_refresh")
@@ -666,19 +804,36 @@ async def get_project_strategic_state(
         project,
         current_user["user_id"],
     )
+    active_cycle_summary = _cycle_summary(active_cycle, active_task=active_task)
+    latest_cycle_summary = _cycle_summary(latest_cycle)
+    running_update_summary = _running_update_summary(project)
+    problem_model_summary = _problem_model_summary(project.problem_model or {})
+    directions_summary = _direction_summary(project.directions or [])
+    context_package = _strategic_context_package_summary(
+        project,
+        active_cycle=active_cycle_summary,
+        active_task=active_task,
+        latest_cycle=latest_cycle,
+        running_update=running_update_summary,
+        problem_model=problem_model_summary,
+        directions=directions_summary,
+        message_counts=message_counts,
+        task_counts=task_counts,
+        attention=attention,
+    )
 
     return {
         "project_id": str(project.id),
         "strategic": {
-            "active_cycle": _cycle_summary(active_cycle, active_task=active_task),
+            "active_cycle": active_cycle_summary,
             "active_task": _task_summary(active_task),
             "active_phase": active_phase,
-            "latest_cycle": _cycle_summary(latest_cycle),
+            "latest_cycle": latest_cycle_summary,
             "refresh": _strategic_refresh_summary(project.vision or {}),
         },
-        "running_update": _running_update_summary(project),
-        "problem_model": _problem_model_summary(project.problem_model or {}),
-        "directions": _direction_summary(project.directions or []),
+        "running_update": running_update_summary,
+        "problem_model": problem_model_summary,
+        "directions": directions_summary,
         "messages": {
             "counts": message_counts,
             "items": [_message_preview(message) for message in message_rows],
@@ -688,6 +843,7 @@ async def get_project_strategic_state(
             "cumulative_estimated_cost_usd": float(cost_total or 0.0),
         },
         "attention": attention,
+        "context_package": context_package,
         "design": {
             "has_design_doc": bool(project.design_doc),
             "revision": ((project.design_doc or {}).get("_meta") or {}).get("revision")

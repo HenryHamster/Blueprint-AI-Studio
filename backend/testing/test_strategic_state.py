@@ -210,6 +210,39 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     assert len(linked_preview["content"]) <= 280
     assert linked_preview["context"] == {"event_type": "blocker_linked"}
     assert data["design"]["revision"] == 3
+    package = data["context_package"]
+    assert package["id"] == f"strategic-context:{project.id}"
+    assert package["title"] == "Persistent Strategic interaction"
+    assert len(package["title"]) <= 100
+    assert package["status"] == "building"
+    assert package["updated_at"]
+    assert package["token_count"] is None
+    assert package["canvas"]["kind"] == "strategic_context"
+    assert package["canvas"]["node_count"] is None
+    assert {source["kind"]: source["count"] for source in package["sources"]} == {
+        "running_update": 1,
+        "problem_model": 4,
+        "directions": 2,
+        "messages": 2,
+        "tasks": 2,
+        "design": 1,
+    }
+    assert package["item_count"] == 12
+    assert {entry["id"] for entry in package["drilldowns"]} == {
+        "running_update",
+        "problem_model",
+        "directions",
+        "pipeline",
+        "runtime",
+        "design",
+    }
+    assert {
+        entry["target"]["section"]
+        for entry in package["drilldowns"]
+        if entry["target"].get("surface") == "project"
+    } == {"running-update", "problem-model", "directions", "design-doc"}
+    assert "huge" not in package
+    assert "A blocker is owned by a direction" not in str(package)
 
 
 @pytest.mark.asyncio
@@ -234,6 +267,7 @@ async def test_strategic_state_marks_active_cycle_without_live_task_as_stale(
     assert active["has_active_task"] is False
     assert active["stale"] is True
     assert resp.json()["strategic"]["active_task"] is None
+    assert resp.json()["context_package"]["status"] == "stale"
 
 
 @pytest.mark.asyncio

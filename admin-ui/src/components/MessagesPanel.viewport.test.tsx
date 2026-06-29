@@ -1,7 +1,7 @@
 import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { MessagesPanel } from './MessagesPanel';
+import { MessagesPanel, type MessagesPanelProps } from './MessagesPanel';
 import type { ProjectMessage } from './MessageBubble';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt, stressStrings } from '../test/viewport';
 
@@ -34,7 +34,7 @@ function makeMsg(overrides: Partial<ProjectMessage> = {}): ProjectMessage {
   };
 }
 
-async function renderPanel(root: Root, messages: ProjectMessage[]) {
+async function renderPanel(root: Root, messages: ProjectMessage[], props: Partial<MessagesPanelProps> = {}) {
   const { apiFetch } = await import('../api');
   (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
     new Response(JSON.stringify({ messages }), { status: 200 }),
@@ -46,6 +46,7 @@ async function renderPanel(root: Root, messages: ProjectMessage[]) {
         onClose={() => {}}
         addToast={() => {}}
         onMessageCountChange={() => {}}
+        {...props}
       />,
     );
   });
@@ -149,6 +150,45 @@ describe('MessagesPanel — viewport regression', () => {
       root = r;
       await renderPanel(r, msgs);
     }, { waitMs: 50 });
+  });
+
+  test('minimal chat context package strip does not overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderPanel(r, [], {
+        variant: 'page',
+        filterChrome: 'minimal',
+        showCloseButton: false,
+        contextPackage: {
+          id: 'strategic-context:project-123',
+          title: 'Strategic context for a long-running local workday session',
+          status: 'ready',
+          item_count: 42,
+          token_count: null,
+          canvas: {
+            id: 'strategic-canvas:project-123',
+            title: 'Strategic context map',
+            kind: 'strategic_context',
+            node_count: null,
+          },
+          sources: [
+            { kind: 'running_update', count: 1 },
+            { kind: 'problem_model', count: 7 },
+            { kind: 'tasks', count: 34 },
+          ],
+          drilldowns: [],
+        },
+      });
+    });
+
+    const strip = host!.querySelector('[data-testid="strategic-context-package-strip"]');
+    expect(strip).not.toBeNull();
+    expect(strip!.textContent).toContain('42 items');
+    expect(strip!.textContent).not.toContain('canvas nodes');
   });
 
   test('stale citation warning chip does not overflow at 375px', async () => {

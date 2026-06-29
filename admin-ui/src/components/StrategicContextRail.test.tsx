@@ -145,6 +145,33 @@ const STATE: StrategicStateResponse = {
       },
     ],
   },
+  context_package: {
+    id: 'strategic-context:proj-1',
+    title: 'Workbench context package',
+    status: 'building',
+    updated_at: '2026-06-29T01:05:00Z',
+    token_count: null,
+    item_count: 32,
+    sources: [
+      { kind: 'running_update', count: 1 },
+      { kind: 'problem_model', count: 9 },
+      { kind: 'directions', count: 2 },
+      { kind: 'messages', count: 3 },
+      { kind: 'tasks', count: 20 },
+    ],
+    canvas: {
+      id: 'strategic-canvas:proj-1',
+      title: 'Strategic context map',
+      kind: 'strategic_context',
+      node_count: null,
+    },
+    drilldowns: [
+      { id: 'running_update', label: 'Update', target: { surface: 'project', section: 'running-update' } },
+      { id: 'problem_model', label: 'Model', target: { surface: 'project', section: 'problem-model' } },
+      { id: 'pipeline', label: 'Pipeline', target: { surface: 'pipeline' } },
+      { id: 'runtime', label: 'Runtime', target: { surface: 'runtime', section: 'health' } },
+    ],
+  },
   design: {
     has_design_doc: true,
     revision: 4,
@@ -190,6 +217,10 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).toContain('Unblock the operator workbench');
     expect(host.textContent).toContain('Strategic is consolidating operator chat state');
     expect(host.textContent).toContain('$3.50');
+    expect(host.textContent).toContain('Workbench context package');
+    expect(host.textContent).toContain('building');
+    expect(host.textContent).toContain('32 items');
+    expect(host.textContent).toContain('problem model 9');
     expect(host.textContent).toContain('Needs operator');
     expect(host.textContent).toContain('Question waiting');
     expect(host.textContent).toContain('new');
@@ -209,6 +240,13 @@ describe('StrategicContextRail', () => {
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('directions');
     expect(props.onOpenPipeline).toHaveBeenCalled();
     expect(props.onOpenRuntimeHealth).toHaveBeenCalled();
+  });
+
+  test('does not render a context package block before the backend descriptor exists', () => {
+    const { host } = mount({ state: { ...STATE, context_package: null } });
+
+    expect(host.textContent).not.toContain('Workbench context package');
+    expect(host.textContent).toContain('Running update');
   });
 
   test('attention items drill into existing surfaces', () => {

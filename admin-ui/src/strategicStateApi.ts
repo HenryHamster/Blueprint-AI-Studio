@@ -56,6 +56,37 @@ export interface StrategicStateAttentionItem {
   event_type?: string | null;
 }
 
+export interface StrategicContextPackageSource {
+  kind: string;
+  count: number;
+}
+
+export interface StrategicContextPackageDrilldown {
+  id: string;
+  label: string;
+  target: {
+    surface: 'project' | 'pipeline' | 'runtime' | string;
+    section?: string | null;
+  };
+}
+
+export interface StrategicContextPackageDescriptor {
+  id: string;
+  title: string;
+  status?: 'ready' | 'building' | 'stale' | string;
+  updated_at?: string | null;
+  token_count?: number | null;
+  item_count?: number | null;
+  sources?: StrategicContextPackageSource[];
+  canvas?: {
+    id?: string;
+    title?: string;
+    kind?: string;
+    node_count?: number | null;
+  } | null;
+  drilldowns?: StrategicContextPackageDrilldown[];
+}
+
 export interface StrategicStateResponse {
   project_id: string;
   strategic: {
@@ -142,6 +173,7 @@ export interface StrategicStateResponse {
     };
     items: StrategicStateAttentionItem[];
   };
+  context_package?: StrategicContextPackageDescriptor | null;
   design: {
     has_design_doc: boolean;
     revision?: number | null;

@@ -23,6 +23,7 @@ import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { DirectionsAddForm } from './DirectionsAddForm';
+import type { StrategicContextPackageDescriptor } from '../strategicStateApi';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -88,6 +89,19 @@ function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 
   return parts.join(' · ');
 }
 
+function formatContextPackageNumber(value: number | null | undefined): string {
+  const n = Number(value ?? 0);
+  if (!Number.isFinite(n)) return '0';
+  if (Math.abs(n) >= 1000) return `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k`;
+  return String(n);
+}
+
+function contextPackageTextTone(status?: string | null): string {
+  if (status === 'building') return 'text-cyan-300';
+  if (status === 'stale') return 'text-amber-300';
+  return 'text-emerald-300';
+}
+
 function viewMatches(
   view: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean; showOnlyNew: boolean },
   state: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean; showOnlyNew: boolean },
@@ -135,6 +149,8 @@ export interface MessagesPanelProps {
   lastCycleCompletion?: StrategicCycleCompletion | null;
   /** Incrementing signal from the workbench shell to focus the Strategic composer. */
   focusComposerSignal?: number;
+  /** Compact Strategic context descriptor, shown only in the minimal chat surface. */
+  contextPackage?: StrategicContextPackageDescriptor | null;
 }
 
 type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean; criticalOnly: boolean };
@@ -208,7 +224,7 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, contextPackage }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -1275,6 +1291,20 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         showCloseButton={resolvedShowCloseButton}
         filterChrome={resolvedFilterChrome}
       />
+
+      {conversationMode && contextPackage && (
+        <div className="shrink-0 border-b border-neutral-800 bg-[#07090c] px-4 py-2 md:px-6" data-testid="strategic-context-package-strip">
+          <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500">
+            <span className="min-w-0 max-w-full truncate font-medium text-neutral-300">
+              {contextPackage.title || 'Strategic context'}
+            </span>
+            <span className={contextPackageTextTone(contextPackage.status)}>
+              {contextPackage.status || 'ready'}
+            </span>
+            {contextPackage.item_count ? <span>{formatContextPackageNumber(contextPackage.item_count)} items</span> : null}
+          </div>
+        </div>
+      )}
 
       {/* Strategic-refresh indicator: either pending (armed but not yet fired) or
           a receipt showing when a prior steer was picked up and acted upon. Hidden

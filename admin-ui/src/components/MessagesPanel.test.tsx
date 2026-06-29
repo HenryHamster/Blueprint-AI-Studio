@@ -513,6 +513,46 @@ describe('MessagesPanel chrome modes', () => {
     expect(el.querySelector('input[placeholder="Search messages..."]')).toBeNull();
     expect(filterToggle(el)?.getAttribute('aria-expanded')).toBe('false');
   });
+
+  test('minimal chat chrome shows the compact Strategic context package strip', async () => {
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      contextPackage: {
+        id: 'strategic-context:proj-1',
+        title: 'Workbench context',
+        status: 'ready',
+        item_count: 18,
+        token_count: null,
+        canvas: {
+          id: 'strategic-canvas:proj-1',
+          title: 'Strategic context map',
+          kind: 'strategic_context',
+          node_count: null,
+        },
+        sources: [{ kind: 'messages', count: 2 }],
+        drilldowns: [],
+      },
+    });
+
+    const strip = el.querySelector('[data-testid="strategic-context-package-strip"]');
+    expect(strip?.textContent).toContain('Workbench context');
+    expect(strip?.textContent).toContain('ready');
+    expect(strip?.textContent).toContain('18 items');
+    expect(strip?.textContent).not.toContain('canvas nodes');
+  });
+
+  test('compact/full message chrome keeps the context package out of the legacy surface', async () => {
+    const el = await renderPanel({
+      filterChrome: 'compact',
+      contextPackage: {
+        id: 'strategic-context:proj-1',
+        title: 'Workbench context',
+        status: 'ready',
+      },
+    });
+
+    expect(el.querySelector('[data-testid="strategic-context-package-strip"]')).toBeNull();
+  });
 });
 
 describe('MessagesPanel grouping', () => {

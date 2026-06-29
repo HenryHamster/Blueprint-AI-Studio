@@ -1,7 +1,11 @@
 import type { ReactNode } from 'react';
-import { ArrowUpRight, CircleAlert, FileText, GitBranch, Radio } from 'lucide-react';
+import { ArrowUpRight, CircleAlert, FileText, GitBranch, Network, Radio } from 'lucide-react';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
-import type { StrategicStateAttentionItem, StrategicStateResponse } from '../strategicStateApi';
+import type {
+  StrategicContextPackageDescriptor,
+  StrategicStateAttentionItem,
+  StrategicStateResponse,
+} from '../strategicStateApi';
 import { WorkbenchPanel } from './WorkbenchLayout';
 
 type ProjectTarget = 'running-update' | 'directions' | 'problem-model' | 'design-doc';
@@ -23,10 +27,23 @@ function formatCost(value: number | undefined): string {
   return `$${n.toFixed(2)}`;
 }
 
+function formatCompactNumber(value: number | null | undefined): string {
+  const n = Number(value ?? 0);
+  if (!Number.isFinite(n)) return '0';
+  if (Math.abs(n) >= 1000) return `${(n / 1000).toFixed(n >= 10_000 ? 0 : 1)}k`;
+  return String(n);
+}
+
 function phaseLabel(phase?: string | null): string {
   if (phase === 'strategic_review') return 'Strategic review';
   if (phase === 'design_doc_update') return 'Architecture review';
   return 'Strategic';
+}
+
+function contextPackageTone(status?: string | null): { dot: string; text: string; label: string } {
+  if (status === 'building') return { dot: 'bg-cyan-400', text: 'text-cyan-300', label: 'building' };
+  if (status === 'stale') return { dot: 'bg-amber-300', text: 'text-amber-300', label: 'stale' };
+  return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'ready' };
 }
 
 function RailButton({
@@ -96,6 +113,49 @@ function AttentionItem({
     >
       {content}
     </button>
+  );
+}
+
+function ContextPackageBlock({
+  contextPackage,
+}: {
+  contextPackage?: StrategicContextPackageDescriptor | null;
+}) {
+  if (!contextPackage) return null;
+  const tone = contextPackageTone(contextPackage.status);
+  const sources = (contextPackage.sources ?? []).slice(0, 5);
+  const itemCount = Number(contextPackage.item_count ?? 0);
+
+  return (
+    <div className="border-b border-neutral-800 pb-3">
+      <div className="flex min-w-0 gap-2">
+        <Network className="mt-0.5 h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="truncate text-xs font-semibold text-neutral-100">{contextPackage.title}</span>
+            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${tone.dot}`} aria-hidden="true" />
+            <span className={`shrink-0 text-ui-sm font-semibold uppercase ${tone.text}`}>
+              {tone.label}
+            </span>
+          </div>
+          <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500">
+            {itemCount > 0 && <span>{formatCompactNumber(itemCount)} items</span>}
+          </div>
+        </div>
+      </div>
+      {sources.length > 0 && (
+        <div className="mt-2 flex flex-wrap gap-1.5">
+          {sources.map(source => (
+            <span
+              key={source.kind}
+              className="rounded border border-neutral-800 bg-neutral-950/70 px-1.5 py-0.5 text-ui-sm font-medium text-neutral-500"
+            >
+              {source.kind.replace(/_/g, ' ')} {formatCompactNumber(source.count)}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -238,6 +298,9 @@ export function StrategicContextRail({
 
       <WorkbenchPanel title="Context" meta={formatCost(state?.tasks.cumulative_estimated_cost_usd)}>
         <div className="space-y-3">
+          <ContextPackageBlock
+            contextPackage={state?.context_package}
+          />
           <div>
             <div className="mb-1 flex items-center gap-2 text-xs font-semibold text-neutral-100">
               <FileText className="h-4 w-4 text-neutral-500" aria-hidden="true" />
