@@ -129,8 +129,11 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     ? recon.capability_contradictions as Array<Record<string, unknown>> : [];
   const orphanedGaps = Array.isArray(recon.orphaned_gaps)
     ? recon.orphaned_gaps as Array<Record<string, unknown>> : [];
+  const staffedButDeferred = Array.isArray(recon.staffed_but_deferred) ? recon.staffed_but_deferred as Array<Record<string, unknown>> : [];
   const ungroundedDirs = Array.isArray(recon.ungrounded_directions)
     ? recon.ungrounded_directions as Array<Record<string, unknown>> : [];
+  const staleActiveMoves = Array.isArray(recon.stale_active_moves) ? recon.stale_active_moves as Array<Record<string, unknown>> : [];
+  const phantomRefs = Array.isArray(recon.phantom_direction_refs) ? recon.phantom_direction_refs as Array<Record<string, unknown>> : [];
   const pipeline = Array.isArray(recon.direction_pipeline)
     ? recon.direction_pipeline as Array<Record<string, unknown>> : [];
   const counts = (recon.counts && typeof recon.counts === 'object')
@@ -175,6 +178,14 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     }
   }
 
+  if (staffedButDeferred.length > 0) {
+    lines.push(`\n### Staffed-but-deferred gaps — contradictory staffing state (${fmtScalar(counts.staffed_but_deferred, String(staffedButDeferred.length))})`);
+    lines.push('These gaps have an active direction pointing at them while also carrying a deferral. Either remove the deferral or park/retarget the direction.');
+    for (const g of staffedButDeferred) {
+      lines.push(`- **${strVal(g.name, 'Unnamed gap')}** [${strVal(g.priority, 'medium')}] (gap ${strVal(g.gap_id, '?')}, status=${strVal(g.status, 'active')})`);
+    }
+  }
+
   // Active directions whose gap_id no longer resolves to an active gap.
   if (ungroundedDirs.length > 0) {
     lines.push(`\n### Ungrounded active directions — advance no tracked gap (${fmtScalar(counts.ungrounded_directions, String(ungroundedDirs.length))})`);
@@ -186,6 +197,23 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
         ? 'its gap_id no longer resolves to an active gap'
         : 'no gap_id linkage';
       lines.push(`- ${text} (id: ${did}) — ${reason}`);
+    }
+  }
+
+  if (staleActiveMoves.length > 0) {
+    lines.push(`\n### Stale gap active_moves — listed direction is no longer active (${fmtScalar(counts.stale_active_moves, String(staleActiveMoves.length))})`);
+    lines.push('These gap active_moves entries point at retired, completed, deleted, or otherwise non-active directions. Prune the stale IDs before trusting gap staffing.');
+    for (const g of staleActiveMoves) {
+      const staleIds = Array.isArray(g.stale_direction_ids) ? (g.stale_direction_ids as string[]).join(', ') : '?';
+      lines.push(`- **${strVal(g.gap_name, 'Unnamed gap')}** (gap ${strVal(g.gap_id, '?')}) — stale active_moves: ${staleIds}`);
+    }
+  }
+
+  if (phantomRefs.length > 0) {
+    lines.push(`\n### Phantom direction refs — prose cites missing directions (${fmtScalar(counts.phantom_direction_refs, String(phantomRefs.length))})`);
+    lines.push('These prose references do not resolve to any known direction. Rewrite the stale narrative or link it to a real direction.');
+    for (const p of phantomRefs) {
+      lines.push(`- ${strVal(p.direction_id, '?')} cited in ${strVal(p.cited_in, '?')}`);
     }
   }
 

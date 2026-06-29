@@ -254,6 +254,27 @@ describe('buildCycleStartReconciliationSection', () => {
     expect(result).toContain('**blocked orphan** [low] (gap g-b) — BLOCKED');
   });
 
+  it('buildCycleStartReconciliationSection renders stale active moves staffed deferrals and phantom refs', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      staffed_but_deferred: [{ gap_id: 'g-defer', name: 'deferred but staffed', priority: 'high', status: 'active' }],
+      ungrounded_directions: [],
+      stale_active_moves: [{ gap_id: 'g-stale', gap_name: 'stale staffed gap', stale_direction_ids: ['d-retired'] }],
+      phantom_direction_refs: [{ direction_id: 'd-4890df9e', cited_in: 'intent.current_focus' }, { direction_id: 'd-aaaabbbb', cited_in: 'running_update' }],
+      direction_pipeline: [],
+      counts: { staffed_but_deferred: 1, stale_active_moves: 1, phantom_direction_refs: 2 },
+    });
+
+    expect(result).toContain('Staffed-but-deferred gaps — contradictory staffing state (1)');
+    expect(result).toContain('**deferred but staffed** [high] (gap g-defer, status=active)');
+    expect(result).toContain('Stale gap active_moves — listed direction is no longer active (1)');
+    expect(result).toContain('**stale staffed gap** (gap g-stale) — stale active_moves: d-retired');
+    expect(result).toContain('Phantom direction refs — prose cites missing directions (2)');
+    expect(result).toContain('d-4890df9e cited in intent.current_focus');
+    expect(result).toContain('d-aaaabbbb cited in running_update');
+  });
+
   it('splits the research pipeline into held / recent / waiting / in-progress / idle', () => {
     const result = buildCycleStartReconciliationSection({
       capability_contradictions: [],
