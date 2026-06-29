@@ -6,8 +6,11 @@ from httpx import AsyncClient
 from app.models import (
     Alert,
     AlertSeverity,
+    Artifact,
+    ArtifactType,
     ComputeJob,
     ComputeJobStatus,
+    KnowledgeDocument,
     LocalRunner,
     MessageType,
     MessagesLastSeen,
@@ -19,6 +22,7 @@ from app.models import (
     Task,
     TaskWakeRegistration,
     TaskStatus,
+    SourceKind,
     WakeAction,
     WakeDeliveryState,
     _utcnow,
@@ -174,10 +178,32 @@ async def test_strategic_state_returns_persistent_workbench_projection(
             "huge": "x" * 10_000,
         },
     )
+    knowledge_doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=phase2_task.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Operator workbench notes",
+        summary="The workbench should expose context when requested.",
+        body="DO NOT EMBED KNOWLEDGE BODY " + ("body " * 200),
+        topic="operator-experience",
+        direction_id="d-high",
+        tags=["operator", "workbench"],
+        source_citations=[],
+        forward_quality_verdict={"passed": True},
+    )
+    artifact = Artifact(
+        task_id=phase2_task.id,
+        artifact_type=ArtifactType.INVESTIGATION_REPORT,
+        storage_uri="gs://blueprint-test/operator-context/report.md",
+        logical_key="operator-context-report",
+        logs="DO NOT EMBED ARTIFACT LOGS " + ("logs " * 200),
+    )
     db_session.add(active_cycle)
     db_session.add(latest_cycle)
     db_session.add(open_message)
     db_session.add(linked_message)
+    db_session.add(knowledge_doc)
+    db_session.add(artifact)
     await db_session.commit()
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
@@ -230,16 +256,33 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     assert package["updated_at"]
     assert package["token_count"] is None
     assert package["canvas"]["kind"] == "strategic_context"
-    assert package["canvas"]["node_count"] is None
     assert {source["kind"]: source["count"] for source in package["sources"]} == {
         "running_update": 1,
         "problem_model": 4,
         "directions": 2,
         "messages": 2,
         "tasks": 2,
+        "knowledge": 1,
+        "artifacts": 1,
         "design": 1,
     }
-    assert package["item_count"] == 12
+    assert package["item_count"] == 14
+    assert package["canvas"]["node_count"] >= 8
+    assert package["canvas"]["edge_count"] >= 7
+    assert package["canvas"]["nodes"]
+    assert package["canvas"]["edges"]
+    assert any(node["kind"] == "knowledge_document" for node in package["canvas"]["nodes"])
+    assert any(node["kind"] == "artifact" for node in package["canvas"]["nodes"])
+    assert package["resources"][0]["kind"] == "canvas"
+    assert any(resource["kind"] == "knowledge_document" for resource in package["resources"])
+    assert any(resource["kind"] == "artifact" for resource in package["resources"])
+    assert package["evidence"]["knowledge"]["total"] == 1
+    assert package["evidence"]["knowledge"]["items"][0]["id"] == str(knowledge_doc.id)
+    assert package["evidence"]["knowledge"]["items"][0]["target"]["document_id"] == str(knowledge_doc.id)
+    assert package["evidence"]["artifacts"]["total"] == 1
+    assert package["evidence"]["artifacts"]["items"][0]["target"]["task_id"] == str(phase2_task.id)
+    assert "storage_uri" not in package["evidence"]["artifacts"]["items"][0]
+    assert "gs://blueprint-test" not in str(package)
     assert {entry["id"] for entry in package["drilldowns"]} == {
         "running_update",
         "problem_model",
@@ -255,6 +298,8 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     } == {"running-update", "problem-model", "directions", "design-doc"}
     assert "huge" not in package
     assert "A blocker is owned by a direction" not in str(package)
+    assert "DO NOT EMBED KNOWLEDGE BODY" not in str(package)
+    assert "DO NOT EMBED ARTIFACT LOGS" not in str(package)
 
 
 @pytest.mark.asyncio

@@ -1366,6 +1366,11 @@ export default function App() {
                     handleTabChange('runtime');
                   }}
                   onOpenTask={handleViewTaskById}
+                  onOpenKnowledge={(documentId, directionId) => {
+                    setKnowledgeBrowserInitialDocId(documentId ?? null);
+                    setKnowledgeBrowserDirectionId(directionId ?? null);
+                    s.setShowKnowledgeBrowser(true);
+                  }}
                   onOpenMessages={() => handleTabChange('chat')}
                 />
                 <TaskContextRail

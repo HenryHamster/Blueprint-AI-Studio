@@ -474,6 +474,7 @@ function makeStrategicState(overrides: Partial<StrategicStateResponse> = {}): St
         running: 3,
         evaluating: 0,
         blocked: 0,
+        parked: 0,
         failed: 0,
         completed: 12,
         total: 20,
@@ -4112,6 +4113,34 @@ describe('MessagesPanel send arming receipt', () => {
     const el = host as HTMLDivElement;
 
     expect(onStrategicRefresh).not.toHaveBeenCalled();
+    await typeAndSend(el, 'steer: focus on the migration work');
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    expect(onStrategicRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  test('refreshes strategic state once after duplicate steering replay', async () => {
+    _setupSendMock({ arming: 'duplicate' });
+    const addToast = vi.fn();
+    const onStrategicRefresh = vi.fn();
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast as never}
+          onMessageCountChange={() => {}}
+          onStrategicRefresh={onStrategicRefresh}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    const el = host as HTMLDivElement;
+
     await typeAndSend(el, 'steer: focus on the migration work');
     await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
     expect(onStrategicRefresh).toHaveBeenCalledTimes(1);

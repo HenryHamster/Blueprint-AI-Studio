@@ -164,7 +164,71 @@ const STATE: StrategicStateResponse = {
       id: 'strategic-canvas:proj-1',
       title: 'Strategic context map',
       kind: 'strategic_context',
-      node_count: null,
+      node_count: 9,
+      edge_count: 8,
+      nodes: [
+        { id: 'project:proj-1', kind: 'project', label: 'Workbench context package' },
+        { id: 'knowledge:kdoc-1', kind: 'knowledge_document', label: 'Operator notes' },
+        { id: 'artifact:artifact-1', kind: 'artifact', label: 'operator-context-report' },
+      ],
+      edges: [
+        { source: 'project:proj-1', target: 'knowledge:kdoc-1', label: 'knowledge' },
+        { source: 'pipeline', target: 'artifact:artifact-1', label: 'artifact' },
+      ],
+    },
+    resources: [
+      {
+        id: 'strategic-canvas:proj-1',
+        kind: 'canvas',
+        label: 'Strategic context map',
+        summary: '9 nodes / 8 links',
+        target: { surface: 'project', section: 'problem-model' },
+      },
+      {
+        id: 'knowledge:kdoc-1',
+        kind: 'knowledge_document',
+        label: 'Operator notes',
+        summary: 'Context should be available when requested.',
+        target: { surface: 'knowledge', document_id: 'kdoc-1', direction_id: 'd-1', task_id: 'task-strat' },
+      },
+      {
+        id: 'artifact:artifact-1',
+        kind: 'artifact',
+        label: 'operator-context-report',
+        summary: 'Strategic review',
+        target: { surface: 'task', task_id: 'task-strat', artifact_id: 'artifact-1' },
+      },
+    ],
+    evidence: {
+      knowledge: {
+        total: 1,
+        items: [
+          {
+            id: 'kdoc-1',
+            kind: 'knowledge_document',
+            label: 'Operator notes',
+            summary: 'Context should be available when requested.',
+            source_kind: 'design',
+            direction_id: 'd-1',
+            source_task_id: 'task-strat',
+            target: { surface: 'knowledge', document_id: 'kdoc-1', direction_id: 'd-1', task_id: 'task-strat' },
+          },
+        ],
+      },
+      artifacts: {
+        total: 1,
+        items: [
+          {
+            id: 'artifact-1',
+            kind: 'storage',
+            label: 'operator-context-report',
+            artifact_type: 'INVESTIGATION_REPORT',
+            task_id: 'task-strat',
+            task_title: 'Strategic review',
+            target: { surface: 'task', task_id: 'task-strat', artifact_id: 'artifact-1' },
+          },
+        ],
+      },
     },
     drilldowns: [
       { id: 'running_update', label: 'Update', target: { surface: 'project', section: 'running-update' } },
@@ -323,6 +387,10 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).toContain('Workbench context package');
     expect(host.textContent).toContain('building');
     expect(host.textContent).toContain('32 items');
+    expect(host.textContent).toContain('9 nodes / 8 links');
+    expect(host.textContent).toContain('Strategic context map');
+    expect(host.textContent).toContain('Operator notes');
+    expect(host.textContent).toContain('operator-context-report');
     expect(host.textContent).toContain('problem model 9');
     expect(host.textContent).toContain('Needs operator');
     expect(host.textContent).toContain('Question waiting');
@@ -340,9 +408,14 @@ describe('StrategicContextRail', () => {
 
   test('drills into existing workbench sections', () => {
     const onOpenRuntimeCompute = vi.fn();
-    const { host, props } = mount({ onOpenRuntimeCompute });
+    const onOpenKnowledge = vi.fn();
+    const onOpenTask = vi.fn();
+    const { host, props } = mount({ onOpenRuntimeCompute, onOpenKnowledge, onOpenTask });
 
     const buttons = Array.from(host.querySelectorAll('button'));
+    buttons.find(button => button.textContent?.includes('Strategic context map'))?.click();
+    buttons.find(button => button.textContent?.includes('Operator notes'))?.click();
+    buttons.find(button => button.textContent?.includes('operator-context-report'))?.click();
     buttons.find(button => button.textContent?.includes('Model'))?.click();
     buttons.find(button => button.textContent?.includes('Directions'))?.click();
     buttons.find(button => button.textContent?.includes('Pipeline'))?.click();
@@ -351,6 +424,8 @@ describe('StrategicContextRail', () => {
     buttons.find(button => button.textContent?.includes('Compute'))?.click();
 
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('problem-model');
+    expect(onOpenKnowledge).toHaveBeenCalledWith('kdoc-1', 'd-1');
+    expect(onOpenTask).toHaveBeenCalledWith('task-strat');
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('directions');
     expect(props.onOpenPipeline).toHaveBeenCalled();
     expect(props.onOpenRuntimeHealth).toHaveBeenCalled();

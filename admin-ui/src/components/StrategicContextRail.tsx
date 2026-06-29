@@ -3,6 +3,8 @@ import { Activity, ArrowUpRight, CircleAlert, Cpu, FileText, GitBranch, Network,
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import type {
   StrategicContextPackageDescriptor,
+  StrategicContextPackageDrilldown,
+  StrategicContextResourceRef,
   StrategicLocalRunnerState,
   StrategicRuntimeWorkState,
   StrategicStateAttentionItem,
@@ -11,6 +13,10 @@ import type {
 import { WorkbenchPanel } from './WorkbenchLayout';
 
 type ProjectTarget = 'running-update' | 'directions' | 'problem-model' | 'design-doc';
+
+function isProjectTarget(value?: string | null): value is ProjectTarget {
+  return value === 'running-update' || value === 'directions' || value === 'problem-model' || value === 'design-doc';
+}
 
 interface StrategicContextRailProps {
   state: StrategicStateResponse | null;
@@ -26,6 +32,7 @@ interface StrategicContextRailProps {
   onOpenRuntimeCompute?: () => void;
   onOpenTask?: (taskId: string) => void;
   onOpenMessages?: () => void;
+  onOpenKnowledge?: (documentId?: string | null, directionId?: string | null) => void;
 }
 
 function formatCost(value: number | undefined): string {
@@ -168,6 +175,44 @@ function StatRow({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
+function resourceKindLabel(kind?: string | null): string {
+  if (kind === 'canvas') return 'map';
+  if (kind === 'knowledge_document') return 'knowledge';
+  if (kind === 'artifact') return 'artifact';
+  if (kind === 'task') return 'task';
+  return (kind || 'resource').replace(/_/g, ' ');
+}
+
+function ContextResourceButton({
+  resource,
+  onOpen,
+}: {
+  resource: StrategicContextResourceRef;
+  onOpen?: (resource: StrategicContextResourceRef) => void;
+}) {
+  const disabled = !onOpen;
+  const detail = resource.kind === 'canvas' ? null : resource.summary;
+  return (
+    <button
+      type="button"
+      disabled={disabled}
+      onClick={() => onOpen?.(resource)}
+      className="flex min-h-11 w-full min-w-0 items-center justify-between gap-2 rounded-md border border-neutral-800 bg-neutral-950/60 px-2.5 py-2 text-left transition-colors enabled:hover:border-neutral-700 enabled:hover:bg-neutral-900 disabled:cursor-default disabled:opacity-80"
+    >
+      <span className="min-w-0">
+        <span className="block truncate text-xs font-semibold text-neutral-200">
+          {resource.label}
+        </span>
+        <span className="mt-0.5 block truncate text-ui-sm font-medium uppercase text-neutral-500">
+          {resourceKindLabel(resource.kind)}
+          {detail ? ` / ${detail}` : ''}
+        </span>
+      </span>
+      {!disabled && <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-neutral-500" aria-hidden="true" />}
+    </button>
+  );
+}
+
 function AttentionItem({
   item,
   onClick,
@@ -212,13 +257,18 @@ function AttentionItem({
 
 function ContextPackageBlock({
   contextPackage,
+  onOpenResource,
 }: {
   contextPackage?: StrategicContextPackageDescriptor | null;
+  onOpenResource?: (resource: StrategicContextResourceRef) => void;
 }) {
   if (!contextPackage) return null;
   const tone = contextPackageTone(contextPackage.status);
   const sources = (contextPackage.sources ?? []).slice(0, 5);
   const itemCount = Number(contextPackage.item_count ?? 0);
+  const resources = (contextPackage.resources ?? []).slice(0, 4);
+  const nodeCount = contextPackage.canvas?.node_count ?? null;
+  const edgeCount = contextPackage.canvas?.edge_count ?? null;
 
   return (
     <div className="border-b border-neutral-800 pb-3">
@@ -234,6 +284,12 @@ function ContextPackageBlock({
           </div>
           <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500">
             {itemCount > 0 && <span>{formatCompactNumber(itemCount)} items</span>}
+            {nodeCount != null && (
+              <span>
+                {formatCompactNumber(nodeCount)} nodes
+                {edgeCount != null ? ` / ${formatCompactNumber(edgeCount)} links` : ''}
+              </span>
+            )}
           </div>
         </div>
       </div>
@@ -246,6 +302,17 @@ function ContextPackageBlock({
             >
               {source.kind.replace(/_/g, ' ')} {formatCompactNumber(source.count)}
             </span>
+          ))}
+        </div>
+      )}
+      {resources.length > 0 && (
+        <div className="mt-2 space-y-1.5" data-testid="strategic-context-resources">
+          {resources.map(resource => (
+            <ContextResourceButton
+              key={`${resource.kind}:${resource.id}`}
+              resource={resource}
+              onOpen={onOpenResource}
+            />
           ))}
         </div>
       )}
@@ -267,6 +334,7 @@ export function StrategicContextRail({
   onOpenRuntimeCompute,
   onOpenTask,
   onOpenMessages,
+  onOpenKnowledge,
 }: StrategicContextRailProps) {
   const activeCycle = state?.strategic.active_cycle ?? null;
   const localRunner = state?.runtime?.local_runner ?? null;
@@ -316,6 +384,41 @@ export function StrategicContextRail({
     if (item.kind === 'alert') return onOpenRuntimeHealth;
     if (item.kind === 'message') return onOpenMessages ?? onOpenPipeline;
     return undefined;
+  }
+
+  function openContextTarget(target?: StrategicContextPackageDrilldown['target'] | null): void {
+    if (!target) return;
+    if (target.surface === 'project') {
+      if (isProjectTarget(target.section)) onOpenProjectSection(target.section);
+      return;
+    }
+    if (target.surface === 'pipeline') {
+      onOpenPipeline();
+      return;
+    }
+    if (target.surface === 'runtime') {
+      if (target.section === 'devices' && onOpenRuntimeDevices) onOpenRuntimeDevices();
+      else if (target.section === 'compute' && onOpenRuntimeCompute) onOpenRuntimeCompute();
+      else onOpenRuntimeHealth();
+      return;
+    }
+    if (target.surface === 'messages') {
+      (onOpenMessages ?? onOpenPipeline)();
+      return;
+    }
+    if (target.surface === 'task') {
+      if (target.task_id && onOpenTask) onOpenTask(target.task_id);
+      else onOpenPipeline();
+      return;
+    }
+    if (target.surface === 'knowledge') {
+      if (onOpenKnowledge) onOpenKnowledge(target.document_id, target.direction_id);
+      else onOpenProjectSection('directions');
+    }
+  }
+
+  function openContextResource(resource: StrategicContextResourceRef): void {
+    openContextTarget(resource.target);
   }
 
   return (
@@ -454,6 +557,7 @@ export function StrategicContextRail({
         <div className="space-y-3">
           <ContextPackageBlock
             contextPackage={state?.context_package}
+            onOpenResource={openContextResource}
           />
           <div>
             <div className="mb-1 flex items-center gap-2 text-xs font-semibold text-neutral-100">

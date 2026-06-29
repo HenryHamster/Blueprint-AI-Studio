@@ -65,9 +65,71 @@ export interface StrategicContextPackageDrilldown {
   id: string;
   label: string;
   target: {
-    surface: 'project' | 'pipeline' | 'runtime' | string;
+    surface: 'project' | 'pipeline' | 'runtime' | 'messages' | 'task' | 'knowledge' | string;
     section?: string | null;
+    task_id?: string | null;
+    document_id?: string | null;
+    direction_id?: string | null;
+    artifact_id?: string | null;
   };
+}
+
+export interface StrategicContextCanvasNode {
+  id: string;
+  kind: string;
+  label: string;
+  summary?: string | null;
+  status?: string | null;
+  count?: number | null;
+  target?: StrategicContextPackageDrilldown['target'] | null;
+}
+
+export interface StrategicContextCanvasEdge {
+  source: string;
+  target: string;
+  label?: string | null;
+}
+
+export interface StrategicContextResourceRef {
+  id: string;
+  kind: 'canvas' | 'knowledge_document' | 'artifact' | 'task' | 'project_section' | string;
+  label: string;
+  summary?: string | null;
+  target?: StrategicContextPackageDrilldown['target'] | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface StrategicContextKnowledgeEvidence {
+  id: string;
+  kind: 'knowledge_document' | string;
+  label?: string | null;
+  summary?: string | null;
+  source_kind?: string | null;
+  topic?: string | null;
+  direction_id?: string | null;
+  source_task_id?: string | null;
+  target?: StrategicContextPackageDrilldown['target'] | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+}
+
+export interface StrategicContextArtifactEvidence {
+  id: string;
+  kind: string;
+  label?: string | null;
+  artifact_type?: string | null;
+  task_id?: string | null;
+  task_title?: string | null;
+  task_status?: string | null;
+  logical_key?: string | null;
+  target?: StrategicContextPackageDrilldown['target'] | null;
+  created_at?: string | null;
+}
+
+export interface StrategicContextEvidenceCollection<T> {
+  total: number;
+  items: T[];
 }
 
 export interface StrategicContextPackageDescriptor {
@@ -83,6 +145,15 @@ export interface StrategicContextPackageDescriptor {
     title?: string;
     kind?: string;
     node_count?: number | null;
+    edge_count?: number | null;
+    nodes?: StrategicContextCanvasNode[];
+    edges?: StrategicContextCanvasEdge[];
+    drilldowns?: StrategicContextPackageDrilldown[];
+  } | null;
+  resources?: StrategicContextResourceRef[];
+  evidence?: {
+    knowledge?: StrategicContextEvidenceCollection<StrategicContextKnowledgeEvidence>;
+    artifacts?: StrategicContextEvidenceCollection<StrategicContextArtifactEvidence>;
   } | null;
   drilldowns?: StrategicContextPackageDrilldown[];
 }

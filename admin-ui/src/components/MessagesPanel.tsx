@@ -1075,6 +1075,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       // partial outcome — the message saved, but the strategist was not woken.
       // Surface it as info, not a green success, so the receipt is truthful.
       addToast(armingToastCopy(arming), arming === 'not_armed' ? 'info' : 'success');
+      let didRefreshStrategicState = false;
       if (arming === 'steering') {
         const optimisticRefresh = {
           requested_at: new Date().toISOString(),
@@ -1087,11 +1088,13 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         optimisticStrategicRefreshRef.current = optimisticRefresh;
         setStrategicRefresh(optimisticRefresh);
         void refreshStrategicState?.();
+        didRefreshStrategicState = true;
       } else if (arming === 'duplicate') {
         void refreshStrategicState?.();
+        didRefreshStrategicState = true;
       }
       await fetchMessages();
-      void refreshStrategicState?.();
+      if (!didRefreshStrategicState) void refreshStrategicState?.();
     } catch {
       addToast('Failed to send message', 'error');
     } finally {

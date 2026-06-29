@@ -188,6 +188,7 @@ describe('MessagesPanel — viewport regression', () => {
               running: 4,
               evaluating: 0,
               blocked: 0,
+              parked: 0,
               failed: 0,
               completed: 28,
               total: 49,
