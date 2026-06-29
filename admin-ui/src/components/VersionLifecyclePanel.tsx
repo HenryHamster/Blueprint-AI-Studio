@@ -624,7 +624,10 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                       <>
                         <span>audit {Math.round(cv.last_qualification.sub_scores.audit * 100)}%</span>
                         <span>erosion {Math.round(cv.last_qualification.sub_scores.test_erosion * 100)}%</span>
-                        <span>smoke {Math.round(cv.last_qualification.sub_scores.smoketest * 100)}%</span>
+                        {cv.last_qualification.smoketest_enabled === false
+                          ? <span className="text-neutral-600 italic">smoke disabled</span>
+                          : <span>smoke {Math.round(cv.last_qualification.sub_scores.smoketest * 100)}%</span>
+                        }
                       </>
                     )}
                     {cv.last_qualification.ci_resolution && (
@@ -818,7 +821,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     <span className={`font-mono font-semibold ${v.would_promote ? 'text-emerald-400' : 'text-amber-400'}`}>{v.confidence != null ? `${Math.round(v.confidence * 100)}%` : '—'}</span>
                     <span className={QUAL_VERDICT_COLOR[v.terminal_status ?? ''] ?? 'text-neutral-400'}>{v.terminal_status?.replace(/_/g, '-') ?? '?'}</span>
                     {v.promotion_enabled && <span className="text-ui-xs font-mono text-emerald-600">LIVE</span>}
-                    {v.sub_scores && <span className="text-neutral-600 font-mono text-ui-xs">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)} s:{Math.round(v.sub_scores.smoketest * 100)}</span>}
+                    {v.sub_scores && <span className="text-neutral-600 font-mono text-ui-xs">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)}{v.smoketest_enabled === false ? ' s:—' : ` s:${Math.round(v.sub_scores.smoketest * 100)}`}</span>}
                     {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
                     {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
                     {v.terminal_status === 'promoted' && (

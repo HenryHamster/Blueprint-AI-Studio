@@ -2466,6 +2466,210 @@ async def test_auto_retire_stale_churn_paused_direction(db_session, mocker):
     assert not h.get("auto_completed")
 
 
+async def _make_gap_project(db_session, direction: dict, problem_model: dict) -> Project:
+    """A _make_cost_project variant that also seeds a problem_model so the
+    terminal auto-retire gap reconciliation can be exercised."""
+    project = Project(
+        name="Gap Reconcile Test",
+        user_id="u-gap-reconcile",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+        problem_model=problem_model,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+    return project
+
+
+@pytest.mark.asyncio
+async def test_code_failure_auto_retire_reconciles_gap(db_session, mocker):
+    """The code-failure auto-retire ladder must prune the now-completed direction
+    out of its gap's active_moves and archive it in past_moves — the same terminal
+    invariant the zombie/strategic retires preserve."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    # >70% code-failure rate (Rule 3) re-trips a code-failure pause this tick;
+    # code_failure_pause_count preset to 2 → increments to 3 → hits the retire
+    # threshold (_MAX_AUTO_PAUSE_CYCLES = 3).
+    history = [
+        {
+            "timestamp": (now - timedelta(days=i)).isoformat(),
+            "tasks_created": 10,
+            "tasks_completed": 1,
+            "tasks_failed": 9,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        }
+        for i in range(3, 0, -1)
+    ]
+    direction = {
+        "id": "d-codefail",
+        "text": "Direction whose tasks keep crashing",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": history,
+        "code_failure_pause_count": 2,
+        "gap_id": "g-codefail",
+    }
+    problem_model = {
+        "gaps": [
+            {
+                "id": "g-codefail",
+                "name": "Code-failure gap",
+                "status": "active",
+                "active_moves": ["d-codefail"],
+                "past_moves": [],
+            }
+        ]
+    }
+    project = await _make_gap_project(db_session, direction, problem_model)
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "completed", "code-failure ladder should auto-retire"
+    assert d.get("auto_completed") is True
+    assert "code-failure" in (d.get("auto_completed_reason") or "").lower()
+
+    gap = project.problem_model["gaps"][0]
+    assert "d-codefail" not in gap["active_moves"], (
+        "retired direction must be pruned from the gap's active_moves"
+    )
+    assert "d-codefail" in gap["past_moves"], (
+        "retired direction must be archived in the gap's past_moves"
+    )
+    # Last active move removed with no prior deferral → a GapDeferral is recorded.
+    assert gap.get("deferral") is not None, (
+        "emptying active_moves on retire should record a GapDeferral"
+    )
+
+
+@pytest.mark.asyncio
+async def test_scaffolding_auto_retire_reconciles_gap_and_persists(db_session, mocker):
+    """The outcome-scaffolding auto-retire branch must (a) prune the completed
+    direction out of its gap's active_moves AND (b) persist the completed status
+    across a session refresh — even on a tick where the flagged-cycles counter
+    does NOT advance (the missing-dirty-flag regression)."""
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_stalled_message",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_outcome_scaffolding_escalation_message",
+        new_callable=AsyncMock,
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new_callable=AsyncMock,
+    )
+    # flagged_cycles already at the default retire threshold (6) and a watermark
+    # far above total_cycles so the counter does NOT advance this tick. Without
+    # the directions_modified=True fix, the in-memory completion is never
+    # persisted (no other branch flags the row dirty) and is lost on refresh.
+    direction = _already_flagged_direction(
+        flagged_cycles=6,
+        outcome_scaffolding_last_cycle_count=999,
+    )
+    did = direction["id"]
+    direction["gap_id"] = "g-scaffold"
+    problem_model = {
+        "gaps": [
+            {
+                "id": "g-scaffold",
+                "name": "Scaffolding gap",
+                "status": "active",
+                "active_moves": [did],
+                "past_moves": [],
+            }
+        ]
+    }
+    project = await _make_gap_project(db_session, direction, problem_model)
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=datetime.utcnow()
+    )
+    await db_session.refresh(project)
+
+    # (b) Durable persistence: assert the refreshed row, not just an in-memory dict.
+    d = project.directions[0]
+    assert d["status"] == "completed", (
+        "scaffolding auto-retire must persist completed status across refresh"
+    )
+    assert d.get("auto_completed") is True
+    assert "scaffolding" in (d.get("auto_completed_reason") or "").lower()
+
+    # (a) Gap reconciled out of active_moves and archived in past_moves.
+    gap = project.problem_model["gaps"][0]
+    assert did not in gap["active_moves"], (
+        "retired direction must be pruned from the gap's active_moves"
+    )
+    assert did in gap["past_moves"], (
+        "retired direction must be archived in the gap's past_moves"
+    )
+
+
+@pytest.mark.asyncio
+async def test_zombie_retire_reconciles_gap_with_stale_gap_id(db_session, mocker):
+    """Authoritative id-match: even when the direction's gap_id hint is missing
+    or stale, the zombie retire still prunes the direction out of any gap whose
+    active_moves lists its id — closing the latent gap_id-gated no-op hole."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    zombie = {
+        "id": "d-zombie-stale",
+        "text": "Recycling zombie with stale gap link",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": _unproductive_history(now),
+        "churn_family_pause_count": 1,
+        # No gap_id at all — the old gap_id-gated reconcile would have been a no-op.
+    }
+    problem_model = {
+        "gaps": [
+            {
+                "id": "g-orphan",
+                "name": "Gap still staffing the zombie by id",
+                "status": "active",
+                "active_moves": ["d-zombie-stale"],
+                "past_moves": [],
+            }
+        ]
+    }
+    project = await _make_gap_project(db_session, zombie, problem_model)
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "completed", "zombie direction should be auto-retired"
+
+    gap = project.problem_model["gaps"][0]
+    assert "d-zombie-stale" not in gap["active_moves"], (
+        "id-match must prune the direction even with no gap_id hint"
+    )
+    assert "d-zombie-stale" in gap["past_moves"]
+
+
 @pytest.mark.asyncio
 async def test_zombie_not_retired_on_first_churn_pause(db_session, mocker):
     """A fresh direction's FIRST churn-family pause increments the counter to 1
@@ -2617,5 +2821,321 @@ async def test_churn_pause_count_resets_on_productive_cycle(db_session):
     d = project.directions[0]
     assert d.get("churn_family_pause_count", 0) == 0, (
         "a productive cycle should reset the zombie churn-pause counter"
+    )
+
+
+def _lifetime_burn_history(now: datetime) -> tuple[list[dict], dict]:
+    """research_history + history_aggregate that trips the lifetime burn backstop
+    (Rule 6) but NOT the churn guardrail (Rule 5) or unproductive (Rule 2).
+
+    Recent window: 3 cycles, 10 tasks each, 2 merges per cycle = 20% merge rate.
+    Rule 5 threshold needs <10% rate, so it doesn't fire.
+    Aggregate: 136 non-merge tasks, 10 merges → combined lifetime merge rate ~9.6%
+    which is below the 10% threshold → trips Rule 6 (lifetime burn backstop).
+    """
+    history = [
+        {
+            "timestamp": (now - timedelta(days=3 - i)).isoformat(),
+            "tasks_created": 10,
+            "tasks_completed": 10,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": 2,
+        }
+        for i in range(3)
+    ]
+    aggregate = {
+        "total_cycles": 10,
+        "total_tasks_created": 136,
+        "total_tasks_completed": 136,
+        "total_tasks_failed": 0,
+        "total_tasks_failed_infra": 0,
+        "total_prs_merged": 10,
+    }
+    return history, aggregate
+
+
+@pytest.mark.asyncio
+async def test_lifetime_burn_manual_hold_auto_retires_after_bound(db_session, mocker):
+    """Acceptance test: a direction that trips the lifetime burn backstop for the
+    second time (_MAX_LIFETIME_BURN_PAUSE_CYCLES=2) is auto-retired on that same
+    lifecycle tick rather than accumulating another manual hold.
+
+    Verifies:
+    - status=completed, auto_completed=True
+    - auto_completed_reason mentions 'lifetime burn'
+    - needs_manual_intervention NOT set (cleared on retirement)
+    - completed_at is set
+    - gap is reconciled (pruned from active_moves)
+    """
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    history, aggregate = _lifetime_burn_history(now)
+
+    # Direction already paused once for lifetime burn (count=1, threshold=2).
+    direction = {
+        "id": "d-lb-retire",
+        "text": "Structurally stuck lifetime burn direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": history,
+        "history_aggregate": aggregate,
+        "lifetime_burn_pause_count": 1,  # already paused once — next pause retires
+        "gap_id": "g-lb-retire",
+    }
+
+    project = Project(
+        name="Lifetime Burn Retire Test",
+        user_id="u-lb-retire",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-lb-retire",
+                    "name": "LB retire gap",
+                    "status": "active",
+                    "active_moves": ["d-lb-retire"],
+                    "past_moves": [],
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "completed", (
+        "direction should be auto-retired after hitting _MAX_LIFETIME_BURN_PAUSE_CYCLES"
+    )
+    assert d.get("auto_completed") is True
+    assert "lifetime burn" in (d.get("auto_completed_reason") or "").lower(), (
+        f"auto_completed_reason should mention 'lifetime burn', got: {d.get('auto_completed_reason')!r}"
+    )
+    assert d.get("completed_at") is not None
+    assert d.get("lifetime_burn_pause_count") == 2, (
+        "lifetime_burn_pause_count should reflect the retiring pause event"
+    )
+    # Manual-hold flags cleared on retirement
+    assert not d.get("needs_manual_intervention"), (
+        "needs_manual_intervention should be cleared when direction is auto-retired"
+    )
+
+    # Gap reconciled: direction pruned from active_moves, recorded in past_moves.
+    gap = project.problem_model["gaps"][0]
+    assert "d-lb-retire" not in gap["active_moves"], (
+        "retired direction should be removed from gap active_moves"
+    )
+    assert "d-lb-retire" in gap["past_moves"], (
+        "retired direction should be recorded in gap past_moves"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lifetime_burn_retire_stale_gap_id(db_session, mocker):
+    """Regression: lifetime-burn auto-retire must remove the direction from
+    active_moves even when the direction's gap_id is stale (points to a
+    different gap than where it is actually staffed) or missing entirely.
+
+    The old code only ran reconcile when gap_id matched the staffing gap;
+    the new code uses _reconcile_retired_gap which matches by direction id
+    across ALL gaps — so a stale or absent gap_id is not a silencing no-op.
+    """
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    history, aggregate = _lifetime_burn_history(now)
+
+    # Sub-case 1: gap_id points to a *different* gap than where the direction
+    # is actually staffed.
+    direction_stale = {
+        "id": "d-lb-stale-gap",
+        "text": "Stale gap_id lifetime burn direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": history,
+        "history_aggregate": aggregate,
+        "lifetime_burn_pause_count": 1,
+        "gap_id": "g-wrong-gap",  # stale — direction is actually in g-real-gap
+    }
+
+    project_stale = Project(
+        name="LB Stale GapId Test",
+        user_id="u-lb-stale",
+        autonomous_enabled=True,
+        directions=[direction_stale],
+        vision={"purpose": "test"},
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-real-gap",
+                    "name": "Real gap (direction is actually here)",
+                    "status": "active",
+                    "active_moves": ["d-lb-stale-gap"],
+                    "past_moves": [],
+                },
+                {
+                    "id": "g-wrong-gap",
+                    "name": "Wrong gap (gap_id points here but direction isn't)",
+                    "status": "active",
+                    "active_moves": [],
+                    "past_moves": [],
+                },
+            ]
+        },
+    )
+    db_session.add(project_stale)
+    await db_session.commit()
+    await db_session.refresh(project_stale)
+    _ss.circuit_breakers.pop(str(project_stale.id), None)
+
+    await _process_direction_lifecycle(
+        project_stale, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project_stale)
+
+    d_stale = project_stale.directions[0]
+    assert d_stale["status"] == "completed", (
+        "direction should be auto-retired even with stale gap_id"
+    )
+    real_gap = next(
+        g for g in project_stale.problem_model["gaps"] if g["id"] == "g-real-gap"
+    )
+    assert "d-lb-stale-gap" not in real_gap["active_moves"], (
+        "retired direction must be removed from the gap it was actually staffing, "
+        "regardless of stale gap_id on the direction dict"
+    )
+    assert "d-lb-stale-gap" in real_gap["past_moves"], (
+        "retired direction should appear in past_moves of the real gap"
+    )
+
+    # Sub-case 2: direction has no gap_id at all but is staffing a gap.
+    history2, aggregate2 = _lifetime_burn_history(now)
+    direction_no_gap = {
+        "id": "d-lb-no-gap-id",
+        "text": "Missing gap_id lifetime burn direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": history2,
+        "history_aggregate": aggregate2,
+        "lifetime_burn_pause_count": 1,
+        # No gap_id field at all
+    }
+
+    project_no_gap = Project(
+        name="LB No GapId Test",
+        user_id="u-lb-no-gap",
+        autonomous_enabled=True,
+        directions=[direction_no_gap],
+        vision={"purpose": "test"},
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-no-gap-id-gap",
+                    "name": "Gap staffed without gap_id on direction",
+                    "status": "active",
+                    "active_moves": ["d-lb-no-gap-id"],
+                    "past_moves": [],
+                }
+            ]
+        },
+    )
+    db_session.add(project_no_gap)
+    await db_session.commit()
+    await db_session.refresh(project_no_gap)
+    _ss.circuit_breakers.pop(str(project_no_gap.id), None)
+
+    await _process_direction_lifecycle(
+        project_no_gap, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project_no_gap)
+
+    d_no_gap = project_no_gap.directions[0]
+    assert d_no_gap["status"] == "completed", (
+        "direction should be auto-retired even without any gap_id"
+    )
+    gap_no_id = project_no_gap.problem_model["gaps"][0]
+    assert "d-lb-no-gap-id" not in gap_no_id["active_moves"], (
+        "retired direction must be removed from active_moves when gap_id is absent"
+    )
+    assert "d-lb-no-gap-id" in gap_no_id["past_moves"], (
+        "retired direction should appear in past_moves even without gap_id"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lifetime_burn_no_retire_below_threshold(db_session, mocker):
+    """First lifetime-burn pause (count absent) increments to 1 and sets
+    needs_manual_intervention=True, but does NOT auto-retire the direction."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    history, aggregate = _lifetime_burn_history(now)
+
+    direction = {
+        "id": "d-lb-first",
+        "text": "First lifetime burn pause direction",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": history,
+        "history_aggregate": aggregate,
+        # No lifetime_burn_pause_count yet — this is the first pause.
+    }
+
+    project = Project(
+        name="Lifetime Burn First Pause Test",
+        user_id="u-lb-first",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d["status"] == "paused", (
+        "direction should be paused (not retired) on first lifetime burn pause"
+    )
+    assert d.get("lifetime_burn_pause_count") == 1, (
+        "lifetime_burn_pause_count should be 1 after first burn pause"
+    )
+    assert d.get("needs_manual_intervention") is True, (
+        "needs_manual_intervention should be set on the first burn pause"
+    )
+    assert not d.get("auto_completed"), (
+        "direction should NOT be auto-retired below the threshold"
     )
 

@@ -89,13 +89,13 @@ echo ""
 // /api/agent/projects/{project_id}/... — all share the standard agent auth and
 // are callable by any of the project's agent tokens, so the helper works for
 // every task type, not just strategic-cycle agents.
-export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot';
+export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot';
 
 // Canonical order of the full vocabulary. STRATEGIC provisions all of these.
 // `knowledge` is a SEARCH-shaped verb (token-scoped list/search + get-by-id),
 // distinct from the single-id project-path verbs that precede it.
 export const STRATEGIC_FETCH_VERBS: FetchVerb[] = [
-  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot',
+  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot',
 ];
 
 // Read-only verb subsets for non-strategic agents. Research resolves directions,
@@ -119,6 +119,7 @@ const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
   'gap':           'gap)        PATH_SUFFIX="gaps/$ID"',
   'message':       'message)    PATH_SUFFIX="messages/$ID"',
   'section':       'section)    PATH_SUFFIX="design-doc/$ID"',
+  'compute-sweeps': 'compute-sweeps) PATH_SUFFIX="compute-sweeps${ID:+/$ID}"',
   'qualification': 'qualification) PATH_SUFFIX="qualification"',
   'version-phase': 'version-phase) PATH_SUFFIX="version-phase"',
   'vm-cost':            'vm-cost)              PATH_SUFFIX="vm-cost"',
@@ -129,7 +130,7 @@ const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
 // path-suffix verbs it hits the token-scoped /api/agent/knowledge-documents
 // endpoint directly (project resolved from the token, not the URL): a bare
 // positional id pulls one document's full body, otherwise optional
-// --topic/--direction/--q/--source-kind/--tag flags become URL-encoded query
+// --topic/--direction/--q/--source-kind/--sweep-id/--tag flags become URL-encoded query
 // params on the list/search endpoint. It does its own curl and exits, so it
 // never falls through to the project-path fetch below.
 const KNOWLEDGE_FETCH_CASE = `  knowledge)
@@ -145,9 +146,10 @@ const KNOWLEDGE_FETCH_CASE = `  knowledge)
           --topic)       QARGS+=(--data-urlencode "topic=\${2:-}"); shift 2 ;;
           --direction)   QARGS+=(--data-urlencode "direction=\${2:-}"); shift 2 ;;
           --source-kind) QARGS+=(--data-urlencode "source_kind=\${2:-}"); shift 2 ;;
+          --sweep-id)    QARGS+=(--data-urlencode "sweep_id=\${2:-}"); shift 2 ;;
           --q)           QARGS+=(--data-urlencode "q=\${2:-}"); shift 2 ;;
           --tag)         QARGS+=(--data-urlencode "tag=\${2:-}"); shift 2 ;;
-          *) echo "[ERROR] fetch knowledge: unknown flag '$1' (use --topic/--direction/--q/--source-kind/--tag or a document id)" >&2; exit 1 ;;
+          *) echo "[ERROR] fetch knowledge: unknown flag '$1' (use --topic/--direction/--q/--source-kind/--sweep-id/--tag or a document id)" >&2; exit 1 ;;
         esac
       done
       kresp=$(curl -sS --max-time 20 --connect-timeout 10 --get \\
@@ -170,7 +172,8 @@ const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'gap':           '`./fetch gap <id>` — a full gap record',
   'message':       '`./fetch message <ref>` — an operator message (short ref or UUID)',
   'section':       '`./fetch section <key>` — a full design-doc section',
-  'knowledge':     '`./fetch knowledge [--topic T] [--direction D] [--q TERM] [--source-kind K] [--tag T]` — list/search knowledge documents (web_research/design outputs); `./fetch knowledge <id>` for one document\'s full body',
+  'knowledge':     '`./fetch knowledge [--topic T] [--direction D] [--q TERM] [--source-kind K] [--sweep-id S] [--tag T]` — list/search knowledge documents (web_research/design outputs); `./fetch knowledge <id>` for one document\'s full body',
+  'compute-sweeps': '`./fetch compute-sweeps [sweep_id]` — list completed compute experiment sweeps, or fetch one sweep by id',
   'qualification': '`./fetch qualification` — latest qualification verdict for the open version: candidate SHA, confidence, sub_scores, and full audit findings list (no id)',
   'version-phase': '`./fetch version-phase` — compact current version phase/lifecycle context, qualification state, serving/deploy status, and recent closed versions (no id)',
   'vm-cost':            '`./fetch vm-cost` — live VM cost by task type: cost_usd, task/VM count, merged count, and merge-yield per type over the last 7 days (no id)',
@@ -208,8 +211,9 @@ TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 PROJECT="${projectId}"
 [ -n "$PROJECT" ] || { echo "[ERROR] no project_id available; ./fetch is unavailable in this workspace" >&2; exit 1; }
 
-# problem-model, qualification, version-phase, vm-cost, and efficiency-snapshot
-# take no id; everything else requires one. For "message" the id may be a short
+# problem-model, compute-sweeps, qualification, version-phase, vm-cost, and efficiency-snapshot
+# take no id; everything else requires one. compute-sweeps accepts an optional
+# sweep_id. For "message" the id may be a short
 # ref (first 8+ hex chars of the message UUID — the same ref operators see in
 # the admin UI) or a full UUID; the backend resolves it and fails loudly on
 # ambiguous/missing refs.
@@ -217,7 +221,7 @@ case "$KIND" in
 ${caseBody}
 esac
 
-if [ "$KIND" != "problem-model" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ -z "$ID" ]; then
+if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ -z "$ID" ]; then
   echo "[ERROR] fetch $KIND requires an id argument" >&2
   exit 1
 fi

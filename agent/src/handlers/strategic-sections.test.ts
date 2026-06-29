@@ -1198,7 +1198,7 @@ describe('buildSweepComparisonSection', () => {
         },
       ],
     });
-    expect(result).toContain('Winner: **beta** (loss=0.81)');
+    expect(result).toContain('Winner: **beta** (loss=0.81; margin=0.13 over alpha=0.94)');
     expect(result).toContain('margin: +0.13 loss over alpha');
     expect(result).toContain('**alpha** [NOT MET]');
     expect(result).toContain('**beta** [MET]');
@@ -1243,9 +1243,22 @@ describe('buildSweepComparisonSection', () => {
     expect(result).not.toContain('margin:');
   });
 
+  it('does not dereference a missing measured arm when all label-only arms are NOT MET', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-label-only-all-fail': [
+        { id: 'k-a', title: 'arm A', arm_label: 'a', criterion_met: false, summary: 'No pass' },
+        { id: 'k-b', title: 'arm B', arm_label: 'b', criterion_met: false, summary: 'No pass' },
+      ],
+    });
+    expect(result).toContain('Winner: **none (all NOT MET)**');
+    expect(result).toContain('Best measured arm: none (no numeric metric values available)');
+    expect(result).toContain('**a** [NOT MET] [k-a]');
+    expect(result).toContain('**b** [NOT MET] [k-b]');
+  });
+
   it('omits the margin when there is only one numeric arm', () => {
     const result = buildSweepComparisonSection({
-      'sweep-single': [
+      'sweep-one-numeric': [
         {
           id: 'k-solo',
           title: 'Solo arm',
@@ -1254,6 +1267,13 @@ describe('buildSweepComparisonSection', () => {
           criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
           per_arm_verdicts: { solo: { value: 0.97, met: true } },
           summary: 'Single-arm completion',
+        },
+        {
+          id: 'k-unmeasured',
+          title: 'Unmeasured arm',
+          arm_label: 'unmeasured',
+          criterion_met: false,
+          summary: 'No metric value',
         },
       ],
     });

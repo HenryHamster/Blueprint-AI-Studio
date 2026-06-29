@@ -730,12 +730,23 @@ async def build_compute_sweep_groups(
 ) -> dict[str, list[dict]]:
     """Group complete compute_experiment sweeps by their planned task roster.
 
-    Returns ``{sweep_id: [entry, ...]}`` only when the authoritative
-    ``compute_experiment`` Task rows for the project (and direction, when
-    scoped) define at least two unique arm labels and every planned arm has
-    reached a terminal state with a newest definitive, available
-    KnowledgeDocument. ``build_sweep_knowledge_index`` remains the raw per-sweep
-    document listing; this payload is reserved for strategist-ready comparisons.
+    Returns ``{sweep_id: [entry, ...]}`` for sweeps that pass the completeness
+    gate. Bounded to ``limit`` distinct sweeps, newest-first. Sweeps with no
+    sweep_id are excluded. Two paths populate the result:
+
+    1. Multi-doc path: sweeps with ``>= _SWEEP_MIN_DOCS`` KnowledgeDocuments.
+    2. Single-doc arms-block path: sweeps with exactly one KnowledgeDocument
+       whose ``per_arm_verdicts`` carries ``>= _SWEEP_MIN_DOCS`` arms, each
+       with a boolean ``met`` value. Used for single-task arms-block experiments
+       where all arm results are encoded in a single document.
+
+    Completeness gate (both paths): when compute_experiment Task rows for this
+    project carry a matching sweep_id in their first payload, every such task
+    must have a usable KnowledgeDocument (source_task_id match, no
+    unavailable_cause) before the sweep is returned. Sweeps that fail this
+    check are excluded so the strategist cannot synthesise from partial
+    evidence. When no Task manifest is discoverable for a sweep, the
+    docs-only behavior is preserved unchanged.
     """
     docs_stmt = (
         build_knowledge_documents_stmt(
@@ -754,23 +765,25 @@ async def build_compute_sweep_groups(
             continue
         by_sweep_docs.setdefault(sid, []).append(doc)
 
-    candidate_sweeps = {
+    if not by_sweep_docs:
+        return {}
+
+    multi_docs = {
         sid: docs
         for sid, docs in by_sweep_docs.items()
         if len(docs) >= _SWEEP_MIN_DOCS
     }
-    if not candidate_sweeps:
-        return {}
+    single_doc_candidates: dict[str, KnowledgeDocument] = {
+        sid: docs[0]
+        for sid, docs in by_sweep_docs.items()
+        if len(docs) == 1
+    }
+    candidate_sweep_ids = set(multi_docs) | set(single_doc_candidates)
 
-    task_stmt = (
-        select(Task)
-        .where(
-            Task.project_id == project_id,
-            Task.payloads[0]["type"].as_string()
-            == SourceKind.COMPUTE_EXPERIMENT.value,
-            Task.payloads[0]["sweep_id"].as_string().is_not(None),
-        )
-        .order_by(Task.created_at.desc())
+    task_stmt = select(Task).where(
+        Task.project_id == project_id,
+        Task.payloads[0]["type"].as_string() == SourceKind.COMPUTE_EXPERIMENT.value,
+        Task.payloads[0]["sweep_id"].as_string().in_(list(candidate_sweep_ids)),
     )
     if direction_id:
         task_stmt = task_stmt.where(
@@ -803,7 +816,7 @@ async def build_compute_sweep_groups(
         docs_by_sweep_arm.setdefault(sweep_id, {}).setdefault(arm_label, doc)
 
     complete: dict[str, list[dict]] = {}
-    for sweep_id, docs in candidate_sweeps.items():
+    for sweep_id, docs in multi_docs.items():
         arms = planned.get(sweep_id)
         if not arms:
             if direction_id is None:
@@ -838,6 +851,49 @@ async def build_compute_sweep_groups(
         )
         complete[sweep_id] = [
             _knowledge_index_entry(doc, summary_chars) for doc in selected_docs
+        ]
+
+    for sweep_id, doc in single_doc_candidates.items():
+        if sweep_id in complete:
+            continue
+        arms = planned.get(sweep_id)
+        if not arms and direction_id is not None:
+            continue
+        if arms and any(
+            not _compute_sweep_task_is_terminal(task)
+            for arm_tasks in arms.values()
+            for task in arm_tasks
+        ):
+            continue
+        if arms and not all(
+            any(
+                doc.source_task_id == task.id and _compute_sweep_doc_is_definitive(doc)
+                for doc in by_sweep_docs.get(sweep_id, [])
+            )
+            for arm_tasks in arms.values()
+            for task in arm_tasks
+        ):
+            continue
+        fqv = (
+            doc.forward_quality_verdict
+            if isinstance(doc.forward_quality_verdict, dict)
+            else {}
+        )
+        verdicts = fqv.get("per_arm_verdicts")
+        if not isinstance(verdicts, dict):
+            continue
+        arm_items = list(verdicts.items())
+        if len(arm_items) < _SWEEP_MIN_DOCS:
+            continue
+        if not all(
+            isinstance(arm, dict) and arm.get("met") in (True, False)
+            for _, arm in arm_items
+        ):
+            continue
+        base_entry = _knowledge_index_entry(doc, summary_chars)
+        complete[sweep_id] = [
+            {**base_entry, "arm_label": str(arm_name), "criterion_met": arm.get("met")}
+            for arm_name, arm in arm_items
         ]
 
     if not complete:

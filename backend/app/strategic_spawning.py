@@ -2531,6 +2531,13 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # draws prerequisite / provides_capability refs from. Small and bounded; medium
     # priority so it survives typical pressure but degrades before load-bearing state.
     "available_capabilities": {"priority": "medium"},
+    # Live local-runner availability (ever_registered, active_total, active_gpu,
+    # require_local_runner). Surfaced only when the project has ever registered a
+    # runner OR declares the enforce-local policy. Medium priority: it is small
+    # (4 scalars) and actionable — the strategist uses it to avoid authoring GPU
+    # experiments that would fall back to billable cloud GPU (or be held
+    # indefinitely when require_local_runner is set).
+    "local_runner_status": {"priority": "medium"},
 }
 
 

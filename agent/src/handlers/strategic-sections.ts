@@ -630,7 +630,6 @@ export function buildSweepComparisonSection(
       arm.met && arm.value !== null ? [{ id: arm.id, label: arm.label, value: arm.value }] : []
     ));
     const metricWinner = bestArmByMetric(metArms, direction);
-    const bestMeasuredArm = measuredArms[0] ?? null;
     const runnerUp = metricWinner && measuredArms.length > 1
       ? measuredArms.find(arm => arm.id !== metricWinner.id) ?? null
       : measuredArms[1] ?? null;
@@ -653,9 +652,14 @@ export function buildSweepComparisonSection(
         : metricWinner.value - runnerUp.value;
       lines.push(`margin: +${formatMetricNumber(margin)} ${metric} over ${runnerUp.label}`);
     } else if (!metricWinner) {
-      lines.push(
-        `Best measured arm: **${bestMeasuredArm.label}**${renderMetricTail(metric, bestMeasuredArm, runnerUp, direction)}`,
-      );
+      if (measuredArms.length > 0) {
+        const measuredFallback = measuredArms[0];
+        lines.push(
+          `Best measured arm: **${measuredFallback.label}**${renderMetricTail(metric, measuredFallback, runnerUp, direction)}`,
+        );
+      } else {
+        lines.push('Best measured arm: none (no numeric metric values available)');
+      }
     }
 
     for (const arm of armRows) {

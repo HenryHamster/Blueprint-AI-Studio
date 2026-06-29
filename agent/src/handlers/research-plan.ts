@@ -1371,17 +1371,27 @@ export function buildPortfolioComposition(
 
   const pct = (n: number) => total > 0 ? Math.round((n / total) * 100) : 0;
   const productPct = pct(catCounts.product);
+  // The shipped detail list is incomplete when fewer active rows shipped than
+  // the authoritative total — i.e. some active directions were trimmed.
+  const listIncomplete = shipped < total;
   const lines: string[] = [];
   // When the shipped rows are fewer than the authoritative total, the category
   // mix is computed from the shipped subset but percentages divide by the true
   // total — flag that so the reader does not mistake a partial mix for the whole.
-  if (shipped < total) {
+  if (listIncomplete) {
     lines.push(`_Category mix below computed from ${shipped} of ${total} active directions shipped this cycle (${total - shipped} trimmed for budget — fetch with \`./fetch direction <id>\`); percentages use the authoritative total of ${total}._`);
   }
   const catParts = (['product', 'structural', 'mixed', 'uncategorized'] as const)
     .filter(c => catCounts[c] > 0)
     .map(c => `${c}=${catCounts[c]} (${pct(catCounts[c])}%)`);
-  const productFlag = productPct < 30 ? ' [LOW PRODUCT RATIO — <30%]' : '';
+  // When the direction list is trimmed the category counts only cover the shipped
+  // subset, so a definitive low-product alarm is misleading — trimmed-away
+  // product directions could bring the full-portfolio ratio above 30%.
+  const productFlag = productPct < 30
+    ? (listIncomplete
+        ? ' [LOW PRODUCT RATIO IN SHOWN SUBSET — <30%; omitted directions may alter the full mix]'
+        : ' [LOW PRODUCT RATIO — <30%]')
+    : '';
   lines.push(`Category mix: ${catParts.join(', ')}${productFlag}`);
 
   // Per-system signals (coverage gaps + concentration risk). Prefer the
@@ -1395,9 +1405,6 @@ export function buildPortfolioComposition(
   const effectiveSystemCounts: Record<string, number> = hasAuthSystemCounts
     ? authoritativeSystemCounts
     : systemCounts;
-  // The shipped detail list is incomplete when fewer active rows shipped than
-  // the authoritative total — i.e. some active directions were trimmed.
-  const listIncomplete = shipped < total;
 
   const allSystems = systems.filter(s => typeof s.id === 'string').map(s => ({
     id: s.id as string,

@@ -2,13 +2,21 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const fsMockState = vi.hoisted(() => ({
   presentFiles: new Set<string>(),
+  fileContents: new Map<string, string>(),
 }));
 
 vi.mock('fs', () => ({
   default: {
-    readFileSync: vi.fn().mockReturnValue(''),
-    writeFileSync: vi.fn((path: string) => {
-      if (typeof path === 'string') fsMockState.presentFiles.add(path);
+    readFileSync: vi.fn((path: string) => {
+      return fsMockState.fileContents.get(path) || '';
+    }),
+    writeFileSync: vi.fn((path: string, data: string) => {
+      if (typeof path === 'string') {
+        fsMockState.presentFiles.add(path);
+        if (typeof data === 'string') {
+          fsMockState.fileContents.set(path, data);
+        }
+      }
     }),
     existsSync: vi.fn((path: string) => fsMockState.presentFiles.has(path)),
     appendFileSync: vi.fn(),
@@ -27,7 +35,13 @@ vi.mock('../index.js', () => ({
 
 import fs from 'fs';
 import { runClaudeCode, persistAndPostStatus } from '../index.js';
-import { buildThinkerPrompt, runThinkerWithGate, type ThinkerPromptParams } from './thinker.js';
+import {
+  buildThinkerPrompt,
+  computeResearchPlanPromptFingerprint,
+  computeStrategicPromptFingerprint,
+  runThinkerWithGate,
+  type ThinkerPromptParams,
+} from './thinker.js';
 import { READ_ONLY_BASH_WRITE_NOTE } from '../prompt.js';
 import { buildThinkerPrompt as buildThinkerPromptFromResearchPlan } from '../handlers/research-plan.js';
 import { buildMemoCitationsSection } from '../handlers/research-plan.js';
@@ -39,6 +53,63 @@ import { renderStrategicPromptSuffix } from '../handlers/strategic.js';
 describe('thinker re-export identity', () => {
   it('research-plan.ts re-exports buildThinkerPrompt from thinker.ts (same reference)', () => {
     expect(buildThinkerPromptFromResearchPlan).toBe(buildThinkerPrompt);
+  });
+});
+
+describe('computeStrategicPromptFingerprint', () => {
+  const base: ThinkerPromptParams = {
+    contextPrefix: '',
+    projectName: 'Test Project',
+    clockHeader: 'Clock: 2026-05-04',
+    isSelfRepo: false,
+    userStateLine: 'User last active: today',
+    packerMetaSection: '',
+    strategicContext: '',
+    problemModelSection: '## Your current understanding (problem_model)\n```json\n{\n  "fingerprint": "strategic-prompt"\n}\n```',
+    problemModelRecovery: 'present',
+    reflectionSection: '## What you previously said was hard\n_(no prior)_',
+    selfImprovementBlock: '',
+    runningUpdateSection: '## Running update (living document — rewrite, don\'t append)\n_(empty)_',
+    designDocJson: '',
+    visionJson: '',
+    outcomeSection: '',
+    previousDecisionOutcomes: '',
+    pastRetirementCritiquesSection: '',
+    retiredDirectionsSummarySection: '',
+    dirSummaryText: 'No active directions.',
+    dirHealthSummary: 'Active: 0/10 slots.',
+    userPausedSection: '',
+    rejectedProposalsSection: '',
+    operatorOverridesSection: '',
+    portfolioCompositionText: 'No active directions — portfolio is empty.',
+    modelHealthSection: '',
+    systemMaturitySection: '',
+    driftSection: '',
+    recentWorkSection: '',
+    feedbackSection: '',
+    questionSection: '',
+    threadSection: '',
+    taskId: 'test-task-123',
+    versionPhaseSection: '',
+    memoCitationsSection: '',
+    efficiencySnapshotSection: '',
+  };
+
+  it('normalizes payload noise but changes when strategic structure changes', () => {
+    const stable = computeStrategicPromptFingerprint(base);
+    const noisy = computeStrategicPromptFingerprint({
+      ...base,
+      projectName: 'Different Project',
+      clockHeader: 'Clock: 2026-06-01',
+      userStateLine: 'User last active: yesterday',
+      taskId: 'other-task',
+    });
+    const fetchVariant = computeStrategicPromptFingerprint({ ...base, problemModelRecovery: 'fetch' });
+
+    expect(stable).toHaveLength(12);
+    expect(stable).toBe(noisy);
+    expect(stable).not.toBe(fetchVariant);
+    expect(stable).not.toBe(computeResearchPlanPromptFingerprint('research'));
   });
 });
 
@@ -588,13 +659,24 @@ describe('runThinkerWithGate', () => {
     // bleed-over between tests. Re-setup defaults after the reset.
     vi.resetAllMocks();
     fsMockState.presentFiles.clear();
+    fsMockState.fileContents.clear();
     mockRunClaudeCode.mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
     mockPersistAndPostStatus.mockResolvedValue(undefined);
     mockExistsSync.mockImplementation((path: string) => fsMockState.presentFiles.has(path));
-    // resetAllMocks also clears the writeFileSync implementation from vi.mock().
-    // Restore it so that thinker.ts writing the problem_model file is reflected in presentFiles.
-    vi.mocked(fs.writeFileSync as (path: string, data: unknown) => void).mockImplementation(
-      (path: string) => { if (typeof path === 'string') fsMockState.presentFiles.add(path); },
+    // resetAllMocks also clears the implementations from vi.mock().
+    // Restore them so that thinker.ts writing/reading files is properly tracked.
+    vi.mocked(fs.readFileSync as (path: string, encoding?: string) => string).mockImplementation(
+      (path: string) => fsMockState.fileContents.get(path) || '',
+    );
+    vi.mocked(fs.writeFileSync as (path: string, data: string) => void).mockImplementation(
+      (path: string, data: string) => {
+        if (typeof path === 'string') {
+          fsMockState.presentFiles.add(path);
+          if (typeof data === 'string') {
+            fsMockState.fileContents.set(path, data);
+          }
+        }
+      },
     );
   });
 
@@ -614,16 +696,16 @@ describe('runThinkerWithGate', () => {
     // Gate should check the authoritative written file before deciding to repair,
     // so a valid file + imperfect stdout does NOT trigger a repair reopen.
     const validProblemModel = '{"intent":{"purpose":"real intent"},"gaps":[],"capabilities":[]}';
-    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockReturnValueOnce(
-      validProblemModel,
-    );
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.fileContents.set(problemModelPath, validProblemModel);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.fileContents.set(runningUpdatePath, '# Running Update\n');
+
     mockRunClaudeCode.mockResolvedValueOnce({
       exitCode: 0,
       allOutput: 'analysis without parseable problem_model JSON',
       lastResultText: '',
     });
-    fsMockState.presentFiles.add(problemModelPath);
-    fsMockState.presentFiles.add(runningUpdatePath);
 
     const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
 
@@ -671,18 +753,20 @@ describe('runThinkerWithGate', () => {
   it('(b2) repair prompt includes research_progress breadcrumb when the file exists', async () => {
     // Arrange: thinker wrote a research_progress breadcrumb file.
     const progressPath = `/tmp/research_progress_${taskId}.md`;
+    const progressContent = '# Progress summary\nIntent: billing system\nGaps: g-billing';
+    const validProblemModel = '{"intent":{"purpose":"ok"},"gaps":[]}';
     fsMockState.presentFiles.add(progressPath);
-    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockReturnValueOnce(
-      '# Progress summary\nIntent: billing system\nGaps: g-billing',
-    );
+    fsMockState.fileContents.set(progressPath, progressContent);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.fileContents.set(runningUpdatePath, '# Running Update\n');
+
     mockRunClaudeCode
       .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
       .mockResolvedValueOnce({
         exitCode: 0,
-        allOutput: '{"intent":{"purpose":"ok"},"gaps":[]}',
-        lastResultText: '{"intent":{"purpose":"ok"},"gaps":[]}',
+        allOutput: validProblemModel,
+        lastResultText: validProblemModel,
       });
-    fsMockState.presentFiles.add(runningUpdatePath);
 
     await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
 
@@ -711,13 +795,17 @@ describe('runThinkerWithGate', () => {
     // Thinker applied state via ./strategic commands — no inline JSON expected.
     // Both handoff files are present (written by the thinker via bash or the API).
     const commandModeOutput = './strategic set-problem-model ...\n./strategic set-running-update ...';
+    const validProblemModel = '{"intent":{"purpose":"ok"},"gaps":[]}';
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.fileContents.set(problemModelPath, validProblemModel);
+    fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.fileContents.set(runningUpdatePath, '# Running Update\n');
+
     mockRunClaudeCode.mockResolvedValueOnce({
       exitCode: 0,
       allOutput: commandModeOutput,
       lastResultText: commandModeOutput,
     });
-    fsMockState.presentFiles.add(problemModelPath);
-    fsMockState.presentFiles.add(runningUpdatePath);
 
     const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
 
@@ -768,15 +856,13 @@ describe('runThinkerWithGate', () => {
   it('(g) Section 7 new_version_goal file present → returned in newVersionGoal field', async () => {
     const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
     const goalText = 'Deliver autonomous cross-project coordination so Blueprint manages 3+ projects with fewer than 1 operator intervention per day.';
+    const validProblemModel = '{"intent":{"purpose":"ok"},"gaps":[]}';
     fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.fileContents.set(problemModelPath, validProblemModel);
     fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.fileContents.set(runningUpdatePath, '# Running Update\n');
     fsMockState.presentFiles.add(newVersionGoalPath);
-    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
-      (path: string) => {
-        if (path === newVersionGoalPath) return goalText;
-        return '{"intent":{"purpose":"ok"},"gaps":[]}';
-      },
-    );
+    fsMockState.fileContents.set(newVersionGoalPath, goalText);
     mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
 
     const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
@@ -788,8 +874,11 @@ describe('runThinkerWithGate', () => {
   });
 
   it('(h) Section 7 new_version_goal file absent → newVersionGoal undefined in result', async () => {
+    const validProblemModel = '{"intent":{"purpose":"ok"},"gaps":[]}';
     fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.fileContents.set(problemModelPath, validProblemModel);
     fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.fileContents.set(runningUpdatePath, '# Running Update\n');
     // new_version_goal_<taskId>.txt NOT in presentFiles
     mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
 
@@ -803,15 +892,13 @@ describe('runThinkerWithGate', () => {
 
   it('(i) Section 7 file present but empty → newVersionGoal undefined (empty content rejected)', async () => {
     const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
+    const validProblemModel = '{"intent":{"purpose":"ok"},"gaps":[]}';
     fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.fileContents.set(problemModelPath, validProblemModel);
     fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.fileContents.set(runningUpdatePath, '# Running Update\n');
     fsMockState.presentFiles.add(newVersionGoalPath);
-    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
-      (path: string) => {
-        if (path === newVersionGoalPath) return '   \n  '; // whitespace only
-        return '{"intent":{"purpose":"ok"},"gaps":[]}';
-      },
-    );
+    fsMockState.fileContents.set(newVersionGoalPath, '   \n  '); // whitespace only
     mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
 
     const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
@@ -826,17 +913,12 @@ describe('runThinkerWithGate', () => {
     // First-class path: the thinker embeds new_version_goal directly in the
     // problem_model JSON rather than writing a separate tmp file.
     const goalText = 'Deliver autonomous cross-project coordination with zero operator interventions per day.';
+    const problemModelWithGoal = JSON.stringify({ intent: { purpose: 'ok' }, gaps: [], new_version_goal: goalText });
     fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.fileContents.set(problemModelPath, problemModelWithGoal);
     fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.fileContents.set(runningUpdatePath, '# Running Update\n');
     // No new_version_goal_<taskId>.txt in presentFiles (tmp file absent)
-    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
-      (path: string) => {
-        if (path === problemModelPath) {
-          return JSON.stringify({ intent: { purpose: 'ok' }, gaps: [], new_version_goal: goalText });
-        }
-        return '';
-      },
-    );
     mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
 
     const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
@@ -852,18 +934,13 @@ describe('runThinkerWithGate', () => {
     const goalInJson = 'Primary goal from problem_model JSON field.';
     const goalInFile = 'Secondary goal from legacy tmp file.';
     const newVersionGoalPath = `/tmp/new_version_goal_${taskId}.txt`;
+    const problemModelWithGoal = JSON.stringify({ intent: { purpose: 'ok' }, gaps: [], new_version_goal: goalInJson });
     fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.fileContents.set(problemModelPath, problemModelWithGoal);
     fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.fileContents.set(runningUpdatePath, '# Running Update\n');
     fsMockState.presentFiles.add(newVersionGoalPath);
-    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
-      (path: string) => {
-        if (path === problemModelPath) {
-          return JSON.stringify({ intent: { purpose: 'ok' }, gaps: [], new_version_goal: goalInJson });
-        }
-        if (path === newVersionGoalPath) return goalInFile;
-        return '';
-      },
-    );
+    fsMockState.fileContents.set(newVersionGoalPath, goalInFile);
     mockRunClaudeCode.mockResolvedValueOnce(okThinkerResult);
 
     const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
@@ -897,13 +974,24 @@ describe('runThinkerWithGate validateParsedValue guard', () => {
   beforeEach(() => {
     vi.resetAllMocks();
     fsMockState.presentFiles.clear();
+    fsMockState.fileContents.clear();
     mockRunClaudeCode.mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
     mockPersistAndPostStatus.mockResolvedValue(undefined);
     vi.mocked(fs.existsSync as (p: string) => boolean).mockImplementation(
       (path: string) => fsMockState.presentFiles.has(path),
     );
-    vi.mocked(fs.writeFileSync as (path: string, data: unknown) => void).mockImplementation(
-      (path: string) => { if (typeof path === 'string') fsMockState.presentFiles.add(path); },
+    vi.mocked(fs.readFileSync as (path: string, encoding?: string) => string).mockImplementation(
+      (path: string) => fsMockState.fileContents.get(path) || '',
+    );
+    vi.mocked(fs.writeFileSync as (path: string, data: string) => void).mockImplementation(
+      (path: string, data: string) => {
+        if (typeof path === 'string') {
+          fsMockState.presentFiles.add(path);
+          if (typeof data === 'string') {
+            fsMockState.fileContents.set(path, data);
+          }
+        }
+      },
     );
   });
 
@@ -960,6 +1048,8 @@ describe('runThinkerWithGate validateParsedValue guard', () => {
 
   it('accepts real intent.purpose — no focused retry, file written, returns ok:true', async () => {
     fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.fileContents.set(runningUpdatePath, '# Running Update\n');
+
     mockRunClaudeCode
       .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
       .mockResolvedValueOnce({
@@ -979,6 +1069,8 @@ describe('runThinkerWithGate validateParsedValue guard', () => {
     // The prompt explicitly permits partial updates: "entries you omit are preserved".
     // A legitimate partial update might omit intent entirely (only changing gaps or capabilities).
     fsMockState.presentFiles.add(runningUpdatePath);
+    fsMockState.fileContents.set(runningUpdatePath, '# Running Update\n');
+
     mockRunClaudeCode
       .mockResolvedValueOnce({ exitCode: 0, allOutput: 'analysis without JSON', lastResultText: '' })
       .mockResolvedValueOnce({
@@ -992,6 +1084,50 @@ describe('runThinkerWithGate validateParsedValue guard', () => {
     expect(mockRunClaudeCode).toHaveBeenCalledTimes(2);
     expect(fsMockState.presentFiles.has(problemModelPath)).toBe(true);
     expect(result).toEqual({ ok: true, analysisText: 'analysis without JSON' });
+  });
+
+  it('rejects_existing_but_invalid_problem_model_handoff', async () => {
+    // Both handoff files exist, but problem_model contains an invalid intent.purpose (empty string).
+    // The gate must reject this and trigger repair/retry, not return ok with malformed state.
+    fsMockState.presentFiles.add(problemModelPath);
+    fsMockState.presentFiles.add(runningUpdatePath);
+
+    const invalidProblemModel = JSON.stringify({ intent: { purpose: '' }, gaps: [], capabilities: [] });
+
+    // Mock readFileSync to return invalid problem_model for the initial read
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => {
+        if (path === problemModelPath) {
+          return invalidProblemModel;
+        }
+        return '';
+      },
+    );
+
+    // Thinker produces output, repair still produces invalid model, retry can't fix it
+    mockRunClaudeCode
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: invalidProblemModel, // thinker's output
+        lastResultText: invalidProblemModel,
+      })
+      // repair session detects invalid content and fails validation
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: '{"intent":{"purpose":"<placeholder>"},"gaps":[]}',
+        lastResultText: '{"intent":{"purpose":"<placeholder>"},"gaps":[]}',
+      })
+      // focused retry still can't produce valid files
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: 'retry output', lastResultText: '' });
+
+    const result = await runThinkerWithGate('prompt', taskId, ws, statusRef, undefined, undefined, []);
+
+    // Should fail because the existing problem_model is invalid and repair/retry don't fix it
+    expect(result).toEqual({ ok: false });
+    expect(mockPersistAndPostStatus).toHaveBeenCalledOnce();
+    const statusArg = mockPersistAndPostStatus.mock.calls[0][1];
+    expect(statusArg.status).toBe('FAILED');
+    expect(statusArg.failure_category).toBe('strategic_thinker_artifacts_missing');
   });
 });
 

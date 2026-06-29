@@ -3195,6 +3195,205 @@ async def test_build_compute_sweep_groups_falls_back_to_docs_only_when_no_task_m
 
 
 @pytest.mark.asyncio
+async def test_build_compute_sweep_groups_includes_single_doc_arms_block(db_session):
+    """A lone compute doc with >=2 measured per-arm verdicts is still a completed sweep."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, task = await _make_web_research_task(db_session, project_name="SWGBlock")
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="arms block",
+        source_kind="compute_experiment",
+        sweep_id="sw-block",
+        arm_label="arms-block",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": True,
+            "criterion": {"metric": "accuracy", "value": 0.92},
+            "per_arm_verdicts": {
+                "baseline": {"value": 0.88, "met": False},
+                "treatment": {"value": 0.92, "met": True},
+            },
+        },
+        source_citations=["gs://bucket/result.json"],
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="one-arm block",
+        source_kind="compute_experiment",
+        sweep_id="sw-solo",
+        arm_label="arms-block",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": True,
+            "criterion": {"metric": "accuracy", "value": 0.91},
+            "per_arm_verdicts": {
+                "only": {"value": 0.91, "met": True},
+            },
+        },
+        source_citations=["gs://bucket/result.json"],
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-block" in groups
+    assert "sw-solo" not in groups
+    assert len(groups) == 1
+
+    entries = groups["sw-block"]
+    assert len(entries) == 2
+    by_label = {e["arm_label"]: e for e in entries}
+    assert by_label["baseline"]["criterion_met"] is False
+    assert by_label["treatment"]["criterion_met"] is True
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_single_doc_blocks_unmeasured_arm(db_session):
+    """A lone-doc sweep whose per_arm_verdicts has an unmeasured arm (met=None) is excluded.
+
+    This exercises the guard that prevents partial-sweep overclaim when the arms block
+    is incomplete — the invariant that every arm must carry a boolean met value.
+    """
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, task = await _make_web_research_task(db_session, project_name="SWGUnmeasured")
+    # per_arm_verdicts has one boolean arm and one unmeasured arm (met=None).
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="partial arms block",
+        source_kind="compute_experiment",
+        sweep_id="sw-partial",
+        arm_label="arms-block",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": True,
+            "criterion": {"metric": "accuracy", "value": 0.92},
+            "per_arm_verdicts": {
+                "baseline": {"value": 0.88, "met": False},
+                "treatment": {"value": None, "met": None},  # unmeasured — must disqualify
+            },
+        },
+        source_citations=["gs://bucket/result.json"],
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-partial" not in groups, (
+        "A per_arm_verdicts block with an unmeasured arm must not be synthesised"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_single_doc_blocks_when_sibling_task_missing_doc(
+    db_session,
+):
+    """A single-doc sweep is excluded when a sibling compute_experiment task lacks a doc.
+
+    Even though the one document's per_arm_verdicts appears fully measured, the Task
+    manifest shows a second planned arm with no usable KnowledgeDocument — the sweep
+    must be excluded to enforce the completeness invariant.
+    """
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project = make_project(name="SWGSiblingMissing")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # task_main produces the single document.
+    task_main = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-sibling", arm_label="main"
+    )
+    # task_sibling is a second planned arm — it never produced a KnowledgeDocument.
+    await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-sibling", arm_label="sibling"
+    )
+
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_main.id,
+        title="main arm result",
+        source_kind="compute_experiment",
+        sweep_id="sw-sibling",
+        arm_label="arms-block",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": True,
+            "criterion": {"metric": "accuracy", "value": 0.92},
+            "per_arm_verdicts": {
+                "baseline": {"value": 0.88, "met": False},
+                "treatment": {"value": 0.92, "met": True},
+            },
+        },
+        source_citations=["gs://bucket/result.json"],
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-sibling" not in groups, (
+        "Single-doc sweep with an unrepresented sibling task must be excluded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_single_doc_with_manifest_included(db_session):
+    """A lone-doc sweep backed by a compute_experiment Task manifest is included.
+
+    This exercises the manifest-gating positive path: a single compute_experiment
+    Task with the same sweep_id exists, the document is sourced from that task
+    (so it is usable), and the per_arm_verdicts are fully measured — the sweep
+    must be promoted to a completed group entry.
+    """
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project = make_project(name="SWGManifestOK")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # One compute_experiment task — the manifest contains exactly this task.
+    task = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-manifest-ok", arm_label="arms"
+    )
+
+    # One document sourced from that task with fully measured per_arm_verdicts.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="single-doc arms block",
+        source_kind="compute_experiment",
+        sweep_id="sw-manifest-ok",
+        arm_label="arms-block",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": True,
+            "criterion": {"metric": "accuracy", "value": 0.92},
+            "per_arm_verdicts": {
+                "baseline": {"value": 0.88, "met": False},
+                "treatment": {"value": 0.92, "met": True},
+            },
+        },
+        source_citations=["gs://bucket/result.json"],
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-manifest-ok" in groups, (
+        "Single-doc sweep whose sole compute_experiment task produced a usable doc "
+        "must be included via the manifest-gating path"
+    )
+    entries = groups["sw-manifest-ok"]
+    assert len(entries) == 2
+    by_label = {e["arm_label"]: e for e in entries}
+    assert by_label["baseline"]["criterion_met"] is False
+    assert by_label["treatment"]["criterion_met"] is True
+
+
+@pytest.mark.asyncio
 async def test_analyze_unavailable_stamps_cause_on_existing_doc(
     db_session, _quiet_broadcast
 ):
