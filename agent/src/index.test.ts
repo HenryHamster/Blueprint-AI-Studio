@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, type SecretManifest, type FailureCategory } from './index.js';
 import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { jaccardSimilarity } from './utils/diff-detection.js';
 import {
@@ -131,6 +131,11 @@ beforeEach(() => {
   delete process.env.LLM_EXECUTION_MODE;
   delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
   delete process.env.ANTHROPIC_API_KEY;
+  delete process.env.ANTHROPIC_AUTH_TOKEN;
+  delete process.env.ANTHROPIC_BASE_URL;
+  delete process.env.ZAI_API_KEY;
+  delete process.env.ZAI_ANTHROPIC_BASE_URL;
+  delete process.env.ZAI_BASE_URL;
   delete process.env.OPENAI_API_KEY;
   delete process.env.CODEX_API_KEY;
   delete process.env.CODEX_HOME;
@@ -433,10 +438,16 @@ describe('sanitize', () => {
     expect(sanitize('AGENT_SECRET_TOKEN=abc')).toBe('AGENT_SECRET_TOKEN=abc');
   });
 
-  it('redacts provider API key env vars (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY, CLAUDE_CODE_OAUTH_TOKEN)', () => {
+  it('redacts provider API key env vars (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, OPENAI_API_KEY, GEMINI_API_KEY, ZAI_API_KEY, CLAUDE_CODE_OAUTH_TOKEN)', () => {
     expect(sanitize('ANTHROPIC_API_KEY=sk-ant-api03-secretkey123')).toBe('ANTHROPIC_API_KEY=***');
+    expect(sanitize('ANTHROPIC_AUTH_TOKEN=plain-zai-token')).toBe('ANTHROPIC_AUTH_TOKEN=***');
     expect(sanitize('OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123')).toBe('OPENAI_API_KEY=***');
     expect(sanitize('GEMINI_API_KEY=AIzaSyabcdefghijklmnop')).toBe('GEMINI_API_KEY=***');
+    expect(sanitize('ZAI_API_KEY=plain-zai-token')).toBe('ZAI_API_KEY=***');
+    expect(sanitize('ZAI_API_KEY="plain-zai-token"')).toBe('ZAI_API_KEY=***');
+    const zaiJsonOut = sanitize('{"ZAI_API_KEY":"plain-zai-token","ANTHROPIC_AUTH_TOKEN":"anthropic-secret-token"}');
+    expect(zaiJsonOut).not.toContain('plain-zai-token');
+    expect(zaiJsonOut).not.toContain('anthropic-secret-token');
     // CLAUDE_CODE_OAUTH_TOKEN: the oauth_token sub-pattern fires first, normalising the suffix to lowercase
     const oauthOut = sanitize('CLAUDE_CODE_OAUTH_TOKEN=some-long-oauth-token-value-here');
     expect(oauthOut).toContain('***');
@@ -1572,6 +1583,10 @@ describe('matchesRateLimit', () => {
     expect(matchesRateLimit('RESOURCE_EXHAUSTED while calling model', 'gemini', 'service_account')).toBe(true);
   });
 
+  it('detects Z.AI API-key rate limits when provider/auth are supplied', () => {
+    expect(matchesRateLimit('Too many requests: rate_limit exceeded', 'zai', 'api_key')).toBe(true);
+  });
+
   it('detects Gemini API-key quota metric bodies', () => {
     const msg = "Quota exceeded for quota metric 'GenerateRequests'. Please retry in 39.8s.";
     expect(matchesRateLimit(msg, 'gemini', 'api_key')).toBe(true);
@@ -1682,6 +1697,10 @@ describe('matchesAuthFailure', () => {
 
   it('detects Gemini "API key not valid" for the gemini provider', () => {
     expect(matchesAuthFailure('API key not valid. Please pass a valid API key.', 'gemini')).toBe(true);
+  });
+
+  it('detects Z.AI invalid-key failures for the zai provider', () => {
+    expect(matchesAuthFailure('invalid z.ai api key', 'zai')).toBe(true);
   });
 
   it('does not classify a rate-limit body as an auth failure', () => {
@@ -1859,6 +1878,33 @@ describe('provider runner prompt transport', () => {
     expect(command.args).toContain('--output-format');
     expect(command.args).toContain('stream-json');
     expect(command.args).toContain('--verbose');
+  });
+
+  it('uses Claude Code with the Anthropic-compatible endpoint for Z.AI', () => {
+    process.env.PROVIDER = 'zai';
+    process.env.AUTH_MODE = 'oauth';
+    process.env.ZAI_API_KEY = 'zai-test-key';
+    refreshRuntimeState();
+
+    const runner = getProviderRunner();
+    const command = runner.buildRunCommand('prompt body', 'glm-5.2', 'high');
+
+    expect(runner.provider).toBe('zai');
+    expect(runner.authMode).toBe('api_key');
+    expect(providerSupportsNativeSubagents('zai')).toBe(true);
+    expect(command.command).toBe('claude');
+    expect(command.outputMode).toBe('claude-stream-json');
+    expect(command.promptInput).toBe('stdin-file');
+    expect(command.displayName).toBe('Z.AI GLM (Claude compat)');
+    expect(command.args).toContain('--model');
+    expect(command.args).toContain('glm-5.2');
+    expect(command.args).toContain('--effort');
+    expect(command.args).toContain('high');
+    expect(command.env.ZAI_API_KEY).toBe('zai-test-key');
+    expect(command.env.ANTHROPIC_API_KEY).toBe('zai-test-key');
+    expect(command.env.ANTHROPIC_AUTH_TOKEN).toBe('zai-test-key');
+    expect(command.env.ANTHROPIC_BASE_URL).toBe('https://api.z.ai/api/anthropic');
+    expect(runner.missingCredentials()).toEqual([]);
   });
 });
 
@@ -4620,6 +4666,86 @@ describe('main pool-mode startup ordering', () => {
     expect(fetched.some((u) => u.includes('/api/agent/claim'))).toBe(false);
   });
 
+  it('reports pre-claim failure when taskless OAuth rotation returns a no-op', async () => {
+    const originalProvider = process.env.PROVIDER;
+    const originalAuthMode = process.env.AUTH_MODE;
+    const originalCodexHome = process.env.CODEX_HOME;
+    const originalOpenAiKey = process.env.OPENAI_API_KEY;
+    const originalCodexKey = process.env.CODEX_API_KEY;
+    process.env.PROVIDER = 'openai';
+    process.env.AUTH_MODE = 'oauth';
+    process.env.CODEX_HOME = '/opt/agent/openai';
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.CODEX_API_KEY;
+    refreshRuntimeState();
+
+    const execMock = vi.mocked(execFileSync);
+    execMock.mockClear();
+    let authReadCount = 0;
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p) === '/opt/agent/openai/auth.json');
+    mockReadFileSync.mockImplementation((path, encoding) => {
+      if (String(path) === '/opt/agent/openai/auth.json') {
+        authReadCount += 1;
+        const raw = authReadCount === 1 ? '{"refresh_token":"old"}' : '{"refresh_token":"new"}';
+        return encoding ? raw : Buffer.from(raw);
+      }
+      return '';
+    });
+    (spawn as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => ({
+      stdout: { on: vi.fn() },
+      stderr: { on: vi.fn() },
+      on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+        if (event === 'close') void Promise.resolve().then(() => { handler(0); });
+      }),
+      kill: vi.fn(),
+    }));
+    fetchMock.mockImplementation((input: unknown) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/credentials/rotate')) {
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(''),
+          json: () => Promise.resolve({ rotated: false, reason: 'pool VM has no LLM runtime context' }),
+          headers: { get: () => null },
+        });
+      }
+      if (url.endsWith('/api/agent/next-role')) {
+        throw new Error('must not poll for work after failed OAuth rotation');
+      }
+      return Promise.resolve({
+        status: 204, ok: true,
+        text: () => Promise.resolve(''),
+        json: () => Promise.resolve({}),
+        headers: { get: () => null },
+      });
+    });
+
+    try {
+      await expect(main()).rejects.toThrow(/did not persist rotated OAuth credentials/);
+    } finally {
+      if (originalProvider !== undefined) process.env.PROVIDER = originalProvider;
+      else delete process.env.PROVIDER;
+      if (originalAuthMode !== undefined) process.env.AUTH_MODE = originalAuthMode;
+      else delete process.env.AUTH_MODE;
+      if (originalCodexHome !== undefined) process.env.CODEX_HOME = originalCodexHome;
+      else delete process.env.CODEX_HOME;
+      if (originalOpenAiKey !== undefined) process.env.OPENAI_API_KEY = originalOpenAiKey;
+      else delete process.env.OPENAI_API_KEY;
+      if (originalCodexKey !== undefined) process.env.CODEX_API_KEY = originalCodexKey;
+      else delete process.env.CODEX_API_KEY;
+      refreshRuntimeState();
+    }
+
+    const curlCall = execMock.mock.calls.find((c) => c[0] === 'curl');
+    expect(curlCall).toBeDefined();
+    const curlArgs = ((curlCall?.[1] ?? []) as string[]).join(' ');
+    expect(curlArgs).toContain('/api/agent/vm-heartbeat');
+    expect(curlArgs).toContain('oauth credential rotation failed');
+    const fetched = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(fetched.some((u) => u.includes('next-role'))).toBe(false);
+  });
+
   it('proceeds to poll for work when ~/.claude.json never existed on this VM (account without the optional claude_config_json)', async () => {
     // 2026-06-06 false-positive incident (49 terminally FAILED tasks):
     // claude_config_json is an OPTIONAL per-account pool field. An account
@@ -4666,6 +4792,135 @@ describe('main pool-mode startup ordering', () => {
       .map((c) => ((c[1] ?? []) as string[]).join(' '))
       .join('\n');
     expect(curlReports).not.toContain('vm_config_missing');
+  });
+});
+
+describe('main non-pool startup OAuth rotation', () => {
+  const originalPoolMode = process.env.BLUEPRINT_POOL_MODE;
+  const originalTaskId = process.env.TASK_ID;
+  const originalProvider = process.env.PROVIDER;
+  const originalAuthMode = process.env.AUTH_MODE;
+  const originalCodexHome = process.env.CODEX_HOME;
+  const originalOpenAiKey = process.env.OPENAI_API_KEY;
+  const originalCodexKey = process.env.CODEX_API_KEY;
+  let fetchMock: FetchMock;
+
+  beforeEach(() => {
+    fetchMock = makeFetchMock();
+    vi.stubGlobal('fetch', fetchMock);
+    delete process.env.BLUEPRINT_POOL_MODE;
+    process.env.TASK_ID = 'cold-preclaim-task';
+    process.env.PROVIDER = 'openai';
+    process.env.AUTH_MODE = 'oauth';
+    process.env.CODEX_HOME = '/opt/agent/openai';
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.CODEX_API_KEY;
+    _setAgentTokenForTesting('cold-bootstrap-jwt');
+    refreshRuntimeState();
+    vi.mocked(execFileSync).mockReset();
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
+    vi.mocked(fs.existsSync).mockImplementation((p) => String(p) === '/opt/agent/openai/auth.json');
+    vi.mocked(fs.readdirSync).mockReset();
+    vi.mocked(fs.readdirSync).mockReturnValue([]);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    vi.mocked(fs.existsSync).mockReset();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readdirSync).mockReset();
+    vi.mocked(fs.readdirSync).mockReturnValue([]);
+    if (originalPoolMode !== undefined) process.env.BLUEPRINT_POOL_MODE = originalPoolMode;
+    else delete process.env.BLUEPRINT_POOL_MODE;
+    if (originalTaskId !== undefined) process.env.TASK_ID = originalTaskId;
+    else delete process.env.TASK_ID;
+    if (originalProvider !== undefined) process.env.PROVIDER = originalProvider;
+    else delete process.env.PROVIDER;
+    if (originalAuthMode !== undefined) process.env.AUTH_MODE = originalAuthMode;
+    else delete process.env.AUTH_MODE;
+    if (originalCodexHome !== undefined) process.env.CODEX_HOME = originalCodexHome;
+    else delete process.env.CODEX_HOME;
+    if (originalOpenAiKey !== undefined) process.env.OPENAI_API_KEY = originalOpenAiKey;
+    else delete process.env.OPENAI_API_KEY;
+    if (originalCodexKey !== undefined) process.env.CODEX_API_KEY = originalCodexKey;
+    else delete process.env.CODEX_API_KEY;
+    _setAgentTokenForTesting('');
+    refreshRuntimeState();
+  });
+
+  it('persists a Codex OAuth refresh during cold-start validation before first claim', async () => {
+    const events: string[] = [];
+    let authReadCount = 0;
+    let rotateBody: Record<string, unknown> | null = null;
+
+    mockReadFileSync.mockImplementation((path, encoding) => {
+      const filePath = String(path);
+      if (filePath === '/opt/agent/openai/auth.json') {
+        authReadCount += 1;
+        const raw = authReadCount === 1 ? '{"refresh_token":"old"}' : '{"refresh_token":"new"}';
+        return encoding ? raw : Buffer.from(raw);
+      }
+      return '';
+    });
+    (spawn as unknown as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      events.push('provider-validation');
+      return {
+        stdout: { on: vi.fn() },
+        stderr: { on: vi.fn() },
+        on: vi.fn((event: string, handler: (...args: unknown[]) => void) => {
+          if (event === 'close') void Promise.resolve().then(() => { handler(0); });
+        }),
+        kill: vi.fn(),
+      };
+    });
+
+    fetchMock.mockImplementation((input: unknown, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith('/api/agent/credentials/rotate')) {
+        events.push('rotate');
+        rotateBody = JSON.parse(typeof init?.body === 'string' ? init.body : '{}') as Record<string, unknown>;
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          text: () => Promise.resolve(''),
+          json: () => Promise.resolve({ rotated: true }),
+          headers: { get: () => null },
+        });
+      }
+      if (url === 'http://metadata.google.internal/computeMetadata/v1/instance/image') {
+        events.push('vm-image-fetch');
+        return Promise.resolve({ ok: false, text: () => Promise.resolve('') });
+      }
+      if (url.endsWith('/api/agent/claim')) {
+        events.push('claim');
+        return Promise.resolve({
+          ok: false,
+          status: 400,
+          text: () => Promise.resolve('claim stopped test'),
+          json: () => Promise.resolve({}),
+          headers: { get: () => null },
+        });
+      }
+      throw new Error(`unexpected fetch ${url}`);
+    });
+
+    await expect(main()).rejects.toThrow('POST /api/agent/claim failed (400): claim stopped test');
+
+    expect(events).toEqual(expect.arrayContaining(['provider-validation', 'rotate', 'claim']));
+    expect(events.indexOf('provider-validation')).toBeLessThan(events.indexOf('rotate'));
+    expect(events.indexOf('rotate')).toBeLessThan(events.indexOf('claim'));
+    expect(rotateBody).toEqual({
+      secret: '{"refresh_token":"new"}',
+      task_id: 'cold-preclaim-task',
+    });
+    expect(vi.mocked(fs.writeFileSync).mock.calls).toEqual(expect.arrayContaining([
+      [
+        '/opt/agent/openai/auth.json',
+        '{"refresh_token":"new"}',
+        { encoding: 'utf-8', mode: 0o600 },
+      ],
+    ]));
   });
 });
 

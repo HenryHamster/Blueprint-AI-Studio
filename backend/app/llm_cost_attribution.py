@@ -27,6 +27,7 @@ from app.models import (
 #   Anthropic — https://www.anthropic.com/pricing#api
 #   OpenAI    — https://openai.com/api/pricing
 #   Gemini    — https://ai.google.dev/gemini-api/docs/pricing
+#   Z.AI      — https://docs.z.ai/guides/overview/pricing
 #
 # Gemini tasks estimate token counts from prompt/result char lengths (4 chars ≈ 1 token)
 # since the Gemini CLI outputMode='text' path has no structured usage block. The estimates
@@ -64,6 +65,8 @@ LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
     ("gemini", "gemini-3.1-pro-preview"): (1.25e-6, 10e-6),
     ("gemini", "gemini-3-flash-preview"): (0.30e-6, 2.5e-6),
     ("gemini", "gemini-3.1-flash-lite-preview"): (0.10e-6, 0.40e-6),
+    # Z.AI GLM-5.2 API (docs.z.ai/guides/overview/pricing, 2026-06).
+    ("zai", "glm-5.2"): (1.40e-6, 4.40e-6),
 }
 
 # Provider/model combos priced at a proxy rate (closest GA equivalent or published

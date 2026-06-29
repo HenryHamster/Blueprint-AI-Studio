@@ -57,7 +57,19 @@ export async function rotateOAuthCredentialsIfChanged(
   } catch (e) {
     throw new Error(`read ${path} failed: ${e instanceof Error ? e.message : String(e)}`);
   }
-  await apiPostFn('/api/agent/credentials/rotate', { secret: contents, task_id: taskId });
+  const result = await apiPostFn('/api/agent/credentials/rotate', { secret: contents, task_id: taskId });
+  if (!result || typeof result !== 'object' || Array.isArray(result) || (result as { rotated?: unknown }).rotated !== true) {
+    let reason = 'unexpected response';
+    if (result && typeof result === 'object' && !Array.isArray(result)) {
+      const rawReason = (result as { reason?: unknown }).reason;
+      reason = typeof rawReason === 'string'
+        ? rawReason
+        : rawReason === undefined
+          ? 'unknown reason'
+          : JSON.stringify(rawReason);
+    }
+    throw new Error(`backend did not persist rotated OAuth credentials: ${reason}`);
+  }
   // Update the initial hash so a follow-up error path doesn't re-POST the
   // same blob twice. Defensive; the backend is idempotent regardless.
   initialOAuthAuthHash = currentHash;

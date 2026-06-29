@@ -352,6 +352,29 @@ class TestAgentSecretManifest:
             }
         ]
 
+    def test_build_agent_secret_manifest_maps_zai_to_claude_compat_env(self):
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-zai",
+            task_id=task_id,
+            oauth_token="zai-test-key",
+            task_type="create",
+            provider="zai",
+            auth_mode="api_key",
+            model="glm-5.2",
+            provider_metadata={"anthropic_base_url": "https://example.test/anthropic/"},
+            provider_settings={"model": "glm-5.2", "effort": "high"},
+        )
+
+        assert manifest["env"]["PROVIDER"] == "zai"
+        assert manifest["env"]["AUTH_MODE"] == "api_key"
+        assert manifest["env"]["LLM_MODEL"] == "glm-5.2"
+        assert manifest["env"]["ZAI_API_KEY"] == "zai-test-key"
+        assert manifest["env"]["ANTHROPIC_API_KEY"] == "zai-test-key"
+        assert manifest["env"]["ANTHROPIC_AUTH_TOKEN"] == "zai-test-key"
+        assert manifest["env"]["ANTHROPIC_BASE_URL"] == "https://example.test/anthropic"
+        assert manifest["files"] == []
+
     def test_build_agent_secret_manifest_includes_provider_metadata_backed_files(self):
         task_id = uuid.uuid4()
         manifest = compute.build_agent_secret_manifest(
@@ -10916,6 +10939,10 @@ def test_command_runner_redacts_credentials(tmp_path):
         "echo ya29.A0ARrdaM-GOOGLEOAUTHTOKEN1234",
         # Bearer token
         "echo 'Authorization: Bearer MYSECRETBEARERTOKEN'",
+        # Z.AI key env var
+        "echo ZAI_API_KEY=ZAISECRET1234567890",
+        "echo 'ZAI_API_KEY=\"ZAIQUOTED1234567890\"'",
+        "echo '{\"ZAI_API_KEY\":\"ZAIJSON1234567890\",\"ANTHROPIC_AUTH_TOKEN\":\"ANTHROPICJSON1234567890\"}'",
         # Named field — access_token
         "echo 'access_token=FIELDTOKEN1234567890'",
         # AWS IAM access key
@@ -10962,6 +10989,12 @@ def test_command_runner_redacts_credentials(tmp_path):
     )
     assert "ya29.A0ARrdaM-GOOGLEOAUTHTOKEN1234" not in text, "ya29. must be redacted"
     assert "MYSECRETBEARERTOKEN" not in text, "Bearer token must be redacted"
+    assert "ZAISECRET1234567890" not in text, "ZAI_API_KEY must be redacted"
+    assert "ZAIQUOTED1234567890" not in text, "quoted ZAI_API_KEY must be redacted"
+    assert "ZAIJSON1234567890" not in text, "JSON ZAI_API_KEY must be redacted"
+    assert "ANTHROPICJSON1234567890" not in text, (
+        "JSON ANTHROPIC_AUTH_TOKEN must be redacted"
+    )
     assert "FIELDTOKEN1234567890" not in text, (
         "named access_token field must be redacted"
     )
@@ -11003,7 +11036,14 @@ def test_terminal_record_b64_file_redacts_command_log(tmp_path):
     # --- normal case: credential is redacted; benign text and other fields survive ---
     log_file = tmp_path / "command.log.json"
     payload = {
-        "text": "cloning https://x-access-token:ghp_SECRETTOKEN123@github.com/org/repo\nstep 1 done",
+        "text": (
+            "cloning https://x-access-token:ghp_SECRETTOKEN123@github.com/org/repo\n"
+            "ZAI_API_KEY=ZAISECRET1234567890\n"
+            "ZAI_API_KEY=\"ZAIQUOTED1234567890\"\n"
+            "{\"ZAI_API_KEY\":\"ZAIJSON1234567890\",\"ANTHROPIC_AUTH_TOKEN\":\"ANTHROPICJSON1234567890\"}\n"
+            "ANTHROPIC_AUTH_TOKEN=ANTHROPICSECRET1234567890\n"
+            "step 1 done"
+        ),
         "truncated": False,
         "byte_count": 77,
     }
@@ -11013,6 +11053,19 @@ def test_terminal_record_b64_file_redacts_command_log(tmp_path):
     decoded = json_mod.loads(base64.b64decode(b64).decode("utf-8"))
 
     assert "ghp_SECRETTOKEN123" not in decoded["text"], "credential must be redacted"
+    assert "ZAISECRET1234567890" not in decoded["text"], "ZAI key must be redacted"
+    assert "ZAIQUOTED1234567890" not in decoded["text"], (
+        "quoted ZAI key must be redacted"
+    )
+    assert "ZAIJSON1234567890" not in decoded["text"], "JSON ZAI key must be redacted"
+    assert "ANTHROPICJSON1234567890" not in decoded["text"], (
+        "JSON Anthropic-compatible token must be redacted"
+    )
+    assert "ANTHROPICSECRET1234567890" not in decoded["text"], (
+        "Anthropic-compatible token must be redacted"
+    )
+    assert "ZAI_API_KEY=***" in decoded["text"]
+    assert "ANTHROPIC_AUTH_TOKEN=***" in decoded["text"]
     assert "step 1 done" in decoded["text"], "benign text must survive"
     assert decoded["truncated"] is False, "truncated field must survive"
     assert decoded["byte_count"] == 77, "byte_count field must survive"

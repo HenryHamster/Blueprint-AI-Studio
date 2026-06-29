@@ -1366,6 +1366,13 @@ _CRED_REDACT_SUBS: tuple[tuple[re.Pattern, str], ...] = (
     (re.compile(r"Bearer\s+[^\s,'\"]+", re.IGNORECASE), "Bearer ***"),
     # OAuth token query parameters
     (re.compile(r"oauth_token[=:]\s*[^\s&'\"]+", re.IGNORECASE), "oauth_token=***"),
+    (
+        re.compile(
+            r"([\"']?\b(?:AGENT_SECRET_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|OPENAI_API_KEY|CODEX_API_KEY|GEMINI_API_KEY|ZAI_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|X-Agent-Token)\b[\"']?\s*[:=]\s*)(?!['\"]?AIza\*\*\*)(?:(['\"])(?:[^'\"\\]|\\.)+\2|[^\s,'\";&\])\n]{4,})",
+            re.IGNORECASE,
+        ),
+        r"\1***",
+    ),
     # PEM private keys (multiline)
     (
         re.compile(
@@ -2642,6 +2649,7 @@ def _classify_failure_class(
         for kw in [
             "api.github.com",
             "api.anthropic.com",
+            "api.z.ai",
             "500 internal server error",
             "502 bad gateway",
             "503 service unavailable",

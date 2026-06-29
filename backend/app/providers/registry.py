@@ -5,11 +5,13 @@ from app.providers.anthropic import AnthropicProvider
 from app.providers.base import LLMProvider
 from app.providers.gemini import GeminiProvider
 from app.providers.openai import OpenAIProvider
+from app.providers.zai import ZaiProvider
 
 _PROVIDERS: dict[LLMProviderName, LLMProvider] = {
     LLMProviderName.ANTHROPIC: AnthropicProvider(),
     LLMProviderName.OPENAI: OpenAIProvider(),
     LLMProviderName.GEMINI: GeminiProvider(),
+    LLMProviderName.ZAI: ZaiProvider(),
 }
 
 

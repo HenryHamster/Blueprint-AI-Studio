@@ -3273,7 +3273,19 @@ class TestRedactCredentials:
 
         out = _redact_credentials("OPENAI_API_KEY=sk-proj-abcdefghijk1234567890extra")
         assert "sk-proj-abcdefghijk1234567890extra" not in out
-        assert "sk-proj-***" in out
+        assert "OPENAI_API_KEY=***" in out
+
+    def test_zai_api_key_env_var_redacted(self):
+        from app.failure_classification import _redact_credentials
+
+        out = _redact_credentials(
+            'ZAI_API_KEY=plain-zai-token ZAI_API_KEY="quoted-zai-token" '
+            '{"ZAI_API_KEY":"json-zai-token","ANTHROPIC_AUTH_TOKEN":"json-anthropic-token"}'
+        )
+        assert "plain-zai-token" not in out
+        assert "quoted-zai-token" not in out
+        assert "json-zai-token" not in out
+        assert "json-anthropic-token" not in out
 
     def test_sk_generic_key_redacted(self):
         from app.failure_classification import _redact_credentials

@@ -12,6 +12,7 @@ import TaskStreamPanel from './components/TaskStreamPanel';
 import { ResearchBrowser } from './components/ResearchBrowser';
 import { KnowledgeBrowser } from './components/KnowledgeBrowser';
 import { PipelineView } from './components/PipelineView';
+import { StrategicCockpit, type StrategicCockpitDirection } from './components/StrategicCockpit';
 import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask, apiFetch, API_BASE_URL } from './api';
 import { countHighSignalMessages, countNewSinceLastVisit, loadLastSeen, fetchBackendLastSeen, resolveLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
@@ -96,14 +97,23 @@ export default function App() {
       return (stored as SortBy) ?? 'newest';
     } catch { return 'newest'; }
   });
+  // Apply a saved view's snapshot through the live filter/sort setters so the
+  // active-filter persistence layer keeps working exactly as before. Destructure
+  // the (stable) setters so exhaustive-deps can track them without depending on
+  // the whole per-render state object `s`.
+  const {
+    setSearchQuery, setTaskTypeFilter, setStatusFilter, setDateRange,
+    setBlockedFilter, setRequiresApproval, setStuckFilter, setStuckMinSeconds,
+    setFailureClassFilter,
+  } = s;
   useEffect(() => {
     const onFailureClassFilter = (e: Event) => {
       const failureClass = (e as CustomEvent<string>).detail;
-      if (failureClass && failureClass in FAILURE_CLASS_CONFIG) s.setFailureClassFilter([failureClass]);
+      if (failureClass && failureClass in FAILURE_CLASS_CONFIG) setFailureClassFilter([failureClass]);
     };
     window.addEventListener('blueprint:failure-class-filter', onFailureClassFilter);
     return () => window.removeEventListener('blueprint:failure-class-filter', onFailureClassFilter);
-  }, [s.setFailureClassFilter]);
+  }, [setFailureClassFilter]);
 
   useEffect(() => {
     localStorage.setItem(SORT_KEY, sortBy);
@@ -129,15 +139,6 @@ export default function App() {
     sortBy,
   };
 
-  // Apply a saved view's snapshot through the live filter/sort setters so the
-  // active-filter persistence layer keeps working exactly as before. Destructure
-  // the (stable) setters so exhaustive-deps can track them without depending on
-  // the whole per-render state object `s`.
-  const {
-    setSearchQuery, setTaskTypeFilter, setStatusFilter, setDateRange,
-    setBlockedFilter, setRequiresApproval, setStuckFilter, setStuckMinSeconds,
-    setFailureClassFilter,
-  } = s;
   const applyBoardView = useCallback((snap: BoardFilterSnapshot) => {
     setSearchQuery(snap.query);
     setTaskTypeFilter(snap.taskTypeFilter);
@@ -163,20 +164,102 @@ export default function App() {
   // Fetch open message count periodically (when panel is closed the callback won't fire)
   const selectedProjectId = s.selectedProjectId;
   const showMessages = s.showMessages;
+  const activeTab: PrimaryTab = s.activeTab;
 
-  const [directions, setDirections] = useState<{ id: string; text: string }[]>([]);
+  const [directions, setDirections] = useState<StrategicCockpitDirection[]>([]);
+  const [directionsLoading, setDirectionsLoading] = useState(false);
+  const [directionsError, setDirectionsError] = useState<string | null>(null);
+  const [cockpitTasks, setCockpitTasks] = useState<Task[]>([]);
+  const [cockpitTasksLoading, setCockpitTasksLoading] = useState(false);
+  const [cockpitTasksError, setCockpitTasksError] = useState<string | null>(null);
   useEffect(() => {
-    if (!selectedProjectId) { setDirections([]); return; }
-    const pid = selectedProjectId;
-    apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(pid)}/directions`)
-      .then(res => res.json())
-      .then((data: unknown) => {
-        if (pid !== selectedProjectId) return;
-        const list = Array.isArray(data) ? data : ((data as Record<string, unknown>)?.directions ?? []);
-        setDirections((list as { id: string; text?: string; title?: string }[]).map(d => ({ id: d.id, text: d.text ?? d.title ?? d.id })));
-      })
-      .catch(() => { /* directions are non-critical, silently ignore */ });
+    setDirections([]);
+    setDirectionsError(null);
+    setDirectionsLoading(false);
   }, [selectedProjectId]);
+  useEffect(() => {
+    setCockpitTasks([]);
+    setCockpitTasksError(null);
+    setCockpitTasksLoading(activeTab === 'cockpit');
+  }, [selectedProjectId, activeTab]);
+  usePoller(async (signal) => {
+    if (!selectedProjectId) {
+      setDirections([]);
+      setDirectionsError(null);
+      setDirectionsLoading(false);
+      return;
+    }
+    const pid = selectedProjectId;
+    setDirectionsLoading(true);
+    try {
+      const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(pid)}/directions`, undefined, 2, 30000, signal);
+      if (signal.aborted) return;
+      if (!res.ok) {
+        setDirectionsError('Direction data unavailable');
+        return;
+      }
+      const data: unknown = await res.json();
+      if (signal.aborted || pid !== selectedProjectId) return;
+      const list = Array.isArray(data) ? data : ((data as Record<string, unknown>)?.directions ?? []);
+      setDirections((list as Array<Record<string, unknown>>)
+        .map((d): StrategicCockpitDirection | null => {
+          const id = typeof d.id === 'string' ? d.id : '';
+          if (!id) return null;
+          const text = typeof d.text === 'string'
+            ? d.text
+            : typeof d.title === 'string'
+              ? d.title
+              : id;
+          return {
+            id,
+            text,
+            priority: typeof d.priority === 'string' ? d.priority : null,
+            status: typeof d.status === 'string' ? d.status : null,
+            category: typeof d.category === 'string' ? d.category : null,
+            last_researched_at: typeof d.last_researched_at === 'string' ? d.last_researched_at : null,
+            held: d.held === true,
+          };
+        })
+        .filter((d): d is StrategicCockpitDirection => d !== null));
+      setDirectionsError(null);
+    } catch {
+      if (!signal.aborted) setDirectionsError('Direction data unavailable');
+    } finally {
+      if (!signal.aborted) setDirectionsLoading(false);
+    }
+  }, {
+    intervalMs: DEFAULT_POLL_MS,
+    enabled: activeTab === 'cockpit' || activeTab === 'board',
+    deps: [selectedProjectId, activeTab],
+  });
+
+  usePoller(async (signal) => {
+    if (activeTab !== 'cockpit') return;
+    setCockpitTasksLoading(true);
+    const query = new URLSearchParams({ archived: 'false', limit: '500' });
+    if (selectedProjectId) query.set('project_id', selectedProjectId);
+    try {
+      const res = await apiFetch(`/api/admin/tasks?${query.toString()}`, undefined, 2, 30000, signal);
+      if (signal.aborted) return;
+      if (!res.ok) {
+        setCockpitTasksError('Cockpit task snapshot unavailable');
+        return;
+      }
+      const data = await res.json();
+      if (signal.aborted) return;
+      const nextTasks: Task[] = Array.isArray(data) ? data : (data.tasks ?? []);
+      setCockpitTasks(nextTasks);
+      setCockpitTasksError(null);
+    } catch {
+      if (!signal.aborted) setCockpitTasksError('Cockpit task snapshot unavailable');
+    } finally {
+      if (!signal.aborted) setCockpitTasksLoading(false);
+    }
+  }, {
+    intervalMs: DEFAULT_POLL_MS,
+    enabled: activeTab === 'cockpit',
+    deps: [selectedProjectId, activeTab],
+  });
 
   // Clear message count when panel opens
   useEffect(() => {
@@ -506,9 +589,9 @@ export default function App() {
 
   const [showAnalytics, setShowAnalytics] = useState(false);
 
-  // activeTab drives the primary nav; 'home' renders ConsoleHome, 'board' renders
-  // the kanban/pipeline views, 'directions' renders DirectionsPanel in page mode.
-  const activeTab: PrimaryTab = s.activeTab;
+  // activeTab drives the primary nav; 'cockpit' renders the strategic landing
+  // surface, 'home' keeps the existing console, 'board' renders the kanban/pipeline
+  // views, and 'directions' renders DirectionsPanel in page mode.
   const handleTabChange = (tab: PrimaryTab) => {
     s.setActiveTab(tab);
   };
@@ -873,6 +956,31 @@ export default function App() {
           setArchiveSortOrder={s.setArchiveSortOrder}
           onPurgeArchive={s.handlePurgeArchive}
         />
+      ) : activeTab === 'cockpit' ? (
+        <ErrorBoundary level="panel">
+          <StrategicCockpit
+            projectName={selectedProject?.name ?? (selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : null)}
+            selectedProjectId={s.selectedProjectId}
+            tasks={cockpitTasks}
+            directions={directions}
+            alerts={combinedAlerts}
+            tasksLoading={cockpitTasksLoading}
+            tasksError={cockpitTasksError}
+            directionsLoading={directionsLoading}
+            directionsError={directionsError}
+            strategistActive={s.strategistActive}
+            cycleProgress={s.cycleProgress}
+            lastCycleCompletion={s.lastCycleCompletion}
+            onOpenComposer={() => s.setShowMessages(true)}
+            onOpenDirections={() => s.setActiveTab('directions')}
+            onOpenResearch={(directionId) => {
+              setResearchBrowserDirectionId(directionId ?? null);
+              s.setShowResearchBrowser(true);
+            }}
+            onCreateTask={s.openNewTaskModal}
+            onViewTask={s.handleViewLogs}
+          />
+        </ErrorBoundary>
       ) : activeTab === 'directions' ? (
         <ErrorBoundary level="panel">
           <DirectionsPanel

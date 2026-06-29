@@ -12,6 +12,7 @@ def test_registry_lists_expected_providers():
         LLMProviderName.ANTHROPIC,
         LLMProviderName.OPENAI,
         LLMProviderName.GEMINI,
+        LLMProviderName.ZAI,
     }
 
 
@@ -99,6 +100,44 @@ def test_gemini_api_key_secret_material_includes_trust_workspace():
     assert material.env["GEMINI_CLI_TRUST_WORKSPACE"] == "true"
 
 
+def test_zai_provider_uses_claude_compat_secret_material():
+    provider = get_provider(LLMProviderName.ZAI)
+    result = provider.validate_secret("zai-test-key", LLMAuthMode.API_KEY, {})
+    assert result.secret == "zai-test-key"
+
+    material = provider.secret_material("zai-test-key", LLMAuthMode.API_KEY, {})
+    assert material.env["ZAI_API_KEY"] == "zai-test-key"
+    assert material.env["ANTHROPIC_API_KEY"] == "zai-test-key"
+    assert material.env["ANTHROPIC_AUTH_TOKEN"] == "zai-test-key"
+    assert material.env["ANTHROPIC_BASE_URL"] == "https://api.z.ai/api/anthropic"
+
+
+def test_zai_provider_accepts_base_url_metadata_override():
+    provider = get_provider(LLMProviderName.ZAI)
+    material = provider.secret_material(
+        "zai-test-key",
+        LLMAuthMode.API_KEY,
+        {"anthropic_base_url": "https://example.test/anthropic/"},
+    )
+    assert material.env["ANTHROPIC_BASE_URL"] == "https://example.test/anthropic"
+
+
+def test_zai_provider_translates_settings_to_claude_cli_args():
+    provider = get_provider(LLMProviderName.ZAI)
+    translation = provider.settings_to_cli(
+        {"model": "glm-5.2", "effort": "high"},
+        auth_mode=LLMAuthMode.API_KEY,
+    )
+    assert translation.args == (
+        "--model",
+        "glm-5.2",
+        "--effort",
+        "high",
+        "--permission-mode",
+        "bypassPermissions",
+    )
+
+
 def test_gemini_thinking_budget_clamped_to_per_model_cap():
     provider = get_provider(LLMProviderName.GEMINI)
 
@@ -167,6 +206,7 @@ def test_providers_expose_default_execution_mode_only():
         LLMProviderName.ANTHROPIC,
         LLMProviderName.OPENAI,
         LLMProviderName.GEMINI,
+        LLMProviderName.ZAI,
     ):
         provider = get_provider(provider_name)
         assert provider.supported_execution_modes() == ("default",)
