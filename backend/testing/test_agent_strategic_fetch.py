@@ -176,6 +176,110 @@ async def test_agent_fetch_direction_merge_credit_summary(
 
 
 @pytest.mark.asyncio
+async def test_agent_fetch_direction_merge_credit_summary_includes_reachability(
+    client: AsyncClient, db_session
+):
+    """merge_credit includes reachable_prs_merged when history entries carry the
+    reachable_prs_merged field; entries without it are treated as legacy-unknown
+    and contribute 0, matching strategic_spawning stat_entry semantics."""
+    project = Project(
+        name="Reachability Credit Test",
+        user_id="test-user-reach",
+        directions=[
+            {
+                "id": "dir-reach",
+                "status": "active",
+                "text": "Reachability direction",
+                "priority": "high",
+                # 3 entries: two with reachable_prs_merged recorded, one legacy
+                "research_history": [
+                    {"prs_merged": 3, "verified_prs_merged": 3, "reachable_prs_merged": 2},
+                    {"prs_merged": 2, "verified_prs_merged": 2, "reachable_prs_merged": 2},
+                    {"prs_merged": 1, "verified_prs_merged": 1},  # legacy — no reachable field
+                ],
+                "history_aggregate": {
+                    "total_prs_merged": 0,
+                    "total_reachable_prs_merged": 0,
+                },
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-reach"
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-reach")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/directions/dir-reach",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    mc = res.json()["data"]["merge_credit"]
+    # raw total: 3+2+1 = 6
+    assert mc["prs_merged"] == 6
+    # verified total: 3+2+1 = 6 (all verified)
+    assert mc["verified_prs_merged"] == 6
+    # badge_only = 6 - 6 = 0
+    assert mc["badge_only_prs_merged"] == 0
+    # reachable_prs_merged: present because at least one entry has the field;
+    # legacy entry contributes 0, so total = 2+2+0 = 4
+    assert "reachable_prs_merged" in mc, "reachable_prs_merged must be present when any history entry records it"
+    assert mc["reachable_prs_merged"] == 4
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_direction_merge_credit_summary_preserves_known_zero_reachability_after_eviction(
+    client: AsyncClient, db_session
+):
+    """Known-zero reachability survives eviction when the aggregate records it."""
+    project = Project(
+        name="Reachability Eviction Test",
+        user_id="test-user-reach-zero",
+        directions=[
+            {
+                "id": "dir-reach-zero",
+                "status": "active",
+                "text": "Zero-reachability direction",
+                "priority": "high",
+                "research_history": [],
+                "history_aggregate": {
+                    "total_prs_merged": 0,
+                    "total_reachable_prs_merged": 0,
+                    "total_reachable_recorded_cycles": 2,
+                },
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-reach-zero"
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-reach-zero")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/directions/dir-reach-zero",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    mc = res.json()["data"]["merge_credit"]
+    assert "reachable_prs_merged" in mc
+    assert mc["reachable_prs_merged"] == 0
+
+
+@pytest.mark.asyncio
 async def test_agent_fetch_direction_rejects_cross_project(
     client: AsyncClient, db_session
 ):
@@ -3425,13 +3529,14 @@ async def test_agent_fetch_version_phase_surfaces_criterion_coverage(
         db_session, project.id, version.id, "Harden CI pipeline"
     )
 
-    # Record a task_merge evidence for c_covered → classified 'covered'.
+    # Record a proven task_merge evidence for c_covered → classified 'covered'.
     await record_evidence(
         db_session,
         c_covered.id,
         project.id,
         source_kind="task_merge",
         source_id="pr-101",
+        detail={"proven": True},
     )
     # No evidence for c_uncovered → classified 'uncovered'.
 

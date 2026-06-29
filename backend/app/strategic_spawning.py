@@ -4431,7 +4431,7 @@ async def _spawn_strategic_review(
         _reachable_counts = [reachable_merged_count(h) for h in history]
         _any_reachable_recorded = any(c is not None for c in _reachable_counts) or bool(
             agg.get("total_reachable_prs_merged")
-        )
+        ) or (agg.get("total_reachable_recorded_cycles", 0) or 0) > 0
         total_reachable_merged: int | None = None
         if _any_reachable_recorded:
             total_reachable_merged = sum(

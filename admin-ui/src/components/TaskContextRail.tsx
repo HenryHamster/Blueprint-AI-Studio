@@ -8,6 +8,7 @@ import { StatusBadge, TaskTypeBadge } from './TaskCard';
 interface TaskContextRailProps {
   currentTask?: Task | null;
   attentionTasks?: Task[];
+  localFallbackTasks?: Task[];
   trackedTaskIds?: Set<string>;
   onOpenTask: (task: Task) => void;
   onOpenPipeline?: () => void;
@@ -193,12 +194,15 @@ function AttentionTaskList({
 export function TaskContextRail({
   currentTask = null,
   attentionTasks = [],
+  localFallbackTasks = [],
   trackedTaskIds,
   onOpenTask,
   onOpenPipeline,
   onTrackTask,
 }: TaskContextRailProps) {
-  const visibleAttention = attentionTasks
+  const backendIds = new Set(attentionTasks.map(t => t.id));
+  const mergedAttention = [...attentionTasks, ...localFallbackTasks.filter(t => !backendIds.has(t.id))];
+  const visibleAttention = mergedAttention
     .filter(task => task.id !== currentTask?.id)
     .slice(0, currentTask ? 3 : 5);
   const tracked = Boolean(currentTask && trackedTaskIds?.has(currentTask.id));

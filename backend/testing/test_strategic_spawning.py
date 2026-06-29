@@ -14827,3 +14827,118 @@ async def test_direction_stats_reachable_prs_merged_in_stat_entry(db_session):
     assert "reachable_prs_merged" not in legacy_dir, (
         "legacy directions without reachable_prs_merged must not fabricate a value"
     )
+
+
+@pytest.mark.asyncio
+async def test_direction_stats_known_zero_reachable_in_window(db_session):
+    """A direction with in-window reachable_prs_merged=0 surfaces reachable_prs_merged: 0 (present, not omitted).
+
+    Known-zero (field present, value 0) must be distinguishable from legacy-unknown
+    (field absent).  The stat_entry must include reachable_prs_merged=0 so the
+    agent renderer can emit the explicit alarm annotation rather than silently
+    treating it as legacy-unknown.
+    """
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-zero-reachable",
+                "status": "active",
+                "text": "Direction where all merges were badge-only (zero reachable)",
+                "priority": "high",
+                # 2 merged, reachability measured but zero confirmed reachable.
+                "research_history": [
+                    {
+                        "prs_merged": 2,
+                        "verified_prs_merged": 2,
+                        "reachable_prs_merged": 0,
+                    }
+                ],
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+
+    zero_dir = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-zero-reachable"
+    )
+    assert "reachable_prs_merged" in zero_dir, (
+        "known-zero reachability (field present, value 0) must not be omitted from stat_entry"
+    )
+    assert zero_dir["reachable_prs_merged"] == 0, (
+        "reachable_prs_merged must be 0, not inflated"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direction_stats_known_zero_reachable_survives_eviction(db_session):
+    """A direction whose reachability-recorded cycles were all evicted still surfaces reachable_prs_merged: 0.
+
+    When all in-window history is evicted and the history_aggregate only has
+    total_reachable_prs_merged=0 but total_reachable_recorded_cycles>0, the
+    stat_entry must still include reachable_prs_merged=0 (not omit the field).
+    """
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    # Build an aggregate that represents evicted cycles with known-zero reachability.
+    evicted_cycles = [
+        {
+            "timestamp": "2025-01-01T00:00:00",
+            "prs_merged": 3,
+            "verified_prs_merged": 3,
+            "reachable_prs_merged": 0,  # key present, value 0
+        },
+        {
+            "timestamp": "2025-02-01T00:00:00",
+            "prs_merged": 2,
+            "verified_prs_merged": 2,
+            "reachable_prs_merged": 0,
+        },
+    ]
+    history_aggregate = _fold_evicted_into_aggregate(None, evicted_cycles)
+    assert history_aggregate["total_reachable_recorded_cycles"] == 2
+    assert history_aggregate["total_reachable_prs_merged"] == 0
+
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-evicted-zero-reachable",
+                "status": "active",
+                "text": "Direction with evicted zero-reachable aggregate",
+                "priority": "high",
+                # No in-window history — all reachability info is in the aggregate.
+                "research_history": [],
+                "history_aggregate": history_aggregate,
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+
+    evicted_dir = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-evicted-zero-reachable"
+    )
+    assert "reachable_prs_merged" in evicted_dir, (
+        "known-zero reachability must survive eviction via total_reachable_recorded_cycles counter"
+    )
+    assert evicted_dir["reachable_prs_merged"] == 0

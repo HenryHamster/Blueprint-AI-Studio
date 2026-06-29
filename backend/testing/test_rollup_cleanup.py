@@ -1207,6 +1207,46 @@ async def test_verify_pr_merged_401_retries_with_fresh_token(cleanup_db, mocker)
 
 
 @pytest.mark.asyncio
+async def test_verify_pr_merged_401_retry_transient_does_not_negative_cache(
+    cleanup_db, mocker
+):
+    """When a 401 prompts a fresh-token retry and the retry encounters a transient
+    error (503), return False without poisoning the negative cache. This ensures
+    transient GitHub instability during auth-retry doesn't block rollup convergence."""
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/77")
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("fresh-token", "owner", "repo"),
+    )
+    mock_invalidate = mocker.patch("app.routers.agent.invalidate_github_token_cache")
+    # First call: 401 (auth expired)
+    # Retry call: 503 (transient GitHub outage)
+    mock_get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            HTTPException(status_code=401, detail="Unauthorized"),
+            HTTPException(status_code=503, detail="Service Unavailable"),
+        ],
+    )
+
+    result = await _verify_pr_merged(task, cleanup_db)
+
+    assert result is False
+    # Crucially: no negative cache entry for this transient-on-retry case
+    from app.rollup_pr_verification import _pr_merge_negative_cache
+    assert task.id not in _pr_merge_negative_cache, (
+        "Transient error on fresh-token retry must not poison negative cache"
+    )
+    mock_invalidate.assert_called_once_with(str(task.project_id))
+    assert mock_get_pr.call_count == 2
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [500, 502, 503])
 async def test_verify_pr_merged_transient_errors_return_false(
     cleanup_db, mocker, status_code

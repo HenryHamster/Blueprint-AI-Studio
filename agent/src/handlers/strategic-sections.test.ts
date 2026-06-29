@@ -1011,7 +1011,7 @@ describe('buildDirSummaryText', () => {
     expect(result).toContain('5 merged (3 reachable, 2 badge-only)');
   });
 
-  it('omits reachable split when field is absent or zero', () => {
+  it('omits reachable split when field is absent (legacy-unknown)', () => {
     const result = buildDirSummaryText([{
       id: 'd-legacy-no-reachable',
       text: 'original direction',
@@ -1022,6 +1022,22 @@ describe('buildDirSummaryText', () => {
     }]);
     expect(result).toContain('2 merged');
     expect(result).not.toContain('2 merged (');
+  });
+
+  it('renders explicit known-zero reachability distinctly from legacy-unknown', () => {
+    // reachable_prs_merged: 0 (present, zero) — must emit the annotation so operators
+    // see "merged credit exists but nothing is ancestry-confirmed" rather than the
+    // same silent '3 merged' as a legacy-unknown direction.
+    const result = buildDirSummaryText([{
+      id: 'd-known-zero-reachable',
+      text: 'direction with zero reachable',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 3,
+      prs_merged: 3,
+      reachable_prs_merged: 0,
+    }]);
+    expect(result).toContain('3 merged (0 reachable, 3 badge-only)');
   });
 
   it('combines verified and reachable annotations with semicolon separator', () => {

@@ -284,24 +284,27 @@ def mark_stranded_non_landing(task: Task, *, reason: str) -> None:
     not reachable from the integration branch (``is_ancestor_of`` -> False): the
     rollup->integration merge never completed, so the work is stranded on a
     staging branch. Records ``landed_on_integration=False`` and the stranded
-    reason WITHOUT setting the ``pr_merged`` unblock bit, so shipped / merge-rate
+    reason, and clears any stale ``pr_merged`` unblock bit so confirmed
+    non-landings never act as merge-equivalent success. Shipped / merge-rate
     analytics never count it and the rollup does not converge on a false landing.
 
     Idempotent: re-stamping the same definitive negative only re-writes the same
-    two keys. Callers gate on a DEFINITIVE negative before calling this, so a
-    previously-recorded true landing (whose ancestry check returns True) is never
-    routed here and cannot be flipped.
+    two keys and re-clears the unblock bit. Callers gate on a DEFINITIVE negative
+    before calling this, so a previously-recorded true landing (whose ancestry
+    check returns True) is never routed here and cannot be flipped.
     """
     logger.warning(
         "[LANDED] stranded non-landing for task %s: %s",
         getattr(task, "id", None),
         reason,
     )
-    task.context = {
+    ctx = {
         **(task.context or {}),
         LANDED_ON_INTEGRATION_KEY: False,
         STRANDED_LANDING_REASON_KEY: reason,
     }
+    ctx.pop(LANDED_SIGNAL_KEY, None)
+    task.context = ctx
 
 
 def apply_merged_landed_signal(

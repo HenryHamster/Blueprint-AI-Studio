@@ -4087,6 +4087,35 @@ describe('MessagesPanel send arming receipt', () => {
     expect(postKeys[2]).toBeTruthy();
     expect(postKeys[2]).not.toBe(postKeys[0]);
   });
+
+  test('refreshes strategic state after steering message mutation', async () => {
+    _setupSendMock({ arming: 'steering' });
+    const addToast = vi.fn();
+    const onStrategicRefresh = vi.fn();
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast as never}
+          onMessageCountChange={() => {}}
+          onStrategicRefresh={onStrategicRefresh}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    const el = host as HTMLDivElement;
+
+    expect(onStrategicRefresh).not.toHaveBeenCalled();
+    await typeAndSend(el, 'steer: focus on the migration work');
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    expect(onStrategicRefresh).toHaveBeenCalledTimes(1);
+  });
 });
 
 // ── Feedback → direction conversion idempotency ───────────────────────────────

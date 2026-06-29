@@ -138,6 +138,30 @@ describe('TaskContextRail', () => {
     expect(onTrackTask).toHaveBeenCalledWith(task);
   });
 
+  test('merges backend attention tasks with local fallback tasks', async () => {
+    const user = userEvent.setup();
+    const onOpenTask = vi.fn();
+    const backendTask = makeTask({ id: 'task-backend', title: 'Backend attention task', status: 'BLOCKED' });
+    const localTask = makeTask({ id: 'task-local', title: 'Local fallback task', status: 'FAILED' });
+    const overlapTask = makeTask({ id: 'task-overlap', title: 'Overlapping task', status: 'BLOCKED' });
+
+    render(
+      <TaskContextRail
+        currentTask={null}
+        attentionTasks={[backendTask, overlapTask]}
+        localFallbackTasks={[overlapTask, localTask]}
+        onOpenTask={onOpenTask}
+      />,
+    );
+
+    expect(screen.getByText('Backend attention task')).toBeInTheDocument();
+    expect(screen.getByText('Local fallback task')).toBeInTheDocument();
+    expect(screen.getAllByText('Overlapping task')).toHaveLength(1);
+
+    await user.click(screen.getByText('Local fallback task'));
+    expect(onOpenTask).toHaveBeenCalledWith(expect.objectContaining({ id: 'task-local' }));
+  });
+
   test('prefers exact sideboard child count over capped child task ids', () => {
     render(
       <TaskContextRail

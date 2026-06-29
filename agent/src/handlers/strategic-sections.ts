@@ -1012,9 +1012,12 @@ export function buildDirSummaryText(
       const verified = d.verified_prs_merged !== undefined && d.verified_prs_merged !== null
         ? Number(d.verified_prs_merged)
         : 0;
-      const reachable = d.reachable_prs_merged !== undefined && d.reachable_prs_merged !== null
+      // null = field absent = legacy-unknown (no reachability annotation).
+      // 0 = field present but zero = known-zero (explicit alarm annotation).
+      // >0 = confirmed reachable (reachable-vs-badge split).
+      const reachable: number | null = d.reachable_prs_merged !== undefined && d.reachable_prs_merged !== null
         ? Number(d.reachable_prs_merged)
-        : 0;
+        : null;
 
       let mergedText = `${prs_merged} merged`;
       const annotations: string[] = [];
@@ -1024,11 +1027,13 @@ export function buildDirSummaryText(
         annotations.push(`${verified} verified`);
       }
 
-      // Add reachable-vs-badge split if reachable is present.
+      // Add reachable-vs-badge split when the field is present (including known-zero).
+      // null = field absent (legacy-unknown) → omit entirely so legacy directions
+      // are not annotated with misleading zero counts.
       // "badge-only" here means merged but NOT ancestry-reachable (prs_merged - reachable).
       // The backend also defines badge_only_prs_merged = prs_merged - verified_prs_merged
       // (a different axis); the agent does not consume that field for this text.
-      if (reachable > 0) {
+      if (reachable !== null) {
         const badgeOnly = Math.max(0, prs_merged - reachable);
         annotations.push(`${reachable} reachable, ${badgeOnly} badge-only`);
       }

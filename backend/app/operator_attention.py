@@ -425,7 +425,9 @@ async def build_operator_attention(
     manual_directions = [
         direction
         for direction in directions
-        if isinstance(direction, dict) and _direction_manual_intervention(direction)
+        if isinstance(direction, dict)
+        and _direction_manual_intervention(direction)
+        and direction.get("status") == "active"
     ]
     manual_directions.sort(key=_direction_priority)
 

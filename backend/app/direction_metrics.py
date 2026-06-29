@@ -157,6 +157,11 @@ _HISTORY_AGG_DEFAULTS = {
     # entries have unknown reachability, so they contribute 0 here, keeping the
     # aggregate honest rather than inflating with unconfirmed ancestry.
     "total_reachable_prs_merged": 0,
+    # Count of evicted cycles that CONTAINED the reachable_prs_merged key (presence
+    # check, not truthiness). Non-zero means reachability WAS measured for at least
+    # one evicted cycle; a zero total_reachable_prs_merged alongside a non-zero count
+    # means confirmed-zero (known-zero), not legacy-unknown (field absent).
+    "total_reachable_recorded_cycles": 0,
     # Credit-gate lifetime stranded count: confirmed-unreachable merges that are
     # subtracted from total_verified_prs_merged to get the credit-eligible total
     # after a cycle is evicted from research_history. Folded by
@@ -495,6 +500,10 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         # Legacy-0 fallback: pre-reachability entries lack the key; contribute 0
         # so the aggregate stays honest (unknown ancestry ≠ confirmed reachable).
         agg["total_reachable_prs_merged"] += ev.get("reachable_prs_merged", 0)
+        # Track presence of the key (not truthiness) so a zero-total aggregate
+        # still signals "reachability was measured" vs "field was never recorded".
+        if "reachable_prs_merged" in ev:
+            agg["total_reachable_recorded_cycles"] += 1
         # Preserve the credit-gate discount so confirmed-stranded merges remain
         # excluded from the credit-eligible total after their cycle is evicted.
         agg["total_stranded_prs_merged"] += int(ev.get("stranded_prs_merged") or 0)

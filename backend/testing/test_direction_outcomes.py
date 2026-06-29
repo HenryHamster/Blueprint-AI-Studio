@@ -4370,6 +4370,52 @@ def test_fold_evicted_generalized_fields_backfill_legacy_aggregate():
     }
 
 
+def test_fold_evicted_reachable_recorded_cycles_tracks_presence_not_truthiness():
+    """total_reachable_recorded_cycles increments on key presence, not value truthiness.
+
+    An evicted cycle with reachable_prs_merged=0 (known-zero) must increment the
+    counter so the aggregate can later signal 'reachability was measured' even when
+    the total_reachable_prs_merged sum is 0.  A legacy cycle (key absent) must NOT
+    increment the counter.
+    """
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    # One zero-reachable cycle (key present, value 0) and one legacy cycle (key absent).
+    evicted = [
+        {
+            "timestamp": "2025-06-01T00:00:00",
+            "prs_merged": 2,
+            "verified_prs_merged": 2,
+            "reachable_prs_merged": 0,  # present, zero — reachability measured, nothing confirmed
+        },
+        {
+            "timestamp": "2025-05-01T00:00:00",
+            "prs_merged": 1,
+            "verified_prs_merged": 1,
+            # reachable_prs_merged absent — legacy, unknown reachability
+        },
+    ]
+    agg = _fold_evicted_into_aggregate(None, evicted)
+
+    # Only the cycle with the key present increments the counter.
+    assert agg["total_reachable_recorded_cycles"] == 1
+    # Total reachable is still 0 (not inflated by legacy fallback).
+    assert agg["total_reachable_prs_merged"] == 0
+
+    # Accumulate a second call with another zero-reachable cycle.
+    evicted2 = [
+        {
+            "timestamp": "2025-07-01T00:00:00",
+            "prs_merged": 3,
+            "reachable_prs_merged": 0,
+        }
+    ]
+    agg2 = _fold_evicted_into_aggregate(agg, evicted2)
+
+    assert agg2["total_reachable_recorded_cycles"] == 2  # 1 + 1
+    assert agg2["total_reachable_prs_merged"] == 0
+
+
 def test_fold_evicted_stranded_prs_merged_accumulates():
     """stranded_prs_merged rolls into total_stranded_prs_merged and accumulates on a prior aggregate."""
     from app.direction_metrics import _fold_evicted_into_aggregate

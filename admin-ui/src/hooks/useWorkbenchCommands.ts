@@ -174,7 +174,7 @@ export function useWorkbenchCommands({
         section: 'Project',
         detail: hasDesignDoc ? `revision ${designRevision ?? 'loaded'}` : 'No design doc loaded',
         keywords: ['architecture', 'design'],
-        disabled: projectDisabled,
+        disabled: projectDisabled || !hasDesignDoc,
         run: () => openProjectSection('design-doc'),
       },
       {

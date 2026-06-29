@@ -564,15 +564,13 @@ export default function App() {
       .filter(item => item.kind === 'task' && item.ref.id)
       .map(item => item.ref.id) ?? []
   ), [strategicReadModel.data?.attention?.items]);
-  const pipelineAttentionTasks = useMemo(() => {
-    if (backendPipelineAttentionTaskIds.length > 0) {
-      const taskById = new Map(s.tasks.map(task => [task.id, task]));
-      const backendTasks = backendPipelineAttentionTaskIds
-        .map(taskId => taskById.get(taskId))
-        .filter((task): task is Task => Boolean(task))
-        .slice(0, 5);
-      if (backendTasks.length > 0) return backendTasks;
-    }
+  const backendAttentionTasks = useMemo(() => {
+    const taskById = new Map(s.tasks.map(task => [task.id, task]));
+    return backendPipelineAttentionTaskIds
+      .map(taskId => taskById.get(taskId))
+      .filter((task): task is Task => Boolean(task));
+  }, [backendPipelineAttentionTaskIds, s.tasks]);
+  const localAttentionTasks = useMemo(() => {
     const priority = (task: Task) => {
       if (task.status === 'FAILED') return 5;
       if (task.status === 'BLOCKED') return 4;
@@ -582,9 +580,8 @@ export default function App() {
     };
     return [...filteredTasks]
       .filter(t => t.status === 'FAILED' || t.status === 'BLOCKED' || stuckTaskIds.has(t.id) || ACTIVE_PIPELINE_STATUSES.has(t.status))
-      .sort((a, b) => priority(b) - priority(a) || parseTimestamp(b.created_at).getTime() - parseTimestamp(a.created_at).getTime())
-      .slice(0, 5);
-  }, [backendPipelineAttentionTaskIds, filteredTasks, s.tasks, stuckTaskIds]);
+      .sort((a, b) => priority(b) - priority(a) || parseTimestamp(b.created_at).getTime() - parseTimestamp(a.created_at).getTime());
+  }, [filteredTasks, stuckTaskIds]);
   const openPipelineTask = useMemo(() => {
     if (!s.logTask) return null;
     if (s.selectedProjectId && s.logTask.project_id !== s.selectedProjectId) return null;
@@ -1369,7 +1366,8 @@ export default function App() {
                 />
                 <TaskContextRail
                   currentTask={openPipelineTask}
-                  attentionTasks={pipelineAttentionTasks}
+                  attentionTasks={backendAttentionTasks}
+                  localFallbackTasks={localAttentionTasks}
                   trackedTaskIds={s.trackedTaskIds}
                   onOpenTask={s.handleViewLogs}
                   onOpenPipeline={() => handleTabChange('pipeline')}
@@ -1565,7 +1563,8 @@ export default function App() {
 
                   <TaskContextRail
                     currentTask={openPipelineTask}
-                    attentionTasks={pipelineAttentionTasks}
+                    attentionTasks={backendAttentionTasks}
+                    localFallbackTasks={localAttentionTasks}
                     trackedTaskIds={s.trackedTaskIds}
                     onOpenTask={s.handleViewLogs}
                     onOpenPipeline={() => handleTabChange('pipeline')}

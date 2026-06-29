@@ -27,7 +27,7 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
 from app.database import get_session
-from app.direction_outcomes import proven_merged_count, verified_merged_count
+from app.direction_outcomes import proven_merged_count, reachable_merged_count, verified_merged_count
 from app.knowledge_query import build_compute_sweep_groups, build_sweep_knowledge_index
 from app.message_convergence import get_message_link, resolve_message_ref
 from app.models import Project, QualificationVerdict, ReleaseVersion, Task
@@ -261,12 +261,22 @@ async def agent_fetch_direction(
     _total_consumed = sum(
         h.get("acceptance_consumed_merged", 0) for h in full_history
     ) + (agg.get("total_acceptance_consumed_merged", 0) or 0)
+    _reachable_counts = [reachable_merged_count(h) for h in full_history]
+    _any_reachable_recorded = any(c is not None for c in _reachable_counts) or bool(
+        agg.get("total_reachable_prs_merged")
+    ) or (agg.get("total_reachable_recorded_cycles", 0) or 0) > 0
+    _total_reachable: int | None = None
+    if _any_reachable_recorded:
+        _total_reachable = sum(
+            c for c in _reachable_counts if c is not None
+        ) + (agg.get("total_reachable_prs_merged", 0) or 0)
     out["merge_credit"] = {
         "prs_merged": _total_prs_merged,
         "verified_prs_merged": _total_verified,
         "badge_only_prs_merged": max(0, _total_prs_merged - _total_verified),
         "proven_prs_merged": _total_proven,
         "consumed_prs_merged": _total_consumed,
+        **({"reachable_prs_merged": _total_reachable} if _total_reachable is not None else {}),
     }
     history = out.get("research_history")
     if isinstance(history, list) and len(history) > _RESEARCH_HISTORY_KEEP_ON_FETCH:

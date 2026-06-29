@@ -98,7 +98,7 @@ async def verify_rollup_merge_landed(
         from app.release_qualifier import _resolve_github_with_session
 
         creds = await _resolve_github_with_session(session, project)
-    except Exception as exc:  # noqa: BLE001 — credential failure -> indeterminate
+    except Exception as exc:
         logger.debug(
             "[ROLLUP_ANCESTRY] credential resolution skipped for %s: %s", source, exc
         )
@@ -116,7 +116,7 @@ async def verify_rollup_merge_landed(
                 token, owner, repo, pr_number, project_id=project_id
             )
             merge_commit_sha = (pr_data or {}).get("merge_commit_sha")
-        except Exception as exc:  # noqa: BLE001 — transient fetch error -> indeterminate; never poisons credit
+        except Exception as exc:
             logger.warning(
                 "[ROLLUP_ANCESTRY] PR #%s fetch failed (transient) for %s: %s — degrading to indeterminate",
                 pr_number,
@@ -139,7 +139,7 @@ async def verify_rollup_merge_landed(
             integration_branch,
             project_id=project_id,
         )
-    except Exception as exc:  # noqa: BLE001 — transient API error -> indeterminate; never poisons credit
+    except Exception as exc:
         logger.warning(
             "[ROLLUP_ANCESTRY] is_ancestor_of raised for %s: %s — degrading to indeterminate",
             source,
@@ -166,7 +166,7 @@ async def verify_rollup_merge_landed(
     await discount_stranded_pr_from_direction_credit(task, session)
     try:
         await _maybe_create_failure_alert(task, session, reason)
-    except Exception as exc:  # noqa: BLE001 — alert failure must not undo the gate
+    except Exception as exc:
         logger.warning(
             "[ROLLUP_ANCESTRY] stranded alert failed for task %s: %s",
             getattr(task, "id", None),
@@ -325,8 +325,22 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 gh_token, owner, repo = await get_github_token_for_task(
                     task.id, session, force_refresh=True
                 )
-                pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
-            except Exception as fetch_exc:  # noqa: BLE001 — transient network/parse error; must not poison the negative cache
+                try:
+                    pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
+                except HTTPException as retry_err:
+                    if retry_err.status_code in (500, 502, 503):
+                        # Transient GitHub error on retry — don't poison cache
+                        logger.warning(
+                            f"[PR_VERIFY] GitHub API error ({retry_err.status_code}) on fresh-token retry for PR #{pr_number} task {task.id} — skipping"
+                        )
+                        return False
+                    raise
+                except Exception as retry_exc:
+                    logger.warning(
+                        f"[PR_VERIFY] GitHub fetch error on fresh-token retry for PR #{pr_number} task {task.id}: {retry_exc} — skipping (transient)"
+                    )
+                    return False
+            except Exception as fetch_exc:
                 logger.warning(
                     f"[PR_VERIFY] GitHub fetch error for PR #{pr_number} task {task.id}: {fetch_exc} — skipping (transient)"
                 )

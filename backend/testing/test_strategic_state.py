@@ -1,4 +1,3 @@
-import uuid
 from datetime import timedelta
 
 import pytest
@@ -329,7 +328,7 @@ async def test_strategic_state_reports_active_local_strategic_runner(
     assert local_runner["liveness_window_seconds"] == 300
 
 
-@pytest.mark.asyncio
+
 async def test_strategic_state_reports_offline_strategic_runner(
     client: AsyncClient, db_session
 ):
@@ -363,6 +362,75 @@ async def test_strategic_state_reports_offline_strategic_runner(
     assert local_runner["live_runner_count"] == 0
     assert local_runner["eligible_live_count"] == 0
     assert local_runner["stale_runner_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_marks_active_cycle_with_cancelled_task_as_stale(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    cancelled_task = Task(
+        project_id=project.id,
+        title="Cancelled Strategic review",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.CANCELLED,
+    )
+    db_session.add(cancelled_task)
+    await db_session.commit()
+    await db_session.refresh(cancelled_task)
+    stale_cycle = StrategicCycle(
+        id="sc-stale",
+        project_id=project.id,
+        outcome="phase2_running",
+        phase1_started_at=_utcnow() - timedelta(hours=2),
+        phase2_task_id=cancelled_task.id,
+    )
+    db_session.add(stale_cycle)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    active = resp.json()["strategic"]["active_cycle"]
+    assert active["id"] == "sc-stale"
+    assert active["has_active_task"] is False
+    assert active["stale"] is True
+    assert resp.json()["strategic"]["active_task"] is None
+    assert resp.json()["context_package"]["status"] == "stale"
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_does_not_return_failed_task_as_active(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    failed_task = Task(
+        project_id=project.id,
+        title="Failed Strategic review",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.FAILED,
+        strategic_cycle_id="sc-failed-task",
+    )
+    db_session.add(failed_task)
+    await db_session.commit()
+    await db_session.refresh(failed_task)
+    stale_cycle = StrategicCycle(
+        id="sc-failed-task",
+        project_id=project.id,
+        outcome="phase2_running",
+        phase1_started_at=_utcnow() - timedelta(hours=1),
+        phase2_task_id=failed_task.id,
+    )
+    db_session.add(stale_cycle)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    strategic = resp.json()["strategic"]
+    assert strategic["active_cycle"]["id"] == "sc-failed-task"
+    assert strategic["active_cycle"]["has_active_task"] is False
+    assert strategic["active_cycle"]["stale"] is True
+    assert strategic["active_task"] is None
+    assert strategic["active_phase"] is None
 
 
 @pytest.mark.asyncio
@@ -523,12 +591,21 @@ async def test_strategic_state_marks_active_cycle_without_live_task_as_stale(
     client: AsyncClient, db_session
 ):
     project = await _make_project(db_session)
+    cancelled_task = Task(
+        project_id=project.id,
+        title="Cancelled Strategic review",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.CANCELLED,
+    )
+    db_session.add(cancelled_task)
+    await db_session.commit()
+    await db_session.refresh(cancelled_task)
     stale_cycle = StrategicCycle(
         id="sc-stale",
         project_id=project.id,
         outcome="phase2_running",
         phase1_started_at=_utcnow() - timedelta(hours=2),
-        phase2_task_id=uuid.uuid4(),
+        phase2_task_id=cancelled_task.id,
     )
     db_session.add(stale_cycle)
     await db_session.commit()
@@ -918,6 +995,66 @@ async def test_operator_attention_surfaces_bug_and_feedback_as_watch_items(
 
 
 @pytest.mark.asyncio
+async def test_operator_attention_ignores_inert_manual_intervention_directions(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    project.directions = [
+        *(project.directions or []),
+        {
+            "id": "d-active-manual",
+            "text": "Active direction needing manual intervention.",
+            "priority": "critical",
+            "status": "active",
+            "needs_manual_intervention": True,
+        },
+        {
+            "id": "d-expired-manual",
+            "text": "Expired direction needing manual intervention.",
+            "priority": "high",
+            "status": "expired",
+            "needs_manual_intervention": True,
+        },
+        {
+            "id": "d-completed-manual",
+            "text": "Completed direction needing manual intervention.",
+            "priority": "high",
+            "status": "completed",
+            "needs_manual_intervention": True,
+        },
+        {
+            "id": "d-proposed-manual",
+            "text": "Proposed direction needing manual intervention.",
+            "priority": "medium",
+            "status": "proposed",
+            "needs_manual_intervention": True,
+        },
+        {
+            "id": "d-staged-manual",
+            "text": "Staged direction needing manual intervention.",
+            "priority": "medium",
+            "status": "staged",
+            "needs_manual_intervention": True,
+        },
+    ]
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    attention = resp.json()["attention"]
+
+    assert attention["counts"]["manual_directions"] == 1
+    assert attention["counts"]["needs_operator"] == 1
+    item_ids = {item["id"] for item in attention["items"]}
+    assert "direction:d-active-manual:manual_intervention" in item_ids
+    assert "direction:d-expired-manual:manual_intervention" not in item_ids
+    assert "direction:d-completed-manual:manual_intervention" not in item_ids
+    assert "direction:d-proposed-manual:manual_intervention" not in item_ids
+    assert "direction:d-staged-manual:manual_intervention" not in item_ids
+
+
+@pytest.mark.asyncio
 async def test_operator_attention_approval_precedence_over_blocked(
     client: AsyncClient, db_session
 ):
@@ -1120,7 +1257,9 @@ async def test_operator_attention_first_visit_all_messages_unread(
     assert f"message:{first_visit_message.id}" in item_ids
     assert "direction:d-context:manual_intervention" in item_ids
     assert next(
-        item for item in attention["items"] if item["id"] == f"message:{first_visit_message.id}"
+        item
+        for item in attention["items"]
+        if item["id"] == f"message:{first_visit_message.id}"
     )["unread"] is True
 
 

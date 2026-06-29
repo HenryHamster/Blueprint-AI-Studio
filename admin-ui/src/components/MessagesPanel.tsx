@@ -187,6 +187,8 @@ export interface MessagesPanelProps {
   strategicState?: StrategicStateResponse | null;
   /** Refresh the Strategic read model after a chat action changes Strategic state. */
   onStrategicStateRefresh?: () => void | Promise<void>;
+  /** Legacy refresh callback kept for callers that still wire the old prop name. */
+  onStrategicRefresh?: () => void;
 }
 
 type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean; criticalOnly: boolean };
@@ -260,7 +262,7 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, contextPackage, strategicState, onStrategicStateRefresh }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, contextPackage, strategicState, onStrategicStateRefresh, onStrategicRefresh }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -271,6 +273,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const workbenchState = currentStrategicState?.workbench ?? null;
   const strategicAttention = currentStrategicState?.attention ?? null;
   const strategicTaskCounts = currentStrategicState?.tasks.counts ?? null;
+  const refreshStrategicState = onStrategicStateRefresh ?? onStrategicRefresh;
   const selectedProjectIdRef = useRef(selectedProjectId);
   selectedProjectIdRef.current = selectedProjectId;
   const usesStrategicReadModelRef = useRef(usesStrategicReadModel);
@@ -1024,7 +1027,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         setLastArming(null);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         addToast('Question answered', 'success');
-        void onStrategicStateRefresh?.();
+        void refreshStrategicState?.();
         await fetchMessages();
         return;
       }
@@ -1083,11 +1086,12 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         };
         optimisticStrategicRefreshRef.current = optimisticRefresh;
         setStrategicRefresh(optimisticRefresh);
-        void onStrategicStateRefresh?.();
+        void refreshStrategicState?.();
       } else if (arming === 'duplicate') {
-        void onStrategicStateRefresh?.();
+        void refreshStrategicState?.();
       }
       await fetchMessages();
+      void refreshStrategicState?.();
     } catch {
       addToast('Failed to send message', 'error');
     } finally {
@@ -1108,7 +1112,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       optimisticStrategicRefreshRef.current = null;
       setStrategicRefresh(null);
-      void onStrategicStateRefresh?.();
+      void refreshStrategicState?.();
       addToast('Strategic steer cancelled', 'success');
       await fetchMessages();
     } catch {
@@ -1179,6 +1183,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       directionIdempotencyKeysRef.current.delete(msg.id);
       if (!silent) addToast('Direction created', 'success');
       await fetchMessages();
+      void refreshStrategicState?.();
       return true;
     } catch {
       addToast('Failed to create direction', 'error');
@@ -1233,6 +1238,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       convertForm.resetAddForm();
       addToast('Direction created', 'success');
       await fetchMessages();
+      void refreshStrategicState?.();
     } catch {
       convertForm.markAddAttemptFailed();
       addToast('Failed to create direction', 'error');

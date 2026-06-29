@@ -460,6 +460,36 @@ describe('StrategicContextRail', () => {
     expect(props.onOpenRuntimeHealth).toHaveBeenCalled();
   });
 
+  test('task-linked alert attention item opens task drawer', () => {
+    const attentionState: StrategicStateResponse = {
+      ...STATE,
+      attention: {
+        ...STATE.attention!,
+        items: [
+          {
+            id: 'alert:alert-2',
+            kind: 'alert',
+            severity: 'watch',
+            reason: 'alert',
+            label: 'Task performance degraded',
+            detail: 'Task runtime exceeded expectations.',
+            ref: { kind: 'alert', id: 'alert-2', project_id: 'proj-1' },
+            task_id: 'task-perf-1',
+          },
+        ],
+      },
+    };
+    const onOpenTask = vi.fn();
+    const { host, props } = mount({ state: attentionState, onOpenTask });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Task performance degraded'))
+      ?.click();
+
+    expect(onOpenTask).toHaveBeenCalledWith('task-perf-1');
+    expect(props.onOpenRuntimeHealth).not.toHaveBeenCalled();
+  });
+
   test('shows stale instead of working when a persisted cycle has no live task', () => {
     const staleState: StrategicStateResponse = {
       ...STATE,

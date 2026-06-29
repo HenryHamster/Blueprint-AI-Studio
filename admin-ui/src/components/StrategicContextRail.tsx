@@ -254,7 +254,9 @@ export function StrategicContextRail({
       return onOpenTask && item.ref?.id ? () => onOpenTask(item.ref.id) : onOpenPipeline;
     }
     if (item.kind === 'direction') return () => onOpenProjectSection('directions');
-    if (item.kind === 'alert' && item.task_id) return onOpenPipeline;
+    if (item.kind === 'alert' && item.task_id) {
+      return onOpenTask ? () => onOpenTask(item.task_id!) : onOpenPipeline;
+    }
     if (item.kind === 'alert') return onOpenRuntimeHealth;
     if (item.kind === 'message') return onOpenMessages ?? onOpenPipeline;
     return undefined;

@@ -156,4 +156,16 @@ describe('useWorkbenchCommands', () => {
     expect(captured.find(command => command.id === 'task.new')?.shortcut).toBe('Global N');
     expect(captured.find(command => command.id === 'workbench.refresh')?.shortcut).toBe('Global R');
   });
+
+  test('disables design command when no design doc exists', () => {
+    mount({ hasDesignDoc: false });
+
+    expect(captured.find(command => command.id === 'project.design')?.disabled).toBe(true);
+  });
+
+  test('enables design command when design doc exists', () => {
+    mount({ hasDesignDoc: true });
+
+    expect(captured.find(command => command.id === 'project.design')?.disabled).toBe(false);
+  });
 });
