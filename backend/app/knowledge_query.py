@@ -752,6 +752,7 @@ async def build_compute_sweep_groups(
         build_knowledge_documents_stmt(
             project_id,
             source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+            direction=direction_id,
         )
         .where(KnowledgeDocument.sweep_id.is_not(None))
         .order_by(KnowledgeDocument.sweep_id, KnowledgeDocument.created_at.desc())
@@ -819,10 +820,9 @@ async def build_compute_sweep_groups(
     for sweep_id, docs in multi_docs.items():
         arms = planned.get(sweep_id)
         if not arms:
-            if direction_id is None:
-                complete[sweep_id] = [
-                    _knowledge_index_entry(doc, summary_chars) for doc in docs
-                ]
+            complete[sweep_id] = [
+                _knowledge_index_entry(doc, summary_chars) for doc in docs
+            ]
             continue
 
         labels = [label for label in arms if label is not None]
@@ -857,7 +857,7 @@ async def build_compute_sweep_groups(
         if sweep_id in complete:
             continue
         arms = planned.get(sweep_id)
-        if not arms and direction_id is not None:
+        if not arms:
             continue
         if arms and any(
             not _compute_sweep_task_is_terminal(task)
@@ -917,9 +917,18 @@ async def build_compute_sweep_groups(
         if not _sid or _sid not in complete:
             continue
         _status = _t.status.value if hasattr(_t.status, "value") else str(_t.status)
+        _status_norm = _status.strip().lower()
+        if _status_norm not in {
+            TaskStatus.QUEUED.value.lower(),
+            TaskStatus.PROVISIONING.value.lower(),
+            TaskStatus.IN_PROGRESS.value.lower(),
+            TaskStatus.EVALUATING.value.lower(),
+            TaskStatus.COMPLETED.value.lower(),
+        }:
+            continue
         _existing = _disposition.get(_sid)
-        # Prefer any non-failed status over a failed one when multiple tasks exist.
-        if _existing is None or _existing.get("status") in ("failed", "cancelled"):
+        # Prefer any non-terminal disposition over a completed one when multiple tasks exist.
+        if _existing is None or _existing.get("status") == TaskStatus.COMPLETED.value:
             _disposition[_sid] = {"task_id": str(_t.id), "status": _status}
     for _sid, _disp in _disposition.items():
         if complete[_sid]:
