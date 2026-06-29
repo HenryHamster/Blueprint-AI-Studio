@@ -8508,6 +8508,26 @@ class TestComputeLifetimeBurnMetrics:
         assert m is not None
         assert m["lifetime_non_merge_finished"] == 10  # only tasks_completed counts
 
+    def test_aggregate_stranded_merges_discounted_from_lifetime_merged_and_rate(self):
+        # Aggregate: 5 verified merges, 2 confirmed-stranded → credit-eligible = 3
+        # 10 tasks_completed, 0 failed. Window is empty.
+        # agg_merged = 5 - 2 = 3; non_merge = max(0, 10 - 3) = 7; total_finished = 10
+        # lifetime_merge_rate = proof_weighted / 10 ≈ 3/10 (no acceptance fields → proof == verified)
+        agg = {
+            "total_prs_merged": 5,
+            "total_verified_prs_merged": 5,
+            "total_stranded_prs_merged": 2,
+            "total_tasks_completed": 10,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(research_history=[], history_aggregate=agg)
+        m = _compute_lifetime_burn_metrics(d)
+        assert m is not None
+        assert m["lifetime_merged"] == 3  # 5 verified − 2 stranded
+        assert m["lifetime_non_merge_finished"] == 7  # 10 completed − 3 credit-merged
+        assert m["lifetime_merge_rate"] == round(3 / 10, 3)
+
 
 # ── Rule 6: Lifetime burn backstop ───────────────────────────────────────────
 
@@ -9179,6 +9199,83 @@ def _scaffolding_direction(progress_window, *, success_evidence_fps=None, **over
     }
     d.update(overrides)
     return d
+
+
+class TestCreditGateMergedCount:
+    """credit_gate_merged_count: indeterminate merges count, only stranded excluded.
+
+    The credit-decision gates (auto-completion, churn-rate pause, lifetime-burn
+    pause) must count ancestry-indeterminate merges alongside confirmed-landed
+    ones, and exclude ONLY merges confirmed as unreachable (stranded).
+    """
+
+    def test_indeterminate_merge_counts_only_stranded_excluded_from_credit_gate(self):
+        from app.direction_outcomes import credit_gate_merged_count
+
+        # No stranded_prs_merged field → indeterminate case: all verified count
+        entry_indeterminate = {"verified_prs_merged": 2, "prs_merged": 2}
+        assert credit_gate_merged_count(entry_indeterminate) == 2
+
+        # One confirmed-stranded: subtracted from verified, only 1 credit-eligible
+        entry_one_stranded = {
+            "verified_prs_merged": 2,
+            "prs_merged": 3,
+            "stranded_prs_merged": 1,
+        }
+        assert credit_gate_merged_count(entry_one_stranded) == 1
+
+        # All stranded (floors at 0, never negative)
+        entry_all_stranded = {
+            "verified_prs_merged": 2,
+            "prs_merged": 2,
+            "stranded_prs_merged": 2,
+        }
+        assert credit_gate_merged_count(entry_all_stranded) == 0
+
+        # Legacy entry (no verified_prs_merged): falls back via verified_merged_count
+        entry_legacy = {"prs_merged": 3, "stranded_prs_merged": 1}
+        assert credit_gate_merged_count(entry_legacy) == 2
+
+    def test_churn_gate_excludes_stranded_merges_from_merge_count(self):
+        # 5 cycles, each with 1 verified merge that is confirmed-stranded.
+        # credit_gate_merged_count returns 0 → churn gate sees 0 merges → fires.
+        d = _direction(
+            research_history=[
+                {
+                    "tasks_created": 2,
+                    "tasks_completed": 2,
+                    "tasks_failed": 0,
+                    "prs_merged": 1,
+                    "verified_prs_merged": 1,
+                    "stranded_prs_merged": 1,
+                }
+                for _ in range(5)
+            ]
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        # All merges are stranded → credit count is 0 → all 10 completions are non-merge
+        assert m["merged"] == 0
+        assert m["non_merge_finished"] == 10
+
+    def test_churn_gate_counts_indeterminate_merges(self):
+        # Same shape but no stranded_prs_merged → indeterminate merges count
+        d = _direction(
+            research_history=[
+                {
+                    "tasks_created": 2,
+                    "tasks_completed": 2,
+                    "tasks_failed": 0,
+                    "prs_merged": 1,
+                    "verified_prs_merged": 1,
+                }
+                for _ in range(5)
+            ]
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["merged"] == 5
+        assert m["non_merge_finished"] == 5
 
 
 class TestComputeOutcomeProgressSignal:

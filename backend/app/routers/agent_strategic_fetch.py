@@ -27,6 +27,7 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
 from app.database import get_session
+from app.direction_outcomes import proven_merged_count, verified_merged_count
 from app.knowledge_query import build_compute_sweep_groups, build_sweep_knowledge_index
 from app.message_convergence import get_message_link, resolve_message_ref
 from app.models import Project, QualificationVerdict, ReleaseVersion, Task
@@ -244,6 +245,28 @@ async def agent_fetch_direction(
     if direction is None:
         raise HTTPException(status_code=404, detail="Direction not found")
     out = dict(direction)
+    # Compute merge_credit summary from the full history before capping.
+    full_history = direction.get("research_history") or []
+    agg = direction.get("history_aggregate") or {}
+    _total_prs_merged = sum(h.get("prs_merged", 0) for h in full_history) + (
+        agg.get("total_prs_merged") or 0
+    )
+    _total_verified = sum(verified_merged_count(h) for h in full_history) + (
+        agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
+    )
+    _total_proven = sum(proven_merged_count(h) for h in full_history) + (
+        agg.get("total_acceptance_proven_merged", 0) or 0
+    )
+    _total_consumed = sum(
+        h.get("acceptance_consumed_merged", 0) for h in full_history
+    ) + (agg.get("total_acceptance_consumed_merged", 0) or 0)
+    out["merge_credit"] = {
+        "prs_merged": _total_prs_merged,
+        "verified_prs_merged": _total_verified,
+        "badge_only_prs_merged": max(0, _total_prs_merged - _total_verified),
+        "proven_prs_merged": _total_proven,
+        "consumed_prs_merged": _total_consumed,
+    }
     history = out.get("research_history")
     if isinstance(history, list) and len(history) > _RESEARCH_HISTORY_KEEP_ON_FETCH:
         out["research_history"] = history[-_RESEARCH_HISTORY_KEEP_ON_FETCH:]

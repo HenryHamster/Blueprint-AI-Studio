@@ -4506,6 +4506,10 @@ async def _spawn_strategic_review(
             "total_cycles": total_cycles,
             "prs_merged": total_merged,
             "verified_prs_merged": total_verified_merged,
+            # badge_only = merges counted via is_merged_completion badge but not
+            # yet ancestry-verified; max(0,...) guards against legacy data where
+            # verified could transiently exceed raw due to aggregate drift.
+            "badge_only_prs_merged": max(0, total_merged - total_verified_merged),
             # Proven count + declaration coverage: the honest, machine-checked
             # subset of verified merges (proven <= verified) plus how much merged
             # code even committed to forward evidence. Lets the strategist

@@ -966,7 +966,16 @@ export function buildDirSummaryText(
   }
   const body = directionsSummary.map((d, i) => {
     const parts = [`${fmtScalar(d.total_cycles, '0')} cycles`];
-    if (d.prs_merged) parts.push(`${fmtScalar(d.prs_merged)} merged`);
+    if (d.prs_merged) {
+      const rawMerged = Number(d.prs_merged);
+      const verifiedMerged = typeof d.verified_prs_merged === 'number' ? d.verified_prs_merged : undefined;
+      if (verifiedMerged !== undefined && verifiedMerged < rawMerged) {
+        const badgeOnly = Math.max(0, rawMerged - verifiedMerged);
+        parts.push(`${rawMerged} merged (${verifiedMerged} verified, ${badgeOnly} badge-only)`);
+      } else {
+        parts.push(`${fmtScalar(d.prs_merged)} merged`);
+      }
+    }
     const proven = Number(d.proven_prs_merged ?? 0);
     const consumed = Number(d.consumed_prs_merged ?? 0);
     if (proven > 0 || consumed > 0) {

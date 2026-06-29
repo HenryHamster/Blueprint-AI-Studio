@@ -692,6 +692,7 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "total_cycles",
         "prs_merged",
         "verified_prs_merged",
+        "badge_only_prs_merged",
         "proven_prs_merged",
         "consumed_prs_merged",
         "acceptance_declaration_coverage",

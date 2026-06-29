@@ -23,7 +23,7 @@ from app.direction_metrics import (
     _compute_direction_quality_score,
     proof_weighted_merged,
 )
-from app.direction_outcomes import verified_merged_count
+from app.direction_outcomes import credit_gate_merged_count, verified_merged_count
 
 # Stopword set reused so the spawn-title redundancy check matches the project's
 # established word-overlap semantics (same tokens ignored: articles,
@@ -2023,16 +2023,22 @@ def _compute_churn_metrics(direction: dict) -> dict | None:
     if len(history) < 3 or churn_window <= 0:
         return None
     window = history[-churn_window:]
-    # Verification-aware: degraded-unverified merges are excluded from the merge
-    # count (and so count as non-merge finished work) to match the per-task
-    # outcome layer. Benign-unverified and verified merges still count.
-    merged = sum(verified_merged_count(e) for e in window)
+    # Credit-gate aware: confirmed-stranded merges are excluded; landed and
+    # ancestry-indeterminate merges both count (flag-trust preserved). Also
+    # excludes degraded-unverified merges via verified_merged_count base.
+    merged = sum(credit_gate_merged_count(e) for e in window)
     # Proof-weighted merge volume drives the RATE gate so a direction whose merges
     # are mostly undeclared/unproven (the "merely delivered" proxy) reads as a lower
     # merge rate than one shipping proven work, and trips the churn guardrail where
-    # the proven direction does not. The displayed ``merged`` count stays the integer
-    # verified total. Legacy/read-only cycles degrade to the verified value.
-    proof_merged = sum(proof_weighted_merged(e) for e in window)
+    # the proven direction does not. The displayed ``merged`` count is the
+    # credit-gate basis (verified minus confirmed-stranded). Legacy/read-only cycles
+    # degrade to the verified value.
+    # Subtract confirmed-stranded merges from the proof-weighted total so the rate
+    # numerator stays consistent with the credit_gate_merged_count denominator.
+    proof_merged = sum(
+        max(0.0, proof_weighted_merged(e) - float(e.get("stranded_prs_merged") or 0))
+        for e in window
+    )
     tasks_complete = sum(e.get("tasks_completed", 0) for e in window)
     # Children that COMPLETED without opening a PR because the deliverable already
     # existed ("no changes needed") are correct no-ops, not churn. Subtract them so
@@ -2066,9 +2072,9 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
 
-    # Verification-aware merge counts (window + evicted aggregate): degraded
-    # merges are excluded so they don't suppress lifetime non-merge burn.
-    window_merged = sum(verified_merged_count(e) for e in history)
+    # Credit-gate aware: excludes confirmed-stranded AND degraded-unverified
+    # merges so neither suppresses lifetime non-merge burn.
+    window_merged = sum(credit_gate_merged_count(e) for e in history)
     window_completed = sum(e.get("tasks_completed", 0) for e in history)
     # Correct no-op completions ("deliverable already exists", no PR) are not burn.
     # Subtract them across both the rolling window and the lifetime aggregate. Both
@@ -2079,8 +2085,13 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
         for e in history
     )
     # Legacy aggregates predate total_verified_prs_merged; fall back to
-    # total_prs_merged so old folded data is unchanged.
-    agg_merged = agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0))
+    # total_prs_merged so old folded data is unchanged. Subtract stranded merges
+    # so the credit-gate discount survives cycle eviction into the aggregate.
+    agg_merged = max(
+        0,
+        int(agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0)
+        - int(agg.get("total_stranded_prs_merged", 0) or 0),
+    )
     agg_completed = agg.get("total_tasks_completed", 0)
     agg_no_pr = agg.get("total_tasks_completed_no_pr", 0)
     agg_code_failed = max(
@@ -2102,10 +2113,15 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
     # Proof-weighted lifetime merge volume drives the RATE gate (same rationale as
     # _compute_churn_metrics): undeclared/unproven lifetime merges count for less, so
     # a slow-burn direction shipping only unprovable work trips the backstop where a
-    # proven one does not. Displayed lifetime_merged stays the integer verified total.
+    # proven one does not. Displayed lifetime_merged is the credit-gate basis
+    # (verified minus confirmed-stranded, same as window_merged).
+    # Subtract confirmed-stranded merges so the rate numerator stays consistent with
+    # the credit_gate_merged_count basis used for lifetime_merged/window_merged.
+    agg_stranded = float(agg.get("total_stranded_prs_merged", 0) or 0)
     proof_lifetime_merged = sum(
-        proof_weighted_merged(e) for e in history
-    ) + _agg_proof_weighted_merged(agg)
+        max(0.0, proof_weighted_merged(e) - float(e.get("stranded_prs_merged") or 0))
+        for e in history
+    ) + max(0.0, _agg_proof_weighted_merged(agg) - agg_stranded)
     lifetime_merge_rate = proof_lifetime_merged / total_finished
     return {
         "lifetime_merged": lifetime_merged,

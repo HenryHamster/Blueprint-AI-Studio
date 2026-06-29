@@ -151,6 +151,11 @@ _HISTORY_AGG_DEFAULTS = {
     # _compute_lifetime_burn_metrics reads this so a degraded merge does not
     # suppress lifetime non-merge burn even after its cycle is evicted.
     "total_verified_prs_merged": 0,
+    # Credit-gate lifetime stranded count: confirmed-unreachable merges that are
+    # subtracted from total_verified_prs_merged to get the credit-eligible total
+    # after a cycle is evicted from research_history. Folded by
+    # _fold_evicted_into_aggregate so the credit_gate discount survives eviction.
+    "total_stranded_prs_merged": 0,
     # Acceptance-evidence lifetime aggregates — folded so directions past the
     # 10-cycle eviction window keep an honest proven/declared signal. Distinct
     # from (and never larger than) total_verified_prs_merged: proven counts
@@ -481,6 +486,9 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         agg["total_verified_prs_merged"] += ev.get(
             "verified_prs_merged", ev.get("prs_merged", 0)
         )
+        # Preserve the credit-gate discount so confirmed-stranded merges remain
+        # excluded from the credit-eligible total after their cycle is evicted.
+        agg["total_stranded_prs_merged"] += int(ev.get("stranded_prs_merged") or 0)
         # Acceptance-evidence aggregates — legacy-0 fallback: pre-aggregate
         # entries claim nothing proven/declared and contribute no denominator,
         # matching proven_merged_count / declared_merged_count semantics.

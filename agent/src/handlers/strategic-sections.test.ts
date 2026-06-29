@@ -784,6 +784,49 @@ describe('buildDirSummaryText', () => {
     expect(result).toContain('2 proven (1 consumed downstream)');
   });
 
+  it('renders verified vs badge-only merge credit when verified_prs_merged is present and less than prs_merged', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-credit',
+      text: 'direction with badge split',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 3,
+      prs_merged: 5,
+      verified_prs_merged: 3,
+    }]);
+    expect(result).toContain('5 merged (3 verified, 2 badge-only)');
+    expect(result).not.toContain('5 merged\n');
+  });
+
+  it('renders plain merged when verified_prs_merged equals prs_merged (no badge-only noise)', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-allverified',
+      text: 'all verified direction',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 2,
+      prs_merged: 4,
+      verified_prs_merged: 4,
+    }]);
+    expect(result).toContain('4 merged');
+    expect(result).not.toContain('badge-only');
+    expect(result).not.toContain('verified,');
+  });
+
+  it('falls back to plain merged when verified_prs_merged is absent (legacy payload)', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-legacy',
+      text: 'legacy no verified field',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 1,
+      prs_merged: 7,
+    }]);
+    expect(result).toContain('7 merged');
+    expect(result).not.toContain('badge-only');
+    expect(result).not.toContain('verified,');
+  });
+
   it('omits zero-only proof fields from legacy summaries', () => {
     const result = buildDirSummaryText([{
       id: 'd-legacy-proof',

@@ -31,7 +31,7 @@ from app.models import (
 )
 from app.broadcast import broadcast_to_project
 from app.direction_metrics import _fold_evicted_into_aggregate
-from app.direction_outcomes import verified_merged_count
+from app.direction_outcomes import credit_gate_merged_count
 from app.research_context import (
     _build_research_context,
     build_recent_findings_evidence,
@@ -896,13 +896,17 @@ async def apply_post_spawn_state(
                         history = d.get("research_history", [])
                         agg = d.get("history_aggregate", {})
                         total_merged = sum(
-                            verified_merged_count(e) for e in history
-                        ) + int(
-                            agg.get(
-                                "total_verified_prs_merged",
-                                agg.get("total_prs_merged", 0),
+                            credit_gate_merged_count(e) for e in history
+                        ) + max(
+                            0,
+                            int(
+                                agg.get(
+                                    "total_verified_prs_merged",
+                                    agg.get("total_prs_merged", 0),
+                                )
+                                or 0
                             )
-                            or 0
+                            - int(agg.get("total_stranded_prs_merged", 0) or 0),
                         )
                         if total_merged < 3:
                             await _maybe_autocomplete_exhausted_direction(

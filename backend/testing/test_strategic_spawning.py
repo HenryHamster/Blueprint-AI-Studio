@@ -1349,6 +1349,16 @@ async def test_direction_stat_surfaces_proven_and_declaration_coverage(db_sessio
                 # Predates the acceptance aggregates — no acceptance_* fields.
                 "research_history": [{"prs_merged": 2, "prs_rejected": 0}],
             },
+            {
+                "id": "d-badge01",
+                "status": "active",
+                "text": "Direction with badge-only merges",
+                "priority": "medium",
+                # 3 raw merges, only 1 verified → badge_only = max(0, 3 - 1) = 2.
+                "research_history": [
+                    {"prs_merged": 3, "prs_rejected": 0, "verified_prs_merged": 1}
+                ],
+            },
         ],
         vision={"purpose": "test purpose"},
     )
@@ -1372,12 +1382,18 @@ async def test_direction_stat_surfaces_proven_and_declaration_coverage(db_sessio
     assert proven["proven_prs_merged"] <= proven["verified_prs_merged"]
     assert proven["consumed_prs_merged"] <= proven["proven_prs_merged"]
     assert proven["acceptance_declaration_coverage"] == round(3 / 4, 3)
+    # All merges were verified — no badge-only gap.
+    assert proven["badge_only_prs_merged"] == 0
 
     legacy = next(s for s in payload["directions_summary"] if s["id"] == "d-legacy01")
     # Legacy fallback: nothing retroactively claimed proven, no coverage denom.
     assert legacy["proven_prs_merged"] == 0
     assert legacy["consumed_prs_merged"] == 0
     assert legacy["acceptance_declaration_coverage"] is None
+
+    badge = next(s for s in payload["directions_summary"] if s["id"] == "d-badge01")
+    # badge_only = max(0, raw_prs_merged - verified_prs_merged) = max(0, 3 - 1) = 2.
+    assert badge["badge_only_prs_merged"] == 2
 
 
 @pytest.mark.asyncio

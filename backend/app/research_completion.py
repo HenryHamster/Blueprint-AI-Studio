@@ -52,7 +52,7 @@ from app.direction_metrics import (  # noqa: F401 — re-exported for callers/te
     _compute_acceptance_rate,
     _compute_productivity_score,
 )
-from app.direction_outcomes import verified_merged_count
+from app.direction_outcomes import credit_gate_merged_count
 from app.failure_classification import (
     CO_DEFERRED_SHELVED,
     GRADER_CAUSE_REFUSAL,
@@ -903,12 +903,15 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
 
             history = target.get("research_history", [])
             agg = target.get("history_aggregate", {})
-            total_merged = sum(verified_merged_count(e) for e in history) + int(
-                agg.get(
-                    "total_verified_prs_merged",
-                    agg.get("total_prs_merged", 0),
-                )
-                or 0
+            total_merged = sum(credit_gate_merged_count(e) for e in history) + max(
+                0,
+                int(
+                    agg.get(
+                        "total_verified_prs_merged",
+                        agg.get("total_prs_merged", 0),
+                    )
+                    or 0
+                ) - int(agg.get("total_stranded_prs_merged", 0) or 0),
             )
             total_cycles = len(history) + (agg.get("total_cycles") or 0)
             if total_merged >= 3:

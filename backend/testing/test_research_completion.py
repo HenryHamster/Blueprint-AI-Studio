@@ -13799,6 +13799,45 @@ class TestStampNoFindingsRefractory:
             "Direction with 3 verified aggregate merges must be auto-completed"
         )
 
+    def test_auto_complete_aggregate_stranded_merges_not_counted(self):
+        """Auto-completion must subtract total_stranded_prs_merged from aggregate verified total.
+
+        When total_verified_prs_merged >= 3 but all are confirmed-stranded (stranded==verified),
+        the effective credit-eligible count is 0 and the direction must NOT be auto-completed.
+        When the non-stranded remainder reaches 3, it should auto-complete.
+        """
+        from app.research_completion import _stamp_no_findings_refractory
+
+        # Case 1: 3 verified, 3 stranded → credit-eligible = 0 → must NOT auto-complete
+        agg_all_stranded = {
+            "total_prs_merged": 3,
+            "total_verified_prs_merged": 3,
+            "total_stranded_prs_merged": 3,
+            "total_cycles": 5,
+        }
+        task = self._make_task()
+        project = self._make_saturated_project(agg=agg_all_stranded)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+        direction = project.directions[0]
+        assert direction.get("status") != "completed", (
+            "Direction whose only aggregate merges are confirmed-stranded must NOT be auto-completed"
+        )
+
+        # Case 2: 5 verified, 2 stranded → credit-eligible = 3 → must auto-complete
+        agg_partial_stranded = {
+            "total_prs_merged": 5,
+            "total_verified_prs_merged": 5,
+            "total_stranded_prs_merged": 2,
+            "total_cycles": 5,
+        }
+        task2 = self._make_task()
+        project2 = self._make_saturated_project(agg=agg_partial_stranded)
+        self._run(project2, _stamp_no_findings_refractory(task2, self._make_session()))
+        direction2 = project2.directions[0]
+        assert direction2.get("status") == "completed", (
+            "Direction with 3 credit-eligible aggregate merges (5 verified − 2 stranded) must auto-complete"
+        )
+
     # ── Additive exhaustion route (terminal COMPLETED regardless of merge count) ──
 
     def _make_exhausted_project(
@@ -15014,4 +15053,174 @@ async def test_criterion_ids_propagated_from_finding_direction(db_session, mocke
     assert child.criterion_ids == [criterion.criterion_key], (
         f"spawned task must inherit criterion_ids from the finding's direction "
         f"(cross-direction); got {child.criterion_ids!r}"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_apply_post_spawn_state_aggregate_stranded_merges_not_counted(db_session):
+    """apply_post_spawn_state must subtract total_stranded_prs_merged from aggregate total.
+
+    When stranded merges have been evicted into history_aggregate, the aggregate term
+    in the saturated auto-complete gate must apply the same credit-gate discount as
+    research_completion._stamp_no_findings_refractory and
+    strategic_completion._compute_lifetime_burn_metrics.
+
+    Case 1: total_verified=3, total_stranded=3 → credit-eligible=0 → must NOT auto-complete.
+    Case 2: total_verified=5, total_stranded=2 → credit-eligible=3 → must auto-complete.
+    """
+    from datetime import datetime, timedelta
+
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-agg-stranded-apply"
+
+    # Two prior genuine (non-dedup-zero) cycles with tasks_created=1.
+    # When apply_post_spawn_state adds a no-findings entry (tasks_created=0,
+    # no dedup) for the 3rd cycle, _compute_saturation sees 3 consecutive
+    # genuine low-output cycles → possibly_saturated=True → triggers auto-complete check.
+    old_history = [
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "task_id": "t-agg-str-1",
+            "tasks_created": 1,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "test cycle 1",
+        },
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "task_id": "t-agg-str-2",
+            "tasks_created": 1,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "test cycle 2",
+        },
+    ]
+
+    # Case 1: 3 verified, 3 stranded → credit-eligible = max(0, 3-3) = 0 → NOT auto-complete.
+    agg_all_stranded = {
+        "total_prs_merged": 3,
+        "total_verified_prs_merged": 3,
+        "total_stranded_prs_merged": 3,
+        "total_cycles": 5,
+    }
+    direction = {
+        **_active_direction(direction_id, "Aggregate stranded test direction"),
+        "research_history": list(old_history),
+        "history_aggregate": agg_all_stranded,
+    }
+    project = _Project(
+        name="Aggregate Stranded Test",
+        user_id="test-user-agg-str1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],   # findings
+        [],   # child_tasks
+        [],   # deduplicated
+        [],   # insights
+        [],   # direction_notes
+        [],   # direction_proposals
+        0,    # hash_dedup_count
+        0,    # word_overlap_count
+        0,    # file_overlap_count
+        0,    # evidence_overlap_count
+        0,    # type_filtered_count
+        0,    # empty_prompt_count
+        "research-branch",
+        "main",
+        0,    # research_depth
+        None, # parent_research_task_id
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("status") != "completed", (
+        "Direction whose only aggregate merges are confirmed-stranded must NOT be "
+        "auto-completed via apply_post_spawn_state"
+    )
+
+    # Case 2: 5 verified, 2 stranded → credit-eligible = max(0, 5-2) = 3 → auto-complete.
+    direction_id2 = "d-agg-stranded-apply2"
+    agg_partial_stranded = {
+        "total_prs_merged": 5,
+        "total_verified_prs_merged": 5,
+        "total_stranded_prs_merged": 2,
+        "total_cycles": 5,
+    }
+    direction2 = {
+        **_active_direction(direction_id2, "Aggregate partial stranded test direction"),
+        "research_history": list(old_history),
+        "history_aggregate": agg_partial_stranded,
+    }
+    project2 = _Project(
+        name="Aggregate Partial Stranded Test",
+        user_id="test-user-agg-str2",
+        autonomous_enabled=True,
+        directions=[direction2],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    task2 = await _make_research_task(project2, direction2, db_session)
+    task2.context = {**(task2.context or {}), "direction_id": direction_id2}
+    db_session.add(task2)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task2,
+        [],   # findings
+        [],   # child_tasks
+        [],   # deduplicated
+        [],   # insights
+        [],   # direction_notes
+        [],   # direction_proposals
+        0,    # hash_dedup_count
+        0,    # word_overlap_count
+        0,    # file_overlap_count
+        0,    # evidence_overlap_count
+        0,    # type_filtered_count
+        0,    # empty_prompt_count
+        "research-branch",
+        "main",
+        0,    # research_depth
+        None, # parent_research_task_id
+    )
+    await db_session.refresh(project2)
+
+    d2 = project2.directions[0]
+    assert d2.get("status") == "completed", (
+        "Direction with 3 credit-eligible aggregate merges (5 verified − 2 stranded) "
+        "must auto-complete via apply_post_spawn_state"
     )

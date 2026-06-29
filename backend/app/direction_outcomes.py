@@ -184,6 +184,24 @@ def verified_merged_count(entry: dict) -> int:
     return int(entry.get("prs_merged") or 0)
 
 
+def credit_gate_merged_count(entry: dict) -> int:
+    """Credit-eligible merge count for direction decision gates (auto-completion, churn, lifetime burn).
+
+    Confirmed-reachable (landed) and ancestry-indeterminate merges both count.
+    Only confirmed-unreachable (stranded) merges are excluded — flag-trust is
+    preserved for ancestry-indeterminate outcomes per the merge-trust policy.
+
+    Built on :func:`verified_merged_count` as the base; subtracts
+    ``stranded_prs_merged`` when present so a reconciliation pass that discovers
+    confirmed-stranded merges can persist them on the entry and have them excluded
+    here without touching any credit-gate caller. Legacy entries without the field
+    are unchanged (stranded defaults to 0).
+    """
+    verified = verified_merged_count(entry)
+    stranded = int(entry.get("stranded_prs_merged") or 0)
+    return max(0, verified - stranded)
+
+
 def proven_merged_count(entry: dict) -> int:
     """Machine-checked PROVEN merged-PR count for a research_history entry.
 

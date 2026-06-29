@@ -4088,6 +4088,39 @@ def test_fold_evicted_generalized_fields_backfill_legacy_aggregate():
     }
 
 
+def test_fold_evicted_stranded_prs_merged_accumulates():
+    """stranded_prs_merged rolls into total_stranded_prs_merged and accumulates on a prior aggregate."""
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    # One evicted entry with 2 verified merges, 1 confirmed-stranded
+    evicted = [
+        {
+            "timestamp": "2025-04-01T00:00:00",
+            "tasks_created": 3,
+            "prs_merged": 2,
+            "verified_prs_merged": 2,
+            "stranded_prs_merged": 1,
+        }
+    ]
+    agg = _fold_evicted_into_aggregate(None, evicted)
+
+    assert agg["total_stranded_prs_merged"] == 1
+
+    # Second call: accumulate on top of existing aggregate that already has stranded count
+    evicted2 = [
+        {
+            "timestamp": "2025-05-01T00:00:00",
+            "tasks_created": 2,
+            "prs_merged": 3,
+            "verified_prs_merged": 3,
+            "stranded_prs_merged": 2,
+        }
+    ]
+    agg2 = _fold_evicted_into_aggregate(agg, evicted2)
+
+    assert agg2["total_stranded_prs_merged"] == 3  # 1 + 2
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # compute_direction_autonomy_state
 # ─────────────────────────────────────────────────────────────────────────────

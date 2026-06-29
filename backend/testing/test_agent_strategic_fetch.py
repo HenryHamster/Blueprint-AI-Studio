@@ -119,6 +119,63 @@ async def test_agent_fetch_direction_returns_full_record_with_history_cap(
 
 
 @pytest.mark.asyncio
+async def test_agent_fetch_direction_merge_credit_summary(
+    client: AsyncClient, db_session
+):
+    """Agent fetch response includes an additive merge_credit summary with
+    verified vs badge-only split computed from the full history."""
+    project = Project(
+        name="Credit Test",
+        user_id="test-user-credit",
+        directions=[
+            {
+                "id": "dir-credit",
+                "status": "active",
+                "text": "Credit direction",
+                "priority": "high",
+                # 3 history entries: 2 with verified_prs_merged, 1 legacy
+                "research_history": [
+                    {"prs_merged": 4, "verified_prs_merged": 3},
+                    {"prs_merged": 2, "verified_prs_merged": 2},
+                    {"prs_merged": 1},  # legacy — no verified field, treated as verified
+                ],
+                "history_aggregate": {
+                    "total_prs_merged": 0,
+                },
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-credit"
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-credit")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/directions/dir-credit",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    mc = body["data"]["merge_credit"]
+    # raw total: 4+2+1 = 7
+    assert mc["prs_merged"] == 7
+    # verified: 3+2 + legacy fallback 1 = 6
+    assert mc["verified_prs_merged"] == 6
+    # badge-only = 7 - 6 = 1
+    assert mc["badge_only_prs_merged"] == 1
+    assert mc["proven_prs_merged"] == 0
+    assert mc["consumed_prs_merged"] == 0
+
+
+@pytest.mark.asyncio
 async def test_agent_fetch_direction_rejects_cross_project(
     client: AsyncClient, db_session
 ):
