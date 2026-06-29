@@ -171,6 +171,8 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('## 4. Running update document');
     expect(prompt).toContain('## 5. Self-reflection');
     expect(prompt).toContain('## 6. Problem model');
+    expect(prompt).toContain('## 7. Version goal');
+    expect(prompt).toContain('## 8. Acceptance criteria');
   });
 
   it('includes sweep synthesis guidance for reading back completed experiments', () => {
@@ -631,6 +633,28 @@ describe('buildThinkerPrompt', () => {
     expect(sec6Idx).toBeGreaterThan(-1);
     expect(sec7Idx).toBeGreaterThan(-1);
     expect(sec7Idx).toBeGreaterThan(sec6Idx);
+  });
+
+  it('instructs conditional acceptance-criteria authoring after the version goal section', () => {
+    const prompt = buildThinkerPrompt({ ...base, taskId: 'criteria-task-1' });
+
+    expect(prompt).toContain('## 8. Acceptance criteria');
+    expect(prompt).toContain('criterion_coverage.total=0');
+    expect(prompt).toContain('non-empty `Goal:` line');
+    expect(prompt).toContain('no acceptance-criteria coverage block at all');
+    expect(prompt).toContain('active directions created this cycle have no criterion mappings');
+    expect(prompt).toContain('Skip entirely if criteria already exist and are reasonably mapped');
+    expect(prompt).toContain('Do NOT fabricate criteria when the version goal is unset');
+    expect(prompt).toContain('/tmp/proposed_criteria_criteria-task-1.json');
+    expect(prompt).toContain('{"criteria":[{"text":"Users can complete the key workflow without manual operator intervention.","direction_keys":["d-xxx"]}]}');
+    expect(prompt).toContain('5-7 criteria maximum');
+    expect(prompt).toContain('outcomes ("Users can X", "System handles Y"), not implementation steps');
+
+    const sec7Idx = prompt.indexOf('## 7. Version goal');
+    const sec8Idx = prompt.indexOf('## 8. Acceptance criteria');
+    const playbookIdx = prompt.indexOf('./playbook set');
+    expect(sec8Idx).toBeGreaterThan(sec7Idx);
+    expect(sec8Idx).toBeLessThan(playbookIdx);
   });
 });
 

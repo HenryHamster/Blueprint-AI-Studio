@@ -651,7 +651,7 @@ class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
 
     task_id: uuid.UUID
-    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "stage_direction", "create_message", "resolve_message", "spawn_task", "spawn_fix", "set_strategic_challenge"
+    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "stage_direction", "create_message", "resolve_message", "spawn_task", "spawn_fix", "set_strategic_challenge", "set_acceptance_criteria"
     data: Any = {}
 
 
@@ -3167,6 +3167,110 @@ async def strategic_operation(
                 "retirement_approvals_count": ra_n,
                 "retirement_critique_quality_count": rc_n,
                 "portfolio_shape_risk_count": ps_n,
+            }
+        )
+
+    elif payload.op == "set_acceptance_criteria":
+        # Author criteria for the open release version and optionally map
+        # directions to them.  Restricted to strategic_review agents (enforced
+        # above by the task_type guard).  Deduplicates by text within the
+        # (project_id, release_version_id) scope so repeated calls are safe.
+        from app.acceptance_criteria import (
+            get_criterion_by_text as _get_criterion_by_text,
+            generate_criterion_key as _gen_criterion_key,
+        )
+        from app.directions_repo import get_direction_row as _get_direction_row
+        from app.models import VersionAcceptanceCriterion as _VAC
+        from app.release_version import current_open_version as _cur_open_ver
+
+        if not isinstance(data, dict) or not isinstance(data.get("criteria"), list):
+            raise HTTPException(
+                status_code=400,
+                detail="set_acceptance_criteria: data must be {\"criteria\": [...]}",
+            )
+        criteria_input = data["criteria"]
+        for item in criteria_input:
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str) or not item["text"].strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail="set_acceptance_criteria: each criterion must have a non-empty 'text' string",
+                )
+
+        open_version = await _cur_open_ver(session, project.id)
+        if open_version is None:
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return JSONResponse(
+                content=_resp({"status": "error", "reason": "No open release version"}),
+                status_code=409,
+            )
+
+        processed: list[dict] = []
+        for item in criteria_input:
+            text = item["text"].strip()
+            direction_keys_input: list[str] = list(item.get("direction_keys") or [])
+
+            existing = await _get_criterion_by_text(
+                session, project.id, open_version.id, text
+            )
+            if existing is not None:
+                criterion_key = existing.criterion_key
+                is_new = False
+            else:
+                criterion_key = _gen_criterion_key()
+                new_row = _VAC(
+                    project_id=project.id,
+                    release_version_id=open_version.id,
+                    criterion_key=criterion_key,
+                    text=text,
+                    created_by="strategist",
+                )
+                session.add(new_row)
+                is_new = True
+
+            mapped_keys: list[str] = []
+            for dk in direction_keys_input:
+                dir_row = await _get_direction_row(session, project.id, dk)
+                if dir_row is None:
+                    warnings.append(f"Unknown direction_key: {dk}")
+                    continue
+                merged = list(set(dir_row.criterion_keys or []) | {criterion_key})
+                dir_row.criterion_keys = merged
+                session.add(dir_row)
+                mapped_keys.append(dk)
+
+            processed.append(
+                {
+                    "criterion_key": criterion_key,
+                    "text": text,
+                    "is_new": is_new,
+                    "direction_keys": mapped_keys,
+                }
+            )
+
+        ctx = task.context or {}
+        task.context = {
+            **ctx,
+            "_strategic_api_called": True,
+            "_strategic_criteria_authored": len(processed),
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC API] set_acceptance_criteria for task %s: %d criteria, %d warnings",
+            task.id,
+            len(processed),
+            len(warnings),
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "set_acceptance_criteria",
+                "criteria": processed,
             }
         )
 

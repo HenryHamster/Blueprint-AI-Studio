@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 
 // Capture the prompt the handler hands to the thinker (analysis) pass.
@@ -186,6 +186,7 @@ vi.mock('./strategic-sections.js', () => ({
     authoritative?: { active: number; paused: number },
   ) => `DIRHEALTH(max=${maxActiveDirections},auth=${authoritative ? authoritative.active : undefined})`,
   buildSweepComparisonSection: () => '',
+  buildCiComplianceSection: () => '',
 }));
 
 vi.mock('../telemetry.js', () => ({
@@ -558,7 +559,7 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
       statusRef,
     );
 
-    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(executorPrompt).toBeDefined();
     expect(executorPrompt).toContain('"staged": true');
     expect(executorPrompt).toContain('one atomic op');
@@ -590,7 +591,7 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
       statusRef,
     );
 
-    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(executorPrompt).toContain('if the file is still missing, empty, or the JSON is malformed after the bounded repair reopen');
   });
 
@@ -694,7 +695,7 @@ describe('handleStrategic strategic challenge gate', () => {
 
     // The executor prompt carries the challenge section (only the APPROVED
     // advancing/met pair, d-7) plus the evidence-progress gate instruction.
-    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(executorPrompt).toContain('CHALLENGE_SECTION(status=ok;approved=d-7:advancing;retirements=)');
     expect(executorPrompt).toContain('Challenge gate');
     expect(executorPrompt).toContain('the independent challenge APPROVED');
@@ -1250,6 +1251,81 @@ describe('handleStrategic pre-merge: new_version_goal written into problem_model
     expect(typeof writtenStr).toBe('string');
     const written = JSON.parse(writtenStr as string) as Record<string, unknown>;
     expect(written.new_version_goal).toBe('Ship reliable error recovery so ops incidents drop by 50%.');
+  });
+});
+
+describe('handleStrategic executor prompt: proposed acceptance criteria handoff', () => {
+  beforeEach(() => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockReturnValue('');
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+  });
+
+  afterEach(() => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockReturnValue('');
+  });
+
+  it('injects the proposed criteria block and conditional command when the thinker wrote a non-empty file', async () => {
+    const taskId = 'task-criteria';
+    const criteriaPath = `/tmp/proposed_criteria_${taskId}.json`;
+    const criteriaPayload = '{"criteria":[{"text":"Users can promote only when canonical criteria pass.","direction_keys":["d-abc"]}]}';
+    vi.mocked(fs.existsSync).mockImplementation(
+      (path: Parameters<typeof fs.existsSync>[0]) => String(path) === criteriaPath,
+    );
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => (path === criteriaPath ? criteriaPayload : ''),
+    );
+
+    await handleStrategic(
+      taskId,
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(executorPrompt).toContain('# Proposed acceptance criteria');
+    expect(executorPrompt).toContain(criteriaPayload);
+    expect(executorPrompt).toContain(`./strategic set-acceptance-criteria "$(cat ${criteriaPath})"`);
+    expect(executorPrompt).toContain('If the file is absent or empty, SKIP');
+    expect(executorPrompt).toContain('do not fabricate a criteria list');
+    expect(executorPrompt.indexOf('# Proposed acceptance criteria')).toBeLessThan(
+      executorPrompt.indexOf('# Instructions'),
+    );
+  });
+
+  it('omits the proposed criteria block when the file is absent while keeping the command conditional', async () => {
+    const taskId = 'task-no-criteria';
+
+    await handleStrategic(
+      taskId,
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(executorPrompt).not.toContain('# Proposed acceptance criteria');
+    expect(executorPrompt).toContain(`./strategic set-acceptance-criteria "$(cat /tmp/proposed_criteria_${taskId}.json)"`);
+    expect(executorPrompt).toContain('If the file is absent or empty, SKIP');
   });
 });
 

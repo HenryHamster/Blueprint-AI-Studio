@@ -505,6 +505,26 @@ Good: a concrete deliverable paired with a measurable success bar a new contribu
 
 Omit the \`new_version_goal\` key entirely if the goal is already set.
 
+## 8. Acceptance criteria (conditional — author only when warranted)
+
+Author criteria only when the version needs a root acceptance contract:
+- When the Version Phase section shows \`criterion_coverage.total=0\` (no criteria exist yet for this version) AND the version has a non-empty \`Goal:\` line. If the Version Phase has a non-empty \`Goal:\` but no acceptance-criteria coverage block at all, treat that as the same no-criteria case.
+- OR when active directions created this cycle have no criterion mappings and need to be tied to version-level outcomes.
+
+Skip entirely if criteria already exist and are reasonably mapped. Do NOT fabricate criteria when the version goal is unset — Section 7 handles that case first.
+
+When criteria are warranted, write \`/tmp/proposed_criteria_${p.taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} as the backend payload shape:
+
+\`\`\`json
+{"criteria":[{"text":"Users can complete the key workflow without manual operator intervention.","direction_keys":["d-xxx"]}]}
+\`\`\`
+
+Each \`criteria\` item has:
+- \`text\`: a short, concrete, independently verifiable criterion statement for the VERSION, not a direction description.
+- \`direction_keys\`: the \`d-xxx\` identifiers of directions that contribute to that criterion; use an empty array only when no active direction maps cleanly yet.
+
+Keep the total to 5-7 criteria maximum. Frame text as outcomes ("Users can X", "System handles Y"), not implementation steps ("Implement Z"). Ground every criterion in the version goal and active gap descriptions. If no criteria are needed this cycle, do not write the file at all.
+
 ${PLAYBOOK_GUIDANCE}
 
 ${DEFAULT_TOOL_GUIDANCE}`;

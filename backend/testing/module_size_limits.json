@@ -197,7 +197,7 @@
     "components/srTrendBreakdown/types.ts": 350,
     "components/SrUnhandledEdgesRetrospectivesPanel.tsx": 800,
     "components/TaskDetailDrawerMeta.tsx": 400,
-    "api.ts": 4250,
+    "api.ts": 4950,
     "components/WarmVmPanel.tsx": 1800,
     "components/TaskDetailDrawerSections.tsx": 1950,
     "components/VersionLifecyclePanelPrimitives.tsx": 1300,

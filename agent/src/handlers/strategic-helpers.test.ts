@@ -91,6 +91,16 @@ describe('writeStrategicHelpers', () => {
     expect(content).toContain('spawn-fix');
   });
 
+  it('routes acceptance-criteria authoring to the set_acceptance_criteria backend operation', () => {
+    const taskId = 'test-task-123';
+    const projectId = 'test-project-456';
+    writeStrategicHelpers(taskId, projectId, testWorkspace);
+
+    const content = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+    expect(content).toContain('set-acceptance-criteria');
+    expect(content).toContain('set-acceptance-criteria)   _call "set_acceptance_criteria"');
+  });
+
   it('embeds projectId in fetch script safely', () => {
     const taskId = 'test-task-123';
     const projectId = 'test-project-456';

@@ -72,7 +72,10 @@ from app.strategic_spawning import (
 )
 from app.strategic_analysis import _build_outcome_evaluation
 from app.direction_lifecycle import _reset_outcome_detection_state
-from app.models import Project, ProjectMember, StrategicCycle, Task
+from app.models import Direction, Project, ProjectMember, ReleaseVersion, StrategicCycle, Task, VersionAcceptanceCriterion
+from app.auth import create_agent_token
+from httpx import AsyncClient
+from sqlmodel import select
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -16377,3 +16380,172 @@ async def test_batch_retire_reconciles_gap_active_moves_and_records_deferral(
     assert gap["deferral"]["created_at"]
     # Status is never auto-closed.
     assert gap["status"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# set_acceptance_criteria strategic op (DB-backed, HTTP endpoint)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strategic_authors_and_maps_acceptance_criteria(
+    client: AsyncClient, db_session
+):
+    """strategic op set_acceptance_criteria creates VersionAcceptanceCriterion rows
+    and maps directions to them via Direction.criterion_keys.
+
+    Exercises:
+    - happy path: two criteria, one mapped to a direction
+    - idempotency: same call twice → no duplicate rows
+    - 409 when no open release version exists
+    """
+    # --- Setup ---
+    project = Project(name="AC-Strategic-Test", user_id="test-user-ac-strat")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(
+        project_id=project.id, version_number=1, status="open"
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-ac-test1",
+        data={"id": "d-ac-test1", "text": "Test direction", "status": "active"},
+        status="active",
+    )
+    db_session.add(direction)
+    await db_session.commit()
+    await db_session.refresh(direction)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="agent-vm-ac-strat",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-ac-strat", task_type="strategic_review"
+    )
+    headers = {"x-agent-token": token}
+
+    # --- First call: creates two criteria, maps first to direction ---
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {
+                        "text": "Users can create projects",
+                        "direction_keys": ["d-ac-test1"],
+                    },
+                    {
+                        "text": "CI passes on HEAD",
+                        "direction_keys": [],
+                    },
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["op"] == "set_acceptance_criteria"
+    assert len(body["criteria"]) == 2
+
+    first_item = next(c for c in body["criteria"] if "create projects" in c["text"])
+    second_item = next(c for c in body["criteria"] if "CI passes" in c["text"])
+    assert first_item["is_new"] is True
+    assert second_item["is_new"] is True
+    assert "d-ac-test1" in first_item["direction_keys"]
+    assert second_item["direction_keys"] == []
+
+    criterion_key_1 = first_item["criterion_key"]
+    criterion_key_2 = second_item["criterion_key"]
+
+    # DB: two VersionAcceptanceCriterion rows
+    rows = (
+        await db_session.execute(
+            select(VersionAcceptanceCriterion).where(
+                VersionAcceptanceCriterion.release_version_id == version.id
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 2
+    texts = {r.text for r in rows}
+    assert "Users can create projects" in texts
+    assert "CI passes on HEAD" in texts
+    for row in rows:
+        assert row.project_id == project.id
+        assert row.release_version_id == version.id
+
+    # DB: direction has criterion_key_1 in criterion_keys
+    await db_session.refresh(direction)
+    assert criterion_key_1 in direction.criterion_keys
+    assert criterion_key_2 not in direction.criterion_keys
+
+    # --- Second call: same criteria → no new rows (idempotent) ---
+    resp2 = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {
+                        "text": "Users can create projects",
+                        "direction_keys": ["d-ac-test1"],
+                    },
+                    {
+                        "text": "CI passes on HEAD",
+                        "direction_keys": [],
+                    },
+                ]
+            },
+        },
+    )
+    assert resp2.status_code == 200, resp2.text
+    body2 = resp2.json()
+    assert body2["status"] == "ok"
+    for item in body2["criteria"]:
+        assert item["is_new"] is False
+
+    rows_after = (
+        await db_session.execute(
+            select(VersionAcceptanceCriterion).where(
+                VersionAcceptanceCriterion.release_version_id == version.id
+            )
+        )
+    ).scalars().all()
+    assert len(rows_after) == 2, "Idempotent call must not create duplicate rows"
+
+    # criterion_keys on direction still contains only criterion_key_1 (no duplicates)
+    await db_session.refresh(direction)
+    assert direction.criterion_keys.count(criterion_key_1) == 1
+
+    # --- Third call: no open version → 409 ---
+    version.status = "closed"
+    db_session.add(version)
+    await db_session.commit()
+
+    resp3 = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {"criteria": [{"text": "Should fail", "direction_keys": []}]},
+        },
+    )
+    assert resp3.status_code == 409, resp3.text

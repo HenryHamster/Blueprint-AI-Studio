@@ -3567,7 +3567,7 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     expect(script).toContain('set-evidence-progress)');
     expect(script).toContain('_call "set_evidence_progress"');
     // Usage string advertises the new op.
-    expect(script).toContain('set-evidence-progress <json-or-file>');
+    expect(script).toContain('set-evidence-progress|set-acceptance-criteria <json-or-file>');
   });
 });
 

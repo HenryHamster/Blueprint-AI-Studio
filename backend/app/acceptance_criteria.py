@@ -38,6 +38,9 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     return False
 
 
+MAX_CRITERIA_PER_VERSION = 50
+
+
 def generate_criterion_key() -> str:
     """Return a stable 'c-<8hexchars>' key for a new acceptance criterion."""
     return f"c-{secrets.token_hex(4)}"
@@ -120,6 +123,23 @@ async def get_criteria_for_version(
         .order_by(VersionAcceptanceCriterion.created_at)
     )
     return list(result.scalars().all())
+
+
+async def get_criterion_by_text(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+    text: str,
+) -> VersionAcceptanceCriterion | None:
+    """Return an existing criterion matching (project_id, release_version_id, text), or None."""
+    result = await session.execute(
+        select(VersionAcceptanceCriterion).where(
+            VersionAcceptanceCriterion.project_id == project_id,
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.text == text,
+        )
+    )
+    return result.scalar_one_or_none()
 
 
 async def record_evidence(
@@ -278,6 +298,31 @@ async def record_task_merge_evidence(
             getattr(task, "id", None),
         )
         return 0
+
+
+async def delete_criterion(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+    criterion_key: str,
+) -> bool:
+    """Delete a criterion scoped to the given version.
+
+    Returns True if the row was found and deleted, False if not found.
+    """
+    result = await session.execute(
+        select(VersionAcceptanceCriterion).where(
+            VersionAcceptanceCriterion.project_id == project_id,
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.criterion_key == criterion_key,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        return False
+    await session.delete(row)
+    await session.commit()
+    return True
 
 
 async def get_version_coverage_summary(

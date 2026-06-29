@@ -2700,6 +2700,43 @@ export async function clearDeployFailed(
   return data;
 }
 
+export interface CreateCriterionResponse {
+  criterion_key: string;
+  text: string;
+  release_version_id: string;
+}
+
+export async function createAcceptanceCriterion(
+  projectId: string,
+  text: string,
+): Promise<CreateCriterionResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/acceptance-criteria`,
+    { method: 'POST', body: JSON.stringify({ text }) },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Failed to create criterion: ${res.status}`;
+    throw new Error(detail);
+  }
+  return data;
+}
+
+export async function deleteAcceptanceCriterion(
+  projectId: string,
+  criterionKey: string,
+): Promise<void> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/acceptance-criteria/${encodeURIComponent(criterionKey)}`,
+    { method: 'DELETE' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const detail = data?.detail || `Failed to delete criterion: ${res.status}`;
+    throw new Error(detail);
+  }
+}
+
 export type QualifyTriggerStatus =
   | 'wrong_phase'
   | 'already_pending'

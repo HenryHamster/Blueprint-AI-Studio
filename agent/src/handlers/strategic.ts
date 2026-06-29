@@ -735,6 +735,17 @@ prompts, schemas, tools, or orchestration.` : '';
       }
     }
 
+    let proposedCriteriaBlock = '';
+    const proposedCriteriaPath = `/tmp/proposed_criteria_${taskId}.json`;
+    if (fs.existsSync(proposedCriteriaPath)) {
+      try {
+        const raw = fs.readFileSync(proposedCriteriaPath, 'utf8').trim();
+        if (raw) proposedCriteriaBlock = `# Proposed acceptance criteria\n\`\`\`json\n${raw}\n\`\`\`\n`;
+      } catch (e) {
+        sendLog(ws, `[WARNING] Failed to read proposed_criteria file: ${String(e)}\n`);
+      }
+    }
+
     // Scan thinker analysis for cited memo handles and persist them via the API.
     // The completion handler reads task.context["_strategic_cited_memo_ids"] to
     // count memos_cited — scanning the analysis text (where memos were shown
@@ -906,6 +917,10 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # assessed no directions — it's an optional precision refinement, never required.
 ./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing","rationale":"..."}]'
 
+# CONDITIONAL: Submit acceptance criteria proposed by the Thinker, only when the
+# /tmp/proposed_criteria_${taskId}.json file exists and is non-empty.
+./strategic set-acceptance-criteria "$(cat /tmp/proposed_criteria_${taskId}.json)"
+
 # Spawn a targeted investigation/knowledge task when something from the Recent
 # Work section needs attention NOW instead of waiting for the next autonomous
 # cycle. Choose the type by what you need:
@@ -997,6 +1012,7 @@ ${analysisText.slice(0, 50_000)}
 
 ${strategicChallengeSection}
 
+${proposedCriteriaBlock}
 # Instructions
 
 1. **Problem model (REQUIRED).** First do step 5 below: if the Thinker emitted \`version_phase_decision\`, \`qualify_request\`, and/or \`new_version_goal\`, edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add those top-level sibling fields. Then pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\` — the \`cat\` re-reads the file, so the sibling fields you added in step 5 are included. Don't summarize or re-emit the model's own content — read-and-pass; the only edit permitted is step 5's sibling fields.
@@ -1029,6 +1045,8 @@ ${strategicChallengeSection}
 4. **Retired-direction critique (REQUIRED).** From Section 3.5, call \`./strategic set-retirement-critiques\` with a JSON array of critique objects. If the Thinker wrote "No eligible retirements", pass \`'{"no_eligible_retirements": true}'\`. Never skip this call.
 
    *Optional companion:* If the Thinker's Section 3.6 recorded \`evidence_progress\` verdicts for long-running active directions, persist them with \`./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing|stalled|met","rationale":"..."}]'\`. Skip entirely when Section 3.6 is empty — this is an optional precision refinement, never a required call. **Challenge gate:** submit an \`advancing\` or \`met\` status ONLY for a (direction_id, status) pair the independent challenge APPROVED (see the "Independent strategic challenge" section above). For any direction the challenge did not approve at that exact status — or if the challenge was blocked/invalid — submit \`stalled\` (advisory, always allowed) or omit it.
+
+4.5. **Acceptance criteria (conditional).** If the proposed criteria block above is non-empty, call \`./strategic set-acceptance-criteria "$(cat /tmp/proposed_criteria_${taskId}.json)"\`. If the file is absent or empty, SKIP — do not fabricate a criteria list.
 
 5. **Version phase / qualify siblings (conditional — do this BEFORE step 1's \`set-problem-model\` call).** If the Thinker's analysis includes a \`version_phase_decision\` field (look in Section 6 and throughout the analysis), edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add it as a top-level sibling key, so the file becomes:
    \`{"version_phase_decision": {"phase": "build" or "stabilize", "reasoning": "..."}, ...rest_of_problem_model}\`
