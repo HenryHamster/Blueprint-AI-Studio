@@ -21814,10 +21814,10 @@ class TestTaskPayloadSecretRedaction:
         # secret-bearing launch-spec keys are stripped
         assert "container_registry_auth" not in payload
         assert "env" not in payload
-        # internal launch-spec keys mirrored from the compute-job serializer
-        assert "command" not in payload
-        assert "cwd" not in payload
-        # non-secret fields are preserved
+        # non-secret launch fields are preserved for operator debugging
+        assert payload["command"] == "python run.py"
+        assert payload["cwd"] == "/work"
+        # other non-secret fields are preserved
         assert payload["type"] == "compute_experiment"
         assert payload["base_branch"] == "main"
         # the plaintext secrets never appear anywhere in the serialized response
@@ -21847,6 +21847,8 @@ class TestTaskPayloadSecretRedaction:
         payload = match["payloads"][0]
         assert "container_registry_auth" not in payload
         assert "env" not in payload
+        assert payload["command"] == "python run.py"
+        assert payload["cwd"] == "/work"
         assert payload["base_branch"] == "main"
         assert "SUPER-SECRET-REGISTRY-PW" not in resp.text
         assert "hf_SECRET_ENV_TOKEN" not in resp.text

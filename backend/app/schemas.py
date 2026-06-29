@@ -533,10 +533,11 @@ def serialize_compute_job_response(job: object) -> Dict[str, Any]:
 _POLLING_METADATA_LAUNCH_SPEC_KEYS = frozenset(
     {"env", "command", "cwd", "container_registry_auth"}
 )
+_TASK_PAYLOAD_SECRET_KEYS = frozenset({"env", "container_registry_auth"})
 
 
 def redact_task_payloads(payloads: Any) -> Any:
-    """Strip launch-spec secret keys from operator-facing task payloads.
+    """Strip secret keys from operator-facing task payloads.
 
     A ``compute_experiment`` task stores its launch contract inline in
     ``Task.payloads`` — including ``container_registry_auth`` (a registry
@@ -544,9 +545,8 @@ def redact_task_payloads(payloads: Any) -> Any:
     agent-claim path legitimately needs these (the claiming agent forwards them
     when it creates the compute job, and a retried task re-reads them), so the
     values must stay in the row. But the operator-facing task list/detail
-    endpoints must not echo them back: ``serialize_compute_job_response_safe``
-    already redacts these same keys from compute-job responses, so without this
-    the very registry password redacted in one operator view leaks in another.
+    endpoints must not echo those secret-bearing fields back, or the very
+    registry password redacted in one operator view leaks in another.
 
     Returns a new list with the secret keys removed from each payload dict. The
     input is never mutated (a fresh dict is built only for entries that carry a
@@ -558,13 +558,11 @@ def redact_task_payloads(payloads: Any) -> Any:
         return payloads
     redacted = []
     for entry in payloads:
-        if isinstance(entry, dict) and any(
-            k in entry for k in _POLLING_METADATA_LAUNCH_SPEC_KEYS
-        ):
+        if isinstance(entry, dict) and any(k in entry for k in _TASK_PAYLOAD_SECRET_KEYS):
             entry = {
                 k: v
                 for k, v in entry.items()
-                if k not in _POLLING_METADATA_LAUNCH_SPEC_KEYS
+                if k not in _TASK_PAYLOAD_SECRET_KEYS
             }
         redacted.append(entry)
     return redacted
