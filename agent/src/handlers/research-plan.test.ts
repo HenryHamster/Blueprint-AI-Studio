@@ -3468,6 +3468,15 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     // runThinkerWithGate's gate: thinker exit 0 + both handoff files present.
     // Returning true for every existsSync keeps the gate happy.
     vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(true);
+    // runThinkerWithGate now does a strict final re-parse of the problem_model
+    // file after the gate passes. Mock readFileSync to return valid JSON for the
+    // problem_model path so JSON.parse succeeds and runThinkerWithGate returns
+    // { ok: true } instead of { ok: false } (the strict re-parse was added after
+    // these tests were written against the old swallowing behavior).
+    vi.mocked(fs.readFileSync as (p: string | Buffer, opts?: unknown) => string).mockImplementation((path) => {
+      if (typeof path === 'string' && path.includes(`problem_model_${EX_TASK_ID}`)) return THINKER_JSON;
+      return '';
+    });
 
     await handleStrategic(
       EX_TASK_ID, EX_PAYLOAD, EX_TASK, EX_GH_TOKEN, EX_OWNER, EX_REPO, EX_WS, EX_STATUS_REF(),
@@ -3702,6 +3711,13 @@ describe('handlePlan structured-output self-repair', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // mockReset clears the once-queue that vi.clearAllMocks() leaves intact.
+    // Preceding test suites (e.g. strategic executor) may leave un-consumed
+    // mockResolvedValueOnce entries when their runThinkerWithGate call returns
+    // { ok: false } early, consuming only 1 of 3 queued values. Those leftovers
+    // contaminate the runClaudeCode sequence seen by handlePlan. Resetting here
+    // ensures this suite starts with a clean implementation queue.
+    vi.mocked(runClaudeCode).mockReset();
     vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
     vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
     vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
