@@ -3,10 +3,8 @@ import { ErrorBoundary } from './components/ErrorBoundary';
 import {
   Activity,
   AlertCircle,
-  BookOpen,
   CheckSquare,
   LayoutList,
-  Microscope,
 } from 'lucide-react';
 import { ColumnsPicker } from './components/ColumnsPicker';
 import type { ColumnPref } from './components/ColumnsPicker';
@@ -215,7 +213,7 @@ export default function App() {
     } catch { /* ignore; the pipeline filter can operate without direction labels */ }
   }, {
     intervalMs: DEFAULT_POLL_MS,
-    enabled: activeTab === 'pipeline',
+    enabled: activeTab === 'pipeline' || activeTab === 'chat',
     deps: [selectedProjectId, activeTab],
   });
 
@@ -462,29 +460,22 @@ export default function App() {
     : combinedAlerts.some(a => a.severity === 'WARNING') ? 'WARNING'
     : combinedAlerts.length > 0 ? 'INFO' : null;
 
-  const pendingFindingsCount = useMemo(() => {
-    const implemented = new Set<string>();
-    for (const t of s.tasks) {
-      const ctx = t.context as Record<string, unknown> | undefined;
-      if (ctx?.research_task_id && ctx?.finding_index !== undefined) {
-        implemented.add(`${ctx.research_task_id}-${ctx.finding_index}`);
-      }
-    }
-    let count = 0;
-    for (const t of s.tasks) {
-      if (t.task_type !== 'research' || t.status !== 'COMPLETED' || !t.research_findings) continue;
-      const arr = Array.isArray(t.research_findings) ? t.research_findings : [];
-      arr.forEach((_: unknown, i: number) => {
-        if (!implemented.has(`${t.id}-${i}`)) count++;
-      });
-    }
-    return count;
-  }, [s.tasks]);
-
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
   const blockedTasks = useMemo(() => s.tasks.filter(t => t.status === 'BLOCKED'), [s.tasks]);
   const failedTasksForProject = useMemo(() => s.tasks.filter(t => t.status === 'FAILED'), [s.tasks]);
+  const activeDirections = useMemo(() => directions.filter(d => {
+    const status = d.status?.toLowerCase();
+    return !d.held && status !== 'retired' && status !== 'done' && status !== 'completed';
+  }), [directions]);
+  const primaryDirection = activeDirections[0] ?? directions[0] ?? null;
+  const chatCanvasBars = useMemo(() => [
+    { key: 'active', label: 'active', value: runningTasks.length, className: 'bg-emerald-500' },
+    { key: 'queued', label: 'queued', value: queuedTasks.length, className: 'bg-neutral-500' },
+    { key: 'blocked', label: 'blocked', value: blockedTasks.length, className: 'bg-amber-400' },
+    { key: 'failed', label: 'failed', value: failedTasksForProject.length, className: 'bg-red-500' },
+  ], [runningTasks.length, queuedTasks.length, blockedTasks.length, failedTasksForProject.length]);
+  const chatCanvasMax = useMemo(() => Math.max(1, ...chatCanvasBars.map(item => item.value)), [chatCanvasBars]);
 
   const selectedTasks = useMemo(() => s.tasks.filter(t => s.selectedTaskIds.has(t.id)), [s.tasks, s.selectedTaskIds]);
   const cancellableTasks = useMemo(() => selectedTasks.filter(t => CANCELLABLE_STATUSES.has(t.status)), [selectedTasks]);
@@ -804,41 +795,22 @@ export default function App() {
 
   const pipelineSurfaceActions = (
     <>
-      <span className="hidden items-center rounded-md border border-neutral-800 bg-neutral-950/80 px-2 py-1 text-xs text-neutral-500 md:inline-flex">
+      <span className="hidden items-center rounded-md border border-neutral-800 bg-neutral-950/80 px-2.5 py-1.5 text-xs text-neutral-500 md:inline-flex">
         {filteredTasks.length}/{s.tasks.length}
       </span>
       <button
         type="button"
-        onClick={() => s.setShowResearchBrowser(prev => !prev)}
-        aria-pressed={s.showResearchBrowser}
-        className={`relative inline-flex min-h-9 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium transition-colors ${
-          s.showResearchBrowser
-            ? 'border-cyan-500/40 bg-cyan-500/10 text-cyan-300'
-            : 'border-neutral-800 bg-neutral-950/70 text-neutral-500 hover:border-neutral-700 hover:text-neutral-300'
-        }`}
-        title="Research Findings"
+        onClick={() => { void s.fetchTasks(); }}
+        className="inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
       >
-        <Microscope className="h-3.5 w-3.5" />
-        <span className="hidden sm:inline">Research</span>
-        {pendingFindingsCount > 0 && (
-          <span className="ml-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-cyan-400 px-1 text-ui-2xs font-bold leading-none text-neutral-950">
-            {pendingFindingsCount}
-          </span>
-        )}
+        Refresh
       </button>
       <button
         type="button"
-        onClick={() => s.setShowKnowledgeBrowser(prev => !prev)}
-        aria-pressed={s.showKnowledgeBrowser}
-        className={`inline-flex min-h-9 items-center gap-1.5 rounded-md border px-2.5 text-xs font-medium transition-colors ${
-          s.showKnowledgeBrowser
-            ? 'border-violet-500/40 bg-violet-500/10 text-violet-300'
-            : 'border-neutral-800 bg-neutral-950/70 text-neutral-500 hover:border-neutral-700 hover:text-neutral-300'
-        }`}
-        title="Knowledge Library"
+        onClick={s.openNewTaskModal}
+        className="inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
       >
-        <BookOpen className="h-3.5 w-3.5" />
-        <span className="hidden sm:inline">Knowledge</span>
+        New task
       </button>
     </>
   );
@@ -1274,42 +1246,99 @@ export default function App() {
             )}
             rail={(
               <div className="space-y-3">
-                <WorkbenchPanel title="Pipeline" meta={`${filteredTasks.length}/${s.tasks.length}`}>
-                  <div className="grid grid-cols-2 gap-2">
-                    <WorkbenchMetric label="active" value={runningTasks.length} tone="good" />
-                    <WorkbenchMetric label="queued" value={queuedTasks.length} tone="neutral" />
-                    <WorkbenchMetric label="blocked" value={blockedTasks.length} tone={blockedTasks.length > 0 ? 'warn' : 'neutral'} />
-                    <WorkbenchMetric label="failed" value={failedTasksForProject.length} tone={failedTasksForProject.length > 0 ? 'bad' : 'neutral'} />
-                  </div>
-                </WorkbenchPanel>
-                <WorkbenchPanel title="Strategic" meta={s.strategistActive ? 'running' : 'idle'}>
-                  <div className="space-y-2 text-sm">
+                <WorkbenchPanel title="Canvas" meta="live">
+                  <div className="rounded-md border border-neutral-800 bg-[#0b0f14] p-3">
                     <div className="flex items-center justify-between gap-3">
-                      <span className="text-neutral-500">cycle</span>
-                      <span className={s.strategistActive ? 'text-indigo-300' : 'text-neutral-300'}>
-                        {s.strategistActive ? (s.cycleProgress?.phase_label ?? 'working') : 'idle'}
-                      </span>
+                      <h3 className="truncate text-xs font-semibold text-neutral-100">Pipeline + spend snapshot</h3>
+                      <span className="shrink-0 font-mono text-ui-md text-neutral-500">{filteredTasks.length}/{s.tasks.length}</span>
                     </div>
-                    {s.lastCycleCompletion?.status_message && (
-                      <p className="text-xs leading-relaxed text-neutral-400">{s.lastCycleCompletion.status_message.slice(0, 180)}</p>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setProjectSection('running-update');
-                        handleTabChange('project');
-                      }}
-                      className="text-xs font-medium text-neutral-300 underline-offset-4 hover:text-neutral-100 hover:underline"
-                    >
-                      Open running update
-                    </button>
+                    <div className="mt-3 grid grid-cols-3 gap-2">
+                      <WorkbenchMetric label="active" value={runningTasks.length} tone="good" />
+                      <WorkbenchMetric label="blocked" value={blockedTasks.length} tone={blockedTasks.length > 0 ? 'warn' : 'neutral'} />
+                      <WorkbenchMetric label="cost" value={`$${s.cumulativeCost.toFixed(2)}`} tone="neutral" />
+                    </div>
+                    <div className="mt-4 flex h-20 items-end gap-2 border-t border-neutral-800 pt-3" aria-label="Pipeline status snapshot">
+                      {chatCanvasBars.map(item => (
+                        <div key={item.key} className="flex min-w-0 flex-1 flex-col items-center gap-1">
+                          <div className="flex h-12 w-full items-end rounded-sm bg-neutral-900/70">
+                            <div
+                              className={`w-full rounded-sm ${item.className}`}
+                              style={{ height: `${Math.max(8, Math.round((item.value / chatCanvasMax) * 100))}%` }}
+                            />
+                          </div>
+                          <span className="truncate text-ui-md text-neutral-600">{item.label}</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
+                      <div className="rounded-md border border-neutral-800 bg-neutral-950/60 px-2 py-1.5">
+                        <div className="text-neutral-500">queued</div>
+                        <div className="mt-0.5 font-semibold text-neutral-200">{queuedTasks.length}</div>
+                      </div>
+                      <div className="rounded-md border border-neutral-800 bg-neutral-950/60 px-2 py-1.5">
+                        <div className="text-neutral-500">accounts</div>
+                        <div className="mt-0.5 font-semibold text-neutral-200">{s.maxPlanAccounts.length}</div>
+                      </div>
+                    </div>
                   </div>
                 </WorkbenchPanel>
-                <WorkbenchPanel title="Runtime" meta={s.wsConnected ? 'connected' : 'offline'}>
-                  <div className="space-y-2 text-sm text-neutral-400">
-                    <div className="flex justify-between gap-3"><span className="text-neutral-500">API</span><span className={s.apiHealthy ? 'text-emerald-300' : 'text-red-300'}>{s.apiHealthy ? 'healthy' : 'unhealthy'}</span></div>
-                    <div className="flex justify-between gap-3"><span className="text-neutral-500">accounts</span><span>{s.maxPlanAccounts.length}</span></div>
-                    <div className="flex justify-between gap-3"><span className="text-neutral-500">cost</span><span>${s.cumulativeCost.toFixed(2)}</span></div>
+                <WorkbenchPanel title="Context" meta="current project">
+                  <div className="divide-y divide-neutral-800 text-sm">
+                    <div className="pb-3">
+                      <div className="flex items-center justify-between gap-3">
+                        <span className="text-xs font-semibold text-neutral-100">Running update</span>
+                        <span className={s.strategistActive ? 'text-xs text-indigo-300' : 'text-xs text-neutral-500'}>
+                          {s.strategistActive ? (s.cycleProgress?.phase_label ?? 'working') : 'idle'}
+                        </span>
+                      </div>
+                      <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-neutral-400">
+                        {s.lastCycleCompletion?.status_message ?? 'No recent strategic cycle receipt.'}
+                      </p>
+                    </div>
+                    <div className="py-3">
+                      <div className="text-xs font-semibold text-neutral-100">Selected direction</div>
+                      <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-neutral-400">
+                        {primaryDirection?.text ?? 'No active direction loaded for this project.'}
+                      </p>
+                    </div>
+                    <div className="pt-3">
+                      <div className="text-xs font-semibold text-neutral-100">Problem model</div>
+                      <p className="mt-1 text-xs leading-relaxed text-neutral-500">
+                        {selectedProject ? selectedProjectRepoLabel : 'Select a project'}
+                      </p>
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setProjectSection('running-update');
+                            handleTabChange('project');
+                          }}
+                          className="rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 py-1.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
+                        >
+                          Running update
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setProjectSection('directions');
+                            handleTabChange('project');
+                          }}
+                          className="rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 py-1.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
+                        >
+                          Directions
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setProjectSection('problem-model');
+                            handleTabChange('project');
+                          }}
+                          className="rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 py-1.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
+                        >
+                          Model
+                        </button>
+                      </div>
+                    </div>
                   </div>
                 </WorkbenchPanel>
               </div>
@@ -1416,6 +1445,7 @@ export default function App() {
             if (id === 'board') s.setViewMode('kanban');
           }}
           actions={pipelineSurfaceActions}
+          tabLayout="stacked"
           flush
         >
           {pipelineSection === 'archive' && s.showArchive ? (

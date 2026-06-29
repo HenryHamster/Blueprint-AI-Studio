@@ -33,7 +33,7 @@ export function ProjectSwitcherDropdown({
     <div ref={ref} className="relative shrink-0">
       <button
         onClick={() => setOpen(o => !o)}
-        className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium text-neutral-300 hover:text-neutral-100 hover:bg-neutral-800/60 transition-colors min-h-11"
+        className="flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-800 bg-[#0b0f14] px-3 py-2 text-sm font-medium text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 md:h-8 md:min-h-0 md:py-0"
         aria-haspopup="listbox"
         aria-expanded={open}
       >

@@ -67,7 +67,7 @@ function MultiSelectDropdown({ label, options, selected, onChange }: MultiSelect
     <div ref={ref} className="relative">
       <button
         onClick={() => setOpen(prev => !prev)}
-        className={`flex items-center gap-1.5 px-2.5 py-1.5 min-h-11 rounded-lg text-xs font-medium transition-all border ${
+        className={`flex items-center gap-1.5 px-2.5 py-1.5 min-h-11 rounded-md text-xs font-medium transition-all border md:min-h-8 md:py-1 ${
           !allSelected
             ? 'bg-white/5 border-neutral-600 text-neutral-100'
             : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
@@ -140,7 +140,7 @@ export function SingleSelectDropdown({ options, value, onChange, isActive }: Sin
     <div ref={ref} className="relative">
       <button
         onClick={() => setOpen(prev => !prev)}
-        className={`flex items-center gap-1.5 px-2.5 py-1.5 min-h-11 rounded-lg text-xs font-medium transition-all border ${
+        className={`flex items-center gap-1.5 px-2.5 py-1.5 min-h-11 rounded-md text-xs font-medium transition-all border md:min-h-8 md:py-1 ${
           active
             ? 'bg-white/5 border-neutral-600 text-neutral-100'
             : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
@@ -225,7 +225,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
           value={inputValue}
           onChange={e => setInputValue(e.target.value)}
           placeholder="Search by title, ID, or status..."
-          className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg pl-9 pr-3 py-2 text-base md:text-sm text-neutral-100 placeholder-neutral-600 focus:ring-1 focus:ring-neutral-700 w-full md:w-64 outline-none"
+          className="w-full rounded-md border border-neutral-800/70 bg-neutral-950 pl-9 pr-3 py-2 text-base text-neutral-100 placeholder-neutral-600 outline-none focus:ring-1 focus:ring-neutral-700 md:w-64 md:py-1.5 md:text-sm"
         />
       </div>
 
@@ -254,7 +254,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
 
       <button
         onClick={() => onBlockedFilterChange(!blockedFilter)}
-        className={`flex items-center gap-1.5 px-2.5 py-1.5 min-h-11 rounded-lg text-xs font-medium transition-all border ${
+        className={`flex items-center gap-1.5 px-2.5 py-1.5 min-h-11 rounded-md text-xs font-medium transition-all border md:min-h-8 md:py-1 ${
           blockedFilter
             ? 'bg-amber-950/30 border-amber-700/60 text-amber-400'
             : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
@@ -282,7 +282,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
       <button
         onClick={onDownloadCsv}
         title="Download CSV"
-        className="px-3 py-1.5 min-h-11 rounded-full text-xs font-medium border bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300 transition-colors"
+        className="min-h-11 rounded-md border border-neutral-800/50 bg-neutral-900/50 px-3 py-1.5 text-xs font-medium text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-300 md:min-h-8 md:py-1"
       >
         CSV
       </button>
@@ -290,7 +290,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
       {hasActiveFilters && (
         <button
           onClick={handleClear}
-          className="px-2.5 py-1.5 min-h-11 rounded-lg text-xs font-medium transition-all border bg-red-950/30 border-red-900/50 text-red-400 hover:border-red-700/60 hover:text-red-300"
+          className="min-h-11 rounded-md border border-red-900/50 bg-red-950/30 px-2.5 py-1.5 text-xs font-medium text-red-400 transition-all hover:border-red-700/60 hover:text-red-300 md:min-h-8 md:py-1"
         >
           Clear
         </button>

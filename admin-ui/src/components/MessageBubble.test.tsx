@@ -130,6 +130,28 @@ describe('MessageBubble', () => {
     expect(screen.queryByTitle('Delete')).toBeNull();
   });
 
+  test('reply-only mode keeps reply available and hides triage actions', () => {
+    const onReply = vi.fn();
+    render(<MessageBubble {...makeProps({
+      actionMode: 'reply-only',
+      msg: makeMsg({ message_type: 'QUESTION', content: 'Can you decide this?' }),
+      onReply,
+    })} />);
+
+    expect(screen.queryByTitle('Resolve')).toBeNull();
+    expect(screen.queryByTitle('Delete')).toBeNull();
+    expect(screen.queryByTitle('Create Direction')).toBeNull();
+
+    const replyBtn = screen.getByTitle('Reply');
+    fireEvent.click(replyBtn);
+    expect(onReply).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'msg-1',
+      content: 'Can you decide this?',
+      message_type: 'QUESTION',
+      status: 'open',
+    }));
+  });
+
   test('shows resolved note when status is resolved with resolution', () => {
     render(<MessageBubble {...makeProps({
       msg: makeMsg({ status: 'resolved', resolution: 'Fixed in PR 123' }),

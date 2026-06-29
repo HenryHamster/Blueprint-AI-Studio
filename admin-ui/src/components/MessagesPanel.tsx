@@ -1500,6 +1500,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         onChangeContent={(value) => { setNewContent(value); if (value) { saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: newType, content: value }); } else { clearComposerDraft(auth.currentUser?.email, selectedProjectId); } }}
         onCancelReply={() => setReplyTo(null)}
         onSubmit={handleSubmit}
+        chrome={conversationMode ? 'minimal' : 'full'}
       />
     </div>
   );

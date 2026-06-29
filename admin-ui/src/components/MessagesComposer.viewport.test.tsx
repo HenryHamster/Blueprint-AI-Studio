@@ -9,6 +9,7 @@ async function renderComposer(
   newType: string,
   lastArming: 'steering' | 'passive_note' | 'routine_event' | null = null,
   strategistBusy = false,
+  chrome: 'full' | 'minimal' = 'full',
 ) {
   const ref = createRef<HTMLTextAreaElement>();
   await act(async () => {
@@ -25,6 +26,7 @@ async function renderComposer(
         onChangeContent={() => {}}
         onCancelReply={() => {}}
         onSubmit={() => {}}
+        chrome={chrome}
       />,
     );
   });
@@ -103,6 +105,23 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     });
     expect(host!.textContent).toContain('Routine event');
     expect(host!.textContent).toContain('won’t wake the strategist');
+    await expectNoTextTruncationAt(375, async () => {});
+    await expectMinTouchTargetAt(375, async () => {});
+  });
+
+  test('minimal chat composer keeps type selector visible without hint clutter', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderComposer(r, 'BLOCKER', null, false, 'minimal');
+    });
+    expect(host!.textContent).toContain('Blocker');
+    expect(host!.textContent).toContain('Send');
+    expect(host!.textContent).not.toContain('reaches the strategist soon');
+    expect(host!.textContent).not.toContain('won’t wake the strategist');
     await expectNoTextTruncationAt(375, async () => {});
     await expectMinTouchTargetAt(375, async () => {});
   });

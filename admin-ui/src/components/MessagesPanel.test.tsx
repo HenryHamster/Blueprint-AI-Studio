@@ -4317,6 +4317,57 @@ describe('MessagesPanel composer draft persistence', () => {
     });
   });
 
+  test('minimal chat surfaces and sends the restored draft message type', async () => {
+    const draftKey = 'messages_composer_draft:test-user@example.com:proj-draft';
+    localStorage.setItem(draftKey, JSON.stringify({ type: 'BLOCKER', content: 'use the clean chat path' }));
+    const postedBodies: unknown[] = [];
+
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const initObj = init as RequestInit | undefined;
+      const method = initObj?.method ?? 'GET';
+      if (method === 'POST' && urlStr.includes('/api/admin/messages')) {
+        postedBodies.push(JSON.parse(String(initObj?.body ?? '{}')));
+        return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
+      }
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+
+    _suppressSinceLastVisit('test-user@example.com', 'proj-draft');
+    const { container, getByText } = render(
+      <MessagesPanel
+        selectedProjectId="proj-draft"
+        variant="page"
+        filterChrome="minimal"
+        showCloseButton={false}
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+      />,
+    );
+    await waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1));
+
+    const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
+    expect(textarea.value).toBe('use the clean chat path');
+    expect(container.textContent).toContain('Blocker');
+
+    await act(async () => {
+      getByText('Send').click();
+    });
+
+    await waitFor(() => expect(postedBodies).toHaveLength(1));
+    expect(postedBodies[0]).toMatchObject({
+      project_id: 'proj-draft',
+      message_type: 'BLOCKER',
+      content: 'use the clean chat path',
+    });
+  });
+
   test('draft is scoped per project — switching projects loads the new project draft', async () => {
     // Seed separate drafts for two projects
     localStorage.setItem(

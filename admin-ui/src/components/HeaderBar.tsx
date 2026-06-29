@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Compass, Microscope, BookOpen, Plus, MoreHorizontal, Settings, Bell } from 'lucide-react';
+import { Activity, Compass, Microscope, BookOpen, MoreHorizontal, Settings, Bell, Plus } from 'lucide-react';
 import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
@@ -403,14 +403,14 @@ export function HeaderBar(props: HeaderBarProps) {
       )}
 
       {/* Unified top bar: compact global shell with fixed utility clusters and a scrolling tab strip. */}
-      <header className="mb-2 flex flex-wrap items-center gap-2 rounded-md border border-neutral-800/80 bg-[#05070a] px-2 py-1.5 shadow-[0_1px_0_rgba(255,255,255,0.04)] md:flex-nowrap">
+      <header className="flex min-h-10 flex-wrap items-center gap-2 border-b border-neutral-800 bg-[#05070a] px-2 py-1.5 md:flex-nowrap">
         {/* LEFT: ProjectSwitcher + Manage projects slot */}
         <div className="flex min-w-0 shrink-0 items-center gap-1.5">
-          <div className="hidden items-center gap-2 pr-1 sm:flex">
-            <span className="flex h-8 w-8 items-center justify-center rounded-md border border-neutral-800 bg-[#0b0f14] text-neutral-300 shadow-inner shadow-black/20">
+          <div className="hidden items-center gap-2 pr-1 lg:flex">
+            <span className="flex h-7 w-7 items-center justify-center rounded-md border border-neutral-800 bg-[#0b0f14] text-neutral-300 shadow-inner shadow-black/20">
               <Compass className="h-3.5 w-3.5" />
             </span>
-            <span className="text-sm font-semibold tracking-normal text-neutral-100">Blueprint</span>
+            <span className="text-sm font-semibold tracking-normal text-neutral-100">BlueprintAIStudio</span>
           </div>
           <ProjectSwitcherDropdown
             projects={props.projects}
@@ -429,6 +429,14 @@ export function HeaderBar(props: HeaderBarProps) {
           )}
         </div>
 
+        <button
+          type="button"
+          onClick={() => props.onTabChange('chat')}
+          className="hidden min-w-0 flex-1 items-center rounded-md border border-neutral-800 bg-[#0b0f14] px-3 py-1.5 text-left font-mono text-xs text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-300 lg:flex"
+        >
+          <span className="truncate">Message Strategic...</span>
+        </button>
+
         {/* CENTER: Primary tab group — intentional horizontal-scroll strip
             (overflow-x-auto + min-w-0) so the tabs scroll rather than wrap or
             push the bar wide on narrow viewports; opt the scroll container out
@@ -437,7 +445,7 @@ export function HeaderBar(props: HeaderBarProps) {
         <nav
           data-viewport-allow-overflow
           data-viewport-allow-truncation
-          className="order-3 flex min-w-0 flex-1 basis-full items-center gap-0.5 overflow-x-auto rounded-md border border-neutral-800 bg-[#0b0f14] p-0.5 sm:order-none sm:mx-1 sm:basis-0"
+          className="order-3 flex min-w-0 flex-1 basis-full items-center gap-0.5 overflow-x-auto rounded-md border border-neutral-800 bg-[#0b0f14] p-0.5 sm:order-none sm:basis-auto md:flex-none"
         >
           {(['chat', 'pipeline', 'project', 'runtime'] as const).map(tab => {
             const isActive = props.activeTab === tab;
@@ -451,7 +459,7 @@ export function HeaderBar(props: HeaderBarProps) {
                 className={`inline-flex min-h-[44px] shrink-0 items-center rounded px-2.5 py-1 text-sm font-semibold transition-colors whitespace-nowrap md:min-h-0 ${
                   isActive
                     ? 'bg-neutral-800 text-neutral-100 shadow-[0_1px_0_rgba(255,255,255,0.06)]'
-                    : 'text-neutral-500 hover:bg-neutral-900 hover:text-neutral-300'
+                    : 'text-neutral-300 hover:bg-neutral-900 hover:text-neutral-100'
                 }`}
               >
                 {tab.charAt(0).toUpperCase() + tab.slice(1)}
@@ -490,6 +498,44 @@ export function HeaderBar(props: HeaderBarProps) {
                 }`} />
                 <Bell className="w-3.5 h-3.5" />
                 <span>{props.alertCount}</span>
+              </button>
+            )}
+            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
+            <button
+              onClick={onToggleResearchBrowser}
+              title="Research findings"
+              aria-pressed={showResearchBrowser}
+              className={`relative flex h-8 w-8 items-center justify-center rounded text-xs transition-colors ${
+                showResearchBrowser ? 'bg-cyan-500/10 text-cyan-300' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'
+              }`}
+            >
+              <Microscope className="w-4 h-4" />
+              {pendingFindingsCount > 0 && (
+                <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-cyan-400 px-0.5 text-ui-2xs font-bold leading-none text-neutral-950">
+                  {pendingFindingsCount > 9 ? '9+' : pendingFindingsCount}
+                </span>
+              )}
+            </button>
+            {/* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */}
+            <button
+              onClick={onToggleKnowledgeBrowser}
+              title="Knowledge library"
+              aria-pressed={showKnowledgeBrowser}
+              className={`flex h-8 w-8 items-center justify-center rounded text-xs transition-colors ${
+                showKnowledgeBrowser ? 'bg-violet-500/10 text-violet-300' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'
+              }`}
+            >
+              <BookOpen className="w-4 h-4" />
+            </button>
+            {props.activeTab !== 'pipeline' && (
+              /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
+              <button
+                onClick={onOpenNewTaskModal}
+                title="New task"
+                className="flex h-8 items-center gap-1 rounded px-2 text-xs font-semibold text-neutral-300 transition-colors hover:bg-neutral-900 hover:text-neutral-100"
+              >
+                <Plus className="w-3.5 h-3.5" />
+                <span>New</span>
               </button>
             )}
             {/* Activity */}
@@ -722,6 +768,13 @@ export function HeaderBar(props: HeaderBarProps) {
                     <span>Activity stream</span>
                   </button>
                 )}
+                <button
+                  onClick={() => { onOpenNewTaskModal(); setShowMobileMenu(false); }}
+                  className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
+                >
+                  <span className="w-4 h-4 flex items-center justify-center font-mono shrink-0">N</span>
+                  <span>New task</span>
+                </button>
                 {(['chat', 'pipeline', 'project', 'runtime'] as const).map(tab => (
                   <button
                     key={tab}
@@ -784,15 +837,6 @@ export function HeaderBar(props: HeaderBarProps) {
             )}
           </div>
 
-          {/* Launch Task CTA — always visible (primary action) */}
-          <button
-            onClick={onOpenNewTaskModal}
-            className="flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-700 bg-neutral-100 px-3 py-2 text-xs font-semibold text-neutral-950 shadow-sm transition-colors hover:bg-white md:min-h-0 md:h-9 md:px-2.5 md:py-0"
-          >
-            <Plus className="w-3.5 h-3.5" />
-            <span className="hidden sm:inline">New task</span>
-            <span className="sm:hidden">New</span>
-          </button>
         </div>
       </header>
     </div>

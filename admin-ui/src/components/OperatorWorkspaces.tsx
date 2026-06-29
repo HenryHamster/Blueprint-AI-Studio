@@ -131,17 +131,14 @@ export function ProjectWorkspace({
     PROJECT_MANAGE_SECTIONS.find(item => item.id === projectManageSection) ?? PROJECT_MANAGE_SECTIONS[0]!;
   const ActiveProjectManageIcon = activeProjectManageItem.icon;
   const activeProjectSettingsSection = activeProjectManageItem.id === 'overview' ? null : activeProjectManageItem.id;
+  const actionButtonClass = 'inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100';
 
   const projectSurfaceActions = (
     <>
-      <span className="hidden min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs text-neutral-500 md:inline-flex">
-        <GitBranch className="h-3.5 w-3.5" />
-        <span className="max-w-[220px] truncate">{selectedProjectRepoLabel ?? 'No project selected'}</span>
-      </span>
       <button
         type="button"
         onClick={onOpenProjectManagement}
-        className="inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs font-medium text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900"
+        className={actionButtonClass}
       >
         <Wrench className="h-3.5 w-3.5" />
         Projects
@@ -150,7 +147,7 @@ export function ProjectWorkspace({
         <button
           type="button"
           onClick={onOpenProjectMembers}
-          className="inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs font-medium text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900"
+          className={actionButtonClass}
         >
           <Users className="h-3.5 w-3.5" />
           Members
@@ -424,25 +421,22 @@ export function RuntimeWorkspace({
   const activeRuntimeSettingsItem =
     runtimeSettingsSections.find(item => item.id === runtimeConfigSection) ?? runtimeSettingsSections[0]!;
   const ActiveRuntimeSettingsIcon = activeRuntimeSettingsItem.icon;
+  const actionButtonClass = 'inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100';
 
   const runtimeSurfaceActions = (
     <>
-      <span className="hidden min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs text-neutral-500 sm:inline-flex">
-        <span className={`h-1.5 w-1.5 rounded-full ${apiHealthy ? 'bg-emerald-400' : 'bg-red-400'}`} />
-        API {apiHealthy ? 'healthy' : 'unhealthy'}
-      </span>
-      <span className="hidden min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs text-neutral-500 sm:inline-flex">
-        <span className={`h-1.5 w-1.5 rounded-full ${wsConnected ? 'bg-cyan-400' : 'bg-neutral-600'}`} />
-        {wsConnected ? 'WS connected' : 'WS offline'}
+      <span className="hidden min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs text-neutral-500 md:inline-flex">
+        <span className={`h-1.5 w-1.5 rounded-full ${apiHealthy && wsConnected ? 'bg-emerald-400' : 'bg-amber-400'}`} />
+        {apiHealthy && wsConnected ? 'runtime healthy' : 'runtime degraded'}
       </span>
       {userRole === 'admin' && (
         <button
           type="button"
           onClick={() => { void onRestartOrchestrator(); }}
-          className="inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs font-medium text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900"
+          className={actionButtonClass}
         >
           <RotateCw className="h-3.5 w-3.5" />
-          Restart
+          Restart orchestrator
         </button>
       )}
     </>

@@ -304,4 +304,22 @@ describe('HeaderBar — viewport regression', () => {
     await act(async () => { activityButton?.click(); });
     expect(onOpenActivityFeed).toHaveBeenCalledOnce();
   });
+
+  test('desktop new task launcher remains available outside pipeline', async () => {
+    const onOpenNewTaskModal = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenNewTaskModal={onOpenNewTaskModal} activeTab="chat" />); });
+
+    const newTaskButton = host.querySelector<HTMLButtonElement>('button[title="New task"]');
+    expect(newTaskButton).toBeTruthy();
+    await act(async () => { newTaskButton?.click(); });
+    expect(onOpenNewTaskModal).toHaveBeenCalledOnce();
+
+    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenNewTaskModal={onOpenNewTaskModal} activeTab="pipeline" />); });
+    expect(host.querySelector<HTMLButtonElement>('button[title="New task"]')).toBeNull();
+  });
 });
