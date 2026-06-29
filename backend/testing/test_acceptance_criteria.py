@@ -279,6 +279,40 @@ async def test_record_and_fetch_evidence(db_session):
     assert fetched[0].id == evidence.id
 
 
+@pytest.mark.asyncio
+async def test_record_evidence_duplicate_is_noop(db_session):
+    """Duplicate non-null evidence keys are collapsed by the DB constraint."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "CI green")
+
+    await ac.record_evidence(
+        db_session,
+        criterion_id=criterion.id,
+        project_id=project.id,
+        source_kind="task_merge",
+        source_id="task-uuid-abc123",
+        detail={"pr": 42},
+    )
+
+    await ac.record_evidence(
+        db_session,
+        criterion_id=criterion.id,
+        project_id=project.id,
+        source_kind="task_merge",
+        source_id="task-uuid-abc123",
+        detail={"pr": 43},
+    )
+
+    assert await ac.count_criteria_for_version(db_session, version.id) == 1
+
+    fetched = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(fetched) == 1
+    assert fetched[0].source_kind == "task_merge"
+    assert fetched[0].source_id == "task-uuid-abc123"
+    assert fetched[0].detail == {"pr": 42}
+
+
 # ---------------------------------------------------------------------------
 # compute_criterion_coverage (pure function)
 # ---------------------------------------------------------------------------
