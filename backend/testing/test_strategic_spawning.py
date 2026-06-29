@@ -9688,6 +9688,256 @@ async def test_rollup_squash_body_evidence_prevents_not_landed_verdict(
     assert commit_messages_mock.await_count == expected_scan_count
 
 
+# ── stranded-PR credit discount persisted by cycle-start reconciliation ────────
+
+
+@pytest.mark.asyncio
+async def test_verified_not_landed_persists_stranded_discount(db_session, mocker):
+    """verified_not_landed tasks get stranded_prs_merged incremented and stranded_discount_applied stamped.
+
+    When _build_recent_interventions classifies a task as verified_not_landed
+    (ancestry check returns False), it must call mark_stranded_non_landing and
+    discount_stranded_pr_from_direction_credit so the direction credit gate stops
+    crediting the stranded merge.
+    """
+    research_task_id = str(uuid.uuid4())
+    direction_id = "dir-stranded-discount"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {
+                "id": direction_id,
+                "text": "stranded discount test dir",
+                "status": "active",
+                "research_history": [
+                    {
+                        "task_id": research_task_id,
+                        "prs_merged": 1,
+                        "verified_prs_merged": 1,
+                    }
+                ],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Stranded non-landing task",
+        description="merge commit NOT an ancestor of integration branch",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "pr_number": 501,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"merge_commit_sha": "stranded-sha", "head": {"sha": "h1"}}
+        ),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.list_recent_commit_messages", new=AsyncMock(return_value=[])
+    )
+
+    await _build_recent_interventions(project, db_session)
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("stranded_discount_applied") is True, (
+        "stranded_discount_applied must be stamped after cycle-start reconciliation"
+    )
+    assert ctx.get("landed_on_integration") is False, (
+        "mark_stranded_non_landing must stamp landed_on_integration=False"
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    the_dir = next(d for d in dirs if d.get("id") == direction_id)
+    history = the_dir.get("research_history", [])
+    entry = next(h for h in history if h.get("task_id") == research_task_id)
+    assert entry.get("stranded_prs_merged") == 1, (
+        "stranded_prs_merged must be incremented to 1 for the matching research_history entry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_verified_not_landed_stranded_discount_idempotent(db_session, mocker):
+    """A task already carrying stranded_discount_applied=True is not double-counted.
+
+    If a task was already processed by rollup verification (stranded_discount_applied=True
+    in context), the cycle-start reconciliation must NOT increment stranded_prs_merged again.
+    """
+    research_task_id = str(uuid.uuid4())
+    direction_id = "dir-stranded-idem"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {
+                "id": direction_id,
+                "text": "idempotency test dir",
+                "status": "active",
+                "research_history": [
+                    {
+                        "task_id": research_task_id,
+                        "prs_merged": 1,
+                        "verified_prs_merged": 1,
+                        "stranded_prs_merged": 1,  # already discounted once
+                    }
+                ],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Already stranded and discounted",
+        description="discount was already applied by rollup verification",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "pr_number": 502,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+            "landed_on_integration": False,
+            "stranded_discount_applied": True,  # already stamped
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"merge_commit_sha": "stranded-sha2", "head": {"sha": "h2"}}
+        ),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.list_recent_commit_messages", new=AsyncMock(return_value=[])
+    )
+
+    await _build_recent_interventions(project, db_session)
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    the_dir = next(d for d in dirs if d.get("id") == direction_id)
+    history = the_dir.get("research_history", [])
+    entry = next(h for h in history if h.get("task_id") == research_task_id)
+    assert entry.get("stranded_prs_merged") == 1, (
+        "stranded_prs_merged must not be incremented again when stranded_discount_applied=True"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unverifiable_verdict_does_not_apply_stranded_discount(
+    db_session, mocker
+):
+    """Tasks with unverifiable verdict must not trigger the stranded-PR credit discount.
+
+    When ancestry cannot be determined (no GitHub credentials or API error),
+    the task gets verdict 'unverifiable' and must NOT be marked stranded.
+    """
+    research_task_id = str(uuid.uuid4())
+    direction_id = "dir-unverifiable"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {
+                "id": direction_id,
+                "text": "unverifiable test dir",
+                "status": "active",
+                "research_history": [
+                    {
+                        "task_id": research_task_id,
+                        "prs_merged": 1,
+                        "verified_prs_merged": 0,
+                    }
+                ],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # No pr_number → ancestry check is skipped → verdict is "unverifiable"
+    task = Task(
+        project_id=project.id,
+        title="Unverifiable merge",
+        description="no pr_number so ancestry check is skipped",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Even if GitHub creds are present, no pr_number → unverifiable
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.list_recent_commit_messages", new=AsyncMock(return_value=[])
+    )
+
+    await _build_recent_interventions(project, db_session)
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("stranded_discount_applied") is None, (
+        "unverifiable tasks must not have stranded_discount_applied stamped"
+    )
+    assert ctx.get("landed_on_integration") is None, (
+        "unverifiable tasks must not have landed_on_integration stamped"
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    the_dir = next(d for d in dirs if d.get("id") == direction_id)
+    history = the_dir.get("research_history", [])
+    entry = next(h for h in history if h.get("task_id") == research_task_id)
+    assert entry.get("stranded_prs_merged") is None, (
+        "stranded_prs_merged must not be written for unverifiable tasks"
+    )
+
+
 @pytest.mark.asyncio
 async def test_rollup_squash_body_evidence_applies_to_promotion_target(
     db_session, mocker
@@ -13901,6 +14151,34 @@ def test_direction_activity_score_legacy_falls_back_to_prs_merged():
     legacy = {"prs_merged": 4}
     # 4 merges * 3 = 12, no other signals.
     assert _direction_activity_score(legacy) == 12
+
+
+def test_direction_activity_score_prefers_reachable_prs_merged():
+    """Reachable merges (landed on integration) take precedence over verified merges."""
+    # When reachable_prs_merged is present, use it instead of verified_prs_merged
+    reachable_stat = {"reachable_prs_merged": 3, "verified_prs_merged": 5, "prs_merged": 5}
+    # 3 reachable merges * 3 = 9, not 5 * 3 = 15
+    assert _direction_activity_score(reachable_stat) == 9
+
+    # When reachable_prs_merged is 0 (key present), use 0 — do NOT fall back to verified
+    zero_reachable = {"reachable_prs_merged": 0, "verified_prs_merged": 4}
+    # Key present with value 0 means reachability was recorded and nothing landed: score 0
+    assert _direction_activity_score(zero_reachable) == 0
+
+    # When both reachable and verified are present and non-zero, reachable wins
+    both_present = {"reachable_prs_merged": 2, "verified_prs_merged": 5}
+    # 2 reachable * 3 = 6, not 5 * 3 = 15
+    assert _direction_activity_score(both_present) == 6
+
+    # Missing reachable_prs_merged falls back through to verified_prs_merged
+    missing_reachable = {"verified_prs_merged": 3}
+    # 3 verified * 3 = 9
+    assert _direction_activity_score(missing_reachable) == 9
+
+    # All three missing falls back to prs_merged (legacy back-compat)
+    legacy_only = {"prs_merged": 2}
+    # 2 merges * 3 = 6
+    assert _direction_activity_score(legacy_only) == 6
 
 
 # ---------------------------------------------------------------------------

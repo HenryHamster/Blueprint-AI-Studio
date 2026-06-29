@@ -554,15 +554,19 @@ def _direction_activity_score(stat: dict) -> int:
     and recency (cycles). High-priority directions get a small boost so a quiet
     high-priority direction doesn't get evicted by a chatty low-priority one.
 
-    "Work shipped" counts VERIFIED merges (``verified_prs_merged``, populated in
-    the direction_stats loop) so a direction whose merges never actually landed —
-    or landed degraded/unverified — does not win payload space over one that
-    truly shipped. Falls back to the raw ``prs_merged`` for back-compat with
-    stat dicts that predate the verified field.
+    "Work shipped" prefers REACHABLE merges (``reachable_prs_merged``: commits
+    confirmed landed on integration branch), falling back to VERIFIED merges
+    (``verified_prs_merged``: CI/acceptance-bucket-verified), then raw
+    ``prs_merged`` for back-compat. This ensures directions with stranded merges
+    (CI-passing but never landed) do not crowd out directions whose work truly shipped.
     """
     if not isinstance(stat, dict):
         return 0
-    merged = int(stat.get("verified_prs_merged", stat.get("prs_merged", 0)) or 0)
+    merged = int(
+        stat["reachable_prs_merged"]
+        if "reachable_prs_merged" in stat
+        else (stat.get("verified_prs_merged", stat.get("prs_merged", 0)) or 0)
+    )
     failed = int(stat.get("tasks_failed") or 0)
     cycles = int(stat.get("total_cycles") or 0)
     priority = stat.get("priority")

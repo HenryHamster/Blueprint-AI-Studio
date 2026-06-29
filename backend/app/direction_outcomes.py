@@ -2186,7 +2186,7 @@ async def refresh_direction_outcomes_after_merge(
 
 
 async def discount_stranded_pr_from_direction_credit(
-    task: Task, session: AsyncSession
+    task: Task, session: AsyncSession, *, had_pr_merged: bool | None = None
 ) -> None:
     """Persist a confirmed non-landing discount to the direction's research-history entry.
 
@@ -2201,6 +2201,12 @@ async def discount_stranded_pr_from_direction_credit(
     requiring a full outcome recompute.  Only increments when the task actually
     carried ``pr_merged=True`` — a task that was never badge-counted needs no
     correction.
+
+    ``had_pr_merged`` lets callers supply the pre-stranding badge state when
+    calling this function after :func:`~app.landed_signal.mark_stranded_non_landing`,
+    which clears ``pr_merged`` from ``task.context``.  When ``None`` (default),
+    the function reads ``pr_merged`` from the current context (safe only when
+    called before stranding).
 
     Idempotent: stamps ``stranded_discount_applied=True`` on ``task.context``
     after the first successful discount so repeated rollup-management cycles
@@ -2218,7 +2224,11 @@ async def discount_stranded_pr_from_direction_credit(
     research_task_id = ctx.get("research_task_id")
     if not (direction_id and research_task_id) or task.project_id is None:
         return
-    if not ctx.get("pr_merged"):
+    # Use caller-supplied snapshot when available — mark_stranded_non_landing
+    # pops pr_merged before this function is called, so ctx.get("pr_merged")
+    # would be falsy even for previously badge-counted tasks.
+    _was_badge_counted = had_pr_merged if had_pr_merged is not None else bool(ctx.get("pr_merged"))
+    if not _was_badge_counted:
         # Never badge-counted; no stale credit to retract.
         return
     if ctx.get("stranded_discount_applied"):

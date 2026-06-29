@@ -581,12 +581,14 @@ async def test_confirmed_non_landing_discounts_credit_gate(db_session: AsyncSess
     assert credit_gate_merged_count(entry) == 2
 
     # Ancestry check later confirms the first PR never reached integration.
+    # Capture badge state before stranding — mark_stranded_non_landing clears pr_merged.
+    had_pr_merged = bool((stranded_task.context or {}).get("pr_merged"))
     mark_stranded_non_landing(stranded_task, reason="rollup->integration merge not an ancestor")
     await db_session.flush()
 
     # discount_stranded_pr_from_direction_credit persists stranded_prs_merged so
     # credit_gate_merged_count subtracts the confirmed non-landing from credit.
-    await discount_stranded_pr_from_direction_credit(stranded_task, db_session)
+    await discount_stranded_pr_from_direction_credit(stranded_task, db_session, had_pr_merged=had_pr_merged)
 
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
@@ -652,12 +654,14 @@ async def test_discount_stranded_pr_is_idempotent(db_session: AsyncSession):
     )
     await db_session.refresh(project)
 
+    # Capture badge state before stranding — mark_stranded_non_landing clears pr_merged.
+    had_pr_merged = bool((stranded_task.context or {}).get("pr_merged"))
     mark_stranded_non_landing(stranded_task, reason="not reachable from integration")
     await db_session.flush()
 
     # Simulate N rollup-management cycles all calling discount on the same task.
     for _ in range(3):
-        await discount_stranded_pr_from_direction_credit(stranded_task, db_session)
+        await discount_stranded_pr_from_direction_credit(stranded_task, db_session, had_pr_merged=had_pr_merged)
 
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]

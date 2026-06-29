@@ -160,10 +160,13 @@ async def verify_rollup_merge_landed(
         f"rollup->integration merge did not land. Leaving pr_merged/shipped unset "
         f"and marking the task stranded ({source})."
     )
+    _had_pr_merged = bool((task.context or {}).get("pr_merged"))
     mark_stranded_non_landing(task, reason=reason)
     logger.error("[ROLLUP_ANCESTRY] %s task=%s", reason, getattr(task, "id", None))
     from app.direction_outcomes import discount_stranded_pr_from_direction_credit
-    await discount_stranded_pr_from_direction_credit(task, session)
+    await discount_stranded_pr_from_direction_credit(
+        task, session, had_pr_merged=_had_pr_merged
+    )
     try:
         await _maybe_create_failure_alert(task, session, reason)
     except Exception as exc:

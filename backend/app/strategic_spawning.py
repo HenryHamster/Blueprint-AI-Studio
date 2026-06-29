@@ -21,6 +21,7 @@ from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
 from app.direction_outcomes import (
     declared_merged_count,
+    discount_stranded_pr_from_direction_credit,
     proven_merged_count,
     reachable_merged_count,
     verified_merged_count,
@@ -97,7 +98,7 @@ from app.shared_state import (
 )
 from app.time_utils import _utcnow, _coerce_naive_utc
 from app.vision_merge import REJECTED_EDITS_KEY
-from app.landed_signal import LANDED_ON_INTEGRATION_KEY
+from app.landed_signal import LANDED_ON_INTEGRATION_KEY, mark_stranded_non_landing
 from app.project_message_projection import agent_thread_message_dict
 
 logger = logging.getLogger(__name__)
@@ -3383,6 +3384,16 @@ async def _build_recent_interventions(
                 and len(recent_not_landed_titles) < _RECON_LIST_CAP
             ):
                 recent_not_landed_titles.append(title)
+            if merge_verdict == "verified_not_landed" and (t.context or {}).get(
+                LANDED_ON_INTEGRATION_KEY
+            ) is not False:
+                _had_pr_merged = bool((t.context or {}).get("pr_merged"))
+                mark_stranded_non_landing(
+                    t, reason="cycle_start_reconciliation_ancestry_check"
+                )
+                await discount_stranded_pr_from_direction_credit(
+                    t, session, had_pr_merged=_had_pr_merged
+                )
         if recent_merges_dicts:
             entry["recent_merged_titles"] = recent_merges_dicts[
                 :_RECENT_MERGED_TITLES_CAP
