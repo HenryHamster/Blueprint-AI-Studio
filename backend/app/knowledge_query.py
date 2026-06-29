@@ -857,8 +857,6 @@ async def build_compute_sweep_groups(
         if sweep_id in complete:
             continue
         arms = planned.get(sweep_id)
-        if not arms:
-            continue
         if arms and any(
             not _compute_sweep_task_is_terminal(task)
             for arm_tasks in arms.values()

@@ -14561,3 +14561,96 @@ async def test_spawn_fix_per_review_budget_enforced(db_session, mocker):
     flag = (review.context or {}).get("_strategic_spawn_budget_exhausted")
     assert flag is not None
     assert flag["scope"] == "per_review"
+
+
+# ── CI compliance in strategic review payload ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_includes_ci_compliance_when_available(
+    db_session, mocker
+):
+    """When get_or_compute_ci_compliance returns a result it is included in the
+    strategic review payload under the 'ci_compliance' key."""
+    from unittest.mock import AsyncMock
+
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+
+    fake_envelope = {
+        "status": "success",
+        "integration_branch": "automain",
+        "head_sha": "abc123def456",
+        "data": {
+            "ref": "abc123def456",
+            "compliant": True,
+            "violations": [],
+            "branch_literal_violations": [],
+            "checked": 5,
+            "limits_available": True,
+            "tree_available": True,
+        },
+        "computed": False,
+    }
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=AsyncMock(return_value=fake_envelope),
+    )
+
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    assert "ci_compliance" in payload, "ci_compliance block missing from strategic payload"
+    ci = payload["ci_compliance"]
+    assert ci["head_sha"] == "abc123def456"
+    assert ci["compliant"] is True
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_omits_ci_compliance_when_unavailable(
+    db_session, mocker
+):
+    """When get_or_compute_ci_compliance returns None the payload has no ci_compliance key."""
+    from unittest.mock import AsyncMock
+
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=AsyncMock(return_value={
+            "status": "unavailable",
+            "reason": "github_credentials_unavailable",
+            "integration_branch": "automain",
+            "head_sha": None,
+            "data": None,
+        }),
+    )
+
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    assert "ci_compliance" not in payload, (
+        "ci_compliance should be absent when ensure_current_ci_compliance is unavailable"
+    )

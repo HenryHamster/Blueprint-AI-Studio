@@ -14,6 +14,7 @@ import {
   buildOpenMessagesText,
   buildDirSummaryText,
   buildDirHealthSummary,
+  buildCiComplianceSection,
   buildSweepComparisonSection,
 } from './strategic-sections.js';
 
@@ -1071,6 +1072,61 @@ describe('buildQuestionSection', () => {
     expect(result).toContain('from: operator');
     expect(result).toContain('What is the plan?');
     expect(result).toContain('./messages resolve');
+  });
+});
+
+describe('buildCiComplianceSection', () => {
+  it('returns empty for nullish and non-object input', () => {
+    expect(buildCiComplianceSection(null)).toBe('');
+    expect(buildCiComplianceSection(undefined)).toBe('');
+    expect(buildCiComplianceSection('bad')).toBe('');
+  });
+
+  it('returns empty when compliant is true', () => {
+    expect(buildCiComplianceSection({ compliant: true, violations: [{ section: 'backend', rel: 'app/foo.py', count: 200, cap: 100 }] })).toBe('');
+  });
+
+  it('renders capped and uncapped module-size violations', () => {
+    const result = buildCiComplianceSection({
+      compliant: false,
+      head_sha: 'deadbeefcafe1234',
+      violations: [
+        { section: 'backend', rel: 'app/canary.py', count: 150, cap: 100 },
+        { section: 'agent', rel: 'handlers/big.ts', count: 1700, cap: null },
+      ],
+      branch_literal_violations: [],
+    });
+    expect(result).toContain('## CI Compliance (automain HEAD)');
+    expect(result).toContain('Compliant: **no**  (SHA: deadbeef)');
+    expect(result).toContain('### Module-size violations');
+    expect(result).toContain('python3 backend/testing/check_size_limits.py --fix');
+    expect(result).toContain('  - [backend] app/canary.py: 150 lines (limit: 100)');
+    expect(result).toContain('  - [agent] handlers/big.ts: 1700 lines (limit: uncapped)');
+  });
+
+  it('renders without sha when head_sha is absent', () => {
+    const result = buildCiComplianceSection({
+      compliant: false,
+      violations: [{ section: 'backend', rel: 'app/foo.py', count: 200, cap: 100 }],
+      branch_literal_violations: [],
+    });
+    expect(result).toContain('Compliant: **no**');
+    expect(result).not.toContain('SHA:');
+  });
+
+  it('renders branch-literal violations', () => {
+    const result = buildCiComplianceSection({
+      compliant: false,
+      violations: [],
+      branch_literal_violations: [
+        { section: 'agent', rel: 'src/handlers/review-fix.ts', line: 12, text: 'if (baseBranch === "main") {' },
+        { section: 'agent', rel: 'src/prompt.ts', line: 9, text: 'if (branch !== "automain") {' },
+      ],
+    });
+    expect(result).toContain('### Branch-literal violations');
+    expect(result).toContain('resolveBaseBranch()');
+    expect(result).toContain('  - src/handlers/review-fix.ts:12: if (baseBranch === "main") {');
+    expect(result).toContain('  - src/prompt.ts:9: if (branch !== "automain") {');
   });
 });
 

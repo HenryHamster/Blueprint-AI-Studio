@@ -866,7 +866,7 @@ export function DurableQualificationEvidenceRow({ q }: { q: DurableQualification
 
 export function PromotionReadinessSummary({ readiness }: { readiness: PromotionReadiness | null | undefined }) {
   if (!readiness) return null;
-  const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers, caveat, ground_truth_validated, validated_precision, resolved_outcome_sample } = readiness;
+  const { ready, reason, verdicts_evaluated, would_promote_rate, consecutive_clean_passes, recurring_blockers, caveat, ground_truth_validated, validated_precision, resolved_outcome_sample, acceptance_caveat } = readiness;
   const hasBlockers = Object.keys(recurring_blockers ?? {}).length > 0;
   // Once promotion is live, this dry-run window is frozen pre-go-live history —
   // it no longer receives verdicts, so it is NOT current readiness. Label it as a
@@ -897,6 +897,7 @@ export function PromotionReadinessSummary({ readiness }: { readiness: PromotionR
         <span
           className={`text-ui-sm font-semibold px-1.5 py-0.5 rounded border ${ready ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400'}`}
           title={explanatoryCaveat}
+          data-testid="ready-badge"
         >
           {ready ? 'self-approval streak clears thresholds' : 'not ready'}
         </span>
@@ -920,6 +921,15 @@ export function PromotionReadinessSummary({ readiness }: { readiness: PromotionR
       </div>
       {ready && (
         <p className="text-ui-xs text-neutral-600 italic">{explanatoryCaveat}</p>
+      )}
+      {acceptance_caveat && (
+        <p
+          data-testid="acceptance-caveat-on-badge"
+          className="text-ui-xs text-amber-400 italic"
+          title={acceptance_caveat}
+        >
+          ⚠ {acceptance_caveat}
+        </p>
       )}
       {!ready && reason && (
         <p className="text-ui-sm text-neutral-400 line-clamp-2">{reason}</p>

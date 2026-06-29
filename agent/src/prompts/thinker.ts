@@ -108,6 +108,7 @@ function buildStrategicFingerprintPrompt(
     versionPhaseSection: p.versionPhaseSection ? '<version-phase>' : '',
     memoCitationsSection: p.memoCitationsSection ? '<memo-citations>' : '',
     efficiencySnapshotSection: p.efficiencySnapshotSection ? '<efficiency-snapshot>' : '',
+    ciComplianceSection: p.ciComplianceSection ? '<ci-compliance>' : '',
     availableCapabilitiesSection: p.availableCapabilitiesSection ? '<available-capabilities>' : '',
     sweepComparisonSection: p.sweepComparisonSection ? '<sweep-comparison>' : '',
     localRunnerSection: p.localRunnerSection ? '<local-runner>' : '',
@@ -203,6 +204,13 @@ export interface ThinkerPromptParams {
   memoCitationsSection: string;
   efficiencySnapshotSection: string;
   /**
+   * CI compliance snapshot for the current automain HEAD — module-size breaches
+   * and branch-literal offenders. Built from the strategic payload's
+   * `ci_compliance` field. Optional so existing constructions/tests that omit it
+   * still compile; '' renders nothing (also omitted when overall status is 'pass').
+   */
+  ciComplianceSection?: string;
+  /**
    * Shared capability vocabulary section (canonical registry names + statuses)
    * plus the uniform provides_capability / prerequisite declaration guidance.
    * Built from the strategic payload's `available_capabilities` field. Optional
@@ -290,7 +298,7 @@ ${p.dirHealthSummary}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
-${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}
+${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}
 ${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
