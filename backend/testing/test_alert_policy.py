@@ -94,12 +94,25 @@ def test_info_severity_is_suppressed_for_durable_alerts():
 
     decision = should_emit_project_alert(
         project,
-        "warm_pool.payoff",
+        "release.calcifying",
         severity=AlertSeverity.INFO,
     )
 
     assert decision.emit is False
     assert decision.reason == "info_severity"
+
+
+def test_proven_info_alert_surfaces_when_allow_info_set():
+    project = make_project(is_self_repo=True)
+
+    decision = should_emit_project_alert(
+        project,
+        "warm_pool.payoff",
+        severity=AlertSeverity.INFO,
+    )
+
+    assert decision.emit is True
+    assert decision.domain == DOMAIN_WARM_POOL
 
 
 def test_apply_project_alert_domain_updates_round_trips_build_config():

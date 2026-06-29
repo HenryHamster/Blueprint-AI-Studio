@@ -171,7 +171,7 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
         "sr.signal_stale", domain=DOMAIN_SR_QUALITY, route=ROUTE_HEALTH
     ),
     "warm_pool.payoff": AlertEventPolicy(
-        "warm_pool.payoff", domain=DOMAIN_WARM_POOL
+        "warm_pool.payoff", domain=DOMAIN_WARM_POOL, allow_info=True
     ),
     "warm_pool.cost_guard": AlertEventPolicy(
         "warm_pool.cost_guard", domain=DOMAIN_WARM_POOL
