@@ -117,6 +117,207 @@ def _compact_text(value: Any, *, max_chars: int = 360) -> str | None:
     return f"{text[: max_chars - 1]}…"
 
 
+def _work_session_metric(
+    metric_id: str,
+    label: str,
+    value: int | float,
+    *,
+    tone: str = "neutral",
+    target: Dict[str, Any] | None = None,
+    unit: str | None = None,
+) -> Dict[str, Any]:
+    metric: Dict[str, Any] = {
+        "id": metric_id,
+        "label": label,
+        "value": value,
+        "tone": tone,
+    }
+    if unit:
+        metric["unit"] = unit
+    if target:
+        metric["target"] = target
+    return metric
+
+
+def _selected_ref_descriptor(
+    ref: Dict[str, Any],
+    context_package: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    kind = _compact_text(ref.get("kind"), max_chars=40) or "ref"
+    ref_id = _compact_text(ref.get("id"), max_chars=160) or ""
+    label = _compact_text(ref.get("label"), max_chars=180)
+    descriptor: Dict[str, Any] = {
+        "kind": kind,
+        "id": ref_id,
+        "label": label or f"{kind}:{ref_id}",
+    }
+    if not context_package:
+        return descriptor
+
+    candidates: list[Dict[str, Any]] = []
+    resources = context_package.get("resources")
+    if isinstance(resources, list):
+        candidates.extend(entry for entry in resources if isinstance(entry, dict))
+    canvas = context_package.get("canvas")
+    if isinstance(canvas, dict):
+        nodes = canvas.get("nodes")
+        if isinstance(nodes, list):
+            candidates.extend(entry for entry in nodes if isinstance(entry, dict))
+
+    for candidate in candidates:
+        candidate_kind = candidate.get("kind")
+        candidate_id = candidate.get("id")
+        if candidate_kind == kind and candidate_id == ref_id:
+            descriptor["label"] = _compact_text(
+                candidate.get("label") or descriptor["label"],
+                max_chars=180,
+            )
+            summary = _compact_text(candidate.get("summary"), max_chars=220)
+            if summary:
+                descriptor["summary"] = summary
+            target = candidate.get("target")
+            if isinstance(target, dict):
+                descriptor["target"] = target
+            status = _compact_text(candidate.get("status"), max_chars=80)
+            if status:
+                descriptor["status"] = status
+            break
+    return descriptor
+
+
+def _dedupe_workbench_refs(refs: Any, *, limit: int = 12) -> list[Dict[str, Any]]:
+    if not isinstance(refs, list):
+        return []
+    seen: set[tuple[str, str]] = set()
+    deduped: list[Dict[str, Any]] = []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        kind = _compact_text(ref.get("kind"), max_chars=40)
+        ref_id = _compact_text(ref.get("id"), max_chars=160)
+        if not kind or not ref_id:
+            continue
+        key = (kind, ref_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        item: Dict[str, Any] = {"kind": kind, "id": ref_id}
+        label = _compact_text(ref.get("label"), max_chars=180)
+        if label:
+            item["label"] = label
+        deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _build_work_session_summary(
+    project: Project,
+    *,
+    workbench_state: Dict[str, Any],
+    context_package: Dict[str, Any] | None,
+    attention: Dict[str, Any] | None,
+    message_counts: Dict[str, int],
+    task_counts: Dict[str, int],
+) -> Dict[str, Any]:
+    selected_refs = _dedupe_workbench_refs(workbench_state.get("selected_refs"))
+    attention_counts = (
+        attention.get("counts", {}) if isinstance(attention, dict) else {}
+    )
+    context_sources = (
+        context_package.get("sources", [])
+        if isinstance(context_package, dict)
+        else []
+    )
+    context_item_count = (
+        int(context_package.get("item_count") or 0)
+        if isinstance(context_package, dict)
+        else 0
+    )
+
+    session_started_at = workbench_state.get("session_started_at")
+    session_id = f"strategic-session:{project.id}:{session_started_at or 'idle'}"
+    metrics = [
+        _work_session_metric(
+            "attention.needs_operator",
+            "needs operator",
+            int(attention_counts.get("needs_operator") or 0),
+            tone="warning"
+            if int(attention_counts.get("needs_operator") or 0) > 0
+            else "neutral",
+            target={"surface": "messages"},
+        ),
+        _work_session_metric(
+            "attention.watch",
+            "watch",
+            int(attention_counts.get("watch") or 0),
+            tone="watch" if int(attention_counts.get("watch") or 0) > 0 else "neutral",
+            target={"surface": "messages"},
+        ),
+        _work_session_metric(
+            "messages.open",
+            "open messages",
+            int(message_counts.get("open") or 0),
+            target={"surface": "messages"},
+        ),
+        _work_session_metric(
+            "messages.linked",
+            "linked messages",
+            int(message_counts.get("linked") or 0),
+            target={"surface": "messages"},
+        ),
+        _work_session_metric(
+            "tasks.running",
+            "running tasks",
+            int(task_counts.get("running") or 0),
+            tone="active" if int(task_counts.get("running") or 0) > 0 else "neutral",
+            target={"surface": "pipeline"},
+        ),
+        _work_session_metric(
+            "tasks.blocked",
+            "blocked tasks",
+            int(task_counts.get("blocked") or 0),
+            tone="warning" if int(task_counts.get("blocked") or 0) > 0 else "neutral",
+            target={"surface": "pipeline"},
+        ),
+        _work_session_metric(
+            "tasks.failed",
+            "failed tasks",
+            int(task_counts.get("failed") or 0),
+            tone="critical" if int(task_counts.get("failed") or 0) > 0 else "neutral",
+            target={"surface": "pipeline"},
+        ),
+        _work_session_metric(
+            "context.items",
+            "context items",
+            context_item_count,
+            target={"surface": "project", "section": "problem-model"},
+        ),
+    ]
+    return {
+        "version": 1,
+        "id": session_id[:240],
+        "mode": workbench_state.get("interaction_mode") or "chat",
+        "active_surface": workbench_state.get("active_surface") or "strategic",
+        "session_started_at": session_started_at,
+        "last_interaction_at": workbench_state.get("last_interaction_at"),
+        "context_package_id": context_package.get("id")
+        if isinstance(context_package, dict)
+        else None,
+        "attention_level": attention.get("level")
+        if isinstance(attention, dict)
+        else "clear",
+        "selected_refs": selected_refs,
+        "selected_ref_descriptors": [
+            _selected_ref_descriptor(ref, context_package)
+            for ref in selected_refs[:12]
+            if isinstance(ref, dict)
+        ],
+        "curated_metrics": metrics,
+        "context_sources": context_sources[:8] if isinstance(context_sources, list) else [],
+    }
+
+
 _LIVE_STRATEGIC_TASK_STATUSES = frozenset(
     {
         TaskStatus.QUEUED,
@@ -718,6 +919,14 @@ async def get_project_strategic_state(
         current_user["user_id"],
         project.id,
     )
+    work_session = _build_work_session_summary(
+        project,
+        workbench_state=workbench_state,
+        context_package=context_package,
+        attention=attention,
+        message_counts=message_counts,
+        task_counts=task_counts,
+    )
 
     # SHA-aware freshness: resolve candidate vs integration HEAD, best-effort.
     # A GitHub API failure must not break the endpoint — verdict degrades to unknown.
@@ -787,6 +996,7 @@ async def get_project_strategic_state(
         "context_package": context_package,
         "runtime": runtime_summary,
         "workbench": workbench_state,
+        "work_session": work_session,
         "design": {
             "has_design_doc": bool(project.design_doc),
             "revision": ((project.design_doc or {}).get("_meta") or {}).get("revision")

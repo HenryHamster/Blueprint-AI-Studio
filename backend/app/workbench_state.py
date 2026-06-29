@@ -58,6 +58,7 @@ def _sanitize_selected_refs(raw: Any) -> list[dict[str, str]]:
     if not isinstance(raw, list):
         return []
     selected_refs: list[dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
     for entry in raw:
         if not isinstance(entry, dict):
             continue
@@ -65,6 +66,10 @@ def _sanitize_selected_refs(raw: Any) -> list[dict[str, str]]:
         ref_id = _string(entry.get("id"), max_chars=120)
         if not kind or not ref_id:
             continue
+        key = (kind, ref_id)
+        if key in seen:
+            continue
+        seen.add(key)
         item = {"kind": kind, "id": ref_id}
         label = _string(entry.get("label"), max_chars=160)
         if label:

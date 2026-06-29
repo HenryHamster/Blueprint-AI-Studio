@@ -1,7 +1,8 @@
 import type { ReactNode } from 'react';
-import { Activity, ArrowUpRight, CircleAlert, Cpu, FileText, GitBranch, Network, Radio } from 'lucide-react';
+import { Activity, ArrowUpRight, CircleAlert, Cpu, FileText, GitBranch, Network, Plus, Radio, X } from 'lucide-react';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import type {
+  StrategicContextCanvasNode,
   StrategicContextPackageDescriptor,
   StrategicContextPackageDrilldown,
   StrategicContextResourceRef,
@@ -9,7 +10,15 @@ import type {
   StrategicRuntimeWorkState,
   StrategicStateAttentionItem,
   StrategicStateResponse,
+  StrategicWorkbenchState,
+  StrategicWorkSessionRefDescriptor,
 } from '../strategicStateApi';
+import {
+  MAX_STRATEGIC_SELECTED_REFS,
+  removeStrategicSelectedRef,
+  upsertStrategicSelectedRef,
+  type StrategicSelectedRef,
+} from '../utils/strategicWorkbenchSession';
 import { WorkbenchPanel } from './WorkbenchLayout';
 
 type ProjectTarget = 'running-update' | 'directions' | 'problem-model' | 'design-doc';
@@ -33,6 +42,11 @@ interface StrategicContextRailProps {
   onOpenTask?: (taskId: string) => void;
   onOpenMessages?: () => void;
   onOpenKnowledge?: (documentId?: string | null, directionId?: string | null) => void;
+  workbenchState?: StrategicWorkbenchState | null;
+  savingSessionRefs?: boolean;
+  onUpdateSessionRefs?: (
+    updateRefs: (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs']
+  ) => void;
 }
 
 function formatCost(value: number | undefined): string {
@@ -183,33 +197,231 @@ function resourceKindLabel(kind?: string | null): string {
   return (kind || 'resource').replace(/_/g, ' ');
 }
 
-function ContextResourceButton({
-  resource,
-  onOpen,
+function sessionRefKey(ref: Pick<StrategicSelectedRef, 'kind' | 'id'>): string {
+  return `${ref.kind}:${ref.id}`;
+}
+
+function selectedRefFromResource(resource: StrategicContextResourceRef): StrategicSelectedRef {
+  return {
+    kind: resource.kind,
+    id: resource.id,
+    label: resource.label,
+  };
+}
+
+function selectedRefFromNode(node: StrategicContextCanvasNode): StrategicSelectedRef {
+  return {
+    kind: node.kind,
+    id: node.id,
+    label: node.label,
+  };
+}
+
+function fallbackRefDescriptor(ref: StrategicSelectedRef): StrategicWorkSessionRefDescriptor {
+  return {
+    kind: ref.kind,
+    id: ref.id,
+    label: ref.label || `${resourceKindLabel(ref.kind)} ${ref.id.slice(0, 8)}`,
+  };
+}
+
+function SessionContextList({
+  refs,
+  onOpenTarget,
+  onRemove,
+  disabled,
 }: {
-  resource: StrategicContextResourceRef;
-  onOpen?: (resource: StrategicContextResourceRef) => void;
+  refs: StrategicWorkSessionRefDescriptor[];
+  onOpenTarget: (target?: StrategicContextPackageDrilldown['target'] | null) => void;
+  onRemove?: (ref: Pick<StrategicSelectedRef, 'kind' | 'id'>) => void;
+  disabled?: boolean;
 }) {
-  const disabled = !onOpen;
-  const detail = resource.kind === 'canvas' ? null : resource.summary;
+  if (refs.length === 0) return null;
+  return (
+    <div className="mt-2 space-y-1.5" data-testid="strategic-session-refs">
+      <div className="text-ui-sm font-semibold uppercase text-neutral-500">Session context</div>
+      {refs.slice(0, MAX_STRATEGIC_SELECTED_REFS).map(ref => {
+        const canOpen = Boolean(ref.target);
+        return (
+          <div
+            key={sessionRefKey(ref)}
+            className="flex min-w-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/60 px-2 py-1.5"
+          >
+            <button
+              type="button"
+              disabled={!canOpen}
+              onClick={() => onOpenTarget(ref.target)}
+              className="min-h-11 min-w-0 flex-1 text-left disabled:cursor-default"
+              title={canOpen ? `Open ${ref.label}` : ref.label}
+            >
+              <span className="block truncate text-xs font-semibold text-neutral-200">{ref.label}</span>
+              <span className="block truncate text-ui-sm font-medium uppercase text-neutral-500">
+                {resourceKindLabel(ref.kind)}
+                {ref.status ? ` / ${ref.status}` : ''}
+              </span>
+            </button>
+            {onRemove && (
+              <button
+                type="button"
+                disabled={disabled}
+                onClick={() => onRemove(ref)}
+                className="flex min-h-11 min-w-11 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-200 disabled:opacity-40"
+                title={`Stop keeping ${ref.label} in session context`}
+                aria-label={`Stop keeping ${ref.label} in session context`}
+              >
+                <X className="h-3.5 w-3.5" aria-hidden="true" />
+              </button>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function SessionRefAction({
+  selected,
+  disabled,
+  label,
+  onUse,
+  onRemove,
+}: {
+  selected: boolean;
+  disabled?: boolean;
+  label: string;
+  onUse?: () => void;
+  onRemove?: () => void;
+}) {
+  if (selected) {
+    return (
+      <button
+        type="button"
+        disabled={disabled}
+        onClick={onRemove}
+        className="inline-flex min-h-11 shrink-0 items-center gap-1 rounded-md border border-neutral-800 px-2 text-ui-sm font-semibold text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 disabled:opacity-40"
+        title={`Remove ${label} from session context`}
+        aria-label={`Remove ${label} from session context`}
+      >
+        <X className="h-3.5 w-3.5" aria-hidden="true" />
+        <span>Remove</span>
+      </button>
+    );
+  }
   return (
     <button
       type="button"
       disabled={disabled}
-      onClick={() => onOpen?.(resource)}
-      className="flex min-h-11 w-full min-w-0 items-center justify-between gap-2 rounded-md border border-neutral-800 bg-neutral-950/60 px-2.5 py-2 text-left transition-colors enabled:hover:border-neutral-700 enabled:hover:bg-neutral-900 disabled:cursor-default disabled:opacity-80"
+      onClick={onUse}
+      className="inline-flex min-h-11 shrink-0 items-center gap-1 rounded-md border border-neutral-800 px-2 text-ui-sm font-semibold text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 disabled:opacity-40"
+      title={`Keep ${label} in session context`}
+      aria-label={`Keep ${label} in session context`}
     >
-      <span className="min-w-0">
-        <span className="block truncate text-xs font-semibold text-neutral-200">
-          {resource.label}
+      <Plus className="h-3.5 w-3.5" aria-hidden="true" />
+      <span>Keep</span>
+    </button>
+  );
+}
+
+function ContextResourceButton({
+  resource,
+  onOpen,
+  selected,
+  onUse,
+  onRemove,
+  disabled,
+}: {
+  resource: StrategicContextResourceRef;
+  onOpen?: (resource: StrategicContextResourceRef) => void;
+  selected?: boolean;
+  onUse?: () => void;
+  onRemove?: () => void;
+  disabled?: boolean;
+}) {
+  const openDisabled = !onOpen;
+  const detail = resource.kind === 'canvas' ? null : resource.summary;
+  return (
+    <div className="flex min-w-0 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950/60 px-2.5 py-2">
+      <button
+        type="button"
+        disabled={openDisabled}
+        onClick={() => onOpen?.(resource)}
+        className="min-h-11 min-w-0 flex-1 text-left disabled:cursor-default"
+      >
+        <span className="min-w-0">
+          <span className="block truncate text-xs font-semibold text-neutral-200">
+            {resource.label}
+          </span>
+          <span className="mt-0.5 block truncate text-ui-sm font-medium uppercase text-neutral-500">
+            {resourceKindLabel(resource.kind)}
+            {detail ? ` / ${detail}` : ''}
+          </span>
+        </span>
+      </button>
+      {!openDisabled && <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
+      {(onUse || onRemove) && (
+        <SessionRefAction
+          selected={Boolean(selected)}
+          disabled={disabled}
+          label={resource.label}
+          onUse={onUse}
+          onRemove={onRemove}
+        />
+      )}
+    </div>
+  );
+}
+
+function ContextMapNodeRow({
+  node,
+  selected,
+  disabled,
+  onOpenTarget,
+  onUse,
+  onRemove,
+}: {
+  node: StrategicContextCanvasNode;
+  selected?: boolean;
+  disabled?: boolean;
+  onOpenTarget: (target?: StrategicContextPackageDrilldown['target'] | null) => void;
+  onUse?: () => void;
+  onRemove?: () => void;
+}) {
+  const canOpen = Boolean(node.target);
+  return (
+    <div className="flex min-w-0 items-center gap-2 border-t border-neutral-800/70 py-1.5 first:border-t-0">
+      <button
+        type="button"
+        disabled={!canOpen}
+        onClick={() => onOpenTarget(node.target)}
+        className="min-h-11 min-w-0 flex-1 text-left disabled:cursor-default"
+        title={canOpen ? `Open ${node.label}` : node.label}
+      >
+        <span className="flex min-w-0 items-center gap-2">
+          <span className="truncate text-xs font-semibold text-neutral-200">{node.label}</span>
+          {node.count != null && (
+            <span className="shrink-0 rounded border border-neutral-800 px-1 text-ui-sm font-semibold text-neutral-500">
+              {formatCompactNumber(node.count)}
+            </span>
+          )}
         </span>
         <span className="mt-0.5 block truncate text-ui-sm font-medium uppercase text-neutral-500">
-          {resourceKindLabel(resource.kind)}
-          {detail ? ` / ${detail}` : ''}
+          {resourceKindLabel(node.kind)}
+          {node.status ? ` / ${node.status}` : ''}
         </span>
-      </span>
-      {!disabled && <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-neutral-500" aria-hidden="true" />}
-    </button>
+        {node.summary && (
+          <span className="mt-0.5 block truncate text-xs text-neutral-600">{node.summary}</span>
+        )}
+      </button>
+      {(onUse || onRemove) && (
+        <SessionRefAction
+          selected={Boolean(selected)}
+          disabled={disabled}
+          label={node.label}
+          onUse={onUse}
+          onRemove={onRemove}
+        />
+      )}
+    </div>
   );
 }
 
@@ -257,18 +469,34 @@ function AttentionItem({
 
 function ContextPackageBlock({
   contextPackage,
+  sessionRefs,
+  selectedRefs,
+  savingSessionRefs,
   onOpenResource,
+  onOpenTarget,
+  onUseRef,
+  onRemoveRef,
 }: {
   contextPackage?: StrategicContextPackageDescriptor | null;
+  sessionRefs: StrategicWorkSessionRefDescriptor[];
+  selectedRefs: StrategicSelectedRef[];
+  savingSessionRefs?: boolean;
   onOpenResource?: (resource: StrategicContextResourceRef) => void;
+  onOpenTarget: (target?: StrategicContextPackageDrilldown['target'] | null) => void;
+  onUseRef?: (ref: StrategicSelectedRef) => void;
+  onRemoveRef?: (ref: Pick<StrategicSelectedRef, 'kind' | 'id'>) => void;
 }) {
   if (!contextPackage) return null;
   const tone = contextPackageTone(contextPackage.status);
   const sources = (contextPackage.sources ?? []).slice(0, 5);
   const itemCount = Number(contextPackage.item_count ?? 0);
   const resources = (contextPackage.resources ?? []).slice(0, 4);
+  const mapNodes = (contextPackage.canvas?.nodes ?? [])
+    .filter(node => node.kind !== 'project')
+    .slice(0, 5);
   const nodeCount = contextPackage.canvas?.node_count ?? null;
   const edgeCount = contextPackage.canvas?.edge_count ?? null;
+  const selectedKeys = new Set(selectedRefs.map(sessionRefKey));
 
   return (
     <div className="border-b border-neutral-800 pb-3">
@@ -305,14 +533,52 @@ function ContextPackageBlock({
           ))}
         </div>
       )}
+      <SessionContextList
+        refs={sessionRefs}
+        onOpenTarget={onOpenTarget}
+        onRemove={onRemoveRef}
+        disabled={savingSessionRefs}
+      />
+      {mapNodes.length > 0 && (
+        <div className="mt-2" data-testid="strategic-context-map">
+          <div className="mb-1 text-ui-sm font-semibold uppercase text-neutral-500">Context map</div>
+          <div className="rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5">
+            {mapNodes.map(node => {
+              const ref = selectedRefFromNode(node);
+              const key = sessionRefKey(ref);
+              return (
+                <ContextMapNodeRow
+                  key={node.id}
+                  node={node}
+                  selected={selectedKeys.has(key)}
+                  disabled={savingSessionRefs}
+                  onOpenTarget={onOpenTarget}
+                  onUse={onUseRef ? () => onUseRef(ref) : undefined}
+                  onRemove={onRemoveRef ? () => onRemoveRef(ref) : undefined}
+                />
+              );
+            })}
+          </div>
+        </div>
+      )}
       {resources.length > 0 && (
         <div className="mt-2 space-y-1.5" data-testid="strategic-context-resources">
           {resources.map(resource => (
-            <ContextResourceButton
-              key={`${resource.kind}:${resource.id}`}
-              resource={resource}
-              onOpen={onOpenResource}
-            />
+            (() => {
+              const ref = selectedRefFromResource(resource);
+              const key = sessionRefKey(ref);
+              return (
+                <ContextResourceButton
+                  key={`${resource.kind}:${resource.id}`}
+                  resource={resource}
+                  selected={selectedKeys.has(key)}
+                  disabled={savingSessionRefs}
+                  onOpen={onOpenResource}
+                  onUse={onUseRef ? () => onUseRef(ref) : undefined}
+                  onRemove={onRemoveRef ? () => onRemoveRef(ref) : undefined}
+                />
+              );
+            })()
           ))}
         </div>
       )}
@@ -335,6 +601,9 @@ export function StrategicContextRail({
   onOpenTask,
   onOpenMessages,
   onOpenKnowledge,
+  workbenchState,
+  savingSessionRefs = false,
+  onUpdateSessionRefs,
 }: StrategicContextRailProps) {
   const activeCycle = state?.strategic.active_cycle ?? null;
   const localRunner = state?.runtime?.local_runner ?? null;
@@ -384,6 +653,10 @@ export function StrategicContextRail({
   const showRuntimeWork = runtimeWorkHasSignal(runtimeWork);
   const runtimeWorkStatus = showRuntimeWork ? runtimeWorkTone(runtimeWork) : null;
   const firstRuntimeJob = runtimeWork?.compute_jobs.items[0] ?? null;
+  const selectedRefs = workbenchState?.selected_refs ?? state?.work_session?.selected_refs ?? state?.workbench?.selected_refs ?? [];
+  const workSessionDescriptors = state?.work_session?.selected_ref_descriptors ?? [];
+  const descriptorByRef = new Map(workSessionDescriptors.map(descriptor => [sessionRefKey(descriptor), descriptor]));
+  const selectedRefDescriptors = selectedRefs.map(ref => descriptorByRef.get(sessionRefKey(ref)) ?? fallbackRefDescriptor(ref));
 
   function attentionItemAction(item: StrategicStateAttentionItem): (() => void) | undefined {
     if (item.kind === 'task') {
@@ -391,7 +664,8 @@ export function StrategicContextRail({
     }
     if (item.kind === 'direction') return () => onOpenProjectSection('directions');
     if (item.kind === 'alert' && item.task_id) {
-      return onOpenTask ? () => onOpenTask(item.task_id!) : onOpenPipeline;
+      const taskId = item.task_id;
+      return onOpenTask ? () => onOpenTask(taskId) : onOpenPipeline;
     }
     if (item.kind === 'alert') return onOpenRuntimeHealth;
     if (item.kind === 'message') return onOpenMessages ?? onOpenPipeline;
@@ -431,6 +705,16 @@ export function StrategicContextRail({
 
   function openContextResource(resource: StrategicContextResourceRef): void {
     openContextTarget(resource.target);
+  }
+
+  function useSessionRef(ref: StrategicSelectedRef): void {
+    if (!onUpdateSessionRefs) return;
+    onUpdateSessionRefs(refs => upsertStrategicSelectedRef(refs, ref));
+  }
+
+  function removeSessionRef(ref: Pick<StrategicSelectedRef, 'kind' | 'id'>): void {
+    if (!onUpdateSessionRefs) return;
+    onUpdateSessionRefs(refs => removeStrategicSelectedRef(refs, ref));
   }
 
   return (
@@ -569,7 +853,13 @@ export function StrategicContextRail({
         <div className="space-y-3">
           <ContextPackageBlock
             contextPackage={state?.context_package}
+            sessionRefs={selectedRefDescriptors}
+            selectedRefs={selectedRefs}
+            savingSessionRefs={savingSessionRefs}
             onOpenResource={openContextResource}
+            onOpenTarget={openContextTarget}
+            onUseRef={onUpdateSessionRefs ? useSessionRef : undefined}
+            onRemoveRef={onUpdateSessionRefs ? removeSessionRef : undefined}
           />
           <div>
             <div className="mb-1 flex items-center gap-2 text-xs font-semibold text-neutral-100">

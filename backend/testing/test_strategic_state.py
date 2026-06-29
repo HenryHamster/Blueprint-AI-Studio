@@ -691,7 +691,16 @@ async def test_strategic_state_includes_operator_workbench_state(
                             "kind": "task",
                             "id": "task-123",
                             "label": "Review active wave",
-                        }
+                        },
+                        {
+                            "kind": "canvas",
+                            "id": f"strategic-canvas:{project.id}",
+                        },
+                        {
+                            "kind": "canvas",
+                            "id": f"strategic-canvas:{project.id}",
+                            "label": "Duplicate canvas",
+                        },
                     ],
                     "session_started_at": "2026-06-29T12:00:00",
                     "last_interaction_at": "2026-06-29T12:03:00",
@@ -709,9 +718,35 @@ async def test_strategic_state_includes_operator_workbench_state(
     assert workbench["interaction_mode"] == "check_in"
     assert workbench["active_surface"] == "pipeline"
     assert workbench["selected_refs"] == [
-        {"kind": "task", "id": "task-123", "label": "Review active wave"}
+        {"kind": "task", "id": "task-123", "label": "Review active wave"},
+        {"kind": "canvas", "id": f"strategic-canvas:{project.id}"},
     ]
     assert "cycle_summary" not in workbench
+
+    work_session = resp.json()["work_session"]
+    assert work_session["version"] == 1
+    assert work_session["mode"] == "check_in"
+    assert work_session["active_surface"] == "pipeline"
+    assert work_session["context_package_id"] == f"strategic-context:{project.id}"
+    assert work_session["selected_refs"] == [
+        {"kind": "task", "id": "task-123", "label": "Review active wave"},
+        {"kind": "canvas", "id": f"strategic-canvas:{project.id}"},
+    ]
+    descriptors = {
+        (entry["kind"], entry["id"]): entry
+        for entry in work_session["selected_ref_descriptors"]
+    }
+    assert descriptors[("task", "task-123")]["label"] == "Review active wave"
+    canvas_descriptor = descriptors[("canvas", f"strategic-canvas:{project.id}")]
+    assert canvas_descriptor["label"] == "Strategic context map"
+    assert canvas_descriptor["target"] == {
+        "surface": "project",
+        "section": "problem-model",
+    }
+    metrics = {entry["id"]: entry for entry in work_session["curated_metrics"]}
+    assert metrics["messages.open"]["label"] == "open messages"
+    assert metrics["tasks.running"]["target"] == {"surface": "pipeline"}
+    assert metrics["context.items"]["value"] == resp.json()["context_package"]["item_count"]
 
 
 @pytest.mark.asyncio

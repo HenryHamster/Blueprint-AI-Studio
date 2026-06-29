@@ -1,11 +1,6 @@
 import { useMemo, useRef, useEffect, useState, useCallback } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import {
-  Activity,
-  AlertCircle,
-  CheckSquare,
-  LayoutList,
-} from 'lucide-react';
+import { Activity, AlertCircle, CheckSquare, LayoutList } from 'lucide-react';
 import { ColumnsPicker } from './components/ColumnsPicker';
 import type { ColumnPref } from './components/ColumnsPicker';
 import { ConfirmDialog } from './components/ConfirmDialog';
@@ -79,6 +74,7 @@ const SORT_KEY = 'blueprint-admin:kanban-sort';
 const CANCELLABLE_STATUSES = new Set(['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING', 'BLOCKED', 'PARKED']);
 const TERMINAL_STATUSES = new Set(['COMPLETED', 'CANCELLED', 'FAILED']);
 const ACTIVE_PIPELINE_STATUSES = new Set(['IN_PROGRESS', 'PROVISIONING', 'EVALUATING']);
+type StrategicSessionRefs = StrategicWorkbenchState['selected_refs'];
 
 export default function App() {
   const s = useAppState();
@@ -529,6 +525,10 @@ export default function App() {
       () => undefined,
     );
   }, [s, strategicReadModel, strategicReadModelWorkbench]);
+  const updateStrategicSessionRefs = useCallback((updateRefs: (refs: StrategicSessionRefs) => StrategicSessionRefs) => {
+    const baseRefs = (strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench)?.selected_refs ?? [];
+    persistStrategicWorkbench({ selected_refs: updateRefs(baseRefs) });
+  }, [persistStrategicWorkbench, strategicReadModelWorkbench]);
   const pipelineAttentionCount = useMemo(() => {
     const counts = strategicReadModel.data?.attention?.counts;
     if (!counts) return s.needsAttentionCount;
@@ -1471,6 +1471,9 @@ export default function App() {
                     s.setShowKnowledgeBrowser(true);
                   }}
                   onOpenMessages={() => handleTabChange('chat')}
+                  workbenchState={strategicWorkbenchState}
+                  savingSessionRefs={savingStrategicWorkbench}
+                  onUpdateSessionRefs={updateStrategicSessionRefs}
                 />
                 <TaskContextRail
                   currentTask={openPipelineTask}

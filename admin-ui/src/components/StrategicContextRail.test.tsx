@@ -3,7 +3,9 @@ import type { ComponentProps } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { StrategicContextRail } from './StrategicContextRail';
-import type { StrategicStateResponse } from '../strategicStateApi';
+import type { StrategicStateResponse, StrategicWorkbenchState } from '../strategicStateApi';
+
+type SessionRefs = StrategicWorkbenchState['selected_refs'];
 
 const STATE: StrategicStateResponse = {
   project_id: 'proj-1',
@@ -167,9 +169,9 @@ const STATE: StrategicStateResponse = {
       node_count: 9,
       edge_count: 8,
       nodes: [
-        { id: 'project:proj-1', kind: 'project', label: 'Workbench context package' },
-        { id: 'knowledge:kdoc-1', kind: 'knowledge_document', label: 'Operator notes' },
-        { id: 'artifact:artifact-1', kind: 'artifact', label: 'operator-context-report' },
+        { id: 'project:proj-1', kind: 'project', label: 'Workbench context package', target: { surface: 'project', section: 'running-update' } },
+        { id: 'knowledge:kdoc-1', kind: 'knowledge_document', label: 'Operator notes', target: { surface: 'knowledge', document_id: 'kdoc-1', direction_id: 'd-1', task_id: 'task-strat' } },
+        { id: 'artifact:artifact-1', kind: 'artifact', label: 'operator-context-report', target: { surface: 'task', task_id: 'task-strat', artifact_id: 'artifact-1' } },
       ],
       edges: [
         { source: 'project:proj-1', target: 'knowledge:kdoc-1', label: 'knowledge' },
@@ -338,6 +340,46 @@ const STATE: StrategicStateResponse = {
       },
     },
   },
+  workbench: {
+    version: 1,
+    interaction_mode: 'continuous',
+    active_surface: 'strategic',
+    selected_refs: [
+      { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
+    ],
+    session_started_at: '2026-06-29T01:00:00Z',
+    last_interaction_at: '2026-06-29T01:08:00Z',
+  },
+  work_session: {
+    version: 1,
+    id: 'strategic-session:proj-1:2026-06-29T01:00:00Z',
+    mode: 'continuous',
+    active_surface: 'strategic',
+    session_started_at: '2026-06-29T01:00:00Z',
+    last_interaction_at: '2026-06-29T01:08:00Z',
+    context_package_id: 'strategic-context:proj-1',
+    attention_level: 'needs_operator',
+    selected_refs: [
+      { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
+    ],
+    selected_ref_descriptors: [
+      {
+        kind: 'knowledge_document',
+        id: 'knowledge:kdoc-1',
+        label: 'Operator notes',
+        summary: 'Context should be available when requested.',
+        target: { surface: 'knowledge', document_id: 'kdoc-1', direction_id: 'd-1', task_id: 'task-strat' },
+      },
+    ],
+    curated_metrics: [
+      { id: 'attention.needs_operator', label: 'needs operator', value: 1, tone: 'warning', target: { surface: 'messages' } },
+      { id: 'tasks.running', label: 'running tasks', value: 2, tone: 'active', target: { surface: 'pipeline' } },
+    ],
+    context_sources: [
+      { kind: 'running_update', count: 1 },
+      { kind: 'tasks', count: 20 },
+    ],
+  },
   design: {
     has_design_doc: true,
     revision: 4,
@@ -388,6 +430,8 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).toContain('building');
     expect(host.textContent).toContain('32 items');
     expect(host.textContent).toContain('9 nodes / 8 links');
+    expect(host.textContent).toContain('Session context');
+    expect(host.textContent).toContain('Context map');
     expect(host.textContent).toContain('Strategic context map');
     expect(host.textContent).toContain('Operator notes');
     expect(host.textContent).toContain('operator-context-report');
@@ -431,6 +475,64 @@ describe('StrategicContextRail', () => {
     expect(props.onOpenRuntimeHealth).toHaveBeenCalled();
     expect(props.onOpenRuntimeDevices).toHaveBeenCalled();
     expect(onOpenRuntimeCompute).toHaveBeenCalled();
+  });
+
+  test('applies Strategic session ref updates against the latest workbench state', () => {
+    const baseWorkbench = STATE.workbench;
+    if (!baseWorkbench) throw new Error('Expected fixture workbench state');
+    let currentRefs: SessionRefs = [...baseWorkbench.selected_refs];
+    const updates: SessionRefs[] = [];
+    const onUpdateSessionRefs = vi.fn((updateRefs: (refs: SessionRefs) => SessionRefs) => {
+      currentRefs = updateRefs(currentRefs);
+      updates.push(currentRefs);
+    });
+    const firstMount = mount({ onUpdateSessionRefs });
+
+    let buttons = Array.from(firstMount.host.querySelectorAll('button'));
+    const keepCanvas = buttons.find(button => button.title === 'Keep Strategic context map in session context');
+    const keepArtifact = buttons.find(button => button.title === 'Keep operator-context-report in session context');
+    if (!keepCanvas || !keepArtifact) throw new Error('Expected keep actions for context refs');
+    expect(keepCanvas.getAttribute('aria-label')).toBe('Keep Strategic context map in session context');
+    keepCanvas.click();
+    keepArtifact.click();
+
+    expect(updates).toEqual([
+      [
+        { kind: 'canvas', id: 'strategic-canvas:proj-1', label: 'Strategic context map' },
+        { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
+      ],
+      [
+        { kind: 'artifact', id: 'artifact:artifact-1', label: 'operator-context-report' },
+        { kind: 'canvas', id: 'strategic-canvas:proj-1', label: 'Strategic context map' },
+        { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
+      ],
+    ]);
+    expect(onUpdateSessionRefs).toHaveBeenCalledTimes(2);
+
+    act(() => { root?.unmount(); });
+    root = null;
+    host?.remove();
+    host = null;
+
+    const withSelectedRefs = {
+      ...baseWorkbench,
+      selected_refs: currentRefs,
+    };
+    const mounted = mount({ onUpdateSessionRefs, workbenchState: withSelectedRefs });
+
+    expect(mounted.host.textContent).toContain('Strategic context map');
+    buttons = Array.from(mounted.host.querySelectorAll('button'));
+    const removeCanvas = buttons.find(button => button.title === 'Remove Strategic context map from session context');
+    const removeKnowledge = buttons.find(button => button.title === 'Remove Operator notes from session context');
+    if (!removeCanvas || !removeKnowledge) throw new Error('Expected remove actions for selected refs');
+    expect(removeCanvas.getAttribute('aria-label')).toBe('Remove Strategic context map from session context');
+    removeCanvas.click();
+    removeKnowledge.click();
+
+    expect(updates.at(-1)).toEqual([
+      { kind: 'artifact', id: 'artifact:artifact-1', label: 'operator-context-report' },
+    ]);
+    expect(onUpdateSessionRefs).toHaveBeenCalledTimes(4);
   });
 
   test('shows recent terminal compute results without requiring an active job', () => {

@@ -285,6 +285,39 @@ export interface StrategicWorkbenchState {
   last_interaction_at?: string | null;
 }
 
+export interface StrategicWorkSessionMetric {
+  id: string;
+  label: string;
+  value: number;
+  unit?: string | null;
+  tone?: 'neutral' | 'watch' | 'warning' | 'critical' | 'active' | string;
+  target?: StrategicContextPackageDrilldown['target'] | null;
+}
+
+export interface StrategicWorkSessionRefDescriptor {
+  kind: string;
+  id: string;
+  label: string;
+  summary?: string | null;
+  status?: string | null;
+  target?: StrategicContextPackageDrilldown['target'] | null;
+}
+
+export interface StrategicWorkSession {
+  version: 1;
+  id: string;
+  mode: string;
+  active_surface: string;
+  session_started_at?: string | null;
+  last_interaction_at?: string | null;
+  context_package_id?: string | null;
+  attention_level?: string | null;
+  selected_refs: StrategicWorkbenchState['selected_refs'];
+  selected_ref_descriptors: StrategicWorkSessionRefDescriptor[];
+  curated_metrics: StrategicWorkSessionMetric[];
+  context_sources?: StrategicContextPackageSource[];
+}
+
 export interface StrategicStateResponse {
   project_id: string;
   strategic: {
@@ -378,6 +411,7 @@ export interface StrategicStateResponse {
     work?: StrategicRuntimeWorkState | null;
   };
   workbench?: StrategicWorkbenchState | null;
+  work_session?: StrategicWorkSession | null;
   design: {
     has_design_doc: boolean;
     revision?: number | null;

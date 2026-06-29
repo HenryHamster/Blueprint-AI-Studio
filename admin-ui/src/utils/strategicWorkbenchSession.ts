@@ -2,6 +2,9 @@ import type { PrimaryTab } from '../hooks/useUIState';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import type { StrategicWorkbenchState } from '../strategicStateApi';
 
+export const MAX_STRATEGIC_SELECTED_REFS = 12;
+export type StrategicSelectedRef = StrategicWorkbenchState['selected_refs'][number];
+
 export function normalizeStrategicInteractionMode(mode?: string | null): StrategicInteractionMode {
   if (mode === 'check_in' || mode === 'monitor' || mode === 'continuous') return mode;
   return 'chat';
@@ -21,6 +24,52 @@ export function tabForWorkbenchSurface(surface?: string | null): PrimaryTab | nu
   return null;
 }
 
+function compactRefString(value: unknown, maxChars: number): string | null {
+  if (typeof value !== 'string') return null;
+  const text = value.trim().replace(/\s+/g, ' ');
+  if (!text) return null;
+  return text.slice(0, maxChars);
+}
+
+export function normalizeStrategicSelectedRefs(refs: unknown): StrategicSelectedRef[] {
+  if (!Array.isArray(refs)) return [];
+  const seen = new Set<string>();
+  const normalized: StrategicSelectedRef[] = [];
+  for (const entry of refs) {
+    if (!entry || typeof entry !== 'object') continue;
+    const raw = entry as Partial<StrategicSelectedRef>;
+    const kind = compactRefString(raw.kind, 40);
+    const id = compactRefString(raw.id, 120);
+    if (!kind || !id) continue;
+    const key = `${kind}:${id}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const label = compactRefString(raw.label, 160);
+    normalized.push(label ? { kind, id, label } : { kind, id });
+    if (normalized.length >= MAX_STRATEGIC_SELECTED_REFS) break;
+  }
+  return normalized;
+}
+
+export function upsertStrategicSelectedRef(
+  refs: StrategicSelectedRef[] | null | undefined,
+  ref: StrategicSelectedRef,
+): StrategicSelectedRef[] {
+  const normalizedRef = normalizeStrategicSelectedRefs([ref])[0];
+  if (!normalizedRef) return normalizeStrategicSelectedRefs(refs ?? []);
+  const withoutRef = normalizeStrategicSelectedRefs(refs ?? [])
+    .filter(existing => !(existing.kind === normalizedRef.kind && existing.id === normalizedRef.id));
+  return normalizeStrategicSelectedRefs([normalizedRef, ...withoutRef]);
+}
+
+export function removeStrategicSelectedRef(
+  refs: StrategicSelectedRef[] | null | undefined,
+  ref: Pick<StrategicSelectedRef, 'kind' | 'id'>,
+): StrategicSelectedRef[] {
+  return normalizeStrategicSelectedRefs(refs ?? [])
+    .filter(existing => !(existing.kind === ref.kind && existing.id === ref.id));
+}
+
 export function buildOptimisticStrategicWorkbench(
   base: StrategicWorkbenchState | null | undefined,
   patch: Partial<StrategicWorkbenchState>,
@@ -32,7 +81,9 @@ export function buildOptimisticStrategicWorkbench(
       typeof patch.interaction_mode === 'string' ? patch.interaction_mode : base?.interaction_mode,
     ),
     active_surface: typeof patch.active_surface === 'string' ? patch.active_surface : base?.active_surface ?? 'strategic',
-    selected_refs: Array.isArray(patch.selected_refs) ? patch.selected_refs : base?.selected_refs ?? [],
+    selected_refs: normalizeStrategicSelectedRefs(
+      Array.isArray(patch.selected_refs) ? patch.selected_refs : base?.selected_refs ?? [],
+    ),
     session_started_at: base?.session_started_at ?? now,
     last_interaction_at: now,
   };
