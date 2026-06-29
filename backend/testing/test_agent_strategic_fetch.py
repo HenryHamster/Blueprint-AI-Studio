@@ -3632,3 +3632,149 @@ async def test_agent_fetch_version_phase_criterion_coverage_absent_when_no_open_
     assert data["current_version"] is None
     # criterion_coverage is absent when there is no open version.
     assert "criterion_coverage" not in (data.get("current_version") or {})
+
+
+# ---------------------------------------------------------------------------
+# candidate_currency freshness-SHAs tests
+# ---------------------------------------------------------------------------
+
+
+def _patch_version_phase_currency(mocker, *, resolved, head_sha):
+    """Mock the GitHub resolution path used by _resolve_candidate_currency
+    for agent_fetch_version_phase tests."""
+    from unittest.mock import AsyncMock
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=resolved),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=head_sha),
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_exposes_payload_freshness_shas(
+    client: AsyncClient, db_session, mocker
+):
+    """Acceptance requirement: candidate_currency in the version-phase response
+    must expose payload_sha, active_candidate_sha, integration_head_sha, stale,
+    and stale_reason when the open version has a candidate SHA and the integration
+    branch HEAD can be resolved.
+
+    Stale case: candidate != HEAD -> stale=True, stale_reason set.
+    Current case: candidate == HEAD -> stale=False, stale_reason=None.
+
+    This test covers both sub-cases in one fixture to satisfy the named acceptance
+    evidence requirement: test_agent_fetch_version_phase_exposes_payload_freshness_shas.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    candidate = "a" * 40
+    head = "b" * 40
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-freshness-shas"
+    )
+    version.last_qualification = {"candidate_sha": candidate, "status": "not_promoted"}
+    flag_modified(version, "last_qualification")
+    await db_session.commit()
+
+    _patch_version_phase_currency(
+        mocker, resolved=("tok", "owner", "repo"), head_sha=head
+    )
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    # Stale case: candidate differs from HEAD
+    cc = data.get("candidate_currency")
+    assert cc is not None, "candidate_currency must be present when currency resolves"
+    assert cc["stale"] is True
+    assert cc["payload_sha"] == candidate
+    assert cc["payload_compiled_sha"] == candidate
+    assert cc["active_candidate_sha"] == candidate
+    assert cc["integration_head_sha"] == head
+    assert cc["stale_reason"] == "payload_sha_differs_from_integration_head"
+    # backward-compat fields preserved
+    assert cc["current"] is False
+    assert cc["candidate_sha"] == candidate
+    assert cc["head_sha"] == head
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_candidate_currency_current(
+    client: AsyncClient, db_session, mocker
+):
+    """When candidate_sha equals integration HEAD, candidate_currency has stale=False
+    and stale_reason=None."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    sha = "c" * 40
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-freshness-current"
+    )
+    version.last_qualification = {"candidate_sha": sha, "status": "promoted"}
+    flag_modified(version, "last_qualification")
+    await db_session.commit()
+
+    _patch_version_phase_currency(
+        mocker, resolved=("tok", "owner", "repo"), head_sha=sha
+    )
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    cc = data.get("candidate_currency")
+    assert cc is not None
+    assert cc["stale"] is False
+    assert cc["payload_sha"] == sha
+    assert cc["active_candidate_sha"] == sha
+    assert cc["integration_head_sha"] == sha
+    assert cc["stale_reason"] is None
+    assert cc["current"] is True
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_candidate_currency_absent_when_indeterminate(
+    client: AsyncClient, db_session, mocker
+):
+    """When GitHub resolution fails (resolved=None), candidate_currency is absent
+    from the response — the endpoint must not error."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    candidate = "d" * 40
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-freshness-indet"
+    )
+    version.last_qualification = {"candidate_sha": candidate, "status": "not_promoted"}
+    flag_modified(version, "last_qualification")
+    await db_session.commit()
+
+    # resolved=None -> _resolve_github_with_session returns None -> _resolve_candidate_currency returns None
+    _patch_version_phase_currency(mocker, resolved=None, head_sha="e" * 40)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    assert "candidate_currency" not in data, (
+        "candidate_currency must be absent when currency is indeterminate"
+    )

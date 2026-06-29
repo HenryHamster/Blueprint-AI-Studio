@@ -1266,20 +1266,32 @@ export function buildPayloadStalenessSection(staleness: Record<string, unknown> 
   if (!staleness || typeof staleness !== 'object') return '';
   if (typeof staleness.stale !== 'boolean') return '';
 
-  const payloadSha = typeof staleness.payload_compiled_sha === 'string'
-    ? staleness.payload_compiled_sha.slice(0, 12)
-    : '?';
-  const candidateSha = typeof staleness.active_candidate_sha === 'string'
-    ? staleness.active_candidate_sha.slice(0, 12)
-    : '?';
+  // payload_sha is the primary field; payload_compiled_sha is the backward-compat fallback
+  const rawPayloadSha = typeof staleness.payload_sha === 'string' && staleness.payload_sha
+    ? staleness.payload_sha
+    : (typeof staleness.payload_compiled_sha === 'string' ? staleness.payload_compiled_sha : '');
+  const rawCandidateSha = typeof staleness.active_candidate_sha === 'string' ? staleness.active_candidate_sha : '';
+  const rawIntegrationHeadSha = typeof staleness.integration_head_sha === 'string' ? staleness.integration_head_sha : '';
+
+  const payloadShaShort = rawPayloadSha ? rawPayloadSha.slice(0, 12) : '?';
+  const candidateShaShort = rawCandidateSha ? rawCandidateSha.slice(0, 12) : '?';
+  const integrationHeadShaShort = rawIntegrationHeadSha ? rawIntegrationHeadSha.slice(0, 12) : '';
 
   const lines: string[] = ['\n## Payload Currency (cycle-start check)'];
   if (staleness.stale) {
-    lines.push(`⚠ STALE — this payload was compiled against candidate \`${payloadSha}\`, but the active qualification candidate is now \`${candidateSha}\`.`);
+    lines.push(`⚠ STALE — this payload was compiled against an older commit than the current active state. Specific divergences:`);
+    // Emit payload-vs-candidate bullet only when both SHAs are available and differ
+    if (rawPayloadSha && rawCandidateSha && rawPayloadSha !== rawCandidateSha) {
+      lines.push(`- payload-vs-candidate: payload compiled at \`${payloadShaShort}\` but active qualification candidate is \`${candidateShaShort}\``);
+    }
+    // Emit payload-vs-integration-head bullet only when both SHAs are available and differ
+    if (rawPayloadSha && rawIntegrationHeadSha && rawPayloadSha !== rawIntegrationHeadSha) {
+      lines.push(`- payload-vs-integration-head: payload compiled at \`${payloadShaShort}\` but integration HEAD is \`${integrationHeadShaShort}\``);
+    }
     lines.push('Audit findings, CI compliance, and direction scores in this payload were evaluated against the OLDER candidate commit, not the current integration HEAD.');
     lines.push('Do NOT treat unverified audit findings as current promotion blockers before confirming they still reproduce on current HEAD. Consider fetching a fresh qualification before acting on stale findings.');
   } else {
-    lines.push(`Candidate is CURRENT — payload compiled against \`${candidateSha}\`, which matches the active qualification candidate. Audit findings are scored against live HEAD.`);
+    lines.push(`Candidate is CURRENT — payload compiled against \`${candidateShaShort}\`, which matches the active qualification candidate. Audit findings are scored against live HEAD.`);
   }
   return lines.join('\n');
 }

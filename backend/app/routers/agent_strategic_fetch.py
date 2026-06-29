@@ -644,15 +644,21 @@ async def agent_fetch_version_phase(
     if open_row is not None:
         try:
             from app.strategic_spawning import (  # noqa: PLC0415
+                _build_freshness_shas_block,
                 _resolve_candidate_currency,
                 get_project_integration_branch,
             )
 
             _last_qual = open_row.last_qualification or {}
             _integration_branch = get_project_integration_branch(project)
-            candidate_currency = await _resolve_candidate_currency(
+            _raw_currency = await _resolve_candidate_currency(
                 session, project, _last_qual, _integration_branch
             )
+            if _raw_currency is not None:
+                candidate_currency = {
+                    **_raw_currency,
+                    **_build_freshness_shas_block(_raw_currency),
+                }
         except Exception:
             logger.exception(
                 "[AGENT_FETCH] candidate_currency resolve failed for project %s",

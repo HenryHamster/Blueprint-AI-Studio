@@ -1773,7 +1773,7 @@ describe('buildSweepComparisonSection', () => {
 
 describe('buildPayloadStalenessSection', () => {
   const STALE_SHA = 'a'.repeat(40);
-  const HEAD_SHA = 'b'.repeat(40);
+  const CANDIDATE_SHA = 'b'.repeat(40);
 
   it('returns empty string for undefined', () => {
     expect(buildPayloadStalenessSection(undefined)).toBe('');
@@ -1784,22 +1784,73 @@ describe('buildPayloadStalenessSection', () => {
     expect(buildPayloadStalenessSection({})).toBe('');
   });
 
-  it('divergence rendered — stale=true shows ⚠ STALE block with truncated SHAs', () => {
+  it('divergence rendered — stale=true shows ⚠ STALE block with truncated SHAs (legacy payload_compiled_sha fallback)', () => {
     const result = buildPayloadStalenessSection({
       stale: true,
       payload_compiled_sha: STALE_SHA,
-      active_candidate_sha: HEAD_SHA,
+      active_candidate_sha: CANDIDATE_SHA,
     });
     expect(result).toContain('⚠ STALE');
     expect(result).toContain(STALE_SHA.slice(0, 12));
-    expect(result).toContain(HEAD_SHA.slice(0, 12));
+    expect(result).toContain(CANDIDATE_SHA.slice(0, 12));
     expect(result).toContain('## Payload Currency (cycle-start check)');
     expect(result).toContain('Do NOT treat unverified audit findings');
+    expect(result).toContain('payload-vs-candidate');
+  });
+
+  it('buildPayloadStalenessSection renders structured stale reasons for SHA divergence', () => {
+    const CANDIDATE_SHA = 'c'.repeat(40);
+    const INTEGRATION_SHA = 'd'.repeat(40);
+    // payload_sha as primary; differs from both candidate and integration head
+    const result = buildPayloadStalenessSection({
+      stale: true,
+      payload_sha: STALE_SHA,
+      payload_compiled_sha: 'e'.repeat(40),  // should be ignored when payload_sha present
+      active_candidate_sha: CANDIDATE_SHA,
+      integration_head_sha: INTEGRATION_SHA,
+    });
+    expect(result).toContain('⚠ STALE');
+    expect(result).toContain('## Payload Currency (cycle-start check)');
+    // Uses payload_sha (STALE_SHA), not payload_compiled_sha
+    expect(result).toContain(STALE_SHA.slice(0, 12));
+    expect(result).not.toContain('e'.repeat(12));
+    // payload-vs-candidate bullet present
+    expect(result).toContain('payload-vs-candidate');
+    expect(result).toContain(CANDIDATE_SHA.slice(0, 12));
+    // payload-vs-integration-head bullet present
+    expect(result).toContain('payload-vs-integration-head');
+    expect(result).toContain(INTEGRATION_SHA.slice(0, 12));
+    expect(result).toContain('Do NOT treat unverified audit findings');
+  });
+
+  it('only candidate annotation when integration_head_sha absent', () => {
+    const result = buildPayloadStalenessSection({
+      stale: true,
+      payload_sha: STALE_SHA,
+      active_candidate_sha: CANDIDATE_SHA,
+    });
+    expect(result).toContain('⚠ STALE');
+    expect(result).toContain('payload-vs-candidate');
+    expect(result).toContain(CANDIDATE_SHA.slice(0, 12));
+    expect(result).not.toContain('payload-vs-integration-head');
+  });
+
+  it('no stale bullets when payload SHA is missing (indeterminate guard)', () => {
+    const result = buildPayloadStalenessSection({
+      stale: true,
+      active_candidate_sha: CANDIDATE_SHA,
+      integration_head_sha: 'c'.repeat(40),
+    });
+    expect(result).toContain('⚠ STALE');
+    // No specific SHA comparison bullets since payload SHA is unknown
+    expect(result).not.toContain('payload-vs-candidate');
+    expect(result).not.toContain('payload-vs-integration-head');
   });
 
   it('no false positive — stale=false shows CURRENT line, not ⚠ STALE', () => {
     const result = buildPayloadStalenessSection({
       stale: false,
+      payload_sha: STALE_SHA,
       payload_compiled_sha: STALE_SHA,
       active_candidate_sha: STALE_SHA,
     });

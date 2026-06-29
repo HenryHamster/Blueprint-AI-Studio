@@ -6432,9 +6432,8 @@ async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
     await db_session.refresh(active_project)
 
     assert await _spawn_strategic_review(active_project, db_session) is True
-    # Two calls: (1) direct version-phase lookup, (2) release_readiness
-    # _compute_acceptance_aggregate — both inside the integration!=promotion gate.
-    assert current_open_version.call_count == 2
+    # The integration!=promotion gate now performs one direct version-phase lookup.
+    assert current_open_version.call_count == 1
     assert ensure_initial_release_version.call_args.kwargs["promotion_target"] == "main"
 
 
@@ -6929,7 +6928,8 @@ async def test_spawn_strategic_review_payload_staleness_stale_when_candidate_beh
 ):
     """When the qualification candidate is BEHIND integration HEAD, the spawned
     strategic_review payload must contain a payload_staleness block with stale=True,
-    payload_compiled_sha == candidate_sha, and active_candidate_sha == head_sha."""
+    payload_compiled_sha == candidate_sha, active_candidate_sha == candidate_sha,
+    and integration_head_sha == head_sha."""
     await _ensure_releaseversion_table(db_session)
     await _ensure_audit_finding_resolution_table(db_session)
     project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
@@ -6963,8 +6963,10 @@ async def test_spawn_strategic_review_payload_staleness_stale_when_candidate_beh
     assert staleness is not None, "payload_staleness must be present when currency resolved"
     assert staleness["stale"] is True, "stale must be True when candidate is behind HEAD"
     assert staleness["payload_compiled_sha"] == candidate
-    assert staleness["active_candidate_sha"] == head
+    assert staleness["payload_sha"] == candidate
+    assert staleness["active_candidate_sha"] == candidate
     assert staleness["integration_head_sha"] == head
+    assert staleness["stale_reason"] == "payload_sha_differs_from_integration_head"
 
 
 @pytest.mark.asyncio
@@ -7003,8 +7005,11 @@ async def test_spawn_strategic_review_payload_staleness_current_when_candidate_m
     staleness = payload.get("payload_staleness")
     assert staleness is not None, "payload_staleness must be present when currency resolved"
     assert staleness["stale"] is False, "stale must be False when candidate equals HEAD"
+    assert staleness["payload_sha"] == sha
+    assert staleness["payload_compiled_sha"] == sha
     assert staleness["active_candidate_sha"] == sha
     assert staleness["integration_head_sha"] == sha
+    assert staleness["stale_reason"] is None
 
 
 @pytest.mark.asyncio

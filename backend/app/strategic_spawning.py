@@ -4107,6 +4107,30 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     return True
 
 
+def _build_freshness_shas_block(currency: dict) -> dict:
+    """Build a normalized SHA-freshness dict from a resolved candidate-currency dict.
+
+    Takes the ``{"current": bool, "candidate_sha": str, "head_sha": str}`` dict
+    returned by ``_resolve_candidate_currency`` and returns an additive block that
+    exposes payload_sha, active_candidate_sha, integration_head_sha, stale, and
+    stale_reason.  payload_compiled_sha is kept for backward-compat with older
+    agent consumers that read it directly.
+
+    Not called when currency is None (GitHub indeterminate) — callers must guard.
+    """
+    is_stale = not currency["current"]
+    return {
+        "payload_sha": currency["candidate_sha"],
+        "payload_compiled_sha": currency["candidate_sha"],
+        "active_candidate_sha": currency["candidate_sha"],
+        "integration_head_sha": currency["head_sha"],
+        "stale": is_stale,
+        "stale_reason": (
+            "payload_sha_differs_from_integration_head" if is_stale else None
+        ),
+    }
+
+
 async def _resolve_candidate_currency(
     session: AsyncSession,
     project: Project,
@@ -6041,12 +6065,7 @@ async def _spawn_strategic_review(
     # Best-effort: _currency is None when GitHub was unreachable (no-op below).
     _payload_staleness: dict | None = None
     if _currency is not None:
-        _payload_staleness = {
-            "payload_compiled_sha": _currency["candidate_sha"],
-            "active_candidate_sha": _currency["head_sha"],
-            "integration_head_sha": _currency["head_sha"],
-            "stale": not _currency["current"],
-        }
+        _payload_staleness = _build_freshness_shas_block(_currency)
     # Inject explicit list of failed approaches from retired directions so the
     # agent has a clear "do not re-propose" block in the prompt.
     _retired_summary = _build_retired_directions_summary(project)
