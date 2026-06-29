@@ -305,6 +305,21 @@ describe('HeaderBar — viewport regression', () => {
     expect(onOpenActivityFeed).toHaveBeenCalledOnce();
   });
 
+  test('pipeline tab shows attention badge from existing count prop', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<HeaderBar {...makeProps()} needsAttentionCount={7} />);
+    });
+
+    const pipelineTab = Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Pipeline'));
+    expect(pipelineTab?.textContent).toContain('7');
+  });
+
   test('desktop new task launcher remains available outside pipeline', async () => {
     const onOpenNewTaskModal = vi.fn();
     host = document.createElement('div');

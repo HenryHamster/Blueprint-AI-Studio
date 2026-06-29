@@ -43,6 +43,7 @@ from app.ci_resolution import (
 )
 from app.capability_proof import enrich_problem_model_capability_proofs
 from app.message_convergence import LINKED_STATUS, OPEN_STATUS
+from app.operator_attention import build_operator_attention
 from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
 from app.onboarding_proof import build_onboarding_proof_block
@@ -685,6 +686,12 @@ async def get_project_strategic_state(
         if status in message_counts:
             message_counts[status] = int(count or 0)
 
+    attention = await build_operator_attention(
+        session,
+        project,
+        current_user["user_id"],
+    )
+
     return {
         "project_id": str(project.id),
         "strategic": {
@@ -705,6 +712,7 @@ async def get_project_strategic_state(
             "counts": task_counts,
             "cumulative_estimated_cost_usd": float(cost_total or 0.0),
         },
+        "attention": attention,
         "design": {
             "has_design_doc": bool(project.design_doc),
             "revision": ((project.design_doc or {}).get("_meta") or {}).get("revision")

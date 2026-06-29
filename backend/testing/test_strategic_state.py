@@ -5,7 +5,10 @@ import pytest
 from httpx import AsyncClient
 
 from app.models import (
+    Alert,
+    AlertSeverity,
     MessageType,
+    MessagesLastSeen,
     Project,
     ProjectMember,
     ProjectMessage,
@@ -83,7 +86,10 @@ async def _make_project(session) -> Project:
             ],
         },
         design_doc={"_meta": {"revision": 3}, "pages": []},
-        running_update="Strategic is consolidating operator chat state.\n\nPipeline remains available in the task view.",
+        running_update=(
+            "Strategic is consolidating operator chat state.\n\n"
+            "Pipeline remains available in the task view."
+        ),
     )
     session.add(project)
     await session.commit()
@@ -196,6 +202,8 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     assert data["tasks"]["cumulative_estimated_cost_usd"] == 2.0
     assert data["messages"]["counts"] == {"open": 1, "linked": 1}
     assert {m["status"] for m in data["messages"]["items"]} == {"open", "linked"}
+    assert data["attention"]["level"] == "clear"
+    assert data["attention"]["counts"]["needs_operator"] == 0
     linked_preview = next(
         m for m in data["messages"]["items"] if m["status"] == "linked"
     )
@@ -261,6 +269,243 @@ async def test_strategic_state_does_not_return_terminal_task_as_active(
     assert strategic["active_cycle"]["stale"] is True
     assert strategic["active_task"] is None
     assert strategic["active_phase"] is None
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_includes_operator_attention(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    project.directions = [
+        *(project.directions or []),
+        {
+            "id": "d-manual",
+            "text": "Resolve the product direction conflict before spawning more work.",
+            "priority": "critical",
+            "status": "active",
+            "needs_manual_intervention": True,
+        },
+    ]
+    db_session.add(project)
+    now = _utcnow()
+    question = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="agent",
+        content="Should the local Strategic runner stay enabled during the workday?",
+        status="open",
+        created_at=now,
+    )
+    blocker = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BLOCKER,
+        from_type="system",
+        content="Runner registration failed for the local device.",
+        status="open",
+        created_at=now - timedelta(minutes=10),
+    )
+    user_blocker = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BLOCKER,
+        from_type="user",
+        content="User-authored steering should not count as operator attention.",
+        status="open",
+        created_at=now,
+    )
+    approval_task = Task(
+        project_id=project.id,
+        title="Approve compute experiment",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=True,
+        priority=5,
+    )
+    failed_task = Task(
+        project_id=project.id,
+        title="Failed UI polish",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        latest_status_message="Viewport test failed on mobile.",
+    )
+    blocked_task = Task(
+        project_id=project.id,
+        title="Blocked pipeline work",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.BLOCKED,
+        blocked_reason="Waiting for a project setting.",
+    )
+    active_alert = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.ERROR,
+        title="Runner offline",
+        message="The local Strategic runner has not checked in.",
+        domain="runtime",
+        event_type="runner_offline",
+    )
+    dismissed_alert = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.ERROR,
+        title="Dismissed alert",
+        message="This alert should stay out of attention.",
+        dismissed_at=now,
+    )
+    db_session.add(
+        MessagesLastSeen(
+            user_id=TEST_USER_ID,
+            project_id=project.id,
+            last_seen_at=now - timedelta(minutes=5),
+        )
+    )
+    db_session.add_all(
+        [
+            question,
+            blocker,
+            user_blocker,
+            approval_task,
+            failed_task,
+            blocked_task,
+            active_alert,
+            dismissed_alert,
+        ]
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    attention = resp.json()["attention"]
+
+    assert attention["level"] == "needs_operator"
+    assert attention["summary"] == "5 operator items need review"
+    assert attention["counts"]["questions"] == 1
+    assert attention["counts"]["blockers"] == 1
+    assert attention["counts"]["bug_reports"] == 0
+    assert attention["counts"]["feedback"] == 0
+    assert attention["counts"]["unread"] == 1
+    assert attention["counts"]["approvals"] == 1
+    assert attention["counts"]["manual_directions"] == 1
+    assert attention["counts"]["alerts"] == 1
+    assert attention["counts"]["error_alerts"] == 1
+    assert attention["counts"]["failed_tasks"] == 1
+    assert attention["counts"]["blocked_tasks"] == 1
+    assert attention["counts"]["needs_operator"] == 5
+    assert attention["counts"]["watch"] == 2
+    assert len(attention["items"]) <= 8
+
+    item_ids = {item["id"] for item in attention["items"]}
+    assert f"message:{question.id}" in item_ids
+    assert f"message:{blocker.id}" in item_ids
+    assert f"message:{user_blocker.id}" not in item_ids
+    assert f"task:{approval_task.id}:approval_required" in item_ids
+    assert f"alert:{active_alert.id}" in item_ids
+    assert f"alert:{dismissed_alert.id}" not in item_ids
+    assert "direction:d-manual:manual_intervention" in item_ids
+    assert all(len(item.get("detail") or "") <= 180 for item in attention["items"])
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_endpoint_reuses_projection(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Approval Task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=True,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["level"] == "needs_operator"
+    assert data["counts"]["approvals"] == 1
+    assert data["items"][0]["id"] == f"task:{task.id}:approval_required"
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_message_counts_are_not_capped_by_preview_limit(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    for idx in range(30):
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.FEEDBACK,
+                from_type="agent",
+                content=f"Recent feedback {idx}",
+                status="open",
+                created_at=_utcnow() + timedelta(minutes=idx),
+            )
+        )
+    old_question = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="agent",
+        content="Older open question must still count.",
+        status="open",
+        created_at=_utcnow() - timedelta(days=1),
+    )
+    approval_task = Task(
+        project_id=project.id,
+        title="Approval survives feedback flood",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=True,
+    )
+    db_session.add(old_question)
+    db_session.add(approval_task)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["level"] == "needs_operator"
+    assert attention["counts"]["questions"] == 1
+    assert attention["counts"]["feedback"] == 30
+    assert attention["counts"]["approvals"] == 1
+    assert attention["counts"]["needs_operator"] == 2
+    assert attention["counts"]["watch"] == 30
+    item_ids = {item["id"] for item in attention["items"]}
+    assert f"task:{approval_task.id}:approval_required" in item_ids
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_surfaces_bug_and_feedback_as_watch_items(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    bug = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BUG_REPORT,
+        from_type="agent",
+        content="The pipeline chart failed to render.",
+        status="open",
+    )
+    feedback = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.FEEDBACK,
+        from_type="strategic",
+        content="Strategic suggests watching runtime health.",
+        status="open",
+    )
+    db_session.add_all([bug, feedback])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["level"] == "watch"
+    assert attention["counts"]["bug_reports"] == 1
+    assert attention["counts"]["feedback"] == 1
+    item_ids = {item["id"] for item in attention["items"]}
+    assert f"message:{bug.id}" in item_ids
+    assert f"message:{feedback.id}" in item_ids
 
 
 @pytest.mark.asyncio

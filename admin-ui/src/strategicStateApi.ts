@@ -45,6 +45,27 @@ export interface StrategicStateMessage {
   created_at: string | null;
 }
 
+export interface StrategicStateAttentionItem {
+  id: string;
+  kind: 'message' | 'task' | 'direction' | string;
+  severity: 'needs_operator' | 'watch' | string;
+  reason: string;
+  label: string;
+  detail?: string | null;
+  unread?: boolean;
+  status?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  ref: {
+    kind: string;
+    id: string;
+    project_id: string;
+  };
+  task_id?: string | null;
+  domain?: string | null;
+  event_type?: string | null;
+}
+
 export interface StrategicStateResponse {
   project_id: string;
   strategic: {
@@ -105,6 +126,31 @@ export interface StrategicStateResponse {
       total: number;
     };
     cumulative_estimated_cost_usd: number;
+  };
+  attention?: {
+    level: 'clear' | 'watch' | 'needs_operator' | string;
+    summary: string;
+    last_seen_at: string | null;
+    counts: {
+      needs_operator: number;
+      watch: number;
+      visible_needs_operator?: number;
+      visible_watch?: number;
+      unread: number;
+      questions: number;
+      blockers: number;
+      bug_reports?: number;
+      feedback?: number;
+      approvals: number;
+      manual_directions: number;
+      alerts?: number;
+      error_alerts?: number;
+      warning_alerts?: number;
+      failed_tasks: number;
+      blocked_tasks: number;
+      parked_tasks: number;
+    };
+    items: StrategicStateAttentionItem[];
   };
   design: {
     has_design_doc: boolean;

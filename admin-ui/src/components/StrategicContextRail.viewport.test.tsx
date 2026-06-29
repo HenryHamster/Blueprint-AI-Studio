@@ -82,6 +82,38 @@ const STATE: StrategicStateResponse = {
     },
     cumulative_estimated_cost_usd: 8.25,
   },
+  attention: {
+    level: 'needs_operator',
+    summary: '1 operator item needs review',
+    last_seen_at: '2026-06-29T01:00:00Z',
+    counts: {
+      needs_operator: 1,
+      watch: 1,
+      visible_needs_operator: 1,
+      visible_watch: 1,
+      unread: 1,
+      questions: 1,
+      blockers: 0,
+      approvals: 0,
+      manual_directions: 0,
+      failed_tasks: 1,
+      blocked_tasks: 0,
+      parked_tasks: 0,
+    },
+    items: [
+      {
+        id: 'message:msg-1',
+        kind: 'message',
+        severity: 'needs_operator',
+        reason: 'question',
+        label: 'Question waiting',
+        detail: 'Keep local Strategic enabled?',
+        unread: true,
+        created_at: '2026-06-29T01:05:00Z',
+        ref: { kind: 'message', id: 'msg-1', project_id: 'proj-1' },
+      },
+    ],
+  },
   design: { has_design_doc: true, revision: 5 },
 };
 

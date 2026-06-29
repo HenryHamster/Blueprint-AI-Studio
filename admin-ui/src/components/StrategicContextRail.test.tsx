@@ -113,6 +113,38 @@ const STATE: StrategicStateResponse = {
     },
     cumulative_estimated_cost_usd: 3.5,
   },
+  attention: {
+    level: 'needs_operator',
+    summary: '1 operator item needs review',
+    last_seen_at: '2026-06-29T01:00:00Z',
+    counts: {
+      needs_operator: 1,
+      watch: 1,
+      visible_needs_operator: 1,
+      visible_watch: 1,
+      unread: 1,
+      questions: 1,
+      blockers: 0,
+      approvals: 0,
+      manual_directions: 0,
+      failed_tasks: 1,
+      blocked_tasks: 0,
+      parked_tasks: 0,
+    },
+    items: [
+      {
+        id: 'message:msg-1',
+        kind: 'message',
+        severity: 'needs_operator',
+        reason: 'question',
+        label: 'Question waiting',
+        detail: 'Keep local Strategic enabled during the workday?',
+        unread: true,
+        created_at: '2026-06-29T01:05:00Z',
+        ref: { kind: 'message', id: 'msg-1', project_id: 'proj-1' },
+      },
+    ],
+  },
   design: {
     has_design_doc: true,
     revision: 4,
@@ -158,6 +190,9 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).toContain('Unblock the operator workbench');
     expect(host.textContent).toContain('Strategic is consolidating operator chat state');
     expect(host.textContent).toContain('$3.50');
+    expect(host.textContent).toContain('Needs operator');
+    expect(host.textContent).toContain('Question waiting');
+    expect(host.textContent).toContain('new');
     expect(host.textContent).toContain('linked messages');
   });
 
@@ -173,6 +208,73 @@ describe('StrategicContextRail', () => {
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('problem-model');
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('directions');
     expect(props.onOpenPipeline).toHaveBeenCalled();
+    expect(props.onOpenRuntimeHealth).toHaveBeenCalled();
+  });
+
+  test('attention items drill into existing surfaces', () => {
+    const attentionState: StrategicStateResponse = {
+      ...STATE,
+      attention: {
+        ...STATE.attention!,
+        items: [
+          {
+            id: 'task:task-1:failed_task',
+            kind: 'task',
+            severity: 'watch',
+            reason: 'failed_task',
+            label: 'Task failed',
+            detail: 'Viewport test failed.',
+            ref: { kind: 'task', id: 'task-1', project_id: 'proj-1' },
+          },
+          {
+            id: 'direction:d-1:manual_intervention',
+            kind: 'direction',
+            severity: 'needs_operator',
+            reason: 'manual_intervention',
+            label: 'Direction needs intervention',
+            detail: 'Choose the operating mode.',
+            ref: { kind: 'direction', id: 'd-1', project_id: 'proj-1' },
+          },
+        ],
+      },
+    };
+    const { host, props } = mount({ state: attentionState });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Task failed'))
+      ?.click();
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Direction needs intervention'))
+      ?.click();
+
+    expect(props.onOpenPipeline).toHaveBeenCalled();
+    expect(props.onOpenProjectSection).toHaveBeenCalledWith('directions');
+  });
+
+  test('alert attention items drill into runtime health', () => {
+    const attentionState: StrategicStateResponse = {
+      ...STATE,
+      attention: {
+        ...STATE.attention!,
+        items: [
+          {
+            id: 'alert:alert-1',
+            kind: 'alert',
+            severity: 'watch',
+            reason: 'alert',
+            label: 'Runner offline',
+            detail: 'Local runner stopped heartbeating.',
+            ref: { kind: 'alert', id: 'alert-1', project_id: 'proj-1' },
+          },
+        ],
+      },
+    };
+    const { host, props } = mount({ state: attentionState });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Runner offline'))
+      ?.click();
+
     expect(props.onOpenRuntimeHealth).toHaveBeenCalled();
   });
 
@@ -219,5 +321,34 @@ describe('StrategicContextRail', () => {
 
     expect(host.textContent).toContain('Refresh queued');
     expect(host.textContent).not.toContain('Steer queued');
+  });
+
+  test('keeps clear attention state quiet while preserving counts', () => {
+    const clearState: StrategicStateResponse = {
+      ...STATE,
+      attention: {
+        level: 'clear',
+        summary: 'No operator action is currently flagged',
+        last_seen_at: null,
+        counts: {
+          needs_operator: 0,
+          watch: 0,
+          unread: 0,
+          questions: 0,
+          blockers: 0,
+          approvals: 0,
+          manual_directions: 0,
+          failed_tasks: 0,
+          blocked_tasks: 0,
+          parked_tasks: 0,
+        },
+        items: [],
+      },
+    };
+    const { host } = mount({ state: clearState });
+
+    expect(host.textContent).toContain('needs operator');
+    expect(host.textContent).not.toContain('Needs operator');
+    expect(host.textContent).not.toContain('Question waiting');
   });
 });

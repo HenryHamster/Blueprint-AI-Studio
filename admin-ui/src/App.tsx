@@ -467,6 +467,16 @@ export default function App() {
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
   const strategicReadModel = useStrategicReadModel(s.selectedProjectId);
+  const pipelineAttentionCount = useMemo(() => {
+    const counts = strategicReadModel.data?.attention?.counts;
+    if (!counts) return s.needsAttentionCount;
+    return (
+      (counts.approvals ?? 0) +
+      (counts.failed_tasks ?? 0) +
+      (counts.blocked_tasks ?? 0) +
+      (counts.parked_tasks ?? 0)
+    );
+  }, [s.needsAttentionCount, strategicReadModel.data?.attention?.counts]);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [strategicComposerFocusSignal, setStrategicComposerFocusSignal] = useState(0);
 
@@ -548,7 +558,20 @@ export default function App() {
   const visibleBlockedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'BLOCKED' || (t.status === 'QUEUED' && !!t.depends_on && t.depends_on.length > 0)), [filteredTasks]);
   const visibleFailedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'FAILED'), [filteredTasks]);
   const visibleTerminalTasks = useMemo(() => filteredTasks.filter(t => TERMINAL_STATUSES.has(t.status)), [filteredTasks]);
+  const backendPipelineAttentionTaskIds = useMemo(() => (
+    strategicReadModel.data?.attention?.items
+      .filter(item => item.kind === 'task' && item.ref.id)
+      .map(item => item.ref.id) ?? []
+  ), [strategicReadModel.data?.attention?.items]);
   const pipelineAttentionTasks = useMemo(() => {
+    if (backendPipelineAttentionTaskIds.length > 0) {
+      const taskById = new Map(s.tasks.map(task => [task.id, task]));
+      const backendTasks = backendPipelineAttentionTaskIds
+        .map(taskId => taskById.get(taskId))
+        .filter((task): task is Task => Boolean(task))
+        .slice(0, 5);
+      if (backendTasks.length > 0) return backendTasks;
+    }
     const priority = (task: Task) => {
       if (task.status === 'FAILED') return 5;
       if (task.status === 'BLOCKED') return 4;
@@ -560,7 +583,7 @@ export default function App() {
       .filter(t => t.status === 'FAILED' || t.status === 'BLOCKED' || stuckTaskIds.has(t.id) || ACTIVE_PIPELINE_STATUSES.has(t.status))
       .sort((a, b) => priority(b) - priority(a) || parseTimestamp(b.created_at).getTime() - parseTimestamp(a.created_at).getTime())
       .slice(0, 5);
-  }, [filteredTasks, stuckTaskIds]);
+  }, [backendPipelineAttentionTaskIds, filteredTasks, s.tasks, stuckTaskIds]);
   const openPipelineTask = useMemo(() => {
     if (!s.logTask) return null;
     if (s.selectedProjectId && s.logTask.project_id !== s.selectedProjectId) return null;
@@ -1083,7 +1106,7 @@ export default function App() {
         onOpenActivityFeed={() => setShowActivityFeed(true)}
         openMessageCount={openMessageCount}
         newSinceLastVisitCount={newSinceLastVisit}
-        needsAttentionCount={s.needsAttentionCount}
+        needsAttentionCount={pipelineAttentionCount}
         onOpenNewTaskModal={s.openNewTaskModal}
         onNewProject={() => setShowNewProjectModal(true)}
         onManageProjects={() => setShowProjectManagement(true)}

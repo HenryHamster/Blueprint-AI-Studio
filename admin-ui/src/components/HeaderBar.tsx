@@ -456,6 +456,8 @@ export function HeaderBar(props: HeaderBarProps) {
             const chatBadgeCount = tab === 'chat'
               ? Math.max(openMessageCount ?? 0, newSinceLastVisitCount ?? 0)
               : 0;
+            const pipelineBadgeCount = tab === 'pipeline' ? props.needsAttentionCount ?? 0 : 0;
+            const badgeCount = Math.max(chatBadgeCount, pipelineBadgeCount);
             const label = tab === 'chat' ? 'Strategic' : tab.charAt(0).toUpperCase() + tab.slice(1);
             return (
               <button
@@ -468,9 +470,9 @@ export function HeaderBar(props: HeaderBarProps) {
                 }`}
               >
                 {label}
-                {chatBadgeCount > 0 && (
+                {badgeCount > 0 && (
                   <span className="ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-ui-sm font-bold leading-none text-black">
-                    {chatBadgeCount > 99 ? '99+' : chatBadgeCount}
+                    {badgeCount > 99 ? '99+' : badgeCount}
                   </span>
                 )}
               </button>

@@ -1,7 +1,7 @@
 import type { ReactNode } from 'react';
-import { ArrowUpRight, FileText, GitBranch, Radio } from 'lucide-react';
+import { ArrowUpRight, CircleAlert, FileText, GitBranch, Radio } from 'lucide-react';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
-import type { StrategicStateResponse } from '../strategicStateApi';
+import type { StrategicStateAttentionItem, StrategicStateResponse } from '../strategicStateApi';
 import { WorkbenchPanel } from './WorkbenchLayout';
 
 type ProjectTarget = 'running-update' | 'directions' | 'problem-model' | 'design-doc';
@@ -57,6 +57,48 @@ function StatRow({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
+function AttentionItem({
+  item,
+  onClick,
+}: {
+  item: StrategicStateAttentionItem;
+  onClick?: () => void;
+}) {
+  const content = (
+    <>
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        <span className="truncate text-xs font-medium text-neutral-200">{item.label}</span>
+        {item.unread && (
+          <span className="shrink-0 text-ui-sm font-semibold uppercase text-amber-300">new</span>
+        )}
+      </div>
+      {item.detail && (
+        <p className="mt-0.5 line-clamp-2 text-xs leading-relaxed text-neutral-500">
+          {item.detail}
+        </p>
+      )}
+    </>
+  );
+
+  if (!onClick) {
+    return (
+      <div className="min-w-0 border-t border-neutral-800/70 pt-1.5 first:border-t-0 first:pt-0">
+        {content}
+      </div>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex min-h-11 w-full min-w-0 flex-col justify-center border-t border-neutral-800/70 py-1.5 text-left transition-colors first:border-t-0 hover:text-neutral-100"
+    >
+      {content}
+    </button>
+  );
+}
+
 export function StrategicContextRail({
   state,
   loading = false,
@@ -72,6 +114,10 @@ export function StrategicContextRail({
   const pendingSteer = state?.strategic.refresh.pending ?? null;
   const latestCycle = state?.strategic.latest_cycle ?? null;
   const taskCounts = state?.tasks.counts;
+  const attention = state?.attention ?? null;
+  const attentionItems = attention?.items.slice(0, 2) ?? [];
+  const attentionNeeds = attention?.counts.needs_operator ?? 0;
+  const attentionWatch = attention?.counts.watch ?? 0;
   const staleCycle = Boolean(activeCycle?.stale);
   const operatorSteerQueued = Boolean(
     pendingSteer && (pendingSteer.origin === 'operator' || (pendingSteer.operator_count ?? 0) > 0),
@@ -95,6 +141,14 @@ export function StrategicContextRail({
       ? pendingSteer.excerpt
       : latestCycle?.summary_text ?? lastCycleCompletion?.status_message ?? 'No active Strategic cycle';
 
+  function attentionItemAction(item: StrategicStateAttentionItem): (() => void) | undefined {
+    if (item.kind === 'task') return onOpenPipeline;
+    if (item.kind === 'direction') return () => onOpenProjectSection('directions');
+    if (item.kind === 'alert' && item.task_id) return onOpenPipeline;
+    if (item.kind === 'alert') return onOpenRuntimeHealth;
+    return undefined;
+  }
+
   return (
     <div className="space-y-3" data-testid="strategic-context-rail">
       <WorkbenchPanel title="Strategic" meta={loading ? 'loading' : error ? 'stale' : 'live'}>
@@ -116,6 +170,33 @@ export function StrategicContextRail({
                 value={`${latestCycle.directions_created} opened / ${latestCycle.tasks_spawned} tasks`}
               />
             ) : null}
+          </div>
+        )}
+        {attention && attention.level !== 'clear' && (
+          <div className="mt-3 border-t border-neutral-800 pt-3">
+            <div className="flex min-w-0 gap-2">
+              <CircleAlert
+                className={`mt-0.5 h-4 w-4 shrink-0 ${
+                  attention.level === 'needs_operator' ? 'text-amber-300' : 'text-neutral-500'
+                }`}
+                aria-hidden="true"
+              />
+              <div className="min-w-0">
+                <div className="text-xs font-semibold text-neutral-100">
+                  {attention.level === 'needs_operator' ? 'Needs operator' : 'Watch'}
+                </div>
+                <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-neutral-400">
+                  {attention.summary}
+                </p>
+              </div>
+            </div>
+            {attentionItems.length > 0 && (
+              <div className="mt-2 space-y-1.5">
+                {attentionItems.map(item => (
+                  <AttentionItem key={item.id} item={item} onClick={attentionItemAction(item)} />
+                ))}
+              </div>
+            )}
           </div>
         )}
       </WorkbenchPanel>
@@ -170,6 +251,8 @@ export function StrategicContextRail({
             <StatRow label="running" value={taskCounts?.running ?? 0} />
             <StatRow label="queued" value={taskCounts?.queued ?? 0} />
             <StatRow label="blocked" value={taskCounts?.blocked ?? 0} />
+            <StatRow label="needs operator" value={attentionNeeds} />
+            <StatRow label="watch" value={attentionWatch} />
             <StatRow label="linked messages" value={state?.messages.counts.linked ?? 0} />
           </div>
           <div className="flex flex-wrap gap-2">

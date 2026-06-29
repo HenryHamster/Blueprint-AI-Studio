@@ -86,6 +86,7 @@ from app.routers.admin_agent_ops import router as admin_agent_ops_router
 from app.routers.admin_agent_ops import _bump_size_limit  # noqa: F401  re-exported for test patches (test_agent_annotate.py)
 from app.routers.admin_acceptance_criteria import router as admin_acceptance_criteria_router
 from app.routers.admin_state import router as admin_state_router
+from app.routers.admin_operator_attention import router as admin_operator_attention_router
 from app.shared_state import limiter
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
@@ -805,6 +806,7 @@ app.include_router(admin_activity_router)
 app.include_router(admin_health_router)
 app.include_router(admin_state_router)
 app.include_router(admin_acceptance_criteria_router)
+app.include_router(admin_operator_attention_router)
 app.include_router(admin_evergreen_router)
 app.include_router(admin_orchestrator_errors_router)
 app.include_router(admin_scope_measurement_router)
