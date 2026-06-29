@@ -313,7 +313,7 @@ def compute_composite(
     ci_required: bool = True,
     migration_collision: bool = False,
     migration_apply_blocked: bool = False,
-    merge_grade_blocked: bool = False,
+    criterion_coverage: dict[str, Any] | None = None,
     merge_grade_misses: bool = False,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
@@ -355,6 +355,10 @@ def compute_composite(
         caller precomputes this via
         ``migration_apply_gate.run_migration_apply_gate`` — this function stays
         pure and only consumes the boolean.
+      * ``criterion_coverage`` reports at least one uncovered version-scoped
+        acceptance criterion (``"criterion_coverage_incomplete"``).  Versions
+        with no criteria, or callers that pass ``None`` for backward
+        compatibility, skip this gate.
       * ``smoketest_score`` is None — the smoketest never produced a usable
         score, treated as a startup-suite failure
         (``"smoketest_startup_failed"``).  ONLY checked when
@@ -454,13 +458,15 @@ def compute_composite(
     elif merge_grade_misses:
         # The armable-dark blind-grade gate: coverage_verdict == "misses" AND the
         # operator has raised merge_grade_block_threshold above 0.0.  Distinct from
-        # the child-task gate (covers_goal == False) so operators see the right label.
+        # the canonical criterion-coverage gate so operators see the right label.
         blocker = "merge_grade_misses"
-    elif merge_grade_blocked:
-        # The child-task merge-grade gate: the uninvested agent graded the merged
-        # DIFFS against the frozen version.goal and found they do NOT advance the
-        # goal (covers_goal == False).
-        blocker = "merge_grade_goal_coverage"
+    elif (
+        criterion_coverage is not None
+        and int(criterion_coverage.get("total") or 0) > 0
+        and int(criterion_coverage.get("covered") or 0)
+        < int(criterion_coverage.get("total") or 0)
+    ):
+        blocker = "criterion_coverage_incomplete"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
         # enabled — a disabled subsystem legitimately produces no score.

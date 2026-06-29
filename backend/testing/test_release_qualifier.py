@@ -55,8 +55,10 @@ from app.models import (
     Project,
     ProjectMessage,
     QualificationVerdict,
+    CriterionEvidence,
     Task,
     TaskStatus,
+    VersionAcceptanceCriterion,
 )
 
 # Fixed test policy for the compute_composite scoring-math tests.  Weights
@@ -7125,6 +7127,201 @@ async def _seed_qualification_children(
     return audit_task, smoke_task
 
 
+async def _add_version_criterion(
+    db_session,
+    project,
+    version,
+    *,
+    key: str,
+    text: str,
+    source_kind: str | None = None,
+):
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=key,
+        text=text,
+        created_by="test",
+    )
+    db_session.add(criterion)
+    await db_session.flush()
+    if source_kind is not None:
+        db_session.add(
+            CriterionEvidence(
+                project_id=project.id,
+                criterion_id=criterion.id,
+                source_kind=source_kind,
+                source_id=f"merge-test-{key}",
+                detail={"verdict": "merge-test"},
+            )
+        )
+    await db_session.commit()
+    await db_session.refresh(criterion)
+    return criterion
+
+
+@pytest.mark.asyncio
+async def test_criterion_coverage_incomplete_blocks_qualification(
+    db_session, mocker
+):
+    """Uncovered canonical criteria hard-block qualification via coverage summary."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-covered1",
+        text="Merge-test evidence exists",
+        source_kind="task_merge",
+    )
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-missing1",
+        text="Reachability evidence missing",
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "criterion_coverage_incomplete"
+    assert result["confidence"] == 0.0
+    promote_spy.assert_not_called()
+
+    await db_session.refresh(version)
+    assert version.last_qualification["blocker"] == "criterion_coverage_incomplete"
+    assert version.last_qualification["criterion_coverage"]["total"] == 2
+    assert version.last_qualification["criterion_coverage"]["covered"] == 1
+    assert version.last_qualification["criterion_coverage"]["uncovered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_criterion_coverage_all_covered_passes_qualification(
+    db_session, mocker
+):
+    """All criteria covered by task-merge evidence lets the normal decision pass."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-covered1",
+        text="First merge-test criterion",
+        source_kind="task_merge",
+    )
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-covered2",
+        text="Second merge-test criterion",
+        source_kind="task_merge",
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    await db_session.refresh(version)
+    assert version.last_qualification["blocker"] is None
+    assert version.last_qualification["criterion_coverage"]["total"] == 2
+    assert version.last_qualification["criterion_coverage"]["covered"] == 2
+    assert version.last_qualification["criterion_coverage"]["uncovered"] == 0
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_no_criteria_no_criterion_blocker(db_session, mocker):
+    """Versions with no criteria skip the criterion coverage gate."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    await db_session.refresh(version)
+    assert version.last_qualification["blocker"] is None
+    assert version.last_qualification["criterion_coverage"] == {
+        "total": 0,
+        "covered": 0,
+        "partial": 0,
+        "uncovered": 0,
+        "criteria": [],
+    }
+    promote_spy.assert_not_called()
+
+
 async def _seed_completed_challenge_without_artifact(db_session, project, version):
     challenge_task = Task(
         project_id=project.id,
@@ -8782,14 +8979,13 @@ async def test_finalize_blocks_on_migration_apply_drift(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mocker):
-    """The blind merge-grade gate (dir d-c0fe439f) blocks stabilize->qualify
-    promotion unless the merged diffs cover the version goal.
+    """The blind merge-grade artifact is validated but no longer gates coverage.
 
-    Three scenarios prove the gate is load-bearing AND unskippable — an
+    Three scenarios prove the artifact is still unskippable, while canonical
+    criterion coverage now owns the hard goal-coverage decision:
     otherwise-clean candidate (audit 1.0 / smoke green / no migration drift)
-    that would promote is decided ONLY by the merge-grade verdict:
-      (a) a FAILING merge-grade -> not_promoted, blocker merge_grade_goal_coverage,
-          version stays stabilize/open (the hard block).
+    that would promote is not decided by the merge-grade covers_goal verdict:
+      (a) a FAILING merge-grade -> promote proceeds when criteria are absent.
       (b) the required merge-grade artifact MISSING -> held (infra_failure),
           NOT promoted (the gate cannot be skipped).
       (c) a PASSING merge-grade with everything else green -> promote proceeds.
@@ -8813,7 +9009,7 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
     }
     goal = "Deliver the blind merge-grade qualification gate on stabilize->qualify"
 
-    # --- (a) FAILING merge-grade -> hard block, cannot promote --------------
+    # --- (a) FAILING merge-grade -> diagnostic only; promote proceeds --------
     project_a, version_a = await _make_project_and_version(db_session)
     await _seed_qualification_children(
         db_session,
@@ -8830,25 +9026,15 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
             "candidate_sha": "feed" * 10,
         },
     )
-    promote_a = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    promote_a = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
     result_a = await rq._finalize_qualification(db_session, version_a)
     await db_session.commit()
 
-    assert result_a["status"] == "not_promoted"
-    assert result_a["blocker"] == "merge_grade_goal_coverage"
-    assert result_a["confidence"] == 0.0
-    promote_a.assert_not_called()
-
-    await db_session.refresh(version_a)
-    lq_a = version_a.last_qualification
-    assert lq_a["status"] == "not_promoted"
-    assert lq_a["blocker"] == "merge_grade_goal_coverage"
-    assert lq_a["confidence"] == 0.0
-    assert lq_a["merge_grade_status"] == "fail"
-    assert "never wired" in lq_a["merge_grade_biggest_gap"]
-    # The gate did NOT finalize to promotion: version stays in stabilize, open.
-    assert version_a.phase == "stabilize"
-    assert version_a.status == "open"
+    promote_a.assert_called_once()
+    assert result_a == {"status": "promoted"}
     # The durable verdict row carries the merge-grade columns + blocker.
     vrow_a = (
         (
@@ -8863,7 +9049,7 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
     )
     assert vrow_a is not None
     assert vrow_a.merge_grade_status == "fail"
-    assert vrow_a.blocker == "merge_grade_goal_coverage"
+    assert vrow_a.blocker is None
     assert "never wired" in (vrow_a.merge_grade_biggest_gap or "")
 
     # --- (b) MISSING merge-grade artifact -> infra hold, cannot be skipped --
@@ -8990,7 +9176,7 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
         f"Expected promotion for superseded version but got: {result_a}"
     )
 
-    # --- (b) prior_superseded absent -> gate still fires for a fresh version ---
+    # --- (b) prior_superseded absent -> still diagnostic only; promote proceeds ---
     project_b, version_b = await _make_project_and_version(db_session)
     await _seed_qualification_children(
         db_session,
@@ -9003,316 +9189,15 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
         merge_grade_logs=failing_merge_grade,
     )
     # Do NOT set prior_superseded — version_b is a never-promoted fresh version.
-    promote_b = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    promote_b = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
     result_b = await rq._finalize_qualification(db_session, version_b)
     await db_session.commit()
 
-    assert result_b["status"] == "not_promoted"
-    assert result_b["blocker"] == "merge_grade_goal_coverage"
-    promote_b.assert_not_called()
-    await db_session.refresh(version_b)
-    assert version_b.last_qualification["status"] == "not_promoted"
-    assert version_b.last_qualification["blocker"] == "merge_grade_goal_coverage"
-
-
-@pytest.mark.asyncio
-async def test_finalize_merge_grade_suppressed_via_direct_on_main_check(
-    db_session, mocker
-):
-    """Direct GitHub ancestry fallback: when prior_superseded is NOT set (e.g.
-    GitHub-cred outage let the 6h timeout beat the supersession reconciler),
-    the merge-grade block is still suppressed when _candidate_already_on_main
-    returns True.
-
-    Scenarios:
-      (a) _candidate_already_on_main=True + prior_superseded absent -> suppressed,
-          promote proceeds
-      (b) _candidate_already_on_main=False + prior_superseded absent -> gate fires,
-          merge_grade_goal_coverage blocker set
-    """
-    from app import shared_state
-
-    shared_state.runtime_config["promotion_enabled"] = True
-
-    clean_audit = {
-        "audit_score": 1.0,
-        "test_erosion": {
-            "deleted_test_files": [],
-            "assertion_delta": 5,
-            "test_count_delta": 2,
-        },
-    }
-    clean_smoke = {
-        "passed": True,
-        "tests": [{"name": "a", "status": "pass"}],
-        "suites": {"startup": {"passed": True}},
-    }
-    failing_merge_grade = {
-        "covers_goal": False,
-        "coverage_score": 0.05,
-        "biggest_gap": "Stabilization-only tail commits; feature content already on main.",
-        "candidate_sha": "feed" * 10,
-    }
-    goal = "Deliver the direct on-main ancestry exemption"
-
-    # --- (a) _candidate_already_on_main=True -> block suppressed, promote ---
-    project_a, version_a = await _make_project_and_version(db_session)
-    await _seed_qualification_children(
-        db_session,
-        project_a,
-        version_a,
-        audit_logs=clean_audit,
-        smoke_logs=clean_smoke,
-        version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs=failing_merge_grade,
-    )
-    # Stamp blocker='qualification_timeout' WITHOUT prior_superseded (simulates
-    # cred-outage timeout race winning over the supersession reconciler).
-    version_a.last_qualification = {
-        **version_a.last_qualification,
-        "blocker": "qualification_timeout",
-        # prior_superseded intentionally absent
-    }
-    db_session.add(version_a)
-    await db_session.commit()
-    await db_session.refresh(version_a)
-
-    mocker.patch(
-        "app.release_qualifier._resolve_github_with_session",
-        new=AsyncMock(return_value=("tok", "owner", "repo")),
-    )
-    mocker.patch(
-        "app.release_qualifier._candidate_already_on_main",
-        new=AsyncMock(return_value=True),
-    )
-    promote_a = mocker.patch(
-        "app.release_qualifier.promote",
-        new=AsyncMock(return_value={"status": "promoted"}),
-    )
-    result_a = await rq._finalize_qualification(db_session, version_a)
-    await db_session.commit()
-
-    promote_a.assert_called_once()
-    assert result_a == {"status": "promoted"}, (
-        f"Expected promotion via direct on-main check but got: {result_a}"
-    )
-
-    # --- (b) _candidate_already_on_main=False -> gate still fires ---
-    project_b, version_b = await _make_project_and_version(db_session)
-    await _seed_qualification_children(
-        db_session,
-        project_b,
-        version_b,
-        audit_logs=clean_audit,
-        smoke_logs=clean_smoke,
-        version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs=failing_merge_grade,
-    )
-    mocker.patch(
-        "app.release_qualifier._resolve_github_with_session",
-        new=AsyncMock(return_value=("tok", "owner", "repo")),
-    )
-    mocker.patch(
-        "app.release_qualifier._candidate_already_on_main",
-        new=AsyncMock(return_value=False),
-    )
-    promote_b = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
-    result_b = await rq._finalize_qualification(db_session, version_b)
-    await db_session.commit()
-
-    assert result_b["status"] == "not_promoted"
-    assert result_b["blocker"] == "merge_grade_goal_coverage"
-    promote_b.assert_not_called()
-    await db_session.refresh(version_b)
-    assert version_b.last_qualification["blocker"] == "merge_grade_goal_coverage"
-
-
-@pytest.mark.asyncio
-async def test_finalize_already_on_main_resolved_pre_lock(db_session, mocker):
-    """_candidate_already_on_main is resolved BEFORE the FOR UPDATE lock.
-
-    Verifies the pre-gates refactor: the direct already-on-main ancestry check
-    (merge-grade exemption fallback) is hoisted out of _finalize_qualification
-    (which runs under the lock) into the pre-lock block in _finalize_locked_version.
-
-    Scenarios tested:
-      (a) pre_merge_grade_already_on_main=True in _pre_gates → block suppressed,
-          no second call to _candidate_already_on_main under the lock.
-      (b) pre_merge_grade_already_on_main=False in _pre_gates → gate still fires,
-          merge_grade_goal_coverage blocker set.
-      (c) Direct call with _pre_gates=None → inline fallback path still works
-          (fail-closed preserved for direct/timeout callers).
-    """
-    from app import shared_state
-
-    shared_state.runtime_config["promotion_enabled"] = True
-
-    clean_audit = {
-        "audit_score": 1.0,
-        "test_erosion": {
-            "deleted_test_files": [],
-            "assertion_delta": 5,
-            "test_count_delta": 2,
-        },
-    }
-    clean_smoke = {
-        "passed": True,
-        "tests": [{"name": "a", "status": "pass"}],
-        "suites": {"startup": {"passed": True}},
-    }
-    failing_merge_grade = {
-        "covers_goal": False,
-        "coverage_score": 0.05,
-        "biggest_gap": "Feature content already on main.",
-        "candidate_sha": "feed" * 10,
-    }
-    goal = "Deliver the pre-lock ancestry refactor"
-
-    # ── (a) Pre-gates path: _candidate_already_on_main called before lock, ──
-    #        block suppressed, NOT re-called inside _finalize_qualification.
-    project_a, version_a = await _make_project_and_version(db_session)
-    await _seed_qualification_children(
-        db_session,
-        project_a,
-        version_a,
-        audit_logs=clean_audit,
-        smoke_logs=clean_smoke,
-        version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs=failing_merge_grade,
-    )
-    await db_session.commit()
-    await db_session.refresh(version_a)
-
-    call_log: list[str] = []
-    fq_entered = [False]
-    orig_fq = rq._finalize_qualification
-
-    async def tracking_fq_a(session, version, *, _pre_gates=None):
-        fq_entered[0] = True
-        call_log.append("finalize_qualification")
-        return await orig_fq(session, version, _pre_gates=_pre_gates)
-
-    mocker.patch(
-        "app.release_qualifier._resolve_github_with_session",
-        new=AsyncMock(return_value=("tok", "owner", "repo")),
-    )
-
-    ancestry_call_count = [0]
-
-    async def tracked_already_on_main(*args, **kwargs):
-        if fq_entered[0]:
-            raise AssertionError(
-                "_candidate_already_on_main called inside _finalize_qualification "
-                "(under the lock) — must be called pre-lock only"
-            )
-        ancestry_call_count[0] += 1
-        call_log.append("already_on_main")
-        return True
-
-    mocker.patch(
-        "app.release_qualifier._candidate_already_on_main",
-        side_effect=tracked_already_on_main,
-    )
-    mocker.patch(
-        "app.release_qualifier._finalize_qualification",
-        side_effect=tracking_fq_a,
-    )
-    promote_a = mocker.patch(
-        "app.release_qualifier.promote",
-        new=AsyncMock(return_value={"status": "promoted"}),
-    )
-
-    factory = _shared_session_factory(db_session)
-    result_a = await rq._finalize_in_dedicated_session(
-        version_a.id, timeout_now=None, session_factory=factory
-    )
-    await db_session.commit()
-
-    assert "already_on_main" in call_log, (
-        "_candidate_already_on_main was not called pre-lock"
-    )
-    assert "finalize_qualification" in call_log, (
-        "_finalize_qualification was not called"
-    )
-    assert call_log.index("already_on_main") < call_log.index("finalize_qualification"), (
-        f"_candidate_already_on_main called AFTER _finalize_qualification: {call_log}"
-    )
-    promote_a.assert_called_once()
-    assert result_a == {"status": "promoted"}, (
-        f"Expected promotion via pre-lock ancestry check but got: {result_a}"
-    )
-
-    # ── (b) Pre-gates path: _candidate_already_on_main=False → gate fires ──
-    project_b, version_b = await _make_project_and_version(db_session)
-    await _seed_qualification_children(
-        db_session,
-        project_b,
-        version_b,
-        audit_logs=clean_audit,
-        smoke_logs=clean_smoke,
-        version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs=failing_merge_grade,
-    )
-    await db_session.commit()
-    await db_session.refresh(version_b)
-
-    fq_entered[0] = False
-
-    mocker.patch(
-        "app.release_qualifier._candidate_already_on_main",
-        new=AsyncMock(return_value=False),
-    )
-    mocker.patch(
-        "app.release_qualifier._finalize_qualification",
-        side_effect=tracking_fq_a,
-    )
-    promote_b = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
-
-    result_b = await rq._finalize_in_dedicated_session(
-        version_b.id, timeout_now=None, session_factory=factory
-    )
-    await db_session.commit()
-
-    assert result_b is not None and result_b.get("blocker") == "merge_grade_goal_coverage", (
-        f"Expected merge_grade_goal_coverage blocker when already_on_main=False, got: {result_b}"
-    )
-    promote_b.assert_not_called()
-
-    # ── (c) Direct call with _pre_gates=None → inline fallback path still works ──
-    project_c, version_c = await _make_project_and_version(db_session)
-    await _seed_qualification_children(
-        db_session,
-        project_c,
-        version_c,
-        audit_logs=clean_audit,
-        smoke_logs=clean_smoke,
-        version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs=failing_merge_grade,
-    )
-    await db_session.commit()
-    await db_session.refresh(version_c)
-
-    mocker.patch(
-        "app.release_qualifier._candidate_already_on_main",
-        new=AsyncMock(return_value=True),
-    )
-    promote_c = mocker.patch(
-        "app.release_qualifier.promote",
-        new=AsyncMock(return_value={"status": "promoted"}),
-    )
-
-    result_c = await rq._finalize_qualification(db_session, version_c, _pre_gates=None)
-    await db_session.commit()
-
-    promote_c.assert_called_once()
-    assert result_c == {"status": "promoted"}, (
-        f"Direct call with _pre_gates=None: expected promotion via inline fallback, got: {result_c}"
-    )
+    promote_b.assert_called_once()
+    assert result_b == {"status": "promoted"}
 
 
 @pytest.mark.asyncio
@@ -20822,14 +20707,29 @@ async def _seed_clean_streak(db_session, project, version, *, n: int = 6):
         )
 
 
+_RETIRED_READINESS_ACCEPTANCE_KEYS = {
+    "acceptance_proven",
+    "acceptance_satisfied_unproven",
+    "acceptance_declared_unsatisfied",
+    "acceptance_undeclared",
+    "acceptance_merged_unverified_degraded",
+    "acceptance_malformed",
+    "acceptance_unproven_present",
+    "acceptance_caveat",
+    "acceptance_aggregate",
+}
+
+
+def _assert_retired_acceptance_keys_absent(out: dict):
+    for key in _RETIRED_READINESS_ACCEPTANCE_KEYS:
+        assert key not in out
+
+
 @pytest.mark.asyncio
-async def test_readiness_declared_unsatisfied_raises_caveat_without_flipping_ready(
+async def test_readiness_declared_unsatisfied_omits_retired_acceptance_keys(
     db_session,
 ):
-    """A version window containing a merged task whose DECLARED acceptance
-    evidence did not pass surfaces an advisory caveat and the
-    ``acceptance_unproven_present`` flag — but readiness stays driven by the
-    existing thresholds (not hard-flipped)."""
+    """Readiness no longer emits advisory acceptance aggregate/caveat keys."""
     project, version = await _make_project_and_version(db_session)
     await _ensure_verdict_table(db_session)
     await _seed_clean_streak(db_session, project, version)
@@ -20837,23 +20737,14 @@ async def test_readiness_declared_unsatisfied_raises_caveat_without_flipping_rea
 
     out = await rq.compute_promotion_readiness(db_session, project.id)
 
-    # The existing self-approval thresholds still drive readiness.
     assert out["ready"] is True, out["reason"]
-    # Additive signal reflects the unproven work.
-    assert out["acceptance_declared_unsatisfied"] == 1
-    assert out["acceptance_satisfied_unproven"] == 0
-    assert out["acceptance_unproven_present"] is True
-    assert "acceptance_caveat" in out
-    assert "not fully proven" in out["acceptance_caveat"]
-    # The caveat is appended to the operator-facing reason.
-    assert "not fully proven" in out["reason"]
+    _assert_retired_acceptance_keys_absent(out)
+    assert "not fully proven" not in out["reason"]
 
 
 @pytest.mark.asyncio
 async def test_readiness_undeclared_only_is_unaffected(db_session):
-    """A version window with only undeclared (no-verdict) merged tasks must NOT
-    raise a caveat or set ``acceptance_unproven_present`` — undeclared/legacy
-    work never counts against readiness."""
+    """Undeclared merged work no longer adds retired acceptance keys."""
     project, version = await _make_project_and_version(db_session)
     await _ensure_verdict_table(db_session)
     await _seed_clean_streak(db_session, project, version)
@@ -20863,18 +20754,13 @@ async def test_readiness_undeclared_only_is_unaffected(db_session):
     out = await rq.compute_promotion_readiness(db_session, project.id)
 
     assert out["ready"] is True, out["reason"]
-    assert out["acceptance_undeclared"] == 2
-    assert out["acceptance_declared_unsatisfied"] == 0
-    assert out["acceptance_satisfied_unproven"] == 0
-    assert out["acceptance_unproven_present"] is False
-    assert "acceptance_caveat" not in out
+    _assert_retired_acceptance_keys_absent(out)
     assert "not fully proven" not in out["reason"]
 
 
 @pytest.mark.asyncio
 async def test_readiness_proven_only_has_no_caveat(db_session):
-    """A version window with only satisfied (proven) merged tasks raises no
-    caveat — proven work is exactly what the qualifier wants."""
+    """Proven-only merged work no longer adds retired acceptance keys."""
     project, version = await _make_project_and_version(db_session)
     await _ensure_verdict_table(db_session)
     await _seed_clean_streak(db_session, project, version)
@@ -20882,19 +20768,15 @@ async def test_readiness_proven_only_has_no_caveat(db_session):
 
     out = await rq.compute_promotion_readiness(db_session, project.id)
 
-    assert out["acceptance_proven"] == 1
-    assert out["acceptance_satisfied_unproven"] == 0
-    assert out["acceptance_declared_unsatisfied"] == 0
-    assert out["acceptance_unproven_present"] is False
-    assert "acceptance_caveat" not in out
+    _assert_retired_acceptance_keys_absent(out)
     assert "not fully proven" not in out["reason"]
 
 
 @pytest.mark.asyncio
-async def test_readiness_satisfied_unproven_raises_caveat_without_flipping_ready(
+async def test_readiness_satisfied_unproven_omits_retired_acceptance_keys(
     db_session,
 ):
-    """Soft satisfied evidence is advisory unproven work, not strict proof."""
+    """Soft satisfied evidence no longer emits acceptance caveats."""
     project, version = await _make_project_and_version(db_session)
     await _ensure_verdict_table(db_session)
     await _seed_clean_streak(db_session, project, version)
@@ -20909,39 +20791,27 @@ async def test_readiness_satisfied_unproven_raises_caveat_without_flipping_ready
     out = await rq.compute_promotion_readiness(db_session, project.id)
 
     assert out["ready"] is True, out["reason"]
-    assert out["acceptance_proven"] == 0
-    assert out["acceptance_satisfied_unproven"] == 1
-    assert out["acceptance_declared_unsatisfied"] == 0
-    assert out["acceptance_unproven_present"] is True
-    assert "satisfied-but-not-machine-proven" in out["acceptance_caveat"]
-    assert "satisfied-but-not-machine-proven" in out["reason"]
+    _assert_retired_acceptance_keys_absent(out)
+    assert "satisfied-but-not-machine-proven" not in out["reason"]
 
 
 @pytest.mark.asyncio
-async def test_readiness_empty_history_carries_acceptance_keys(db_session):
-    """The no-verdict (empty-history) readiness path still carries the additive
-    acceptance keys so the dict shape is stable for every consumer."""
+async def test_readiness_empty_history_omits_retired_acceptance_keys(db_session):
+    """The no-verdict path omits retired acceptance aggregate/caveat keys."""
     project, _version = await _make_project_and_version(db_session)
     await _ensure_verdict_table(db_session)
 
     out = await rq.compute_promotion_readiness(db_session, project.id)
 
     assert out["verdicts_evaluated"] == 0
-    assert out["acceptance_proven"] == 0
-    assert out["acceptance_satisfied_unproven"] == 0
-    assert out["acceptance_declared_unsatisfied"] == 0
-    assert out["acceptance_undeclared"] == 0
-    assert out["acceptance_merged_unverified_degraded"] == 0
-    assert out["acceptance_malformed"] == 0
-    assert out["acceptance_unproven_present"] is False
+    _assert_retired_acceptance_keys_absent(out)
 
 
 @pytest.mark.asyncio
-async def test_readiness_acceptance_aggregate_failure_degrades_safely(
+async def test_readiness_does_not_query_acceptance_aggregate(
     db_session, mocker
 ):
-    """If the acceptance aggregate query raises, readiness degrades to zero
-    acceptance counts and is otherwise unaffected (fail-safe, never blocks)."""
+    """Readiness no longer depends on the retired acceptance aggregate query."""
     project, version = await _make_project_and_version(db_session)
     await _ensure_verdict_table(db_session)
     await _seed_clean_streak(db_session, project, version)
@@ -20955,10 +20825,7 @@ async def test_readiness_acceptance_aggregate_failure_degrades_safely(
     out = await rq.compute_promotion_readiness(db_session, project.id)
 
     assert out["ready"] is True, out["reason"]
-    assert out["acceptance_declared_unsatisfied"] == 0
-    assert out["acceptance_satisfied_unproven"] == 0
-    assert out["acceptance_unproven_present"] is False
-    assert "acceptance_caveat" not in out
+    _assert_retired_acceptance_keys_absent(out)
 
 
 async def _seed_promoted_verdict(
@@ -21518,13 +21385,11 @@ async def test_check_promotion_readiness_messaging_failure_is_nonfatal(
 
 
 @pytest.mark.asyncio
-async def test_finalize_records_version_acceptance_aggregate_for_mixed_window(
+async def test_finalize_omits_version_acceptance_aggregate(
     db_session, mocker
 ):
-    """A mixed merged window persists the version-window acceptance aggregate
-    on both last_qualification and the immutable verdict row."""
+    """Finalize no longer writes retired acceptance_aggregate payloads."""
     from app import shared_state
-    from app.models import QualificationVerdict
 
     shared_state.runtime_config["promotion_enabled"] = False
 
@@ -21547,85 +21412,15 @@ async def test_finalize_records_version_acceptance_aggregate_for_mixed_window(
             "suites": {"startup": {"passed": True}},
         },
     )
-
-    db_session.add_all(
-        [
-            Task(
-                project_id=project.id,
-                title="proven-merge",
-                payloads=[{"type": "create", "prompt": "x"}],
-                status=TaskStatus.COMPLETED,
-                context={
-                    "pr_merged": True,
-                    "code_acceptance_verdict": {
-                        "satisfied": True,
-                        "proven": True,
-                    },
-                },
-            ),
-            Task(
-                project_id=project.id,
-                title="soft-satisfied-merge",
-                payloads=[{"type": "create", "prompt": "x"}],
-                status=TaskStatus.COMPLETED,
-                context={
-                    "pr_merged": True,
-                    "code_acceptance_verdict": {
-                        "satisfied": True,
-                        "proven": False,
-                        "kind": "observable_behavior",
-                    },
-                },
-            ),
-            Task(
-                project_id=project.id,
-                title="declared-unsatisfied",
-                payloads=[{"type": "create", "prompt": "x"}],
-                status=TaskStatus.COMPLETED,
-                context={
-                    "pr_merged": True,
-                    "code_acceptance_verdict": {"satisfied": False},
-                },
-            ),
-            Task(
-                project_id=project.id,
-                title="degraded-merge",
-                payloads=[{"type": "create", "prompt": "x"}],
-                status=TaskStatus.COMPLETED,
-                context={
-                    "pr_merged": True,
-                    "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
-                },
-            ),
-            Task(
-                project_id=project.id,
-                title="undeclared-merge",
-                payloads=[{"type": "create", "prompt": "x"}],
-                status=TaskStatus.COMPLETED,
-                context={"pr_merged": True},
-            ),
-        ]
-    )
-    await db_session.commit()
+    await _seed_landed_acceptance_task(db_session, project.id, satisfied=False)
 
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    expected = {
-        "total": 5,
-        "proven": 1,
-        "satisfied_unproven": 1,
-        "declared_unsatisfied": 1,
-        "merged_unverified_degraded": 1,
-        "undeclared": 1,
-        "malformed": 0,
-        "proven_rate": 0.2,
-        "satisfied_rate": 0.4,
-    }
     assert result["status"] == "dry_run"
-    assert version.last_qualification["acceptance_aggregate"] == expected
+    assert "acceptance_aggregate" not in result
     await db_session.refresh(version)
-    assert version.last_qualification["acceptance_aggregate"] == expected
+    assert "acceptance_aggregate" not in version.last_qualification
 
     rows = (
         (
@@ -21639,153 +21434,7 @@ async def test_finalize_records_version_acceptance_aggregate_for_mixed_window(
         .all()
     )
     assert len(rows) == 1
-    assert rows[0].sub_scores["acceptance_aggregate"] == expected
-
-
-@pytest.mark.asyncio
-async def test_finalize_records_version_acceptance_aggregate_for_undeclared_window(
-    db_session, mocker
-):
-    """An all-undeclared merged window stays neutral and records no proven
-    acceptance credit."""
-    from app import shared_state
-
-    shared_state.runtime_config["promotion_enabled"] = False
-
-    project, version = await _make_project_and_version(db_session)
-    await _seed_qualification_children(
-        db_session,
-        project,
-        version,
-        audit_logs={
-            "audit_score": 1.0,
-            "test_erosion": {
-                "deleted_test_files": [],
-                "assertion_delta": 3,
-                "test_count_delta": 1,
-            },
-        },
-        smoke_logs={
-            "passed": True,
-            "tests": [{"name": "a", "status": "pass"}],
-            "suites": {"startup": {"passed": True}},
-        },
-    )
-
-    db_session.add_all(
-        [
-            Task(
-                project_id=project.id,
-                title="undeclared-1",
-                payloads=[{"type": "create", "prompt": "x"}],
-                status=TaskStatus.COMPLETED,
-                context={"pr_merged": True},
-            ),
-            Task(
-                project_id=project.id,
-                title="undeclared-2",
-                payloads=[{"type": "create", "prompt": "x"}],
-                status=TaskStatus.COMPLETED,
-                context={"pr_merged": True},
-            ),
-        ]
-    )
-    await db_session.commit()
-
-    result = await rq._finalize_qualification(db_session, version)
-    await db_session.commit()
-
-    expected = {
-        "total": 2,
-        "proven": 0,
-        "satisfied_unproven": 0,
-        "declared_unsatisfied": 0,
-        "merged_unverified_degraded": 0,
-        "undeclared": 2,
-        "malformed": 0,
-        "proven_rate": 0.0,
-        "satisfied_rate": 0.0,
-    }
-    assert result["status"] == "dry_run"
-    assert version.last_qualification["acceptance_aggregate"] == expected
-
-
-@pytest.mark.asyncio
-async def test_finalize_records_version_acceptance_aggregate_ignores_post_terminal_updates(
-    db_session, mocker
-):
-    """A later non-terminal task write must not reopen the qualification window."""
-    from datetime import timedelta
-    from unittest.mock import patch
-
-    from app import shared_state
-
-    shared_state.runtime_config["promotion_enabled"] = False
-
-    project, version = await _make_project_and_version(db_session)
-    await _seed_qualification_children(
-        db_session,
-        project,
-        version,
-        audit_logs={
-            "audit_score": 1.0,
-            "test_erosion": {
-                "deleted_test_files": [],
-                "assertion_delta": 1,
-                "test_count_delta": 1,
-            },
-        },
-        smoke_logs={
-            "passed": True,
-            "tests": [{"name": "a", "status": "pass"}],
-            "suites": {"startup": {"passed": True}},
-        },
-    )
-
-    window_opened_at = rq._utcnow()
-    old_completed_at = window_opened_at - timedelta(days=1)
-    post_terminal_message_at = window_opened_at + timedelta(days=1)
-
-    old_task = Task(
-        project_id=project.id,
-        title="old-merge",
-        payloads=[{"type": "create", "prompt": "x"}],
-        status=TaskStatus.QUEUED,
-        context={},
-        created_at=old_completed_at,
-        updated_at=old_completed_at,
-    )
-    db_session.add(old_task)
-    await db_session.commit()
-
-    with patch("app.models._utcnow", return_value=old_completed_at):
-        old_task.status = TaskStatus.COMPLETED
-        old_task.context = {"pr_merged": True}
-        await db_session.commit()
-
-    version.opened_at = window_opened_at
-    await db_session.commit()
-
-    with patch("app.models._utcnow", return_value=post_terminal_message_at):
-        old_task.latest_status_message = "Post-terminal context update"
-        await db_session.commit()
-
-    result = await rq._finalize_qualification(db_session, version)
-    await db_session.commit()
-
-    expected = {
-        "total": 0,
-        "proven": 0,
-        "satisfied_unproven": 0,
-        "declared_unsatisfied": 0,
-        "merged_unverified_degraded": 0,
-        "undeclared": 0,
-        "malformed": 0,
-        "proven_rate": None,
-        "satisfied_rate": None,
-    }
-    assert result["status"] == "dry_run"
-    assert version.last_qualification["acceptance_aggregate"] == expected
+    assert "acceptance_aggregate" not in (rows[0].sub_scores or {})
 
 
 @pytest.mark.asyncio
@@ -24931,9 +24580,8 @@ def test_format_verdict_for_api_surfaces_acceptance_window_signal_without_changi
     assert out_legacy["sub_scores"] is None
 
 
-def test_format_verdict_for_api_includes_acceptance_aggregate():
-    """format_verdict_for_api surfaces the stored per-verdict acceptance aggregate
-    additively (via the release_qualifier re-export), preserving the raw fields."""
+def test_format_verdict_for_api_omits_acceptance_aggregate():
+    """format_verdict_for_api no longer promotes retired acceptance aggregates."""
     import uuid
 
     verdict = QualificationVerdict(
@@ -24961,25 +24609,15 @@ def test_format_verdict_for_api_includes_acceptance_aggregate():
         },
     )
     out = rq.format_verdict_for_api(verdict)
-    assert out["acceptance_aggregate"] == {
-        "total": 4,
-        "proven": 3,
-        "satisfied_unproven": 1,
-        "declared_unsatisfied": 0,
-        "undeclared": 0,
-        "merged_unverified_degraded": 0,
-        "malformed": 0,
-        "satisfied_rate": 1.0,
-        "proven_rate": 0.75,
-    }
+    assert "acceptance_aggregate" not in out
     # Raw evidence fields stay intact.
     assert out["candidate_sha"] == "agg123"
     assert out["would_promote"] is True
+    assert "acceptance_aggregate" not in (out["sub_scores"] or {})
 
 
-def test_format_verdict_for_api_acceptance_aggregate_none_on_legacy():
-    """A legacy verdict with no stored aggregate yields acceptance_aggregate=None;
-    the additive key is always present."""
+def test_format_verdict_for_api_acceptance_aggregate_absent_on_legacy():
+    """Legacy rows also omit the retired acceptance_aggregate response key."""
     import uuid
 
     verdict = QualificationVerdict(
@@ -24992,8 +24630,7 @@ def test_format_verdict_for_api_acceptance_aggregate_none_on_legacy():
         terminal_status="not_promoted",
     )
     out = rq.format_verdict_for_api(verdict)
-    assert "acceptance_aggregate" in out
-    assert out["acceptance_aggregate"] is None
+    assert "acceptance_aggregate" not in out
 
 
 def test_format_verdict_for_api_smoketest_enabled_false():
@@ -26225,6 +25862,24 @@ class TestRecoverConfidenceFromCiUnresolved:
         assert out.get("confidence_recovered_from_ci_unresolved") is True
         assert out["confidence"] > 0.0
 
+    def test_ci_unresolved_preserves_criterion_coverage_blocker(self):
+        """Recovery keeps criterion_coverage_incomplete when uncovered criteria exist."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
+            "smoketest_enabled": True,
+            "criterion_coverage": {
+                "total": 2,
+                "covered": 1,
+                "partial": 0,
+                "uncovered": 1,
+            },
+        }
+        out = self._fn(record)
+        assert out["blocker"] == "criterion_coverage_incomplete"
+        assert out["confidence"] == 0.0
+
 
 # ===========================================================================
 # SITE B lock-window fix: GitHub-bound gates run BEFORE FOR UPDATE
@@ -26769,22 +26424,46 @@ class TestBlindMergeGradeBlock:
 
     # --- Unit tests: compute_composite integration --------------------------
 
-    def test_compute_composite_merge_grade_blocked_fires(self):
-        """merge_grade_blocked=True forces confidence=0.0 and the merge_grade blocker label."""
+    def test_compute_composite_criterion_coverage_incomplete_fires(self):
+        """Uncovered criteria force confidence=0.0 and the criterion blocker label."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
             test_erosion=1.0,
             smoketest_score=1.0,
             policy=_POLICY,
-            merge_grade_blocked=True,
+            criterion_coverage={
+                "total": 2,
+                "covered": 1,
+                "partial": 0,
+                "uncovered": 1,
+            },
         )
         assert result["confidence"] == 0.0
         assert result["promote"] is False
-        assert result["blocker"] == "merge_grade_goal_coverage"
+        assert result["blocker"] == "criterion_coverage_incomplete"
 
-    def test_compute_composite_merge_grade_blocked_default_false(self):
-        """Backward compat: omitting merge_grade_blocked does not block."""
+    def test_compute_composite_criterion_coverage_partial_only_fires(self):
+        """Partial-only coverage also blocks because the criterion is not covered."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            criterion_coverage={
+                "total": 1,
+                "covered": 0,
+                "partial": 1,
+                "uncovered": 0,
+            },
+        )
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        assert result["blocker"] == "criterion_coverage_incomplete"
+
+    def test_compute_composite_criterion_coverage_default_skips_gate(self):
+        """Backward compat: omitting criterion_coverage does not block."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
@@ -26809,18 +26488,23 @@ class TestBlindMergeGradeBlock:
         assert result["promote"] is False
         assert result["blocker"] == "merge_grade_misses"
 
-    def test_compute_composite_merge_grade_goal_coverage_label(self):
-        """merge_grade_blocked=True (child-task gate) emits merge_grade_goal_coverage."""
+    def test_compute_composite_criterion_coverage_no_criteria_skips_gate(self):
+        """A version with no criteria does not emit the criterion blocker."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
             test_erosion=1.0,
             smoketest_score=1.0,
             policy=_POLICY,
-            merge_grade_blocked=True,
+            criterion_coverage={
+                "total": 0,
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 0,
+            },
         )
-        assert result["confidence"] == 0.0
-        assert result["blocker"] == "merge_grade_goal_coverage"
+        assert result["blocker"] is None
+        assert result["promote"] is True
 
 
 @pytest.mark.asyncio

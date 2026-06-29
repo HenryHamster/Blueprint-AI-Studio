@@ -50,7 +50,11 @@ async def create_criterion(
     text: str,
     created_by: str | None = None,
 ) -> VersionAcceptanceCriterion:
-    """Create and persist a new acceptance criterion for a release version."""
+    """Create and persist a new acceptance criterion for a release version.
+
+    Commits the session immediately — use :func:`stage_criterion` when calling
+    from inside a larger transaction that must commit once at the end.
+    """
     criterion = VersionAcceptanceCriterion(
         project_id=project_id,
         release_version_id=release_version_id,
@@ -62,6 +66,47 @@ async def create_criterion(
     await session.commit()
     await session.refresh(criterion)
     return criterion
+
+
+async def stage_criterion(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+    text: str,
+    created_by: str | None = None,
+) -> VersionAcceptanceCriterion:
+    """Stage a new acceptance criterion without committing the session.
+
+    Unlike :func:`create_criterion`, this only calls ``session.add()`` — the
+    caller is responsible for committing (or flushing) the session.  Use this
+    from within a larger transaction (e.g. strategic-completion handlers) where
+    a mid-transaction ``session.commit()`` would break the surrounding
+    atomicity guarantee and cause one commit per criterion.
+    """
+    criterion = VersionAcceptanceCriterion(
+        project_id=project_id,
+        release_version_id=release_version_id,
+        criterion_key=generate_criterion_key(),
+        text=text,
+        created_by=created_by,
+    )
+    session.add(criterion)
+    return criterion
+
+
+async def get_criterion_by_key(
+    session: AsyncSession,
+    release_version_id: uuid.UUID,
+    criterion_key: str,
+) -> VersionAcceptanceCriterion | None:
+    """Return a single criterion by its criterion_key within a release version."""
+    result = await session.execute(
+        select(VersionAcceptanceCriterion).where(
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.criterion_key == criterion_key,
+        )
+    )
+    return result.scalars().first()
 
 
 async def get_criteria_for_version(

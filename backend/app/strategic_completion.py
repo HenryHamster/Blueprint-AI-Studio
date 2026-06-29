@@ -416,6 +416,11 @@ NEW_VERSION_GOAL_CONTEXT_KEY = "_strategic_new_version_goal"
 # ReleaseVersion.goal).  Matches the display budget for version goal UI surfaces.
 _NEW_VERSION_GOAL_MAX = 500
 
+# Transient task.context key carrying agent-emitted new_acceptance_criteria from the
+# set_problem_model endpoint to _handle_strategic_completion's API path. Mirrors
+# NEW_VERSION_GOAL_CONTEXT_KEY — one source of truth so producer + consumer never drift.
+NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY = "_strategic_new_acceptance_criteria"
+
 # OPTIONAL agent verdict that refines the deterministic outcome-progress
 # (scaffolding) detector. For each long-running ACTIVE direction the strategic
 # agent may record one verdict — advancing | stalled | met — that raises the
@@ -1184,6 +1189,85 @@ async def _apply_new_version_goal(
     except Exception:
         logger.exception(
             "[STRATEGIC] Task %s (%s path): failed to apply new_version_goal (non-fatal)",
+            task.id,
+            path,
+        )
+
+
+async def _apply_new_acceptance_criteria(
+    criteria_texts: object,
+    task: Task,
+    project: Project,
+    session: AsyncSession,
+    *,
+    path: str,
+) -> None:
+    """Apply optional ``new_acceptance_criteria`` from the strategic agent.
+
+    ``criteria_texts`` is the raw value from
+    ``task.context[NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY]`` — a list of strings.
+    For each text, creates a new VersionAcceptanceCriterion on the open version,
+    skipping duplicates (same text already exists). Errors are swallowed so a
+    bad criteria list never blocks vision/direction writes.
+    """
+    if not isinstance(criteria_texts, list) or not criteria_texts:
+        return
+    try:
+        from app import acceptance_criteria as _ac
+        from app.release_version import current_open_version as _cur_open_version
+
+        _open_ver = await _cur_open_version(session, project.id)
+        if _open_ver is None:
+            logger.info(
+                "[STRATEGIC] Task %s (%s path): no open ReleaseVersion for project %s "
+                "— skipping new_acceptance_criteria",
+                task.id,
+                path,
+                project.id,
+            )
+            return
+        existing = await _ac.get_criteria_for_version(session, _open_ver.id)
+        existing_texts = {c.text for c in existing}
+        created_count = 0
+        for text in criteria_texts:
+            if not isinstance(text, str):
+                continue
+            cleaned = text.strip()
+            if not cleaned:
+                continue
+            if cleaned in existing_texts:
+                logger.debug(
+                    "[STRATEGIC] Task %s (%s path): skipping duplicate criterion text for "
+                    "project %s version v%d: %.80s",
+                    task.id,
+                    path,
+                    project.id,
+                    _open_ver.version_number,
+                    cleaned,
+                )
+                continue
+            await _ac.stage_criterion(
+                session,
+                project_id=project.id,
+                release_version_id=_open_ver.id,
+                text=cleaned,
+                created_by="strategist",
+            )
+            existing_texts.add(cleaned)
+            created_count += 1
+        if created_count > 0:
+            logger.info(
+                "[STRATEGIC] Task %s (%s path): authored %d acceptance criterion(a) "
+                "for project %s version v%d",
+                task.id,
+                path,
+                created_count,
+                project.id,
+                _open_ver.version_number,
+            )
+    except Exception:
+        logger.exception(
+            "[STRATEGIC] Task %s (%s path): failed to apply new_acceptance_criteria (non-fatal)",
             task.id,
             path,
         )
@@ -3753,6 +3837,13 @@ async def _handle_strategic_completion(
         # Sets the open version's goal with source="strategist" when null.
         _nvg_ctx = (task.context or {}).get(NEW_VERSION_GOAL_CONTEXT_KEY)
         await _apply_new_version_goal(_nvg_ctx, task, project, session, path="api")
+        # Apply new_acceptance_criteria if the agent supplied them via the API.
+        # Same transport: the ``set_problem_model`` endpoint lifts the field out of
+        # the problem_model JSON and stows the list under
+        # ``NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY``. Creates one criterion per text,
+        # skipping duplicates.
+        _nac_ctx = (task.context or {}).get(NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY)
+        await _apply_new_acceptance_criteria(_nac_ctx, task, project, session, path="api")
 
         # Per-cycle message post removed: the strategic agent now maintains
         # project.running_update as a living markdown document it rewrites
@@ -4070,6 +4161,13 @@ async def _handle_strategic_completion(
     # shared helper used by the API path so both paths behave identically.
     await _apply_new_version_goal(
         new_version_goal, task, project, session, path="fallback"
+    )
+
+    # Apply new_acceptance_criteria when the strategist authors version-scoped
+    # criteria in the fallback output. Mirrors the API path above so fallback
+    # completions cannot silently drop the canonical acceptance contract.
+    await _apply_new_acceptance_criteria(
+        parsed.get("new_acceptance_criteria"), task, project, session, path="fallback"
     )
 
     # Reconcile project.running_update operator-wins via the same shared helper

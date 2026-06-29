@@ -44,7 +44,7 @@ Public API:
       Return a compact dict for embedding the version's phase state in the
       strategic agent's payload.
 
-  build_version_highlights(version, *, merged_count, aggregate_serving_status, acceptance_aggregate)
+  build_version_highlights(version, *, merged_count, aggregate_serving_status)
       Build the shared human-readable ``highlights`` block (headline plus
       at-a-glance metrics) for a version.  The 'serving' word in the headline is
       driven off the aggregate required-artifact serving status, not the scalar
@@ -1008,11 +1008,6 @@ def to_phase_block(
         if artifact_evidence is not None
         else version.deploy_failure_reason
     )
-    acceptance_aggregate = None
-    if isinstance(version.last_qualification, dict):
-        acceptance_aggregate = version.last_qualification.get("acceptance_aggregate")
-    if acceptance_aggregate is None:
-        acceptance_aggregate = getattr(version, "acceptance_aggregate", None)
     block = {
         "version_number": version.version_number,
         "phase": version.phase,
@@ -1035,13 +1030,6 @@ def to_phase_block(
         "served_sha": version.served_sha,
         "served_at": version.served_at.isoformat() if version.served_at else None,
         "deploy_failure_reason": effective_failure_reason,
-        # Version-window acceptance aggregate (proven-vs-merged) — additive and
-        # nullable. The aggregate itself is computed/stored by the acceptance
-        # layer; this read model only passes it through so the strategist reads
-        # the proven claim state ALONGSIDE the raw merged count
-        # (``tasks_merged_this_version``, added by the caller). ``None`` on legacy
-        # rows that predate the aggregate, keeping the payload backward-compatible.
-        "acceptance_aggregate": acceptance_aggregate,
     }
     if artifact_evidence is not None:
         block["artifacts"] = artifact_evidence
@@ -1053,8 +1041,6 @@ def _synthesize_narrative(
     *,
     merged_count: int,
     aggregate_serving_status: str | None,
-    proven: int,
-    total_merged: int,
     confidence: float | None,
     threshold: float | None,
 ) -> str:
@@ -1064,7 +1050,6 @@ def _synthesize_narrative(
     ``build_version_highlights`` so all summary surfaces render identical text.
     """
     task_word = "task" if merged_count == 1 else "tasks"
-    total_word = "task" if total_merged == 1 else "tasks"
 
     if version.status == "promoted":
         if aggregate_serving_status == "serving_confirmed":
@@ -1073,32 +1058,17 @@ def _synthesize_narrative(
             intro = "Promoted."
         if merged_count == 0:
             return f"{intro} No tasks were merged into this version."
-        acceptance_part = (
-            f" Acceptance evidence proven for {proven} of {total_merged} merged {total_word}."
-            if total_merged > 0
-            else ""
-        )
-        return f"{intro} Delivered {merged_count} merged {task_word}.{acceptance_part}"
+        return f"{intro} Delivered {merged_count} merged {task_word}."
 
     if version.status == "abandoned":
         if merged_count == 0:
             return "Abandoned before promotion with no merged work."
-        acceptance_part = (
-            f" Acceptance evidence was proven for {proven} of {total_merged} merged {total_word}."
-            if total_merged > 0
-            else ""
-        )
-        return f"Abandoned before promotion with {merged_count} merged {task_word}.{acceptance_part}"
+        return f"Abandoned before promotion with {merged_count} merged {task_word}."
 
     # open
     if merged_count == 0:
         return f"Open in the {version.phase} phase with no merged work yet."
 
-    acceptance_part = (
-        f" Acceptance evidence proven for {proven} of {total_merged} merged {total_word}."
-        if total_merged > 0
-        else ""
-    )
     qual_part = ""
     if confidence is not None and threshold is not None:
         conf_pct = round(confidence * 100)
@@ -1111,7 +1081,7 @@ def _synthesize_narrative(
 
     return (
         f"Open in the {version.phase} phase with {merged_count} merged {task_word}."
-        f"{acceptance_part}{qual_part}"
+        f"{qual_part}"
     )
 
 
@@ -1120,7 +1090,6 @@ def build_version_highlights(
     *,
     merged_count: int,
     aggregate_serving_status: str | None,
-    acceptance_aggregate: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Build the human-readable ``highlights`` block for a release version.
 
@@ -1135,17 +1104,14 @@ def build_version_highlights(
     ``"promoted & serving"`` only when every required artifact confirms,
     otherwise ``"promoted"``.
 
-    ``acceptance_aggregate`` is the proven-vs-merged bucket mapping (keys
-    ``"proven"`` / ``"total"``); ``None`` on legacy versions that predate the
-    aggregate, in which case both counts default to 0.
-
     Returns a dict with keys ``merged_count``, ``proven``,
     ``total_merged_for_acceptance``, ``qualification_confidence``,
-    ``qualification_threshold`` and ``headline``.
+    ``qualification_threshold`` and ``headline``. The retired acceptance metrics
+    are kept as zero-valued compatibility fields for existing clients.
+
+    Canonical criterion coverage now drives version acceptance qualification;
+    the retired acceptance aggregate no longer contributes to highlights.
     """
-    acceptance = acceptance_aggregate or {}
-    proven = acceptance.get("proven", 0)
-    total_merged = acceptance.get("total", 0)
     qual = version.last_qualification or {}
     confidence = qual.get("confidence")
     threshold = qual.get("threshold")
@@ -1165,16 +1131,14 @@ def build_version_highlights(
         version,
         merged_count=merged_count,
         aggregate_serving_status=aggregate_serving_status,
-        proven=proven,
-        total_merged=total_merged,
         confidence=confidence,
         threshold=threshold,
     )
 
     return {
         "merged_count": merged_count,
-        "proven": proven,
-        "total_merged_for_acceptance": total_merged,
+        "proven": 0,
+        "total_merged_for_acceptance": 0,
         "qualification_confidence": confidence,
         "qualification_threshold": threshold,
         "headline": headline,

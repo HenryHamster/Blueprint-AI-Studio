@@ -10,7 +10,7 @@ import uuid
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -48,8 +48,8 @@ async def list_acceptance_criteria(
 
 
 class LinkDirectionRequest(BaseModel):
-    direction_key: str
-    criterion_keys: List[str]
+    direction_key: str = Field(..., max_length=128)
+    criterion_keys: List[str] = Field(..., max_length=50)
 
 
 @router.post("/projects/{project_id}/acceptance-criteria/link-direction")

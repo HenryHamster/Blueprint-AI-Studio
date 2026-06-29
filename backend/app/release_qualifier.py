@@ -84,6 +84,7 @@ from app.failure_classification import (
 from app.acceptance_gate import (
     classify_merged_acceptance_context,
 )
+from app.acceptance_criteria import get_version_coverage_summary
 from app.landed_signal import landed_signal_predicate
 from app.models import (
     ArtifactType,
@@ -192,7 +193,6 @@ from app.release_scoring import (
     evaluate_merge_grade,
     is_contentless_goal,
 )
-from app.acceptance_gate import summarize_version_acceptance_aggregate
 from app.release_stall_alerts import (
     _AUTO_MERGE_STALL_SECONDS,  # noqa: F401 — re-exported for back-compat
     _BUILD_STALL_AGE_DAYS,  # noqa: F401 — re-exported for back-compat
@@ -1598,8 +1598,8 @@ _BLOCKER_LABELS: dict[str, str] = {
         "the candidate's migration chain does not apply cleanly against "
         "production's recorded schema state (deploy-fatal drift)"
     ),
-    "merge_grade_goal_coverage": (
-        "the blind merge-grade found the merged diffs do not advance the version goal"
+    "criterion_coverage_incomplete": (
+        "one or more version acceptance criteria remain uncovered"
     ),
     "merge_grade_misses": (
         "the merged diffs 'misses' the version goal per the blind merge-grade "
@@ -3139,15 +3139,15 @@ async def _finalize_qualification(
         )
     migration_apply_blocked = apply_verdict == "block"
 
-    # --- Blind merge-grade goal-coverage gate (dir d-c0fe439f) --------------
+    # --- Blind merge-grade artifact validation (dir d-c0fe439f) -------------
     # An uninvested release_merge_grade agent graded the merged diffs against the
-    # frozen version.goal (blind to running_update).  Read its verdict and turn a
-    # FAILING goal-coverage grade into a HARD promotion blocker.  Semantics:
+    # frozen version.goal (blind to running_update).  Read its verdict for
+    # observability and artifact integrity.  Canonical version acceptance
+    # criteria now drive the hard goal-coverage gate below.  Semantics:
     #   * version.goal empty/unset → the gate is a no-op PASS (nothing to grade
     #     against); no child was spawned, merge_grade_task_id is None.
-    #   * goal non-empty + a usable grade → covers_goal False is a hard block.
     #   * goal non-empty but the required grade is MISSING / UNPARSEABLE → HOLD
-    #     (infra_failure): the gate cannot be skipped or waved through.
+    #     (infra_failure): required artifacts cannot be skipped or waved through.
     merge_grade_cert: dict[str, Any] = {
         "status": "not_applicable",
         "covers_goal": None,
@@ -3156,7 +3156,6 @@ async def _finalize_qualification(
         "blocked": False,
         "detail": None,
     }
-    merge_grade_blocked = False
     if merge_grade_task_id:
         merge_grade_artifact: dict[str, Any] | None = None
         try:
@@ -3184,69 +3183,6 @@ async def _finalize_qualification(
                 else "merge_grade_report_unparseable"
             )
             return await _handle_infra_failure(session, version, qual, label)
-        merge_grade_blocked = bool(merge_grade_cert["blocked"])
-        # Already-promoted exemption: when the previous qualification was
-        # qualification_superseded (force-promoted out-of-band), the feature
-        # content is already on the promotion target.  Grading stabilization-
-        # only tail commits against the frozen goal is meaningless — suppress.
-        if merge_grade_blocked and qual.get("prior_superseded"):
-            logger.warning(
-                "[RELEASE_QUALIFIER] v%d merge_grade_goal_coverage suppressed: "
-                "prior qualification was superseded (force-promoted out-of-band); "
-                "stabilization-only diff graded against frozen goal is not actionable",
-                version.version_number,
-            )
-            merge_grade_blocked = False
-            merge_grade_cert = {**merge_grade_cert, "status": "superseded_exempt", "blocked": False}
-        # Fallback: direct GitHub ancestry check when prior_superseded was not
-        # set (e.g. GitHub-cred outage let the 6h timeout beat the supersession
-        # reconciler).  Fail-closed: cred unavailable or any error → leave
-        # merge_grade_blocked as-is.
-        #
-        # Normal path (_pre_gates is not None): result was pre-resolved before
-        # the FOR UPDATE lock in _finalize_locked_version — consume it directly
-        # without re-issuing a GitHub call under the lock.
-        # Fallback path (_pre_gates is None): direct calls from tests or the
-        # timeout reaper — run inline as before.
-        if merge_grade_blocked and candidate_sha:
-            if _pre_gates is not None:
-                if _pre_gates.get("pre_merge_grade_already_on_main") is True:
-                    logger.warning(
-                        "[RELEASE_QUALIFIER] v%d merge_grade_goal_coverage suppressed: "
-                        "direct GitHub ancestry check confirms candidate %s is already "
-                        "on main (prior_superseded was not set — likely GitHub-cred outage "
-                        "during force-promote window)",
-                        version.version_number,
-                        candidate_sha[:8],
-                    )
-                    merge_grade_blocked = False
-                    merge_grade_cert = {**merge_grade_cert, "status": "superseded_exempt", "blocked": False}
-            else:
-                try:
-                    _mg_project = await session.get(Project, version.project_id)
-                    _mg_resolved = await _resolve_github_with_session(session, _mg_project)
-                    if _mg_resolved is not None:
-                        _mg_token, _mg_owner, _mg_repo = _mg_resolved
-                        if await _candidate_already_on_main(
-                            _mg_token, _mg_owner, _mg_repo, candidate_sha, version, project=_mg_project
-                        ):
-                            logger.warning(
-                                "[RELEASE_QUALIFIER] v%d merge_grade_goal_coverage suppressed: "
-                                "direct GitHub ancestry check confirms candidate %s is already "
-                                "on main (prior_superseded was not set — likely GitHub-cred outage "
-                                "during force-promote window)",
-                                version.version_number,
-                                candidate_sha[:8],
-                            )
-                            merge_grade_blocked = False
-                            merge_grade_cert = {**merge_grade_cert, "status": "superseded_exempt", "blocked": False}
-                except Exception:
-                    logger.warning(
-                        "[RELEASE_QUALIFIER] v%d direct already-on-main check failed "
-                        "(fail-closed): merge_grade_goal_coverage block preserved",
-                        version.version_number,
-                        exc_info=True,
-                    )
 
     # --- Compute the composite ---------------------------------------------
     # Whether an UNRESOLVED candidate CI (pending / no check-runs) hard-blocks
@@ -3257,6 +3193,7 @@ async def _finalize_qualification(
     # real, still-strict CI gate). A confirmed red still blocks regardless.
     _ci_project = await session.get(Project, version.project_id)
     ci_required = requires_ci_checks(_ci_project) if _ci_project is not None else True
+    criterion_coverage = await get_version_coverage_summary(session, version.id)
     composite = compute_composite(
         ci_green=ci_green,
         audit_score=audit_score,
@@ -3268,43 +3205,19 @@ async def _finalize_qualification(
         ci_required=ci_required,
         migration_collision=migration_collision,
         migration_apply_blocked=migration_apply_blocked,
-        merge_grade_blocked=merge_grade_blocked,
+        criterion_coverage=criterion_coverage,
     )
 
-    # --- Acceptance-window aggregate (additive evidence, no score impact) --
+    # --- Acceptance-window counts (additive evidence, no score impact) -----
     # Reuses the same verified-prs-merged predicate from direction_outcomes so
     # the release qualification surfaces the same proven-vs-delivered signal as
     # the strategic and direction layers. Merged into sub_scores as additive
     # keys; the existing audit/test_erosion/smoketest weights are unchanged.
-    acceptance_aggregate = await _compute_acceptance_window_aggregate(session, version)
+    acceptance_window = await _compute_acceptance_window_aggregate(session, version)
     extended_sub_scores = dict(composite["sub_scores"])
-    extended_sub_scores.update(acceptance_aggregate)
+    extended_sub_scores.update(acceptance_window)
 
     finalized_at = _utcnow().isoformat()
-    acceptance_aggregate = None
-    if version.opened_at is not None:
-        merged_rows = (
-            (
-                await session.execute(
-                    select(Task)
-                    .where(
-                        Task.project_id == version.project_id,
-                        Task.status == TaskStatus.COMPLETED,
-                        landed_signal_predicate(session),
-                        Task.updated_at >= version.opened_at,
-                    )
-                    .order_by(Task.created_at.asc())
-                )
-            )
-            .scalars()
-            .all()
-        )
-        merged_rows = [
-            task
-            for task in merged_rows
-            if release_version._task_completed_at(task) >= version.opened_at
-        ]
-        acceptance_aggregate = summarize_version_acceptance_aggregate(merged_rows)
     base_record: dict[str, Any] = {
         "candidate_sha": candidate_sha,
         "ci_green": ci_green,
@@ -3349,7 +3262,7 @@ async def _finalize_qualification(
         "migration_safety_detail": migration_detail,
         "migration_apply_safety": apply_verdict,
         "migration_apply_safety_detail": apply_detail,
-        "acceptance_aggregate": acceptance_aggregate,
+        "criterion_coverage": criterion_coverage,
         # Blind merge-grade goal-coverage verdict (dir d-c0fe439f). Mirrored into
         # last_qualification AND persisted on QualificationVerdict so an operator
         # can see the single biggest gap toward the goal.
@@ -3455,14 +3368,6 @@ async def _finalize_qualification(
             # would fail to create, not just the generic blocker label.
             if composite["blocker"] == "migration_apply_drift" and apply_detail:
                 blocker_label = f"{blocker_label} — {apply_detail}"
-            # The merge-grade blocker carries the single biggest gap so the
-            # operator sees WHAT the merges failed to deliver toward the goal.
-            if composite[
-                "blocker"
-            ] == "merge_grade_goal_coverage" and merge_grade_cert.get("biggest_gap"):
-                blocker_label = (
-                    f"{blocker_label} — biggest gap: {merge_grade_cert['biggest_gap']}"
-                )
             notify_event = "release_blocked"
             notify_summary = (
                 f"v{version.version_number} blocked from promotion — "
@@ -4065,41 +3970,6 @@ async def _finalize_locked_version(
         ) = await _resolve_migration_apply_at_finalize(
             session, peek, peek_candidate_sha
         )
-        # Pre-resolve the direct already-on-main ancestry check (merge-grade
-        # exemption fallback) before acquiring the lock.  Only attempt when a
-        # merge-grade child was spawned, a candidate SHA is available, and the
-        # prior_superseded exemption will not already clear the block (short-
-        # circuit avoids a spurious GitHub call).  Fail-closed: any error or
-        # cred unavailability → None (preserved in _pre_gates; consumed as
-        # fail-closed inside _finalize_qualification).
-        _pre_merge_grade_already_on_main: bool | None = None
-        if (
-            peek_qual.get("merge_grade_task_id")
-            and peek_candidate_sha
-            and not peek_qual.get("prior_superseded")
-        ):
-            try:
-                _mg_project_pre = await session.get(Project, peek.project_id)
-                _mg_resolved_pre = await _resolve_github_with_session(
-                    session, _mg_project_pre
-                )
-                if _mg_resolved_pre is not None:
-                    _mg_token_pre, _mg_owner_pre, _mg_repo_pre = _mg_resolved_pre
-                    _pre_merge_grade_already_on_main = await _candidate_already_on_main(
-                        _mg_token_pre,
-                        _mg_owner_pre,
-                        _mg_repo_pre,
-                        peek_candidate_sha,
-                        peek,
-                        project=_mg_project_pre,
-                    )
-            except Exception:
-                logger.warning(
-                    "[RELEASE_QUALIFIER] pre-lock already-on-main check failed "
-                    "(fail-closed): stored as None in _pre_gates",
-                    exc_info=True,
-                )
-
         _pre_gates = {
             "ci_green": pre_ci_green,
             "ci_resolution": pre_ci_resolution,
@@ -4107,7 +3977,6 @@ async def _finalize_locked_version(
             "migration_detail": pre_migration_detail,
             "apply_verdict": pre_apply_verdict,
             "apply_detail": pre_apply_detail,
-            "pre_merge_grade_already_on_main": _pre_merge_grade_already_on_main,
         }
 
     # Expire the peek instance so the FOR UPDATE select below forces a fresh

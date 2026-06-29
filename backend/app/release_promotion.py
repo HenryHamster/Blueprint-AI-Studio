@@ -295,6 +295,7 @@ def _recover_confidence_from_ci_unresolved(
         smoketest_score=smoketest_score,
         policy=_policy,
         smoketest_enabled=smoketest_enabled,
+        criterion_coverage=base_record.get("criterion_coverage"),
     )
 
     return {
@@ -338,10 +339,6 @@ async def _record_qualification_verdict(
         sub_scores = base_record.get("sub_scores") or {}
         if not isinstance(sub_scores, dict):
             sub_scores = {}
-        acceptance_aggregate = base_record.get("acceptance_aggregate")
-        if acceptance_aggregate is not None:
-            sub_scores = dict(sub_scores)
-            sub_scores["acceptance_aggregate"] = acceptance_aggregate
         # Embed CI resolution provenance in sub_scores.
         ci_resolution = base_record.get("ci_resolution")
         if isinstance(ci_resolution, dict):

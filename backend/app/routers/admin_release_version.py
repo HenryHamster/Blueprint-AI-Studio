@@ -244,7 +244,6 @@ async def _serialize_version_history_entry(
             version,
             merged_count=merged_count,
             aggregate_serving_status=aggregate["serving_status"],
-            acceptance_aggregate=acceptance_aggregate,
         )
         try:
             from app import acceptance_criteria as _acceptance_criteria  # noqa: PLC0415
@@ -654,7 +653,6 @@ async def get_version_lifecycle(
                     open_row,
                     merged_count=merged_count,
                     aggregate_serving_status=aggregate_serving["serving_status"],
-                    acceptance_aggregate=acceptance_aggregate,
                 ),
                 # Tasks merged AT/AFTER the last qualification verdict's finalized_at
                 # (verdict-staleness signal). None when no verdict/finalized_at.
@@ -1332,7 +1330,6 @@ async def get_version_summary(
         version,
         merged_count=merged_count,
         aggregate_serving_status=aggregate_serving["serving_status"],
-        acceptance_aggregate=acceptance_aggregate,
     )
 
     return {
@@ -1700,7 +1697,6 @@ async def get_release_version_summary(
         version,
         merged_count=merged_count,
         aggregate_serving_status=aggregate_serving["serving_status"],
-        acceptance_aggregate=acceptance_aggregate,
     )
 
     return {

@@ -400,13 +400,17 @@ async def test_run_qualification_skips_merge_grade_when_goal_empty(db_session, m
 
 
 @pytest.mark.asyncio
-async def test_finalize_blocks_on_failing_merge_grade(db_session, mocker):
-    """A FAILING merge-grade verdict blocks promotion: status=not_promoted,
-    blocker=merge_grade_goal_coverage, confidence=0.0."""
+async def test_finalize_records_failing_merge_grade_without_blocking(
+    db_session, mocker
+):
+    """A failing merge-grade verdict is diagnostic only and does not block."""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
-    promote_mock = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    promote_mock = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted", "confidence": 0.99}),
+    )
 
     project, version = await _make_project_and_version(db_session)
     await _seed_for_finalize(
@@ -424,15 +428,11 @@ async def test_finalize_blocks_on_failing_merge_grade(db_session, mocker):
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    assert result["status"] == "not_promoted"
-    assert result["blocker"] == "merge_grade_goal_coverage"
-    assert result["confidence"] == 0.0
-    promote_mock.assert_not_called()
-
-    await db_session.refresh(version)
-    lq = version.last_qualification
-    assert lq["status"] == "not_promoted"
-    assert lq["merge_grade_status"] == "fail"
+    assert result["status"] == "promoted"
+    promote_mock.assert_awaited_once()
+    call_kwargs = promote_mock.await_args.kwargs
+    assert call_kwargs["base_record"]["merge_grade_status"] == "fail"
+    assert call_kwargs["composite"]["blocker"] is None
 
 
 @pytest.mark.asyncio

@@ -652,6 +652,37 @@ async def _attempt_merge_with_retry_and_escalation(
                             await refresh_direction_outcomes_after_merge(
                                 orig, _orig_session
                             )
+                        if record_pr_merged and orig.criterion_ids:
+                            try:
+                                from app import acceptance_criteria as _ac
+                                from app.release_version import (
+                                    current_open_version as _cur_open_version,
+                                )
+
+                                _open_ver = await _cur_open_version(
+                                    _orig_session, orig.project_id
+                                )
+                                if _open_ver is not None:
+                                    for _ckey in orig.criterion_ids:
+                                        _crit = await _ac.get_criterion_by_key(
+                                            _orig_session, _open_ver.id, _ckey
+                                        )
+                                        if _crit is not None:
+                                            await _ac.record_evidence(
+                                                _orig_session,
+                                                criterion_id=_crit.id,
+                                                project_id=orig.project_id,
+                                                source_kind="task_merge",
+                                                source_id=str(orig.id),
+                                                detail={"pr": ci_pr_number},
+                                            )
+                            except Exception:
+                                logger.warning(
+                                    "[CI] Failed to record criterion evidence for "
+                                    "task %s after merge (non-fatal)",
+                                    orig.id,
+                                    exc_info=True,
+                                )
             except Exception as e:
                 logger.warning(
                     f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True

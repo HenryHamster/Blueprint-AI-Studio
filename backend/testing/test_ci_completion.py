@@ -4725,3 +4725,101 @@ async def test_waiting_check_run_does_not_resolve_green(mocker, non_terminal_sta
     assert result["conclusion"] != "success" or result["status"] != "completed", (
         "aggregate must not resolve green while a check-run is still non-terminal"
     )
+
+
+# ---------------------------------------------------------------------------
+# CriterionEvidence recorded through _attempt_merge_with_retry_and_escalation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_criterion_evidence_persisted_via_attempt_merge(db_session, mocker):
+    """CriterionEvidence rows are persisted through the full merge path.
+
+    Exercises the production code path at ci_completion.py:655 — the block that
+    records task_merge evidence for each criterion_id on the original task after
+    a PR lands on the integration branch.  A regression that removes or bypasses
+    that block would fail this test, unlike unit tests that directly call
+    get_criterion_by_key/record_evidence.
+    """
+    from app import acceptance_criteria as ac
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.models import ReleaseVersion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    # Merge succeeds on the first attempt
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True, "sha": "abc123merge"},
+    )
+    # Ancestry gate returns "indeterminate" (no GitHub credentials) → record_pr_merged stays True
+    mocker.patch(
+        "app.rollup_pr_verification.verify_rollup_merge_landed",
+        new=AsyncMock(return_value="indeterminate"),
+    )
+
+    project = Project(name="CriterionEvidence merge test", user_id="test-user-ce")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create an open release version and a criterion
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Feature ships green",
+        created_by="strategist",
+    )
+
+    # Create the original (implementation) task with criterion_ids set
+    orig_task = Task(
+        project_id=project.id,
+        title="Implement feature",
+        payloads=[{"type": "create", "prompt": "build the feature", "base_branch": "main"}],
+        context={"direction_id": "d-ce-test"},
+        status=TaskStatus.EVALUATING,
+        vm_instance_id=f"agent-vm-orig-{uuid.uuid4().hex[:8]}",
+        criterion_ids=[criterion.criterion_key],
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    # Create the CI review task pointing to the original task
+    ci_task = _make_task(
+        db_session,
+        project,
+        pr_number=99,
+        ci_loop_extra={
+            "original_task_id": str(orig_task.id),
+            "base_branch": "main",
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(ci_task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        ci_task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True, "merge should have succeeded"
+
+    # Re-query criterion evidence using a fresh session path (dedicated session
+    # in _attempt_merge_with_retry_and_escalation commits via AsyncSessionLocal,
+    # which is patched to the test engine by the autouse fixture)
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) >= 1, (
+        "At least one CriterionEvidence row must be persisted for the merged task"
+    )
+    task_merge_ev = [e for e in evidence if e.source_kind == "task_merge"]
+    assert len(task_merge_ev) == 1, "exactly one task_merge evidence row expected"
+    assert task_merge_ev[0].source_id == str(orig_task.id)
+    assert task_merge_ev[0].detail == {"pr": 99}

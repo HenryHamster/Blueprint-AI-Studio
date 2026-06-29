@@ -255,11 +255,11 @@ class ArtifactType(str, Enum):
     # Blind goal-coverage grade from the release_merge_grade handler: an
     # uninvested agent grades the merged DIFFS of a release version against the
     # frozen version.goal — BLIND to the strategist's running_update narrative —
-    # and emits {covers_goal, coverage_score, biggest_gap}. Consumed as a hard
-    # gate in _finalize_qualification (compute_composite blocker
-    # ``merge_grade_goal_coverage``): a candidate whose merged diffs do not
-    # advance the goal cannot promote. Like MERGE_TEST_RESULT the artifact column
-    # is a plain String so no migration is needed for the ArtifactType itself.
+    # and emits {covers_goal, coverage_score, biggest_gap}. Kept as diagnostic
+    # artifact evidence; canonical VersionAcceptanceCriterion coverage now owns
+    # the hard goal-coverage qualification gate. Like MERGE_TEST_RESULT the
+    # artifact column is a plain String so no migration is needed for the
+    # ArtifactType itself.
     RELEASE_MERGE_GRADE = "RELEASE_MERGE_GRADE"
     MEMO = "MEMO"
     # Verdict from the verify_tests agent handler: the repo's detected test

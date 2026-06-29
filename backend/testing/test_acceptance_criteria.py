@@ -7,6 +7,10 @@ Exercises :mod:`app.acceptance_criteria`:
   * record_evidence persists an evidence row round-trippable by get_evidence_for_criterion;
   * compute_criterion_coverage returns 'covered', 'partial', or 'uncovered';
   * get_version_coverage_summary returns correct totals and per-criterion detail;
+  * get_criterion_by_key returns the matching criterion or None;
+  * _apply_new_acceptance_criteria creates criteria from the strategist path;
+  * criterion_ids are propagated from direction to spawned task;
+  * test_criterion_evidence_recorded_on_task_merge verifies merge evidence flow;
   * GET /version-lifecycle includes criterion_coverage on current_version and history entries.
 """
 
@@ -265,8 +269,319 @@ async def test_coverage_summary_empty(db_session):
 
 
 # ---------------------------------------------------------------------------
-# Autonomous direction-task criterion propagation and merge evidence recording
+# get_criterion_by_key, criterion_ids propagation, and merge evidence recording
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_criterion_by_key_found(db_session):
+    """get_criterion_by_key returns the criterion when the key exists."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Found it")
+
+    result = await ac.get_criterion_by_key(db_session, version.id, criterion.criterion_key)
+
+    assert result is not None
+    assert result.id == criterion.id
+    assert result.text == "Found it"
+
+
+@pytest.mark.asyncio
+async def test_get_criterion_by_key_missing(db_session):
+    """get_criterion_by_key returns None when the key does not exist."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    result = await ac.get_criterion_by_key(db_session, version.id, "c-notexist")
+
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _apply_new_acceptance_criteria (strategist authoring path)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strategist_criterion_authoring(db_session):
+    """_apply_new_acceptance_criteria creates criteria for the open version."""
+    from app.strategic_completion import _apply_new_acceptance_criteria
+    from app import release_version as rv
+
+    project = Project(
+        name="AC-Strategist",
+        user_id="strat-user",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    criteria_texts = ["All unit tests pass", "No P0 bugs open", "Deploy to staging succeeds"]
+    await _apply_new_acceptance_criteria(criteria_texts, task, project, db_session, path="test")
+
+    fetched = await ac.get_criteria_for_version(db_session, version.id)
+    assert len(fetched) == 3
+    fetched_texts = {c.text for c in fetched}
+    assert "All unit tests pass" in fetched_texts
+    assert "No P0 bugs open" in fetched_texts
+    assert "Deploy to staging succeeds" in fetched_texts
+    for c in fetched:
+        assert c.created_by == "strategist"
+
+
+@pytest.mark.asyncio
+async def test_strategist_criterion_authoring_skips_duplicates(db_session):
+    """_apply_new_acceptance_criteria skips criteria with text already present."""
+    from app.strategic_completion import _apply_new_acceptance_criteria
+    from app import release_version as rv
+
+    project = Project(
+        name="AC-DedupTest",
+        user_id="strat-user2",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    # Pre-create one criterion
+    await ac.create_criterion(db_session, project.id, version.id, "Existing criterion")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Submit the existing text plus a new one
+    await _apply_new_acceptance_criteria(
+        ["Existing criterion", "Brand new criterion"],
+        task,
+        project,
+        db_session,
+        path="test",
+    )
+
+    fetched = await ac.get_criteria_for_version(db_session, version.id)
+    assert len(fetched) == 2  # only one new criterion created
+    fetched_texts = {c.text for c in fetched}
+    assert "Existing criterion" in fetched_texts
+    assert "Brand new criterion" in fetched_texts
+
+
+@pytest.mark.asyncio
+async def test_strategist_criterion_authoring_no_op_when_no_open_version(db_session):
+    """_apply_new_acceptance_criteria is a no-op when no open version exists."""
+    from app.strategic_completion import _apply_new_acceptance_criteria
+
+    project = Project(
+        name="AC-NoVersion",
+        user_id="strat-user3",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Should not raise even with no open version
+    await _apply_new_acceptance_criteria(
+        ["Test criterion"], task, project, db_session, path="test"
+    )
+
+
+# ---------------------------------------------------------------------------
+# criterion_ids propagation from direction to spawned task
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_criterion_ids_propagated_from_direction(db_session):
+    """get_direction_row returns the ORM row with criterion_keys accessible."""
+    from app.directions_repo import get_direction_row
+
+    project = await _make_project(db_session, "CriterionPropagation")
+    version = await _make_version(db_session, project)
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Criterion A")
+    c2 = await ac.create_criterion(db_session, project.id, version.id, "Criterion B")
+
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-testdir1",
+        data={"id": "d-testdir1", "text": "Test direction", "status": "active"},
+        status="active",
+        text="Test direction",
+        criterion_keys=[c1.criterion_key, c2.criterion_key],
+    )
+    db_session.add(direction)
+    await db_session.commit()
+    await db_session.refresh(direction)
+
+    row = await get_direction_row(db_session, project.id, "d-testdir1")
+
+    assert row is not None
+    assert set(row.criterion_keys) == {c1.criterion_key, c2.criterion_key}
+
+
+@pytest.mark.asyncio
+async def test_spawn_task_copies_criterion_ids_from_direction(db_session):
+    """criterion_ids on the spawned Task match the direction's criterion_keys.
+
+    Exercises the propagation logic in admin_agent_ops.spawn_task: when a direction
+    row has criterion_keys, those keys are copied verbatim into the new Task's
+    criterion_ids field.
+    """
+    from app.directions_repo import get_direction_row
+
+    project = await _make_project(db_session, "SpawnPropagation")
+    version = await _make_version(db_session, project)
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Feature complete")
+    c2 = await ac.create_criterion(db_session, project.id, version.id, "Rollback tested")
+
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-spawn-prop",
+        data={"id": "d-spawn-prop", "text": "Spawn propagation test", "status": "active"},
+        status="active",
+        text="Spawn propagation test",
+        criterion_keys=[c1.criterion_key, c2.criterion_key],
+    )
+    db_session.add(direction)
+    await db_session.commit()
+    await db_session.refresh(direction)
+
+    # Replicate exactly what admin_agent_ops.spawn_task does:
+    # look up the direction row and copy criterion_keys to the new task.
+    dir_row = await get_direction_row(db_session, project.id, "d-spawn-prop")
+    task_criterion_ids: list[str] = []
+    if dir_row is not None and dir_row.criterion_keys:
+        task_criterion_ids = list(dir_row.criterion_keys)
+
+    spawned = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "implement feature"}],
+        context={"direction_id": "d-spawn-prop"},
+        criterion_ids=task_criterion_ids,
+    )
+    db_session.add(spawned)
+    await db_session.commit()
+    await db_session.refresh(spawned)
+
+    assert set(spawned.criterion_ids) == {c1.criterion_key, c2.criterion_key}
+
+
+@pytest.mark.asyncio
+async def test_get_direction_row_returns_none_for_missing(db_session):
+    """get_direction_row returns None when the direction does not exist."""
+    from app.directions_repo import get_direction_row
+
+    project = await _make_project(db_session, "MissingDir")
+
+    row = await get_direction_row(db_session, project.id, "d-doesnotexist")
+    assert row is None
+
+
+# ---------------------------------------------------------------------------
+# test_criterion_evidence_recorded_on_task_merge
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_criterion_evidence_recorded_on_task_merge(db_session):
+    """CriterionEvidence rows are created for each criterion_id after a task merge.
+
+    Exercises the merge-evidence path: given a Task with criterion_ids pointing
+    to real VersionAcceptanceCriterion rows, calling get_criterion_by_key and
+    record_evidence (as ci_completion does after apply_merged_landed_signal)
+    produces CriterionEvidence rows with source_kind='task_merge'.
+    """
+    project = await _make_project(db_session, "MergeEvidence")
+    version = await _make_version(db_session, project)
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Tests green")
+    c2 = await ac.create_criterion(db_session, project.id, version.id, "Docs updated")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "implement X"}],
+        context={"direction_id": "d-abc"},
+        criterion_ids=[c1.criterion_key, c2.criterion_key],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Simulate the ci_completion evidence-recording loop.
+    ci_pr_number = 42
+    for ckey in task.criterion_ids:
+        crit = await ac.get_criterion_by_key(db_session, version.id, ckey)
+        assert crit is not None, f"criterion_key {ckey} must resolve"
+        await ac.record_evidence(
+            db_session,
+            criterion_id=crit.id,
+            project_id=task.project_id,
+            source_kind="task_merge",
+            source_id=str(task.id),
+            detail={"pr": ci_pr_number},
+        )
+
+    # Both criteria must now have task_merge evidence.
+    ev1 = await ac.get_evidence_for_criterion(db_session, c1.id)
+    ev2 = await ac.get_evidence_for_criterion(db_session, c2.id)
+
+    assert len(ev1) == 1, "c1 must have exactly one evidence record"
+    assert ev1[0].source_kind == "task_merge"
+    assert ev1[0].source_id == str(task.id)
+    assert ev1[0].detail == {"pr": ci_pr_number}
+
+    assert len(ev2) == 1, "c2 must have exactly one evidence record"
+    assert ev2[0].source_kind == "task_merge"
+
+    # The ci_completion path records a bare badge (detail={"pr": N}) without
+    # proven=True, so coverage is 'partial' not 'covered'.  Only
+    # record_task_merge_evidence (the acceptance-gate path) records proven=True.
+    assert ac.compute_criterion_coverage(ev1) == "partial"
+    assert ac.compute_criterion_coverage(ev2) == "partial"
+
+    # Summary must reflect evidence is present but not proven.
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["total"] == 2
+    assert summary["covered"] == 0
+    assert summary["partial"] == 2
+    assert summary["uncovered"] == 0
 
 
 @pytest.mark.asyncio
@@ -350,6 +665,102 @@ async def test_autonomous_direction_task_inherits_criterion_ids_and_records_evid
 
 
 # ---------------------------------------------------------------------------
+# spawn_task endpoint-level criterion_ids propagation test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_spawn_task_endpoint_propagates_criterion_ids(
+    client: AsyncClient, db_session
+):
+    """POST /api/agent/strategic spawn_task propagates direction.criterion_keys to Task.criterion_ids.
+
+    This is an endpoint-level regression test: it calls the real strategic
+    handler via HTTP so a code change that stops passing criterion_ids from
+    direction → spawned task will fail here, unlike the unit test that
+    replicates the internal logic by hand.
+    """
+    from app.auth import create_agent_token
+
+    # Create project (no member row needed — agent token auth bypasses member check)
+    project = Project(name="SpawnEndpointCriterion", user_id="test-user-se")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create an open release version and two criteria
+    version = await _make_version(db_session, project)
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "CI passes")
+    c2 = await ac.create_criterion(db_session, project.id, version.id, "Docs updated")
+
+    # Create a Direction row with criterion_keys AND mirror it in project.directions
+    # (spawn_task validates direction_id against project.directions JSONB blob)
+    direction_key = "d-spawn-endpoint-crit"
+    direction = Direction(
+        project_id=project.id,
+        direction_key=direction_key,
+        data={
+            "id": direction_key,
+            "text": "Improve stability",
+            "status": "active",
+        },
+        status="active",
+        text="Improve stability",
+        criterion_keys=[c1.criterion_key, c2.criterion_key],
+    )
+    db_session.add(direction)
+    # Mirror in project.directions so spawn_task's direction_id validation passes
+    project.directions = [{"id": direction_key, "text": "Improve stability", "status": "active"}]
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create strategic review task
+    strategic_task = Task(
+        project_id=project.id,
+        title="Strategic review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-spawn-endpoint-crit",
+    )
+    db_session.add(strategic_task)
+    await db_session.commit()
+    await db_session.refresh(strategic_task)
+
+    token = create_agent_token(
+        str(strategic_task.id),
+        "agent-vm-spawn-endpoint-crit",
+        task_type="strategic_review",
+    )
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(strategic_task.id),
+            "op": "spawn_task",
+            "data": {
+                "type": "research",
+                "prompt": "investigate stability regression",
+                "title": "Stability research",
+                "direction_id": direction_key,
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["op"] == "spawn_task"
+
+    child_id = uuid.UUID(body["task_id"])
+    child = await db_session.get(Task, child_id)
+    assert child is not None, "spawned task must be persisted"
+    assert set(child.criterion_ids) == {
+        c1.criterion_key,
+        c2.criterion_key,
+    }, f"criterion_ids must match direction.criterion_keys; got {child.criterion_ids}"
+
+
+# ---------------------------------------------------------------------------
 # GET /version-lifecycle includes criterion_coverage
 # ---------------------------------------------------------------------------
 
@@ -407,11 +818,13 @@ class TestVersionLifecycleCriterionCoverage:
         c1 = await ac.create_criterion(
             db_session, project.id, version.id, "All tests pass"
         )
+        # Use source_kind="reachability" which always satisfies _evidence_proves_covered.
+        # A bare task_merge without proven=True only gives 'partial', not 'covered'.
         await ac.record_evidence(
             db_session,
             criterion_id=c1.id,
             project_id=project.id,
-            source_kind="task_merge",
+            source_kind="reachability",
         )
         c2 = await ac.create_criterion(
             db_session, project.id, version.id, "Docs updated"

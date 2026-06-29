@@ -38,6 +38,7 @@ from app.models import (
     ProjectMessage,
     MessageType,
     MessagesLastSeen,
+    Direction,
     SystemMaturity,
     WakeDeliveryState,
     _on_task_terminal_callbacks,
@@ -9319,6 +9320,148 @@ class TestSetVersionGoal:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# admin_acceptance_criteria.py — Version Acceptance Criteria
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestAcceptanceCriteriaRouter:
+    @pytest.mark.asyncio
+    async def test_acceptance_criteria_router_happy_path(
+        self, client: AsyncClient, db_session
+    ):
+        """List, create, and criterion-key updates work over the HTTP routes."""
+        project = await _make_project(db_session, name="Acceptance Criteria")
+        await _make_open_version(db_session, project.id)
+        direction = Direction(
+            project_id=project.id,
+            direction_key="d-criteria",
+            status="active",
+            text="Acceptance criteria direction",
+            data={
+                "id": "d-criteria",
+                "status": "active",
+                "text": "Acceptance criteria direction",
+            },
+            criterion_keys=[],
+        )
+        db_session.add(direction)
+        await db_session.commit()
+
+        list_resp = await client.get(
+            f"/api/admin/projects/{project.id}/acceptance-criteria"
+        )
+        assert list_resp.status_code == 200, list_resp.text
+        summary = list_resp.json()
+        assert summary == {
+            "total": 0,
+            "covered": 0,
+            "partial": 0,
+            "uncovered": 0,
+            "criteria": [],
+        }
+
+        create_resp = await client.post(
+            f"/api/admin/projects/{project.id}/acceptance-criteria",
+            json={"text": "  Ship with zero P0 bugs  "},
+        )
+        assert create_resp.status_code == 200, create_resp.text
+        criterion_key = create_resp.json()["criterion_key"]
+        assert criterion_key.startswith("c-")
+
+        list_resp = await client.get(
+            f"/api/admin/projects/{project.id}/acceptance-criteria"
+        )
+        assert list_resp.status_code == 200, list_resp.text
+        summary = list_resp.json()
+        assert summary["total"] == 1
+        assert summary["covered"] == 0
+        assert summary["partial"] == 0
+        assert summary["uncovered"] == 1
+        assert summary["criteria"][0]["criterion_key"] == criterion_key
+        assert summary["criteria"][0]["text"] == "Ship with zero P0 bugs"
+
+        patch_resp = await client.patch(
+            f"/api/admin/projects/{project.id}/directions/d-criteria/criterion-keys",
+            json={"criterion_keys": [criterion_key]},
+        )
+        assert patch_resp.status_code == 200, patch_resp.text
+        assert patch_resp.json() == {
+            "direction_key": "d-criteria",
+            "criterion_keys": [criterion_key],
+        }
+
+        await db_session.refresh(direction)
+        assert direction.criterion_keys == [criterion_key]
+
+    @pytest.mark.asyncio
+    async def test_acceptance_criteria_router_validation_and_role_checks(
+        self, client: AsyncClient, db_session
+    ):
+        """Bad inputs are rejected and viewer-role callers cannot mutate."""
+        from app.auth import get_current_user as _gcu
+
+        project = await _make_project(db_session, name="Acceptance Criteria Guards")
+        await _make_open_version(db_session, project.id)
+        direction = Direction(
+            project_id=project.id,
+            direction_key="d-criteria-guards",
+            status="active",
+            text="Guarded direction",
+            data={
+                "id": "d-criteria-guards",
+                "status": "active",
+                "text": "Guarded direction",
+            },
+            criterion_keys=[],
+        )
+        db_session.add(direction)
+        await db_session.commit()
+
+        empty_resp = await client.post(
+            f"/api/admin/projects/{project.id}/acceptance-criteria",
+            json={"text": "   "},
+        )
+        assert empty_resp.status_code == 400
+        assert "must not be empty" in empty_resp.text
+
+        bad_patch = await client.patch(
+            f"/api/admin/projects/{project.id}/directions/d-criteria-guards/criterion-keys",
+            json={"criterion_keys": ["c-not-a-real-key"]},
+        )
+        assert bad_patch.status_code == 422
+        assert "Unknown criterion_key" in bad_patch.text
+
+        viewer_id = "viewer-ac-guard"
+
+        async def viewer_user():
+            return {
+                "user_id": viewer_id,
+                "email": "viewer-ac-guard@example.com",
+                "role": "user",
+            }
+
+        db_session.add(
+            ProjectMember(project_id=project.id, user_id=viewer_id, role="viewer")
+        )
+        await db_session.commit()
+        app.dependency_overrides[_gcu] = viewer_user
+        try:
+            forbidden_create = await client.post(
+                f"/api/admin/projects/{project.id}/acceptance-criteria",
+                json={"text": "Viewer cannot write this"},
+            )
+            assert forbidden_create.status_code == 403
+
+            forbidden_patch = await client.patch(
+                f"/api/admin/projects/{project.id}/directions/d-criteria-guards/criterion-keys",
+                json={"criterion_keys": []},
+            )
+            assert forbidden_patch.status_code == 403
+        finally:
+            app.dependency_overrides.pop(_gcu, None)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # admin_release_version.py — Cut/Abandon Version
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -12283,8 +12426,8 @@ class TestVersionLifecycleAcceptanceAggregate:
     async def test_verdict_row_exposes_acceptance_aggregate_key(
         self, client: AsyncClient, db_session
     ):
-        """Each qualification-verdict row carries acceptance_aggregate (None
-        default) without disturbing the existing verdict fields."""
+        """Each qualification-verdict row omits the retired acceptance_aggregate
+        key without disturbing the existing verdict fields."""
         from app.models import QualificationVerdict
 
         project = await _make_project(db_session)
@@ -12309,15 +12452,14 @@ class TestVersionLifecycleAcceptanceAggregate:
         assert resp.status_code == 200, resp.text
         verdicts = resp.json()["verdicts"]
         assert len(verdicts) == 1
-        assert "acceptance_aggregate" in verdicts[0]
-        assert verdicts[0]["acceptance_aggregate"] is None
+        assert "acceptance_aggregate" not in verdicts[0]
         assert verdicts[0]["candidate_sha"] == "aggsha456"
 
     @pytest.mark.asyncio
     async def test_verdict_row_surfaces_stored_acceptance_aggregate_after_reload(
         self, client: AsyncClient, db_session
     ):
-        """qualification-verdict rows read acceptance_aggregate back out of the
+        """qualification-verdict rows scrub acceptance_aggregate from the
         persisted JSON-backed evidence payload after reload."""
         from app.models import QualificationVerdict
 
@@ -12354,7 +12496,8 @@ class TestVersionLifecycleAcceptanceAggregate:
         assert resp.status_code == 200, resp.text
         verdicts = resp.json()["verdicts"]
         assert len(verdicts) == 1
-        assert verdicts[0]["acceptance_aggregate"] == aggregate
+        assert "acceptance_aggregate" not in verdicts[0]
+        assert verdicts[0]["sub_scores"] == {}
         assert verdicts[0]["candidate_sha"] == "aggsha789"
 
 

@@ -2203,6 +2203,16 @@ async def strategic_operation(
         if direction_id:
             new_task_ctx["direction_id"] = direction_id
 
+        # Resolve criterion_keys from the direction row so they propagate to the
+        # spawned task's criterion_ids field.
+        _task_criterion_ids: list[str] = []
+        if direction_id:
+            from app.directions_repo import get_direction_row as _get_direction_row
+
+            _dir_row = await _get_direction_row(session, project.id, direction_id)
+            if _dir_row is not None and _dir_row.criterion_keys:
+                _task_criterion_ids = list(_dir_row.criterion_keys)
+
         new_task = Task(
             project_id=project.id,
             title=title,
@@ -2213,6 +2223,7 @@ async def strategic_operation(
             priority=100,  # ahead of default (50) — course-correction runs first
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             created_by="STRATEGIC_AGENT",
+            criterion_ids=_task_criterion_ids,
             **(
                 {"requires_approval": spawn_requires_approval}
                 if spawn_requires_approval is not None
@@ -2497,6 +2508,7 @@ async def strategic_operation(
         from app import strategic_cycle as _strategic_cycle
         from app.problem_model import apply_agent_update, operator_owned_subset
         from app.strategic_completion import (
+            NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
             NEW_VERSION_GOAL_CONTEXT_KEY,
             QUALIFY_REQUEST_CONTEXT_KEY,
             VERSION_PHASE_DECISION_CONTEXT_KEY,
@@ -2527,6 +2539,16 @@ async def strategic_operation(
         new_version_goal = extract_new_version_goal(
             pm_data.pop("new_version_goal", None)
         )
+        # new_acceptance_criteria: optional list of strings the strategist wants to
+        # create as version-scoped acceptance criteria. Lifted out before
+        # apply_agent_update validates (ProblemModel is extra="forbid"). The list
+        # rides task.context and is applied at strategic completion.
+        _raw_nac = pm_data.pop("new_acceptance_criteria", None)
+        new_acceptance_criteria: list[str] | None = None
+        if isinstance(_raw_nac, list):
+            cleaned_nac = [str(t).strip() for t in _raw_nac if isinstance(t, str) and str(t).strip()]
+            if cleaned_nac:
+                new_acceptance_criteria = cleaned_nac
         # Resolve the cycle's baseline problem model (snapshot at spawn) so a
         # concurrent operator edit to an operator-owned field is merged
         # operator-wins rather than silently clobbered. Mirrors the vision
@@ -2606,6 +2628,8 @@ async def strategic_operation(
             new_ctx[QUALIFY_REQUEST_CONTEXT_KEY] = qualify_request
         if new_version_goal is not None:
             new_ctx[NEW_VERSION_GOAL_CONTEXT_KEY] = new_version_goal
+        if new_acceptance_criteria is not None:
+            new_ctx[NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY] = new_acceptance_criteria
         task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)
@@ -2638,6 +2662,13 @@ async def strategic_operation(
                 "task %s — applied to open version at strategic completion",
                 task.id,
             )
+        if new_acceptance_criteria is not None:
+            logger.info(
+                "[STRATEGIC API] new_acceptance_criteria (%d items) routed to task.context "
+                "for task %s — criteria created at strategic completion",
+                len(new_acceptance_criteria),
+                task.id,
+            )
         return _resp(
             {
                 "status": "ok",
@@ -2647,6 +2678,7 @@ async def strategic_operation(
                 "version_phase_decision_received": version_phase_decision is not None,
                 "qualify_request_received": qualify_request is not None,
                 "new_version_goal_received": new_version_goal is not None,
+                "new_acceptance_criteria_received": new_acceptance_criteria is not None,
             }
         )
 

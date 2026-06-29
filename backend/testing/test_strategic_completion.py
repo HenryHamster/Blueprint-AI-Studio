@@ -8290,6 +8290,147 @@ async def test_set_problem_model_with_qualify_request_does_not_400(client, db_se
     assert body["qualify_request_received"] is True
 
 
+# ── new_acceptance_criteria transport / fallback ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_handle_strategic_completion_applies_new_acceptance_criteria_from_logs(
+    db_session, mocker
+):
+    """Fallback completion output must author version-scoped criteria."""
+    from unittest.mock import AsyncMock
+    from app import acceptance_criteria as ac
+    from app import release_version as rv
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="NAC-FALLBACK",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    db_session.add(version)
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "new_acceptance_criteria": [
+                "All unit tests pass",
+                "No unresolved P0 bugs",
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    fetched = await ac.get_criteria_for_version(db_session, version.id)
+    assert [c.text for c in fetched] == [
+        "All unit tests pass",
+        "No unresolved P0 bugs",
+    ]
+    assert all(c.created_by == "strategist" for c in fetched)
+
+
+@pytest.mark.asyncio
+async def test_set_problem_model_lifts_new_acceptance_criteria_api_path(
+    client, db_session
+):
+    """The API seam must strip, stow, and later apply new_acceptance_criteria."""
+    from app import acceptance_criteria as ac
+    from app import release_version as rv
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app.strategic_completion import (
+        NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
+        _handle_strategic_completion,
+    )
+    from app import strategic_cycle
+
+    project = Project(
+        name="NAC-E2E",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-nac-e2e",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-nac-e2e", task_type="strategic_review")
+    criteria_texts = [
+        "All unit tests pass",
+        "No unresolved P0 bugs",
+    ]
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {"purpose": "Ship the thing", "current_focus": "build"},
+                "capabilities": [],
+                "gaps": [],
+                "new_acceptance_criteria": criteria_texts,
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["op"] == "set_problem_model"
+    assert body["new_acceptance_criteria_received"] is True
+
+    await db_session.refresh(project)
+    assert "new_acceptance_criteria" not in (project.problem_model or {})
+
+    await db_session.refresh(task)
+    stored = (task.context or {}).get(NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY)
+    assert stored == criteria_texts
+
+    await _handle_strategic_completion(task, "", db_session)
+
+    fetched = await ac.get_criteria_for_version(db_session, version.id)
+    assert [c.text for c in fetched] == criteria_texts
+    assert all(c.created_by == "strategist" for c in fetched)
+
+
 # ── _compute_lifetime_burn_metrics ───────────────────────────────────────────
 
 

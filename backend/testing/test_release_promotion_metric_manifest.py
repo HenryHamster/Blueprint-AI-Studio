@@ -2,7 +2,7 @@
 
 ``compute_promotion_readiness`` (backend/app/release_readiness.py) returns a
 block of metric fields describing the durable promotion-gate readiness verdict
-(would_promote_rate, validated_precision, acceptance signal, regime annotation).
+(would_promote_rate, validated_precision, regime annotation).
 ``PROMOTION_READINESS_METRIC_MANIFEST`` is the queryable, test-enforced record
 of what each emitted field means, the named ground-truth source it is computed
 from, and who consumes it (or a dated pending/retired reason).
@@ -18,15 +18,10 @@ Mirrors ``test_panel_review_metric_manifest.py``:
 * Every retired/pending entry carries a non-empty reason and an ISO date.
 
 Because ``compute_promotion_readiness`` builds its output via ``out = {...}``
-plus ``out.update(...)`` rather than a single ``return {...}`` literal, the
-emitted-field set is extracted from the two stable shape-defining helpers:
+rather than a single ``return {...}`` literal on every path, the emitted-field
+set is extracted from the stable no-history shape-defining helper:
 * ``_empty_readiness`` — the stable no-history return dict (covers all core
   keys including regime annotation added by ``_annotate_regime``).
-* ``_acceptance_keys`` — the acceptance sub-block merged into every return.
-
-The ``acceptance_caveat`` key is conditional (only emitted when there is a
-caveat string) and must be declared in the manifest but is excluded from the
-stale-consumer check.
 
 The test is DB-free, deterministic, and standalone-smoke compatible.
 """
@@ -37,7 +32,7 @@ import datetime as _dt
 from app import release_readiness
 from app.release_readiness import PROMOTION_READINESS_METRIC_MANIFEST
 
-_CONDITIONAL_FIELDS = frozenset({"acceptance_caveat"})
+_CONDITIONAL_FIELDS = frozenset()
 
 
 def _extract_return_dict_keys(source: str, fn_name: str) -> set[str]:
@@ -70,13 +65,11 @@ def _extract_return_dict_keys(source: str, fn_name: str) -> set[str]:
 
 
 def _emitted_metric_fields() -> set[str]:
-    """Return the union of fields from the two stable shape-defining helpers."""
+    """Return the fields from the stable shape-defining helper."""
     source = open(release_readiness.__file__, encoding="utf-8").read()
     core = _extract_return_dict_keys(source, "_empty_readiness")
     assert core, "AST extraction found no keys in _empty_readiness — extractor is broken"
-    acceptance = _extract_return_dict_keys(source, "_acceptance_keys")
-    assert acceptance, "AST extraction found no keys in _acceptance_keys — extractor is broken"
-    return core | acceptance
+    return core
 
 
 def test_every_emitted_field_has_a_recorded_consumer_or_retirement():

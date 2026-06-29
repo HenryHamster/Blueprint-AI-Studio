@@ -1040,7 +1040,11 @@ ${strategicChallengeSection}
 
    Likewise, if \`new_version_goal\` is already present as a top-level key in \`/tmp/problem_model_${taskId}.json\` (pre-merged from the Thinker's Section 7 output file before this executor pass), it is already set — the \`cat\` in step 1 will carry it through automatically. Do NOT overwrite or re-add it. If it is absent from the file, the Thinker did not set a version goal this cycle; do NOT fabricate one.
 
-   \`version_phase_decision\`, \`qualify_request\`, and \`new_version_goal\` are independent siblings; add whichever the Thinker emitted (any, all, or none).
+   You may also emit \`new_acceptance_criteria\` as a top-level sibling array to author acceptance criteria for the open version:
+   \`{"new_acceptance_criteria": ["All unit tests pass on automain", "No P0 bugs in open state"], ...rest_of_problem_model}\`
+   Each string becomes a new VersionAcceptanceCriterion (duplicates are skipped). Omit the key entirely when no new criteria are needed — absence is the default and means "no new criteria this cycle."
+
+   \`version_phase_decision\`, \`qualify_request\`, \`new_version_goal\`, and \`new_acceptance_criteria\` are independent siblings; add whichever the Thinker emitted (any, all, or none).
 
    Because step 1 passes \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\`, editing the file here is what carries these siblings through — step 1 will re-read the file and the fields will be included. If the file is missing/malformed and you took step 1's fallback (constructing the model inline), include these siblings in that inline JSON instead.
 
