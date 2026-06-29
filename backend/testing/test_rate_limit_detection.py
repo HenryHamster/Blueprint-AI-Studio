@@ -860,6 +860,42 @@ async def test_db_pool_wide_cooldown_returns_false_when_account_potentially_usab
 
 
 @pytest.mark.asyncio
+async def test_db_pool_wide_cooldown_treats_zai_secret_blob_as_runtime_ready(
+    monkeypatch,
+):
+    from datetime import datetime, timedelta
+    from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
+    from app.models import LLMAuthMode, LLMProviderName, MaxPlanAccount
+
+    rl_at = datetime.utcnow() - timedelta(minutes=5)
+    rl_acct = MaxPlanAccount(
+        user_id="u",
+        name="rl",
+        oauth_token="tok-rl",
+        rate_limit_state={
+            "disabled_models": {
+                "claude-sonnet-4-6": {
+                    "at": rl_at.isoformat(),
+                    "hits": 1,
+                    "kind": "rate_limit",
+                }
+            }
+        },
+    )
+    healthy_zai = MaxPlanAccount(
+        user_id="u",
+        name="zai",
+        provider=LLMProviderName.ZAI,
+        auth_mode=LLMAuthMode.API_KEY,
+        secret_blob_ref="projects/test/secrets/zai/versions/1",
+        rate_limit_state=None,
+    )
+    _mock_db_pool(monkeypatch, [rl_acct, healthy_zai])
+
+    assert await db_pool_wide_rate_limit_cooldown(providers=["zai"]) is False
+
+
+@pytest.mark.asyncio
 async def test_db_pool_wide_cooldown_returns_false_when_all_accounts_credentialless(
     monkeypatch,
 ):

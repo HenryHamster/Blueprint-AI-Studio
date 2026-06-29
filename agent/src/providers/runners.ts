@@ -17,9 +17,11 @@ import {
 } from '../index.js';
 import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper } from '../prompt.js';
 
-export type ProviderName = 'anthropic' | 'openai' | 'gemini';
+export type ProviderName = 'anthropic' | 'openai' | 'gemini' | 'zai';
 export type AuthMode = 'oauth' | 'api_key' | 'service_account';
 export type OutputMode = 'claude-stream-json' | 'codex-jsonl' | 'text';
+
+const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
 
 const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode, readonly string[]>>>> = {
   anthropic: {
@@ -90,14 +92,27 @@ const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode
       'please refer to https://cloud.google.com/vertex-ai/generative-ai/docs/error-code-429',
     ],
   },
+  zai: {
+    api_key: [
+      'rate limit exceeded',
+      'rate_limit',
+      'too many requests',
+      'api error: rate limit',
+      'api error: 429',
+      'status 429',
+      'quota exceeded',
+      'api usage exhausted',
+    ],
+  },
 } as const;
 
 function normalizeProvider(raw: string | undefined): ProviderName {
-  if (raw === 'openai' || raw === 'gemini') return raw;
+  if (raw === 'openai' || raw === 'gemini' || raw === 'zai') return raw;
   return 'anthropic';
 }
 
 function normalizeAuthMode(raw: string | undefined, provider: ProviderName): AuthMode {
+  if (provider === 'zai') return 'api_key';
   if (provider === 'gemini' && raw === 'service_account') return raw;
   if (raw === 'api_key' || raw === 'oauth') return raw;
   if (provider === 'gemini') return 'api_key';
@@ -145,14 +160,14 @@ export function refreshRuntimeState(): void {
 /**
  * Whether the active provider exposes a native sub-agent / Task fan-out
  * primitive that lets a single orchestrating pass run several independent
- * review passes in parallel. Only Claude Code (anthropic) ships the
- * Task/Agent tool; codex and gemini have no equivalent, so callers that
- * depend on native fan-out (e.g. the panel_review handler) must fall back to a
- * serial path for those providers. This is the single source of truth for "is
- * the native fan-out primitive available" — detect availability, never assume.
+ * review passes in parallel. Claude Code-backed providers expose the
+ * Task/Agent tool; codex and gemini have no equivalent, so callers that depend
+ * on native fan-out (e.g. the panel_review handler) must fall back to a serial
+ * path for those providers. This is the single source of truth for "is the
+ * native fan-out primitive available" — detect availability, never assume.
  */
 export function providerSupportsNativeSubagents(provider: ProviderName = PROVIDER): boolean {
-  return provider === 'anthropic';
+  return provider === 'anthropic' || provider === 'zai';
 }
 
 function getRateLimitPatterns(provider: ProviderName, authMode: AuthMode): readonly string[] {
@@ -238,6 +253,14 @@ const AUTH_FAILURE_PATTERNS: Readonly<Record<ProviderName, readonly string[]>> =
     'unauthenticated',
     'permission_denied',
     'invalid authentication credentials',
+  ],
+  zai: [
+    'api key not valid',
+    'invalid z.ai api key',
+    'invalid zai api key',
+    'missing api key',
+    'x-api-key header is required',
+    'invalid x-api-key',
   ],
 } as const;
 
@@ -461,7 +484,7 @@ export interface ProviderRunner {
   missingCredentials(): string[];
 }
 
-function buildBaseCliEnv(): Record<string, string> {
+function buildBaseCliEnv(provider: ProviderName = PROVIDER): Record<string, string> {
   const env: Record<string, string> = {
     HOME: process.env.HOME || '/home/agent',
     PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
@@ -471,6 +494,11 @@ function buildBaseCliEnv(): Record<string, string> {
   for (const key of [
     'CLAUDE_CODE_OAUTH_TOKEN',
     'ANTHROPIC_API_KEY',
+    'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_BASE_URL',
+    'ZAI_API_KEY',
+    'ZAI_ANTHROPIC_BASE_URL',
+    'ZAI_BASE_URL',
     'OPENAI_API_KEY',
     'CODEX_API_KEY',
     'CODEX_HOME',
@@ -491,6 +519,14 @@ function buildBaseCliEnv(): Record<string, string> {
     for (const [k, v] of Object.entries(LLM_CLI_TRANSLATION.env)) {
       if (!(k in env)) env[k] = v;
     }
+  }
+  if (provider === 'zai') {
+    if (env.ZAI_API_KEY) {
+      env.ANTHROPIC_API_KEY = env.ZAI_API_KEY;
+      env.ANTHROPIC_AUTH_TOKEN = env.ZAI_API_KEY;
+    }
+    const baseUrl = env.ANTHROPIC_BASE_URL || env.ZAI_ANTHROPIC_BASE_URL || env.ZAI_BASE_URL || ZAI_ANTHROPIC_BASE_URL;
+    env.ANTHROPIC_BASE_URL = baseUrl.replace(/\/+$/, '');
   }
   return env;
 }
@@ -523,7 +559,8 @@ function appendBoundedTail(current: string, chunk: string, maxBytes: number): st
 }
 
 export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: AuthMode = AUTH_MODE): ProviderRunner {
-  const baseEnv = buildBaseCliEnv();
+  if (provider === 'zai') authMode = 'api_key';
+  const baseEnv = buildBaseCliEnv(provider);
   if (provider === 'openai') {
     return {
       provider,
@@ -599,12 +636,20 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
       },
     };
   }
+  const isZai = provider === 'zai';
+  const claudeDisplayName = isZai ? 'Z.AI GLM (Claude compat)' : 'Claude Code';
   return {
-    provider: 'anthropic',
+    provider: isZai ? 'zai' : 'anthropic',
     authMode,
-    displayName: 'Claude Code',
-    credentialSummary: () => baseEnv.CLAUDE_CODE_OAUTH_TOKEN ? 'Using OAuth token for Claude Code auth' : 'Using ANTHROPIC_API_KEY as fallback auth',
-    missingCredentials: () => (baseEnv.CLAUDE_CODE_OAUTH_TOKEN || baseEnv.ANTHROPIC_API_KEY) ? [] : ['CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY'],
+    displayName: claudeDisplayName,
+    credentialSummary: () => {
+      if (isZai) return 'Using ZAI_API_KEY via the Anthropic-compatible endpoint';
+      return baseEnv.CLAUDE_CODE_OAUTH_TOKEN ? 'Using OAuth token for Claude Code auth' : 'Using ANTHROPIC_API_KEY as fallback auth';
+    },
+    missingCredentials: () => {
+      if (isZai) return (baseEnv.ZAI_API_KEY || baseEnv.ANTHROPIC_API_KEY) ? [] : ['ZAI_API_KEY'];
+      return (baseEnv.CLAUDE_CODE_OAUTH_TOKEN || baseEnv.ANTHROPIC_API_KEY) ? [] : ['CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY'];
+    },
     buildRunCommand: (_prompt, model, effort, disallowedTools) => {
       // --include-partial-messages emits incremental `stream_event` lines
       // (content_block_delta text / thinking_delta) DURING a model turn. Without
@@ -638,7 +683,7 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
         outputMode: 'claude-stream-json',
         timeoutMs: claudeTimeoutForEffort(effectiveEffort),
         promptInput: 'stdin-file',
-        displayName: 'Claude Code',
+        displayName: claudeDisplayName,
       };
     },
     buildValidationCommand: () => ({

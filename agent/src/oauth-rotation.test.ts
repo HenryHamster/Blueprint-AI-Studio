@@ -58,13 +58,47 @@ describe('rotateOAuthCredentialsIfChanged', () => {
     mockReadFileSync
       .mockReturnValueOnce(Buffer.from('new-token-data'))
       .mockReturnValueOnce('new-token-data');
-    const apiPostFn = vi.fn().mockResolvedValue(undefined);
+    const apiPostFn = vi.fn().mockResolvedValue({ rotated: true });
     // recordInitialOAuthAuthHash sets initial hash to something different (null = no prior hash)
     await rotateOAuthCredentialsIfChanged('task-1', apiPostFn);
     expect(apiPostFn).toHaveBeenCalledWith(
       '/api/agent/credentials/rotate',
       expect.objectContaining({ task_id: 'task-1' }),
     );
+  });
+
+  it('posts taskless rotations for pool pre-claim validation', async () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync
+      .mockReturnValueOnce(Buffer.from('pool-token-data'))
+      .mockReturnValueOnce('pool-token-data');
+    const apiPostFn = vi.fn().mockResolvedValue({ rotated: true });
+
+    await rotateOAuthCredentialsIfChanged('', apiPostFn);
+
+    expect(apiPostFn).toHaveBeenCalledWith(
+      '/api/agent/credentials/rotate',
+      expect.objectContaining({ task_id: '', secret: 'pool-token-data' }),
+    );
+  });
+
+  it('does not advance the baseline when the backend reports a no-op', async () => {
+    mockExistsSync.mockReturnValue(true);
+    mockReadFileSync
+      .mockReturnValueOnce(Buffer.from('first-token-data'))
+      .mockReturnValueOnce('first-token-data')
+      .mockReturnValueOnce(Buffer.from('first-token-data'))
+      .mockReturnValueOnce('first-token-data');
+    const apiPostFn = vi.fn()
+      .mockResolvedValueOnce({ rotated: false, reason: 'pool VM has no LLM runtime context' })
+      .mockResolvedValueOnce({ rotated: true });
+
+    await expect(rotateOAuthCredentialsIfChanged('', apiPostFn)).rejects.toThrow(
+      /did not persist/,
+    );
+    await rotateOAuthCredentialsIfChanged('', apiPostFn);
+
+    expect(apiPostFn).toHaveBeenCalledTimes(2);
   });
 
   it('follows refreshed provider/auth runtime after a retarget', async () => {
@@ -87,6 +121,7 @@ describe('rotateOAuthCredentialsIfChanged', () => {
     mockReadFileSync
       .mockReturnValueOnce(Buffer.from('retargeted-token-data'))
       .mockReturnValueOnce('retargeted-token-data');
+    apiPostFn.mockResolvedValueOnce({ rotated: true });
     await rotateOAuthCredentialsIfChanged('task-openai', apiPostFn);
     expect(apiPostFn).toHaveBeenCalledWith(
       '/api/agent/credentials/rotate',

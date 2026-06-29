@@ -1613,11 +1613,10 @@ def _db_account_runtime_ready(acct: Any) -> bool:
     determine whether an enabled account is *potentially* usable (i.e., has runtime
     credentials) from a DB row alone, without consulting the in-memory pool.
 
-    For Anthropic OAuth (the only currently-runnable v1 path) this is `oauth_token`.
-    Other provider/auth combinations are stored for future use; their runtime
-    readiness is in-memory-only state (set by ensure_runtime_credentials during pool
-    init), so from a DB row we cannot prove they're ready — treat them as not-ready
-    to stay consistent with the in-memory classifier's failure-open behavior.
+    For legacy Anthropic OAuth this is `oauth_token`. For multi-provider
+    account secrets stored through the provider abstraction, this is
+    `secret_blob_ref`; DB-side cooldown classification only needs to know that
+    credentials exist, not materialize the secret itself.
     """
     try:
         provider = getattr(acct.provider, "value", str(acct.provider or "")).lower()
@@ -1627,6 +1626,11 @@ def _db_account_runtime_ready(acct: Any) -> bool:
             and auth_mode == LLMAuthMode.OAUTH.value
         ):
             return bool(acct.oauth_token)
+        if (
+            provider == LLMProviderName.ZAI.value
+            and auth_mode == LLMAuthMode.API_KEY.value
+        ):
+            return bool(acct.secret_blob_ref)
         return False
     except Exception:
         return False

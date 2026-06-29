@@ -477,7 +477,7 @@ async def _check_external_health():
     if result:
         failed.append(result)
 
-    for provider_name in ("anthropic", "openai", "gemini"):
+    for provider_name in ("anthropic", "openai", "gemini", "zai"):
         result = check_provider_api_health(ext, provider_name)
         if result:
             failed.append(result)
@@ -521,6 +521,7 @@ async def _check_external_health():
         "anthropic_api",
         "openai_api",
         "gemini_api",
+        "zai_api",
         "dispatch_api",
         "gcp",
         "db",
@@ -756,6 +757,7 @@ async def _check_pause_mode():
                 "anthropic_api",
                 "openai_api",
                 "gemini_api",
+                "zai_api",
             )
             consec_map = ext.get("consecutive_failures", {}) or {}
             failed_set = set(failed)

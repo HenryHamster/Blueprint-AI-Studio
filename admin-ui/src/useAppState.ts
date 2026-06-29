@@ -404,7 +404,7 @@ export function useAppState() {
         if (showActivityFeed) { setShowActivityFeed(false); return; }
         if (showMessages) { setShowMessages(false); return; }
         if (showArchive) { setShowArchive(false); return; }
-        if (activeTab === 'directions') { setActiveTab('home'); return; }
+        if (activeTab === 'directions') { setActiveTab('cockpit'); return; }
         if (showMetrics) { setShowMetrics(false); return; }
         if (showSettings) { setShowSettings(false); return; }
         return;
@@ -467,7 +467,7 @@ export function useAppState() {
           setActiveTab('board');
           break;
         case '3':
-          setActiveTab('home');
+          setActiveTab('cockpit');
           break;
         case 'd':
           setActiveTab('directions');

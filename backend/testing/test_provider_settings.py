@@ -27,6 +27,7 @@ async def test_get_settings_includes_provider_scaffolding(client):
     # _default routing is the global allow-list + effort fallback.
     assert body["category_routing"]["_default"]["providers"] == [
         "anthropic",
+        "zai",
         "openai",
         "gemini",
     ]
@@ -56,8 +57,9 @@ async def test_get_provider_catalog_route_returns_provider_schema(client):
     assert res.status_code == 200
     body = res.json()
     assert "providers" in body
-    assert set(body["providers"].keys()) == {"anthropic", "openai", "gemini"}
+    assert set(body["providers"].keys()) == {"anthropic", "openai", "gemini", "zai"}
     assert "oauth" in body["providers"]["openai"]["auth_modes"]
+    assert list(body["providers"]["zai"]["auth_modes"].keys()) == ["api_key"]
     # Schema for the settings bag is exposed per provider.
     assert body["providers"]["anthropic"]["settings_schema"]["type"] == "object"
 

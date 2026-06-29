@@ -339,6 +339,11 @@ runtime_config: Dict = {
             "sonnet": "gemini-2.5-flash",
             "haiku": "gemini-2.5-flash-lite",
         },
+        "zai": {
+            "opus": "glm-5.2",
+            "sonnet": "glm-5.2",
+            "haiku": "glm-5.2",
+        },
     },
     # Task-type categories group related types so one routing entry covers
     # the whole group. Every task type listed here falls under the matching
@@ -355,13 +360,25 @@ runtime_config: Dict = {
     # concrete settings bag (including model).
     "category_routing": {
         "_default": {
-            "providers": ["anthropic", "openai", "gemini"],
+            "providers": ["anthropic", "zai", "openai", "gemini"],
             "effort": "medium",
         },
-        "strategic": {"providers": ["anthropic", "openai", "gemini"], "effort": "max"},
-        "build": {"providers": ["anthropic", "openai", "gemini"], "effort": "medium"},
-        "review": {"providers": ["anthropic", "openai", "gemini"], "effort": "high"},
-        "ops": {"providers": ["anthropic", "openai", "gemini"], "effort": "low"},
+        "strategic": {
+            "providers": ["anthropic", "zai", "openai", "gemini"],
+            "effort": "max",
+        },
+        "build": {
+            "providers": ["anthropic", "zai", "openai", "gemini"],
+            "effort": "medium",
+        },
+        "review": {
+            "providers": ["anthropic", "zai", "openai", "gemini"],
+            "effort": "high",
+        },
+        "ops": {
+            "providers": ["anthropic", "zai", "openai", "gemini"],
+            "effort": "low",
+        },
     },
     # Sparse per-task-type routing overrides. Either field optional; the
     # other inherits from the task's category. Use for surgical cases like
@@ -399,6 +416,7 @@ runtime_config: Dict = {
         "anthropic": {},
         "openai": {},
         "gemini": {},
+        "zai": {},
     },
     # Per-provider effort matrix. Each cell is a settings bag (validated by
     # the provider's settings_schema) and typically pins a model + the
@@ -453,6 +471,12 @@ runtime_config: Dict = {
             "medium": {"model": "gemini-2.5-flash", "thinking_budget": 4096},
             "high": {"model": "gemini-2.5-pro", "thinking_budget": 16384},
             "max": {"model": "gemini-2.5-pro", "thinking_budget": 32768},
+        },
+        "zai": {
+            "low": {"model": "glm-5.2", "effort": "low"},
+            "medium": {"model": "glm-5.2", "effort": "medium"},
+            "high": {"model": "glm-5.2", "effort": "high"},
+            "max": {"model": "glm-5.2", "effort": "max"},
         },
     },
     # Sparse per-(task_type, provider) surgical overrides. For cases that
@@ -1134,7 +1158,7 @@ def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
         if "_default" not in cat_routing:
             default_providers = (
                 legacy_pref.get("_default") if isinstance(legacy_pref, dict) else None
-            ) or ["anthropic", "openai", "gemini"]
+            ) or ["anthropic", "zai", "openai", "gemini"]
             cat_routing["_default"] = {
                 "providers": list(default_providers),
                 "effort": default_effort,

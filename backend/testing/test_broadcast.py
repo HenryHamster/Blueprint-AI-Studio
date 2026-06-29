@@ -60,7 +60,18 @@ def test_anthropic_api_key():
 def test_openai_project_key():
     out = _sanitize_log("OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123456")
     assert "sk-proj-abcdefghijklmnopqrstuvwxyz123456" not in out
-    assert "sk-proj-***" in out
+    assert "OPENAI_API_KEY=***" in out
+
+
+def test_zai_api_key_env_var():
+    out = _sanitize_log(
+        'ZAI_API_KEY=plain-zai-token ZAI_API_KEY="quoted-zai-token" '
+        '{"ZAI_API_KEY":"json-zai-token","ANTHROPIC_AUTH_TOKEN":"json-anthropic-token"}'
+    )
+    assert "plain-zai-token" not in out
+    assert "quoted-zai-token" not in out
+    assert "json-zai-token" not in out
+    assert "json-anthropic-token" not in out
 
 
 def test_openai_generic_key():
