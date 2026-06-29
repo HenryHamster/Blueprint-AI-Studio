@@ -3811,6 +3811,90 @@ async def test_orig_positive_ancestry_stamps_as_before(db_session, mocker):
     alert_mock.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_orig_ancestry_gate_degrades_to_indeterminate_on_github_exception(
+    db_session, mocker
+):
+    """When is_ancestor_of raises (e.g. network timeout), the orig ancestry gate
+    must degrade to indeterminate and preserve flag-trust: the orig still receives
+    pr_merged=True and must NOT be stranded or alert.
+
+    A transient GitHub exception in the ancestry check must behave identically to
+    is_ancestor_of returning None — the last-known credit state is preserved and
+    the gate re-checks on the next cycle.
+    """
+    from app.landed_signal import STRANDED_LANDING_REASON_KEY
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "merge_commit_sha": "deadbeefcafe1234"},
+    )
+    # Simulate a transient GitHub API failure on the ancestry check
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new_callable=AsyncMock,
+        side_effect=Exception("connection timeout"),
+    )
+
+    project = Project(name="Ancestry gate exception", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig_task = Task(
+        project_id=project.id,
+        title="Original create task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        context={},
+        vm_instance_id="agent-vm-orig-exc",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"original_task_id": str(orig_task.id)},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    await db_session.refresh(orig_task)
+    ctx = orig_task.context or {}
+    # Exception in is_ancestor_of must degrade to indeterminate → preserves flag-trust
+    assert ctx.get("pr_merged") is True, (
+        "Ancestry gate must preserve pr_merged when is_ancestor_of raises — "
+        "a transient GitHub exception must degrade to indeterminate, not strand the task"
+    )
+    assert STRANDED_LANDING_REASON_KEY not in ctx, (
+        "A transient GitHub exception must NOT record a durable stranded marker"
+    )
+    alert_mock.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Guard: ci_errors must never produce an empty code block in the PR comment
 # ---------------------------------------------------------------------------

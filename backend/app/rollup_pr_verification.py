@@ -116,9 +116,9 @@ async def verify_rollup_merge_landed(
                 token, owner, repo, pr_number, project_id=project_id
             )
             merge_commit_sha = (pr_data or {}).get("merge_commit_sha")
-        except Exception as exc:  # noqa: BLE001 — API error -> indeterminate
-            logger.debug(
-                "[ROLLUP_ANCESTRY] PR #%s fetch failed for %s: %s",
+        except Exception as exc:  # noqa: BLE001 — transient fetch error -> indeterminate; never poisons credit
+            logger.warning(
+                "[ROLLUP_ANCESTRY] PR #%s fetch failed (transient) for %s: %s — degrading to indeterminate",
                 pr_number,
                 source,
                 exc,
@@ -139,8 +139,12 @@ async def verify_rollup_merge_landed(
             integration_branch,
             project_id=project_id,
         )
-    except Exception as exc:  # noqa: BLE001 — API error -> indeterminate
-        logger.debug("[ROLLUP_ANCESTRY] is_ancestor_of failed for %s: %s", source, exc)
+    except Exception as exc:  # noqa: BLE001 — transient API error -> indeterminate; never poisons credit
+        logger.warning(
+            "[ROLLUP_ANCESTRY] is_ancestor_of raised for %s: %s — degrading to indeterminate",
+            source,
+            exc,
+        )
         return "indeterminate"
 
     if is_anc is True:
@@ -320,6 +324,11 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                     task.id, session, force_refresh=True
                 )
                 pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
+            except Exception as fetch_exc:  # noqa: BLE001 — transient network/parse error; must not poison the negative cache
+                logger.warning(
+                    f"[PR_VERIFY] GitHub fetch error for PR #{pr_number} task {task.id}: {fetch_exc} — skipping (transient)"
+                )
+                return False
             if pr_data.get("merged"):
                 project = (
                     await session.get(Project, task.project_id)
