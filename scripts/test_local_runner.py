@@ -165,6 +165,18 @@ class TestAgentBinaryDetection(unittest.TestCase):
                 self.assertIsNone(local_runner._locate_agent_binary())
 
 
+class TestAgentWorkspace(unittest.TestCase):
+    def test_agent_workspace_for_task_uses_configured_root_and_sanitizes_task_id(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch.dict(os.environ, {"BLUEPRINT_RUNNER_WORKSPACE_ROOT": tmpdir}):
+                workspace = local_runner._agent_workspace_for_task("task/abc:123")
+
+            self.assertTrue(workspace.startswith(os.path.abspath(tmpdir)))
+            self.assertTrue(workspace.endswith("task_abc_123"))
+            self.assertTrue(os.path.isdir(workspace))
+
+
 # ── Startup summary ───────────────────────────────────────────────────────────
 
 class TestStartupSummary(unittest.TestCase):
@@ -300,6 +312,9 @@ class TestSubprocessSpawn(unittest.TestCase):
             env = parent_env.copy()
             env["AGENT_SECRET_TOKEN"] = "jwt-for-task"
             env["ORCHESTRATOR_URL"] = "https://api.example.com"
+            env["TASK_ID"] = "task-123"
+            env["VM_INSTANCE_ID"] = "runner:abc"
+            env["AGENT_WORKSPACE"] = "/tmp/blueprint-agent-workspaces/task-123"
 
             subprocess.Popen(
                 ["node", "/path/to/index.js"],
@@ -310,6 +325,12 @@ class TestSubprocessSpawn(unittest.TestCase):
 
         self.assertEqual(captured_env.get("AGENT_SECRET_TOKEN"), "jwt-for-task")
         self.assertEqual(captured_env.get("ORCHESTRATOR_URL"), "https://api.example.com")
+        self.assertEqual(captured_env.get("TASK_ID"), "task-123")
+        self.assertEqual(captured_env.get("VM_INSTANCE_ID"), "runner:abc")
+        self.assertEqual(
+            captured_env.get("AGENT_WORKSPACE"),
+            "/tmp/blueprint-agent-workspaces/task-123",
+        )
         # BLUEPRINT_LOCAL_RUNNER_ID is not part of the runner contract.
         self.assertNotIn("BLUEPRINT_LOCAL_RUNNER_ID", captured_env)
         # Parent env vars must flow through
@@ -377,6 +398,29 @@ class TestReaperLoop(unittest.TestCase):
                 del active_tasks[tid]
 
         self.assertIn("task-running", active_tasks)
+
+    def test_reap_releases_shared_capacity(self):
+        done_proc = MagicMock()
+        done_proc.poll.return_value = 0
+        done_proc.returncode = 0
+
+        active_tasks = {"task-done": done_proc}
+        lock = threading.Lock()
+        capacity = threading.BoundedSemaphore(1)
+        self.assertTrue(capacity.acquire(blocking=False))
+
+        def stop_after_sleep(secs):
+            local_runner._shutdown_event.set()
+
+        local_runner._shutdown_event.clear()
+        try:
+            with patch("time.sleep", stop_after_sleep):
+                local_runner._reap_loop(active_tasks, lock, capacity)
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertNotIn("task-done", active_tasks)
+        self.assertTrue(capacity.acquire(blocking=False))
 
 
 # ── Graceful shutdown ─────────────────────────────────────────────────────────
@@ -503,6 +547,34 @@ class TestRunComputeJob(unittest.TestCase):
         base.update(kwargs)
         return base
 
+    def test_compute_job_releases_shared_capacity_on_exit(self):
+        reports = []
+
+        def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
+                        result_metrics=None, command_log=None):
+            reports.append({"exec_status": exec_status, "exit_code": exit_code})
+            return False
+
+        job = self._make_job(cancel_requested=True)
+        active_jobs: set = {"test-job-001"}
+        lock = threading.Lock()
+        capacity = threading.BoundedSemaphore(1)
+        self.assertTrue(capacity.acquire(blocking=False))
+
+        with patch.object(local_runner, "_report_compute_job", fake_report):
+            local_runner._run_compute_job(
+                job,
+                "https://api.example.com",
+                "tok",
+                active_jobs,
+                lock,
+                capacity,
+            )
+
+        self.assertNotIn("test-job-001", active_jobs)
+        self.assertTrue(capacity.acquire(blocking=False))
+        self.assertEqual(reports[-1]["exec_status"], "failed")
+
     @unittest.skipUnless(
         os.name == "posix",
         "Integration test: the runner executes the command via `bash -lc` and the "
@@ -578,7 +650,7 @@ class TestRunComputeJob(unittest.TestCase):
 
         def fake_run(args, **kwargs):
             commands_run.append(args[2] if len(args) > 2 else args)
-            if "setup" in str(args):
+            if len(args) >= 3 and args[2] == "exit 2":
                 mock = MagicMock()
                 mock.returncode = 2
                 return mock
@@ -838,6 +910,38 @@ class TestComputePollLoop(unittest.TestCase):
 
         self.assertEqual(post_calls, [], "next-compute-job must NOT be called when at capacity")
 
+    def test_shared_capacity_does_not_poll_when_exhausted(self):
+        """Compute polling shares the runner-wide capacity with agent tasks."""
+        post_calls = []
+        sleep_iterations = [0]
+
+        def fake_post(url, token, body):
+            post_calls.append(url)
+            return 204, None
+
+        def fake_sleep(secs):
+            sleep_iterations[0] += 1
+            if sleep_iterations[0] >= 2:
+                local_runner._shutdown_event.set()
+
+        active_jobs: set = set()
+        lock = threading.Lock()
+        capacity = threading.BoundedSemaphore(1)
+        self.assertTrue(capacity.acquire(blocking=False))
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch("time.sleep", fake_sleep):
+            local_runner._compute_poll_loop(
+                "https://api.example.com",
+                "tok",
+                active_jobs,
+                lock,
+                max_concurrent=2,
+                capacity=capacity,
+            )
+
+        self.assertEqual(post_calls, [], "next-compute-job must NOT be called when runner capacity is full")
+
     def test_200_response_spawns_worker_thread(self):
         """A 200 response with a job body causes a worker thread to be started."""
         call_count = [0]
@@ -880,6 +984,63 @@ class TestComputePollLoop(unittest.TestCase):
 
         self.assertTrue(threads_started, "Expected a worker thread to be started")
         self.assertEqual(threads_started[0]["args"][0]["job_id"], "job-xyz")
+
+    def test_worker_start_failure_releases_capacity_and_active_job(self):
+        """A claimed job must not wedge local capacity if the worker fails to start."""
+        reports = []
+
+        def fake_post(url, token, body):
+            return 200, {
+                "job_id": "job-xyz",
+                "command": "echo hi",
+                "env": {},
+                "cwd": None,
+                "setup_step": None,
+                "container_image": None,
+                "container_registry_auth": {},
+                "runtime_deadline_seconds": None,
+                "cancel_requested": False,
+            }
+
+        def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
+                        result_metrics=None, command_log=None):
+            reports.append({
+                "job_id": job_id,
+                "exec_status": exec_status,
+                "exit_code": exit_code,
+                "command_log": command_log,
+            })
+            return False
+
+        class FailingThread:
+            def __init__(self, target=None, args=(), daemon=False):
+                pass
+
+            def start(self):
+                local_runner._shutdown_event.set()
+                raise RuntimeError("thread boom")
+
+        active_jobs: set = set()
+        lock = threading.Lock()
+        capacity = threading.BoundedSemaphore(1)
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch("time.sleep", lambda s: None), \
+             patch("threading.Thread", FailingThread):
+            local_runner._compute_poll_loop(
+                "https://api.example.com",
+                "tok",
+                active_jobs,
+                lock,
+                max_concurrent=2,
+                capacity=capacity,
+            )
+
+        self.assertEqual(active_jobs, set())
+        self.assertTrue(capacity.acquire(blocking=False))
+        self.assertEqual(reports[-1]["job_id"], "job-xyz")
+        self.assertEqual(reports[-1]["exec_status"], "failed")
 
 
 # ── GPU detection ─────────────────────────────────────────────────────────────
@@ -950,7 +1111,8 @@ class TestGpuDetection(unittest.TestCase):
         local_runner._shutdown_event.clear()
 
         try:
-            with patch.object(local_runner, "_post", fake_post):
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value="/agent/dist/index.js"):
                 local_runner._heartbeat_loop(
                     "https://api", "tok", active_tasks, lock, gpu_caps
                 )
@@ -962,6 +1124,41 @@ class TestGpuDetection(unittest.TestCase):
         self.assertTrue(posted_bodies[0]["has_gpu"])
         self.assertEqual(posted_bodies[0]["gpu_count"], 1)
         self.assertEqual(posted_bodies[0]["gpu_names"], ["Tesla T4"])
+        self.assertEqual(posted_bodies[0]["active_compute_job_ids"], [])
+        self.assertTrue(posted_bodies[0]["agent_available"])
+
+    def test_heartbeat_includes_active_compute_job_ids(self):
+        posted_bodies = []
+
+        def fake_post(url, token, body):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        active_tasks = {"task-1": MagicMock()}
+        active_compute_jobs = {"job-b", "job-a"}
+        task_lock = threading.Lock()
+        compute_lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    active_tasks,
+                    task_lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    active_compute_jobs,
+                    compute_lock,
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(posted_bodies[0]["active_task_ids"], ["task-1"])
+        self.assertEqual(posted_bodies[0]["active_compute_job_ids"], ["job-a", "job-b"])
+        self.assertFalse(posted_bodies[0]["agent_available"])
 
 
 # ── Docker login helper ───────────────────────────────────────────────────────

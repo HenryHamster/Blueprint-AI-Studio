@@ -28,7 +28,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -85,8 +85,12 @@ def _filter_result_metrics(raw: dict) -> dict:
 
 class HeartbeatRequest(BaseModel):
     active_task_ids: List[str] = []
+    active_compute_job_ids: List[str] = []
+    agent_available: Optional[StrictBool] = None
+    hostname: Optional[str] = None
+    version: Optional[str] = None
     # Runner-reported hardware capabilities (optional; old runners omit these).
-    has_gpu: Optional[bool] = None
+    has_gpu: Optional[StrictBool] = None
     gpu_count: Optional[int] = None
     gpu_names: Optional[List[str]] = None
 
@@ -154,6 +158,7 @@ async def next_task(
     return {
         "task_id": str(task.id),
         "agent_token": agent_token,
+        "vm_instance_id": pinned_vm_id,
         "payload": task.payloads,
         "task_type": task_type,
         "capability_slice": agent_capability_slice(task_type),
@@ -186,15 +191,22 @@ async def heartbeat(
     runner.status = "active"
     caps = dict(runner.capabilities or {})
     caps["active_task_ids"] = list(payload.active_task_ids)
+    caps["active_compute_job_ids"] = list(payload.active_compute_job_ids)
     # Merge runner-reported hardware capabilities when present.
     # These override the registration-time default but never clobber
     # operator-configured fields (task_types, max_concurrent).
+    if payload.agent_available is not None:
+        caps["agent_available"] = payload.agent_available
     if payload.has_gpu is not None:
         caps["has_gpu"] = payload.has_gpu
     if payload.gpu_count is not None:
         caps["gpu_count"] = payload.gpu_count
     if payload.gpu_names is not None:
         caps["gpu_names"] = payload.gpu_names
+    if payload.hostname:
+        runner.hostname = payload.hostname[:255]
+    if payload.version:
+        runner.version = payload.version[:64]
     runner.capabilities = caps
     session.add(runner)
     await session.commit()

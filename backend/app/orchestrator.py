@@ -65,6 +65,8 @@ from app.task_capabilities import CLOUD_RUN_CANDIDATE_TASK_TYPES
 from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.depends_on_provenance import remap_structural_depends_on
 from app.models import (
+    ComputeJob,
+    ComputeJobStatus,
     DeploymentState,
     LocalRunner,
     Project,
@@ -516,6 +518,27 @@ def _runner_active_task_count(runner: LocalRunner | RunnerDispatchSnapshot) -> i
         return 0
 
 
+def _runner_active_compute_job_count(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+) -> int:
+    """Best-effort compute-job load, from heartbeat-reported active job ids."""
+    active = (runner.capabilities or {}).get("active_compute_job_ids") or []
+    try:
+        return len(active)
+    except TypeError:
+        return 0
+
+
+def _runner_active_work_count(runner: LocalRunner | RunnerDispatchSnapshot) -> int:
+    return _runner_active_task_count(runner) + _runner_active_compute_job_count(runner)
+
+
+def _runner_agent_available(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
+    """Old runners omit the field, which remains backward-compatible."""
+    available = (runner.capabilities or {}).get("agent_available")
+    return available is not False
+
+
 def _runner_at_capacity(
     runner: LocalRunner | RunnerDispatchSnapshot, pins_this_cycle: int = 0
 ) -> bool:
@@ -532,10 +555,21 @@ def _runner_at_capacity(
     per cycle at the runner's real pull capacity.
     """
     caps = runner.capabilities or {}
-    max_concurrent = caps.get("max_concurrent")
+    raw_max_concurrent = caps.get("max_concurrent")
+    if isinstance(raw_max_concurrent, bool):
+        max_concurrent = None
+    elif isinstance(raw_max_concurrent, float):
+        max_concurrent = (
+            int(raw_max_concurrent) if raw_max_concurrent.is_integer() else None
+        )
+    else:
+        try:
+            max_concurrent = int(raw_max_concurrent)
+        except (TypeError, ValueError):
+            max_concurrent = None
     if max_concurrent is None:
         return False
-    return _runner_active_task_count(runner) + pins_this_cycle >= max_concurrent
+    return _runner_active_work_count(runner) + pins_this_cycle >= max_concurrent
 
 
 async def _load_active_runners_cache(
@@ -572,15 +606,84 @@ async def _load_active_runners_cache(
     except Exception:
         logger.exception("[RUNNERS] Failed to load active-runner cache")
         return {}
+    outstanding_compute_by_runner = await _load_runner_compute_job_assignments(
+        session, [runner_id for runner_id, _project_id, _capabilities in rows]
+    )
     by_project: dict[uuid.UUID, list[RunnerDispatchSnapshot]] = {}
     for runner_id, project_id, capabilities in rows:
+        caps = dict(capabilities or {})
+        heartbeat_jobs = caps.get("active_compute_job_ids") or []
+        merged_job_ids: list[str] = []
+        seen_job_ids: set[str] = set()
+        for job_id in list(heartbeat_jobs) + outstanding_compute_by_runner.get(
+            runner_id, []
+        ):
+            if not isinstance(job_id, str) or job_id in seen_job_ids:
+                continue
+            merged_job_ids.append(job_id)
+            seen_job_ids.add(job_id)
+        if merged_job_ids:
+            caps["active_compute_job_ids"] = merged_job_ids
         snapshot = RunnerDispatchSnapshot(
             id=runner_id,
             project_id=project_id,
-            capabilities=dict(capabilities or {}),
+            capabilities=caps,
         )
         by_project.setdefault(project_id, []).append(snapshot)
     return by_project
+
+
+async def _load_runner_compute_job_assignments(
+    session: AsyncSession,
+    runner_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, list[str]]:
+    """Return outstanding runner-subprocess compute jobs keyed by runner id.
+
+    Heartbeat-reported compute ids lag direct ``compute_experiment`` launch by at
+    least one runner poll/heartbeat. Counting persisted runner-subprocess jobs
+    closes that window so a later orchestrator cycle cannot over-assign a runner
+    before it has claimed the first job.
+    """
+    if not runner_ids:
+        return {}
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+
+    runner_id_strings = [str(runner_id) for runner_id in runner_ids]
+    runner_target_expr = ComputeJob.polling_metadata["runner_target_id"].as_string()
+    try:
+        rows = (
+            await session.execute(
+                select(ComputeJob.id, runner_target_expr)
+                .where(
+                    ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
+                    ComputeJob.status.in_(
+                        [
+                            ComputeJobStatus.QUEUED,
+                            ComputeJobStatus.STARTING,
+                            ComputeJobStatus.RUNNING,
+                            ComputeJobStatus.POLLING,
+                        ]
+                    ),
+                    runner_target_expr.in_(runner_id_strings),
+                )
+                .order_by(ComputeJob.created_at.asc())
+            )
+        ).all()
+    except Exception:
+        logger.exception("[RUNNERS] Failed to load runner compute-job assignments")
+        return {}
+
+    by_runner: dict[uuid.UUID, list[str]] = {}
+    runner_ids_by_string = {
+        str(runner_id): runner_id
+        for runner_id in runner_ids
+    }
+    for job_id, raw_runner_id in rows:
+        runner_id = runner_ids_by_string.get(str(raw_runner_id))
+        if runner_id is None:
+            continue
+        by_runner.setdefault(runner_id, []).append(str(job_id))
+    return by_runner
 
 
 async def _try_runner_dispatch(
@@ -715,6 +818,7 @@ def _select_eligible_runner(
         r
         for r in candidates
         if _runner_handles_task_type(r, task_type)
+        and (task_type == "compute_experiment" or _runner_agent_available(r))
         and not _runner_at_capacity(r, runner_pins_this_cycle.get(r.id, 0))
     ]
     if accelerator:
@@ -723,7 +827,7 @@ def _select_eligible_runner(
         return None
     return min(
         eligible,
-        key=lambda r: _runner_active_task_count(r)
+        key=lambda r: _runner_active_work_count(r)
         + runner_pins_this_cycle.get(r.id, 0),
     )
 

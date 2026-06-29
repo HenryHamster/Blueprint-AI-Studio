@@ -14,6 +14,8 @@ Optional environment variables:
     BLUEPRINT_RUNNER_MAX_CONCURRENT   Max simultaneous agent subprocesses (default: 2)
     BLUEPRINT_AGENT_BINARY            Path to node agent entry point (auto-detected if absent)
     BLUEPRINT_RUNNER_POLL_INTERVAL    Base poll interval in seconds (default: 2)
+    BLUEPRINT_RUNNER_WORKSPACE_ROOT   Parent directory for per-task agent workspaces
+                                      (default: <tmp>/blueprint-agent-workspaces)
 """
 
 import io
@@ -92,6 +94,24 @@ def _find_agent_binary() -> str:
         file=sys.stderr,
     )
     sys.exit(1)
+
+
+def _agent_workspace_for_task(task_id: str) -> str:
+    """Return a per-task workspace path for an agent subprocess.
+
+    The node agent defaults to /tmp/workspace when AGENT_WORKSPACE is absent.
+    A persistent local runner may execute multiple tasks across one machine
+    session, so each task gets a stable isolated workspace directory.
+    """
+    root = os.environ.get("BLUEPRINT_RUNNER_WORKSPACE_ROOT", "").strip()
+    if not root:
+        root = os.path.join(tempfile.gettempdir(), "blueprint-agent-workspaces")
+    safe_task_id = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in task_id)
+    if not safe_task_id:
+        safe_task_id = "unknown"
+    workspace = os.path.abspath(os.path.join(root, safe_task_id))
+    os.makedirs(workspace, exist_ok=True)
+    return workspace
 
 
 # ── HTTP helpers ─────────────────────────────────────────────────────────────
@@ -316,26 +336,60 @@ def _handle_signal(signum, frame):  # noqa: ARG001
 
 # ── Active task tracking (background thread) ──────────────────────────────────
 
-def _reap_loop(active_tasks: dict, lock: threading.Lock) -> None:
+def _release_capacity(capacity: threading.Semaphore | None) -> None:
+    if capacity is not None:
+        capacity.release()
+
+
+def _try_acquire_capacity(capacity: threading.Semaphore | None) -> bool:
+    if capacity is None:
+        return True
+    return capacity.acquire(blocking=False)
+
+
+def _reap_loop(
+    active_tasks: dict,
+    lock: threading.Lock,
+    capacity: threading.Semaphore | None = None,
+) -> None:
     while not _shutdown_event.is_set():
         with lock:
             done = [tid for tid, proc in active_tasks.items() if proc.poll() is not None]
             for tid in done:
                 code = active_tasks[tid].returncode
                 del active_tasks[tid]
+                _release_capacity(capacity)
                 print(f"[DONE] task_id={tid} exit_code={code}", flush=True)
         time.sleep(2)
 
 
 # ── Heartbeat (background thread) ─────────────────────────────────────────────
 
-def _heartbeat_loop(orchestrator_url: str, token: str, active_tasks: dict, lock: threading.Lock, gpu_capabilities: dict) -> None:
+def _heartbeat_loop(
+    orchestrator_url: str,
+    token: str,
+    active_tasks: dict,
+    lock: threading.Lock,
+    gpu_capabilities: dict,
+    active_compute_jobs: set | None = None,
+    compute_lock=None,
+) -> None:
     url = f"{orchestrator_url}/api/runner/heartbeat"
     while not _shutdown_event.is_set():
         try:
             with lock:
                 task_ids = list(active_tasks.keys())
-            body = {"active_task_ids": task_ids, **gpu_capabilities}
+            if active_compute_jobs is not None and compute_lock is not None:
+                with compute_lock:
+                    compute_job_ids = sorted(active_compute_jobs)
+            else:
+                compute_job_ids = []
+            body = {
+                "active_task_ids": task_ids,
+                "active_compute_job_ids": compute_job_ids,
+                "agent_available": _locate_agent_binary() is not None,
+                **gpu_capabilities,
+            }
             status, _ = _post(url, token, body)
             if status not in (200, 204):
                 print(f"[runner] heartbeat warning: HTTP {status}", flush=True)
@@ -598,6 +652,7 @@ def _run_compute_job(
     token: str,
     active_jobs: set,
     lock: threading.Lock,
+    capacity: threading.Semaphore | None = None,
 ) -> None:
     """Worker thread: execute a claimed compute job and report the result."""
     job_id = job_body.get("job_id", "unknown")
@@ -877,6 +932,7 @@ def _run_compute_job(
             _upload_artifact(orchestrator_url, token, job_id, artifact_dir)
         with lock:
             active_jobs.discard(job_id)
+        _release_capacity(capacity)
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
@@ -886,6 +942,7 @@ def _compute_poll_loop(
     active_jobs: set,
     lock: threading.Lock,
     max_concurrent: int,
+    capacity: threading.Semaphore | None = None,
     base_poll_interval: float = 2.0,
 ) -> None:
     """Background thread: poll for compute jobs and spawn a worker per claimed job."""
@@ -900,9 +957,14 @@ def _compute_poll_loop(
             time.sleep(poll_interval)
             continue
 
+        if not _try_acquire_capacity(capacity):
+            time.sleep(poll_interval)
+            continue
+
         try:
             status, body = _post(url, token, {})
         except Exception as exc:
+            _release_capacity(capacity)
             print(f"[compute] poll error: {exc}", flush=True)
             time.sleep(5)
             continue
@@ -917,16 +979,19 @@ def _compute_poll_loop(
                 "(row may be reactivating via heartbeat).",
                 flush=True,
             )
+            _release_capacity(capacity)
             poll_interval = min(poll_interval * 2, 30.0)
             time.sleep(poll_interval)
             continue
 
         if status == 204 or body is None:
+            _release_capacity(capacity)
             poll_interval = min(poll_interval * 2, 30.0)
             time.sleep(poll_interval)
             continue
 
         if status != 200:
+            _release_capacity(capacity)
             print(f"[compute] poll warning: HTTP {status}", flush=True)
             time.sleep(5)
             continue
@@ -937,17 +1002,35 @@ def _compute_poll_loop(
         with lock:
             if job_id in active_jobs:
                 print(f"[compute] skipping duplicate job {job_id}", flush=True)
+                _release_capacity(capacity)
                 time.sleep(poll_interval)
                 continue
             active_jobs.add(job_id)
 
         print(f"[compute] claimed job {job_id}", flush=True)
-        worker = threading.Thread(
-            target=_run_compute_job,
-            args=(body, orchestrator_url, token, active_jobs, lock),
-            daemon=True,
-        )
-        worker.start()
+        try:
+            worker = threading.Thread(
+                target=_run_compute_job,
+                args=(body, orchestrator_url, token, active_jobs, lock, capacity),
+                daemon=True,
+            )
+            worker.start()
+        except Exception as exc:
+            with lock:
+                active_jobs.discard(job_id)
+            _release_capacity(capacity)
+            print(f"[compute] failed to start worker for job {job_id}: {exc}", flush=True)
+            try:
+                _report_compute_job(
+                    orchestrator_url,
+                    token,
+                    job_id,
+                    exec_status="failed",
+                    exit_code=1,
+                    command_log=f"Runner failed to start compute worker: {exc}",
+                )
+            except Exception:
+                pass
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -980,6 +1063,7 @@ def main() -> None:
         flush=True,
     )
     print(f"  max concurrent: {max_concurrent}", flush=True)
+    print(f"  max compute jobs: {max_concurrent_compute}", flush=True)
     print(f"  runner token : {token_prefix}", flush=True)
 
     # Detect GPU hardware once at startup
@@ -994,7 +1078,12 @@ def main() -> None:
         status, body = _post(
             f"{orchestrator_url}/api/runner/heartbeat",
             token,
-            {"active_task_ids": [], **gpu_capabilities},
+            {
+                "active_task_ids": [],
+                "active_compute_job_ids": [],
+                "agent_available": agent_binary is not None,
+                **gpu_capabilities,
+            },
         )
     except Exception as exc:
         print(f"ERROR: initial heartbeat failed: {exc}", file=sys.stderr)
@@ -1019,22 +1108,44 @@ def main() -> None:
     # Shared state
     active_tasks: dict[str, subprocess.Popen] = {}
     lock = threading.Lock()
+    runner_capacity = threading.BoundedSemaphore(max_concurrent)
 
     active_compute_jobs: set[str] = set()
     compute_lock = threading.Lock()
 
     # Background threads
-    reaper = threading.Thread(target=_reap_loop, args=(active_tasks, lock), daemon=True)
+    reaper = threading.Thread(
+        target=_reap_loop,
+        args=(active_tasks, lock, runner_capacity),
+        daemon=True,
+    )
     reaper.start()
 
     heartbeat = threading.Thread(
-        target=_heartbeat_loop, args=(orchestrator_url, token, active_tasks, lock, gpu_capabilities), daemon=True
+        target=_heartbeat_loop,
+        args=(
+            orchestrator_url,
+            token,
+            active_tasks,
+            lock,
+            gpu_capabilities,
+            active_compute_jobs,
+            compute_lock,
+        ),
+        daemon=True,
     )
     heartbeat.start()
 
     compute_poll = threading.Thread(
         target=_compute_poll_loop,
-        args=(orchestrator_url, token, active_compute_jobs, compute_lock, max_concurrent_compute),
+        args=(
+            orchestrator_url,
+            token,
+            active_compute_jobs,
+            compute_lock,
+            max_concurrent_compute,
+            runner_capacity,
+        ),
         daemon=True,
     )
     compute_poll.start()
@@ -1051,9 +1162,14 @@ def main() -> None:
             time.sleep(poll_interval)
             continue
 
+        if not _try_acquire_capacity(runner_capacity):
+            time.sleep(poll_interval)
+            continue
+
         try:
             status, body = _post(next_task_url, token, {})
         except Exception as exc:
+            _release_capacity(runner_capacity)
             print(f"[runner] poll error: {exc}", flush=True)
             time.sleep(5)
             continue
@@ -1067,17 +1183,20 @@ def main() -> None:
                 "(row may be reactivating via heartbeat).",
                 flush=True,
             )
+            _release_capacity(runner_capacity)
             poll_interval = min(poll_interval * 2, 30.0)
             time.sleep(poll_interval)
             continue
 
         if status == 204 or body is None:
             # No task available — backoff
+            _release_capacity(runner_capacity)
             poll_interval = min(poll_interval * 2, 30.0)
             time.sleep(poll_interval)
             continue
 
         if status != 200:
+            _release_capacity(runner_capacity)
             print(f"[runner] poll warning: HTTP {status}", flush=True)
             time.sleep(5)
             continue
@@ -1088,6 +1207,7 @@ def main() -> None:
         task_id = body.get("task_id") or body.get("id", "unknown")
         agent_token = body.get("agent_token", "")
         task_type = body.get("task_type", "unknown")
+        vm_instance_id = body.get("vm_instance_id") or "runner:local"
 
         # Defense-in-depth: skip if this task is already tracked (e.g. server
         # returned the same task before started_at was visible to this poll).
@@ -1095,6 +1215,7 @@ def main() -> None:
             already_active = task_id in active_tasks
         if already_active:
             print(f"[runner] skipping duplicate dispatch for task {task_id}", flush=True)
+            _release_capacity(runner_capacity)
             time.sleep(poll_interval)
             continue
 
@@ -1112,13 +1233,25 @@ def main() -> None:
                 "BLUEPRINT_AGENT_BINARY). Compute jobs are unaffected.",
                 flush=True,
             )
+            _release_capacity(runner_capacity)
             time.sleep(poll_interval)
             continue
 
         # Build subprocess environment
+        try:
+            workspace = _agent_workspace_for_task(task_id)
+        except Exception as exc:
+            print(f"[runner] failed to prepare workspace for task {task_id}: {exc}", flush=True)
+            _release_capacity(runner_capacity)
+            time.sleep(poll_interval)
+            continue
+
         env = os.environ.copy()
         env["AGENT_SECRET_TOKEN"] = agent_token
         env["ORCHESTRATOR_URL"] = orchestrator_url
+        env["TASK_ID"] = task_id
+        env["VM_INSTANCE_ID"] = vm_instance_id
+        env["AGENT_WORKSPACE"] = workspace
 
         # Spawn agent
         try:
@@ -1130,11 +1263,16 @@ def main() -> None:
             )
         except Exception as exc:
             print(f"[runner] failed to spawn agent for task {task_id}: {exc}", flush=True)
+            _release_capacity(runner_capacity)
             continue
 
         with lock:
             active_tasks[task_id] = proc
-        print(f"[START] task_id={task_id} type={task_type} pid={proc.pid}", flush=True)
+        print(
+            f"[START] task_id={task_id} type={task_type} vm={vm_instance_id} "
+            f"workspace={workspace} pid={proc.pid}",
+            flush=True,
+        )
 
     # Graceful shutdown
     with lock:

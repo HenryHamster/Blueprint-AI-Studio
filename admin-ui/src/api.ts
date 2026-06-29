@@ -4133,7 +4133,24 @@ export interface FleetRunner {
     max_concurrent?: number;
     // Task ids the runner reported as currently executing in its last heartbeat.
     active_task_ids?: string[];
+    active_compute_job_ids?: string[];
+    runner_preset?: string;
+    workload?: string;
+    gpu_count?: number;
+    gpu_names?: string[];
     [key: string]: unknown;
+  };
+  health?: {
+    is_live: boolean;
+    seconds_since_last_seen: number | null;
+    active_task_count: number;
+    active_compute_job_count?: number;
+    active_work_count?: number;
+    max_concurrent: number | null;
+    available_slots: number | null;
+    stale_reason: string | null;
+    agent_available?: boolean | null;
+    liveness_window_seconds: number;
   };
   last_seen_at: string | null;
   created_at: string | null;
@@ -4142,7 +4159,12 @@ export interface FleetRunner {
 /** Register a new fleet runner for a project. Returns the one-time token. */
 export async function registerFleetRunner(
   projectId: string,
-  opts: { hostname?: string; version?: string; capabilities?: Record<string, unknown> } = {},
+  opts: {
+    hostname?: string;
+    version?: string;
+    capabilities?: Record<string, unknown>;
+    preset?: 'default' | 'strategic_local';
+  } = {},
 ): Promise<{ runner_id: string; token: string }> {
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/runners/register`,

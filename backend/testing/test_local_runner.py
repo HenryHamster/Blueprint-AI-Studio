@@ -12,6 +12,7 @@ from datetime import timedelta
 
 import pytest
 from httpx import AsyncClient
+from sqlmodel import select
 
 from app import auth as auth_mod
 from app import compute_backends as compute_backends_mod
@@ -29,6 +30,7 @@ from app.models import (
     _utcnow,
 )
 from app.routers.runner import _parse_multipart_form
+from app.task_capabilities import STRATEGIC_TASK_TYPES
 
 TEST_USER_ID = "test-user-123"
 
@@ -143,6 +145,56 @@ class TestAdminRunnerEndpoints:
         assert row.capabilities["task_types"] == "all"
 
     @pytest.mark.asyncio
+    async def test_register_strategic_local_preset_limits_runner_to_strategic_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={
+                "hostname": "local-strategic",
+                "preset": "strategic_local",
+                "capabilities": {"task_types": "all", "max_concurrent": 9},
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        row = (
+            await db_session.execute(
+                select(LocalRunner).where(
+                    LocalRunner.id == uuid.UUID(body["runner_id"])
+                )
+            )
+        ).scalars().first()
+        assert row is not None
+        assert row.capabilities["runner_preset"] == "strategic_local"
+        assert row.capabilities["workload"] == "strategic"
+        assert row.capabilities["task_types"] == sorted(STRATEGIC_TASK_TYPES)
+        assert row.capabilities["max_concurrent"] == 1
+
+    @pytest.mark.asyncio
+    async def test_register_rejects_malformed_capabilities(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        bad_payloads = [
+            {"capabilities": {"task_types": ["unknown_type"]}},
+            {"capabilities": {"task_types": []}},
+            {"capabilities": {"max_concurrent": 0}},
+            {"capabilities": {"max_concurrent": True}},
+            {"capabilities": {"max_concurrent": 1.5}},
+            {"capabilities": {"max_concurrent": "1.5"}},
+            {"capabilities": {"has_gpu": "yes"}},
+        ]
+        for payload in bad_payloads:
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/runners/register",
+                json=payload,
+            )
+            assert resp.status_code == 422, payload
+
+    @pytest.mark.asyncio
     async def test_list_excludes_deleted(self, client: AsyncClient, db_session):
         project = await _make_project(db_session)
         r1, _ = await _make_runner(db_session, project.id, hostname="a")
@@ -153,6 +205,47 @@ class TestAdminRunnerEndpoints:
         ids = {r["id"] for r in resp.json()}
         assert str(r1.id) in ids
         assert str(r2.id) not in ids
+
+    @pytest.mark.asyncio
+    async def test_list_returns_backend_computed_dispatch_health(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        live_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            hostname="live",
+            last_seen_at=_utcnow() - timedelta(seconds=30),
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 3,
+                "active_task_ids": ["task-a"],
+            },
+        )
+        stale_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            hostname="stale",
+            last_seen_at=_utcnow() - timedelta(minutes=9),
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert resp.status_code == 200
+        by_id = {row["id"]: row for row in resp.json()}
+
+        live_health = by_id[str(live_runner.id)]["health"]
+        assert live_health["is_live"] is True
+        assert live_health["active_task_count"] == 1
+        assert live_health["max_concurrent"] == 3
+        assert live_health["available_slots"] == 2
+        assert live_health["stale_reason"] is None
+
+        stale_health = by_id[str(stale_runner.id)]["health"]
+        assert stale_health["is_live"] is False
+        assert stale_health["stale_reason"] == "heartbeat_stale"
+        assert stale_health["liveness_window_seconds"] == 300
 
     @pytest.mark.asyncio
     async def test_delete_marks_deleted(self, client: AsyncClient, db_session):
@@ -170,6 +263,46 @@ class TestAdminRunnerEndpoints:
             f"/api/admin/projects/{project.id}/runners/{runner.id}"
         )
         assert resp2.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_delete_releases_unpulled_runner_pins(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+        unpulled = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+            started_at=None,
+        )
+        pulled = Task(
+            project_id=project.id,
+            payloads=[{"type": "review"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+            started_at=_utcnow(),
+        )
+        db_session.add(unpulled)
+        db_session.add(pulled)
+        await db_session.commit()
+
+        resp = await client.delete(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["released_unpulled_pins"] == 1
+
+        await db_session.refresh(unpulled)
+        await db_session.refresh(pulled)
+        assert unpulled.status == TaskStatus.QUEUED
+        assert unpulled.vm_instance_id is None
+        assert "runner_target_id" not in (unpulled.context or {})
+        assert pulled.status == TaskStatus.PROVISIONING
+        assert pulled.vm_instance_id == f"runner:{runner.id}"
 
 
 # ── Runner polling/heartbeat endpoints ───────────────────────────────────────
@@ -208,6 +341,7 @@ class TestRunnerEndpoints:
         assert body["task_id"] == str(task.id)
         assert body["task_type"] == "create"
         assert body["agent_token"]
+        assert body["vm_instance_id"] == f"runner:{runner.id}"
         assert body["payload"] == [{"type": "create", "title": "do a thing"}]
 
         # The minted JWT is task-scoped to this runner's vm id.
@@ -221,6 +355,47 @@ class TestRunnerEndpoints:
         await db_session.refresh(task)
         assert task.status == TaskStatus.PROVISIONING
         assert task.started_at is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("task_type", "output_kind"),
+        [
+            ("design_doc_update", "artifact"),
+            ("strategic_review", "knowledge"),
+        ],
+    )
+    async def test_next_task_returns_strategic_capability_slice(
+        self, client: AsyncClient, db_session, task_type: str, output_kind: str
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": task_type}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/runner/next-task",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["task_type"] == task_type
+        capability = body["capability_slice"]
+        assert capability["id"] == task_type
+        assert capability["agent_mode"] == "read_only"
+        assert capability["run_shape"] == "single_agent"
+        assert capability["output_kind"] == output_kind
+
+        claims = auth_mod.verify_agent_jwt(body["agent_token"])
+        assert claims["task_type"] == task_type
+        assert claims["project_id"] == str(project.id)
 
     @pytest.mark.asyncio
     async def test_next_task_repoll_returns_204_after_dispatch(
@@ -370,9 +545,13 @@ class TestRunnerEndpoints:
             "/api/runner/heartbeat",
             json={
                 "active_task_ids": [],
+                "active_compute_job_ids": ["job-1"],
+                "agent_available": False,
                 "has_gpu": True,
                 "gpu_count": 1,
                 "gpu_names": ["Tesla T4"],
+                "hostname": "worker-host",
+                "version": "local-runner/1",
             },
             headers={"Authorization": f"Bearer {token}"},
         )
@@ -383,6 +562,10 @@ class TestRunnerEndpoints:
         assert runner.capabilities["has_gpu"] is True
         assert runner.capabilities["gpu_count"] == 1
         assert runner.capabilities["gpu_names"] == ["Tesla T4"]
+        assert runner.capabilities["active_compute_job_ids"] == ["job-1"]
+        assert runner.capabilities["agent_available"] is False
+        assert runner.hostname == "worker-host"
+        assert runner.version == "local-runner/1"
 
         # Operator-configured fields must NOT be clobbered.
         assert runner.capabilities["task_types"] == "all"
@@ -400,6 +583,24 @@ class TestRunnerEndpoints:
         # has_gpu persists from the previous heartbeat.
         assert runner.capabilities["has_gpu"] is True
         assert runner.capabilities["active_task_ids"] == ["x"]
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_rejects_malformed_boolean_capabilities(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        _, token = await _make_runner(db_session, project.id)
+
+        for payload in (
+            {"active_task_ids": [], "has_gpu": "yes"},
+            {"active_task_ids": [], "agent_available": "false"},
+        ):
+            resp = await client.post(
+                "/api/runner/heartbeat",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 422, payload
 
     @pytest.mark.asyncio
     async def test_heartbeat_reactivates_inactive_runner(
@@ -775,6 +976,110 @@ class TestOrchestratorRunnerRouting:
             )
             is False
         )
+
+    @pytest.mark.asyncio
+    async def test_strategic_local_runner_pins_only_strategic_task_types(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": sorted(STRATEGIC_TASK_TYPES),
+                "has_gpu": False,
+                "max_concurrent": 4,
+            },
+        )
+        for task_type in sorted(STRATEGIC_TASK_TYPES):
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": task_type}],
+                status=TaskStatus.QUEUED,
+            )
+            db_session.add(task)
+            await db_session.commit()
+            assert await orch._try_runner_dispatch(
+                db_session, task, {project.id: [runner]}, {}
+            )
+            await db_session.refresh(task)
+            assert task.vm_instance_id == f"runner:{runner.id}"
+            assert task.context["runner_target_id"] == str(runner.id)
+
+        for task_type in ("create", "research", "compute_experiment"):
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": task_type}],
+                status=TaskStatus.QUEUED,
+            )
+            db_session.add(task)
+            await db_session.commit()
+            assert await orch._try_runner_dispatch(
+                db_session, task, {project.id: [runner]}, {}
+            ) is False
+            await db_session.refresh(task)
+            assert task.status == TaskStatus.QUEUED
+
+    @pytest.mark.asyncio
+    async def test_agent_unavailable_runner_skips_agent_tasks(self, db_session):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 2,
+                "agent_available": False,
+            },
+        )
+        create_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+        )
+        compute_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(create_task)
+        db_session.add(compute_task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(
+            db_session, create_task, {project.id: [runner]}, {}
+        ) is False
+        assert await orch._try_runner_dispatch(
+            db_session, compute_task, {project.id: [runner]}, {}
+        ) is True
+
+    @pytest.mark.asyncio
+    async def test_active_compute_jobs_count_toward_runner_capacity(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 2,
+                "active_compute_job_ids": ["job-a", "job-b"],
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(
+            db_session, task, {project.id: [runner]}, {}
+        ) is False
 
     @pytest.mark.asyncio
     async def test_try_runner_dispatch_prefers_least_loaded(self, db_session):
@@ -1553,6 +1858,54 @@ class TestDirectComputeExperimentDispatch:
         assert (job.polling_metadata or {}).get("runner_target_id") == str(runner.id)
 
     @pytest.mark.asyncio
+    async def test_runner_subprocess_jobs_count_toward_next_cycle_capacity(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        project.build_config = {"resource_envelope": {"require_local_runner": True}}
+        db_session.add(project)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 1},
+        )
+        first = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+        )
+        second = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(first)
+        db_session.add(second)
+        await db_session.commit()
+
+        assert await orch._dispatch_compute_experiment_directly(
+            db_session, first, {project.id: [runner]}, {}
+        ) == "launched"
+        first_job = await _compute_job_for_task(db_session, first.id)
+        assert first_job is not None
+        assert first_job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+        assert first_job.status == ComputeJobStatus.QUEUED
+
+        next_cycle_cache = await orch._load_active_runners_cache(db_session)
+        next_cycle_runner = next_cycle_cache[project.id][0]
+        assert str(first_job.id) in (
+            next_cycle_runner.capabilities or {}
+        ).get("active_compute_job_ids", [])
+
+        assert await orch._dispatch_compute_experiment_directly(
+            db_session, second, next_cycle_cache, {}
+        ) == "held"
+        await db_session.refresh(second)
+        assert second.status == TaskStatus.QUEUED
+        assert (second.context or {}).get("awaiting_local_runner_since")
+        assert await _compute_job_for_task(db_session, second.id) is None
+
+    @pytest.mark.asyncio
     async def test_launch_cloud_fallback_when_no_runner(self, db_session):
         project = await _make_project(db_session)
         task = Task(
@@ -1594,6 +1947,39 @@ class TestDirectComputeExperimentDispatch:
         assert outcome == "held"
         await db_session.refresh(task)
         # Held QUEUED with the wait stamp; NEVER a billable cloud job.
+        assert task.status == TaskStatus.QUEUED
+        assert (task.context or {}).get("awaiting_local_runner_since")
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_strategic_local_runner_does_not_satisfy_compute_local_policy(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        project.build_config = {"resource_envelope": {"require_local_runner": True}}
+        db_session.add(project)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": sorted(STRATEGIC_TASK_TYPES),
+                "has_gpu": False,
+                "max_concurrent": 1,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [runner]}, {}
+        )
+        assert outcome == "held"
+        await db_session.refresh(task)
         assert task.status == TaskStatus.QUEUED
         assert (task.context or {}).get("awaiting_local_runner_since")
         assert await _compute_job_for_task(db_session, task.id) is None

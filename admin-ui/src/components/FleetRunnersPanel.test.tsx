@@ -127,6 +127,20 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.textContent).toContain('shown only once');
   });
 
+  test('enrolling a strategic runner sends the strategic preset', async () => {
+    const el = await mount();
+
+    const strategicBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('Strategic runner'));
+    expect(strategicBtn).not.toBeNull();
+
+    await act(async () => { (strategicBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(registerFleetRunner).toHaveBeenCalledWith('proj-test', { preset: 'strategic_local' });
+    expect(el.textContent).toContain('Strategic runner enrolled');
+    expect(el.textContent).toContain('BLUEPRINT_RUNNER_MAX_CONCURRENT=1');
+  });
+
   test('dismissing the token dialog removes it', async () => {
     const el = await mount();
 
@@ -220,6 +234,77 @@ describe('FleetRunnersPanel — behavioral', () => {
     ]);
     const el = await mount();
     expect(el.textContent).toContain('GPU');
+  });
+
+  test('backend health renders live state and available slot count', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: {
+          task_types: ['design_doc_update', 'strategic_review'],
+          has_gpu: false,
+          max_concurrent: 1,
+          runner_preset: 'strategic_local',
+          workload: 'strategic',
+        },
+        health: {
+          is_live: true,
+          seconds_since_last_seen: 12,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 1,
+          available_slots: 1,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+    expect(el.textContent).toContain('live');
+    expect(el.textContent).toContain('Strategic');
+    expect(el.textContent).toContain('visible');
+    expect(el.textContent).toContain('1 slots free');
+    expect(el.textContent).toContain('design_doc_update, strategic_review');
+  });
+
+  test('local-only compute warning appears when no live compute runner exists', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: {
+          task_types: ['design_doc_update', 'strategic_review'],
+          has_gpu: false,
+          max_concurrent: 1,
+          runner_preset: 'strategic_local',
+        },
+        health: {
+          is_live: true,
+          seconds_since_last_seen: 12,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 1,
+          available_slots: 1,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<FleetRunnersPanel projectId="proj-test" requireLocalRunner />);
+    });
+    await act(async () => {});
+
+    expect(host.textContent).toContain('Local-only compute is enabled');
+    expect(host.textContent).toContain('wait until a live compute-capable runner connects');
   });
 
   test('empty state renders when no runners enrolled', async () => {

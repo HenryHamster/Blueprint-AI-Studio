@@ -481,7 +481,10 @@ export function RuntimeWorkspace({
           </div>
           <WorkbenchPanel title="Self-hosted runners" meta={selectedProjectRepoLabel ?? 'select project'}>
             {selectedProjectId ? (
-              <FleetRunnersPanel projectId={selectedProjectId} />
+              <FleetRunnersPanel
+                projectId={selectedProjectId}
+                requireLocalRunner={settingsRouterProps.resourceEnvelopeData?.require_local_runner ?? false}
+              />
             ) : (
               <div className="py-10 text-center text-xs text-neutral-500">
                 Select a project to manage self-hosted runners.

@@ -1413,7 +1413,10 @@ export default function App() {
             settingsRouterProps={settingsRouterProps}
             onViewTask={s.handleViewLogs}
             onViewTaskById={handleViewTaskById}
-            onOpenFleet={() => s.setShowFleetDetail(true)}
+            onOpenFleet={() => {
+              s.setActiveTab('runtime');
+              setRuntimeSection('devices');
+            }}
             onCreateTask={s.openNewTaskModal}
             onLaunchCompute={() => {
               s.setComputeExperiment(defaultComputeExperimentForm());
