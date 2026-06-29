@@ -7,6 +7,273 @@ let capturedThinkerPrompt: string | undefined;
 // assert on derived values (problem_model recovery framing).
 let capturedThinkerParams: Record<string, unknown> | undefined;
 
+const {
+  INDEX_EXPORT_NAMES,
+  WORKSPACE_PREP_EXPORT_NAMES,
+  STRATEGIC_HELPERS_EXPORT_NAMES,
+  DESIGN_DOC_PRESENCE_EXPORT_NAMES,
+  RESEARCH_DIRECTION_CONTEXT_EXPORT_NAMES,
+  RESEARCH_PLAN_EXPORT_NAMES,
+  STRATEGIC_SECTIONS_EXPORT_NAMES,
+  TELEMETRY_EXPORT_NAMES,
+} = vi.hoisted(() => ({
+  INDEX_EXPORT_NAMES: [
+    'AUTH_MODE',
+    'AuthFailureError',
+    'ClaudeTimeoutError',
+    'GIT_REFERENCE_CACHE_ROOT',
+    'GracefulShutdownSignal',
+    'LLM_CLI_TRANSLATION',
+    'LLM_EXECUTION_MODE',
+    'MATERIALIZE_SCRIPT_PATH',
+    'NoProgressTimeoutError',
+    'PROVIDER',
+    'RateLimitError',
+    'TASK_BRANCH_NAMESPACE_DEFAULT',
+    'TASK_TYPE_BRANCH_PREFIX',
+    'VmConfigMissingError',
+    'WORKSPACE',
+    '__resetTaskCapabilityContractLoadedForTesting',
+    '__setRunClaudeCodeOverrideForSmoke',
+    '__setWarmRetargetDepsForTesting',
+    '_captureBootCredentialSnapshotForTesting',
+    '_captureBootProviderConfigPresenceForTesting',
+    '_consumePendingParkDirectiveForTesting',
+    '_crashReportForTesting',
+    '_getActiveCredentialStateSourceForTesting',
+    '_getCrashReportTaskIdForTesting',
+    '_getFirstToolUseAtForTesting',
+    '_getHandlerDurationForTesting',
+    '_getJobModeForTesting',
+    '_getRoleClaimTimestampForTesting',
+    '_getWarmStartForTesting',
+    '_isCancelRequestedForTesting',
+    '_materializeClaimCredentialStateForTesting',
+    '_resetCancelRequestedForTesting',
+    '_resetCredentialStateForTesting',
+    '_resetTelemetryForTesting',
+    '_setAgentRuntimeFingerprintForTesting',
+    '_setAgentSourceShaForTesting',
+    '_setAgentTokenForTesting',
+    '_setCancelRequestedForTesting',
+    '_setHandlerDurationForTesting',
+    '_setInWarmPollWindowForTesting',
+    '_setJobModeForTesting',
+    '_setRoleClaimTimestampForTesting',
+    '_setWarmStartForTesting',
+    '_startHeartbeatForTesting',
+    '_stopHeartbeatForTesting',
+    'apiGet',
+    'apiPost',
+    'apiRequest',
+    'appendToLogBuffer',
+    'bootstrapPoolMode',
+    'buildTargetedPytestRunners',
+    'captureTestBaseline',
+    'clearLastProviderRunErrorReport',
+    'clearLogBuffer',
+    'clearToolTrace',
+    'cloneWithRetry',
+    'codexStreamHasTurnCompleted',
+    'collectFixLoopEventsForFlush',
+    'computePromptFingerprint',
+    'computeRefreshDelayMs',
+    'condensedAnalysisSections',
+    'continueWarmContinuation',
+    'createStaleResultEnvelope',
+    'deriveTaskBranch',
+    'detectLoopDivergence',
+    'detectTestRunners',
+    'ensureTaskCapabilityContractLoaded',
+    'errorFingerprint',
+    'estimateTokensFromChars',
+    'execFileAsync',
+    'extractInvestigatedFiles',
+    'extractPytestSelectorsFromOutput',
+    'fetchTaskCapabilityContract',
+    'fetchVmImageIdentity',
+    'getAgentToken',
+    'getCurrentPromptFingerprint',
+    'getFormatComplianceTelemetry',
+    'getLastProviderRunErrorReport',
+    'getLlmTelemetry',
+    'getProviderRunner',
+    'git',
+    'gitAsync',
+    'isBootstrapToken',
+    'isTaskNoLongerActiveError',
+    'listOpenPullRequestsForBranch',
+    'log',
+    'main',
+    'markStaleResultFailure',
+    'matchesAuthFailure',
+    'matchesRateLimit',
+    'matchesVmConfigMissing',
+    'missingProviderConfigFiles',
+    'missingVmProviderConfigFiles',
+    'normalizePytestSelectorForRunner',
+    'parseFailingTests',
+    'parseFailingTestsFromVitestJson',
+    'parseLLMCliTranslation',
+    'parseStaleResultFile',
+    'performWarmRetarget',
+    'persistAndPostStatus',
+    'pollForNextRole',
+    'postTerminalStatusSync',
+    'providerSupportsNativeSubagents',
+    'pushAndCreatePR',
+    'readAgentRuntimeFingerprint',
+    'readAgentSourceSha',
+    'readHandlerOutput',
+    'recordFormatMiss',
+    'recordFormatRepairAttempt',
+    'recordFormatRepairSuccess',
+    'recordInitialOAuthAuthHash',
+    'recordLlmCallStart',
+    'recordLlmTokens',
+    'recordToolUse',
+    'refreshRuntimeState',
+    'registerSizeCapMergeDriver',
+    'replayLogBufferRateLimited',
+    'requiredProviderConfigFiles',
+    'resetFormatComplianceTelemetry',
+    'resetLlmTelemetry',
+    'resetPerRoleModuleState',
+    'resolveBaseBranch',
+    'resolveCredentialsFromSecretVersion',
+    'resolveTaskBranchNamespace',
+    'rotateOAuthCredentialsIfChanged',
+    'runClaudeCode',
+    'runProviderAgent',
+    'sanitize',
+    'sanitizeError',
+    'sendHeartbeatSync',
+    'sendLog',
+    'setCurrentPromptFingerprint',
+    'setupWorkspace',
+    'shouldAbandonStaleResult',
+    'snapshotLogBuffer',
+    'snapshotToolTrace',
+    'staleResultBackoffMs',
+    'strVal',
+    'testFixLoop',
+    'validateBranchName',
+  ],
+  WORKSPACE_PREP_EXPORT_NAMES: [
+    'getLastWorkspacePrepOutcome',
+    'prepareWorkspaceForRole',
+    'resetWorkspacePrepOutcome',
+    'resolveReferenceRepo',
+  ],
+  STRATEGIC_HELPERS_EXPORT_NAMES: [
+    'DESIGN_DOC_FETCH_VERBS',
+    'PLAN_FETCH_VERBS',
+    'RESEARCH_FETCH_VERBS',
+    'STRATEGIC_CHALLENGE_VERSION',
+    'STRATEGIC_FETCH_VERBS',
+    'blockedChallengeRecord',
+    'buildFetchGuidance',
+    'buildStrategicChallengeExecutorSection',
+    'buildStrategicChallengePrompt',
+    'parseStrategicChallengeRecord',
+    'portfolioOperationFingerprint',
+    'runStrategicChallenge',
+    'writeFetchHelper',
+    'writeStrategicHelpers',
+  ],
+  DESIGN_DOC_PRESENCE_EXPORT_NAMES: [
+    'extractEntryPaths',
+    'reconcileDesignDocIndex',
+    'reconcileDesignDocPresence',
+    'reconcileEntry',
+    'reconcileMissingCapabilities',
+    'reconcileSystemEntry',
+  ],
+  RESEARCH_DIRECTION_CONTEXT_EXPORT_NAMES: [
+    'differentiationHintFor',
+    'formatCochangeHints',
+    'formatDecompositionOutcomes',
+    'formatPastRetirementCritiques',
+    'formatPreviousDecisionOutcomes',
+    'formatRetiredDirectionsSummary',
+  ],
+  RESEARCH_PLAN_EXPORT_NAMES: [
+    'CAPABILITY_DECLARATION_DOC',
+    'PR_INELIGIBLE_TASK_TYPES',
+    'aggregateDirectionStats',
+    'buildAvailableCapabilitiesSection',
+    'buildCapabilityVerificationSection',
+    'buildEfficiencySnapshotSection',
+    'buildEmptyRepoGuidance',
+    'buildFilteredFindingsSection',
+    'buildMemoCitationsSection',
+    'buildOperatorOverridesSection',
+    'buildPortfolioComposition',
+    'buildRejectedProposalsSection',
+    'buildRunningUpdateSupersededSection',
+    'buildScopeCalibrationSignal',
+    'buildStrategicCompletionLogs',
+    'buildThinkerPrompt',
+    'buildUserPausedSection',
+    'buildVersionPhaseSection',
+    'calcMessageAge',
+    'classifyFailureCategory',
+    'formatCochangeHints',
+    'formatDecompositionOutcomes',
+    'formatPastRetirementCritiques',
+    'formatPreviousDecisionOutcomes',
+    'formatRetiredDirectionsSummary',
+    'handlePlan',
+    'handleResearch',
+    'normalizePlanSubtaskTypes',
+    'parseResearchContext',
+    'readProgressArtifact',
+    'resolveMemoHandles',
+    'runThinkerWithGate',
+  ],
+  STRATEGIC_SECTIONS_EXPORT_NAMES: [
+    'buildCapabilityVerificationSection',
+    'buildCiComplianceSection',
+    'buildClockAndRecentWorkSection',
+    'buildConversationThreadSection',
+    'buildCycleStartReconciliationSection',
+    'buildDirHealthSummary',
+    'buildDirSummaryText',
+    'buildDriftSection',
+    'buildFeedbackSection',
+    'buildHeldDirectionsSection',
+    'buildModelHealthSection',
+    'buildOpenMessagesText',
+    'buildOutcomeSection',
+    'buildPayloadStalenessSection',
+    'buildPruneCandidatesSection',
+    'buildQuestionSection',
+    'buildSweepComparisonSection',
+    'buildSystemMaturitySection',
+    'fmtScalar',
+  ],
+  TELEMETRY_EXPORT_NAMES: [
+    'computePromptFingerprint',
+    'errorFingerprint',
+    'estimateTokensFromChars',
+    'getCurrentPromptFingerprint',
+    'getFormatComplianceTelemetry',
+    'getLlmTelemetry',
+    'recordFormatMiss',
+    'recordFormatRepairAttempt',
+    'recordFormatRepairInfraFailure',
+    'recordFormatRepairMiss',
+    'recordFormatRepairSuccess',
+    'recordFormatRepairTokens',
+    'recordLlmCallStart',
+    'recordLlmTokens',
+    'recordViewportScreenshotDownload',
+    'resetFormatComplianceTelemetry',
+    'resetLlmTelemetry',
+    'setCurrentPromptFingerprint',
+  ],
+}));
+
 vi.mock('fs', () => ({
   default: {
     existsSync: vi.fn().mockReturnValue(false),
@@ -16,6 +283,7 @@ vi.mock('fs', () => ({
 }));
 
 vi.mock('../index.js', () => ({
+  ...Object.fromEntries(INDEX_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   WORKSPACE: '/tmp/workspace',
   strVal: (v: unknown, def = '') => (typeof v === 'string' ? v : def),
   sanitize: (s: string) => s,
@@ -30,6 +298,7 @@ vi.mock('../index.js', () => ({
 }));
 
 vi.mock('../workspacePrep.js', () => ({
+  ...Object.fromEntries(WORKSPACE_PREP_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -60,6 +329,12 @@ const { DEFAULT_CHALLENGE_RECORD } = vi.hoisted(() => ({
 }));
 
 vi.mock('./strategic-helpers.js', () => ({
+  ...Object.fromEntries(STRATEGIC_HELPERS_EXPORT_NAMES.map((name) => [name, vi.fn()])),
+  DESIGN_DOC_FETCH_VERBS: [],
+  PLAN_FETCH_VERBS: [],
+  RESEARCH_FETCH_VERBS: [],
+  STRATEGIC_CHALLENGE_VERSION: 1,
+  STRATEGIC_FETCH_VERBS: [],
   writeStrategicHelpers: vi.fn(),
   // Mocked so the wiring tests do NOT spawn the real challenge runClaudeCode
   // pass — that keeps runClaudeCode.mock.calls[0] the executor prompt for the
@@ -103,6 +378,7 @@ vi.mock('../utils/time.js', () => ({
 }));
 
 vi.mock('../utils/design-doc-presence.js', () => ({
+  ...Object.fromEntries(DESIGN_DOC_PRESENCE_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   reconcileDesignDocPresence: (doc: unknown) => doc,
   // Identity stub: the handler now reconciles the compact index. Return it
   // unchanged so the overview-rendering assertions see the payload's index.
@@ -110,6 +386,10 @@ vi.mock('../utils/design-doc-presence.js', () => ({
 }));
 
 vi.mock('./research-direction-context.js', () => ({
+  ...Object.fromEntries(RESEARCH_DIRECTION_CONTEXT_EXPORT_NAMES.map((name) => [name, vi.fn()])),
+  differentiationHintFor: () => '',
+  formatCochangeHints: () => '',
+  formatDecompositionOutcomes: () => '',
   formatPreviousDecisionOutcomes: () => '',
   formatPastRetirementCritiques: () => '',
   formatRetiredDirectionsSummary: () => '',
@@ -133,6 +413,8 @@ vi.mock('../prompts/thinker.js', async (importOriginal) => {
 });
 
 vi.mock('./research-plan.js', () => ({
+  ...Object.fromEntries(RESEARCH_PLAN_EXPORT_NAMES.map((name) => [name, vi.fn()])),
+  PR_INELIGIBLE_TASK_TYPES: [],
   buildStrategicCompletionLogs: () => ({ logs: '' }),
   readProgressArtifact: () => '',
   buildRejectedProposalsSection: () => '',
@@ -161,7 +443,13 @@ vi.mock('./research-plan.js', () => ({
 }));
 
 vi.mock('./strategic-sections.js', () => ({
+  ...Object.fromEntries(STRATEGIC_SECTIONS_EXPORT_NAMES.map((name) => [name, vi.fn()])),
+  fmtScalar: (v: unknown, fallback = '?') => {
+    if (v === undefined || v === null || v === '') return fallback;
+    return typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' ? String(v) : fallback;
+  },
   buildSystemMaturitySection: () => '',
+  buildCapabilityVerificationSection: () => '',
   // Echo presence so wiring tests can assert the handler passes
   // payload.cycle_start_reconciliation through to this builder.
   buildCycleStartReconciliationSection: (recon: Record<string, unknown> | undefined) =>
@@ -194,10 +482,21 @@ vi.mock('./strategic-sections.js', () => ({
 }));
 
 vi.mock('../telemetry.js', () => ({
+  ...Object.fromEntries(TELEMETRY_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   recordFormatMiss: vi.fn(),
   recordFormatRepairAttempt: vi.fn(),
   recordFormatRepairSuccess: vi.fn(),
   recordFormatRepairTokens: vi.fn(),
+  recordFormatRepairInfraFailure: vi.fn(),
+  recordFormatRepairMiss: vi.fn(),
+  recordLlmCallStart: vi.fn(),
+  recordLlmTokens: vi.fn(),
+  recordViewportScreenshotDownload: vi.fn(),
+  resetFormatComplianceTelemetry: vi.fn(),
+  resetLlmTelemetry: vi.fn(),
+  setCurrentPromptFingerprint: vi.fn(),
+  getCurrentPromptFingerprint: vi.fn().mockReturnValue(null),
+  getFormatComplianceTelemetry: vi.fn().mockReturnValue({}),
   getLlmTelemetry: vi.fn().mockReturnValue({
     llm_call_count: 0,
     total_input_tokens: 100,
@@ -212,7 +511,9 @@ import {
   renderDesignDocIndexOverview,
   handleStrategic,
 } from './strategic.js';
+import * as mockedIndexModule from '../index.js';
 import { runClaudeCode, apiPost, setCurrentPromptFingerprint, sendHeartbeatSync } from '../index.js';
+import * as mockedWorkspacePrepModule from '../workspacePrep.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 import { VmConfigMissingError } from '../providers/runners.js';
 import {
@@ -220,8 +521,40 @@ import {
   runThinkerWithGate,
   type ThinkerPromptParams,
 } from '../prompts/thinker.js';
+import * as mockedStrategicHelpersModule from './strategic-helpers.js';
 import { runStrategicChallenge } from './strategic-helpers.js';
+import * as mockedTimeModule from '../utils/time.js';
+import * as mockedDesignDocPresenceModule from '../utils/design-doc-presence.js';
+import * as mockedResearchDirectionContextModule from './research-direction-context.js';
+import * as mockedResearchPlanModule from './research-plan.js';
+import * as mockedStrategicSectionsModule from './strategic-sections.js';
+import * as mockedTelemetryModule from '../telemetry.js';
 import { recordFormatMiss, recordFormatRepairAttempt } from '../telemetry.js';
+
+async function expectMockCoversActualNamedExports(moduleId: string, mockedModule: Record<string, unknown>) {
+  const actual = await vi.importActual<Record<string, unknown>>(moduleId);
+  const mockedKeys = new Set(Object.keys(mockedModule));
+  for (const exportName of Object.keys(actual).filter((name) => name !== 'default')) {
+    expect(
+      mockedKeys.has(exportName),
+      `Mock for ${moduleId} is missing export ${exportName} -- add it to the factory.`,
+    ).toBe(true);
+  }
+}
+
+describe('mock factory completeness', () => {
+  it('covers every real named export for local full-replacement mocks', async () => {
+    await expectMockCoversActualNamedExports('../index.js', mockedIndexModule);
+    await expectMockCoversActualNamedExports('../workspacePrep.js', mockedWorkspacePrepModule);
+    await expectMockCoversActualNamedExports('./strategic-helpers.js', mockedStrategicHelpersModule);
+    await expectMockCoversActualNamedExports('../utils/time.js', mockedTimeModule);
+    await expectMockCoversActualNamedExports('../utils/design-doc-presence.js', mockedDesignDocPresenceModule);
+    await expectMockCoversActualNamedExports('./research-direction-context.js', mockedResearchDirectionContextModule);
+    await expectMockCoversActualNamedExports('./research-plan.js', mockedResearchPlanModule);
+    await expectMockCoversActualNamedExports('./strategic-sections.js', mockedStrategicSectionsModule);
+    await expectMockCoversActualNamedExports('../telemetry.js', mockedTelemetryModule);
+  });
+});
 
 describe('buildStagedDirectionsSection', () => {
   it('returns empty string when nothing is staged', () => {

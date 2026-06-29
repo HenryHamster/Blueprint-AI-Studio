@@ -1,5 +1,159 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+const {
+  INDEX_EXPORT_NAMES,
+  WORKSPACE_PREP_EXPORT_NAMES,
+} = vi.hoisted(() => ({
+  INDEX_EXPORT_NAMES: [
+    'AUTH_MODE',
+    'AuthFailureError',
+    'ClaudeTimeoutError',
+    'GIT_REFERENCE_CACHE_ROOT',
+    'GracefulShutdownSignal',
+    'LLM_CLI_TRANSLATION',
+    'LLM_EXECUTION_MODE',
+    'MATERIALIZE_SCRIPT_PATH',
+    'NoProgressTimeoutError',
+    'PROVIDER',
+    'RateLimitError',
+    'TASK_BRANCH_NAMESPACE_DEFAULT',
+    'TASK_TYPE_BRANCH_PREFIX',
+    'VmConfigMissingError',
+    'WORKSPACE',
+    '__resetTaskCapabilityContractLoadedForTesting',
+    '__setRunClaudeCodeOverrideForSmoke',
+    '__setWarmRetargetDepsForTesting',
+    '_captureBootCredentialSnapshotForTesting',
+    '_captureBootProviderConfigPresenceForTesting',
+    '_consumePendingParkDirectiveForTesting',
+    '_crashReportForTesting',
+    '_getActiveCredentialStateSourceForTesting',
+    '_getCrashReportTaskIdForTesting',
+    '_getFirstToolUseAtForTesting',
+    '_getHandlerDurationForTesting',
+    '_getJobModeForTesting',
+    '_getRoleClaimTimestampForTesting',
+    '_getWarmStartForTesting',
+    '_isCancelRequestedForTesting',
+    '_materializeClaimCredentialStateForTesting',
+    '_resetCancelRequestedForTesting',
+    '_resetCredentialStateForTesting',
+    '_resetTelemetryForTesting',
+    '_setAgentRuntimeFingerprintForTesting',
+    '_setAgentSourceShaForTesting',
+    '_setAgentTokenForTesting',
+    '_setCancelRequestedForTesting',
+    '_setHandlerDurationForTesting',
+    '_setInWarmPollWindowForTesting',
+    '_setJobModeForTesting',
+    '_setRoleClaimTimestampForTesting',
+    '_setWarmStartForTesting',
+    '_startHeartbeatForTesting',
+    '_stopHeartbeatForTesting',
+    'apiGet',
+    'apiPost',
+    'apiRequest',
+    'appendToLogBuffer',
+    'bootstrapPoolMode',
+    'buildTargetedPytestRunners',
+    'captureTestBaseline',
+    'clearLastProviderRunErrorReport',
+    'clearLogBuffer',
+    'clearToolTrace',
+    'cloneWithRetry',
+    'codexStreamHasTurnCompleted',
+    'collectFixLoopEventsForFlush',
+    'computePromptFingerprint',
+    'computeRefreshDelayMs',
+    'condensedAnalysisSections',
+    'continueWarmContinuation',
+    'createStaleResultEnvelope',
+    'deriveTaskBranch',
+    'detectLoopDivergence',
+    'detectTestRunners',
+    'ensureTaskCapabilityContractLoaded',
+    'errorFingerprint',
+    'estimateTokensFromChars',
+    'execFileAsync',
+    'extractInvestigatedFiles',
+    'extractPytestSelectorsFromOutput',
+    'fetchTaskCapabilityContract',
+    'fetchVmImageIdentity',
+    'getAgentToken',
+    'getCurrentPromptFingerprint',
+    'getFormatComplianceTelemetry',
+    'getLastProviderRunErrorReport',
+    'getLlmTelemetry',
+    'getProviderRunner',
+    'git',
+    'gitAsync',
+    'isBootstrapToken',
+    'isTaskNoLongerActiveError',
+    'listOpenPullRequestsForBranch',
+    'log',
+    'main',
+    'markStaleResultFailure',
+    'matchesAuthFailure',
+    'matchesRateLimit',
+    'matchesVmConfigMissing',
+    'missingProviderConfigFiles',
+    'missingVmProviderConfigFiles',
+    'normalizePytestSelectorForRunner',
+    'parseFailingTests',
+    'parseFailingTestsFromVitestJson',
+    'parseLLMCliTranslation',
+    'parseStaleResultFile',
+    'performWarmRetarget',
+    'persistAndPostStatus',
+    'pollForNextRole',
+    'postTerminalStatusSync',
+    'providerSupportsNativeSubagents',
+    'pushAndCreatePR',
+    'readAgentRuntimeFingerprint',
+    'readAgentSourceSha',
+    'readHandlerOutput',
+    'recordFormatMiss',
+    'recordFormatRepairAttempt',
+    'recordFormatRepairSuccess',
+    'recordInitialOAuthAuthHash',
+    'recordLlmCallStart',
+    'recordLlmTokens',
+    'recordToolUse',
+    'refreshRuntimeState',
+    'registerSizeCapMergeDriver',
+    'replayLogBufferRateLimited',
+    'requiredProviderConfigFiles',
+    'resetFormatComplianceTelemetry',
+    'resetLlmTelemetry',
+    'resetPerRoleModuleState',
+    'resolveBaseBranch',
+    'resolveCredentialsFromSecretVersion',
+    'resolveTaskBranchNamespace',
+    'rotateOAuthCredentialsIfChanged',
+    'runClaudeCode',
+    'runProviderAgent',
+    'sanitize',
+    'sanitizeError',
+    'sendHeartbeatSync',
+    'sendLog',
+    'setCurrentPromptFingerprint',
+    'setupWorkspace',
+    'shouldAbandonStaleResult',
+    'snapshotLogBuffer',
+    'snapshotToolTrace',
+    'staleResultBackoffMs',
+    'strVal',
+    'testFixLoop',
+    'validateBranchName',
+  ],
+  WORKSPACE_PREP_EXPORT_NAMES: [
+    'getLastWorkspacePrepOutcome',
+    'prepareWorkspaceForRole',
+    'resetWorkspacePrepOutcome',
+    'resolveReferenceRepo',
+  ],
+}));
+
 vi.mock('fs', () => ({
   default: {
     readFileSync: vi.fn().mockReturnValue(''),
@@ -10,6 +164,7 @@ vi.mock('fs', () => ({
 }));
 
 vi.mock('../index.js', () => ({
+  ...Object.fromEntries(INDEX_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   WORKSPACE: '/tmp/workspace',
   sendLog: vi.fn(),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
@@ -35,6 +190,7 @@ vi.mock('../index.js', () => ({
 }));
 
 vi.mock('child_process', () => ({
+  execFile: vi.fn(),
   // Route `git rev-parse` (HEAD and origin/<branch>) to a single stable sha so
   // verifyCloneDelivered sees a resolvable HEAD that matches its remote tracking
   // ref; every other git call returns empty output, which the handlers tolerate
@@ -47,6 +203,7 @@ vi.mock('child_process', () => ({
 }));
 
 vi.mock('../workspacePrep.js', () => ({
+  ...Object.fromEntries(WORKSPACE_PREP_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -78,8 +235,10 @@ vi.mock('../prompt.js', async (importOriginal) => {
 });
 
 import fs from 'fs';
+import * as mockedIndexModule from '../index.js';
 import { runClaudeCode, persistAndPostStatus, getProviderRunner, apiGet } from '../index.js';
 import { execFileSync } from 'child_process';
+import * as mockedWorkspacePrepModule from '../workspacePrep.js';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
 import { writeDesignDocHelper } from '../prompt.js';
@@ -109,6 +268,24 @@ import {
   CAPABILITY_DECLARATION_DOC,
   normalizePlanSubtaskTypes,
 } from './research-plan.js';
+
+async function expectMockCoversActualNamedExports(moduleId: string, mockedModule: Record<string, unknown>) {
+  const actual = await vi.importActual<Record<string, unknown>>(moduleId);
+  const mockedKeys = new Set(Object.keys(mockedModule));
+  for (const exportName of Object.keys(actual).filter((name) => name !== 'default')) {
+    expect(
+      mockedKeys.has(exportName),
+      `Mock for ${moduleId} is missing export ${exportName} -- add it to the factory.`,
+    ).toBe(true);
+  }
+}
+
+describe('mock factory completeness', () => {
+  it('covers every real named export for local full-replacement mocks', async () => {
+    await expectMockCoversActualNamedExports('../index.js', mockedIndexModule);
+    await expectMockCoversActualNamedExports('../workspacePrep.js', mockedWorkspacePrepModule);
+  });
+});
 
 describe('calcMessageAge', () => {
   beforeEach(() => {
