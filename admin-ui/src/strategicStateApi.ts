@@ -120,6 +120,87 @@ export interface StrategicLocalRunnerState {
   liveness_window_seconds: number;
 }
 
+export interface StrategicRuntimeComputeJobPreview {
+  id: string;
+  task_id: string | null;
+  task_title?: string | null;
+  task_type?: string | null;
+  status: string;
+  backend: string;
+  machine_type?: string | null;
+  accelerator_type?: string | null;
+  accelerator_count?: number | null;
+  spend_cap_usd?: number | null;
+  cost_usd?: number | null;
+  created_at?: string | null;
+  updated_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+  last_heartbeat_at?: string | null;
+  next_poll_at?: string | null;
+  terminal_reason?: string | null;
+}
+
+export interface StrategicRuntimeWakePreview {
+  id: string;
+  task_id: string;
+  task_title?: string | null;
+  task_status?: string | null;
+  wake_source_kind: string;
+  wake_source_ref?: string | null;
+  wake_action: string;
+  delivery_state: string;
+  requested_at?: string | null;
+  deadline_at?: string | null;
+  fired_at?: string | null;
+  delivered_at?: string | null;
+  attempt_count: number;
+  result_state?: string | null;
+  result_detail?: string | null;
+}
+
+export interface StrategicRuntimeWorkState {
+  compute_jobs: {
+    window_minutes: number;
+    counts: {
+      active: number;
+      terminal_recent: number;
+      total: number;
+      queued: number;
+      starting: number;
+      running: number;
+      polling: number;
+      succeeded_recent: number;
+      failed_recent: number;
+      cancelled_recent: number;
+      timed_out_recent: number;
+      criterion_measured: number;
+      criterion_met: number;
+    };
+    spend: {
+      active_accrued_usd: number;
+      recent_terminal_usd: number;
+      window_total_usd: number;
+    };
+    items: StrategicRuntimeComputeJobPreview[];
+  };
+  held_approvals: {
+    count: number;
+    items: StrategicStateTask[];
+  };
+  parked_wakes: {
+    counts: {
+      active: number;
+      pending: number;
+      fired: number;
+      problem: number;
+      expired: number;
+      failed: number;
+    };
+    items: StrategicRuntimeWakePreview[];
+  };
+}
+
 export interface StrategicWorkbenchState {
   version: 1;
   interaction_mode: 'chat' | 'check_in' | 'monitor' | 'continuous' | string;
@@ -223,6 +304,7 @@ export interface StrategicStateResponse {
   context_package?: StrategicContextPackageDescriptor | null;
   runtime?: {
     local_runner?: StrategicLocalRunnerState | null;
+    work?: StrategicRuntimeWorkState | null;
   };
   workbench?: StrategicWorkbenchState | null;
   design: {

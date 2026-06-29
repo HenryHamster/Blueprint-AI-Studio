@@ -1,9 +1,10 @@
 import type { ReactNode } from 'react';
-import { ArrowUpRight, CircleAlert, Cpu, FileText, GitBranch, Network, Radio } from 'lucide-react';
+import { Activity, ArrowUpRight, CircleAlert, Cpu, FileText, GitBranch, Network, Radio } from 'lucide-react';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import type {
   StrategicContextPackageDescriptor,
   StrategicLocalRunnerState,
+  StrategicRuntimeWorkState,
   StrategicStateAttentionItem,
   StrategicStateResponse,
 } from '../strategicStateApi';
@@ -22,6 +23,7 @@ interface StrategicContextRailProps {
   onOpenPipeline: () => void;
   onOpenRuntimeHealth: () => void;
   onOpenRuntimeDevices?: () => void;
+  onOpenRuntimeCompute?: () => void;
   onOpenTask?: (taskId: string) => void;
   onOpenMessages?: () => void;
 }
@@ -87,6 +89,55 @@ function localRunnerDetail(localRunner: StrategicLocalRunnerState): string {
   if (localRunner.fallback_reason === 'capability_mismatch') return 'Runner does not cover the full Strategic cycle';
   if (localRunner.fallback_reason === 'runner_claim_pending') return 'Pinned locally; waiting for runner claim';
   return 'Local runner is not available for Strategic work';
+}
+
+function runtimeWorkTone(work: StrategicRuntimeWorkState): { dot: string; text: string; label: string } {
+  if ((work.held_approvals?.count ?? 0) > 0 || (work.parked_wakes?.counts.problem ?? 0) > 0) {
+    return { dot: 'bg-amber-300', text: 'text-amber-300', label: 'needs check' };
+  }
+  if ((work.compute_jobs?.counts.failed_recent ?? 0) > 0 || (work.compute_jobs?.counts.timed_out_recent ?? 0) > 0) {
+    return { dot: 'bg-rose-400', text: 'text-rose-300', label: 'recent failure' };
+  }
+  if ((work.compute_jobs?.counts.active ?? 0) > 0 || (work.parked_wakes?.counts.active ?? 0) > 0) {
+    return { dot: 'bg-cyan-400', text: 'text-cyan-300', label: 'active' };
+  }
+  if ((work.compute_jobs?.counts.terminal_recent ?? 0) > 0) {
+    return { dot: 'bg-neutral-500', text: 'text-neutral-400', label: 'recent result' };
+  }
+  return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'quiet' };
+}
+
+function runtimeWorkDetail(work: StrategicRuntimeWorkState): string {
+  const parts = [
+    (work.compute_jobs?.counts.active ?? 0) > 0
+      ? pluralize(work.compute_jobs.counts.active, 'compute job')
+      : null,
+    (work.held_approvals?.count ?? 0) > 0
+      ? pluralize(work.held_approvals.count, 'approval')
+      : null,
+    (work.parked_wakes?.counts.active ?? 0) > 0
+      ? pluralize(work.parked_wakes.counts.active, 'parked wake')
+      : null,
+    (work.compute_jobs?.counts.failed_recent ?? 0) > 0
+      ? pluralize(work.compute_jobs.counts.failed_recent, 'recent failure')
+      : null,
+  ].filter(Boolean);
+  if (parts.length > 0) return parts.join(', ');
+  const terminal = work.compute_jobs?.counts.terminal_recent ?? 0;
+  return terminal > 0 ? `${pluralize(terminal, 'recent compute result')}` : 'No active background work';
+}
+
+function runtimeWorkHasSignal(work?: StrategicRuntimeWorkState | null): work is StrategicRuntimeWorkState {
+  if (!work) return false;
+  return (
+    (work.compute_jobs?.counts.active ?? 0) > 0 ||
+    (work.compute_jobs?.counts.failed_recent ?? 0) > 0 ||
+    (work.compute_jobs?.counts.timed_out_recent ?? 0) > 0 ||
+    (work.held_approvals?.count ?? 0) > 0 ||
+    (work.parked_wakes?.counts.active ?? 0) > 0 ||
+    (work.parked_wakes?.counts.problem ?? 0) > 0 ||
+    (work.compute_jobs?.counts.terminal_recent ?? 0) > 0
+  );
 }
 
 function RailButton({
@@ -213,11 +264,13 @@ export function StrategicContextRail({
   onOpenPipeline,
   onOpenRuntimeHealth,
   onOpenRuntimeDevices,
+  onOpenRuntimeCompute,
   onOpenTask,
   onOpenMessages,
 }: StrategicContextRailProps) {
   const activeCycle = state?.strategic.active_cycle ?? null;
   const localRunner = state?.runtime?.local_runner ?? null;
+  const runtimeWork = state?.runtime?.work ?? null;
   const pendingSteer = state?.strategic.refresh.pending ?? null;
   const latestCycle = state?.strategic.latest_cycle ?? null;
   const taskCounts = state?.tasks.counts;
@@ -248,6 +301,9 @@ export function StrategicContextRail({
       ? pendingSteer.excerpt
       : latestCycle?.summary_text ?? lastCycleCompletion?.status_message ?? 'No active Strategic cycle';
   const localRunnerStatus = localRunner ? localRunnerTone(localRunner) : null;
+  const showRuntimeWork = runtimeWorkHasSignal(runtimeWork);
+  const runtimeWorkStatus = showRuntimeWork ? runtimeWorkTone(runtimeWork) : null;
+  const firstRuntimeJob = runtimeWork?.compute_jobs.items[0] ?? null;
 
   function attentionItemAction(item: StrategicStateAttentionItem): (() => void) | undefined {
     if (item.kind === 'task') {
@@ -302,6 +358,31 @@ export function StrategicContextRail({
                 </p>
               </div>
               <RailButton onClick={onOpenRuntimeDevices ?? onOpenRuntimeHealth}>Devices</RailButton>
+            </div>
+          </div>
+        )}
+        {showRuntimeWork && runtimeWorkStatus && (
+          <div className="mt-3 border-t border-neutral-800 pt-3">
+            <div className="flex min-w-0 items-center gap-2">
+              <Activity className="h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="truncate text-xs font-semibold text-neutral-100">Runtime work</span>
+                  <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${runtimeWorkStatus.dot}`} aria-hidden="true" />
+                  <span className={`shrink-0 text-ui-sm font-semibold uppercase ${runtimeWorkStatus.text}`}>
+                    {runtimeWorkStatus.label}
+                  </span>
+                </div>
+                <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-neutral-500">
+                  {runtimeWorkDetail(runtimeWork)}
+                </p>
+                {firstRuntimeJob?.task_title && (
+                  <p className="mt-1 truncate text-ui-sm text-neutral-600">
+                    {firstRuntimeJob.task_title}
+                  </p>
+                )}
+              </div>
+              <RailButton onClick={onOpenRuntimeCompute ?? onOpenRuntimeHealth}>Compute</RailButton>
             </div>
           </div>
         )}
@@ -387,6 +468,7 @@ export function StrategicContextRail({
             <StatRow label="running" value={taskCounts?.running ?? 0} />
             <StatRow label="queued" value={taskCounts?.queued ?? 0} />
             <StatRow label="blocked" value={taskCounts?.blocked ?? 0} />
+            <StatRow label="parked" value={taskCounts?.parked ?? 0} />
             <StatRow label="needs operator" value={attentionNeeds} />
             <StatRow label="watch" value={attentionWatch} />
             <StatRow label="linked messages" value={state?.messages.counts.linked ?? 0} />

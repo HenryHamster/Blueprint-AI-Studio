@@ -6,6 +6,8 @@ from httpx import AsyncClient
 from app.models import (
     Alert,
     AlertSeverity,
+    ComputeJob,
+    ComputeJobStatus,
     LocalRunner,
     MessageType,
     MessagesLastSeen,
@@ -15,7 +17,10 @@ from app.models import (
     ProjectMessage,
     StrategicCycle,
     Task,
+    TaskWakeRegistration,
     TaskStatus,
+    WakeAction,
+    WakeDeliveryState,
     _utcnow,
 )
 
@@ -660,6 +665,149 @@ async def test_strategic_state_includes_operator_workbench_state(
         {"kind": "task", "id": "task-123", "label": "Review active wave"}
     ]
     assert "cycle_summary" not in workbench
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_includes_runtime_background_work(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    active_task = Task(
+        project_id=project.id,
+        title="Run GPU benchmark",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    held_task = Task(
+        project_id=project.id,
+        title="Approve expensive benchmark",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=True,
+        priority=1,
+    )
+    parked_task = Task(
+        project_id=project.id,
+        title="Waiting for compute result",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.PARKED,
+        park_reason="waiting on compute job",
+    )
+    db_session.add_all([active_task, held_task, parked_task])
+    await db_session.commit()
+    await db_session.refresh(active_task)
+    await db_session.refresh(parked_task)
+
+    active_job = ComputeJob(
+        project_id=project.id,
+        task_id=active_task.id,
+        backend="local",
+        machine_type="gpu-small",
+        accelerator_type="L4",
+        accelerator_count=1,
+        status=ComputeJobStatus.RUNNING,
+        spend_cap_usd=8.0,
+        accrued_cost_usd=1.25,
+        started_at=now - timedelta(minutes=20),
+        updated_at=now,
+        last_heartbeat_at=now - timedelta(seconds=30),
+    )
+    failed_job = ComputeJob(
+        project_id=project.id,
+        task_id=active_task.id,
+        backend="local",
+        status=ComputeJobStatus.FAILED,
+        final_cost_usd=2.5,
+        completed_at=now - timedelta(minutes=10),
+        updated_at=now - timedelta(minutes=10),
+        terminal_reason="command failed " + ("x" * 500),
+    )
+    old_failed_job = ComputeJob(
+        project_id=project.id,
+        backend="local",
+        status=ComputeJobStatus.FAILED,
+        final_cost_usd=10.0,
+        completed_at=now - timedelta(hours=12),
+        updated_at=now - timedelta(hours=12),
+    )
+    db_session.add_all([active_job, failed_job, old_failed_job])
+    await db_session.commit()
+    await db_session.refresh(active_job)
+
+    pending_wake = TaskWakeRegistration(
+        task_id=parked_task.id,
+        project_id=project.id,
+        wake_source_kind="compute_job_terminal",
+        wake_source_ref=str(active_job.id),
+        wake_action=WakeAction.FINALIZE,
+        delivery_state=WakeDeliveryState.PENDING,
+        requested_at=now - timedelta(minutes=5),
+        deadline_at=now + timedelta(hours=1),
+    )
+    expired_wake = TaskWakeRegistration(
+        task_id=parked_task.id,
+        project_id=project.id,
+        wake_source_kind="compute_job_terminal",
+        wake_source_ref=str(failed_job.id),
+        wake_action=WakeAction.FINALIZE,
+        delivery_state=WakeDeliveryState.EXPIRED,
+        requested_at=now - timedelta(minutes=15),
+        deadline_at=now - timedelta(minutes=1),
+        result_state="expired",
+        result_detail="wake expired after compute job finished " + ("y" * 500),
+    )
+    old_expired_wake = TaskWakeRegistration(
+        task_id=parked_task.id,
+        project_id=project.id,
+        wake_source_kind="compute_job_terminal",
+        wake_source_ref="old-job",
+        wake_action=WakeAction.FINALIZE,
+        delivery_state=WakeDeliveryState.EXPIRED,
+        requested_at=now - timedelta(hours=12),
+        deadline_at=now - timedelta(hours=11),
+        result_state="expired",
+        result_detail="old wake failure should not keep the rail hot",
+    )
+    db_session.add_all([pending_wake, expired_wake, old_expired_wake])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["tasks"]["counts"]["parked"] == 1
+    work = data["runtime"]["work"]
+    compute = work["compute_jobs"]
+    assert compute["window_minutes"] == 360
+    assert compute["counts"]["active"] == 1
+    assert compute["counts"]["running"] == 1
+    assert compute["counts"]["failed_recent"] == 1
+    assert compute["counts"]["terminal_recent"] == 1
+    assert compute["counts"]["total"] == 2
+    assert compute["spend"]["active_accrued_usd"] == 1.25
+    assert compute["spend"]["recent_terminal_usd"] == 2.5
+    assert {item["status"] for item in compute["items"]} == {"RUNNING", "FAILED"}
+    running_item = next(item for item in compute["items"] if item["status"] == "RUNNING")
+    assert running_item["task_title"] == "Run GPU benchmark"
+    assert running_item["accelerator_type"] == "L4"
+    failed_item = next(item for item in compute["items"] if item["status"] == "FAILED")
+    assert len(failed_item["terminal_reason"]) <= 180
+
+    assert work["held_approvals"]["count"] == 1
+    assert work["held_approvals"]["items"][0]["title"] == "Approve expensive benchmark"
+    wakes = work["parked_wakes"]
+    assert wakes["counts"]["active"] == 1
+    assert wakes["counts"]["pending"] == 1
+    assert wakes["counts"]["problem"] == 1
+    assert wakes["counts"]["expired"] == 1
+    assert {item["delivery_state"] for item in wakes["items"]} == {
+        "PENDING",
+        "EXPIRED",
+    }
+    assert all(item["wake_source_ref"] != "old-job" for item in wakes["items"])
+    expired_item = next(item for item in wakes["items"] if item["delivery_state"] == "EXPIRED")
+    assert len(expired_item["result_detail"]) <= 180
 
 
 @pytest.mark.asyncio

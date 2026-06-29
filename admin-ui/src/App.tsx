@@ -1361,6 +1361,10 @@ export default function App() {
                     setRuntimeSection('devices');
                     handleTabChange('runtime');
                   }}
+                  onOpenRuntimeCompute={() => {
+                    setRuntimeSection('compute');
+                    handleTabChange('runtime');
+                  }}
                   onOpenTask={handleViewTaskById}
                   onOpenMessages={() => handleTabChange('chat')}
                 />

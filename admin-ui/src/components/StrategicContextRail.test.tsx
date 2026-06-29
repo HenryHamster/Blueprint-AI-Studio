@@ -107,6 +107,7 @@ const STATE: StrategicStateResponse = {
       running: 2,
       evaluating: 1,
       blocked: 1,
+      parked: 1,
       failed: 0,
       completed: 12,
       total: 20,
@@ -193,6 +194,85 @@ const STATE: StrategicStateResponse = {
       fallback_reason: null,
       liveness_window_seconds: 300,
     },
+    work: {
+      compute_jobs: {
+        window_minutes: 360,
+        counts: {
+          active: 2,
+          terminal_recent: 1,
+          total: 3,
+          queued: 0,
+          starting: 1,
+          running: 1,
+          polling: 0,
+          succeeded_recent: 0,
+          failed_recent: 1,
+          cancelled_recent: 0,
+          timed_out_recent: 0,
+          criterion_measured: 1,
+          criterion_met: 0,
+        },
+        spend: {
+          active_accrued_usd: 1.25,
+          recent_terminal_usd: 2.5,
+          window_total_usd: 3.75,
+        },
+        items: [
+          {
+            id: 'job-1',
+            task_id: 'task-compute',
+            task_title: 'Run GPU benchmark',
+            task_type: 'compute_experiment',
+            status: 'RUNNING',
+            backend: 'local',
+            machine_type: 'gpu-small',
+            accelerator_type: 'L4',
+            accelerator_count: 1,
+            cost_usd: 1.25,
+            updated_at: '2026-06-29T01:06:00Z',
+          },
+        ],
+      },
+      held_approvals: {
+        count: 1,
+        items: [
+          {
+            id: 'task-held',
+            status: 'QUEUED',
+            title: 'Approve expensive benchmark',
+            task_type: 'compute_experiment',
+            latest_status_message: null,
+            started_at: null,
+            created_at: '2026-06-29T01:01:00Z',
+          },
+        ],
+      },
+      parked_wakes: {
+        counts: {
+          active: 1,
+          pending: 1,
+          fired: 0,
+          problem: 0,
+          expired: 0,
+          failed: 0,
+        },
+        items: [
+          {
+            id: 'wake-1',
+            task_id: 'task-parked',
+            task_title: 'Waiting for compute result',
+            task_status: 'PARKED',
+            wake_source_kind: 'compute_job_terminal',
+            wake_source_ref: 'job-1',
+            wake_action: 'finalize',
+            delivery_state: 'PENDING',
+            requested_at: '2026-06-29T01:02:00Z',
+            deadline_at: '2026-06-29T02:02:00Z',
+            attempt_count: 0,
+          },
+        ],
+      },
+    },
   },
   design: {
     has_design_doc: true,
@@ -251,10 +331,16 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).toContain('Local Strategic');
     expect(host.textContent).toContain('Running on runner 11111111');
     expect(host.textContent).toContain('gpt-5.4');
+    expect(host.textContent).toContain('Runtime work');
+    expect(host.textContent).toContain('2 compute jobs');
+    expect(host.textContent).toContain('1 approval');
+    expect(host.textContent).toContain('Run GPU benchmark');
+    expect(host.textContent).toContain('parked');
   });
 
   test('drills into existing workbench sections', () => {
-    const { host, props } = mount();
+    const onOpenRuntimeCompute = vi.fn();
+    const { host, props } = mount({ onOpenRuntimeCompute });
 
     const buttons = Array.from(host.querySelectorAll('button'));
     buttons.find(button => button.textContent?.includes('Model'))?.click();
@@ -262,12 +348,78 @@ describe('StrategicContextRail', () => {
     buttons.find(button => button.textContent?.includes('Pipeline'))?.click();
     buttons.find(button => button.textContent?.includes('Runtime'))?.click();
     buttons.find(button => button.textContent?.includes('Devices'))?.click();
+    buttons.find(button => button.textContent?.includes('Compute'))?.click();
 
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('problem-model');
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('directions');
     expect(props.onOpenPipeline).toHaveBeenCalled();
     expect(props.onOpenRuntimeHealth).toHaveBeenCalled();
     expect(props.onOpenRuntimeDevices).toHaveBeenCalled();
+    expect(onOpenRuntimeCompute).toHaveBeenCalled();
+  });
+
+  test('shows recent terminal compute results without requiring an active job', () => {
+    const terminalOnlyState: StrategicStateResponse = {
+      ...STATE,
+      runtime: {
+        ...STATE.runtime,
+        work: {
+          compute_jobs: {
+            window_minutes: 360,
+            counts: {
+              active: 0,
+              terminal_recent: 1,
+              total: 1,
+              queued: 0,
+              starting: 0,
+              running: 0,
+              polling: 0,
+              succeeded_recent: 1,
+              failed_recent: 0,
+              cancelled_recent: 0,
+              timed_out_recent: 0,
+              criterion_measured: 1,
+              criterion_met: 1,
+            },
+            spend: {
+              active_accrued_usd: 0,
+              recent_terminal_usd: 0.75,
+              window_total_usd: 0.75,
+            },
+            items: [
+              {
+                id: 'job-success',
+                task_id: 'task-success',
+                task_title: 'Compare embeddings',
+                task_type: 'compute_experiment',
+                status: 'SUCCEEDED',
+                backend: 'local',
+                completed_at: '2026-06-29T01:06:00Z',
+                cost_usd: 0.75,
+              },
+            ],
+          },
+          held_approvals: { count: 0, items: [] },
+          parked_wakes: {
+            counts: {
+              active: 0,
+              pending: 0,
+              fired: 0,
+              problem: 0,
+              expired: 0,
+              failed: 0,
+            },
+            items: [],
+          },
+        },
+      },
+    };
+    const { host } = mount({ state: terminalOnlyState });
+
+    expect(host.textContent).toContain('Runtime work');
+    expect(host.textContent).toContain('recent result');
+    expect(host.textContent).toContain('1 recent compute result');
+    expect(host.textContent).toContain('Compare embeddings');
   });
 
   test('shows local Strategic fallback without adding a second runner list', () => {
