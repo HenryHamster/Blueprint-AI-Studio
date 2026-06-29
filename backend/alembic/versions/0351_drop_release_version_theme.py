@@ -11,8 +11,8 @@ dark with theme_block_threshold=0.0), so dropping them removes no enforced
 behavior. The downgrade re-adds the columns nullable; historical values are
 not restored.
 
-Revision ID: 0349
-Revises: 0348
+Revision ID: 0351
+Revises: 0350
 """
 
 from alembic import op
@@ -20,8 +20,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 
-revision = "0349"
-down_revision = "0348"
+revision = "0351"
+down_revision = "0350"
 branch_labels = None
 depends_on = None
 

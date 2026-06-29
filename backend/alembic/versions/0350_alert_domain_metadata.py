@@ -1,15 +1,15 @@
 """Add alert domain metadata.
 
-Revision ID: 0348
-Revises: 0347
+Revision ID: 0350
+Revises: 0349
 """
 
 from alembic import op
 import sqlalchemy as sa
 
 
-revision = "0348"
-down_revision = "0347"
+revision = "0350"
+down_revision = "0349"
 branch_labels = None
 depends_on = None
 
