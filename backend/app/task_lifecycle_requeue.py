@@ -803,6 +803,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             parent_task_id=parent.id,
             payloads=new_payloads,
             context=clone_ctx,  # Strip runtime-only fields; may include _scope_reduced
+            criterion_ids=list(child.criterion_ids or []),
             depends_on=[],  # Set in pass 2 after all clones exist
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,

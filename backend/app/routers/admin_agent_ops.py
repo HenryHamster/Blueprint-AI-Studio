@@ -3176,8 +3176,10 @@ async def strategic_operation(
         # above by the task_type guard).  Deduplicates by text within the
         # (project_id, release_version_id) scope so repeated calls are safe.
         from app.acceptance_criteria import (
+            count_criteria_for_version as _count_criteria,
             get_criterion_by_text as _get_criterion_by_text,
             generate_criterion_key as _gen_criterion_key,
+            MAX_CRITERIA_PER_VERSION as _MAX_CRITERIA,
         )
         from app.directions_repo import get_direction_row as _get_direction_row
         from app.models import VersionAcceptanceCriterion as _VAC
@@ -3208,6 +3210,9 @@ async def strategic_operation(
                 status_code=409,
             )
 
+        existing_count = await _count_criteria(session, open_version.id)
+        new_added_count = 0
+        skipped_over_cap = 0
         processed: list[dict] = []
         for item in criteria_input:
             text = item["text"].strip()
@@ -3220,6 +3225,9 @@ async def strategic_operation(
                 criterion_key = existing.criterion_key
                 is_new = False
             else:
+                if existing_count + new_added_count >= _MAX_CRITERIA:
+                    skipped_over_cap += 1
+                    continue
                 criterion_key = _gen_criterion_key()
                 new_row = _VAC(
                     project_id=project.id,
@@ -3229,6 +3237,7 @@ async def strategic_operation(
                     created_by="strategist",
                 )
                 session.add(new_row)
+                new_added_count += 1
                 is_new = True
 
             mapped_keys: list[str] = []
@@ -3261,9 +3270,10 @@ async def strategic_operation(
         session.add(task)
         await session.commit()
         logger.info(
-            "[STRATEGIC API] set_acceptance_criteria for task %s: %d criteria, %d warnings",
+            "[STRATEGIC API] set_acceptance_criteria for task %s: %d criteria, %d skipped (cap), %d warnings",
             task.id,
             len(processed),
+            skipped_over_cap,
             len(warnings),
         )
         return _resp(
@@ -3271,6 +3281,7 @@ async def strategic_operation(
                 "status": "ok",
                 "op": "set_acceptance_criteria",
                 "criteria": processed,
+                "skipped_over_cap": skipped_over_cap,
             }
         )
 

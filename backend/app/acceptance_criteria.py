@@ -13,6 +13,7 @@ import uuid
 from collections import defaultdict
 from typing import TYPE_CHECKING, Any
 
+from sqlalchemy import func
 from sqlmodel import select
 
 from app.models import CriterionEvidence, VersionAcceptanceCriterion
@@ -110,6 +111,19 @@ async def get_criterion_by_key(
         )
     )
     return result.scalars().first()
+
+
+async def count_criteria_for_version(
+    session: AsyncSession,
+    release_version_id: uuid.UUID,
+) -> int:
+    """Return the count of acceptance criteria for a release version."""
+    result = await session.execute(
+        select(func.count()).where(
+            VersionAcceptanceCriterion.release_version_id == release_version_id
+        )
+    )
+    return result.scalar_one()
 
 
 async def get_criteria_for_version(
@@ -268,29 +282,42 @@ async def record_task_merge_evidence(
                 _release_version_id = _open_ver.id
         except Exception:
             pass
+        if _release_version_id is None:
+            return 0
         rows = await get_criteria_by_keys(
             session, project_id, criterion_ids, release_version_id=_release_version_id
         )
         task_id_str = str(getattr(task, "id", "") or "")
         recorded = 0
         for row in rows:
-            await record_evidence(
-                session,
-                criterion_id=row.id,
-                project_id=project_id,
-                source_kind="task_merge",
-                source_id=task_id_str or None,
-                detail={"proven": True},
-            )
-            await record_evidence(
-                session,
-                criterion_id=row.id,
-                project_id=project_id,
-                source_kind="reachability",
-                source_id=task_id_str or None,
-                detail={"proven": True},
-            )
-            recorded += 1
+            existing = {
+                (e.source_kind, e.source_id)
+                for e in await get_evidence_for_criterion(session, row.id)
+            }
+            source_id = task_id_str or None
+            wrote = False
+            if ("task_merge", source_id) not in existing:
+                await record_evidence(
+                    session,
+                    criterion_id=row.id,
+                    project_id=project_id,
+                    source_kind="task_merge",
+                    source_id=source_id,
+                    detail={"proven": True},
+                )
+                wrote = True
+            if ("reachability", source_id) not in existing:
+                await record_evidence(
+                    session,
+                    criterion_id=row.id,
+                    project_id=project_id,
+                    source_kind="reachability",
+                    source_id=source_id,
+                    detail={"proven": True},
+                )
+                wrote = True
+            if wrote:
+                recorded += 1
         return recorded
     except Exception:
         logger.exception(

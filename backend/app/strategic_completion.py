@@ -1228,7 +1228,9 @@ async def _apply_new_acceptance_criteria(
             return
         existing = await _ac.get_criteria_for_version(session, _open_ver.id)
         existing_texts = {c.text for c in existing}
+        headroom = _ac.MAX_CRITERIA_PER_VERSION - len(existing)
         created_count = 0
+        skipped_over_cap = 0
         for text in criteria_texts:
             if not isinstance(text, str):
                 continue
@@ -1246,6 +1248,9 @@ async def _apply_new_acceptance_criteria(
                     cleaned,
                 )
                 continue
+            if created_count >= headroom:
+                skipped_over_cap += 1
+                continue
             await _ac.stage_criterion(
                 session,
                 project_id=project.id,
@@ -1262,6 +1267,17 @@ async def _apply_new_acceptance_criteria(
                 task.id,
                 path,
                 created_count,
+                project.id,
+                _open_ver.version_number,
+            )
+        if skipped_over_cap > 0:
+            logger.info(
+                "[STRATEGIC] Task %s (%s path): dropped %d criterion(a) — "
+                "cap of %d reached for project %s version v%d",
+                task.id,
+                path,
+                skipped_over_cap,
+                _ac.MAX_CRITERIA_PER_VERSION,
                 project.id,
                 _open_ver.version_number,
             )

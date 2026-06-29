@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
+from sqlmodel import select
 
 from app import acceptance_criteria as ac
 from app.models import CriterionEvidence, Direction, Project, ProjectMember, ReleaseVersion, Task, TaskStatus
@@ -112,6 +113,137 @@ async def test_get_criteria_for_version_ordered(db_session):
     assert len(fetched) == 2
     assert fetched[0].id == c1.id
     assert fetched[1].id == c2.id
+
+
+# ---------------------------------------------------------------------------
+# count_criteria_for_version
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_count_criteria_for_version_empty(db_session):
+    """count_criteria_for_version returns 0 when no criteria exist."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    count = await ac.count_criteria_for_version(db_session, version.id)
+    assert count == 0
+
+
+@pytest.mark.asyncio
+async def test_count_criteria_for_version_with_entries(db_session):
+    """count_criteria_for_version returns the correct count after inserts."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    await ac.create_criterion(db_session, project.id, version.id, "Criterion A")
+    await ac.create_criterion(db_session, project.id, version.id, "Criterion B")
+    count = await ac.count_criteria_for_version(db_session, version.id)
+    assert count == 2
+
+
+@pytest.mark.asyncio
+async def test_count_criteria_for_version_isolated_to_version(db_session):
+    """count_criteria_for_version only counts criteria for the specified version."""
+    project = await _make_project(db_session)
+    version_a = await _make_version(db_session, project)
+    version_b = ReleaseVersion(project_id=project.id, version_number=2)
+    db_session.add(version_b)
+    await db_session.commit()
+    await db_session.refresh(version_b)
+
+    await ac.create_criterion(db_session, project.id, version_a.id, "Only in A")
+    await ac.create_criterion(db_session, project.id, version_b.id, "In B 1")
+    await ac.create_criterion(db_session, project.id, version_b.id, "In B 2")
+
+    assert await ac.count_criteria_for_version(db_session, version_a.id) == 1
+    assert await ac.count_criteria_for_version(db_session, version_b.id) == 2
+
+
+# ---------------------------------------------------------------------------
+# _apply_new_acceptance_criteria cap enforcement
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_apply_new_acceptance_criteria_enforces_cap(db_session):
+    """_apply_new_acceptance_criteria stops staging once MAX_CRITERIA_PER_VERSION is reached
+    and does not raise."""
+    from app.strategic_completion import _apply_new_acceptance_criteria
+    from app import release_version as rv
+
+    project = Project(
+        name="AC-Cap-Enforce",
+        user_id="strat-cap-user",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    # Pre-fill to (MAX - 2) so only 2 slots remain
+    headroom = 2
+    for i in range(ac.MAX_CRITERIA_PER_VERSION - headroom):
+        await ac.create_criterion(db_session, project.id, version.id, f"Pre-existing {i}")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Submit 5 new criteria; only 2 should be staged (fills exactly to cap)
+    criteria_texts = [f"New criterion {i}" for i in range(5)]
+    await _apply_new_acceptance_criteria(criteria_texts, task, project, db_session, path="test")
+
+    fetched = await ac.get_criteria_for_version(db_session, version.id)
+    assert len(fetched) == ac.MAX_CRITERIA_PER_VERSION
+    new_texts = {c.text for c in fetched if c.text.startswith("New criterion")}
+    assert len(new_texts) == headroom
+
+
+@pytest.mark.asyncio
+async def test_apply_new_acceptance_criteria_already_at_cap_is_noop(db_session):
+    """_apply_new_acceptance_criteria is a no-op (no raises) when already at cap."""
+    from app.strategic_completion import _apply_new_acceptance_criteria
+    from app import release_version as rv
+
+    project = Project(
+        name="AC-AtCap",
+        user_id="strat-atcap-user",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    # Fill to exactly MAX
+    for i in range(ac.MAX_CRITERIA_PER_VERSION):
+        await ac.create_criterion(db_session, project.id, version.id, f"Full {i}")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Should not raise and should not add any criteria
+    await _apply_new_acceptance_criteria(["Should not appear"], task, project, db_session, path="test")
+
+    count = await ac.count_criteria_for_version(db_session, version.id)
+    assert count == ac.MAX_CRITERIA_PER_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -504,6 +636,59 @@ async def test_spawn_task_copies_criterion_ids_from_direction(db_session):
 
 
 @pytest.mark.asyncio
+async def test_requeued_task_preserves_criterion_ids(db_session, mocker):
+    """_requeue_parent_task copies criterion_ids onto the cloned retry task."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Retry")
+
+    parent = Task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0},
+        payloads=[{"type": "research", "prompt": "parent"}],
+    )
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.FAILED,
+        criterion_ids=[criterion.criterion_key],
+        latest_status_message="boom",
+        payloads=[{"type": "create", "prompt": "child"}],
+        context={"last_error": "boom"},
+    )
+    db_session.add(parent)
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(parent)
+    await db_session.refresh(child)
+
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="CODE_ERROR")
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    from app.task_lifecycle_requeue import _requeue_parent_task
+
+    await _requeue_parent_task(parent, db_session)
+
+    cloned = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+
+    assert cloned.criterion_ids == [criterion.criterion_key]
+    assert child.criterion_ids == [criterion.criterion_key]
+
+
+@pytest.mark.asyncio
 async def test_get_direction_row_returns_none_for_missing(db_session):
     """get_direction_row returns None when the direction does not exist."""
     from app.directions_repo import get_direction_row
@@ -662,6 +847,135 @@ async def test_autonomous_direction_task_inherits_criterion_ids_and_records_evid
     # The criterion should now be 'covered' (proven task_merge evidence)
     coverage = ac.compute_criterion_coverage(evidence)
     assert coverage == "covered"
+
+
+@pytest.mark.asyncio
+async def test_refresh_after_merge_records_evidence_only_when_proven(db_session):
+    """refresh_direction_outcomes_after_merge skips unproven merge verdicts."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.direction_outcomes import refresh_direction_outcomes_after_merge
+
+    project = await _make_project(db_session, "MergeRefreshUnproven")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Merge verdict is proven"
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "implement X"}],
+        context={CODE_ACCEPTANCE_VERDICT_KEY: {"proven": False}},
+        criterion_ids=[criterion.criterion_key],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await refresh_direction_outcomes_after_merge(task, db_session)
+
+    assert await ac.get_evidence_for_criterion(db_session, criterion.id) == []
+
+
+@pytest.mark.asyncio
+async def test_refresh_after_merge_scopes_to_open_version_and_is_idempotent(
+    db_session,
+):
+    """Merge refresh ignores closed-version keys, and repeated refreshes do not duplicate evidence."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.direction_outcomes import refresh_direction_outcomes_after_merge
+
+    project = await _make_project(db_session, "MergeRefreshScoped")
+    closed_version = await _make_version(db_session, project)
+    closed_version.status = "promoted"
+    db_session.add(closed_version)
+    await db_session.commit()
+
+    closed_criterion = await ac.create_criterion(
+        db_session, project.id, closed_version.id, "Closed version criterion"
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "implement Y"}],
+        context={CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True}},
+        criterion_ids=[closed_criterion.criterion_key, "c-missing"],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    await refresh_direction_outcomes_after_merge(task, db_session)
+    assert await ac.get_evidence_for_criterion(db_session, closed_criterion.id) == []
+
+    reopened_version = ReleaseVersion(project_id=project.id, version_number=2)
+    db_session.add(reopened_version)
+    await db_session.commit()
+    await db_session.refresh(reopened_version)
+
+    open_criterion_a = await ac.create_criterion(
+        db_session, project.id, reopened_version.id, "Open criterion A"
+    )
+    open_criterion_b = await ac.create_criterion(
+        db_session, project.id, reopened_version.id, "Open criterion B"
+    )
+    open_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "implement Y"}],
+        context={CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True}},
+        criterion_ids=[open_criterion_a.criterion_key, open_criterion_b.criterion_key],
+    )
+    db_session.add(open_task)
+    await db_session.commit()
+    await db_session.refresh(open_task)
+
+    first = await ac.record_task_merge_evidence(db_session, open_task, project.id)
+    ev_a = await ac.get_evidence_for_criterion(db_session, open_criterion_a.id)
+    ev_b = await ac.get_evidence_for_criterion(db_session, open_criterion_b.id)
+    assert len(ev_a) == 2
+    assert len(ev_b) == 2
+    assert {e.source_kind for e in ev_a} == {"task_merge", "reachability"}
+    assert {e.source_id for e in ev_a} == {str(open_task.id)}
+
+    second = await ac.record_task_merge_evidence(db_session, open_task, project.id)
+    ev_a_again = await ac.get_evidence_for_criterion(db_session, open_criterion_a.id)
+    ev_b_again = await ac.get_evidence_for_criterion(db_session, open_criterion_b.id)
+    assert len(ev_a_again) == 2
+    assert len(ev_b_again) == 2
+    assert first == 2
+    assert second == 0
+
+    summary = await ac.get_version_coverage_summary(db_session, reopened_version.id)
+    assert summary["total"] == 2
+    assert summary["covered"] == 2
+    assert summary["partial"] == 0
+    assert summary["uncovered"] == 0
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert by_key[open_criterion_a.criterion_key]["evidence_count"] == 2
+    assert by_key[open_criterion_b.criterion_key]["evidence_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_coverage_summary_partial_only(db_session):
+    """A version with only non-covered evidence totals as partial."""
+    project = await _make_project(db_session, "PartialOnly")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Partial")
+
+    await ac.record_evidence(
+        db_session,
+        criterion_id=criterion.id,
+        project_id=project.id,
+        source_kind="task_merge",
+        source_id="task-1",
+        detail={"proven": False},
+    )
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["total"] == 1
+    assert summary["covered"] == 0
+    assert summary["partial"] == 1
+    assert summary["uncovered"] == 0
+    assert summary["criteria"][0]["evidence_count"] == 1
 
 
 # ---------------------------------------------------------------------------

@@ -16549,3 +16549,139 @@ async def test_strategic_authors_and_maps_acceptance_criteria(
         },
     )
     assert resp3.status_code == 409, resp3.text
+
+
+@pytest.mark.asyncio
+async def test_set_acceptance_criteria_op_enforces_cap(
+    client: AsyncClient, db_session
+):
+    """set_acceptance_criteria stops adding new rows at MAX_CRITERIA_PER_VERSION
+    and reports the skipped count in skipped_over_cap.
+
+    Pre-condition: version is pre-filled to MAX-1, then two new criteria are
+    requested — the first fills the last slot, the second is skipped.
+    Existing-by-text (idempotent) rows do NOT consume new headroom.
+    """
+    from app import acceptance_criteria as ac
+
+    project = Project(name="AC-Cap-Op-Test", user_id="test-user-cap-op")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Pre-fill to MAX - 1, leaving exactly one slot
+    for i in range(ac.MAX_CRITERIA_PER_VERSION - 1):
+        await ac.create_criterion(db_session, project.id, version.id, f"Pre {i}")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="agent-vm-cap-op",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-cap-op", task_type="strategic_review")
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {"text": "New criterion 1", "direction_keys": []},
+                    {"text": "New criterion 2", "direction_keys": []},
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    # One accepted (fills last slot), one skipped over cap
+    assert body["skipped_over_cap"] == 1
+    assert len(body["criteria"]) == 1
+    assert body["criteria"][0]["text"] == "New criterion 1"
+    assert body["criteria"][0]["is_new"] is True
+
+    # DB: verify count is exactly at cap
+    all_rows = await ac.get_criteria_for_version(db_session, version.id)
+    assert len(all_rows) == ac.MAX_CRITERIA_PER_VERSION
+
+
+@pytest.mark.asyncio
+async def test_set_acceptance_criteria_dedup_does_not_consume_headroom(
+    client: AsyncClient, db_session
+):
+    """Duplicate-by-text criteria in set_acceptance_criteria do not count against
+    the cap — only genuinely new rows consume headroom."""
+    from app import acceptance_criteria as ac
+
+    project = Project(name="AC-Cap-Dedup-Test", user_id="test-user-cap-dedup")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Pre-fill to MAX - 1, leaving one slot; also pre-create the duplicate row
+    for i in range(ac.MAX_CRITERIA_PER_VERSION - 1):
+        await ac.create_criterion(db_session, project.id, version.id, f"Existing {i}")
+    # The last pre-created row uses index 0 text; create an extra "Already exists" row
+    # to use as the idempotent duplicate in the request
+    await ac.create_criterion(db_session, project.id, version.id, "Already exists")
+
+    # Now at MAX (no slots)
+    count_before = await ac.count_criteria_for_version(db_session, version.id)
+    assert count_before == ac.MAX_CRITERIA_PER_VERSION
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="agent-vm-cap-dedup",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-cap-dedup", task_type="strategic_review")
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {"text": "Already exists", "direction_keys": []},  # duplicate — no headroom consumed
+                    {"text": "Truly new", "direction_keys": []},       # new — no slots → skipped
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    # Duplicate is accepted (is_new=False), new one is skipped over cap
+    assert body["skipped_over_cap"] == 1
+    assert len(body["criteria"]) == 1
+    assert body["criteria"][0]["text"] == "Already exists"
+    assert body["criteria"][0]["is_new"] is False
+
+    # DB count unchanged
+    count_after = await ac.count_criteria_for_version(db_session, version.id)
+    assert count_after == ac.MAX_CRITERIA_PER_VERSION
