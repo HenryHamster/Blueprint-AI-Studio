@@ -2,14 +2,14 @@
 # Read-only context fetch tool — pull full detail for items shipped trimmed,
 # summarized, or only by reference. Reads ORCHESTRATOR_URL, AGENT_API_TOKEN from
 # env. project_id is baked in. All endpoints are GET (strictly read-only).
-KIND="${1:?Usage: fetch direction|playbook|section|knowledge|qualification [id]}"
+KIND="${1:?Usage: fetch direction|playbook|section|knowledge|qualification|ci-compliance [id]}"
 ID="${2:-}"
 API="${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 PROJECT="37d445e1-0775-4403-bacf-1cd7ed129336"
 [ -n "$PROJECT" ] || { echo "[ERROR] no project_id available; ./fetch is unavailable in this workspace" >&2; exit 1; }
 
-# problem-model, qualification, version-phase, vm-cost, and efficiency-snapshot
+# problem-model, qualification, ci-compliance, version-phase, vm-cost, and efficiency-snapshot
 # take no id; everything else requires one. For "message" the id may be a short
 # ref (first 8+ hex chars of the message UUID — the same ref operators see in
 # the admin UI) or a full UUID; the backend resolves it and fails loudly on
@@ -48,11 +48,12 @@ case "$KIND" in
     exit 1
     ;;
   qualification) PATH_SUFFIX="qualification" ;;
-  problem-model|gap|message|version-phase|vm-cost|efficiency-snapshot) echo "Error: ./fetch '$KIND' is not permitted in this workspace (allowed: direction|playbook|section|knowledge|qualification)." >&2; exit 1 ;;
-  *) echo "Unknown kind: $KIND (use direction|playbook|section|knowledge|qualification)" >&2; exit 1 ;;
+  ci-compliance) PATH_SUFFIX="ci-compliance" ;;
+  problem-model|gap|message|version-phase|vm-cost|efficiency-snapshot) echo "Error: ./fetch '$KIND' is not permitted in this workspace (allowed: direction|playbook|section|knowledge|qualification|ci-compliance)." >&2; exit 1 ;;
+  *) echo "Unknown kind: $KIND (use direction|playbook|section|knowledge|qualification|ci-compliance)" >&2; exit 1 ;;
 esac
 
-if [ "$KIND" != "problem-model" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ -z "$ID" ]; then
+if [ "$KIND" != "problem-model" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ -z "$ID" ]; then
   echo "[ERROR] fetch $KIND requires an id argument" >&2
   exit 1
 fi
