@@ -786,6 +786,7 @@ async def get_all_projects(
                     "running": 0,
                     "evaluating": 0,
                     "blocked": 0,
+                    "parked": 0,
                     "failed": 0,
                     "completed": 0,
                     "total": 0,
@@ -801,6 +802,8 @@ async def get_all_projects(
                 bucket["evaluating"] += n
             elif status == TaskStatus.BLOCKED:
                 bucket["blocked"] += n
+            elif status == TaskStatus.PARKED:
+                bucket["parked"] += n
             elif status == TaskStatus.FAILED:
                 bucket["failed"] += n
             elif status == TaskStatus.COMPLETED:
@@ -811,6 +814,7 @@ async def get_all_projects(
         "running": 0,
         "evaluating": 0,
         "blocked": 0,
+        "parked": 0,
         "failed": 0,
         "completed": 0,
         "total": 0,
@@ -996,6 +1000,7 @@ async def get_project_strategic_state(
         "running": 0,
         "evaluating": 0,
         "blocked": 0,
+        "parked": 0,
         "failed": 0,
         "completed": 0,
         "total": 0,
@@ -1011,6 +1016,8 @@ async def get_project_strategic_state(
             task_counts["evaluating"] += n
         elif status == TaskStatus.BLOCKED:
             task_counts["blocked"] += n
+        elif status == TaskStatus.PARKED:
+            task_counts["parked"] += n
         elif status == TaskStatus.FAILED:
             task_counts["failed"] += n
         elif status == TaskStatus.COMPLETED:

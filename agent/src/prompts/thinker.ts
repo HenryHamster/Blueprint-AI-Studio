@@ -100,6 +100,7 @@ function buildStrategicFingerprintPrompt(
     pruneCandidatesSection: p.pruneCandidatesSection ? '<prune-candidates>' : '',
     systemMaturitySection: p.systemMaturitySection ? '<system-maturity>' : '',
     driftSection: p.driftSection ? '<drift>' : '',
+    heldDirectionsSection: p.heldDirectionsSection ? '<held-directions>' : '',
     recentWorkSection: '<recent-work>',
     feedbackSection: '<feedback>',
     questionSection: '<question>',
@@ -195,6 +196,12 @@ export interface ThinkerPromptParams {
   pruneCandidatesSection?: string;
   systemMaturitySection: string;
   driftSection: string;
+  /**
+   * Held-directions block: directions stuck on consecutive failures, with their
+   * dominant error fingerprint and recent raw failure messages. Optional so existing
+   * constructions/tests that omit it still compile; '' renders nothing.
+   */
+  heldDirectionsSection?: string;
   recentWorkSection: string;
   feedbackSection: string;
   questionSection: string;
@@ -298,7 +305,7 @@ ${p.dirHealthSummary}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
-${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}
+${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}
 ${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 

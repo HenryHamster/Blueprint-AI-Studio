@@ -52,6 +52,7 @@ import {
   buildPruneCandidatesSection,
   buildModelHealthSection,
   buildDriftSection,
+  buildHeldDirectionsSection,
   buildOutcomeSection,
   buildClockAndRecentWorkSection,
   buildConversationThreadSection,
@@ -304,8 +305,13 @@ export async function handleStrategic(
       ? payload.drift_signals as Record<string, unknown>
       : null;
 
+    const heldDirections = Array.isArray(payload.held_directions)
+      ? payload.held_directions as Array<Record<string, unknown>>
+      : [];
+
     const systemMaturitySection = buildSystemMaturitySection(systemMaturity);
     const driftSection = buildDriftSection(driftSignals);
+    const heldDirectionsSection = buildHeldDirectionsSection(heldDirections);
 
     const efficiencySnapshotSection = buildEfficiencySnapshotSection(payload.efficiency_snapshot);
     const ciComplianceSection = buildCiComplianceSection(payload.ci_compliance);
@@ -671,6 +677,7 @@ prompts, schemas, tools, or orchestration.` : '';
       pruneCandidatesSection,
       systemMaturitySection,
       driftSection,
+      heldDirectionsSection,
       recentWorkSection,
       feedbackSection,
       questionSection,

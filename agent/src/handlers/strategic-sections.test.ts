@@ -6,6 +6,7 @@ import {
   buildCycleStartReconciliationSection,
   buildPruneCandidatesSection,
   buildDriftSection,
+  buildHeldDirectionsSection,
   buildOutcomeSection,
   buildClockAndRecentWorkSection,
   buildConversationThreadSection,
@@ -106,6 +107,134 @@ describe('buildDriftSection', () => {
     expect(result).toContain('Direction d-1');
     expect(result).toContain('over_claim');
     expect(result).toContain('0.20');
+  });
+});
+
+describe('buildDriftSection consecutive_flagged_cycles', () => {
+  it('appends flagged_cycles count to direction entry when >1', () => {
+    const result = buildDriftSection({
+      window_days: 7,
+      by_direction: {
+        'd-stuck': {
+          over_claim_flag: true,
+          stalled_despite_churn_flag: false,
+          claimed_changes_count: 8,
+          actually_merged_prs: 1,
+          claim_shipped_consistency: 0.12,
+          consecutive_flagged_cycles: 4,
+        },
+      },
+    });
+    expect(result).toContain('Drift Signals');
+    expect(result).toContain('Direction d-stuck');
+    expect(result).toContain('over_claim');
+    expect(result).toContain('flagged_cycles=4');
+  });
+
+  it('omits flagged_cycles tail when consecutive_flagged_cycles is 1', () => {
+    const result = buildDriftSection({
+      window_days: 7,
+      by_direction: {
+        'd-once': {
+          over_claim_flag: true,
+          stalled_despite_churn_flag: false,
+          claimed_changes_count: 5,
+          actually_merged_prs: 0,
+          claim_shipped_consistency: 0.0,
+          consecutive_flagged_cycles: 1,
+        },
+      },
+    });
+    expect(result).toContain('Direction d-once');
+    expect(result).not.toContain('flagged_cycles=');
+  });
+
+  it('omits flagged_cycles tail when consecutive_flagged_cycles is absent', () => {
+    const result = buildDriftSection({
+      window_days: 7,
+      by_direction: {
+        'd-no-trend': {
+          over_claim_flag: true,
+          stalled_despite_churn_flag: false,
+          claimed_changes_count: 3,
+          actually_merged_prs: 0,
+          claim_shipped_consistency: 0.0,
+        },
+      },
+    });
+    expect(result).toContain('Direction d-no-trend');
+    expect(result).not.toContain('flagged_cycles=');
+  });
+});
+
+describe('buildHeldDirectionsSection', () => {
+  it('returns empty string for undefined or empty input', () => {
+    expect(buildHeldDirectionsSection(undefined)).toBe('');
+    expect(buildHeldDirectionsSection([])).toBe('');
+  });
+
+  it('renders direction text, id, consecutive failures, last class, and fingerprint', () => {
+    const result = buildHeldDirectionsSection([{
+      direction_id: 'd-held',
+      direction_text: 'improve test coverage',
+      consecutive_failures: 5,
+      last_failure_class: 'agent_stalled',
+      dominant_error_fingerprint: 'Force-terminated by timeout',
+      recent_failure_messages: ['agent timed out after 600s', 'agent timed out after 600s'],
+    }]);
+    expect(result).toContain('## Held directions — stuck on consecutive failures');
+    expect(result).toContain('improve test coverage (id: d-held)');
+    expect(result).toContain('Consecutive failures: 5');
+    expect(result).toContain('Last failure class: agent_stalled');
+    expect(result).toContain('Dominant fingerprint: Force-terminated by timeout');
+    expect(result).toContain('agent timed out after 600s');
+  });
+
+  it('renders "(none)" fingerprint when dominant_error_fingerprint is absent', () => {
+    const result = buildHeldDirectionsSection([{
+      direction_id: 'd-nofp',
+      direction_text: 'auth work',
+      consecutive_failures: 3,
+      last_failure_class: 'ci_not_green',
+    }]);
+    expect(result).toContain('Dominant fingerprint: (none)');
+  });
+
+  it('omits Recent failure messages block when array is empty', () => {
+    const result = buildHeldDirectionsSection([{
+      direction_id: 'd-empty',
+      direction_text: 'some dir',
+      consecutive_failures: 2,
+      last_failure_class: 'test-coverage',
+      dominant_error_fingerprint: 'missing tests',
+      recent_failure_messages: [],
+    }]);
+    expect(result).not.toContain('Recent failure messages:');
+  });
+
+  it('renders multiple held directions', () => {
+    const result = buildHeldDirectionsSection([
+      {
+        direction_id: 'd-a',
+        direction_text: 'dir alpha',
+        consecutive_failures: 3,
+        last_failure_class: 'error',
+        dominant_error_fingerprint: 'fp-a',
+        recent_failure_messages: ['msg a'],
+      },
+      {
+        direction_id: 'd-b',
+        direction_text: 'dir beta',
+        consecutive_failures: 7,
+        last_failure_class: 'stalled',
+        dominant_error_fingerprint: 'fp-b',
+        recent_failure_messages: ['msg b'],
+      },
+    ]);
+    expect(result).toContain('dir alpha (id: d-a)');
+    expect(result).toContain('dir beta (id: d-b)');
+    expect(result).toContain('fp-a');
+    expect(result).toContain('fp-b');
   });
 });
 
@@ -1047,6 +1176,30 @@ describe('buildDirSummaryText', () => {
     }]);
     expect(result).toContain('Research spawn-gate');
     expect(result).not.toContain('refuted/unresolved reasons:');
+  });
+
+  it('renders SCAFFOLDING marker when outcome_scaffolding_flagged is true', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-scaffolding',
+      text: 'direction with scaffolding flag',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 5,
+      outcome_scaffolding_flagged: true,
+    }]);
+    expect(result).toContain('[SCAFFOLDING]');
+  });
+
+  it('omits SCAFFOLDING marker when outcome_scaffolding_flagged is false or absent', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-no-scaffolding',
+      text: 'direction without scaffolding flag',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 3,
+      outcome_scaffolding_flagged: false,
+    }]);
+    expect(result).not.toContain('[SCAFFOLDING]');
   });
 });
 

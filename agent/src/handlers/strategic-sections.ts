@@ -69,11 +69,52 @@ export function buildDriftSection(driftSignals: Record<string, unknown> | null):
   lines.push('Directions or systems where claimed changes significantly exceed merged PRs — a signal of over-optimistic task output or stalled work.');
   for (const [did, sig] of flaggedDirs) {
     const flags = [sig.over_claim_flag ? 'over_claim' : '', sig.stalled_despite_churn_flag ? 'stalled_despite_churn' : ''].filter(Boolean).join(', ');
-    lines.push(`- Direction ${did}: claimed=${fmtScalar(sig.claimed_changes_count)}, merged=${fmtScalar(sig.actually_merged_prs)}, consistency=${typeof sig.claim_shipped_consistency === 'number' ? sig.claim_shipped_consistency.toFixed(2) : '?'} [${flags}]`);
+    const consecutiveTail = typeof sig.consecutive_flagged_cycles === 'number' && sig.consecutive_flagged_cycles > 1
+      ? `, flagged_cycles=${sig.consecutive_flagged_cycles}`
+      : '';
+    lines.push(`- Direction ${did}: claimed=${fmtScalar(sig.claimed_changes_count)}, merged=${fmtScalar(sig.actually_merged_prs)}, consistency=${typeof sig.claim_shipped_consistency === 'number' ? sig.claim_shipped_consistency.toFixed(2) : '?'} [${flags}${consecutiveTail}]`);
   }
   for (const [sid, sig] of flaggedSys) {
     const flags = [sig.over_claim_flag ? 'over_claim' : '', sig.stalled_despite_churn_flag ? 'stalled_despite_churn' : ''].filter(Boolean).join(', ');
     lines.push(`- System ${sid}: claimed=${fmtScalar(sig.claimed_changes_count)}, merged=${fmtScalar(sig.actually_merged_prs)}, consistency=${typeof sig.claim_shipped_consistency === 'number' ? sig.claim_shipped_consistency.toFixed(2) : '?'} [${flags}]`);
+  }
+  return lines.join('\n');
+}
+
+/**
+ * Render the backend-computed held-directions block (payload field `held_directions`,
+ * built in backend/app/strategic_spawning.py). Surfaces the dominant error fingerprint
+ * and recent raw failure messages for each direction the hold-manager has flagged as
+ * stuck, so the strategist can decide whether to refine or retire it.
+ *
+ * READ-ONLY planning context: no spawner, no enforcement, no hard block.
+ * Returns '' when the block is absent or empty.
+ */
+export function buildHeldDirectionsSection(heldDirections: Array<Record<string, unknown>> | undefined): string {
+  if (!heldDirections || heldDirections.length === 0) return '';
+  const lines: string[] = ['\n## Held directions — stuck on consecutive failures'];
+  lines.push(
+    'These directions have accumulated consecutive task failures and are held by the hold-manager. ' +
+    'Review the dominant error fingerprint and recent failure messages. ' +
+    'Options: refine the direction scope, spawn a targeted investigation, or retire if no longer viable.',
+  );
+  for (const h of heldDirections) {
+    const text = strVal(h.direction_text, '?');
+    const did = strVal(h.direction_id, '?');
+    const consecutiveFailures = fmtScalar(h.consecutive_failures, '?');
+    const lastClass = strVal(h.last_failure_class, 'unknown');
+    const fingerprint = strVal(h.dominant_error_fingerprint, '(none)');
+    lines.push(`\n### ${text} (id: ${did})`);
+    lines.push(`Consecutive failures: ${consecutiveFailures}  Last failure class: ${lastClass}  Dominant fingerprint: ${fingerprint}`);
+    const messages = Array.isArray(h.recent_failure_messages)
+      ? h.recent_failure_messages as string[]
+      : [];
+    if (messages.length > 0) {
+      lines.push('Recent failure messages:');
+      for (const msg of messages) {
+        lines.push(`  - ${strVal(msg, '?').slice(0, 240)}`);
+      }
+    }
   }
   return lines.join('\n');
 }
@@ -1100,7 +1141,9 @@ export function buildDirSummaryText(
       spawnGateSection = `\n   Research spawn-gate: ${challenged} challenged → ${survived} survived (${explicitPass} explicit-pass, ${failOpen} fail-open) · ${refuted} refuted (${unresolved} unresolved)${excludedPart} — merge rate: ${cmr} challenged (${cDenom}) vs ${umr} unchallenged (${uDenom})${reasonsPart}`;
     }
 
-    return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}${spawnGateSection}`;
+    const scaffoldingNote = d.outcome_scaffolding_flagged === true ? ' [SCAFFOLDING]' : '';
+
+    return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}${scaffoldingNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}${spawnGateSection}`;
   }).join('\n\n');
   // When the shipped detail list is shorter than the authoritative active count,
   // render an honest "showing M of N" header instead of letting the reader infer

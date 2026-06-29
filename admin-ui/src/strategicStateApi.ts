@@ -188,6 +188,7 @@ export interface StrategicStateResponse {
       running: number;
       evaluating: number;
       blocked: number;
+      parked: number;
       failed: number;
       completed: number;
       total: number;

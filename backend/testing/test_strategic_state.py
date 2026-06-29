@@ -621,6 +621,66 @@ async def test_strategic_state_does_not_return_terminal_task_as_active(
 
 
 @pytest.mark.asyncio
+async def test_strategic_state_task_counts_reconcile_with_parked(
+    client: AsyncClient, db_session
+):
+    """Task counts reconcile: sum of all buckets equals total, parked work is visible."""
+    project = await _make_project(db_session)
+    parked_task = Task(
+        project_id=project.id,
+        title="Parked: waiting for external signal",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.PARKED,
+        park_reason="Awaiting external webhook",
+    )
+    queued_task = Task(
+        project_id=project.id,
+        title="Queued follow-up",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+    )
+    running_task = Task(
+        project_id=project.id,
+        title="Running task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    blocked_task = Task(
+        project_id=project.id,
+        title="Blocked task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.BLOCKED,
+        blocked_reason="Waiting for dependency",
+    )
+    db_session.add_all([parked_task, queued_task, running_task, blocked_task])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    counts = resp.json()["tasks"]["counts"]
+
+    assert counts["parked"] == 1
+    assert counts["queued"] == 1
+    assert counts["running"] == 1
+    assert counts["blocked"] == 1
+    assert counts["failed"] == 0
+    assert counts["evaluating"] == 0
+    assert counts["completed"] == 0
+
+    bucket_sum = (
+        counts["queued"]
+        + counts["running"]
+        + counts["evaluating"]
+        + counts["blocked"]
+        + counts["parked"]
+        + counts["failed"]
+        + counts["completed"]
+    )
+    assert bucket_sum == counts["total"]
+    assert counts["total"] == 4
+
+
+@pytest.mark.asyncio
 async def test_strategic_state_includes_operator_attention(
     client: AsyncClient, db_session
 ):
