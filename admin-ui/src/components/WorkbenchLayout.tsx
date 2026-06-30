@@ -73,12 +73,12 @@ export function WorkbenchSurface<T extends string>({
   const bodyClassName = contentClassName ?? (
     flush
       ? 'flex min-h-0 min-w-0 flex-col overflow-hidden'
-      : 'min-h-0 min-w-0 overflow-auto p-3 custom-scrollbar md:p-4'
+      : 'min-h-0 min-w-0 overflow-auto p-3 custom-scrollbar'
   );
 
   return (
     <section className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] bg-[#05080c]">
-      <header className="min-w-0 border-b border-neutral-800 bg-[#05070a] px-3 py-3 md:px-4">
+      <header className="min-w-0 border-b border-neutral-800 bg-[#05070a] px-3 py-2.5 md:px-4">
         <div className="flex min-w-0 items-center gap-3">
           <div className="min-w-0 shrink-0">
             <h1 className="truncate text-lg font-semibold leading-6 text-neutral-100">{title}</h1>
@@ -109,7 +109,7 @@ export function WorkbenchSplit({
     <div className="grid h-full min-h-0 min-w-0 grid-cols-1 overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(320px,28vw)]">
       <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">{main}</div>
       {rail && (
-        <aside className={`hidden min-h-0 min-w-0 overflow-auto border-l border-neutral-800 bg-[#10151c] p-4 custom-scrollbar lg:block ${railClassName}`}>
+        <aside className={`hidden min-h-0 min-w-0 overflow-auto border-l border-neutral-800 bg-[#10151c] p-3 custom-scrollbar lg:block ${railClassName}`}>
           {rail}
         </aside>
       )}
@@ -134,7 +134,7 @@ export function WorkbenchPanel({
         <h2 className="truncate text-sm font-semibold text-neutral-100">{title}</h2>
         {meta && <div className="shrink-0 text-xs text-neutral-500">{meta}</div>}
       </div>
-      <div className="min-w-0 p-3">{children}</div>
+      <div className="min-w-0 p-2.5">{children}</div>
     </section>
   );
 }

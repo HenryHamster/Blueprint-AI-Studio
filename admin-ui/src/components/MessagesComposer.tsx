@@ -68,7 +68,7 @@ export function MessagesComposer({
 
   return (
     <div className={minimal
-      ? 'shrink-0 border-t border-neutral-800 bg-[#05080c] px-4 py-3 md:px-8'
+      ? 'shrink-0 border-t border-neutral-800 bg-[#05080c] px-3 py-2.5 md:px-4'
       : 'px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50'
     }>
       {minimal && strategicContext && (
@@ -87,7 +87,7 @@ export function MessagesComposer({
         </div>
       )}
       <div className={minimal
-        ? 'mx-auto flex w-full max-w-4xl items-end gap-2 rounded-lg border border-neutral-700 bg-[#10151c] p-2 shadow-[0_12px_40px_rgba(0,0,0,0.25)]'
+        ? 'mx-auto flex w-full max-w-4xl items-end gap-2 rounded-md border border-neutral-800 bg-[#10151c] p-1.5'
         : 'flex gap-2 items-end'
       }>
         {!minimal && (
@@ -104,7 +104,7 @@ export function MessagesComposer({
             placeholder={minimal ? 'Message Strategic...' : 'Type a message...'}
             rows={1}
             className={minimal
-              ? 'min-h-[44px] w-full resize-none rounded-md border-0 bg-transparent px-3 py-2.5 text-sm leading-relaxed text-neutral-100 placeholder-neutral-500 outline-none'
+              ? 'min-h-[44px] w-full resize-none rounded-md border-0 bg-transparent px-2.5 py-2 text-sm leading-relaxed text-neutral-100 placeholder-neutral-500 outline-none'
               : 'w-full bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600 resize-none min-h-[44px] leading-relaxed'
             }
           />

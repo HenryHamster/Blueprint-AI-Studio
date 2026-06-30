@@ -136,12 +136,12 @@ export function MessagesListView({
 }: MessagesListViewProps) {
   if (presentation === 'conversation') {
     return (
-      <div ref={scrollRef} className="relative flex-1 overflow-y-auto px-4 py-5 md:px-8 md:py-6 custom-scrollbar">
-        <div className="mx-auto flex w-full max-w-4xl flex-col gap-4">
+      <div ref={scrollRef} className="relative flex-1 overflow-y-auto bg-[#05080c] px-3 py-3 custom-scrollbar md:px-4">
+        <div className="mx-auto flex w-full max-w-4xl flex-col gap-3">
           {loading ? (
             <p className="py-8 text-center text-xs text-neutral-500">Loading...</p>
           ) : messages.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
+            <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
               <MessageSquare className="mb-3 h-8 w-8 opacity-40" />
               <p className="text-sm">No messages yet</p>
             </div>
@@ -177,10 +177,10 @@ export function MessagesListView({
   }
 
   return (
-    <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 md:px-6 py-4 space-y-3 relative">
+    <div ref={scrollRef} className="relative flex-1 space-y-2.5 overflow-y-auto bg-[#05080c] px-3 py-3 custom-scrollbar md:px-4">
       {/* Prominent banner: X new since {time} with action buttons */}
       {dividerTime && totalNewCount > 0 && !dividerDismissedRef.current && (
-        <div className="mb-3 p-3 md:p-4 rounded-lg bg-gradient-to-r from-blue-600/20 to-blue-500/10 border border-blue-500/50 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div className="mb-2.5 flex flex-col gap-3 rounded-md border border-blue-500/40 bg-[#10151c] p-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex-1 min-w-0">
             <div className="text-sm font-semibold text-blue-300 truncate">
               {totalNewCount} new since {formatSinceTimestamp(dividerTime)}
@@ -189,13 +189,13 @@ export function MessagesListView({
           <div className="flex items-center gap-2 flex-wrap">
             <button
               onClick={onShowOnlyNew}
-              className="shrink-0 px-3 py-2 rounded-lg bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition-colors min-h-[44px] md:min-h-auto"
+              className="min-h-[44px] shrink-0 rounded-md bg-blue-600 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-500 md:min-h-8"
             >
               Show only new
             </button>
             <button
               onClick={onDismissDivider}
-              className="shrink-0 px-3 py-2 rounded-lg border border-blue-500/60 text-blue-300 hover:bg-blue-500/10 text-xs font-medium transition-colors min-h-[44px] md:min-h-auto"
+              className="min-h-[44px] shrink-0 rounded-md border border-blue-500/50 px-3 py-2 text-xs font-medium text-blue-300 transition-colors hover:bg-blue-500/10 md:min-h-8"
             >
               Mark all read
             </button>
@@ -205,7 +205,7 @@ export function MessagesListView({
 
       {/* Caught-up indicator: when divider is set, not dismissed, and zero new messages of any kind */}
       {dividerTime && !dividerDismissedRef.current && totalNewCount === 0 && !showOnlyNew && (
-        <div className="mb-3 p-3 md:p-4 rounded-lg bg-gradient-to-r from-emerald-600/20 to-emerald-500/10 border border-emerald-500/50 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+        <div className="mb-2.5 flex flex-col gap-3 rounded-md border border-emerald-500/40 bg-[#10151c] p-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex-1 min-w-0">
             <div className="text-sm font-semibold text-emerald-300 truncate">
               No new since {formatSinceTimestamp(dividerTime)}
@@ -214,7 +214,7 @@ export function MessagesListView({
           <div className="flex items-center gap-2 flex-wrap">
             <button
               onClick={onDismissDivider}
-              className="shrink-0 px-3 py-2 rounded-lg border border-emerald-500/60 text-emerald-300 hover:bg-emerald-500/10 text-xs font-medium transition-colors min-h-[44px] md:min-h-auto"
+              className="min-h-[44px] shrink-0 rounded-md border border-emerald-500/50 px-3 py-2 text-xs font-medium text-emerald-300 transition-colors hover:bg-emerald-500/10 md:min-h-8"
             >
               Reset baseline
             </button>
@@ -225,19 +225,19 @@ export function MessagesListView({
       {loading ? (
         <p className="text-xs text-neutral-500 text-center py-8">Loading...</p>
       ) : messages.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
+        <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
           <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
           <p className="text-sm">No messages yet</p>
           <p className="text-xs mt-1 opacity-70">Send feedback, report bugs, or ask questions</p>
         </div>
       ) : showOnlyNew && dividerTime && highSignalOpen.length === 0 && routineOpen.length === 0 && linkedMessages.length === 0 && visibleResolved.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
+        <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
           <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
           <p className="text-sm">No new messages since {formatTimestamp(dividerTime)}</p>
           <p className="text-xs mt-1 opacity-70">You're all caught up!</p>
         </div>
       ) : searchQuery.trim() && highSignalOpen.length === 0 && routineOpen.length === 0 && linkedMessages.length === 0 && visibleResolved.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-16 text-neutral-500">
+        <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
           <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
           <p className="text-sm">No matches for "{searchQuery}"</p>
           <p className="text-xs mt-1 opacity-70">Try a different search term</p>
@@ -336,7 +336,7 @@ export function MessagesListView({
             const bd = outcomeBreakdown(row.msgs);
             const isGroupExpanded = expandedGroupKeys.has(row.key) || autoExpandedKeys.has(row.key);
             return (
-              <div key={row.key} className="border border-red-800/50 rounded-xl overflow-hidden bg-red-950/20">
+              <div key={row.key} className="overflow-hidden rounded-md border border-red-800/50 bg-red-950/20">
                 <div className="flex items-center gap-2 px-4 py-2.5 bg-red-950/30 min-h-[44px]">
                   <button
                     onClick={() => setExpandedGroupKeys(prev => { const next = new Set(prev); if (next.has(row.key)) next.delete(row.key); else next.add(row.key); return next; })}
@@ -361,8 +361,8 @@ export function MessagesListView({
 
           {/* Routine ops group — collapsed by default */}
           {routineOpen.length > 0 && (
-            <div ref={routineRefEl} className="border border-neutral-800/50 rounded-xl overflow-hidden">
-              <div className="flex items-center bg-neutral-900/40 hover:bg-neutral-900/70 transition-colors min-h-[44px]">
+            <div ref={routineRefEl} className="overflow-hidden rounded-md border border-neutral-800 bg-[#10151c]">
+              <div className="flex min-h-[44px] items-center bg-[#10151c] transition-colors hover:bg-neutral-900/70">
                 <button
                   onClick={() => setRoutineExpanded(e => !e)}
                   className="flex-1 flex items-center gap-2 px-4 py-2.5 text-left"
@@ -385,7 +385,7 @@ export function MessagesListView({
                   {showTempMuteMenu && (
                     <>
                       <div className="fixed inset-0 z-40" onClick={() => setShowTempMuteMenu(false)} />
-                      <div className="absolute right-0 top-full mt-1 z-50 bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl p-2 space-y-1 min-w-48">
+                      <div className="absolute right-0 top-full z-50 mt-1 min-w-48 space-y-1 rounded-md border border-neutral-700 bg-[#10151c] p-2 shadow-xl">
                         {getTop3NoisyEventTypes().length > 0 ? (
                           <>
                             <p className="text-ui-sm text-neutral-500 px-2 py-1">Mute for</p>
@@ -472,8 +472,8 @@ export function MessagesListView({
                             {hasDividerBefore && dividerLabel && (
                               <TimeDividerRow label={dividerLabel} className="mb-2" />
                             )}
-                            <div className="border border-neutral-800/40 rounded-xl overflow-hidden">
-                              <div className="flex items-center gap-2 px-3 py-2 bg-neutral-900/30">
+                            <div className="overflow-hidden rounded-md border border-neutral-800/60 bg-[#10151c]">
+                              <div className="flex items-center gap-2 bg-neutral-900/30 px-3 py-2">
                                 <button
                                   onClick={() => setExpandedGroupKeys(prev => {
                                     const next = new Set(prev);
@@ -512,7 +512,7 @@ export function MessagesListView({
                             {hasDividerBefore && dividerLabel && (
                               <TimeDividerRow label={dividerLabel} className="mb-2" />
                             )}
-                            <div className="border border-neutral-800/40 rounded-xl overflow-hidden opacity-60">
+                            <div className="overflow-hidden rounded-md border border-neutral-800/60 bg-[#10151c] opacity-60">
                               <button
                                 onClick={() => setExpandedGroupKeys(prev => { const next = new Set(prev); if (next.has(digestKey)) next.delete(digestKey); else next.add(digestKey); return next; })}
                                 className="w-full flex items-center gap-2 px-3 py-2 bg-neutral-900/30 text-left"

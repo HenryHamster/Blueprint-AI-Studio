@@ -189,6 +189,7 @@ describe('PipelineView — viewport regression', () => {
           'button[title="Expand children"]',
           'button[title^="Copy parent task ID"]',
           'button[title^="Unarchive parent"]',
+          '[role="button"][data-task-id]',
         ].join(', '),
       },
     );

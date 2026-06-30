@@ -74,11 +74,11 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
       data-task-id={task.id}
       onClick={() => onViewLogs(task)}
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onViewLogs(task); } }}
-      className={`flex items-center gap-2.5 bg-neutral-900 border rounded-lg px-3 py-2 hover:border-neutral-600 hover:bg-neutral-800/80 transition-all cursor-pointer text-left w-full min-w-0 group ${isOrphan ? 'border-dashed border-neutral-600' : 'border-neutral-800'} ${dimmed ? 'opacity-40 grayscale' : ''}`}
+      className={`flex min-h-[44px] w-full min-w-0 cursor-pointer items-center gap-2 rounded-md border bg-[#10151c] px-2.5 py-1.5 text-left transition-colors hover:border-neutral-600 hover:bg-neutral-900 md:min-h-0 group ${isOrphan ? 'border-dashed border-neutral-600' : 'border-neutral-800'} ${dimmed ? 'opacity-40 grayscale' : ''}`}
       title={`${task.title}\n${task.status} • ${task.task_type || 'create'}${blockerTooltip ? `\n${blockerTooltip}` : ''}\nClick to view logs`}
     >
       {/* Status dot */}
-      <div className={`w-2.5 h-2.5 rounded-full shrink-0 ${statusColor}`} />
+      <div className={`h-2 w-2 shrink-0 rounded-full ${statusColor}`} />
       {heartbeat && (
         <div className={`w-1.5 h-1.5 rounded-full shrink-0 ${heartbeat.color}${heartbeat.color === 'bg-red-500' ? ' animate-pulse' : ''}`} title={heartbeat.text} />
       )}
@@ -503,11 +503,11 @@ function RootGroup({
   return (
     <div
       className={isSynthetic
-        ? 'bg-neutral-900/30 border border-dashed border-neutral-700/60 rounded-xl p-4'
-        : 'bg-neutral-900/50 border border-neutral-800/50 rounded-xl p-4'}
+        ? 'rounded-md border border-dashed border-neutral-700/60 bg-[#10151c] p-3'
+        : 'rounded-md border border-neutral-800 bg-[#10151c] p-3'}
     >
       {/* Group header — double-click to archive */}
-      <div className="flex items-center justify-between w-full mb-0 px-1 group">
+      <div className="group flex w-full items-center justify-between px-0.5">
         <div className="flex items-center gap-2 truncate pr-4">
           <div
             role="button"
@@ -547,30 +547,30 @@ function RootGroup({
             </button>
           )}
           {runningInGroup > 0 && (
-            <span className="flex items-center gap-1 text-ui-sm bg-yellow-500/10 text-yellow-400 px-2 py-0.5 rounded-full font-medium border border-yellow-500/30">
+            <span className="flex items-center gap-1 rounded border border-yellow-500/30 bg-yellow-500/10 px-1.5 py-0.5 text-ui-sm font-medium text-yellow-400">
               <span className="w-1.5 h-1.5 rounded-full bg-yellow-400 shrink-0" />
               {runningInGroup}
             </span>
           )}
           {blockedInGroup > 0 && (
-            <span className="flex items-center gap-1 text-ui-sm bg-amber-500/10 text-amber-400 px-2 py-0.5 rounded-full font-medium border border-amber-500/30" title={`${blockedInGroup} blocked`}>
+            <span className="flex items-center gap-1 rounded border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-ui-sm font-medium text-amber-400" title={`${blockedInGroup} blocked`}>
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
               {blockedInGroup}
             </span>
           )}
           {parkedInGroup > 0 && (
-            <span className="flex items-center gap-1 text-ui-sm bg-purple-500/10 text-purple-400 px-2 py-0.5 rounded-full font-medium border border-purple-500/30" title={`${parkedInGroup} parked`}>
+            <span className="flex items-center gap-1 rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-ui-sm font-medium text-purple-400" title={`${parkedInGroup} parked`}>
               <span className="w-1.5 h-1.5 rounded-full bg-purple-400 shrink-0" />
               {parkedInGroup}
             </span>
           )}
           {failedInGroup > 0 && (
-            <span className="flex items-center gap-1 text-ui-sm bg-red-500/10 text-red-400 px-2 py-0.5 rounded-full font-medium border border-red-500/30">
+            <span className="flex items-center gap-1 rounded border border-red-500/30 bg-red-500/10 px-1.5 py-0.5 text-ui-sm font-medium text-red-400">
               <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0" />
               {failedInGroup}
             </span>
           )}
-          <span className="text-ui-sm bg-neutral-800 text-neutral-300 px-2 py-0.5 rounded-full font-medium border border-neutral-700">
+          <span className="rounded border border-neutral-700 bg-neutral-900 px-1.5 py-0.5 text-ui-sm font-medium text-neutral-300">
             {completedInGroup}/{totalInGroup - cancelledInGroup} done
           </span>
         </div>
@@ -589,7 +589,7 @@ function RootGroup({
           { count: completedInGroup, color: taskStatusDotColor('COMPLETED') },
         ].filter(s => s.count > 0);
         return (
-          <div className="flex w-full h-1 rounded-full overflow-hidden mt-2">
+          <div className="mt-2 flex h-1 w-full overflow-hidden rounded-full bg-neutral-900">
             {segments.map((s, i) => (
               <div
                 key={i}
@@ -603,7 +603,7 @@ function RootGroup({
 
       {/* Tree */}
       {expanded && (
-        <div className="space-y-1 mt-3">
+        <div className="mt-2.5 space-y-1">
           {isSynthetic ? (
             root.children.map((child, i) => (
               <TreeBranch
