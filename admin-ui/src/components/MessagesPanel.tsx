@@ -1762,7 +1762,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
       {/* Cycle completion receipt — shown after a cycle finishes until the next one begins.
           Summarises what changed: direction counts, running-update, problem-model. */}
-      {lastCycleCompletion && !strategistActive && (
+      {lastCycleCompletion && !strategistActive && !conversationMode && (
         <div className={`px-4 md:px-6 py-2 border-b border-neutral-800 flex items-start gap-2 shrink-0 ${completionReceiptTone?.banner ?? 'bg-emerald-950/30'}`} role="status" aria-live="polite">
           <span className={`w-2 h-2 rounded-full mt-0.5 shrink-0 ${completionReceiptTone?.dot ?? 'bg-emerald-400'}`} aria-hidden="true" />
           <span className={`text-xs min-w-0 ${completionReceiptTone?.text ?? 'text-emerald-300'}`}>
@@ -1876,7 +1876,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       />
 
       {/* Batch action bar */}
-      {selectMode && selectedIds.size > 0 && (
+      {!conversationMode && selectMode && selectedIds.size > 0 && (
         <MessagesBatchActionBar
           selectedCount={selectedIds.size}
           batchCreating={batchCreating}
@@ -1885,7 +1885,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       )}
 
       {/* Convert-to-direction modal */}
-      {pendingConvertMsg && (
+      {!conversationMode && pendingConvertMsg && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" role="dialog" aria-modal="true" aria-label="Create direction from message">
           <div className="bg-neutral-950 border border-neutral-800 rounded-lg shadow-xl w-full max-w-lg mx-4 flex flex-col max-h-[90vh]">
             <div className="px-5 py-3 border-b border-neutral-800 flex items-center justify-between shrink-0">

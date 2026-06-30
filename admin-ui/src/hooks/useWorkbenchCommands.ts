@@ -14,6 +14,7 @@ import type {
   StrategicStateAttentionItem,
   StrategicWorkbenchState,
   StrategicWorkSessionMetric,
+  StrategicWorkSessionAction,
   StrategicWorkSessionRefDescriptor,
 } from '../strategicStateApi';
 import { removeStrategicSelectedRef, upsertStrategicSelectedRef, type StrategicSelectedRef } from '../utils/strategicWorkbenchSession';
@@ -22,6 +23,7 @@ import type { ViewMode } from './useViewPreferences';
 
 export type PipelineSection = 'flow' | 'board' | 'archive';
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
+const WORK_SESSION_ACTION_COMMAND_LIMIT = 4;
 
 interface UseWorkbenchCommandsOptions {
   selectedProjectId: string | null;
@@ -156,6 +158,46 @@ function metricPriority(metric: StrategicWorkSessionMetric): number {
   return 0;
 }
 
+function workSessionActionLabel(action: StrategicWorkSessionAction): string {
+  const label = action.label?.trim();
+  if (label) return label;
+  if (action.kind === 'reply') return 'Reply to message';
+  if (action.kind === 'review') return 'Review item';
+  if (action.kind === 'approve') return 'Review approval';
+  if (action.kind === 'inspect') return 'Inspect target';
+  if (action.kind === 'resume') return 'Resume work';
+  return 'Open action';
+}
+
+function workSessionActionDetail(action: StrategicWorkSessionAction): string | undefined {
+  const detail = (!action.enabled && action.blocked_reason ? action.blocked_reason : action.reason)?.trim();
+  const priority = action.priority === 'critical' || action.priority === 'high' ? action.priority : null;
+  return compactContextDetail(detail, priority) ?? undefined;
+}
+
+function workSessionMessageIntent(action: StrategicWorkSessionAction): StrategicMessageTarget['action'] {
+  const targetAction = action.target?.action;
+  if (targetAction === 'reply' || targetAction === 'highlight') return targetAction;
+  return action.kind === 'reply' ? 'reply' : 'highlight';
+}
+
+function workSessionActionMessageId(action: StrategicWorkSessionAction): string | null {
+  const messageId = action.target?.message_id?.trim();
+  return messageId || null;
+}
+
+function workSessionActionIsMessageTarget(action: StrategicWorkSessionAction): boolean {
+  return Boolean(workSessionActionMessageId(action) || action.target?.surface === 'messages');
+}
+
+function workSessionActionContextTarget(action: StrategicWorkSessionAction): StrategicContextTarget | null {
+  const target = action.target ?? null;
+  if (!target) return null;
+  if (target.surface) return target;
+  if (target.task_id) return { ...target, surface: 'task' };
+  return null;
+}
+
 export function useWorkbenchCommands({
   selectedProjectId,
   selectedProjectRepoLabel,
@@ -272,6 +314,72 @@ export function useWorkbenchCommands({
       }
       runAndClose(focusStrategicComposer);
     };
+    const visibleWorkSessionActions = (strategicState?.work_session?.actions ?? []).slice(0, WORK_SESSION_ACTION_COMMAND_LIMIT);
+    const visibleEnabledWorkSessionActionIds = new Set(
+      visibleWorkSessionActions.filter(action => action.enabled).map(action => action.id),
+    );
+    const workSessionActionCanRoute = (action: StrategicWorkSessionAction): boolean => {
+      if (workSessionActionIsMessageTarget(action)) return Boolean(openStrategicMessageTarget || openStrategicContextTarget);
+      return Boolean(openStrategicContextTarget && workSessionActionContextTarget(action));
+    };
+    const openWorkSessionAction = (action: StrategicWorkSessionAction) => {
+      if (!action.enabled) {
+        closePalette();
+        return;
+      }
+
+      const target = action.target ?? null;
+      const messageId = workSessionActionMessageId(action);
+      if (messageId || target?.surface === 'messages') {
+        if (openStrategicMessageTarget) {
+          openStrategicMessageTarget(messageId ? {
+            messageId,
+            action: workSessionMessageIntent(action),
+          } : undefined);
+          closePalette();
+        } else {
+          openContextTarget(target?.surface ? target : { surface: 'messages', message_id: messageId });
+        }
+        return;
+      }
+
+      const contextTarget = workSessionActionContextTarget(action);
+      if (contextTarget) {
+        openContextTarget(contextTarget);
+        return;
+      }
+
+      closePalette();
+    };
+    const workSessionActionCommands = visibleWorkSessionActions.map((action): WorkbenchCommand => {
+      const routeable = workSessionActionCanRoute(action);
+      const disabled = projectDisabled || !action.enabled || !routeable;
+      return {
+        id: `strategic.session.action.${action.id}`,
+        label: workSessionActionLabel(action),
+        section: 'Session',
+        detail: workSessionActionDetail(action) ?? (!routeable ? 'No navigation target' : undefined),
+        keywords: [
+          'strategic',
+          'session',
+          'action',
+          action.kind,
+          action.source,
+          action.priority,
+          action.label,
+          action.reason,
+          action.blocked_reason ?? '',
+          action.target?.surface ?? '',
+          action.target?.section ?? '',
+          action.target?.task_id ?? '',
+          action.target?.message_id ?? '',
+          action.target?.document_id ?? '',
+          action.target?.artifact_id ?? '',
+        ],
+        disabled,
+        run: () => openWorkSessionAction(action),
+      };
+    });
     const keepContextRef = (ref: StrategicSelectedRef) => {
       updateStrategicSessionRefs?.(refs => upsertStrategicSelectedRef(refs, ref));
       closePalette();
@@ -408,6 +516,7 @@ export function useWorkbenchCommands({
       });
     });
     const attentionCommandEntries = (strategicState?.attention?.items ?? [])
+      .filter(item => !visibleEnabledWorkSessionActionIds.has(`attention.${item.id}`))
       .slice(0, 8)
       .map((item): WorkbenchCommand => ({
         id: `strategic.attention.${item.kind}.${item.id}`,
@@ -488,6 +597,7 @@ export function useWorkbenchCommands({
         disabled: projectDisabled || savingStrategicWorkbench || command.mode === strategicInteractionMode,
         run: command.mode === strategicInteractionMode ? closePalette : () => setStrategicModeAndOpenChat(command.mode),
       })),
+      ...workSessionActionCommands,
       ...attentionCommandEntries,
       ...sessionMetricCommands,
       {

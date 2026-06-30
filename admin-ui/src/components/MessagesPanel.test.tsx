@@ -898,17 +898,161 @@ describe('MessagesPanel chrome modes', () => {
       content: 'Should I keep this path?',
       created_at: '2026-06-01T10:01:00Z',
     });
+    const feedback = makeMsg({
+      id: 'feedback',
+      from_type: 'agent',
+      message_type: 'FEEDBACK',
+      content: 'Convert this only in the triage surface.',
+      created_at: '2026-06-01T10:05:00Z',
+    });
+    const blocker = makeMsg({
+      id: 'blocker',
+      from_type: 'agent',
+      message_type: 'BLOCKER',
+      content: 'Investigate this only in the triage surface.',
+      created_at: '2026-06-01T10:06:00Z',
+    });
 
-    const el = await renderPanel({ filterChrome: 'minimal' }, [routine, strategicRoutine, strategic, operator, question]);
+    const el = await renderPanel({ filterChrome: 'minimal' }, [routine, strategicRoutine, strategic, operator, question, feedback, blocker]);
 
     const text = el.textContent ?? '';
     expect(text).toContain('Operator steering');
     expect(text).toContain('Should I keep this path?');
     expect(text).toContain('Strategic reply');
+    expect(text).toContain('Convert this only in the triage surface.');
+    expect(text).toContain('Investigate this only in the triage surface.');
     expect(text).not.toContain('pr merged successfully');
     expect(text).not.toContain('cycle summary should stay out of chat');
+    expect(text).not.toContain('routine ops');
+    expect(text).not.toContain('Pinned · Blockers');
+    expect(text).not.toContain('Awaiting reply · Questions');
+    expect(el.querySelector('input[placeholder="Search messages..."]')).toBeNull();
+    expect(el.querySelector('[data-testid="saved-views-tab-strip"]')).toBeNull();
+    expect(filterToggle(el)).toBeUndefined();
+    expect(el.querySelector('button[title="Copy message ref"]')).toBeNull();
+    expect(el.querySelector('button[title="Resolve"]')).toBeNull();
+    expect(el.querySelector('button[title="Delete"]')).toBeNull();
+    expect(el.querySelector('button[title="Create Direction"]')).toBeNull();
+    expect(el.querySelector('button[title="Investigate"]')).toBeNull();
     expect(text.indexOf('Operator steering')).toBeLessThan(text.indexOf('Should I keep this path?'));
     expect(text.indexOf('Should I keep this path?')).toBeLessThan(text.indexOf('Strategic reply'));
+  });
+
+  test('full message chrome keeps triage actions available', async () => {
+    const feedback = makeMsg({
+      id: 'feedback-action',
+      from_type: 'agent',
+      message_type: 'FEEDBACK',
+      content: 'Turn this into a direction.',
+      created_at: '2026-06-01T10:00:00Z',
+    });
+    const blocker = makeMsg({
+      id: 'blocker-action',
+      from_type: 'agent',
+      message_type: 'BLOCKER',
+      content: 'Investigate this blocker.',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+
+    const el = await renderPanel({ filterChrome: 'full' }, [feedback, blocker]);
+
+    expect(el.querySelector('button[title="Create Direction"]')).not.toBeNull();
+    expect(el.querySelector('button[title="Investigate"]')).not.toBeNull();
+    expect(el.querySelector('button[title="Resolve"]')).not.toBeNull();
+    expect(el.querySelector('button[title="Delete"]')).not.toBeNull();
+  });
+
+  test('minimal chat hides cycle completion receipt banner chrome', async () => {
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      lastCycleCompletion: {
+        status: 'completed',
+        created_count: 2,
+        tasks_spawned: 1,
+        running_update_changed: true,
+      },
+    });
+
+    const text = el.textContent ?? '';
+    expect(text).not.toContain('Cycle complete');
+    expect(text).not.toContain('+2 directions');
+    expect(text).not.toContain('1 task spawned');
+    expect(text).not.toContain('running update written');
+  });
+
+  test('minimal chat hides leaked batch action state after switching from full chrome', async () => {
+    const first = makeMsg({
+      id: 'feedback-a',
+      from_type: 'agent',
+      message_type: 'FEEDBACK',
+      content: 'First selected feedback.',
+      created_at: '2026-06-01T10:00:00Z',
+    });
+    const second = makeMsg({
+      id: 'feedback-b',
+      from_type: 'agent',
+      message_type: 'FEEDBACK',
+      content: 'Second selected feedback.',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+    const el = await renderPanel({ filterChrome: 'full' }, [first, second]);
+    const selectButton = [...el.querySelectorAll('button')]
+      .find(button => button.textContent?.trim() === 'Select') as HTMLButtonElement | undefined;
+    if (!selectButton) throw new Error('select button not found');
+
+    await act(async () => { selectButton.click(); });
+    expect(el.textContent).toContain('2 selected');
+    expect(el.textContent).toContain('Create Directions');
+
+    const mountedRoot = root;
+    if (!mountedRoot) throw new Error('panel root not mounted');
+    await act(async () => {
+      mountedRoot.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          filterChrome="minimal"
+        />,
+      );
+    });
+    await waitFor(() => expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(1));
+
+    expect(el.textContent).not.toContain('2 selected');
+    expect(el.textContent).not.toContain('Create Directions');
+  });
+
+  test('minimal chat hides a stale convert modal after switching from full chrome', async () => {
+    const feedback = makeMsg({
+      id: 'feedback-convert',
+      from_type: 'agent',
+      message_type: 'FEEDBACK',
+      content: 'Convert me in triage mode.',
+      created_at: '2026-06-01T10:00:00Z',
+    });
+    const el = await renderPanel({ filterChrome: 'full' }, [feedback]);
+    const createDirection = el.querySelector('button[title="Create Direction"]') as HTMLButtonElement | null;
+    if (!createDirection) throw new Error('create direction button not found');
+
+    await act(async () => { createDirection.click(); });
+    expect(el.textContent).toContain('Create direction from message');
+
+    const mountedRoot = root;
+    if (!mountedRoot) throw new Error('panel root not mounted');
+    await act(async () => {
+      mountedRoot.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          filterChrome="minimal"
+        />,
+      );
+    });
+    await waitFor(() => expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(1));
+
+    expect(el.textContent).not.toContain('Create direction from message');
+    expect(el.querySelector('button[title="Create Direction"]')).toBeNull();
   });
 
   test('minimal chat target primes reply for an open question and highlights it', async () => {
