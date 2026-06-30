@@ -135,7 +135,10 @@ function attentionItemLabel(item: StrategicStateAttentionItem): string {
 }
 
 function metricValueDetail(metric: StrategicWorkSessionMetric): string {
-  const value = Number.isInteger(metric.value) ? String(metric.value) : metric.value.toFixed(2);
+  const raw = metric.value;
+  const value = typeof raw === 'number'
+    ? (Number.isInteger(raw) ? String(raw) : raw.toFixed(2))
+    : String(raw ?? '');
   const unit = metric.unit?.trim();
   return unit ? `${value} ${unit}` : value;
 }

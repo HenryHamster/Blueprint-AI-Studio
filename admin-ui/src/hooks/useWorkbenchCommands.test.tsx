@@ -438,6 +438,35 @@ describe('useWorkbenchCommands', () => {
     expect(captured.find(command => command.id === 'settings.general')?.shortcut).toBe('S');
   });
 
+  test('builds palette without throwing on non-numeric metric value', () => {
+    const openStrategicContextTarget = vi.fn();
+    const strategicState = {
+      work_session: {
+        curated_metrics: [
+          {
+            id: 'metric.string_value',
+            label: 'string metric',
+            value: 'high' as unknown as number,
+            tone: 'critical',
+            target: { surface: 'project', section: 'running-update' },
+          },
+          {
+            id: 'metric.null_value',
+            label: 'null metric',
+            value: null as unknown as number,
+            tone: 'warning',
+            target: { surface: 'project', section: 'running-update' },
+          },
+        ],
+      },
+    } as StrategicStateResponse;
+
+    expect(() => mount({ strategicState, openStrategicContextTarget })).not.toThrow();
+    const stringCmd = captured.find(command => command.id === 'strategic.session.metric.metric.string_value');
+    expect(stringCmd).toBeDefined();
+    expect(stringCmd?.detail).toContain('high');
+  });
+
   test('disables design command when no design doc exists', () => {
     mount({ hasDesignDoc: false });
 
