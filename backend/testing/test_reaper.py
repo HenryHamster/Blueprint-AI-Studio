@@ -11359,6 +11359,33 @@ async def _make_bug_message(
     return msg
 
 
+def _assert_message_update_event_payload(
+    payload,
+    *,
+    project,
+    msg,
+    status: str,
+    action: str,
+) -> None:
+    message_type = getattr(msg.message_type, "value", str(msg.message_type))
+    assert payload["schema_version"] == 1
+    assert payload["project_id"] == str(project.id)
+    assert payload["resource"] == "project_message"
+    assert payload["action"] == action
+    assert payload["message_id"] == str(msg.id)
+    assert payload["type"] == message_type
+    assert payload["from"] == msg.from_type
+    assert payload["status"] == status
+    assert payload["message"] == {
+        "id": str(msg.id),
+        "type": message_type,
+        "from": msg.from_type,
+        "status": status,
+        "excerpt": msg.content,
+    }
+    assert payload["refetch"] == {"surfaces": ["messages", "strategic_session"]}
+
+
 async def _make_direction_row(
     db, project, *, direction_key="d-abc123", status="active"
 ):
@@ -11478,6 +11505,46 @@ async def test_linked_message_resurfaces_when_task_fails(reaper_db):
     assert ctx.get("_convergence_link_stale") is not None
     assert "_convergence_link" not in ctx
     assert "FAILED" in (ctx.get("_convergence_resurfaced_reason") or "")
+
+
+@pytest.mark.asyncio
+async def test_linked_message_resurface_broadcasts_workbench_envelope(
+    reaper_db, mocker
+):
+    """Linked-message updates publish the shared workbench message envelope."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.FAILED,
+        context={},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+    link_message_to_outcome(msg, "task", str(task.id))
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    broadcast = mocker.patch(
+        "app.broadcast.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    acted = await sweep_converge_linked_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    broadcast.assert_awaited_once()
+    project_id, event, payload = broadcast.await_args.args
+    assert project_id == str(project.id)
+    assert event == "message_updated"
+    _assert_message_update_event_payload(
+        payload,
+        project=project,
+        msg=msg,
+        status="open",
+        action="updated",
+    )
 
 
 @pytest.mark.asyncio
@@ -12090,6 +12157,37 @@ async def test_open_owned_resolves_when_direction_completed(reaper_db):
 
 
 @pytest.mark.asyncio
+async def test_open_owned_resolution_broadcasts_workbench_envelope(reaper_db, mocker):
+    """Owner-success auto-resolution publishes a resolved message envelope."""
+    project = await _make_project(reaper_db)
+    await _make_direction_row(
+        reaper_db, project, direction_key="d-done-env", status="completed"
+    )
+    msg = await _make_bug_message(
+        reaper_db, project, context={"direction_id": "d-done-env"}
+    )
+    broadcast = mocker.patch(
+        "app.broadcast.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 1
+    await reaper_db.refresh(msg)
+    broadcast.assert_awaited_once()
+    project_id, event, payload = broadcast.await_args.args
+    assert project_id == str(project.id)
+    assert event == "message_updated"
+    _assert_message_update_event_payload(
+        payload,
+        project=project,
+        msg=msg,
+        status="resolved",
+        action="resolved",
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("dir_status", ["retired", "rejected", "expired", "superseded"])
 async def test_open_owned_stays_open_when_direction_ended_without_landing(
     reaper_db, dir_status
@@ -12379,6 +12477,48 @@ async def test_stale_open_bug_resolves_when_citations_absent(reaper_db, monkeypa
     assert msg.context.get("_stale_auto_resolution") == msg.resolution
     assert msg.context.get("_stale_auto_citation_signal") == absent_signal
     assert "_owned_auto_resolution" not in msg.context
+
+
+@pytest.mark.asyncio
+async def test_stale_open_bug_resolution_broadcasts_workbench_envelope(
+    reaper_db, monkeypatch, mocker
+):
+    """Stale auto-resolution publishes the same resolved message envelope."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project, context={"source": "x"})
+
+    async def _absent(_session, _project, _content, *, structured_context=None):
+        return {
+            "citation_state": "absent",
+            "broken_refs": ["app/gone.py"],
+            "ungrounded_refs": [],
+        }
+
+    monkeypatch.setattr(_rs, "compute_message_citation_warning", _absent, raising=False)
+    monkeypatch.setattr(
+        "app.source_ref_validation.compute_message_citation_warning",
+        _absent,
+        raising=False,
+    )
+    broadcast = mocker.patch(
+        "app.broadcast.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    resolved = await sweep_resolve_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 1
+    await reaper_db.refresh(msg)
+    broadcast.assert_awaited_once()
+    project_id, event, payload = broadcast.await_args.args
+    assert project_id == str(project.id)
+    assert event == "message_updated"
+    _assert_message_update_event_payload(
+        payload,
+        project=project,
+        msg=msg,
+        status="resolved",
+        action="resolved",
+    )
 
 
 @pytest.mark.asyncio

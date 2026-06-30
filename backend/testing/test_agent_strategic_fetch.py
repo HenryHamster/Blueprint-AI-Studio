@@ -84,6 +84,27 @@ async def _add_ambiguous_messages(
     return shared_prefix, messages
 
 
+def _assert_project_message_event_payload(
+    payload: dict,
+    *,
+    project: Project,
+    msg: ProjectMessage,
+    action: str,
+    status: str,
+) -> None:
+    message_type = getattr(msg.message_type, "value", str(msg.message_type))
+    assert payload["schema_version"] == 1
+    assert payload["project_id"] == str(project.id)
+    assert payload["resource"] == "project_message"
+    assert payload["action"] == action
+    assert payload["message_id"] == str(msg.id)
+    assert payload["type"] == message_type
+    assert payload["from"] == msg.from_type
+    assert payload["message"]["id"] == str(msg.id)
+    assert payload["message"]["status"] == status
+    assert payload["refetch"] == {"surfaces": ["messages", "strategic_session"]}
+
+
 @pytest.mark.asyncio
 async def test_agent_fetch_direction_returns_full_record_with_history_cap(
     client: AsyncClient, db_session
@@ -1090,9 +1111,11 @@ async def test_agent_fetch_message_cross_project_not_found(
 
 @pytest.mark.asyncio
 async def test_strategic_resolve_message_by_short_ref_plain(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """resolve_message op accepts a short ref and resolves a plain message."""
+    from unittest.mock import AsyncMock
+
     project, task = await _make_project_task(db_session)
     msg = await _add_message(
         db_session,
@@ -1104,6 +1127,10 @@ async def test_strategic_resolve_message_by_short_ref_plain(
     )
     token = create_agent_token(
         str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    broadcast = mocker.patch(
+        "app.routers.admin_agent_ops.broadcast_to_project",
+        new=AsyncMock(),
     )
     res = await client.post(
         "/api/agent/strategic",
@@ -1122,13 +1149,26 @@ async def test_strategic_resolve_message_by_short_ref_plain(
     assert msg.status == "resolved"
     assert msg.resolution == "done"
     assert msg.resolved_at is not None
+    broadcast.assert_awaited_once()
+    project_id, event, payload = broadcast.await_args.args
+    assert project_id == str(project.id)
+    assert event == "message_updated"
+    _assert_project_message_event_payload(
+        payload,
+        project=project,
+        msg=msg,
+        action="resolved",
+        status="resolved",
+    )
 
 
 @pytest.mark.asyncio
 async def test_strategic_resolve_message_by_short_ref_links_bug(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """resolve_message op by short ref links a bug-class message to an outcome."""
+    from unittest.mock import AsyncMock
+
     project, task = await _make_project_task(db_session)
     msg = await _add_message(
         db_session,
@@ -1140,6 +1180,10 @@ async def test_strategic_resolve_message_by_short_ref_links_bug(
     )
     token = create_agent_token(
         str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    broadcast = mocker.patch(
+        "app.routers.admin_agent_ops.broadcast_to_project",
+        new=AsyncMock(),
     )
     res = await client.post(
         "/api/agent/strategic",
@@ -1158,6 +1202,17 @@ async def test_strategic_resolve_message_by_short_ref_links_bug(
     assert body["linked_to"] == {"kind": "direction", "id": "dir-99"}
     await db_session.refresh(msg)
     assert msg.status == "linked"
+    broadcast.assert_awaited_once()
+    project_id, event, payload = broadcast.await_args.args
+    assert project_id == str(project.id)
+    assert event == "message_updated"
+    _assert_project_message_event_payload(
+        payload,
+        project=project,
+        msg=msg,
+        action="updated",
+        status="linked",
+    )
 
 
 @pytest.mark.asyncio
@@ -1340,6 +1395,57 @@ async def test_strategic_create_message_note_type_not_grounded(
     ).scalar_one()
     assert "_provenance_warnings" not in (msg.context or {})
     spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_strategic_create_message_broadcasts_workbench_envelope(
+    client: AsyncClient, db_session, mocker
+):
+    """Strategist-authored messages publish the shared project-message envelope."""
+    from unittest.mock import AsyncMock
+
+    project, task = await _make_project_task(db_session)
+    broadcast = mocker.patch(
+        "app.routers.admin_agent_ops.broadcast_to_project",
+        new=AsyncMock(),
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "Keep the local Strategic session warm.",
+            },
+        },
+    )
+
+    assert res.status_code == 200, res.text
+    msg = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalar_one()
+    broadcast.assert_awaited_once()
+    project_id, event, payload = broadcast.await_args.args
+    assert project_id == str(project.id)
+    assert event == "message_created"
+    assert payload["schema_version"] == 1
+    assert payload["project_id"] == str(project.id)
+    assert payload["resource"] == "project_message"
+    assert payload["action"] == "created"
+    assert payload["message_id"] == str(msg.id)
+    assert payload["type"] == "NOTE"
+    assert payload["from"] == "strategic"
+    assert payload["message"]["id"] == str(msg.id)
+    assert payload["message"]["status"] == "open"
+    assert payload["refetch"] == {"surfaces": ["messages", "strategic_session"]}
 
 
 # ---------------------------------------------------------------------------
@@ -2916,9 +3022,11 @@ async def test_fetch_efficiency_snapshot_rejects_cross_project(
 
 @pytest.mark.asyncio
 async def test_strategic_resolve_question_posts_answer_note(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """resolve_message on a QUESTION-type message posts a question_answer NOTE."""
+    from unittest.mock import AsyncMock
+
     project, task = await _make_project_task(db_session)
     msg = await _add_message(
         db_session,
@@ -2930,6 +3038,10 @@ async def test_strategic_resolve_question_posts_answer_note(
     )
     token = create_agent_token(
         str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    broadcast = mocker.patch(
+        "app.routers.admin_agent_ops.broadcast_to_project",
+        new=AsyncMock(),
     )
     res = await client.post(
         "/api/agent/strategic",
@@ -2967,6 +3079,113 @@ async def test_strategic_resolve_question_posts_answer_note(
         and n.context.get("reply_to") == str(msg.id)
     ]
     assert len(matching) == 1, f"Expected 1 question_answer NOTE, got {len(matching)}"
+    await db_session.refresh(msg)
+    reply_msg = matching[0]
+    assert broadcast.await_count == 2
+    update_call, create_call = broadcast.await_args_list
+    project_id, event, payload = update_call.args
+    assert project_id == str(project.id)
+    assert event == "message_updated"
+    _assert_project_message_event_payload(
+        payload,
+        project=project,
+        msg=msg,
+        action="resolved",
+        status="resolved",
+    )
+    project_id, event, payload = create_call.args
+    assert project_id == str(project.id)
+    assert event == "message_created"
+    _assert_project_message_event_payload(
+        payload,
+        project=project,
+        msg=reply_msg,
+        action="created",
+        status="open",
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_resolve_question_reply_commit_failure_does_not_broadcast_reply(
+    client: AsyncClient, db_session, mocker
+):
+    """A failed optional reply write must not emit a phantom reply-created event."""
+    from unittest.mock import AsyncMock
+
+    project, task = await _make_project_task(db_session)
+    msg = await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="What changed?",
+        status="open",
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    broadcast = mocker.patch(
+        "app.routers.admin_agent_ops.broadcast_to_project",
+        new=AsyncMock(),
+    )
+    from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
+
+    real_commit = _AsyncSession.commit
+    commit_count = 0
+
+    async def _commit_reply_failure(session, *args, **kwargs):
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count == 2:
+            raise RuntimeError("reply commit failed")
+        return await real_commit(session, *args, **kwargs)
+
+    mocker.patch.object(
+        _AsyncSession,
+        "commit",
+        autospec=True,
+        side_effect=_commit_reply_failure,
+    )
+
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "resolve_message",
+            "data": {
+                "message_id": str(msg.id),
+                "resolution": "Resolved, but reply persistence failed.",
+            },
+        },
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["status"] == "ok"
+    await db_session.refresh(msg)
+    assert msg.status == "resolved"
+    assert broadcast.await_count == 1
+    project_id, event, payload = broadcast.await_args.args
+    assert project_id == str(project.id)
+    assert event == "message_updated"
+    assert payload["message_id"] == str(msg.id)
+    assert payload["message"]["status"] == "resolved"
+    _assert_project_message_event_payload(
+        payload,
+        project=project,
+        msg=msg,
+        action="resolved",
+        status="resolved",
+    )
+    notes = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.message_type == MessageType.NOTE,
+            )
+        )
+    ).scalars().all()
+    assert notes == []
 
 
 @pytest.mark.asyncio

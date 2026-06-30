@@ -109,6 +109,10 @@ def message_event_payload(
     return payload
 
 
+def message_updated_event_payload(message: ProjectMessage) -> dict[str, Any]:
+    return message_event_payload(message, status=enum_value(message.status))
+
+
 def legacy_direction_message_dict(message: ProjectMessage) -> dict[str, Any]:
     base = project_message_base(message)
     return {

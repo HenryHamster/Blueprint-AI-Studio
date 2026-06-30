@@ -29,7 +29,7 @@ class OperatorMessageCreateResult:
     message: ProjectMessage
     status: str
     arming: str
-    message_event: dict[str, str] | None = None
+    message_event: dict[str, Any] | None = None
 
     @property
     def message_id(self) -> str:

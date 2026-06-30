@@ -697,7 +697,7 @@ async def resolve_message(
             "resolved_at": resolved_at.isoformat(),
         }
         reply_msg: ProjectMessage | None = None
-        reply_message_event: dict[str, str] | None = None
+        reply_message_event: dict[str, Any] | None = None
         reply_message_id: str | None = None
         reply_message_response: dict[str, Any] | None = None
         arming: str | None = None

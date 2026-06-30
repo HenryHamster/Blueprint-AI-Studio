@@ -44,6 +44,10 @@ from app.playbook_storage import (
     _playbook_size_bytes,
     maybe_archive_for_capacity as _maybe_archive_for_capacity,
 )
+from app.project_message_projection import (
+    message_event_payload,
+    message_updated_event_payload,
+)
 from app.routers.agent import verify_agent_token
 from app.source_ref_validation import (
     compute_message_citation_warning as _compute_message_citation_warning,
@@ -1876,11 +1880,7 @@ async def strategic_operation(
         await broadcast_to_project(
             str(project.id),
             "message_created",
-            {
-                "message_id": str(new_msg.id),
-                "type": msg_type.value,
-                "from": "strategic",
-            },
+            message_event_payload(new_msg),
         )
         return _resp(
             {"status": "ok", "op": "create_message", "message_id": str(new_msg.id)}
@@ -1920,6 +1920,11 @@ async def strategic_operation(
             )
             session.add(msg)
             await session.commit()
+            await broadcast_to_project(
+                str(project.id),
+                "message_updated",
+                message_updated_event_payload(msg),
+            )
             return _resp(
                 {
                     "status": "ok",
@@ -1936,6 +1941,9 @@ async def strategic_operation(
         msg.resolved_at = _utcnow()
         session.add(msg)
         await session.commit()
+        message_id_str = str(msg.id)
+        message_update_event = message_updated_event_payload(msg)
+        reply_msg: ProjectMessage | None = None
         if msg.message_type in (MessageType.QUESTION, MessageType.FEEDBACK):
             try:
                 from app.notification_dispatch import (
@@ -1945,9 +1953,11 @@ async def strategic_operation(
 
                 resolution = msg.resolution or "Addressed by strategic review"
                 if msg.message_type == MessageType.QUESTION:
-                    await _post_qa(session, project.id, msg.id, resolution, task.id)
+                    pending_reply_msg = await _post_qa(
+                        session, project.id, msg.id, resolution, task.id
+                    )
                 else:
-                    await _post_feedback_ack(
+                    pending_reply_msg = await _post_feedback_ack(
                         session,
                         project.id,
                         msg.id,
@@ -1955,14 +1965,28 @@ async def strategic_operation(
                         task.id,
                     )
                 await session.commit()
+                reply_msg = pending_reply_msg
             except Exception:
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    "post resolution reply failed for message %s", msg.id, exc_info=True
+                await session.rollback()
+                reply_msg = None
+                logger.warning(
+                    "post resolution reply failed for message %s",
+                    message_id_str,
+                    exc_info=True,
                 )
+        await broadcast_to_project(
+            str(project.id),
+            "message_updated",
+            message_update_event,
+        )
+        if reply_msg is not None:
+            await broadcast_to_project(
+                str(project.id),
+                "message_created",
+                message_event_payload(reply_msg),
+            )
         return _resp(
-            {"status": "ok", "op": "resolve_message", "message_id": str(msg.id)}
+            {"status": "ok", "op": "resolve_message", "message_id": message_id_str}
         )
 
     elif payload.op == "spawn_task":
