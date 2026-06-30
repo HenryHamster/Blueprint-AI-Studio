@@ -42,7 +42,8 @@ because the dedicated session has nothing else dirty.  A fresh session also
 cannot self-deadlock: the completion handler holds a lock on the *Task* row, not
 the ``ReleaseVersion`` row, and the reaper sweep takes no lock on the version
 before delegating — so the dedicated session's ``SELECT ... FOR UPDATE`` on the
-version row can never wait on a lock the caller still holds.
+version row can never wait on a lock the caller still holds; if a peer holds it,
+the finalize attempt skips and the next completion/sweep retries.
 
 Hard blockers (CI red, smoketest startup-suite failure when the subsystem is
 enabled, any deleted test file) force confidence to 0.0 — those candidates
@@ -4010,19 +4011,19 @@ async def _finalize_in_dedicated_session(
     is injectable for tests (defaults to ``AsyncSessionLocal``).
 
     **Why it cannot self-deadlock.**  The dedicated session takes
-    ``SELECT ... FOR UPDATE`` on the ``ReleaseVersion`` row.  The
+    ``SELECT ... FOR UPDATE SKIP LOCKED`` on the ``ReleaseVersion`` row.  The
     task-completion caller holds a lock on the *Task* row, not the
     ``ReleaseVersion`` row; the reaper sweep takes NO lock on the version row
     before calling here.  So a fresh session can never block on a version-row
-    lock held by the same logical caller — concern (c).
+    lock held by the same logical caller; if a peer holds the row, this attempt
+    no-ops and the next completion/sweep retries — concern (c).
 
     **Why concurrent calls cannot double-promote (concern d).**  This function
-    ``SELECT ... FOR UPDATE``-locks the version row at the very top and holds it
-    across the readiness check and the decision.  For the NON-promote outcomes
-    (``dry_run`` / ``not_promoted``) the lock is held until commit, so a second
-    concurrent call blocks until the first commits, then re-reads
-    ``last_qualification.status``, sees it is no longer ``"pending"``, and bails
-    at the pending guard — the pending guard alone serializes those paths.
+    ``SELECT ... FOR UPDATE SKIP LOCKED``-locks the version row for the
+    readiness check and decision.  For the NON-promote outcomes (``dry_run`` /
+    ``not_promoted``) the lock is held until commit, so a second concurrent call
+    that cannot acquire it simply returns ``None``; a later retry re-reads
+    ``last_qualification.status`` and bails at the pending guard.
 
     The PROMOTE path is different and the pending guard is NOT what protects it:
     ``promote()`` issues an intermediate ``commit()`` that releases this row
@@ -4087,6 +4088,32 @@ async def _finalize_in_dedicated_session(
     return result
 
 
+def _qualification_timeout_age_seconds(
+    version: release_version.ReleaseVersion,
+    qual: dict[str, Any],
+    timeout_now: datetime,
+    *,
+    warn_on_fallback: bool,
+) -> float | None:
+    """Return pending qualification age in seconds, or None if no clock exists."""
+    timeout_clock = _parse_started_at(qual)
+    if timeout_clock is None:
+        timeout_clock = (
+            version.updated_at or version.phase_changed_at or version.opened_at
+        )
+        if timeout_clock is not None and warn_on_fallback:
+            logger.warning(
+                "[RELEASE_QUALIFIER] finalize: version v%d has a "
+                "missing/unparseable started_at (%r) — using updated_at "
+                "as the timeout clock so the backstop still fires",
+                version.version_number,
+                qual.get("started_at"),
+            )
+    if timeout_clock is None:
+        return None
+    return (timeout_now - timeout_clock).total_seconds()
+
+
 async def _finalize_locked_version(
     session: AsyncSession,
     version_id: uuid.UUID,
@@ -4134,22 +4161,36 @@ async def _finalize_locked_version(
     if peek_qual.get("status") != "pending":
         return None
     peek_candidate_sha: str | None = peek_qual.get("candidate_sha")
+    pre_timeout_age_seconds = (
+        _qualification_timeout_age_seconds(
+            peek,
+            peek_qual,
+            timeout_now,
+            warn_on_fallback=False,
+        )
+        if timeout_now is not None and not peek_qual.get("promotion_pending")
+        else None
+    )
+    pre_timeout_expired = (
+        pre_timeout_age_seconds is not None
+        and pre_timeout_age_seconds > _MAX_QUALIFICATION_DURATION_SECONDS
+    )
 
     # ── Run the three GitHub-bound gates BEFORE acquiring the FOR UPDATE ──
-    # Guard: only run when (a) this is not a timeout-only reaper call (timeout_now
-    # is None means task-completion hook — children may be terminal) and (b) all
-    # required children are already terminal according to the non-locking peek.
+    # Guard: only run when all required children are already terminal according
+    # to the non-locking peek.
     # Without this guard the gates ran speculatively on every qualifier child
     # completion (Nx amplification) and on every reaper sweep iteration for
     # versions whose children were still running — a DB/GitHub load regression.
     #
-    # When _pre_gates is None (children not yet terminal, or timeout path),
+    # When _pre_gates is None (children not yet terminal, timeout already
+    # expired, or a readiness race),
     # _finalize_qualification will either be skipped entirely (Path 2 returns
     # early) or run with _pre_gates=None and call the gates itself under the
     # lock — acceptable because that path is rare (race between sibling
     # completion and this check) and the reaper sweep is infrequent.
     _pre_gates: dict[str, Any] | None = None
-    if timeout_now is None and await _required_children_terminal(session, peek):
+    if not pre_timeout_expired and await _required_children_terminal(session, peek):
         # All three are pinned to the immutable candidate_sha and are read-only
         # against GitHub; their results are valid for the entire finalize attempt.
         pre_ci_green, pre_ci_resolution = await _resolve_ci_at_finalize(
@@ -4167,6 +4208,7 @@ async def _finalize_locked_version(
         ) = await _resolve_migration_apply_at_finalize(
             session, peek, peek_candidate_sha
         )
+        pre_theme_evidence = await _fetch_version_theme_evidence(session, peek)
         # Pre-resolve the direct already-on-main ancestry check (merge-grade
         # exemption fallback) before acquiring the lock.  Only attempt when a
         # merge-grade child was spawned, a candidate SHA is available, and the
@@ -4209,9 +4251,15 @@ async def _finalize_locked_version(
             "migration_detail": pre_migration_detail,
             "apply_verdict": pre_apply_verdict,
             "apply_detail": pre_apply_detail,
-            "pre_theme_evidence": await _fetch_version_theme_evidence(session, peek),
+            "pre_theme_evidence": pre_theme_evidence,
             "pre_merge_grade_already_on_main": _pre_merge_grade_already_on_main,
         }
+        # The pre-lock phase is read-only and intentionally best-effort. Some
+        # helpers fail closed by swallowing exceptions, but a swallowed DBAPI
+        # error still leaves the SQLAlchemy transaction aborted; without this
+        # rollback the later FOR UPDATE/commit surfaces as PendingRollbackError
+        # and the sweep misclassifies the qualification as a finalizer crash.
+        await session.rollback()
 
     # Expire the peek instance so the FOR UPDATE select below forces a fresh
     # read from the DB (mirrors _relock_version_for_promotion_write pattern —
@@ -4227,7 +4275,7 @@ async def _finalize_locked_version(
             await session.execute(
                 select(release_version.ReleaseVersion)
                 .where(release_version.ReleaseVersion.id == version_id)
-                .with_for_update()
+                .with_for_update(skip_locked=True)
                 .execution_options(populate_existing=True)
             )
         )
@@ -4237,7 +4285,7 @@ async def _finalize_locked_version(
 
     if version is None:
         logger.debug(
-            "[RELEASE_QUALIFIER] finalize: version %s not found — skipping",
+            "[RELEASE_QUALIFIER] finalize: version %s not found or locked — skipping",
             version_id,
         )
         return None
@@ -4279,34 +4327,24 @@ async def _finalize_locked_version(
         # lifecycle alert) handles the case where the PR is genuinely stuck.
         if qual.get("promotion_pending"):
             return None
-        started_at = _parse_started_at(qual)
-        timeout_clock = started_at
-        if timeout_clock is None:
-            # updated_at is non-null + onupdate-stamped; the others are further
-            # fallbacks.  A corrupt started_at must never defeat the backstop
-            # (audit R4-H5).
-            timeout_clock = (
-                version.updated_at or version.phase_changed_at or version.opened_at
+        age_seconds = _qualification_timeout_age_seconds(
+            version,
+            qual,
+            timeout_now,
+            warn_on_fallback=True,
+        )
+        if (
+            age_seconds is not None
+            and age_seconds > _MAX_QUALIFICATION_DURATION_SECONDS
+        ):
+            await _force_finalize_timed_out_qualification(
+                session, version, age_seconds
             )
-            if timeout_clock is not None:
-                logger.warning(
-                    "[RELEASE_QUALIFIER] finalize: version v%d has a "
-                    "missing/unparseable started_at (%r) — using updated_at "
-                    "as the timeout clock so the backstop still fires",
-                    version.version_number,
-                    qual.get("started_at"),
-                )
-        if timeout_clock is not None:
-            age_seconds = (timeout_now - timeout_clock).total_seconds()
-            if age_seconds > _MAX_QUALIFICATION_DURATION_SECONDS:
-                await _force_finalize_timed_out_qualification(
-                    session, version, age_seconds
-                )
-                await session.commit()
-                return {
-                    "status": "infra_failure",
-                    "blocker": "qualification_timeout",
-                }
+            await session.commit()
+            return {
+                "status": "infra_failure",
+                "blocker": "qualification_timeout",
+            }
 
     # --- Path 2: all required children terminal -----------------------------
     if not await _required_children_terminal(session, version):
@@ -4349,12 +4387,13 @@ async def maybe_finalize_qualification(
          remediation/regression records).  On the dedicated session that
          commit only ever flushes qualifier state.
 
-      2. Takes ``SELECT ... FOR UPDATE`` on the ``ReleaseVersion`` row — the
+      2. Takes ``SELECT ... FOR UPDATE SKIP LOCKED`` on the ``ReleaseVersion`` row — the
          serialization point for the non-promote paths.  The ``release_audit``
          and qualifier ``smoketest`` children can terminate
          near-simultaneously, and a reaper sweep can run concurrently; for a
-         ``dry_run`` / ``not_promoted`` outcome the lock makes a second finalize
-         attempt block until the first commits, then bail at the pending guard.
+         ``dry_run`` / ``not_promoted`` outcome a peer that cannot acquire the
+         lock skips; a later retry bails at the pending guard once the first
+         finalize commits.
          A PROMOTE is the exception: ``promote()`` releases this lock via an
          intermediate commit (with the status still ``"pending"``) before its
          GitHub I/O, so a concurrent caller can pass the pending guard
