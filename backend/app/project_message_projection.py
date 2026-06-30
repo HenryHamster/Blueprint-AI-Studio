@@ -24,6 +24,10 @@ DEFAULT_MESSAGE_CONTEXT_PREVIEW_KEYS = (
     "dedupe_key",
 )
 
+MESSAGE_EVENT_SCHEMA_VERSION = 1
+MESSAGE_EVENT_REFETCH_SURFACES = ("messages", "strategic_session")
+_MESSAGE_EVENT_EXCERPT_MAX_CHARS = 160
+
 
 def enum_value(value: Any) -> str:
     return value.value if hasattr(value, "value") else str(value)
@@ -71,11 +75,34 @@ def message_event_payload(
     message: ProjectMessage,
     *,
     status: str | None = None,
-) -> dict[str, str]:
-    payload = {
-        "message_id": str(message.id),
-        "type": enum_value(message.message_type),
+) -> dict[str, Any]:
+    message_type = enum_value(message.message_type)
+    message_status = status or enum_value(message.status)
+    action = "created"
+    if status:
+        action = "resolved" if status == "resolved" else "updated"
+    message_summary: dict[str, Any] = {
+        "id": str(message.id),
+        "type": message_type,
         "from": str(message.from_type),
+        "status": message_status,
+    }
+    excerpt = compact_text(
+        message.content,
+        max_chars=_MESSAGE_EVENT_EXCERPT_MAX_CHARS,
+    )
+    if excerpt:
+        message_summary["excerpt"] = excerpt
+    payload: dict[str, Any] = {
+        "message_id": str(message.id),
+        "type": message_type,
+        "from": str(message.from_type),
+        "schema_version": MESSAGE_EVENT_SCHEMA_VERSION,
+        "project_id": str(message.project_id),
+        "resource": "project_message",
+        "action": action,
+        "message": message_summary,
+        "refetch": {"surfaces": list(MESSAGE_EVENT_REFETCH_SURFACES)},
     }
     if status is not None:
         payload["status"] = status

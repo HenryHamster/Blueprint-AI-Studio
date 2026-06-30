@@ -39,6 +39,8 @@ _STEERING_EXCERPT_MAX_CHARS = 240
 _STATUS_MAX_CHARS = 160
 _ID_LIST_MAX = 25
 _NOTIFY_PAYLOAD_SOFT_LIMIT = 6_000
+_EVENT_SCHEMA_VERSION = 1
+_STRATEGIC_REFETCH_SURFACES = ("strategic_session", "directions")
 
 _PHASE_LABELS = {
     1: "Architecture review",
@@ -86,7 +88,24 @@ def _as_int(value: Any, *, default: int = 0) -> int:
         return default
 
 
+def _event_envelope(
+    project_id: Any,
+    *,
+    resource: str,
+    action: str,
+    refetch_surfaces: Sequence[str] = _STRATEGIC_REFETCH_SURFACES,
+) -> dict[str, Any]:
+    return {
+        "schema_version": _EVENT_SCHEMA_VERSION,
+        "project_id": str(project_id),
+        "resource": resource,
+        "action": action,
+        "refetch": {"surfaces": list(refetch_surfaces)},
+    }
+
+
 def _phase_payload(
+    project_id: Any,
     task_id: Any,
     phase: Any,
     *,
@@ -98,10 +117,26 @@ def _phase_payload(
     steering_excerpt: str | None = None,
     completion: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    payload: dict[str, Any] = {"task_id": str(task_id), "phase": phase}
+    task_id_str = str(task_id)
+    payload: dict[str, Any] = {
+        "task_id": task_id_str,
+        "phase": phase,
+        **_event_envelope(
+            project_id,
+            resource="strategic_cycle",
+            action=event,
+        ),
+    }
+    strategic_summary: dict[str, Any] = {
+        "kind": "cycle",
+        "task_id": task_id_str,
+        "phase": phase,
+    }
     phase_num = _as_int(phase, default=0)
     if cycle_id:
-        payload["cycle_id"] = str(cycle_id)
+        cycle_id_str = str(cycle_id)
+        payload["cycle_id"] = cycle_id_str
+        strategic_summary["cycle_id"] = cycle_id_str
     if phase_num:
         payload["phase_number"] = phase_num
         payload["phase_label"] = phase_label or _PHASE_LABELS.get(
@@ -118,10 +153,12 @@ def _phase_payload(
         payload["steering_excerpt"] = excerpt
     if completion:
         payload["completion"] = _completion_payload(completion)
+    payload["strategic"] = strategic_summary
     return _enforce_soft_limit(payload)
 
 
 def _output_payload(
+    project_id: Any,
     kind: str,
     *,
     task_id: Any = None,
@@ -134,11 +171,27 @@ def _output_payload(
     running_update_changed: bool | None = None,
 ) -> dict[str, Any]:
     direction_ids = _compact_ids(changed_direction_ids)
-    payload: dict[str, Any] = {"kind": kind}
+    action = _compact_str(op, max_chars=80) or "updated"
+    payload: dict[str, Any] = {
+        "kind": kind,
+        **_event_envelope(
+            project_id,
+            resource="strategic_output",
+            action=action,
+        ),
+    }
+    strategic_summary: dict[str, Any] = {
+        "kind": kind,
+        "output_kind": output_kind or kind,
+    }
     if task_id:
-        payload["task_id"] = str(task_id)
+        task_id_str = str(task_id)
+        payload["task_id"] = task_id_str
+        strategic_summary["task_id"] = task_id_str
     if cycle_id:
-        payload["cycle_id"] = str(cycle_id)
+        cycle_id_str = str(cycle_id)
+        payload["cycle_id"] = cycle_id_str
+        strategic_summary["cycle_id"] = cycle_id_str
     if output_kind:
         payload["output_kind"] = output_kind
     if op:
@@ -149,10 +202,12 @@ def _output_payload(
         payload["changed_count"] = max(0, _as_int(changed_count))
         if changed_count is None:
             payload["changed_count"] = len(direction_ids)
+        strategic_summary["changed_count"] = payload["changed_count"]
     if problem_model_changed is not None:
         payload["problem_model_changed"] = bool(problem_model_changed)
     if running_update_changed is not None:
         payload["running_update_changed"] = bool(running_update_changed)
+    payload["strategic"] = strategic_summary
     return _enforce_soft_limit(payload)
 
 
@@ -255,6 +310,7 @@ async def emit_strategic_cycle_started(
         str(project_id),
         STRATEGIC_CYCLE_STARTED,
         _phase_payload(
+            project_id,
             task_id,
             phase,
             event="started",
@@ -282,6 +338,7 @@ async def emit_strategic_cycle_completed(
         str(project_id),
         STRATEGIC_CYCLE_COMPLETED,
         _phase_payload(
+            project_id,
             task_id,
             phase,
             event="completed",
@@ -314,6 +371,7 @@ async def emit_strategic_updated(
         str(project_id),
         STRATEGIC_UPDATED,
         _output_payload(
+            project_id,
             kind,
             task_id=task_id,
             cycle_id=cycle_id,

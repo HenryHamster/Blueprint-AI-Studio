@@ -26,6 +26,22 @@ from app.strategic_events import (
 )
 
 
+def _assert_v1_envelope(
+    payload: dict,
+    *,
+    project_id: uuid.UUID,
+    resource: str,
+    action: str,
+):
+    assert payload["schema_version"] == 1
+    assert payload["project_id"] == str(project_id)
+    assert payload["resource"] == resource
+    assert payload["action"] == action
+    assert payload["refetch"] == {
+        "surfaces": ["strategic_session", "directions"],
+    }
+
+
 def test_event_name_contract_is_stable():
     """The three event names are a frontend contract — pin them literally."""
     assert STRATEGIC_CYCLE_STARTED == "strategic_cycle_started"
@@ -51,6 +67,14 @@ async def test_emit_cycle_started_payload():
     payload = mock_bcast.await_args.args[2]
     assert payload["task_id"] == str(task_id)
     assert payload["phase"] == 1
+    _assert_v1_envelope(
+        payload,
+        project_id=project_id,
+        resource="strategic_cycle",
+        action="started",
+    )
+    assert payload["strategic"]["kind"] == "cycle"
+    assert payload["strategic"]["task_id"] == str(task_id)
 
 
 @pytest.mark.asyncio
@@ -68,6 +92,14 @@ async def test_emit_cycle_completed_payload():
     payload = mock_bcast.await_args.args[2]
     assert payload["task_id"] == str(task_id)
     assert payload["phase"] == 2
+    _assert_v1_envelope(
+        payload,
+        project_id=project_id,
+        resource="strategic_cycle",
+        action="completed",
+    )
+    assert payload["strategic"]["kind"] == "cycle"
+    assert payload["strategic"]["task_id"] == str(task_id)
 
 
 @pytest.mark.asyncio
@@ -94,6 +126,12 @@ async def test_emit_cycle_started_payload_includes_phase_and_steering_context():
     assert payload["steering_origin"] == "operator"
     assert payload["steering_excerpt"].startswith("Focus on billing reliability.")
     assert len(payload["steering_excerpt"]) <= 240
+    assert payload["strategic"] == {
+        "kind": "cycle",
+        "task_id": str(task_id),
+        "phase": 1,
+        "cycle_id": "sc-live123",
+    }
 
 
 @pytest.mark.asyncio
@@ -140,6 +178,12 @@ async def test_emit_cycle_completed_payload_includes_progress_and_outcome():
     assert completion["directions_changed"] is True
     assert completion["problem_model_changed"] is True
     assert completion["running_update_changed"] is True
+    assert payload["strategic"] == {
+        "kind": "cycle",
+        "task_id": str(task_id),
+        "phase": 2,
+        "cycle_id": "sc-done123",
+    }
 
 
 @pytest.mark.asyncio
@@ -205,11 +249,20 @@ async def test_emit_strategic_updated_payload(kind):
     with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
         await emit_strategic_updated(project_id, kind)
 
-    mock_bcast.assert_awaited_once_with(
+    mock_bcast.assert_awaited_once()
+    assert mock_bcast.await_args.args[:2] == (
         str(project_id),
         "strategic_updated",
-        {"kind": kind},
     )
+    payload = mock_bcast.await_args.args[2]
+    assert payload["kind"] == kind
+    _assert_v1_envelope(
+        payload,
+        project_id=project_id,
+        resource="strategic_output",
+        action="updated",
+    )
+    assert payload["strategic"] == {"kind": kind, "output_kind": kind}
 
 
 @pytest.mark.asyncio
@@ -229,13 +282,24 @@ async def test_emit_strategic_updated_payload_includes_compact_linkage():
         )
 
     payload = mock_bcast.await_args.args[2]
-    assert payload == {
+    assert payload["kind"] == "directions"
+    assert payload["task_id"] == str(task_id)
+    assert payload["cycle_id"] == "sc-live123"
+    assert payload["output_kind"] == "directions"
+    assert payload["op"] == "update_direction"
+    assert payload["changed_direction_ids"] == ["d-live"]
+    assert payload["changed_count"] == 1
+    _assert_v1_envelope(
+        payload,
+        project_id=project_id,
+        resource="strategic_output",
+        action="update_direction",
+    )
+    assert payload["strategic"] == {
         "kind": "directions",
+        "output_kind": "directions",
         "task_id": str(task_id),
         "cycle_id": "sc-live123",
-        "output_kind": "directions",
-        "op": "update_direction",
-        "changed_direction_ids": ["d-live"],
         "changed_count": 1,
     }
 
@@ -252,9 +316,9 @@ async def test_emit_payloads_stay_tiny_for_notify_ceiling():
 
     with patch.object(se, "broadcast_to_project", new=_capture):
         await emit_strategic_cycle_started(uuid.uuid4(), uuid.uuid4(), 1)
-        assert len(json.dumps(captured["data"]).encode("utf-8")) < 200
+        assert len(json.dumps(captured["data"]).encode("utf-8")) < 500
         await emit_strategic_updated(uuid.uuid4(), STRATEGIC_KIND_DIRECTIONS)
-        assert len(json.dumps(captured["data"]).encode("utf-8")) < 200
+        assert len(json.dumps(captured["data"]).encode("utf-8")) < 500
         await emit_strategic_cycle_completed(
             uuid.uuid4(),
             uuid.uuid4(),

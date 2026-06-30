@@ -80,6 +80,38 @@ def _default_no_migration_pr():
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
+def _assert_message_event_payload(
+    payload,
+    *,
+    project_id,
+    message_id: str,
+    message_type: str,
+    from_type: str,
+    action: str,
+    status: str = "open",
+    excerpt: str | None = None,
+):
+    assert payload["message_id"] == message_id
+    assert payload["type"] == message_type
+    assert payload["from"] == from_type
+    if action == "resolved":
+        assert payload["status"] == "resolved"
+    else:
+        assert "status" not in payload
+    assert payload["schema_version"] == 1
+    assert payload["project_id"] == str(project_id)
+    assert payload["resource"] == "project_message"
+    assert payload["action"] == action
+    assert payload["refetch"] == {"surfaces": ["messages", "strategic_session"]}
+    assert payload["message"]["id"] == message_id
+    assert payload["message"]["type"] == message_type
+    assert payload["message"]["from"] == from_type
+    assert payload["message"]["status"] == status
+    if excerpt is not None:
+        assert payload["message"]["excerpt"] == excerpt
+    assert len(json.dumps(payload, default=str).encode("utf-8")) < 800
+
+
 async def _make_project(session, owner_id=TEST_USER_ID, name="Test Project"):
     """Create a project with the given user as owner, plus the owner membership."""
     project = Project(name=name, user_id=owner_id)
@@ -3942,14 +3974,19 @@ class TestMessages:
         assert second.status_code == 200, second.text
         assert second.json()["status"] == "duplicate"
         assert second.json()["id"] == first.json()["id"]
-        broadcast.assert_awaited_once_with(
+        broadcast.assert_awaited_once()
+        assert broadcast.await_args.args[:2] == (
             str(project.id),
             "message_created",
-            {
-                "message_id": first.json()["id"],
-                "type": "NOTE",
-                "from": "user",
-            },
+        )
+        _assert_message_event_payload(
+            broadcast.await_args.args[2],
+            project_id=project.id,
+            message_id=first.json()["id"],
+            message_type="NOTE",
+            from_type="user",
+            action="created",
+            excerpt="Keep this visible in the Strategic workbench.",
         )
 
     @pytest.mark.asyncio
@@ -4962,15 +4999,20 @@ class TestMessages:
 
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == "resolved"
-        broadcast.assert_awaited_once_with(
+        broadcast.assert_awaited_once()
+        assert broadcast.await_args.args[:2] == (
             str(project.id),
             "message_updated",
-            {
-                "message_id": str(msg.id),
-                "type": "NOTE",
-                "from": "user",
-                "status": "resolved",
-            },
+        )
+        _assert_message_event_payload(
+            broadcast.await_args.args[2],
+            project_id=project.id,
+            message_id=str(msg.id),
+            message_type="NOTE",
+            from_type="user",
+            action="resolved",
+            status="resolved",
+            excerpt="Close me everywhere.",
         )
 
     @pytest.mark.asyncio
@@ -5359,28 +5401,31 @@ class TestMessages:
         ]
         assert "context_package_id" not in stored_workbench
         assert broadcast.await_count == 2
-        assert [
+        events = [
             (call.args[1], call.args[2])
             for call in broadcast.await_args_list
-        ] == [
-            (
-                "message_updated",
-                {
-                    "message_id": str(question.id),
-                    "type": "QUESTION",
-                    "from": "system",
-                    "status": "resolved",
-                },
-            ),
-            (
-                "message_created",
-                {
-                    "message_id": str(note.id),
-                    "type": "NOTE",
-                    "from": "user",
-                },
-            ),
         ]
+        assert events[0][0] == "message_updated"
+        _assert_message_event_payload(
+            events[0][1],
+            project_id=project.id,
+            message_id=str(question.id),
+            message_type="QUESTION",
+            from_type="system",
+            action="resolved",
+            status="resolved",
+            excerpt="Should I use approach A or B?",
+        )
+        assert events[1][0] == "message_created"
+        _assert_message_event_payload(
+            events[1][1],
+            project_id=project.id,
+            message_id=str(note.id),
+            message_type="NOTE",
+            from_type="user",
+            action="created",
+            excerpt="Answer: Use approach A.",
+        )
 
     @pytest.mark.asyncio
     async def test_operator_question_answer_survives_arming_rollback(
@@ -5820,14 +5865,19 @@ class TestMessages:
             .where(ProjectMessage.project_id == project.id)
         )
         assert count == 1
-        broadcast.assert_awaited_once_with(
+        broadcast.assert_awaited_once()
+        assert broadcast.await_args.args[:2] == (
             str(project.id),
             "message_created",
-            {
-                "message_id": first_body["id"],
-                "type": "NOTE",
-                "from": "user",
-            },
+        )
+        _assert_message_event_payload(
+            broadcast.await_args.args[2],
+            project_id=project.id,
+            message_id=first_body["id"],
+            message_type="NOTE",
+            from_type="user",
+            action="created",
+            excerpt="Keep this visible in the Strategic workbench.",
         )
 
     @pytest.mark.asyncio
