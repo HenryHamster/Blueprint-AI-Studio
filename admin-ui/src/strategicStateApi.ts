@@ -211,6 +211,7 @@ export interface StrategicLocalRunnerState {
     | 'agent_unavailable'
     | 'at_capacity'
     | 'cloud_dispatch'
+    | 'cloud_dispatch_pending'
     | 'capability_mismatch'
     | 'runner_claim_pending'
     | 'runner_unavailable'

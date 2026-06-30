@@ -702,6 +702,56 @@ async def test_strategic_state_reports_active_cloud_strategic_task_as_working(
 
 
 @pytest.mark.asyncio
+async def test_strategic_state_does_not_report_queued_cloud_task_as_working(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    queued_task = Task(
+        project_id=project.id,
+        title="Strategic review queued for cloud VM",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.QUEUED,
+        strategic_cycle_id="sc-cloud-pending",
+        vm_instance_id="gce-strategic-pending",
+    )
+    db_session.add(queued_task)
+    await db_session.commit()
+    await db_session.refresh(queued_task)
+
+    active_cycle = StrategicCycle(
+        id="sc-cloud-pending",
+        project_id=project.id,
+        outcome="phase2_running",
+        phase1_started_at=_utcnow() - timedelta(minutes=10),
+        phase1_completed_at=_utcnow() - timedelta(minutes=5),
+        phase2_started_at=_utcnow() - timedelta(minutes=5),
+        phase2_task_id=queued_task.id,
+    )
+    db_session.add(active_cycle)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+    local_runner = data["runtime"]["local_runner"]
+
+    assert data["strategic"]["active_task"]["id"] == str(queued_task.id)
+    assert data["strategic"]["active_task"]["status"] == "QUEUED"
+    assert local_runner["mode"] == "cloud"
+    assert local_runner["status"] == "unavailable"
+    assert local_runner["location"] == "cloud"
+    assert local_runner["status_reason"] == "cloud_dispatch_pending"
+    assert local_runner["fallback_reason"] == "cloud_dispatch_pending"
+    assert (
+        local_runner["active_task_runtime"]["vm_instance_id"]
+        == "gce-strategic-pending"
+    )
+    assert data["work_session"]["status"] == "unavailable"
+    assert data["work_session"]["location"] == "cloud"
+    assert data["work_session"]["status_reason"] == "cloud_dispatch_pending"
+
+
+@pytest.mark.asyncio
 async def test_strategic_state_marks_active_cycle_with_cancelled_task_as_stale(
     client: AsyncClient, db_session
 ):

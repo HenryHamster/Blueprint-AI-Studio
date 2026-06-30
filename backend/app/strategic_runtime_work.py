@@ -56,6 +56,12 @@ _LOCAL_STRATEGIC_RUNNING_STATUSES = frozenset(
         TaskStatus.PARKED,
     }
 )
+_CLOUD_STRATEGIC_RUNNING_STATUSES = frozenset(
+    {
+        TaskStatus.PROVISIONING,
+        *_LOCAL_STRATEGIC_RUNNING_STATUSES,
+    }
+)
 _CORE_STRATEGIC_CYCLE_TASK_TYPES = frozenset(
     task_type
     for task_type in ("design_doc_update", "strategic_review")
@@ -254,7 +260,10 @@ def _local_operator_status(
         if mode == "local":
             return {"status": "working", "location": "locally", "reason": None}
         if mode == "cloud":
-            if active_task.vm_instance_id:
+            if (
+                active_task.vm_instance_id
+                and fallback_reason != "cloud_dispatch_pending"
+            ):
                 return {
                     "status": "working",
                     "location": "cloud",
@@ -262,7 +271,7 @@ def _local_operator_status(
                 }
             return {
                 "status": "unavailable",
-                "location": "unavailable",
+                "location": "cloud" if active_task.vm_instance_id else "unavailable",
                 "reason": fallback_reason,
             }
         return {
@@ -458,7 +467,11 @@ async def build_strategic_runtime_summary(
             mode = "local"
     elif active_task is not None and active_task.vm_instance_id:
         mode = "cloud"
-        fallback_reason = "cloud_dispatch"
+        fallback_reason = (
+            "cloud_dispatch"
+            if active_task.status in _CLOUD_STRATEGIC_RUNNING_STATUSES
+            else "cloud_dispatch_pending"
+        )
     elif eligible_live_count > 0:
         mode = "local_ready"
     elif not strategic_runners:
