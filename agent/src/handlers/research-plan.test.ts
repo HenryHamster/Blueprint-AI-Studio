@@ -1848,6 +1848,18 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toMatch(/do NOT emit `?qualify_request`?/i);
   });
 
+  it('renders qualification_state as the authoritative status when raw last_qualification.status is pending', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      last_qualification: { status: 'pending', candidate_sha: 'deadbeefcafe0000' },
+      qualification_state: { state: 'promotion_check_wait' },
+    });
+    expect(result).toContain('status=promotion_check_wait');
+    expect(result).not.toContain('Last qualification: status=pending');
+    expect(result).not.toContain('currently **PENDING**');
+  });
+
   it('omits the pending warning when last_qualification is finalized (not pending)', () => {
     const result = buildVersionPhaseSection({
       version_number: 4,

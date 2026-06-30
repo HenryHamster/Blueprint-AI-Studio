@@ -506,12 +506,20 @@ async def agent_fetch_qualification(
     )
 
     if verdict is not None:
+        # Identity fields (candidate_sha, status, finalized_at) come from the
+        # Version Phase (last_qualification) when available — it is the
+        # authoritative current record and may be newer than the verdict row
+        # when a subsequent re-qualification overwrote the open-version record
+        # without producing a new verdict. Findings still come from the verdict
+        # row because its audit_findings column is immutable and survives
+        # re-qualification overwrites.
+        lq = open_row.last_qualification or {}
         return {
-            "candidate_sha": verdict.candidate_sha,
-            "finalized_at": verdict.finalized_at.isoformat()
-            if verdict.finalized_at
-            else None,
-            "status": verdict.terminal_status,
+            "candidate_sha": lq.get("candidate_sha") or verdict.candidate_sha,
+            "finalized_at": lq.get("finalized_at") or (
+                verdict.finalized_at.isoformat() if verdict.finalized_at else None
+            ),
+            "status": lq.get("status") or verdict.terminal_status,
             "confidence": verdict.confidence,
             "sub_scores": verdict.sub_scores,
             "findings": get_latest_qualification_audit_findings(open_row, verdict),

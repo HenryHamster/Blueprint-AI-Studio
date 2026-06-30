@@ -3205,6 +3205,78 @@ async def test_agent_fetch_qualification_drift_in_fallback_path(
     assert drift["signal"] == "no_grade_yet"
 
 
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_current_identity_uses_version_phase_when_verdict_evidence_is_historical(
+    client: AsyncClient, db_session
+):
+    """Identity fields (candidate_sha, status, finalized_at) come from
+    last_qualification (Version Phase) even when a historical verdict row with
+    audit_findings exists, so ./fetch qualification and ./fetch version-phase
+    always agree on the current candidate identity."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qual-vp-identity"
+    )
+
+    # Older verdict with audit_findings — its identity fields are historical.
+    old_sha = "a" * 40
+    historical_finding = {"severity": "HIGH", "summary": "Old finding", "file": "app/old.py"}
+    old_verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=old_sha,
+        confidence=0.55,
+        sub_scores={"audit": 0.4},
+        terminal_status="not_promoted",
+        finalized_at=datetime(2026, 5, 1, 8, 0, 0),
+        audit_findings=[historical_finding],
+    )
+    db_session.add(old_verdict)
+
+    # Newer qualification recorded in Version Phase last_qualification — this is
+    # the authoritative current candidate identity.
+    new_sha = "b" * 40
+    version.last_qualification = {
+        "status": "dry_run",
+        "candidate_sha": new_sha,
+        "finalized_at": "2026-06-15T10:00:00",
+        "confidence": 0.82,
+        "sub_scores": {"audit": 0.9},
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    # Source still reflects that a verdict row provided the findings.
+    assert body["source"] == "qualification_verdict"
+
+    # Identity fields must come from last_qualification (Version Phase),
+    # NOT from the historical verdict row.
+    assert body["candidate_sha"] == new_sha, (
+        "candidate_sha must reflect the current Version Phase, not the historical verdict"
+    )
+    assert body["status"] == "dry_run", (
+        "status must reflect the current Version Phase, not the historical verdict"
+    )
+    assert body["finalized_at"] == "2026-06-15T10:00:00", (
+        "finalized_at must reflect the current Version Phase, not the historical verdict"
+    )
+
+    # Findings still come from the verdict row.
+    assert len(body["findings"]) == 1
+    assert body["findings"][0]["summary"] == "Old finding"
+
+
 # ---------------------------------------------------------------------------
 # compute-sweeps recovery endpoints + sweep_id filter on knowledge-documents
 # ---------------------------------------------------------------------------

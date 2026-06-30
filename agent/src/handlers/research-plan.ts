@@ -792,7 +792,14 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   const qualStatus = lastQualification && typeof lastQualification.status === 'string'
     ? lastQualification.status
     : null;
-  const qualificationPending = qualStatus === 'pending';
+  const qualificationStateRaw = versionPhase.qualification_state;
+  const qualificationState = qualificationStateRaw && typeof qualificationStateRaw === 'object' && !Array.isArray(qualificationStateRaw)
+    ? qualificationStateRaw as Record<string, unknown>
+    : null;
+  const effectiveQualStatus = qualStatus === 'pending' && typeof qualificationState?.state === 'string'
+    ? qualificationState.state
+    : qualStatus;
+  const qualificationPending = effectiveQualStatus === 'pending';
   // A finalized conclusive verdict (dry_run, not_promoted, or promoted) means
   // the candidate has been fully evaluated and the outcome is settled. In the
   // shipped-dark default (promotion_enabled=False) a passing candidate records
@@ -824,7 +831,7 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     // blocker when present. Keeps the prompt small while surfacing whether a
     // qualification is already running (status='pending').
     const qualBits: string[] = [];
-    qualBits.push(`status=${qualStatus ?? 'unknown'}`);
+    qualBits.push(`status=${effectiveQualStatus ?? 'unknown'}`);
     if (typeof lastQualification.confidence === 'number') {
       qualBits.push(`confidence=${lastQualification.confidence}`);
     }
