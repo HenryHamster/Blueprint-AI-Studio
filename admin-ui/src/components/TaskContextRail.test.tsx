@@ -3,6 +3,9 @@ import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { TaskContextRail } from './TaskContextRail';
 import type { Task } from '../types/task';
+import type { StrategicWorkbenchState } from '../strategicStateApi';
+
+type SessionRefs = StrategicWorkbenchState['selected_refs'];
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -138,6 +141,102 @@ describe('TaskContextRail', () => {
     expect(onTrackTask).toHaveBeenCalledWith(task);
   });
 
+  test('keeps the current task in Strategic session context', async () => {
+    const user = userEvent.setup();
+    const task = makeTask();
+    const onUpdateSessionRefs = vi.fn();
+    render(
+      <TaskContextRail
+        currentTask={task}
+        attentionTasks={[]}
+        sessionRefs={[]}
+        onOpenTask={vi.fn()}
+        onUpdateSessionRefs={onUpdateSessionRefs}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /keep context/i }));
+    expect(onUpdateSessionRefs).toHaveBeenCalledWith(expect.any(Function));
+    const updater = onUpdateSessionRefs.mock.calls[0][0] as (refs: SessionRefs) => SessionRefs;
+    expect(updater([{ kind: 'direction', id: 'd-1', label: 'Direction' }])).toEqual([
+      { kind: 'task', id: task.id, label: task.title },
+      { kind: 'direction', id: 'd-1', label: 'Direction' },
+    ]);
+    expect(updater([{ kind: 'task', id: task.id, label: 'Old task label' }])).toEqual([
+      { kind: 'task', id: task.id, label: task.title },
+    ]);
+  });
+
+  test('removes the current task from Strategic session context', async () => {
+    const user = userEvent.setup();
+    const task = makeTask();
+    const onUpdateSessionRefs = vi.fn();
+    render(
+      <TaskContextRail
+        currentTask={task}
+        attentionTasks={[]}
+        sessionRefs={[{ kind: 'task', id: task.id, label: task.title }]}
+        onOpenTask={vi.fn()}
+        onUpdateSessionRefs={onUpdateSessionRefs}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /remove context/i }));
+    expect(onUpdateSessionRefs).toHaveBeenCalledWith(expect.any(Function));
+    const updater = onUpdateSessionRefs.mock.calls[0][0] as (refs: SessionRefs) => SessionRefs;
+    expect(updater([
+      { kind: 'direction', id: 'd-1', label: 'Direction' },
+      { kind: 'task', id: task.id, label: task.title },
+    ])).toEqual([{ kind: 'direction', id: 'd-1', label: 'Direction' }]);
+  });
+
+  test('disables session context action while refs are saving', async () => {
+    const user = userEvent.setup();
+    const onUpdateSessionRefs = vi.fn();
+    render(
+      <TaskContextRail
+        currentTask={makeTask()}
+        attentionTasks={[]}
+        sessionRefs={[]}
+        savingSessionRefs
+        onOpenTask={vi.fn()}
+        onUpdateSessionRefs={onUpdateSessionRefs}
+      />,
+    );
+
+    const button = screen.getByRole('button', { name: /keep context/i });
+    expect(button).toBeDisabled();
+    await user.click(button);
+    expect(onUpdateSessionRefs).not.toHaveBeenCalled();
+  });
+
+  test('omits session context action when session props are not wired', () => {
+    render(
+      <TaskContextRail
+        currentTask={makeTask()}
+        attentionTasks={[]}
+        onOpenTask={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: /keep context/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /remove context/i })).not.toBeInTheDocument();
+  });
+
+  test('omits session context action while session refs are not loaded', () => {
+    render(
+      <TaskContextRail
+        currentTask={makeTask()}
+        attentionTasks={[]}
+        onOpenTask={vi.fn()}
+        onUpdateSessionRefs={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: /keep context/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /remove context/i })).not.toBeInTheDocument();
+  });
+
   test('merges backend attention tasks with local fallback tasks', async () => {
     const user = userEvent.setup();
     const onOpenTask = vi.fn();
@@ -163,12 +262,13 @@ describe('TaskContextRail', () => {
   });
 
   test('prefers exact sideboard child count over capped child task ids', () => {
+    const sideboardContext = makeTask().sideboard_context as NonNullable<Task['sideboard_context']>;
     render(
       <TaskContextRail
         currentTask={makeTask({
           child_task_ids: Array.from({ length: 1000 }, (_, idx) => `child-${idx}`),
           sideboard_context: {
-            ...makeTask().sideboard_context!,
+            ...sideboardContext,
             pipeline: {
               parent_task_id: null,
               child_count: 1002,

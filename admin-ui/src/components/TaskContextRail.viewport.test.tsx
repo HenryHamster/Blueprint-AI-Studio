@@ -17,6 +17,7 @@ const LONG_TASK: Task = {
   created_at: '2026-06-29T12:00:00Z',
   started_at: '2026-06-29T12:05:00Z',
   latest_status_message: 'A very long status update explaining that the task is validating context handoff from Strategic chat into the pipeline task drawer without creating a second task management surface.',
+  pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/42',
   payloads: [{ type: 'create' }],
   context: {},
   depends_on: ['task-upstream-1', 'task-upstream-2'],
@@ -58,15 +59,18 @@ describe('TaskContextRail viewport', () => {
     host.style.width = `${width}px`;
     document.body.appendChild(host);
     root = createRoot(host);
+    const mountedRoot = root;
     await act(async () => {
-      root!.render(
+      mountedRoot.render(
         <TaskContextRail
           currentTask={LONG_TASK}
           attentionTasks={[LONG_TASK]}
           trackedTaskIds={new Set()}
+          sessionRefs={[]}
           onOpenTask={vi.fn()}
           onOpenPipeline={vi.fn()}
           onTrackTask={vi.fn()}
+          onUpdateSessionRefs={vi.fn()}
         />,
       );
     });

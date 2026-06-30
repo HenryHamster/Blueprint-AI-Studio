@@ -524,7 +524,6 @@ export default function App() {
   const failedTasks = useMemo(() => selectedTasks.filter(t => t.status === 'FAILED'), [selectedTasks]);
   const terminalTasks = useMemo(() => selectedTasks.filter(t => TERMINAL_STATUSES.has(t.status)), [selectedTasks]);
   const approvableTasks = useMemo(() => selectedTasks.filter(t => t.requires_approval && !TERMINAL_STATUSES.has(t.status)), [selectedTasks]);
-
   const effectiveColumnPrefs = useMemo<ColumnPref[]>(() => {
     const base = s.columnPrefs.length > 0 ? s.columnPrefs : COLUMNS.map(c => ({ id: c.id, visible: true }));
     // Add any COLUMNS entry not yet in prefs (e.g. newly added columns)
@@ -543,7 +542,6 @@ export default function App() {
 
   const stuckTaskIds = useMemo(() => new Set((s.diagnostics?.stuck_tasks ?? []).filter((st: { task_id: string; stuck_for_seconds: number }) => st.stuck_for_seconds >= s.stuckMinSeconds).map((st: { task_id: string }) => st.task_id)), [s.diagnostics, s.stuckMinSeconds]);
   const stuckCount1h = useMemo(() => (s.diagnostics?.stuck_tasks ?? []).filter((st: { stuck_for_seconds: number }) => st.stuck_for_seconds >= 3600).length, [s.diagnostics]);
-
   const dateRangeCutoffs: Record<string, number> = { '1h': 3600000, '6h': 21600000, '24h': 86400000, '7d': 604800000 };
   const filteredTasks = useMemo(() => {
     const now = new Date().getTime();
@@ -1480,6 +1478,9 @@ export default function App() {
                   attentionTasks={backendAttentionTasks}
                   localFallbackTasks={localAttentionTasks}
                   trackedTaskIds={s.trackedTaskIds}
+                  sessionRefs={strategicWorkbenchState?.selected_refs}
+                  savingSessionRefs={savingStrategicWorkbench}
+                  onUpdateSessionRefs={updateStrategicSessionRefs}
                   onOpenTask={s.handleViewLogs}
                   onOpenPipeline={() => handleTabChange('pipeline')}
                   onTrackTask={s.trackTask}

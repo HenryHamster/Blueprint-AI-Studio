@@ -1,7 +1,9 @@
 import type { ReactNode } from 'react';
-import { Activity, ArrowUpRight, GitPullRequest, ListTree, Radio, Route, Star } from 'lucide-react';
+import { Activity, ArrowUpRight, BookmarkMinus, BookmarkPlus, GitPullRequest, ListTree, Radio, Route, Star } from 'lucide-react';
+import type { StrategicWorkbenchState } from '../strategicStateApi';
 import type { Task } from '../types/task';
 import { timeAgo } from '../utils/time';
+import { removeStrategicSelectedRef, upsertStrategicSelectedRef } from '../utils/strategicWorkbenchSession';
 import { WorkbenchMetric, WorkbenchPanel } from './WorkbenchLayout';
 import { StatusBadge, TaskTypeBadge } from './TaskCard';
 
@@ -13,7 +15,14 @@ interface TaskContextRailProps {
   onOpenTask: (task: Task) => void;
   onOpenPipeline?: () => void;
   onTrackTask?: (task: Task) => void;
+  sessionRefs?: StrategicWorkbenchState['selected_refs'];
+  savingSessionRefs?: boolean;
+  onUpdateSessionRefs?: (
+    updateRefs: (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs']
+  ) => void;
 }
+
+type StrategicSelectedRef = StrategicWorkbenchState['selected_refs'][number];
 
 function taskType(task: Task): Task['task_type'] {
   return (task.task_type ?? ((task.payloads?.[0] as Record<string, unknown> | undefined)?.type as Task['task_type'] | undefined) ?? 'create') as Task['task_type'];
@@ -39,21 +48,28 @@ function TaskRailButton({
   children,
   onClick,
   title,
+  disabled = false,
 }: {
   children: ReactNode;
   onClick: () => void;
   title?: string;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
       title={title}
-      className="inline-flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
+      disabled={disabled}
+      className={`inline-flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs font-semibold text-neutral-300 transition-colors ${disabled ? 'cursor-not-allowed opacity-50' : 'hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100'}`}
     >
       {children}
     </button>
   );
+}
+
+function taskSessionRef(task: Task): StrategicSelectedRef {
+  return { kind: 'task', id: task.id, label: task.title || task.id };
 }
 
 function CurrentTaskCard({
@@ -62,12 +78,20 @@ function CurrentTaskCard({
   onOpenTask,
   onOpenPipeline,
   onTrackTask,
+  inSessionContext,
+  savingSessionRefs,
+  onKeepContext,
+  onRemoveContext,
 }: {
   task: Task;
   tracked: boolean;
   onOpenTask: (task: Task) => void;
   onOpenPipeline?: () => void;
   onTrackTask?: (task: Task) => void;
+  inSessionContext?: boolean;
+  savingSessionRefs?: boolean;
+  onKeepContext?: () => void;
+  onRemoveContext?: () => void;
 }) {
   const dependencyCount = task.depends_on?.length ?? 0;
   const childCount = task.sideboard_context?.pipeline.child_count ?? task.child_task_ids?.length ?? 0;
@@ -140,6 +164,18 @@ function CurrentTaskCard({
             Track
           </TaskRailButton>
         )}
+        {onKeepContext && !inSessionContext && (
+          <TaskRailButton onClick={onKeepContext} disabled={savingSessionRefs} title="Keep task in Strategic context">
+            <BookmarkPlus className="h-3.5 w-3.5 text-neutral-500" aria-hidden="true" />
+            Keep context
+          </TaskRailButton>
+        )}
+        {onRemoveContext && inSessionContext && (
+          <TaskRailButton onClick={onRemoveContext} disabled={savingSessionRefs} title="Remove task from Strategic context">
+            <BookmarkMinus className="h-3.5 w-3.5 text-neutral-500" aria-hidden="true" />
+            Remove context
+          </TaskRailButton>
+        )}
         {prUrl && (
           <a
             href={prUrl}
@@ -199,6 +235,9 @@ export function TaskContextRail({
   onOpenTask,
   onOpenPipeline,
   onTrackTask,
+  sessionRefs,
+  savingSessionRefs = false,
+  onUpdateSessionRefs,
 }: TaskContextRailProps) {
   const backendIds = new Set(attentionTasks.map(t => t.id));
   const mergedAttention = [...attentionTasks, ...localFallbackTasks.filter(t => !backendIds.has(t.id))];
@@ -206,6 +245,15 @@ export function TaskContextRail({
     .filter(task => task.id !== currentTask?.id)
     .slice(0, currentTask ? 3 : 5);
   const tracked = Boolean(currentTask && trackedTaskIds?.has(currentTask.id));
+  const currentTaskRef = currentTask ? taskSessionRef(currentTask) : null;
+  const sessionRefsReady = Array.isArray(sessionRefs);
+  const currentTaskInSession = Boolean(currentTaskRef && sessionRefsReady && sessionRefs.some(ref => ref.kind === currentTaskRef.kind && ref.id === currentTaskRef.id));
+  const keepCurrentTaskContext = currentTaskRef && sessionRefsReady && onUpdateSessionRefs
+    ? () => onUpdateSessionRefs(refs => upsertStrategicSelectedRef(refs, currentTaskRef))
+    : undefined;
+  const removeCurrentTaskContext = currentTaskRef && sessionRefsReady && onUpdateSessionRefs
+    ? () => onUpdateSessionRefs(refs => removeStrategicSelectedRef(refs, currentTaskRef))
+    : undefined;
 
   return (
     <WorkbenchPanel title="Task context" meta={currentTask ? currentTask.status : visibleAttention.length || 'clear'}>
@@ -217,6 +265,10 @@ export function TaskContextRail({
             onOpenTask={onOpenTask}
             onOpenPipeline={onOpenPipeline}
             onTrackTask={onTrackTask}
+            inSessionContext={currentTaskInSession}
+            savingSessionRefs={savingSessionRefs}
+            onKeepContext={keepCurrentTaskContext}
+            onRemoveContext={removeCurrentTaskContext}
           />
           {visibleAttention.length > 0 && (
             <div className="border-t border-neutral-800 pt-3">
