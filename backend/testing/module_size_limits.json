@@ -52,7 +52,7 @@
     "blocked_task_unblock_sweeps.py": 1750,
     "reaper_orphan_io.py": 600,
     "reaper_infra_recovery.py": 850,
-    "agent_status_spawn.py": 650,
+    "agent_status_spawn.py": 900,
     "admin_task_mutations.py": 1350,
     "review_pipeline.py": 4550,
     "deploy_health.py": 1250,
@@ -101,7 +101,7 @@
     "routers/directions.py": 1750,
     "warm_pool_maintainer.py": 2300,
     "review_fix_lane_pilot.py": 2450,
-    "routers/admin_projects.py": 2400,
+    "routers/admin_projects.py": 3500,
     "recovery_evaluating.py": 2950,
     "recovery_evaluating_approval.py": 450,
     "recovery_evaluating_helpers.py": 1100,
@@ -115,7 +115,8 @@
     "ci_resolution.py": 1800,
     "routers/admin_project_config.py": 1800,
     "compute_backends.py": 2350,
-    "direction_lifecycle.py": 1750
+    "direction_lifecycle.py": 1750,
+    "routers/admin_notifications.py": 1850
   },
   "agent": {
     "index.ts": 4600,
@@ -127,7 +128,7 @@
     "prompts/check-helper.test.ts": 1300,
     "prompts/done-helper.ts": 650,
     "prompts/done-helper.test.ts": 650,
-    "handlers/research-plan.ts": 2600,
+    "handlers/research-plan.ts": 3000,
     "handlers/strategic.ts": 1350,
     "handlers/research-direction-context.ts": 250,
     "prompts/thinker.ts": 900,

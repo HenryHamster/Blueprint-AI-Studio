@@ -435,52 +435,66 @@ async def maybe_spawn_smoketest_fix(
             # Retry the spawn once on the recovered session before alerting the
             # operator. Transient serialization conflicts / poisoned sessions
             # clear after rollback, so a single retry is usually sufficient.
+            #
+            # Guard: only retry when the session was actually rolled back. If
+            # _rolled_back is False the session is still healthy and plan_task
+            # is still pending — it will be committed by the outer handler, so
+            # spawning again would double-insert a second child task.
             _spawn_retry_succeeded = False
             if _smoketest_spawn_state is not None:
-                try:
-                    _retry_task = Task(
-                        project_id=_smoketest_spawn_state["project_id"],
-                        title=_smoketest_spawn_state["title"],
-                        description=_smoketest_spawn_state["description"],
-                        parent_task_id=_smoketest_spawn_state["parent_task_id"],
-                        priority=_smoketest_spawn_state["priority"],
-                        payloads=_smoketest_spawn_state["payloads"],
-                        context=_smoketest_spawn_state["context"],
-                        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-                        status=_smoketest_spawn_state["status"],
-                        created_by=_smoketest_spawn_state["created_by"],
-                    )
-                    session.add(_retry_task)
-                    await session.flush()
-                    session.add(
-                        TaskHistory(
-                            task_id=_retry_task.id,
-                            action="SPAWNED",
-                            details={
-                                "spawned_by": "SMOKETEST_FAILURE",
-                                "priority": _smoketest_spawn_state["priority"],
-                                "failed_tests": [
-                                    t["name"]
-                                    for t in _smoketest_spawn_state["failed_tests"]
-                                ],
-                                "retry": True,
-                            },
-                        )
-                    )
+                if not _rolled_back:
+                    # Original plan_task survived in the session; no retry needed.
                     _spawn_retry_succeeded = True
                     logger.info(
-                        "[SMOKETEST] Retry spawn succeeded for task %s -> plan task %s",
+                        "[SMOKETEST] Retry skipped — session not rolled back; "
+                        "original plan_task still pending for task %s",
                         task_id_str,
-                        _retry_task.id,
                     )
-                except Exception as _retry_err:
-                    logger.error(
-                        "[SMOKETEST] Retry spawn also failed for task %s: %s",
-                        task_id_str,
-                        _retry_err,
-                        exc_info=True,
-                    )
-                    await _recover_poisoned_session(session, task_id_str)
+                else:
+                    try:
+                        _retry_task = Task(
+                            project_id=_smoketest_spawn_state["project_id"],
+                            title=_smoketest_spawn_state["title"],
+                            description=_smoketest_spawn_state["description"],
+                            parent_task_id=_smoketest_spawn_state["parent_task_id"],
+                            priority=_smoketest_spawn_state["priority"],
+                            payloads=_smoketest_spawn_state["payloads"],
+                            context=_smoketest_spawn_state["context"],
+                            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                            status=_smoketest_spawn_state["status"],
+                            created_by=_smoketest_spawn_state["created_by"],
+                        )
+                        session.add(_retry_task)
+                        await session.flush()
+                        session.add(
+                            TaskHistory(
+                                task_id=_retry_task.id,
+                                action="SPAWNED",
+                                details={
+                                    "spawned_by": "SMOKETEST_FAILURE",
+                                    "priority": _smoketest_spawn_state["priority"],
+                                    "failed_tests": [
+                                        t["name"]
+                                        for t in _smoketest_spawn_state["failed_tests"]
+                                    ],
+                                    "retry": True,
+                                },
+                            )
+                        )
+                        _spawn_retry_succeeded = True
+                        logger.info(
+                            "[SMOKETEST] Retry spawn succeeded for task %s -> plan task %s",
+                            task_id_str,
+                            _retry_task.id,
+                        )
+                    except Exception as _retry_err:
+                        logger.error(
+                            "[SMOKETEST] Retry spawn also failed for task %s: %s",
+                            task_id_str,
+                            _retry_err,
+                            exc_info=True,
+                        )
+                        await _recover_poisoned_session(session, task_id_str)
 
             if not _spawn_retry_succeeded:
                 try:
