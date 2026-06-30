@@ -316,6 +316,14 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
             violations.append(
                 f"reachable ({reachable}) exceeds prs_merged ({prs_merged})"
             )
+    # stranded_prs_merged is a cumulative credit-gate discount marker. It can
+    # persist across later recomputes after the stranded task has already been
+    # removed from the current prs_merged snapshot, so it is not partitioned
+    # against prs_merged here.
+    if "stranded_prs_merged" in entry:
+        stranded = int(entry.get("stranded_prs_merged") or 0)
+        if stranded < 0:
+            violations.append(f"stranded ({stranded}) is negative")
 
     coverage = entry.get("acceptance_declaration_coverage")
     if "acceptance_merged_write_total" in entry:

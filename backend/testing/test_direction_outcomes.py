@@ -5876,6 +5876,35 @@ def test_acceptance_metric_invariants_fail_safe_on_legacy_entries():
     assert acceptance_metric_invariant_violations({}) == []
 
 
+def test_stranded_reachable_metrics_allow_persisted_discounts():
+    """Stranded credit survives later recomputes without tripping the guard.
+
+    A direction can legitimately end up with stranded_prs_merged still present
+    after a later refresh has recomputed prs_merged to exclude the stranded task.
+    """
+    valid = {
+        "prs_merged": 1,
+        "reachable_prs_merged": 1,
+        "stranded_prs_merged": 1,
+    }
+    assert acceptance_metric_invariant_violations(valid) == []
+
+    legacy = {"prs_merged": 4}
+    assert acceptance_metric_invariant_violations(legacy) == []
+
+    stranded_negative = {**valid, "stranded_prs_merged": -1}
+    assert any(
+        "stranded (-1) is negative" == violation
+        for violation in acceptance_metric_invariant_violations(stranded_negative)
+    )
+
+    reachable_too_high = {**valid, "reachable_prs_merged": 3}
+    assert any(
+        "reachable (3) exceeds prs_merged (1)" == violation
+        for violation in acceptance_metric_invariant_violations(reachable_too_high)
+    )
+
+
 @pytest.mark.asyncio
 async def test_unproven_merge_surfaced_to_research_feedback(
     db_session: AsyncSession,
