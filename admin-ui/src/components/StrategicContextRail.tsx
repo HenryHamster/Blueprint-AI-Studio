@@ -8,6 +8,9 @@ import type {
   StrategicContextResourceRef,
   StrategicLocalRunnerState,
   StrategicMessageTarget,
+  StrategicStateTaskFocus,
+  StrategicStateTaskFocusBucket,
+  StrategicStateTaskFocusItem,
   StrategicRuntimeWorkState,
   StrategicStateAttentionItem,
   StrategicStateResponse,
@@ -23,6 +26,7 @@ import {
 import { WorkbenchPanel } from './WorkbenchLayout';
 
 type ProjectTarget = 'running-update' | 'directions' | 'problem-model' | 'design-doc';
+type TaskFocusBucketKey = 'needs_judgment' | 'active' | 'friction' | 'queued' | 'recent_completed';
 
 function isProjectTarget(value?: string | null): value is ProjectTarget {
   return value === 'running-update' || value === 'directions' || value === 'problem-model' || value === 'design-doc';
@@ -517,6 +521,137 @@ function AttentionItem({
   );
 }
 
+const TASK_FOCUS_SECTIONS: Array<{
+  key: TaskFocusBucketKey;
+  label: string;
+  dot: string;
+  text: string;
+  limit: number;
+}> = [
+  { key: 'needs_judgment', label: 'Needs judgment', dot: 'bg-amber-300', text: 'text-amber-300', limit: 2 },
+  { key: 'active', label: 'Active', dot: 'bg-cyan-400', text: 'text-cyan-300', limit: 2 },
+  { key: 'friction', label: 'Friction', dot: 'bg-rose-400', text: 'text-rose-300', limit: 2 },
+  { key: 'queued', label: 'Queued', dot: 'bg-neutral-500', text: 'text-neutral-400', limit: 1 },
+  { key: 'recent_completed', label: 'Recent result', dot: 'bg-emerald-400', text: 'text-emerald-300', limit: 1 },
+];
+
+function taskFocusBucket(focus: StrategicStateTaskFocus | null | undefined, key: TaskFocusBucketKey): StrategicStateTaskFocusBucket | null {
+  const bucket = focus?.buckets?.[key];
+  if (!bucket || bucket.total <= 0) return null;
+  return bucket;
+}
+
+function taskFocusDetail(item: StrategicStateTaskFocusItem): string {
+  const reasons = item.reasons ?? [];
+  if (item.detail) return item.detail;
+  if (item.latest_status_message) return item.latest_status_message;
+  if (reasons.length > 0) return reasons.join(', ');
+  return item.status.toLowerCase().replace(/_/g, ' ');
+}
+
+function taskFocusMeta(bucket: StrategicStateTaskFocusBucket): string {
+  const visibleCount = bucket.items?.length ?? 0;
+  if (bucket.has_more && bucket.total > visibleCount) {
+    return `${formatCompactNumber(bucket.total)} total`;
+  }
+  return formatCompactNumber(bucket.total);
+}
+
+function TaskFocusRow({
+  item,
+  onOpenTask,
+}: {
+  item: StrategicStateTaskFocusItem;
+  onOpenTask?: (taskId: string) => void;
+}) {
+  const detail = taskFocusDetail(item);
+  const content = (
+    <>
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        <span className="truncate text-xs font-semibold text-neutral-200">{item.title || item.id}</span>
+        <span className="shrink-0 font-mono text-ui-sm text-neutral-600">{shortId(item.id)}</span>
+      </div>
+      <p className="mt-0.5 line-clamp-2 text-xs leading-relaxed text-neutral-500">{detail}</p>
+    </>
+  );
+
+  if (!onOpenTask) {
+    return (
+      <div className="rounded-md border border-neutral-800 bg-neutral-950/60 px-2.5 py-2">
+        {content}
+      </div>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => onOpenTask(item.id)}
+      className="block min-h-11 w-full min-w-0 rounded-md border border-neutral-800 bg-neutral-950/60 px-2.5 py-2 text-left transition-colors hover:border-neutral-700 hover:bg-neutral-900"
+    >
+      {content}
+    </button>
+  );
+}
+
+function TaskFocusBlock({
+  focus,
+  onOpenTask,
+  onOpenPipeline,
+}: {
+  focus?: StrategicStateTaskFocus | null;
+  onOpenTask?: (taskId: string) => void;
+  onOpenPipeline: () => void;
+}) {
+  const renderedIds = new Set<string>();
+  const liveSections = TASK_FOCUS_SECTIONS
+    .filter(section => section.key !== 'recent_completed')
+    .map(section => {
+      const bucket = taskFocusBucket(focus, section.key);
+      if (!bucket) return null;
+      const items = (bucket.items ?? []).filter(item => !renderedIds.has(item.id)).slice(0, section.limit);
+      items.forEach(item => renderedIds.add(item.id));
+      return { section, bucket, items };
+    })
+    .filter((entry): entry is { section: (typeof TASK_FOCUS_SECTIONS)[number]; bucket: StrategicStateTaskFocusBucket; items: StrategicStateTaskFocusItem[] } => Boolean(entry && entry.items.length > 0));
+  const completedBucket = taskFocusBucket(focus, 'recent_completed');
+  const completedItems = completedBucket
+    ? (completedBucket.items ?? []).filter(item => !renderedIds.has(item.id))
+    : [];
+  const sections = liveSections.length > 0
+    ? liveSections
+    : completedBucket && completedItems.length > 0
+      ? [{ section: TASK_FOCUS_SECTIONS[TASK_FOCUS_SECTIONS.length - 1], bucket: completedBucket, items: completedItems }]
+      : [];
+  const openTotal = liveSections.reduce((sum, entry) => sum + entry.items.length, 0);
+
+  if (sections.length === 0) return null;
+
+  return (
+    <WorkbenchPanel title="Task focus" meta={openTotal > 0 ? `${formatCompactNumber(openTotal)} shown` : 'recent'}>
+      <div className="space-y-3" data-testid="strategic-task-focus">
+        {sections.slice(0, 4).map(({ section, bucket, items }) => (
+          <div key={section.key} className="space-y-1.5">
+            <div className="flex min-w-0 items-center justify-between gap-2">
+              <div className="flex min-w-0 items-center gap-2">
+                <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${section.dot}`} aria-hidden="true" />
+                <span className={`truncate text-ui-sm font-semibold uppercase ${section.text}`}>{section.label}</span>
+              </div>
+              <span className="shrink-0 font-mono text-ui-sm text-neutral-600">{taskFocusMeta(bucket)}</span>
+            </div>
+            {items.map(item => (
+              <TaskFocusRow key={item.id} item={item} onOpenTask={onOpenTask} />
+            ))}
+          </div>
+        ))}
+        <div className="pt-1">
+          <RailButton onClick={onOpenPipeline}>Pipeline</RailButton>
+        </div>
+      </div>
+    </WorkbenchPanel>
+  );
+}
+
 function ContextPackageBlock({
   contextPackage,
   sessionRefs,
@@ -899,6 +1034,12 @@ export function StrategicContextRail({
         )}
         <ShaFreshnessBlock shaFreshness={shaFreshness} />
       </WorkbenchPanel>
+
+      <TaskFocusBlock
+        focus={state?.tasks.focus ?? null}
+        onOpenTask={onOpenTask}
+        onOpenPipeline={onOpenPipeline}
+      />
 
       <WorkbenchPanel title="Problem" meta={state?.problem_model.revision ? `r${state.problem_model.revision}` : undefined}>
         <div className="flex min-w-0 gap-2">

@@ -115,6 +115,153 @@ const STATE: StrategicStateResponse = {
       total: 20,
     },
     cumulative_estimated_cost_usd: 3.5,
+    focus: {
+      version: 1,
+      bucket_limit: 6,
+      has_more: true,
+      buckets: {
+        needs_judgment: {
+          total: 3,
+          limit: 6,
+          has_more: false,
+          items: [
+            {
+              id: 'task-judgment',
+              bucket: 'needs_judgment',
+              status: 'EVALUATING',
+              title: 'Review backend focus contract',
+              task_type: 'review',
+              latest_status_message: 'Strategic needs an operator decision before merging.',
+              detail: 'Approval requested for the task focus projection.',
+              requires_approval: true,
+              reasons: ['approval', 'evaluating'],
+              direction_id: 'd-1',
+              created_at: '2026-06-29T01:02:00Z',
+            },
+            {
+              id: 'task-second-judgment',
+              bucket: 'needs_judgment',
+              status: 'BLOCKED',
+              title: 'Confirm runner registration posture',
+              task_type: 'review',
+              latest_status_message: 'This second judgment row reaches the visible cap.',
+              detail: null,
+              requires_approval: true,
+              reasons: ['approval', 'blocked'],
+              direction_id: 'd-1',
+              created_at: '2026-06-29T01:01:00Z',
+            },
+            {
+              id: 'task-active-focus',
+              bucket: 'needs_judgment',
+              status: 'EVALUATING',
+              title: 'Wire focus rows into the Strategic rail',
+              task_type: 'fix',
+              latest_status_message: 'Hidden high-priority duplicate should not suppress the visible active row.',
+              detail: null,
+              requires_approval: true,
+              reasons: ['approval'],
+              direction_id: 'd-1',
+              created_at: '2026-06-29T01:00:00Z',
+            },
+          ],
+        },
+        active: {
+          total: 3,
+          limit: 6,
+          has_more: false,
+          items: [
+            {
+              id: 'task-judgment',
+              bucket: 'active',
+              status: 'EVALUATING',
+              title: 'Review backend focus contract',
+              task_type: 'review',
+              latest_status_message: 'Duplicate active preview should stay under judgment.',
+              detail: null,
+              requires_approval: true,
+              reasons: ['evaluating'],
+              direction_id: 'd-1',
+              created_at: '2026-06-29T01:02:00Z',
+            },
+            {
+              id: 'task-active-focus',
+              bucket: 'active',
+              status: 'IN_PROGRESS',
+              title: 'Wire focus rows into the Strategic rail',
+              task_type: 'fix',
+              latest_status_message: 'Rendering server-authored task focus rows.',
+              detail: null,
+              requires_approval: false,
+              reasons: [],
+              direction_id: 'd-1',
+              started_at: '2026-06-29T01:06:00Z',
+              created_at: '2026-06-29T01:04:00Z',
+            },
+          ],
+        },
+        friction: {
+          total: 1,
+          limit: 6,
+          has_more: false,
+          items: [
+            {
+              id: 'task-blocked-focus',
+              bucket: 'friction',
+              status: 'BLOCKED',
+              title: 'Blocked runner registration check',
+              task_type: 'diagnose',
+              latest_status_message: 'Self-hosted runner status needs inspection.',
+              detail: 'Runner registration is blocked.',
+              requires_approval: false,
+              reasons: ['blocked'],
+              blocker_kind: 'external',
+              blocked_reason: 'Runner not connected.',
+              created_at: '2026-06-29T01:01:00Z',
+            },
+          ],
+        },
+        queued: {
+          total: 7,
+          limit: 6,
+          has_more: true,
+          items: [
+            {
+              id: 'task-queued-focus',
+              bucket: 'queued',
+              status: 'QUEUED',
+              title: 'Extract Pipeline workspace',
+              task_type: 'fix',
+              latest_status_message: null,
+              detail: 'Ready after the Strategic rail slice lands.',
+              requires_approval: false,
+              reasons: [],
+              created_at: '2026-06-29T00:59:00Z',
+            },
+          ],
+        },
+        recent_completed: {
+          total: 3,
+          limit: 6,
+          has_more: false,
+          items: [
+            {
+              id: 'task-completed-focus',
+              bucket: 'recent_completed',
+              status: 'COMPLETED',
+              title: 'Add backend task focus projection',
+              task_type: 'create',
+              latest_status_message: 'Projection tests passed.',
+              detail: null,
+              requires_approval: false,
+              reasons: [],
+              completed_at: '2026-06-29T01:03:00Z',
+              created_at: '2026-06-29T00:50:00Z',
+            },
+          ],
+        },
+      },
+    },
   },
   attention: {
     level: 'needs_operator',
@@ -440,6 +587,12 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).toContain('Question waiting');
     expect(host.textContent).toContain('new');
     expect(host.textContent).toContain('linked messages');
+    expect(host.textContent).toContain('Task focus');
+    expect(host.textContent).toContain('Needs judgment');
+    expect(host.textContent).toContain('Review backend focus contract');
+    expect(host.textContent).toContain('Wire focus rows into the Strategic rail');
+    expect(host.textContent).toContain('Extract Pipeline workspace');
+    expect(host.textContent?.match(/Review backend focus contract/g) ?? []).toHaveLength(1);
     expect(host.textContent).toContain('Local Strategic');
     expect(host.textContent).toContain('Running on runner 11111111');
     expect(host.textContent).toContain('gpt-5.4');
@@ -462,14 +615,16 @@ describe('StrategicContextRail', () => {
     buttons.find(button => button.textContent?.includes('operator-context-report'))?.click();
     buttons.find(button => button.textContent?.includes('Model'))?.click();
     buttons.find(button => button.textContent?.includes('Directions'))?.click();
-    buttons.find(button => button.textContent?.includes('Pipeline'))?.click();
+    buttons.find(button => button.textContent?.trim() === 'Pipeline')?.click();
     buttons.find(button => button.textContent?.includes('Runtime'))?.click();
     buttons.find(button => button.textContent?.includes('Devices'))?.click();
     buttons.find(button => button.textContent?.includes('Compute'))?.click();
+    buttons.find(button => button.textContent?.includes('Review backend focus contract'))?.click();
 
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('problem-model');
     expect(onOpenKnowledge).toHaveBeenCalledWith('kdoc-1', 'd-1');
     expect(onOpenTask).toHaveBeenCalledWith('task-strat');
+    expect(onOpenTask).toHaveBeenCalledWith('task-judgment');
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('directions');
     expect(props.onOpenPipeline).toHaveBeenCalled();
     expect(props.onOpenRuntimeHealth).toHaveBeenCalled();
