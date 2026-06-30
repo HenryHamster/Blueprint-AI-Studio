@@ -14,6 +14,7 @@ from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -266,7 +267,13 @@ async def attest_criterion(
         detail={"reason": body.reason},
     )
     session.add(evidence)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # uq_criterionevidence_dedup covers attestations (source_id=user_id is non-null);
+        # a duplicate by the same operator is an intentional no-op — just return covered.
+        await session.rollback()
+        return {"status": "ok", "criterion_key": criterion_key, "coverage": "covered"}
 
     logger.info(
         "[AC] Operator attestation recorded: project=%s criterion=%s user=%s reason=%r",

@@ -1597,6 +1597,56 @@ async def test_attest_endpoint_no_open_version(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_attest_duplicate_attestation_is_idempotent(client: AsyncClient, db_session):
+    """Repeat attestation by the same operator on the same criterion returns 200, not 500.
+
+    The uq_criterionevidence_dedup index (migration 0365) covers operator attestations
+    because source_id=user_id is non-null.  A second POST .../attest by the same user
+    violates the unique constraint; the endpoint must catch IntegrityError, rollback, and
+    return the same idempotent {"status":"ok","criterion_key":...,"coverage":"covered"}
+    response instead of surfacing a 500.
+    """
+    project = await _make_project_with_member(db_session, name="Attest-Dup")
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Stuck duplicate criterion"
+    )
+
+    url = f"/api/admin/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/attest"
+
+    # First call: creates the evidence row.
+    resp1 = await client.post(url, json={"reason": "accepted; direction retired"})
+    assert resp1.status_code == 200, resp1.text
+    data1 = resp1.json()
+    assert data1["status"] == "ok"
+    assert data1["criterion_key"] == criterion.criterion_key
+    assert data1["coverage"] == "covered"
+
+    # Second call by the same operator: violates uq_criterionevidence_dedup.
+    # Must return 200 with the same shape — NOT 500 — because duplicates are a no-op.
+    resp2 = await client.post(url, json={"reason": "accepted again"})
+    assert resp2.status_code == 200, (
+        f"Duplicate attestation must return 200 (idempotent), got {resp2.status_code}: {resp2.text}"
+    )
+    data2 = resp2.json()
+    assert data2["status"] == "ok"
+    assert data2["criterion_key"] == criterion.criterion_key
+    assert data2["coverage"] == "covered"
+
+    # Verify exactly one evidence row was persisted (the second was a no-op).
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) == 1, (
+        f"Duplicate attestation must not create a second evidence row; found {len(evidence)}"
+    )
+    assert evidence[0].source_kind == "operator_attestation"
+    assert evidence[0].source_id == _TEST_USER_ID
+
+
+@pytest.mark.asyncio
 async def test_full_pipeline_end_to_end_via_refresh_after_merge(db_session):
     """Full acceptance-criteria pipeline exercised through the real post-merge entry point.
 
