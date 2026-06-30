@@ -71,7 +71,7 @@ export function MessagesComposer({
 
   return (
     <div className={minimal
-      ? 'shrink-0 border-t border-neutral-800 bg-[#05080c] px-2.5 py-1.5 md:px-3'
+      ? 'shrink-0 border-t border-neutral-800 bg-[#05080c] px-2.5 py-2 md:px-3'
       : 'px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50'
     }>
       {minimal && strategicContext && (
@@ -92,7 +92,7 @@ export function MessagesComposer({
       <div
         data-testid={minimal ? 'strategic-composer-box' : undefined}
         className={minimal
-        ? `${minimalColumnClass} flex items-end gap-0 rounded border border-neutral-800 bg-[#0b1016] p-0.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]`
+        ? `${minimalColumnClass} flex items-end gap-0 rounded-md border border-neutral-800 bg-[#0b1016] p-0.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]`
         : 'flex gap-2 items-end'
       }>
         {!minimal && (
@@ -103,13 +103,11 @@ export function MessagesComposer({
             type="button"
             onClick={onOpenCommandPalette}
             title="Open command palette (Ctrl+K)"
-            aria-label="Open command palette"
-            className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-sm border-r border-neutral-800/80 px-2 text-xs font-semibold text-neutral-500 transition-colors hover:bg-neutral-900/70 hover:text-neutral-100 md:min-h-8 md:min-w-8"
+            aria-label="Open command palette (Ctrl+K)"
+            className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-sm border-r border-neutral-800/80 px-2.5 text-xs font-semibold text-neutral-500 transition-colors hover:bg-neutral-900/70 hover:text-neutral-100 md:min-h-9 md:min-w-11"
           >
             <Command className="h-3.5 w-3.5" />
-            <kbd className="hidden rounded-sm border border-neutral-800 bg-transparent px-1 py-0.5 font-mono text-ui-sm text-neutral-500 sm:inline-block">
-              Ctrl K
-            </kbd>
+            <span className="hidden font-mono text-ui-sm text-neutral-500 sm:inline">Ctrl K</span>
           </button>
         )}
         <div className="relative flex-1">
@@ -120,7 +118,7 @@ export function MessagesComposer({
             onKeyDown={e => {
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSubmit(); }
             }}
-            placeholder={minimal ? 'Message Strategic...' : 'Type a message...'}
+            placeholder={minimal ? 'Ask Strategic...' : 'Type a message...'}
             rows={1}
             className={minimal
               ? 'min-h-[44px] w-full resize-none rounded-sm border-0 bg-transparent px-2.5 py-2 text-sm leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-600 md:min-h-8 md:py-1'
@@ -135,7 +133,7 @@ export function MessagesComposer({
           aria-label="Send message"
           title="Send message"
           className={minimal
-            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-sm bg-emerald-600 text-white transition-colors hover:bg-emerald-500 disabled:opacity-40 md:min-h-8 md:min-w-8'
+            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-sm bg-neutral-200 text-neutral-950 transition-colors hover:bg-white disabled:bg-neutral-700 disabled:text-neutral-500 disabled:opacity-100 md:min-h-9 md:min-w-9'
             : 'bg-blue-600 hover:bg-blue-500 text-white p-2.5 rounded-xl text-xs font-medium transition-colors disabled:opacity-40 shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center'
           }
         >

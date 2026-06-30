@@ -1406,6 +1406,7 @@ export default function App() {
       ) : activeTab === 'chat' ? (
         <WorkbenchSurface
           title="Strategic"
+          showTitle={false}
           actions={(
             <>
               <StrategicSessionControl

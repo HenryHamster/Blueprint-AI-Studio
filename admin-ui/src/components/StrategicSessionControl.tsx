@@ -1,14 +1,36 @@
-import { Cpu, LoaderCircle, MonitorCog, Server } from 'lucide-react';
+import {
+  ChevronRight,
+  Clock3,
+  Cpu,
+  Eye,
+  Infinity,
+  LoaderCircle,
+  MessageSquare,
+  MonitorCog,
+  Server,
+} from 'lucide-react';
+import type { LucideIcon } from 'lucide-react';
 
 export type StrategicInteractionMode = 'chat' | 'check_in' | 'monitor' | 'continuous';
 
 export interface StrategicLocalRunnerStatus {
   status?: string | null;
+  location?: string | null;
+  status_reason?: string | null;
   mode?: string | null;
   connected?: boolean | null;
   active?: boolean | null;
   label?: string | null;
   detail?: string | null;
+  continuation?: {
+    enabled?: boolean | null;
+    fresh?: boolean | null;
+    preferred_runner_id?: string | null;
+    reason?: string | null;
+    updated_at?: string | null;
+    last_seen_at?: string | null;
+    ttl_seconds?: number | null;
+  } | null;
   deviceCount?: number | null;
   onlineDevices?: number | null;
   totalDevices?: number | null;
@@ -19,7 +41,16 @@ export interface StrategicLocalRunnerStatus {
   busy_runner_count?: number | null;
   agent_unavailable_count?: number | null;
   active_runner_id?: string | null;
+  active_task_pinned?: boolean | null;
+  active_task_runtime?: {
+    provider?: string | null;
+    model?: string | null;
+    account_id?: string | null;
+    vm_instance_id?: string | null;
+    runner_target_id?: string | null;
+  } | null;
   fallback_reason?: string | null;
+  liveness_window_seconds?: number | null;
 }
 
 export interface StrategicRuntimeWorkStatus {
@@ -47,6 +78,9 @@ export interface StrategicRuntimeWorkStatus {
   held_approvals?: {
     count?: number | null;
   } | null;
+  local_runner_holds?: {
+    count?: number | null;
+  } | null;
   parked_wakes?: {
     counts?: {
       active?: number | null;
@@ -71,24 +105,24 @@ export interface StrategicSessionControlProps {
 
 type Tone = 'neutral' | 'success' | 'warning' | 'danger' | 'info';
 
-const MODE_OPTIONS: Array<{ value: StrategicInteractionMode; label: string }> = [
-  { value: 'chat', label: 'Chat' },
-  { value: 'check_in', label: 'Check-in' },
-  { value: 'monitor', label: 'Monitor' },
-  { value: 'continuous', label: 'Workday' },
+const MODE_OPTIONS: Array<{ value: StrategicInteractionMode; label: string; Icon: LucideIcon }> = [
+  { value: 'chat', label: 'Chat', Icon: MessageSquare },
+  { value: 'check_in', label: 'Check-in', Icon: Clock3 },
+  { value: 'monitor', label: 'Monitor', Icon: Eye },
+  { value: 'continuous', label: 'Workday', Icon: Infinity },
 ];
 
 const toneClasses: Record<Tone, { border: string; bg: string; icon: string; text: string; dot: string }> = {
   neutral: {
     border: 'border-neutral-800',
-    bg: 'bg-neutral-950/60',
+    bg: 'bg-neutral-950/70',
     icon: 'text-neutral-500',
     text: 'text-neutral-300',
     dot: 'bg-neutral-500',
   },
   success: {
-    border: 'border-emerald-500/30',
-    bg: 'bg-emerald-500/10',
+    border: 'border-neutral-800',
+    bg: 'bg-neutral-950/70',
     icon: 'text-emerald-400',
     text: 'text-emerald-300',
     dot: 'bg-emerald-400',
@@ -108,13 +142,21 @@ const toneClasses: Record<Tone, { border: string; bg: string; icon: string; text
     dot: 'bg-red-400',
   },
   info: {
-    border: 'border-cyan-500/30',
-    bg: 'bg-cyan-500/10',
+    border: 'border-neutral-800',
+    bg: 'bg-neutral-950/70',
     icon: 'text-cyan-400',
     text: 'text-cyan-300',
     dot: 'bg-cyan-400',
   },
 };
+
+const WARNING_FALLBACK_REASONS = new Set([
+  'agent_unavailable',
+  'at_capacity',
+  'capability_mismatch',
+  'runner_claim_pending',
+  'runner_unavailable',
+]);
 
 function cleanText(value: string | null | undefined): string | null {
   const trimmed = value?.trim();
@@ -144,18 +186,26 @@ function pluralize(count: number, singular: string): string {
   return `${count} ${singular}${count === 1 ? '' : 's'}`;
 }
 
+function shortId(value?: string | null): string | null {
+  const trimmed = cleanText(value);
+  return trimmed ? trimmed.slice(0, 8) : null;
+}
+
 function runnerStatusValue(status: StrategicLocalRunnerStatus): string {
   return normalizedStatus(status.status ?? status.mode);
 }
 
 function runnerTone(status: StrategicLocalRunnerStatus): Tone {
   const value = runnerStatusValue(status);
+  const fallbackReason = normalizedStatus(status.fallback_reason);
+  const hasStaleContinuation = status.continuation?.enabled === true && status.continuation.fresh === false;
   if (value.includes('error') || value.includes('fail')) return 'danger';
-  if (value.includes('start') || value.includes('sync') || value.includes('warn')) return 'warning';
+  if (hasStaleContinuation || WARNING_FALLBACK_REASONS.has(fallbackReason)) return 'warning';
+  if (value.includes('warn')) return 'warning';
   if (status.connected === true || status.active === true) return 'success';
   if ((firstCount(status.eligible_live_count) ?? 0) > 0) return 'success';
   if (['online', 'connected', 'ready', 'running', 'active', 'local', 'local_ready'].includes(value)) return 'success';
-  if (value === 'pending_local') return 'warning';
+  if (value.includes('start') || value.includes('sync') || value === 'pending_local') return 'info';
   if (['offline', 'disconnected', 'stopped', 'disabled'].includes(value)) return 'neutral';
   return 'info';
 }
@@ -163,33 +213,90 @@ function runnerTone(status: StrategicLocalRunnerStatus): Tone {
 function runnerLabel(status: StrategicLocalRunnerStatus): string {
   const explicit = cleanText(status.label);
   if (explicit) return explicit;
-  if (status.connected === true || status.active === true) return 'Online';
-  if (status.connected === false || status.active === false) return 'Offline';
   const value = runnerStatusValue(status);
   if (value === 'local') return 'Local';
   if (value === 'local_ready') return 'Ready';
   if (value === 'pending_local') return 'Waiting';
   if (value === 'cloud') return 'Cloud';
+  if (status.connected === true || status.active === true) return 'Online';
+  if (status.connected === false || status.active === false) return 'Offline';
   return humanizeStatus(value);
 }
 
 function runnerDetail(status: StrategicLocalRunnerStatus): string | null {
   const explicit = cleanText(status.detail);
   if (explicit) return explicit;
+  const statusReason = cleanText(status.status_reason);
+  const activeRunner = shortId(status.active_runner_id);
+  const preferredRunner = shortId(status.continuation?.preferred_runner_id);
+  const runtimeModel = cleanText(status.active_task_runtime?.model);
+  const value = runnerStatusValue(status);
+  if (value === 'local') {
+    const parts = [
+      activeRunner ? `runner ${activeRunner}` : null,
+      runtimeModel,
+    ].filter(Boolean);
+    return parts.length > 0 ? `Running on ${parts.join(' / ')}` : 'Current cycle pinned locally';
+  }
+  if (status.active_task_pinned === true) {
+    return activeRunner ? `Pinned to runner ${activeRunner}` : 'Pinned to local runner';
+  }
   const online = firstCount(status.onlineDevices);
   const total = firstCount(status.totalDevices);
   const count = firstCount(status.deviceCount);
-  if (online != null && total != null) return `${online}/${total} devices`;
-  if (count != null) return `${count} device${count === 1 ? '' : 's'}`;
   const ready = firstCount(status.eligible_live_count);
-  if (ready != null && ready > 0) return `${ready} ready`;
   const busy = firstCount(status.busy_runner_count);
-  if (busy != null && busy > 0) return `${busy} busy`;
   const live = firstCount(status.live_runner_count);
   const enrolled = firstCount(status.strategic_runner_count);
+  const fallbackReason = normalizedStatus(status.fallback_reason);
+  if (fallbackReason === 'no_runner') return 'No local Strategic runner enrolled';
+  if (fallbackReason === 'runner_offline' && enrolled != null) return `${pluralize(enrolled, 'runner')} enrolled, none live`;
+  if (fallbackReason === 'runner_offline') return 'Local Strategic runner offline';
+  if (fallbackReason === 'agent_unavailable') return 'Runner live, agent unavailable';
+  if (fallbackReason === 'at_capacity') return 'Runner busy with active work';
+  if (fallbackReason === 'cloud_dispatch') return 'Current cycle dispatched to cloud';
+  if (fallbackReason === 'capability_mismatch') return 'Runner cannot handle this cycle';
+  if (fallbackReason === 'runner_claim_pending') return 'Waiting for runner claim';
+  if (fallbackReason === 'runner_unavailable') return 'Runner unavailable';
+  if (statusReason) return humanizeStatus(statusReason);
+  if (busy != null && busy > 0 && (ready == null || ready === 0)) return `${busy} busy`;
+  if (status.continuation?.enabled === true) {
+    if (status.continuation.fresh === false) return 'Continuation is stale';
+    if (preferredRunner) return `Continuation ready on runner ${preferredRunner}`;
+    return 'Continuation ready';
+  }
+  if (online != null && total != null) return `${online}/${total} devices`;
+  if (count != null) return `${count} device${count === 1 ? '' : 's'}`;
+  if (ready != null && ready > 0) return `${ready} ready`;
+  if (busy != null && busy > 0) return `${busy} busy`;
   if (live != null && enrolled != null) return `${live}/${enrolled} live`;
   if (enrolled != null) return pluralize(enrolled, 'runner');
   return null;
+}
+
+function runnerMeta(status: StrategicLocalRunnerStatus, primaryDetail: string | null): string[] {
+  const online = firstCount(status.onlineDevices);
+  const totalDevices = firstCount(status.totalDevices);
+  const deviceCount = firstCount(status.deviceCount);
+  const live = firstCount(status.live_runner_count);
+  const enrolled = firstCount(status.strategic_runner_count);
+  const ready = firstCount(status.eligible_live_count);
+  const busy = firstCount(status.busy_runner_count);
+  const stale = firstCount(status.stale_runner_count);
+  const unavailable = firstCount(status.agent_unavailable_count);
+  const continuation = status.continuation;
+  const parts = [
+    online != null && totalDevices != null ? `${online}/${totalDevices} devices` : null,
+    online == null && deviceCount != null ? pluralize(deviceCount, 'device') : null,
+    live != null && enrolled != null ? `${live}/${enrolled} live` : null,
+    ready != null && ready > 0 ? `${ready} ready` : null,
+    busy != null && busy > 0 ? `${busy} busy` : null,
+    stale != null && stale > 0 ? `${stale} stale` : null,
+    unavailable != null && unavailable > 0 ? `${unavailable} unavailable` : null,
+    status.active_task_pinned === true ? 'pinned' : null,
+    continuation?.enabled === true ? `continue ${continuation.fresh === false ? 'stale' : 'fresh'}` : null,
+  ];
+  return parts.filter((part): part is string => Boolean(part) && part !== primaryDetail);
 }
 
 function runtimeComputeCounts(status: StrategicRuntimeWorkStatus): NonNullable<StrategicRuntimeWorkStatus['compute_jobs']>['counts'] {
@@ -198,6 +305,10 @@ function runtimeComputeCounts(status: StrategicRuntimeWorkStatus): NonNullable<S
 
 function runtimeHeldApprovalCount(status: StrategicRuntimeWorkStatus): number {
   return firstCount(status.held_approvals?.count) ?? 0;
+}
+
+function runtimeLocalRunnerHoldCount(status: StrategicRuntimeWorkStatus): number {
+  return firstCount(status.local_runner_holds?.count) ?? 0;
 }
 
 function runtimeParkedWakeActiveCount(status: StrategicRuntimeWorkStatus): number {
@@ -216,7 +327,9 @@ function runtimeRecentFailureCount(status: StrategicRuntimeWorkStatus): number {
 function runtimeTone(status: StrategicRuntimeWorkStatus): Tone {
   const value = normalizedStatus(status.status);
   if (runtimeRecentFailureCount(status) > 0) return 'danger';
-  if (runtimeHeldApprovalCount(status) > 0 || runtimeParkedWakeProblemCount(status) > 0) return 'warning';
+  if (runtimeHeldApprovalCount(status) > 0 || runtimeLocalRunnerHoldCount(status) > 0 || runtimeParkedWakeProblemCount(status) > 0) {
+    return 'warning';
+  }
   if (value.includes('error') || value.includes('fail')) return 'danger';
   if (value.includes('block') || value.includes('queued') || value.includes('wait')) return 'warning';
   if (runtimeIsUseful(status)) return 'success';
@@ -238,6 +351,7 @@ function runtimeIsUseful(status: StrategicRuntimeWorkStatus): boolean {
       || runtimeActiveCount(status) > 0
       || (firstCount(status.queuedCount, runtimeComputeCounts(status)?.queued) ?? 0) > 0
       || runtimeHeldApprovalCount(status) > 0
+      || runtimeLocalRunnerHoldCount(status) > 0
       || runtimeParkedWakeProblemCount(status) > 0
       || runtimeRecentFailureCount(status) > 0
       || (firstCount(runtimeComputeCounts(status)?.terminal_recent) ?? 0) > 0
@@ -248,7 +362,9 @@ function runtimeIsUseful(status: StrategicRuntimeWorkStatus): boolean {
 function runtimeLabel(status: StrategicRuntimeWorkStatus): string {
   const explicit = cleanText(status.label);
   if (explicit) return explicit;
-  if (runtimeHeldApprovalCount(status) > 0 || runtimeParkedWakeProblemCount(status) > 0) return 'Needs check';
+  if (runtimeHeldApprovalCount(status) > 0 || runtimeLocalRunnerHoldCount(status) > 0 || runtimeParkedWakeProblemCount(status) > 0) {
+    return 'Needs check';
+  }
   if (runtimeRecentFailureCount(status) > 0) return 'Recent failure';
   const active = runtimeActiveCount(status);
   if (active > 0) return 'Active';
@@ -266,6 +382,7 @@ function runtimeDetail(status: StrategicRuntimeWorkStatus): string | null {
   const parts = [
     active > 0 ? `${active} active` : null,
     queued > 0 ? `${queued} queued` : null,
+    runtimeLocalRunnerHoldCount(status) > 0 ? pluralize(runtimeLocalRunnerHoldCount(status), 'local runner hold') : null,
     runtimeHeldApprovalCount(status) > 0 ? pluralize(runtimeHeldApprovalCount(status), 'approval') : null,
     runtimeParkedWakeProblemCount(status) > 0 ? pluralize(runtimeParkedWakeProblemCount(status), 'wake issue') : null,
     runtimeRecentFailureCount(status) > 0 ? pluralize(runtimeRecentFailureCount(status), 'recent failure') : null,
@@ -298,11 +415,15 @@ export function StrategicSessionControl({
   const workStatus = runtimeWorkStatus ?? runtimeWork;
 
   const runner = runnerStatus
-    ? {
-        tone: runnerTone(runnerStatus),
-        label: runnerLabel(runnerStatus),
-        detail: runnerDetail(runnerStatus),
-      }
+    ? (() => {
+        const detail = runnerDetail(runnerStatus);
+        return {
+          tone: runnerTone(runnerStatus),
+          label: runnerLabel(runnerStatus),
+          detail,
+          meta: runnerMeta(runnerStatus, detail),
+        };
+      })()
     : null;
 
   const runtime = workStatus
@@ -316,16 +437,17 @@ export function StrategicSessionControl({
 
   return (
     <div
-      className={`flex min-w-0 flex-col gap-2 text-neutral-100 sm:flex-row sm:items-center sm:justify-end ${className}`}
+      className={`flex min-w-0 flex-col gap-1.5 text-neutral-100 sm:flex-row sm:items-center sm:justify-end ${className}`}
       data-testid="strategic-session-control"
     >
       <div
-        className="grid min-w-0 grid-cols-2 gap-1 rounded-md border border-neutral-800 bg-neutral-950 p-1 sm:flex sm:w-auto"
+        className="grid min-w-0 grid-cols-2 gap-0.5 rounded border border-neutral-800 bg-neutral-950/80 p-0.5 sm:flex sm:w-auto"
         role="group"
         aria-label="Strategic interaction mode"
       >
         {MODE_OPTIONS.map(option => {
           const selected = option.value === selectedMode;
+          const Icon = option.Icon;
           return (
             <button
               key={option.value}
@@ -337,22 +459,23 @@ export function StrategicSessionControl({
               onClick={() => {
                 if (!selected) onModeChange?.(option.value);
               }}
-              className={`min-h-11 min-w-0 rounded px-2.5 py-2 text-xs font-semibold transition-colors sm:min-h-9 sm:px-2 sm:py-1.5 ${
+              className={`inline-flex min-h-11 min-w-0 items-center justify-center gap-1.5 rounded px-2 py-1.5 text-xs font-semibold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 sm:min-h-8 sm:px-2 ${
                 selected
                   ? 'bg-neutral-800 text-neutral-100 ring-1 ring-neutral-700'
                   : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100'
               } disabled:cursor-not-allowed disabled:opacity-50`}
             >
-              <span className="block truncate">{option.label}</span>
+              <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+              <span className="truncate">{option.label}</span>
             </button>
           );
         })}
       </div>
 
-      <div className="flex min-w-0 flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end">
+      <div className="flex min-w-0 flex-col gap-1.5 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end">
         {saving && (
           <span
-            className="inline-flex min-h-11 min-w-0 items-center gap-2 rounded-md border border-cyan-500/25 bg-cyan-500/10 px-2.5 py-2 font-mono text-ui-sm font-semibold uppercase text-cyan-300 sm:min-h-9"
+            className="inline-flex min-h-11 min-w-0 items-center gap-2 rounded border border-cyan-500/25 bg-neutral-950/70 px-2 py-1.5 font-mono text-ui-sm font-semibold uppercase text-cyan-300 sm:min-h-8"
             role="status"
             aria-label="Saving Strategic session mode"
             title="Saving Strategic session mode"
@@ -367,25 +490,34 @@ export function StrategicSessionControl({
             type="button"
             onClick={onOpenDevices}
             disabled={!onOpenDevices}
-            className={`inline-flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md border px-2.5 py-2 text-left transition-colors sm:min-h-9 sm:w-auto ${
+            className={`group inline-grid min-h-11 w-full min-w-0 grid-cols-[auto,minmax(0,1fr),auto] items-center gap-2 rounded border px-2 py-1.5 text-left transition-colors hover:border-neutral-500 hover:bg-neutral-900/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 sm:min-h-8 sm:w-auto sm:max-w-[22rem] ${
               toneClasses[runner.tone].border
-            } ${toneClasses[runner.tone].bg} hover:border-neutral-500 disabled:cursor-not-allowed disabled:opacity-60`}
-            aria-label={`Open devices: runner ${runner.label}${runner.detail ? `, ${runner.detail}` : ''}`}
-            title="Open devices"
+            } ${toneClasses[runner.tone].bg} disabled:cursor-not-allowed disabled:opacity-60`}
+            aria-label={`Open devices: runner ${runner.label}${runner.detail ? `, ${runner.detail}` : ''}${
+              runner.meta.length > 0 ? `, ${runner.meta.join(', ')}` : ''
+            }`}
+            title={runner.detail ? `Open devices: ${runner.detail}` : 'Open devices'}
           >
-            <Server className={`h-4 w-4 shrink-0 ${toneClasses[runner.tone].icon}`} aria-hidden="true" />
+            <Server className={`h-3.5 w-3.5 shrink-0 ${toneClasses[runner.tone].icon}`} aria-hidden="true" />
             <span className="min-w-0 flex-1">
-              <span className="flex min-w-0 items-center gap-1.5">
+              <span className="flex min-w-0 items-center gap-1.5 leading-tight">
+                <span className="shrink-0 font-mono text-ui-sm font-semibold uppercase text-neutral-500">Runner</span>
                 <StatusDot tone={runner.tone} />
                 <span className={`truncate text-xs font-semibold ${toneClasses[runner.tone].text}`}>{runner.label}</span>
               </span>
-              <span className="block truncate font-mono text-ui-sm uppercase text-neutral-500">Runner</span>
+              <span className="block truncate text-ui-sm text-neutral-400">{runner.detail ?? 'Open device and runner state'}</span>
             </span>
-            {runner.detail && (
-              <span className="hidden shrink-0 rounded border border-neutral-800 bg-neutral-950/60 px-1.5 py-0.5 font-mono text-ui-sm text-neutral-400 md:inline">
-                {runner.detail}
-              </span>
-            )}
+            <span className="hidden min-w-0 items-center gap-1 lg:flex">
+              {runner.meta.slice(0, 2).map(item => (
+                <span
+                  key={item}
+                  className="max-w-24 truncate rounded border border-neutral-800 bg-neutral-950/60 px-1.5 py-0.5 font-mono text-ui-sm text-neutral-400"
+                >
+                  {item}
+                </span>
+              ))}
+            </span>
+            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-neutral-600 transition-colors group-hover:text-neutral-300" aria-hidden="true" />
           </button>
         )}
 
@@ -393,41 +525,39 @@ export function StrategicSessionControl({
           <button
             type="button"
             onClick={onOpenCompute}
-            className={`inline-flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md border px-2.5 py-2 text-left transition-colors hover:border-neutral-500 sm:min-h-9 sm:w-auto ${
+            className={`group inline-grid min-h-11 w-full min-w-0 grid-cols-[auto,minmax(0,1fr),auto] items-center gap-2 rounded border px-2 py-1.5 text-left transition-colors hover:border-neutral-500 hover:bg-neutral-900/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 sm:min-h-8 sm:w-auto sm:max-w-[20rem] ${
               toneClasses[runtime.tone].border
             } ${toneClasses[runtime.tone].bg}`}
             aria-label={`Open compute: runtime work ${runtime.label}${runtime.detail ? `, ${runtime.detail}` : ''}`}
-            title="Open compute"
+            title={runtime.detail ? `Open compute: ${runtime.detail}` : 'Open compute'}
           >
-            <Cpu className={`h-4 w-4 shrink-0 ${toneClasses[runtime.tone].icon}`} aria-hidden="true" />
+            <Cpu className={`h-3.5 w-3.5 shrink-0 ${toneClasses[runtime.tone].icon}`} aria-hidden="true" />
             <span className="min-w-0 flex-1">
-              <span className="flex min-w-0 items-center gap-1.5">
+              <span className="flex min-w-0 items-center gap-1.5 leading-tight">
+                <span className="shrink-0 font-mono text-ui-sm font-semibold uppercase text-neutral-500">Compute</span>
                 <StatusDot tone={runtime.tone} />
                 <span className={`truncate text-xs font-semibold ${toneClasses[runtime.tone].text}`}>{runtime.label}</span>
               </span>
-              <span className="block truncate font-mono text-ui-sm uppercase text-neutral-500">Compute</span>
+              <span className="block truncate text-ui-sm text-neutral-400">{runtime.detail ?? 'Open runtime work'}</span>
             </span>
-            {runtime.detail && (
-              <span className="hidden shrink-0 rounded border border-neutral-800 bg-neutral-950/60 px-1.5 py-0.5 font-mono text-ui-sm text-neutral-400 md:inline">
-                {runtime.detail}
-              </span>
-            )}
+            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-neutral-600 transition-colors group-hover:text-neutral-300" aria-hidden="true" />
           </button>
         ) : runtime ? (
           <span
-            className={`inline-flex min-h-11 w-full min-w-0 items-center gap-2 rounded-md border px-2.5 py-2 text-left sm:min-h-9 sm:w-auto ${
+            className={`inline-grid min-h-11 w-full min-w-0 grid-cols-[auto,minmax(0,1fr)] items-center gap-2 rounded border px-2 py-1.5 text-left sm:min-h-8 sm:w-auto sm:max-w-[20rem] ${
               toneClasses[runtime.tone].border
             } ${toneClasses[runtime.tone].bg}`}
             aria-label={`Runtime work ${runtime.label}${runtime.detail ? `, ${runtime.detail}` : ''}`}
             title="Runtime work"
           >
-            <MonitorCog className={`h-4 w-4 shrink-0 ${toneClasses[runtime.tone].icon}`} aria-hidden="true" />
+            <MonitorCog className={`h-3.5 w-3.5 shrink-0 ${toneClasses[runtime.tone].icon}`} aria-hidden="true" />
             <span className="min-w-0 flex-1">
-              <span className="flex min-w-0 items-center gap-1.5">
+              <span className="flex min-w-0 items-center gap-1.5 leading-tight">
+                <span className="shrink-0 font-mono text-ui-sm font-semibold uppercase text-neutral-500">Compute</span>
                 <StatusDot tone={runtime.tone} />
                 <span className={`truncate text-xs font-semibold ${toneClasses[runtime.tone].text}`}>{runtime.label}</span>
               </span>
-              <span className="block truncate font-mono text-ui-sm uppercase text-neutral-500">Compute</span>
+              <span className="block truncate text-ui-sm text-neutral-400">{runtime.detail ?? 'No active runtime work'}</span>
             </span>
           </span>
         ) : null}

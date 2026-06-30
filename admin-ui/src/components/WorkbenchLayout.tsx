@@ -24,6 +24,7 @@ export function WorkbenchSurface<T extends string>({
   actions,
   children,
   flush = false,
+  showTitle = true,
   tabLayout = 'inline',
   contentClassName,
 }: {
@@ -35,6 +36,7 @@ export function WorkbenchSurface<T extends string>({
   actions?: ReactNode;
   children: ReactNode;
   flush?: boolean;
+  showTitle?: boolean;
   tabLayout?: 'inline' | 'stacked';
   contentClassName?: string;
 }) {
@@ -76,16 +78,22 @@ export function WorkbenchSurface<T extends string>({
       : 'min-h-0 min-w-0 overflow-auto p-3 custom-scrollbar'
   );
 
+  const headerClassName = showTitle
+    ? 'min-w-0 border-b border-neutral-800/90 bg-[#030508] px-2 py-1.5 md:px-2.5'
+    : 'min-w-0 border-b border-neutral-800/90 bg-[#030508] px-2 py-1 md:px-2.5';
+
   return (
     <section className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] bg-[#05080c]">
-      <header className="min-w-0 border-b border-neutral-800/90 bg-[#030508] px-2 py-1.5 md:px-2.5">
+      <header className={headerClassName}>
         <div className="flex min-w-0 items-center gap-2">
-          <div className="min-w-0 shrink-0">
-            <h1 className="truncate text-sm font-semibold leading-5 text-neutral-100">{title}</h1>
-            {subtitle && <div className="mt-0.5 truncate text-xs text-neutral-500">{subtitle}</div>}
-          </div>
+          {showTitle && (
+            <div className="min-w-0 shrink-0">
+              <h1 className="truncate text-sm font-semibold leading-5 text-neutral-100">{title}</h1>
+              {subtitle && <div className="mt-0.5 truncate text-xs text-neutral-500">{subtitle}</div>}
+            </div>
+          )}
           {tabLayout === 'inline' && tabStrip}
-          {actions && <div className="ml-auto flex min-w-0 shrink-0 flex-wrap items-center justify-end gap-1">{actions}</div>}
+          {actions && <div className={`${showTitle || hasTabs ? 'ml-auto' : 'mx-auto w-full max-w-[940px] lg:mx-0'} flex min-w-0 shrink-0 flex-wrap items-center justify-end gap-1`}>{actions}</div>}
         </div>
         {tabLayout === 'stacked' && <div className="mt-1.5">{tabStrip}</div>}
       </header>

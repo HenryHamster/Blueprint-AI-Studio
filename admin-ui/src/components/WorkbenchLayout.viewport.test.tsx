@@ -75,4 +75,36 @@ describe('WorkbenchLayout viewport regression', () => {
     expect(rail ? getComputedStyle(rail).paddingTop : '').toBe('10px');
     expect(panelBody instanceof HTMLElement ? getComputedStyle(panelBody).paddingTop : '').toBe('10px');
   });
+
+  test('action-only surface hides the duplicate title while preserving actions', async () => {
+    await page.viewport(1280, 800);
+    host = document.createElement('div');
+    host.style.height = '320px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    let actionOpened = false;
+    await act(async () => {
+      r.render(
+        <WorkbenchSurface
+          title="Strategic"
+          showTitle={false}
+          actions={(
+            <button type="button" onClick={() => { actionOpened = true; }}>
+              Command
+            </button>
+          )}
+          flush
+        >
+          <div>Chat surface</div>
+        </WorkbenchSurface>,
+      );
+    });
+
+    expect(host.querySelector('h1')).toBeNull();
+    const action = host.querySelector<HTMLButtonElement>('button');
+    expect(action?.textContent).toContain('Command');
+    await act(async () => { action?.click(); });
+    expect(actionOpened).toBe(true);
+  });
 });

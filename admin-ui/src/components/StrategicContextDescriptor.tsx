@@ -25,9 +25,6 @@ export function StrategicContextDescriptor({
   const visibleRefs = model.refs.slice(0, 2);
   const hiddenRefCount = Math.max(0, model.refCount - visibleRefs.length);
   const compact = variant === 'receipt';
-  const canvasLabel = model.canvas && (model.canvas.nodeCount > 0 || model.canvas.edgeCount > 0)
-    ? `${model.canvas.nodeCount} nodes / ${model.canvas.edgeCount} links`
-    : null;
   const packageLabel = !compact && model.packageTitle ? model.packageTitle : null;
   const title = onOpen
     ? 'Open Strategic context'
@@ -36,7 +33,7 @@ export function StrategicContextDescriptor({
       : undefined;
   const className = compact
     ? 'flex max-w-full flex-wrap items-center gap-x-1.5 gap-y-1 text-ui-md leading-snug text-neutral-500'
-    : 'mx-auto mb-2 flex w-full max-w-[940px] flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-neutral-800/70 bg-neutral-950/45 px-2 py-1.5 text-ui-md leading-snug text-neutral-500 lg:mx-0';
+    : 'mx-auto mb-2 flex w-full max-w-[940px] flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-neutral-800/70 bg-neutral-950/45 px-2.5 py-1.5 text-ui-md leading-snug text-neutral-500 lg:mx-0';
   const testId = compact ? 'strategic-context-receipt' : 'strategic-context-descriptor';
   const content = (
     <>
@@ -47,32 +44,20 @@ export function StrategicContextDescriptor({
       {packageLabel && (
         <span className="min-w-0 max-w-full truncate text-neutral-300">{packageLabel}</span>
       )}
-      <span aria-hidden="true" className="text-neutral-700">/</span>
+      <span aria-hidden="true" className="text-neutral-700">·</span>
       <span>{model.modeLabel}</span>
       {model.surfaceLabel !== 'Strategic' && (
         <>
-          <span aria-hidden="true" className="text-neutral-700">/</span>
+          <span aria-hidden="true" className="text-neutral-700">·</span>
           <span>{model.surfaceLabel}</span>
         </>
       )}
       {model.contextLabel && (
         <>
-          <span aria-hidden="true" className="text-neutral-700">/</span>
+          <span aria-hidden="true" className="text-neutral-700">·</span>
           <span className={model.contextTone === 'stale' ? 'text-amber-300' : model.contextTone === 'building' ? 'text-cyan-300' : 'text-neutral-400'}>
             {model.contextLabel}
           </span>
-        </>
-      )}
-      {canvasLabel && (
-        <>
-          <span aria-hidden="true" className="text-neutral-700">/</span>
-          <span className="text-neutral-500">{canvasLabel}</span>
-        </>
-      )}
-      {!compact && model.itemCount != null && model.itemCount > 0 && (
-        <>
-          <span aria-hidden="true" className="text-neutral-700">/</span>
-          <span className="text-neutral-500">{model.itemCount} items</span>
         </>
       )}
       {visibleRefs.map(ref => (

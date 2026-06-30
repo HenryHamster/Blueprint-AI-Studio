@@ -781,8 +781,9 @@ describe('MessagesPanel chrome modes', () => {
     expect(descriptor?.textContent).toContain('Workday');
     expect(descriptor?.textContent).toContain('Context ready');
     expect(descriptor?.textContent).toContain('Latest context report');
-    expect(descriptor?.textContent).toContain('8 nodes / 7 links');
-    expect(descriptor?.textContent).toContain('18 items');
+    expect(descriptor?.textContent).not.toContain('1 ref');
+    expect(descriptor?.textContent).not.toContain('8 nodes / 7 links');
+    expect(descriptor?.textContent).not.toContain('18 items');
 
     await act(async () => {
       descriptor?.click();
