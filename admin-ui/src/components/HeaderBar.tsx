@@ -207,7 +207,6 @@ export interface HeaderBarProps {
   // Unified top bar — tab nav
   activeTab: PrimaryTab;
   onTabChange: (tab: PrimaryTab) => void;
-  onMessageStrategic?: () => void;
   onOpenCommandPalette?: () => void;
   // Unified top bar — HealthPill
   health: OrchestratorHealth | null;
@@ -407,14 +406,14 @@ export function HeaderBar(props: HeaderBarProps) {
       )}
 
       {/* Unified top bar: compact global shell with fixed utility clusters and a scrolling tab strip. */}
-      <header className="flex min-h-10 flex-wrap items-center gap-2 border-b border-neutral-800 bg-[#05070a] px-2 py-1.5 md:flex-nowrap">
+      <header className="flex min-h-10 flex-wrap items-center gap-1.5 border-b border-neutral-800 bg-[#05070a] px-2 py-1 md:min-h-11 md:flex-nowrap">
         {/* LEFT: ProjectSwitcher + Manage projects slot */}
         <div className="flex min-w-0 shrink-0 items-center gap-1.5">
-          <div className="hidden items-center gap-2 pr-1 lg:flex">
-            <span className="flex h-7 w-7 items-center justify-center rounded-md border border-neutral-800 bg-[#0b0f14] text-neutral-300 shadow-inner shadow-black/20">
-              <Compass className="h-3.5 w-3.5" />
+          <div className="hidden items-center gap-1.5 pr-1 lg:flex">
+            <span className="flex h-6 w-6 items-center justify-center rounded-md border border-neutral-800 bg-[#0b0f14] text-neutral-400 shadow-inner shadow-black/20">
+              <Compass className="h-3 w-3" />
             </span>
-            <span className="text-sm font-semibold tracking-normal text-neutral-100">BlueprintAIStudio</span>
+            <span className="text-xs font-semibold tracking-normal text-neutral-200">Blueprint</span>
           </div>
           <ProjectSwitcherDropdown
             projects={props.projects}
@@ -432,17 +431,6 @@ export function HeaderBar(props: HeaderBarProps) {
             </button>
           )}
         </div>
-
-        <button
-          type="button"
-          onClick={() => {
-            if (props.onMessageStrategic) props.onMessageStrategic();
-            else props.onTabChange('chat');
-          }}
-          className="hidden min-w-0 flex-1 items-center rounded-md border border-neutral-800 bg-[#0b0f14] px-3 py-1.5 text-left font-mono text-xs text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-300 lg:flex"
-        >
-          <span className="truncate">Message Strategic...</span>
-        </button>
 
         {/* CENTER: Primary tab group — intentional horizontal-scroll strip
             (overflow-x-auto + min-w-0) so the tabs scroll rather than wrap or
@@ -474,7 +462,7 @@ export function HeaderBar(props: HeaderBarProps) {
               >
                 {label}
                 {badgeCount > 0 && (
-                  <span className="ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500 px-1 text-ui-sm font-bold leading-none text-black">
+                  <span className="ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-cyan-400 px-1 text-ui-sm font-bold leading-none text-neutral-950">
                     {badgeCount > 99 ? '99+' : badgeCount}
                   </span>
                 )}
@@ -488,21 +476,6 @@ export function HeaderBar(props: HeaderBarProps) {
 
           {/* Desktop icon cluster */}
           <div className="hidden items-center gap-0.5 rounded-md border border-neutral-800 bg-[#0b0f14] p-0.5 md:flex">
-            {props.onOpenCommandPalette && (
-              /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
-              <button
-                type="button"
-                onClick={props.onOpenCommandPalette}
-                title="Open command palette (Ctrl+K)"
-                aria-label="Open command palette"
-                className="flex h-8 items-center gap-1 rounded px-2 text-xs font-semibold text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-100"
-              >
-                <Command className="w-3.5 h-3.5" />
-                <kbd className="hidden rounded border border-neutral-700 bg-neutral-950 px-1 py-0.5 font-mono text-ui-sm text-neutral-500 xl:inline-block">
-                  Ctrl+K
-                </kbd>
-              </button>
-            )}
             {/* Alerts — only when active alerts exist */}
             {(props.alertCount ?? 0) > 0 && (
               /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
@@ -820,7 +793,7 @@ export function HeaderBar(props: HeaderBarProps) {
                     <Compass className="w-4 h-4 shrink-0" />
                     <span>{tab === 'chat' ? 'Strategic' : tab.charAt(0).toUpperCase() + tab.slice(1)}</span>
                     {tab === 'chat' && (openMessageCount > 0 || (newSinceLastVisitCount ?? 0) > 0) && (
-                      <span className="ml-auto bg-amber-500 text-black text-ui-xs font-bold px-1.5 py-0.5 rounded-full leading-none">
+                      <span className="ml-auto rounded-full bg-cyan-400 px-1.5 py-0.5 text-ui-xs font-bold leading-none text-neutral-950">
                         {Math.max(openMessageCount, newSinceLastVisitCount ?? 0)}
                       </span>
                     )}

@@ -1,5 +1,5 @@
 import { type RefObject } from 'react';
-import { X, Send, Reply } from 'lucide-react';
+import { Command, X, Send, Reply } from 'lucide-react';
 import { MessageTypeDropdown } from './MessageTypeDropdown';
 import { type ArmingOutcome, composerHintCopy } from './messageArming';
 import type { StrategicContextDescriptorModel } from '../utils/strategicContextDescriptor';
@@ -17,6 +17,7 @@ export interface MessagesComposerProps {
   strategistBusy?: boolean;
   strategicContext?: StrategicContextDescriptorModel | null;
   onOpenStrategicContext?: () => void;
+  onOpenCommandPalette?: () => void;
   onChangeType: (value: string) => void;
   onChangeContent: (value: string) => void;
   onCancelReply: () => void;
@@ -42,6 +43,7 @@ export function MessagesComposer({
   strategistBusy,
   strategicContext,
   onOpenStrategicContext,
+  onOpenCommandPalette,
   onChangeType,
   onChangeContent,
   onCancelReply,
@@ -68,7 +70,7 @@ export function MessagesComposer({
 
   return (
     <div className={minimal
-      ? 'shrink-0 border-t border-neutral-800 bg-[#05080c] px-3 py-2.5 md:px-4'
+      ? 'shrink-0 border-t border-neutral-800 bg-[#05080c] px-2.5 py-2 md:px-3'
       : 'px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50'
     }>
       {minimal && strategicContext && (
@@ -87,11 +89,25 @@ export function MessagesComposer({
         </div>
       )}
       <div className={minimal
-        ? 'mx-auto flex w-full max-w-4xl items-end gap-2 rounded-md border border-neutral-800 bg-[#10151c] p-1.5'
+        ? 'mx-auto flex w-full max-w-4xl items-end gap-1.5 rounded-md border border-neutral-800 bg-[#10151c] p-1.5 shadow-inner shadow-black/20'
         : 'flex gap-2 items-end'
       }>
         {!minimal && (
           <MessageTypeDropdown value={newType} onChange={onChangeType} compact={minimal} />
+        )}
+        {minimal && onOpenCommandPalette && (
+          <button
+            type="button"
+            onClick={onOpenCommandPalette}
+            title="Open command palette (Ctrl+K)"
+            aria-label="Open command palette"
+            className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-md border border-neutral-800 bg-[#0b0f14] px-2 text-xs font-semibold text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
+          >
+            <Command className="h-3.5 w-3.5" />
+            <kbd className="hidden rounded border border-neutral-700 bg-neutral-950 px-1 py-0.5 font-mono text-ui-sm text-neutral-500 sm:inline-block">
+              Ctrl+K
+            </kbd>
+          </button>
         )}
         <div className="relative flex-1">
           <textarea

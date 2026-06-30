@@ -1,4 +1,4 @@
-import { afterEach, describe, test, expect } from 'vitest';
+import { afterEach, describe, test, expect, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act, createRef } from 'react';
 import { MessagesComposer } from './MessagesComposer';
@@ -12,6 +12,7 @@ async function renderComposer(
   strategistBusy = false,
   chrome: 'full' | 'minimal' = 'full',
   strategicContext: StrategicContextDescriptorModel | null = null,
+  onOpenCommandPalette?: () => void,
 ) {
   const ref = createRef<HTMLTextAreaElement>();
   await act(async () => {
@@ -31,6 +32,7 @@ async function renderComposer(
         chrome={chrome}
         strategicContext={strategicContext}
         onOpenStrategicContext={() => {}}
+        onOpenCommandPalette={onOpenCommandPalette}
       />,
     );
   });
@@ -126,6 +128,24 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     expect(host!.textContent).not.toContain('Strategic');
     expect(host!.textContent).not.toContain('reaches the strategist soon');
     expect(host!.textContent).not.toContain('won’t wake the strategist');
+    await expectNoTextTruncationAt(375, async () => {});
+    await expectMinTouchTargetAt(375, async () => {});
+  });
+
+  test('minimal chat composer exposes command palette beside the input', async () => {
+    const onOpenCommandPalette = vi.fn();
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderComposer(r, 'FEEDBACK', null, false, 'minimal', null, onOpenCommandPalette);
+    });
+    const commandButton = host!.querySelector<HTMLButtonElement>('button[title="Open command palette (Ctrl+K)"]');
+    expect(commandButton).not.toBeNull();
+    await act(async () => { commandButton?.click(); });
+    expect(onOpenCommandPalette).toHaveBeenCalledOnce();
     await expectNoTextTruncationAt(375, async () => {});
     await expectMinTouchTargetAt(375, async () => {});
   });

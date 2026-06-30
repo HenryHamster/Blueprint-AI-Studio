@@ -252,6 +252,8 @@ export interface MessagesPanelProps {
   onStrategicInteraction?: () => void | Promise<void>;
   /** Open the Strategic context workspace from the minimal Strategic composer. */
   onOpenStrategicContextWorkspace?: () => void;
+  /** Open the global command palette from the Strategic composer. */
+  onOpenCommandPalette?: () => void;
   /** Backwards-compatible alias for older call sites. */
   onOpenStrategicContextCommands?: () => void;
   /** Legacy refresh callback kept for callers that still wire the old prop name. */
@@ -329,7 +331,7 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenStrategicContextCommands, onStrategicRefresh }: MessagesPanelProps) {
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -1540,7 +1542,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   }
 
   const bubbleProps = {
-    actionMode: conversationMode ? 'reply-only' as const : 'full' as const,
+    actionMode: conversationMode ? 'none' as const : 'full' as const,
     resolvingId,
     resolveInput,
     deletingIds,
@@ -1895,6 +1897,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         chrome={conversationMode ? 'minimal' : 'full'}
         strategicContext={conversationMode ? strategicContextDescriptor : null}
         onOpenStrategicContext={conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined}
+        onOpenCommandPalette={conversationMode ? onOpenCommandPalette : undefined}
       />
     </div>
   );

@@ -191,7 +191,7 @@ describe('MessageBubble', () => {
     }));
   });
 
-  test('chat presentation renders a compact task metadata affordance', () => {
+  test('chat presentation renders task metadata as passive provenance', () => {
     const onOpenTask = vi.fn();
     render(<MessageBubble {...makeProps({
       presentation: 'chat',
@@ -204,9 +204,11 @@ describe('MessageBubble', () => {
       onOpenTask,
     })} />);
 
-    const taskButton = screen.getByText('task-abc');
-    fireEvent.click(taskButton);
-    expect(onOpenTask).toHaveBeenCalledWith('task-abcdef123456');
+    const taskMeta = screen.getByText('task-abc');
+    expect(taskMeta).toBeTruthy();
+    expect(taskMeta.tagName.toLowerCase()).toBe('span');
+    fireEvent.click(taskMeta);
+    expect(onOpenTask).not.toHaveBeenCalled();
   });
 
   test('chat presentation treats operator from_type as the local speaker', () => {

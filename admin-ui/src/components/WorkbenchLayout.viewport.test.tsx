@@ -72,7 +72,7 @@ describe('WorkbenchLayout viewport regression', () => {
     const rail = host?.querySelector('aside');
     const panel = rail?.querySelector('section');
     const panelBody = panel?.lastElementChild;
-    expect(rail ? getComputedStyle(rail).paddingTop : '').toBe('12px');
+    expect(rail ? getComputedStyle(rail).paddingTop : '').toBe('10px');
     expect(panelBody instanceof HTMLElement ? getComputedStyle(panelBody).paddingTop : '').toBe('10px');
   });
 });

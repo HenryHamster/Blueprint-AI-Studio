@@ -9,7 +9,7 @@ export interface WorkbenchTab<T extends string> {
 
 export function WorkbenchFrame({ children }: { children: ReactNode }) {
   return (
-    <main className="min-h-0 min-w-0 flex-1 overflow-hidden border-y border-neutral-800 bg-[#05080c]">
+    <main className="min-h-0 min-w-0 flex-1 overflow-hidden border-b border-neutral-800 bg-[#05080c]">
       {children}
     </main>
   );
@@ -78,16 +78,16 @@ export function WorkbenchSurface<T extends string>({
 
   return (
     <section className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] bg-[#05080c]">
-      <header className="min-w-0 border-b border-neutral-800 bg-[#05070a] px-3 py-2.5 md:px-4">
-        <div className="flex min-w-0 items-center gap-3">
+      <header className="min-w-0 border-b border-neutral-800 bg-[#05070a] px-2.5 py-2 md:px-3">
+        <div className="flex min-w-0 items-center gap-2.5">
           <div className="min-w-0 shrink-0">
-            <h1 className="truncate text-lg font-semibold leading-6 text-neutral-100">{title}</h1>
+            <h1 className="truncate text-sm font-semibold leading-5 text-neutral-100">{title}</h1>
             {subtitle && <div className="mt-0.5 truncate text-xs text-neutral-500">{subtitle}</div>}
           </div>
           {tabLayout === 'inline' && tabStrip}
-          {actions && <div className="ml-auto flex min-w-0 shrink-0 flex-wrap items-center justify-end gap-2">{actions}</div>}
+          {actions && <div className="ml-auto flex min-w-0 shrink-0 flex-wrap items-center justify-end gap-1.5">{actions}</div>}
         </div>
-        {tabLayout === 'stacked' && <div className="mt-3">{tabStrip}</div>}
+        {tabLayout === 'stacked' && <div className="mt-2">{tabStrip}</div>}
       </header>
       <div className={bodyClassName}>
         {children}
@@ -106,10 +106,10 @@ export function WorkbenchSplit({
   railClassName?: string;
 }) {
   return (
-    <div className="grid h-full min-h-0 min-w-0 grid-cols-1 overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(320px,28vw)]">
+    <div className="grid h-full min-h-0 min-w-0 grid-cols-1 overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(300px,26vw)]">
       <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">{main}</div>
       {rail && (
-        <aside className={`hidden min-h-0 min-w-0 overflow-auto border-l border-neutral-800 bg-[#10151c] p-3 custom-scrollbar lg:block ${railClassName}`}>
+        <aside className={`hidden min-h-0 min-w-0 overflow-auto border-l border-neutral-800 bg-[#10151c] p-2.5 custom-scrollbar lg:block ${railClassName}`}>
           {rail}
         </aside>
       )}

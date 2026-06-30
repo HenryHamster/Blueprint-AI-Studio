@@ -1,6 +1,8 @@
 @import "tailwindcss";
 
 @theme {
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+
   /* Semantic status badge color tokens — resolved through the canonical StatusTone
      mapper in utils/projectStatus.ts. Component classes reference these tokens
      (bg-status-success/15, text-status-blocking, etc.) instead of ad-hoc palette

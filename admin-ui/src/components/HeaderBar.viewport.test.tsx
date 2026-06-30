@@ -305,7 +305,7 @@ describe('HeaderBar — viewport regression', () => {
     expect(onOpenActivityFeed).toHaveBeenCalledOnce();
   });
 
-  test('desktop command palette launcher calls its opener', async () => {
+  test('desktop command palette launcher is not duplicated in the global header', async () => {
     const onOpenCommandPalette = vi.fn();
     host = document.createElement('div');
     host.style.padding = '12px';
@@ -314,9 +314,8 @@ describe('HeaderBar — viewport regression', () => {
     root = r;
     await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenCommandPalette={onOpenCommandPalette} />); });
     const commandButton = host.querySelector<HTMLButtonElement>('button[title="Open command palette (Ctrl+K)"]');
-    expect(commandButton).toBeTruthy();
-    await act(async () => { commandButton?.click(); });
-    expect(onOpenCommandPalette).toHaveBeenCalledOnce();
+    expect(commandButton).toBeNull();
+    expect(onOpenCommandPalette).not.toHaveBeenCalled();
   });
 
   test('mobile menu exposes command palette action', async () => {

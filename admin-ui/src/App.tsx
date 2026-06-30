@@ -1142,10 +1142,10 @@ export default function App() {
   return (
     <ErrorBoundary>
     <TaskCapabilitiesProvider contract={s.taskCapabilityContract}>
-    <div className="flex flex-col bg-[#08090b] text-neutral-200 font-sans p-2 md:p-4 min-h-screen md:h-screen md:overflow-hidden">
+    <div className="flex min-h-screen flex-col bg-[#08090b] text-neutral-200 font-sans md:h-screen md:overflow-hidden">
       {s.refreshing && (
         <div className="fixed top-0 left-0 right-0 z-50 h-0.5 bg-neutral-800 overflow-hidden">
-          <div className="h-full w-2/5 bg-amber-500" style={{ animation: 'progress-slide 1.2s ease-in-out infinite' }} />
+          <div className="h-full w-2/5 bg-cyan-400" style={{ animation: 'progress-slide 1.2s ease-in-out infinite' }} />
         </div>
       )}
       <HeaderBar
@@ -1334,7 +1334,6 @@ export default function App() {
         onSelectProject={s.setSelectedProjectId}
         activeTab={activeTab}
         onTabChange={handleTabChange}
-        onMessageStrategic={focusStrategicComposer}
         onOpenCommandPalette={openCommandPalette}
         health={s.orchestratorHealth}
         detailedHealth={s.detailedHealth}
@@ -1434,6 +1433,7 @@ export default function App() {
                 onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
                 onStrategicInteraction={() => { void persistStrategicWorkbench({ active_surface: 'strategic' }); }}
                 onOpenStrategicContextWorkspace={openStrategicContextWorkspace}
+                onOpenCommandPalette={openCommandPalette}
               />
             )}
             rail={(

@@ -290,22 +290,19 @@ export function MessageBubble({
           : 'max-w-[85%] md:max-w-[70%]'
       } ${userMsg ? 'items-end' : 'items-start'} flex flex-col`}>
         {chatMode && !userMsg && (
-          <div className="relative mb-1 flex items-center gap-2 px-1 pr-10 text-ui-md text-neutral-500">
+          <div className="relative mb-1 flex items-center gap-2 px-1 text-ui-md text-neutral-500">
             <span className="font-medium text-neutral-400">{formatChatFromType(msg)}</span>
             <span aria-hidden="true">·</span>
             <span>{formatAge(msg.created_at)}</span>
-            {taskId && onOpenTask && (
+            {taskId && (
               <>
                 <span aria-hidden="true">·</span>
-                <button
-                  type="button"
-                  onClick={() => onOpenTask(taskId)}
-                  data-viewport-allow-small-target
-                  className="font-mono text-ui-md text-cyan-400 transition-colors hover:text-cyan-300"
-                  title={`Open task ${taskId}`}
+                <span
+                  className="font-mono text-ui-md text-neutral-600"
+                  title={`Task ${taskId}`}
                 >
                   {taskId.slice(0, 8)}
-                </button>
+                </span>
               </>
             )}
             {canChatReply && (
