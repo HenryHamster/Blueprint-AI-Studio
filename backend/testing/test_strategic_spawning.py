@@ -6962,6 +6962,8 @@ async def test_spawn_strategic_review_payload_staleness_stale_when_candidate_beh
     staleness = payload.get("payload_staleness")
     assert staleness is not None, "payload_staleness must be present when currency resolved"
     assert staleness["stale"] is True, "stale must be True when candidate is behind HEAD"
+    assert staleness["verdict"] == "stale", "verdict must be 'stale' when candidate is behind HEAD"
+    assert "checked_at" in staleness, "checked_at timestamp must be present"
     assert staleness["payload_compiled_sha"] == candidate
     assert staleness["payload_sha"] == candidate
     assert staleness["active_candidate_sha"] == candidate
@@ -7005,6 +7007,8 @@ async def test_spawn_strategic_review_payload_staleness_current_when_candidate_m
     staleness = payload.get("payload_staleness")
     assert staleness is not None, "payload_staleness must be present when currency resolved"
     assert staleness["stale"] is False, "stale must be False when candidate equals HEAD"
+    assert staleness["verdict"] == "fresh", "verdict must be 'fresh' when candidate matches HEAD"
+    assert "checked_at" in staleness, "checked_at timestamp must be present"
     assert staleness["payload_sha"] == sha
     assert staleness["payload_compiled_sha"] == sha
     assert staleness["active_candidate_sha"] == sha
@@ -7013,11 +7017,12 @@ async def test_spawn_strategic_review_payload_staleness_current_when_candidate_m
 
 
 @pytest.mark.asyncio
-async def test_spawn_strategic_review_payload_staleness_absent_when_currency_indeterminate(
+async def test_spawn_strategic_review_payload_freshness_unknown_when_currency_indeterminate(
     db_session, mocker, _lts_split_active
 ):
     """When _resolve_candidate_currency returns None (GitHub unreachable or no
-    candidate SHA), payload_staleness must be absent from the spawned payload."""
+    candidate SHA), payload_staleness must be present with verdict='unknown' and
+    a checked_at timestamp so the agent cannot mistake it for a confirmed-fresh result."""
     await _ensure_releaseversion_table(db_session)
     project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
     db_session.add(project)
@@ -7047,8 +7052,16 @@ async def test_spawn_strategic_review_payload_staleness_absent_when_currency_ind
     assert tasks, "Expected a strategic_review task"
     payload = tasks[0].payloads[0]
 
-    assert "payload_staleness" not in payload, (
-        "payload_staleness must be absent when currency is indeterminate"
+    staleness = payload.get("payload_staleness")
+    assert staleness is not None, (
+        "payload_staleness must be present even when currency is indeterminate"
+    )
+    assert staleness.get("verdict") == "unknown", (
+        "verdict must be 'unknown' when currency could not be resolved"
+    )
+    assert "checked_at" in staleness, "checked_at timestamp must be present"
+    assert staleness.get("stale") is None or "stale" not in staleness, (
+        "stale field must not be set on an unknown-verdict block"
     )
 
 

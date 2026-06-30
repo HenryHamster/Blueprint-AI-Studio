@@ -1258,12 +1258,24 @@ export function buildDirHealthSummary(
  * Render payload currency (cycle-start staleness check). When the strategic
  * payload was compiled against an older qualification candidate than the current
  * integration HEAD, audit findings are scored against stale code and must not
- * be blindly trusted as current. Returns '' when staleness is absent or
- * indeterminate (non-boolean stale field), so the section is omitted when the
- * backend could not compute it (e.g. no version system, GitHub API unavailable).
+ * be blindly trusted as current. Returns '' when staleness is absent entirely.
+ * An 'unknown' verdict (GitHub API unreachable at spawn time) renders explicitly
+ * so the agent cannot mistake an indeterminate freshness check for confirmed-fresh.
  */
 export function buildPayloadStalenessSection(staleness: Record<string, unknown> | undefined): string {
   if (!staleness || typeof staleness !== 'object') return '';
+
+  const lines: string[] = ['\n## Payload Currency (cycle-start check)'];
+
+  // Unknown/indeterminate verdict — currency check could not be completed
+  if (staleness.verdict === 'unknown') {
+    const checkedAt = typeof staleness.checked_at === 'string' ? staleness.checked_at : '';
+    lines.push(`⚠ UNKNOWN — freshness check could not be completed at spawn time (GitHub API unreachable or candidate SHA unavailable).${checkedAt ? ` Checked at: ${checkedAt}.` : ''}`);
+    lines.push('Treat this payload as potentially stale. Do NOT assume audit findings are scored against current HEAD until a fresh qualification confirms currency.');
+    return lines.join('\n');
+  }
+
+  // Resolved verdict requires a boolean stale field
   if (typeof staleness.stale !== 'boolean') return '';
 
   // payload_sha is the primary field; payload_compiled_sha is the backward-compat fallback
@@ -1277,7 +1289,6 @@ export function buildPayloadStalenessSection(staleness: Record<string, unknown> 
   const candidateShaShort = rawCandidateSha ? rawCandidateSha.slice(0, 12) : '?';
   const integrationHeadShaShort = rawIntegrationHeadSha ? rawIntegrationHeadSha.slice(0, 12) : '';
 
-  const lines: string[] = ['\n## Payload Currency (cycle-start check)'];
   if (staleness.stale) {
     lines.push(`⚠ STALE — this payload was compiled against an older commit than the current active state. Specific divergences:`);
     // Emit payload-vs-candidate bullet only when both SHAs are available and differ

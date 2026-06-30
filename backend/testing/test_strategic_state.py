@@ -2069,3 +2069,101 @@ async def test_strategic_state_sha_freshness_unknown_when_resolve_fails(
     assert resp.status_code == 200
     freshness = resp.json()["sha_freshness"]
     assert freshness["verdict"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_sha_freshness_includes_checked_at(
+    client: AsyncClient, db_session, mocker
+):
+    """Freshness block for a fresh verdict carries a checked_at ISO timestamp."""
+    project = await _make_project(db_session)
+    sha = "ccddee11" * 5
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"candidate_sha": sha, "status": "not_promoted"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.strategic_spawning._resolve_candidate_currency",
+        new=AsyncMock(
+            return_value={
+                "current": True,
+                "candidate_sha": sha,
+                "head_sha": sha,
+            }
+        ),
+    )
+    mocker.patch(
+        "app.strategic_spawning.get_project_integration_branch",
+        return_value="main",
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    freshness = resp.json()["sha_freshness"]
+    assert freshness["verdict"] == "fresh"
+    assert "checked_at" in freshness
+    assert freshness["checked_at"] is not None
+    # ISO-8601 string sanity check
+    assert "T" in freshness["checked_at"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_sha_freshness_includes_integration_branch(
+    client: AsyncClient, db_session, mocker
+):
+    """Stale freshness block carries the integration_branch name used for comparison."""
+    project = await _make_project(db_session)
+    candidate_sha = "aabb1122" * 5
+    head_sha = "ccdd3344" * 5
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=5,
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"candidate_sha": candidate_sha, "status": "not_promoted"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.strategic_spawning._resolve_candidate_currency",
+        new=AsyncMock(
+            return_value={
+                "current": False,
+                "candidate_sha": candidate_sha,
+                "head_sha": head_sha,
+            }
+        ),
+    )
+    mocker.patch(
+        "app.strategic_spawning.get_project_integration_branch",
+        return_value="automain",
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    freshness = resp.json()["sha_freshness"]
+    assert freshness["verdict"] == "stale"
+    assert freshness["integration_branch"] == "automain"
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_sha_freshness_unknown_includes_checked_at(
+    client: AsyncClient, db_session
+):
+    """Unknown freshness verdict (no open version) still carries a checked_at timestamp."""
+    project = await _make_project(db_session)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    freshness = resp.json()["sha_freshness"]
+    assert freshness["verdict"] == "unknown"
+    assert "checked_at" in freshness
+    assert freshness["checked_at"] is not None
+    assert "T" in freshness["checked_at"]

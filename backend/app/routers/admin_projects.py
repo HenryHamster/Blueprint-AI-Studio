@@ -1216,35 +1216,38 @@ async def get_project_strategic_state(
             .limit(1)
         )
     ).scalars().first()
+    from app.strategic_spawning import (
+        _build_freshness_shas_block,
+        _build_unknown_freshness_block,
+        _resolve_candidate_currency,
+        get_project_integration_branch,
+    )
+
     if open_version is not None:
         try:
-            from app.strategic_spawning import (
-                _resolve_candidate_currency,
-                get_project_integration_branch,
-            )
-
             _last_qual = open_version.last_qualification or {}
             _integration_branch = get_project_integration_branch(project)
             currency = await _resolve_candidate_currency(
                 session, project, _last_qual, _integration_branch
             )
             if currency is not None:
-                verdict = "fresh" if currency["current"] is True else "stale"
                 sha_freshness = {
-                    "active_candidate_sha": currency.get("candidate_sha"),
-                    "integration_head_sha": currency.get("head_sha"),
-                    "verdict": verdict,
+                    **_build_freshness_shas_block(currency),
+                    "integration_branch": _integration_branch,
                 }
             else:
-                sha_freshness = {"verdict": "unknown"}
+                sha_freshness = {
+                    **_build_unknown_freshness_block(),
+                    "integration_branch": _integration_branch,
+                }
         except Exception:
             logger.exception(
                 "[STRATEGIC_STATE] sha_freshness resolve failed for project %s",
                 project.id,
             )
-            sha_freshness = {"verdict": "unknown"}
+            sha_freshness = _build_unknown_freshness_block()
     else:
-        sha_freshness = {"verdict": "unknown"}
+        sha_freshness = _build_unknown_freshness_block()
 
     return {
         "project_id": str(project.id),

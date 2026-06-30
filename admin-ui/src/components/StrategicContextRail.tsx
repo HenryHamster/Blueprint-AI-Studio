@@ -149,6 +149,55 @@ function runtimeWorkDetail(work: StrategicRuntimeWorkState): string {
   return terminal > 0 ? `${pluralize(terminal, 'recent compute result')}` : 'No active background work';
 }
 
+function shaFreshnessTone(verdict?: string | null): { dot: string; text: string; label: string } {
+  if (verdict === 'fresh') return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'fresh' };
+  if (verdict === 'stale') return { dot: 'bg-rose-400', text: 'text-rose-300', label: 'stale' };
+  return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'unknown' };
+}
+
+function ShaFreshnessBlock({
+  shaFreshness,
+}: {
+  shaFreshness: StrategicStateResponse['sha_freshness'];
+}) {
+  if (!shaFreshness) return null;
+  const tone = shaFreshnessTone(shaFreshness.verdict);
+  const candidateSha = shaFreshness.active_candidate_sha?.slice(0, 7) ?? null;
+  const integrationSha = shaFreshness.integration_head_sha?.slice(0, 7) ?? null;
+  const branch = shaFreshness.integration_branch ?? null;
+  const checkedAt = shaFreshness.checked_at ?? null;
+  return (
+    <div className="mt-3 border-t border-neutral-800 pt-3" data-testid="sha-freshness-block">
+      <div className="flex min-w-0 items-center gap-2">
+        <GitBranch className="h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="truncate text-xs font-semibold text-neutral-100">Payload freshness</span>
+            <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${tone.dot}`} aria-hidden="true" />
+            <span className={`shrink-0 text-ui-sm font-semibold uppercase ${tone.text}`} data-testid="freshness-verdict">
+              {tone.label}
+            </span>
+          </div>
+          {(candidateSha || integrationSha || branch) && (
+            <p className="mt-1 truncate text-xs leading-relaxed text-neutral-500" data-testid="freshness-sha-detail">
+              {candidateSha && `candidate @${candidateSha}`}
+              {candidateSha && integrationSha && ' · '}
+              {integrationSha && `head @${integrationSha}`}
+              {(candidateSha || integrationSha) && branch ? ` on ${branch}` : null}
+              {!(candidateSha || integrationSha) && branch ? `branch ${branch}` : null}
+            </p>
+          )}
+          {checkedAt && (
+            <p className="mt-0.5 truncate text-ui-sm text-neutral-600" data-testid="freshness-checked-at">
+              as of {checkedAt}
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function runtimeWorkHasSignal(work?: StrategicRuntimeWorkState | null): work is StrategicRuntimeWorkState {
   if (!work) return false;
   return (
@@ -821,6 +870,7 @@ export function StrategicContextRail({
             )}
           </div>
         )}
+        <ShaFreshnessBlock shaFreshness={shaFreshness} />
       </WorkbenchPanel>
 
       <WorkbenchPanel title="Problem" meta={state?.problem_model.revision ? `r${state.problem_model.revision}` : undefined}>

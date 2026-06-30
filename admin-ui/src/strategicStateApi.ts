@@ -425,6 +425,10 @@ export interface StrategicStateResponse {
     active_candidate_sha?: string | null;
     integration_head_sha?: string | null;
     verdict: 'stale' | 'fresh' | 'unknown' | string;
+    checked_at?: string | null;
+    integration_branch?: string | null;
+    stale?: boolean | null;
+    stale_reason?: string | null;
   } | null;
 }
 

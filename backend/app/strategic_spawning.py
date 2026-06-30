@@ -4115,11 +4115,13 @@ def _build_freshness_shas_block(currency: dict) -> dict:
     exposes payload_sha, active_candidate_sha, integration_head_sha, stale, and
     stale_reason.  payload_compiled_sha is kept for backward-compat with older
     agent consumers that read it directly.
-
-    Not called when currency is None (GitHub indeterminate) — callers must guard.
     """
+    from datetime import datetime
+
     is_stale = not currency["current"]
     return {
+        "verdict": "stale" if is_stale else "fresh",
+        "checked_at": datetime.utcnow().isoformat(),
         "payload_sha": currency["candidate_sha"],
         "payload_compiled_sha": currency["candidate_sha"],
         "active_candidate_sha": currency["candidate_sha"],
@@ -4128,6 +4130,20 @@ def _build_freshness_shas_block(currency: dict) -> dict:
         "stale_reason": (
             "payload_sha_differs_from_integration_head" if is_stale else None
         ),
+    }
+
+
+def _build_unknown_freshness_block() -> dict:
+    """Build a freshness block for when currency resolution was indeterminate.
+
+    Returns a block with verdict='unknown' so consumers can distinguish an
+    unresolved freshness check from a confirmed-fresh or confirmed-stale result.
+    """
+    from datetime import datetime
+
+    return {
+        "verdict": "unknown",
+        "checked_at": datetime.utcnow().isoformat(),
     }
 
 
@@ -6062,10 +6078,12 @@ async def _spawn_strategic_review(
     # _currency dict.  Exposes payload_compiled_sha, active_candidate_sha,
     # integration_head_sha, and an explicit stale/current verdict at cycle start
     # so the agent can detect stale-context before making portfolio decisions.
-    # Best-effort: _currency is None when GitHub was unreachable (no-op below).
-    _payload_staleness: dict | None = None
+    # Always present: 'unknown' verdict when GitHub was unreachable so the agent
+    # can never mistake an indeterminate freshness check for a confirmed-fresh one.
     if _currency is not None:
-        _payload_staleness = _build_freshness_shas_block(_currency)
+        _payload_staleness: dict = _build_freshness_shas_block(_currency)
+    else:
+        _payload_staleness = _build_unknown_freshness_block()
     # Inject explicit list of failed approaches from retired directions so the
     # agent has a clear "do not re-propose" block in the prompt.
     _retired_summary = _build_retired_directions_summary(project)

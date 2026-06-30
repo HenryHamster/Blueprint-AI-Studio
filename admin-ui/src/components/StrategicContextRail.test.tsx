@@ -909,6 +909,69 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).not.toContain('integration @');
   });
 
+  describe('shows_payload_freshness_for_fresh_stale_and_unknown_states', () => {
+    test('fresh state shows emerald verdict and candidate SHA', () => {
+      const freshState: StrategicStateResponse = {
+        ...STATE,
+        sha_freshness: {
+          verdict: 'fresh',
+          active_candidate_sha: 'abc1234def5678',
+          integration_head_sha: 'abc1234def5678',
+          checked_at: '2026-06-30T10:30:00',
+          integration_branch: 'main',
+        },
+      };
+      const { host } = mount({ state: freshState });
+      expect(host.textContent).toContain('Payload freshness');
+      expect(host.textContent).toContain('fresh');
+      expect(host.textContent).toContain('candidate @abc1234');
+      expect(host.textContent).toContain('on main');
+    });
+
+    test('stale state shows stale verdict, candidate SHA, and integration head SHA', () => {
+      const staleState: StrategicStateResponse = {
+        ...STATE,
+        sha_freshness: {
+          verdict: 'stale',
+          active_candidate_sha: 'abc1234def5678',
+          integration_head_sha: 'xyz9876uvw0123',
+          checked_at: '2026-06-30T10:30:00',
+          integration_branch: 'main',
+        },
+      };
+      const { host } = mount({ state: staleState });
+      expect(host.textContent).toContain('Payload freshness');
+      expect(host.textContent).toContain('stale');
+      expect(host.textContent).toContain('candidate @abc1234');
+      expect(host.textContent).toContain('head @xyz9876');
+      expect(host.textContent).toContain('on main');
+    });
+
+    test('unknown state shows unknown verdict without SHA fields', () => {
+      const unknownState: StrategicStateResponse = {
+        ...STATE,
+        sha_freshness: {
+          verdict: 'unknown',
+          checked_at: '2026-06-30T10:30:00',
+        },
+      };
+      const { host } = mount({ state: unknownState });
+      expect(host.textContent).toContain('Payload freshness');
+      expect(host.textContent).toContain('unknown');
+      expect(host.textContent).not.toContain('candidate @');
+      expect(host.textContent).not.toContain('head @');
+    });
+
+    test('graceful render when sha_freshness is absent from response', () => {
+      const noFreshnessState: StrategicStateResponse = {
+        ...STATE,
+        sha_freshness: undefined,
+      };
+      const { host } = mount({ state: noFreshnessState });
+      expect(host.textContent).not.toContain('Payload freshness');
+    });
+  });
+
   test('distinguishes automated refreshes from operator steers', () => {
     const refreshState: StrategicStateResponse = {
       ...STATE,

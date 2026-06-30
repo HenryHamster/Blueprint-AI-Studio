@@ -1779,9 +1779,26 @@ describe('buildPayloadStalenessSection', () => {
     expect(buildPayloadStalenessSection(undefined)).toBe('');
   });
 
-  it('returns empty string for object missing stale boolean', () => {
+  it('returns empty string for object missing stale boolean and no verdict', () => {
     expect(buildPayloadStalenessSection({ payload_compiled_sha: STALE_SHA })).toBe('');
     expect(buildPayloadStalenessSection({})).toBe('');
+  });
+
+  it('unknown verdict — renders explicit UNKNOWN warning, not empty string', () => {
+    const result = buildPayloadStalenessSection({ verdict: 'unknown', checked_at: '2026-06-30T12:00:00' });
+    expect(result).toContain('## Payload Currency (cycle-start check)');
+    expect(result).toContain('⚠ UNKNOWN');
+    expect(result).toContain('freshness check could not be completed');
+    expect(result).toContain('2026-06-30T12:00:00');
+    expect(result).toContain('Treat this payload as potentially stale');
+    expect(result).not.toContain('⚠ STALE');
+    expect(result).not.toContain('CURRENT');
+  });
+
+  it('unknown verdict without checked_at — still renders UNKNOWN section', () => {
+    const result = buildPayloadStalenessSection({ verdict: 'unknown' });
+    expect(result).toContain('⚠ UNKNOWN');
+    expect(result).toContain('freshness check could not be completed');
   });
 
   it('divergence rendered — stale=true shows ⚠ STALE block with truncated SHAs (legacy payload_compiled_sha fallback)', () => {
