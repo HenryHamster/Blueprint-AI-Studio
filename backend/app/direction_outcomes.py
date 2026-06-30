@@ -196,6 +196,14 @@ def credit_gate_merged_count(entry: dict) -> int:
     confirmed-stranded merges can persist them on the entry and have them excluded
     here without touching any credit-gate caller. Legacy entries without the field
     are unchanged (stranded defaults to 0).
+
+    ``stranded_prs_merged`` is reset to 0 by every full recompute in
+    :func:`_update_direction_research_outcomes` because the recompute already
+    excludes stranded tasks from ``verified_prs_merged`` (``is_merged_completion``
+    returns False when ``landed_on_integration`` is explicitly False). The
+    subtraction here only applies in the window between stranding and the next
+    recompute; after a recompute both ``stranded_prs_merged`` and
+    ``verified_prs_merged`` are consistent and the subtraction is a no-op.
     """
     verified = verified_merged_count(entry)
     stranded = int(entry.get("stranded_prs_merged") or 0)
@@ -316,10 +324,10 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
             violations.append(
                 f"reachable ({reachable}) exceeds prs_merged ({prs_merged})"
             )
-    # stranded_prs_merged is a cumulative credit-gate discount marker. It can
-    # persist across later recomputes after the stranded task has already been
-    # removed from the current prs_merged snapshot, so it is not partitioned
-    # against prs_merged here.
+    # stranded_prs_merged is a delta-patch applied between stranding and the next
+    # full recompute; _update_direction_research_outcomes resets it to 0 once a
+    # recompute runs (stranded tasks are already absent from prs_merged at that
+    # point), so it is not partitioned against prs_merged here.
     if "stranded_prs_merged" in entry:
         stranded = int(entry.get("stranded_prs_merged") or 0)
         if stranded < 0:
@@ -1230,6 +1238,15 @@ async def _update_direction_research_outcomes(
         + aggregate_buckets["satisfied_unproven"]
         + aggregate_buckets["undeclared"]
     )
+    # A full recompute already excludes confirmed-stranded tasks from prs_merged
+    # and verified_prs_merged (is_merged_completion returns False when
+    # landed_on_integration is explicitly False). The delta-patch field
+    # stranded_prs_merged written by discount_stranded_pr_from_direction_credit
+    # is only needed in the window between stranding and the next recompute.
+    # Reset it here so credit_gate_merged_count does not double-discount: once
+    # because the stranded task is absent from verified_prs_merged, and again
+    # because stranded_prs_merged still carries the stale delta.
+    entry["stranded_prs_merged"] = 0
     # reachable_prs_merged: the ancestry-confirmed subset of prs_merged — tasks
     # whose persisted context carries landed_on_integration=True (explicit True,
     # NOT the legacy pr_merged fallback). Badge-only/indeterminate merges (key

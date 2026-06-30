@@ -597,6 +597,98 @@ async def test_confirmed_non_landing_discounts_credit_gate(db_session: AsyncSess
 
 
 @pytest.mark.asyncio
+async def test_stranded_merge_no_double_discount_after_recompute(db_session: AsyncSession):
+    """A stranded merge must not double-discount credit_gate_merged_count after a recompute.
+
+    Regression: stranded_prs_merged persisted across _update_direction_research_outcomes
+    calls even though the recompute already excluded the stranded task from
+    verified_prs_merged (is_merged_completion returns False after stranding). The
+    combination subtracted the stranded count twice, driving the gate below the
+    count of legitimate merges.
+    """
+    from app.direction_outcomes import (
+        _update_direction_research_outcomes,
+        credit_gate_merged_count,
+        discount_stranded_pr_from_direction_credit,
+    )
+    from app.landed_signal import mark_stranded_non_landing
+
+    direction_id = "d-no-double-discount"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=3)]
+    await db_session.flush()
+
+    # Task that will be confirmed stranded.
+    stranded_task = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="stranded",
+    )
+    # Task that legitimately landed on integration.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="landed",
+    )
+    await db_session.flush()
+
+    # Initial recompute: both tasks counted before stranding is known.
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 2
+    assert credit_gate_merged_count(entry) == 2
+
+    # Ancestry check confirms the first PR never reached integration.
+    had_pr_merged = bool((stranded_task.context or {}).get("pr_merged"))
+    mark_stranded_non_landing(stranded_task, reason="rollup->integration not ancestor")
+    await db_session.flush()
+    await discount_stranded_pr_from_direction_credit(
+        stranded_task, db_session, had_pr_merged=had_pr_merged
+    )
+
+    # Subsequent recompute (e.g. triggered by a new terminal child task). After
+    # this, the stranded task is already excluded from prs_merged/verified by the
+    # recompute, so stranded_prs_merged must be reset to 0 to avoid a second
+    # subtraction against the legitimate landed merge.
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    # The stranded task is now excluded by is_merged_completion, so stranded_prs_merged
+    # is reset to 0 by the recompute. The legitimate landed merge must still count.
+    assert entry.get("stranded_prs_merged") == 0
+    assert credit_gate_merged_count(entry) == 1  # only the landed task counts
+
+
+@pytest.mark.asyncio
 async def test_discount_stranded_pr_is_idempotent(db_session: AsyncSession):
     """discount_stranded_pr_from_direction_credit must not over-subtract on repeated calls.
 
