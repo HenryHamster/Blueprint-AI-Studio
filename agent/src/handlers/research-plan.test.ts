@@ -2328,6 +2328,53 @@ describe('buildVersionPhaseSection', () => {
     });
     expect(result).not.toContain('Last qualification goal alignment');
   });
+
+  it('renders candidate currency as CURRENT when last_qualification_candidate_currency.current is true', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      last_qualification_candidate_currency: {
+        current: true,
+        candidate_sha: 'aabbcc001122',
+        head_sha: 'aabbcc001122',
+      },
+    });
+    expect(result).toContain('Qualification candidate currency: CURRENT');
+    expect(result).toContain('aabbcc001122');
+    expect(result).toContain('matches integration HEAD');
+    expect(result).not.toContain('STALE');
+  });
+
+  it('renders candidate currency as STALE when last_qualification_candidate_currency.current is false', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      last_qualification_candidate_currency: {
+        current: false,
+        candidate_sha: 'oldsha1234567890',
+        head_sha: 'newsha9876543210',
+      },
+    });
+    expect(result).toContain('Qualification candidate currency: STALE');
+    expect(result).toContain('oldsha123456');
+    expect(result).toContain('newsha987654');
+    expect(result).toContain('fresh qualification');
+    expect(result).not.toContain('CURRENT');
+  });
+
+  it('omits candidate currency block when last_qualification_candidate_currency is absent', () => {
+    const result = buildVersionPhaseSection({ version_number: 3, phase: 'stabilize' });
+    expect(result).not.toContain('Qualification candidate currency');
+  });
+
+  it('omits candidate currency block when last_qualification_candidate_currency is null', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 3,
+      phase: 'stabilize',
+      last_qualification_candidate_currency: null,
+    });
+    expect(result).not.toContain('Qualification candidate currency');
+  });
 });
 
 describe('buildMemoCitationsSection', () => {

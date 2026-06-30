@@ -858,6 +858,22 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     }
   }
 
+  // Version-phase candidate currency: is the last qualification's candidate SHA still HEAD?
+  const lqCurrencyRaw = versionPhase.last_qualification_candidate_currency;
+  if (lqCurrencyRaw && typeof lqCurrencyRaw === 'object' && !Array.isArray(lqCurrencyRaw)) {
+    const lqc = lqCurrencyRaw as Record<string, unknown>;
+    const isCurrent = lqc.current === true;
+    const candidateSha = typeof lqc.candidate_sha === 'string' && lqc.candidate_sha
+      ? lqc.candidate_sha.slice(0, 12) : '?';
+    const headSha = typeof lqc.head_sha === 'string' && lqc.head_sha
+      ? lqc.head_sha.slice(0, 12) : '?';
+    if (isCurrent) {
+      parts.push(`Qualification candidate currency: CURRENT — candidate \`${candidateSha}\` matches integration HEAD. Audit findings reflect live HEAD.`);
+    } else {
+      parts.push(`Qualification candidate currency: STALE — last qualification candidate \`${candidateSha}\` is behind integration HEAD \`${headSha}\`. Audit findings were scored against an older commit; consider requesting a fresh qualification.`);
+    }
+  }
+
   // Goal-coverage drift signal (continuous BUILD/STABILIZE early-warning).
   const driftRaw = versionPhase.goal_coverage_drift;
   if (driftRaw && typeof driftRaw === 'object' && !Array.isArray(driftRaw)) {
