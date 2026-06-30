@@ -1,6 +1,6 @@
 import { useMemo, useRef, useEffect, useState, useCallback } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { Activity, AlertCircle, CheckSquare, LayoutList } from 'lucide-react';
+import { Activity, AlertCircle, CheckSquare, LayoutList, PanelRightOpen } from 'lucide-react';
 import { ColumnsPicker } from './components/ColumnsPicker';
 import type { ColumnPref } from './components/ColumnsPicker';
 import { ConfirmDialog } from './components/ConfirmDialog';
@@ -38,10 +38,8 @@ import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
 import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
-import { StrategicContextRail } from './components/StrategicContextRail';
 import { StrategicContextWorkspace } from './components/StrategicContextWorkspace';
 import { StrategicSessionControl, type StrategicInteractionMode } from './components/StrategicSessionControl';
-import { TaskContextRail } from './components/TaskContextRail';
 import { CommandPaletteHost } from './components/CommandPaletteHost';
 import { parseArmingOutcome, workbenchArmingToastCopy } from './components/messageArming';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
@@ -52,7 +50,7 @@ import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
 import { ProjectWorkspace, RuntimeWorkspace, type ProjectManageSection, type ProjectSection, type RuntimeSection, type RuntimeSettingsSection } from './components/OperatorWorkspaces';
 import { PipelineWorkspace } from './components/PipelineWorkspace';
-import { WorkbenchFrame, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
+import { WorkbenchFrame, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
 import { useStrategicReadModel } from './hooks/useStrategicReadModel';
 import { useOperatorKeyboardShortcuts } from './hooks/useOperatorKeyboardShortcuts';
 import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
@@ -1363,6 +1361,7 @@ export default function App() {
         savingSessionRefs={savingStrategicWorkbench}
         onClose={closeStrategicContextWorkspace}
         onOpenTarget={openStrategicContextWorkspaceTarget}
+        onOpenMessageTarget={strategicMessageTarget.open}
         onUpdateSessionRefs={updateStrategicSessionRefs}
       />
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
@@ -1408,99 +1407,57 @@ export default function App() {
         <WorkbenchSurface
           title="Strategic"
           actions={(
-            <StrategicSessionControl
-              mode={normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode)}
-              saving={savingStrategicWorkbench}
-              localRunner={strategicReadModel.data?.runtime?.local_runner ?? null}
-              runtimeWork={strategicReadModel.data?.runtime?.work ?? null}
-              onModeChange={setStrategicInteractionMode}
-              onOpenDevices={() => {
-                setRuntimeSection('devices');
-                handleTabChange('runtime');
-              }}
-              onOpenCompute={() => {
-                setRuntimeSection('compute');
-                handleTabChange('runtime');
-              }}
-            />
+            <>
+              <StrategicSessionControl
+                mode={normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode)}
+                saving={savingStrategicWorkbench}
+                localRunner={strategicReadModel.data?.runtime?.local_runner ?? null}
+                runtimeWork={strategicReadModel.data?.runtime?.work ?? null}
+                onModeChange={setStrategicInteractionMode}
+                onOpenDevices={() => {
+                  setRuntimeSection('devices');
+                  handleTabChange('runtime');
+                }}
+                onOpenCompute={() => {
+                  setRuntimeSection('compute');
+                  handleTabChange('runtime');
+                }}
+              />
+              <button
+                type="button"
+                onClick={openStrategicContextWorkspace}
+                className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950 px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9"
+                title="Open Strategic sideboard"
+                aria-label="Open Strategic sideboard"
+              >
+                <PanelRightOpen className="h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
+                <span>Context</span>
+              </button>
+            </>
           )}
           flush
         >
-          <WorkbenchSplit
-            main={(
-              <MessagesPanel
-                selectedProjectId={s.selectedProjectId}
-                githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
-                defaultBranch={s.promotionTargetData?.promotion_target || s.integrationBranchData?.integration_branch || undefined}
-                variant="page"
-                filterChrome="minimal"
-                showCloseButton={false}
-                addToast={s.addToast}
-                onMessageCountChange={handleMessageCountChange}
-                onOpenTask={handleViewTask}
-                notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
-                strategistActive={s.strategistActive}
-                cycleProgress={s.cycleProgress}
-                lastCycleCompletion={s.lastCycleCompletion}
-                focusComposerSignal={strategicComposerFocusSignal}
-                targetMessage={strategicMessageTarget.target} onTargetMessageHandled={strategicMessageTarget.clear}
-                strategicState={strategicReadModel.data ?? null} strategicWorkbenchState={strategicWorkbenchState}
-                onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
-                onStrategicInteraction={() => { void persistStrategicWorkbench({ active_surface: 'strategic' }); }}
-                onOpenStrategicContextWorkspace={openStrategicContextWorkspace}
-                onOpenCommandPalette={openCommandPalette}
-              />
-            )}
-            rail={(
-              <div className="space-y-3">
-                <StrategicContextRail
-                  state={strategicReadModel.data}
-                  loading={strategicReadModel.loading}
-                  error={strategicReadModel.error}
-                  strategistActive={s.strategistActive}
-                  cycleProgress={s.cycleProgress}
-                  lastCycleCompletion={s.lastCycleCompletion}
-                  onOpenProjectSection={(section) => {
-                    setProjectSection(section);
-                    handleTabChange('project');
-                  }}
-                  onOpenPipeline={() => handleTabChange('pipeline')}
-                  onOpenRuntimeHealth={() => {
-                    setRuntimeSection('health');
-                    handleTabChange('runtime');
-                  }}
-                  onOpenRuntimeDevices={() => {
-                    setRuntimeSection('devices');
-                    handleTabChange('runtime');
-                  }}
-                  onOpenRuntimeCompute={() => {
-                    setRuntimeSection('compute');
-                    handleTabChange('runtime');
-                  }}
-                  onOpenTask={handleViewTaskById}
-                  onOpenKnowledge={(documentId, directionId) => {
-                    setKnowledgeBrowserInitialDocId(documentId ?? null);
-                    setKnowledgeBrowserDirectionId(directionId ?? null);
-                    s.setShowKnowledgeBrowser(true);
-                  }}
-                  onOpenMessages={strategicMessageTarget.open}
-                  onOpenTarget={openStrategicContextTarget}
-                  workbenchState={strategicWorkbenchState}
-                  savingSessionRefs={savingStrategicWorkbench}
-                  onUpdateSessionRefs={updateStrategicSessionRefs}
-                />
-                <TaskContextRail
-                  currentTask={openPipelineTask}
-                  attentionTasks={backendAttentionTasks}
-                  localFallbackTasks={localAttentionTasks}
-                  trackedTaskIds={s.trackedTaskIds}
-                  {...taskContextSessionProps}
-                  onOpenTask={s.handleViewLogs}
-                  onOpenPipeline={() => handleTabChange('pipeline')}
-                  onTrackTask={s.trackTask}
-                />
-              </div>
-            )}
+          <MessagesPanel
+            selectedProjectId={s.selectedProjectId}
+            githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
+            defaultBranch={s.promotionTargetData?.promotion_target || s.integrationBranchData?.integration_branch || undefined}
+            variant="page"
+            filterChrome="minimal"
+            showCloseButton={false}
+            addToast={s.addToast}
+            onMessageCountChange={handleMessageCountChange}
+            onOpenTask={handleViewTask}
+            notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
+            strategistActive={s.strategistActive}
+            cycleProgress={s.cycleProgress}
+            lastCycleCompletion={s.lastCycleCompletion}
+            focusComposerSignal={strategicComposerFocusSignal}
+            targetMessage={strategicMessageTarget.target} onTargetMessageHandled={strategicMessageTarget.clear}
+            strategicState={strategicReadModel.data ?? null} strategicWorkbenchState={strategicWorkbenchState}
+            onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
+            onStrategicInteraction={() => { void persistStrategicWorkbench({ active_surface: 'strategic' }); }}
+            onOpenStrategicContextWorkspace={openStrategicContextWorkspace}
+            onOpenCommandPalette={openCommandPalette}
           />
         </WorkbenchSurface>
       ) : activeTab !== 'pipeline' && s.showArchive ? (

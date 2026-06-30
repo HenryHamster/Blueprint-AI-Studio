@@ -240,7 +240,10 @@ describe('useWorkbenchCommands', () => {
       setCommandPaletteOpen,
     });
 
-    captured.find(command => command.id === 'strategic.context.workspace')?.run();
+    const sideboardCommand = captured.find(command => command.id === 'strategic.context.workspace');
+    expect(sideboardCommand?.label).toBe('Strategic sideboard');
+    expect(sideboardCommand?.keywords).toContain('sideboard');
+    sideboardCommand?.run();
     expect(openStrategicContextWorkspace).toHaveBeenCalledTimes(1);
 
     expect(captured.filter(command => command.label.includes('Latest report'))).toHaveLength(2);

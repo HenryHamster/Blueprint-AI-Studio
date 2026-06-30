@@ -31,7 +31,7 @@ import {
   type StrategicStateResponse,
   type StrategicWorkbenchState,
 } from '../strategicStateApi';
-import { buildStrategicContextDescriptor, SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
+import { SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -724,10 +724,6 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         return aTime - bTime;
       });
   }, [messages, eventPrefs, tempMutes]);
-  const strategicContextDescriptor = useMemo(
-    () => buildStrategicContextDescriptor(currentStrategicState, strategicWorkbenchState),
-    [currentStrategicState, strategicWorkbenchState],
-  );
   const showStrategicStatusStrip = conversationMode && Boolean(
     strategistActive
       || strategicRefresh
@@ -1941,7 +1937,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         onCancelReply={() => setReplyTo(null)}
         onSubmit={handleSubmit}
         chrome={conversationMode ? 'minimal' : 'full'}
-        strategicContext={conversationMode ? strategicContextDescriptor : null}
+        strategicContext={null}
         onOpenStrategicContext={conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined}
         onOpenCommandPalette={conversationMode ? onOpenCommandPalette : undefined}
       />

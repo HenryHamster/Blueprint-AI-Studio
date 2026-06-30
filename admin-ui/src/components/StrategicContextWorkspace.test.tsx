@@ -7,6 +7,24 @@ import type { StrategicStateResponse, StrategicWorkbenchState } from '../strateg
 type SessionRefs = StrategicWorkbenchState['selected_refs'];
 
 const STATE = {
+  attention: {
+    level: 'needs_operator',
+    summary: 'One operator decision is waiting.',
+    last_seen_at: null,
+    counts: {
+      needs_operator: 1,
+      watch: 2,
+      unread: 3,
+      questions: 1,
+      blockers: 0,
+      approvals: 1,
+      manual_directions: 0,
+      failed_tasks: 1,
+      blocked_tasks: 1,
+      parked_tasks: 0,
+    },
+    items: [],
+  },
   context_package: {
     id: 'strategic-context:proj-1',
     title: 'Workbench context package',
@@ -129,7 +147,109 @@ const STATE = {
         target: { surface: 'knowledge', document_id: 'operator-notes' },
       },
     ],
-    curated_metrics: [],
+    curated_metrics: [
+      {
+        id: 'runtime.compute_failed',
+        label: 'failed compute',
+        value: 2,
+        tone: 'critical',
+        target: { surface: 'runtime', section: 'compute' },
+      },
+      {
+        id: 'messages.questions',
+        label: 'questions',
+        value: 1,
+        tone: 'warning',
+        target: { surface: 'messages' },
+      },
+    ],
+    actions: [
+      {
+        id: 'reply-operator',
+        kind: 'reply',
+        label: 'Reply to operator question',
+        reason: 'Strategic needs a routing choice',
+        priority: 'critical',
+        source: 'message',
+        target: { surface: 'messages', message_id: 'msg-operator' },
+        enabled: true,
+      },
+      {
+        id: 'inspect-compute',
+        kind: 'inspect',
+        label: 'Inspect compute failures',
+        reason: 'Recent compute failed',
+        priority: 'high',
+        source: 'runtime',
+        target: { surface: 'runtime', section: 'compute' },
+        enabled: true,
+      },
+    ],
+  },
+  runtime: {
+    local_runner: {
+      mode: 'local_ready',
+      strategic_runner_count: 2,
+      live_runner_count: 1,
+      eligible_live_count: 1,
+      stale_runner_count: 0,
+      busy_runner_count: 0,
+      agent_unavailable_count: 0,
+      active_task_pinned: false,
+      fallback_reason: null,
+      liveness_window_seconds: 90,
+    },
+    work: {
+      compute_jobs: {
+        window_minutes: 60,
+        counts: {
+          active: 1,
+          terminal_recent: 3,
+          total: 4,
+          queued: 2,
+          starting: 0,
+          running: 1,
+          polling: 0,
+          succeeded_recent: 2,
+          failed_recent: 1,
+          cancelled_recent: 0,
+          timed_out_recent: 0,
+          criterion_measured: 0,
+          criterion_met: 0,
+        },
+        spend: {
+          active_accrued_usd: 0,
+          recent_terminal_usd: 0,
+          window_total_usd: 0,
+        },
+        items: [],
+      },
+      held_approvals: { count: 1, items: [] },
+      parked_wakes: {
+        counts: {
+          active: 0,
+          pending: 0,
+          fired: 0,
+          problem: 0,
+          expired: 0,
+          failed: 0,
+        },
+        items: [],
+      },
+    },
+  },
+  tasks: {
+    counts: {
+      queued: 2,
+      running: 1,
+      evaluating: 0,
+      blocked: 1,
+      parked: 0,
+      failed: 1,
+      completed: 3,
+      total: 8,
+    },
+    cumulative_estimated_cost_usd: 0,
   },
 } as StrategicStateResponse;
 
@@ -180,6 +300,15 @@ describe('StrategicContextWorkspace', () => {
     const { host } = mount();
 
     expect(host.textContent).toContain('Strategic context');
+    expect(host.textContent).toContain('Session');
+    expect(host.textContent).toContain('Workday');
+    expect(host.textContent).toContain('Runner');
+    expect(host.textContent).toContain('1 runner ready');
+    expect(host.textContent).toContain('Compute');
+    expect(host.textContent).toContain('needs check');
+    expect(host.textContent).toContain('One operator decision is waiting.');
+    expect(host.textContent).toContain('failed compute');
+    expect(host.textContent).toContain('Reply to operator question');
     expect(host.textContent).toContain('Workbench context package');
     expect(host.textContent).toContain('Operator notes');
     expect(host.textContent).toContain('reviewing');
@@ -228,5 +357,28 @@ describe('StrategicContextWorkspace', () => {
       task_id: 'task-context-1',
       artifact_id: 'deep-artifact',
     });
+  });
+
+  test('opens sideboard session targets and closes the workspace', () => {
+    const onClose = vi.fn();
+    const onOpenTarget = vi.fn();
+    const onOpenMessageTarget = vi.fn();
+    const { host } = mount({ onClose, onOpenTarget, onOpenMessageTarget });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.title === 'Open Runner')
+      ?.click();
+    expect(onOpenTarget).toHaveBeenLastCalledWith({ surface: 'runtime', section: 'devices' });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.title === 'Open failed compute')
+      ?.click();
+    expect(onOpenTarget).toHaveBeenLastCalledWith({ surface: 'runtime', section: 'compute' });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.title === 'Open Reply to operator question')
+      ?.click();
+    expect(onOpenMessageTarget).toHaveBeenLastCalledWith({ messageId: 'msg-operator', action: 'reply' });
+    expect(onClose).toHaveBeenCalledTimes(3);
   });
 });

@@ -450,6 +450,19 @@ def _stamp_remediation_spawn_on_direction(
         direction["last_remediation_fingerprint"] = str(fingerprint)
 
 
+def _phase_runner_affinity(task: Task) -> str | None:
+    """Return the local-runner id a completed phase should prefer next."""
+    ctx = task.context or {}
+    runner_target_id = ctx.get("runner_target_id")
+    if isinstance(runner_target_id, str) and runner_target_id.strip():
+        return runner_target_id.strip()
+    vm_instance_id = task.vm_instance_id
+    if isinstance(vm_instance_id, str) and vm_instance_id.startswith("runner:"):
+        runner_id = vm_instance_id.removeprefix("runner:").strip()
+        return runner_id or None
+    return None
+
+
 # Cap on the per-direction remediation-outcome history list length.
 _REMEDIATION_HISTORY_MAX = 5
 
@@ -4588,6 +4601,7 @@ async def _handle_design_doc_completion(
     # it into Phase 2 so the steering directive survives even when the operator
     # message has aged out of the live conversation-thread snapshot.
     steering_excerpt = (task.context or {}).get("steering_excerpt")
+    preferred_runner_target_id = _phase_runner_affinity(task)
     spawned = None
     try:
         # Wave F4 H9: removed `await session.refresh(project)`. The caller
@@ -4602,6 +4616,7 @@ async def _handle_design_doc_completion(
             cycle_id=cycle_id,
             operator_steered=operator_steered,
             steering_excerpt=steering_excerpt,
+            preferred_runner_target_id=preferred_runner_target_id,
         )
         if spawned:
             phase2_spawned = True

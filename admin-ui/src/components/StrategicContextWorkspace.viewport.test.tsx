@@ -6,6 +6,24 @@ import { expectMinTouchTargetAt, expectNoOverflowAt } from '../test/viewport';
 import type { StrategicStateResponse } from '../strategicStateApi';
 
 const STATE = {
+  attention: {
+    level: 'needs_operator',
+    summary: 'A long-running operator attention summary should truncate without widening the sideboard.',
+    last_seen_at: null,
+    counts: {
+      needs_operator: 2,
+      watch: 3,
+      unread: 4,
+      questions: 1,
+      blockers: 0,
+      approvals: 1,
+      manual_directions: 0,
+      failed_tasks: 1,
+      blocked_tasks: 1,
+      parked_tasks: 0,
+    },
+    items: [],
+  },
   context_package: {
     id: 'strategic-context:proj-viewport',
     title: 'Strategic context package with long operator-facing labels',
@@ -87,6 +105,83 @@ const STATE = {
       },
     ],
     curated_metrics: [],
+    actions: [
+      {
+        id: 'viewport-action',
+        kind: 'inspect',
+        label: 'Inspect unusually long runtime compute and local runner monitoring target',
+        reason: 'The label and detail should stay inside the drawer at narrow widths.',
+        priority: 'high',
+        source: 'runtime',
+        target: { surface: 'runtime', section: 'compute' },
+        enabled: true,
+      },
+    ],
+  },
+  runtime: {
+    local_runner: {
+      mode: 'local_ready',
+      strategic_runner_count: 2,
+      live_runner_count: 1,
+      eligible_live_count: 1,
+      stale_runner_count: 0,
+      busy_runner_count: 0,
+      agent_unavailable_count: 0,
+      active_task_pinned: false,
+      fallback_reason: null,
+      liveness_window_seconds: 90,
+    },
+    work: {
+      compute_jobs: {
+        window_minutes: 60,
+        counts: {
+          active: 1,
+          terminal_recent: 2,
+          total: 3,
+          queued: 1,
+          starting: 0,
+          running: 1,
+          polling: 0,
+          succeeded_recent: 1,
+          failed_recent: 1,
+          cancelled_recent: 0,
+          timed_out_recent: 0,
+          criterion_measured: 0,
+          criterion_met: 0,
+        },
+        spend: {
+          active_accrued_usd: 0,
+          recent_terminal_usd: 0,
+          window_total_usd: 0,
+        },
+        items: [],
+      },
+      held_approvals: { count: 0, items: [] },
+      parked_wakes: {
+        counts: {
+          active: 0,
+          pending: 0,
+          fired: 0,
+          problem: 0,
+          expired: 0,
+          failed: 0,
+        },
+        items: [],
+      },
+    },
+  },
+  tasks: {
+    counts: {
+      queued: 1,
+      running: 1,
+      evaluating: 0,
+      blocked: 1,
+      parked: 0,
+      failed: 1,
+      completed: 2,
+      total: 6,
+    },
+    cumulative_estimated_cost_usd: 0,
   },
 } as StrategicStateResponse;
 

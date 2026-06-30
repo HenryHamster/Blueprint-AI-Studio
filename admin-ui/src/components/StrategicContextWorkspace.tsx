@@ -1,12 +1,17 @@
 import { useEffect, type ReactNode } from 'react';
-import { ArrowUpRight, GitBranch, Link2, Network, Plus, X } from 'lucide-react';
+import { Activity, ArrowUpRight, CircleAlert, Cpu, GitBranch, Link2, Network, Plus, Server, X } from 'lucide-react';
 import type {
   StrategicContextArtifactEvidence,
   StrategicContextCanvasNode,
   StrategicContextPackageDrilldown,
   StrategicContextResourceRef,
+  StrategicMessageTarget,
+  StrategicLocalRunnerState,
+  StrategicRuntimeWorkState,
   StrategicStateResponse,
   StrategicWorkbenchState,
+  StrategicWorkSessionAction,
+  StrategicWorkSessionMetric,
   StrategicWorkSessionRefDescriptor,
 } from '../strategicStateApi';
 import {
@@ -25,10 +30,16 @@ interface StrategicContextWorkspaceProps {
   savingSessionRefs?: boolean;
   onClose: () => void;
   onOpenTarget: (target?: StrategicContextTarget | null) => void;
+  onOpenMessageTarget?: (target?: StrategicMessageTarget) => void;
   onUpdateSessionRefs?: (
     updateRefs: (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs']
   ) => void;
 }
+
+type OpenContextTarget = (
+  target?: StrategicContextTarget | null,
+  messageAction?: StrategicMessageTarget['action'],
+) => void;
 
 function formatCompactNumber(value: number | null | undefined): string {
   const n = Number(value ?? 0);
@@ -105,6 +116,130 @@ function targetLabel(target?: StrategicContextTarget | null): string | null {
   const parts = [target.surface, target.section, target.task_id, target.document_id, target.artifact_id]
     .filter((part): part is string => typeof part === 'string' && part.trim().length > 0);
   return parts.join(' / ');
+}
+
+function pluralize(count: number, singular: string): string {
+  return `${count} ${singular}${count === 1 ? '' : 's'}`;
+}
+
+function shortId(value?: string | null): string | null {
+  return value ? value.slice(0, 8) : null;
+}
+
+function compactDetail(...parts: Array<string | null | undefined>): string | null {
+  const detailParts = parts.map(part => part?.trim()).filter((part): part is string => Boolean(part));
+  return detailParts.length > 0 ? detailParts.join(' / ') : null;
+}
+
+function sessionModeLabel(mode?: string | null): string {
+  if (mode === 'check_in') return 'Check-in';
+  if (mode === 'monitor') return 'Monitor';
+  if (mode === 'continuous') return 'Workday';
+  return 'Chat';
+}
+
+function localRunnerTone(localRunner: StrategicLocalRunnerState): { dot: string; text: string; label: string } {
+  if (localRunner.mode === 'local') return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'local' };
+  if (localRunner.mode === 'local_ready') return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'ready' };
+  if (localRunner.mode === 'pending_local') return { dot: 'bg-amber-300', text: 'text-amber-300', label: 'waiting' };
+  if (localRunner.mode === 'cloud') return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'cloud' };
+  return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'unknown' };
+}
+
+function localRunnerDetail(localRunner: StrategicLocalRunnerState): string {
+  if (localRunner.mode === 'local') {
+    const parts = [
+      shortId(localRunner.active_runner_id) ? `runner ${shortId(localRunner.active_runner_id)}` : null,
+      localRunner.active_task_runtime?.model ?? null,
+    ].filter(Boolean);
+    return parts.length > 0 ? `Running on ${parts.join(' / ')}` : 'Current Strategic cycle is pinned locally';
+  }
+  if (localRunner.eligible_live_count > 0) return `${pluralize(localRunner.eligible_live_count, 'runner')} ready`;
+  if (localRunner.fallback_reason === 'no_runner') return 'No local Strategic runner enrolled';
+  if (localRunner.fallback_reason === 'runner_offline') return `${pluralize(localRunner.strategic_runner_count, 'runner')} enrolled, none live`;
+  if (localRunner.fallback_reason === 'agent_unavailable') return 'Runner live, agent unavailable';
+  if (localRunner.fallback_reason === 'at_capacity') return 'Runner busy with active work';
+  if (localRunner.fallback_reason === 'cloud_dispatch') return 'Current cycle already dispatched outside the runner';
+  if (localRunner.fallback_reason === 'runner_claim_pending') return 'Pinned locally; waiting for runner claim';
+  return 'Local runner is not available for Strategic work';
+}
+
+function runtimeWorkTone(work: StrategicRuntimeWorkState): { dot: string; text: string; label: string } {
+  if (
+    (work.local_runner_holds?.count ?? 0) > 0 ||
+    (work.held_approvals?.count ?? 0) > 0 ||
+    (work.parked_wakes?.counts.problem ?? 0) > 0
+  ) {
+    return { dot: 'bg-amber-300', text: 'text-amber-300', label: 'needs check' };
+  }
+  if ((work.compute_jobs?.counts.failed_recent ?? 0) > 0 || (work.compute_jobs?.counts.timed_out_recent ?? 0) > 0) {
+    return { dot: 'bg-rose-400', text: 'text-rose-300', label: 'recent failure' };
+  }
+  if ((work.compute_jobs?.counts.active ?? 0) > 0 || (work.parked_wakes?.counts.active ?? 0) > 0) {
+    return { dot: 'bg-cyan-400', text: 'text-cyan-300', label: 'active' };
+  }
+  if ((work.compute_jobs?.counts.terminal_recent ?? 0) > 0) {
+    return { dot: 'bg-neutral-500', text: 'text-neutral-400', label: 'recent result' };
+  }
+  return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'quiet' };
+}
+
+function runtimeWorkDetail(work: StrategicRuntimeWorkState): string {
+  const parts = [
+    (work.compute_jobs?.counts.active ?? 0) > 0 ? pluralize(work.compute_jobs.counts.active, 'compute job') : null,
+    (work.compute_jobs?.counts.queued ?? 0) > 0 ? `${formatCompactNumber(work.compute_jobs.counts.queued)} queued` : null,
+    (work.local_runner_holds?.count ?? 0) > 0 ? pluralize(work.local_runner_holds?.count ?? 0, 'local runner hold') : null,
+    (work.held_approvals?.count ?? 0) > 0 ? pluralize(work.held_approvals.count, 'approval') : null,
+    (work.parked_wakes?.counts.active ?? 0) > 0 ? pluralize(work.parked_wakes.counts.active, 'parked wake') : null,
+    (work.compute_jobs?.counts.failed_recent ?? 0) > 0 ? pluralize(work.compute_jobs.counts.failed_recent, 'recent failure') : null,
+    (work.compute_jobs?.counts.timed_out_recent ?? 0) > 0 ? pluralize(work.compute_jobs.counts.timed_out_recent, 'timeout') : null,
+  ].filter(Boolean);
+  if (parts.length > 0) return parts.join(' / ');
+  const terminal = work.compute_jobs?.counts.terminal_recent ?? 0;
+  return terminal > 0 ? pluralize(terminal, 'recent compute result') : 'No active background work';
+}
+
+function metricValueDetail(metric: StrategicWorkSessionMetric): string {
+  const raw = metric.value;
+  const value = typeof raw === 'number'
+    ? (Number.isInteger(raw) ? String(raw) : raw.toFixed(2))
+    : String(raw ?? '');
+  const unit = metric.unit?.trim();
+  return unit ? `${value} ${unit}` : value;
+}
+
+function metricToneClass(tone?: string | null): string {
+  if (tone === 'critical') return 'text-rose-300';
+  if (tone === 'warning') return 'text-amber-300';
+  if (tone === 'active') return 'text-cyan-300';
+  if (tone === 'watch') return 'text-neutral-200';
+  return 'text-neutral-100';
+}
+
+function workSessionActionDetail(action: StrategicWorkSessionAction): string | null {
+  return compactDetail(!action.enabled ? action.blocked_reason : action.reason, action.priority === 'normal' ? null : action.priority);
+}
+
+function normalizeActionTarget(action: StrategicWorkSessionAction): StrategicContextTarget | null {
+  const target = action.target ?? null;
+  if (!target) return null;
+  if (target.surface) return target;
+  if (target.task_id) return { ...target, surface: 'task' };
+  if (target.message_id) return { ...target, surface: 'messages' };
+  return null;
+}
+
+function messageTargetFromContextTarget(
+  target?: StrategicContextTarget | null,
+  fallbackAction?: StrategicMessageTarget['action'],
+): StrategicMessageTarget | null {
+  if (target?.surface !== 'messages') return null;
+  const messageId = target.message_id?.trim();
+  if (!messageId) return null;
+  const action = target.action === 'reply' || target.action === 'highlight'
+    ? target.action
+    : fallbackAction;
+  return action ? { messageId, action } : { messageId };
 }
 
 function Section({
@@ -200,7 +335,7 @@ function ContextRow({
   selected?: boolean;
   saving?: boolean;
   badge?: ReactNode;
-  onOpenTarget: (target?: StrategicContextTarget | null) => void;
+  onOpenTarget: OpenContextTarget;
   onKeep?: () => void;
   onRemove?: () => void;
 }) {
@@ -267,6 +402,134 @@ function StatusBadge({ status }: { status?: string | null }) {
   );
 }
 
+function SessionSummaryButton({
+  icon,
+  label,
+  value,
+  detail,
+  tone,
+  target,
+  onOpenTarget,
+}: {
+  icon: ReactNode;
+  label: string;
+  value: string;
+  detail?: string | null;
+  tone?: { dot: string; text: string };
+  target?: StrategicContextTarget | null;
+  onOpenTarget: OpenContextTarget;
+}) {
+  const canOpen = Boolean(target);
+  const className = 'flex min-h-11 min-w-0 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950/50 px-2.5 py-2 text-left';
+  const content = (
+    <>
+      <span className="shrink-0 text-neutral-500">{icon}</span>
+      <span className="min-w-0 flex-1">
+        <span className="flex min-w-0 items-center gap-1.5">
+          {tone && <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${tone.dot}`} aria-hidden="true" />}
+          <span className={`truncate text-xs font-semibold ${tone?.text ?? 'text-neutral-100'}`}>{value}</span>
+        </span>
+        <span className="block truncate font-mono text-ui-sm uppercase text-neutral-500">{label}</span>
+        {detail && <span className="mt-0.5 block truncate text-xs text-neutral-500">{detail}</span>}
+      </span>
+      {canOpen && <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
+    </>
+  );
+  if (!canOpen) return <div className={className}>{content}</div>;
+  return (
+    <button
+      type="button"
+      onClick={() => onOpenTarget(target)}
+      className={`${className} transition-colors hover:border-neutral-700 hover:bg-neutral-900`}
+      title={`Open ${label}`}
+    >
+      {content}
+    </button>
+  );
+}
+
+function MetricButton({
+  metric,
+  onOpenTarget,
+}: {
+  metric: StrategicWorkSessionMetric;
+  onOpenTarget: OpenContextTarget;
+}) {
+  const canOpen = Boolean(metric.target);
+  const className = 'min-h-11 min-w-0 rounded-md border border-neutral-800 bg-neutral-950/50 px-2.5 py-2 text-left';
+  const content = (
+    <>
+      <span className={`block truncate text-sm font-semibold ${metricToneClass(metric.tone)}`}>
+        {metricValueDetail(metric)}
+      </span>
+      <span className="mt-0.5 block truncate text-ui-sm font-semibold uppercase text-neutral-500">
+        {metric.label}
+        {metric.tone && metric.tone !== 'neutral' ? ` / ${metric.tone}` : ''}
+      </span>
+    </>
+  );
+  if (!canOpen) return <div className={className}>{content}</div>;
+  return (
+    <button
+      type="button"
+      onClick={() => onOpenTarget(metric.target)}
+      className={`${className} transition-colors hover:border-neutral-700 hover:bg-neutral-900`}
+      title={`Open ${metric.label}`}
+    >
+      {content}
+    </button>
+  );
+}
+
+function WorkSessionActionRow({
+  action,
+  onOpenTarget,
+}: {
+  action: StrategicWorkSessionAction;
+  onOpenTarget: OpenContextTarget;
+}) {
+  const target = normalizeActionTarget(action);
+  const canOpen = Boolean(action.enabled && target);
+  return (
+    <button
+      type="button"
+      disabled={!canOpen}
+      onClick={() => onOpenTarget(target, action.kind === 'reply' ? 'reply' : 'highlight')}
+      className="flex min-h-11 min-w-0 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950/50 px-2.5 py-2 text-left transition-colors hover:border-neutral-700 hover:bg-neutral-900 disabled:cursor-default disabled:opacity-60"
+      title={canOpen ? `Open ${action.label}` : action.label}
+    >
+      <span className="min-w-0 flex-1">
+        <span className="flex min-w-0 items-center gap-1.5">
+          <span className="truncate text-xs font-semibold text-neutral-100">{action.label}</span>
+          {!action.enabled && (
+            <span className="shrink-0 rounded border border-neutral-800 px-1 text-ui-sm font-semibold uppercase text-neutral-500">
+              blocked
+            </span>
+          )}
+        </span>
+        <span className="mt-0.5 block truncate text-ui-sm font-semibold uppercase text-neutral-500">
+          {compactDetail(action.kind, action.source, targetLabel(target)) ?? 'session action'}
+        </span>
+        {workSessionActionDetail(action) && (
+          <span className="mt-0.5 block line-clamp-2 text-xs leading-relaxed text-neutral-500">
+            {workSessionActionDetail(action)}
+          </span>
+        )}
+      </span>
+      {canOpen && <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
+    </button>
+  );
+}
+
+function AttentionCountPill({ label, value }: { label: string; value: number }) {
+  return (
+    <span className="inline-flex min-h-8 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/50 px-2 text-xs text-neutral-500">
+      <span className="font-semibold text-neutral-100">{formatCompactNumber(value)}</span>
+      <span className="truncate">{label}</span>
+    </span>
+  );
+}
+
 export function StrategicContextWorkspace({
   open,
   state,
@@ -274,6 +537,7 @@ export function StrategicContextWorkspace({
   savingSessionRefs = false,
   onClose,
   onOpenTarget,
+  onOpenMessageTarget,
   onUpdateSessionRefs,
 }: StrategicContextWorkspaceProps) {
   useEffect(() => {
@@ -309,9 +573,35 @@ export function StrategicContextWorkspace({
     tokenCount > 0 ? `${formatCompactNumber(tokenCount)} tokens` : null,
     contextPackage?.updated_at ? `updated ${contextPackage.updated_at}` : null,
   ].filter(Boolean).join(' / ');
+  const workSession = state?.work_session ?? null;
+  const localRunner = state?.runtime?.local_runner ?? null;
+  const runtimeWork = state?.runtime?.work ?? null;
+  const localRunnerStatus = localRunner ? localRunnerTone(localRunner) : null;
+  const runtimeWorkStatus = runtimeWork ? runtimeWorkTone(runtimeWork) : null;
+  const workSessionActions = (workSession?.actions ?? []).slice(0, 4);
+  const workSessionMetrics = (workSession?.curated_metrics ?? []).slice(0, 6);
+  const attentionCounts = state?.attention?.counts ?? null;
+  const attentionPills = attentionCounts ? [
+    { label: 'needs', value: attentionCounts.needs_operator },
+    { label: 'watch', value: attentionCounts.watch },
+    { label: 'unread', value: attentionCounts.unread },
+    { label: 'questions', value: attentionCounts.questions },
+    { label: 'approvals', value: attentionCounts.approvals },
+    { label: 'blocked', value: attentionCounts.blocked_tasks },
+    { label: 'failed', value: attentionCounts.failed_tasks },
+  ].filter(item => item.value > 0).slice(0, 6) : [];
 
-  const handleOpenTarget = (target?: StrategicContextTarget | null): void => {
+  const handleOpenTarget = (
+    target?: StrategicContextTarget | null,
+    messageAction?: StrategicMessageTarget['action'],
+  ): void => {
     if (!target) return;
+    const messageTarget = messageTargetFromContextTarget(target, messageAction);
+    if (messageTarget && onOpenMessageTarget) {
+      onClose();
+      onOpenMessageTarget(messageTarget);
+      return;
+    }
     onClose();
     onOpenTarget(target);
   };
@@ -393,6 +683,85 @@ export function StrategicContextWorkspace({
 
         <div className="min-h-0 flex-1 overflow-auto p-3 custom-scrollbar md:p-4">
           <div className="grid min-w-0 max-w-full grid-cols-1 gap-3">
+            <Section
+              title="Session"
+              meta={sessionModeLabel(workbenchState?.interaction_mode ?? workSession?.mode)}
+              testId="strategic-context-workspace-session"
+            >
+              <div className="space-y-3">
+                <div className="grid gap-2 md:grid-cols-2">
+                  {localRunner && localRunnerStatus && (
+                    <SessionSummaryButton
+                      icon={<Server className="h-4 w-4" aria-hidden="true" />}
+                      label="Runner"
+                      value={localRunnerStatus.label}
+                      detail={localRunnerDetail(localRunner)}
+                      tone={localRunnerStatus}
+                      target={{ surface: 'runtime', section: 'devices' }}
+                      onOpenTarget={handleOpenTarget}
+                    />
+                  )}
+                  {runtimeWork && runtimeWorkStatus && (
+                    <SessionSummaryButton
+                      icon={<Cpu className="h-4 w-4" aria-hidden="true" />}
+                      label="Compute"
+                      value={runtimeWorkStatus.label}
+                      detail={runtimeWorkDetail(runtimeWork)}
+                      tone={runtimeWorkStatus}
+                      target={{ surface: 'runtime', section: 'compute' }}
+                      onOpenTarget={handleOpenTarget}
+                    />
+                  )}
+                  {state?.attention && (
+                    <SessionSummaryButton
+                      icon={<CircleAlert className="h-4 w-4" aria-hidden="true" />}
+                      label="Attention"
+                      value={state.attention.level.replace(/_/g, ' ')}
+                      detail={state.attention.summary}
+                      tone={{
+                        dot: state.attention.level === 'needs_operator' ? 'bg-amber-300' : 'bg-neutral-500',
+                        text: state.attention.level === 'needs_operator' ? 'text-amber-300' : 'text-neutral-300',
+                      }}
+                      target={{ surface: 'messages' }}
+                      onOpenTarget={handleOpenTarget}
+                    />
+                  )}
+                  <SessionSummaryButton
+                    icon={<Activity className="h-4 w-4" aria-hidden="true" />}
+                    label="Work"
+                    value={`${formatCompactNumber(state?.tasks?.counts.running ?? 0)} running`}
+                    detail={`${formatCompactNumber(state?.tasks?.counts.queued ?? 0)} queued / ${formatCompactNumber(state?.tasks?.counts.blocked ?? 0)} blocked`}
+                    target={{ surface: 'pipeline', section: 'flow' }}
+                    onOpenTarget={handleOpenTarget}
+                  />
+                </div>
+
+                {attentionPills.length > 0 && (
+                  <div className="flex min-w-0 flex-wrap gap-1.5" aria-label="Attention counts">
+                    {attentionPills.map(item => (
+                      <AttentionCountPill key={item.label} label={item.label} value={item.value} />
+                    ))}
+                  </div>
+                )}
+
+                {workSessionMetrics.length > 0 && (
+                  <div className="grid gap-2 sm:grid-cols-3" data-testid="strategic-session-metrics">
+                    {workSessionMetrics.map(metric => (
+                      <MetricButton key={metric.id} metric={metric} onOpenTarget={handleOpenTarget} />
+                    ))}
+                  </div>
+                )}
+
+                {workSessionActions.length > 0 && (
+                  <div className="grid gap-2 lg:grid-cols-2" data-testid="strategic-session-actions">
+                    {workSessionActions.map(action => (
+                      <WorkSessionActionRow key={action.id} action={action} onOpenTarget={handleOpenTarget} />
+                    ))}
+                  </div>
+                )}
+              </div>
+            </Section>
+
             <Section
               title="Kept context"
               meta={`${selectedRefDescriptors.length}/${MAX_STRATEGIC_SELECTED_REFS}`}

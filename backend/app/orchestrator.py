@@ -730,6 +730,7 @@ async def _try_runner_dispatch(
         task_type,
         accelerator,
         runner_pins_this_cycle,
+        preferred_runner_target_id=ctx.get("preferred_runner_target_id"),
     )
     if runner is None:
         return False
@@ -799,15 +800,17 @@ def _select_eligible_runner(
     task_type: str,
     accelerator: str | None,
     runner_pins_this_cycle: dict[uuid.UUID, int],
+    preferred_runner_target_id: str | None = None,
 ) -> "LocalRunner | RunnerDispatchSnapshot | None":
     """Pick the least-loaded eligible runner for a task/job, or None.
 
     Eligibility: the runner handles ``task_type`` (its advertised allowlist) and is
     not at its per-cycle pull capacity; when an ``accelerator`` is declared it must
-    also advertise ``has_gpu`` (a CPU runner cannot provide a GPU). Selection prefers
-    the least EFFECTIVE load — heartbeat-reported active count plus pins already made
-    to the runner this cycle — so a same-cycle burst spreads across a fleet instead
-    of stacking onto one runner.
+    also advertise ``has_gpu`` (a CPU runner cannot provide a GPU). A preferred
+    runner wins only after those eligibility checks pass; otherwise selection
+    prefers the least EFFECTIVE load — heartbeat-reported active count plus pins
+    already made to the runner this cycle — so a same-cycle burst spreads across
+    a fleet instead of stacking onto one runner.
 
     Shared by agent-task dispatch (:func:`_try_runner_dispatch`) and direct
     compute-job dispatch (:func:`_dispatch_compute_experiment_directly`) so both use
@@ -825,6 +828,14 @@ def _select_eligible_runner(
         eligible = [r for r in eligible if (r.capabilities or {}).get("has_gpu")]
     if not eligible:
         return None
+    if preferred_runner_target_id:
+        preferred_runner_id = str(preferred_runner_target_id).strip()
+        preferred = next(
+            (r for r in eligible if str(r.id) == preferred_runner_id),
+            None,
+        )
+        if preferred is not None:
+            return preferred
     return min(
         eligible,
         key=lambda r: _runner_active_work_count(r)

@@ -715,7 +715,7 @@ describe('MessagesPanel chrome modes', () => {
     expect(strip?.textContent).not.toContain('3 running / 5 queued');
   });
 
-  test('minimal chat composer shows optimistic Strategic session context descriptor', async () => {
+  test('minimal chat composer does not duplicate the current-session sideboard opener', async () => {
     const sessionStartedAt = new Date(Date.now() - 30 * 60_000).toISOString();
     const lastInteractionAt = new Date(Date.now() - 5 * 60_000).toISOString();
     const el = await renderPanel({
@@ -774,45 +774,7 @@ describe('MessagesPanel chrome modes', () => {
     });
 
     const descriptor = el.querySelector('[data-testid="strategic-context-descriptor"]');
-    expect(descriptor?.textContent).toContain('Context');
-    expect(descriptor?.textContent).toContain('Workbench context');
-    expect(descriptor?.textContent).toContain('Workday');
-    expect(descriptor?.textContent).toContain('8 nodes / 7 links');
-    expect(descriptor?.textContent).toContain('18 items');
-    expect(descriptor?.textContent).toContain('Latest context report');
-    expect(descriptor?.textContent).not.toContain('Operator notes');
-  });
-
-  test('minimal chat context descriptor opens Strategic context workspace', async () => {
-    const onOpenStrategicContextWorkspace = vi.fn();
-    const el = await renderPanel({
-      filterChrome: 'minimal',
-      strategicState: makeStrategicState({
-        work_session: {
-          version: 1,
-          id: 'strategic-session:proj-1:2026-06-29T01:00:00Z',
-          mode: 'continuous',
-          active_surface: 'strategic',
-          session_started_at: '2026-06-29T01:00:00Z',
-          last_interaction_at: '2026-06-29T01:08:00Z',
-          context_package_id: 'strategic-context:proj-1',
-          attention_level: 'watch',
-          selected_refs: [
-            { kind: 'artifact', id: 'artifact:operator-context-report', label: 'Latest context report' },
-          ],
-          selected_ref_descriptors: [],
-          curated_metrics: [],
-        },
-      }),
-      onOpenStrategicContextWorkspace,
-    });
-
-    const descriptor = el.querySelector('[data-testid="strategic-context-descriptor"]') as HTMLButtonElement | null;
-    expect(descriptor).not.toBeNull();
-    await act(async () => {
-      descriptor?.click();
-    });
-    expect(onOpenStrategicContextWorkspace).toHaveBeenCalledTimes(1);
+    expect(descriptor).toBeNull();
   });
 
   test('minimal chat context receipts open Strategic context workspace', async () => {

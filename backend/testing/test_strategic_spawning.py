@@ -2714,6 +2714,38 @@ async def test_spawn_strategic_review_task_context_includes_cycle_id(
     assert tasks[0].context.get("strategic_cycle_id") == cycle_id
 
 
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_records_preferred_runner_without_pin(
+    db_session, mocker
+):
+    """Preferred runner affinity is advisory context, not an authoritative pin."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    cycle_id = "sc-runner-pref"
+    preferred_runner_id = str(uuid.uuid4())
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_strategic_review(
+        project,
+        db_session,
+        cycle_id=cycle_id,
+        preferred_runner_target_id=preferred_runner_id,
+    )
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert task.context.get("strategic_cycle_id") == cycle_id
+    assert task.context.get("preferred_runner_target_id") == preferred_runner_id
+    assert "runner_target_id" not in task.context
+    assert not (task.vm_instance_id or "").startswith("runner:")
+
+
 # ── previous_decision_outcomes in _spawn_strategic_review payload ────────────
 
 
@@ -12900,6 +12932,12 @@ async def test_architecture_cycle_operator_wake_reaches_phase2_after_marker_clea
     # mark Phase 1 complete so the Phase 2 active-task guard does not skip.
     from app.strategic_trigger import strategic_refresh_origin
 
+    preferred_runner_id = str(uuid.uuid4())
+    design_doc_task.context = {
+        **(design_doc_task.context or {}),
+        "runner_target_id": preferred_runner_id,
+    }
+    design_doc_task.vm_instance_id = f"runner:{preferred_runner_id}"
     project.vision = {
         k: v for k, v in project.vision.items() if k != "_strategic_refresh"
     }
@@ -12934,6 +12972,12 @@ async def test_architecture_cycle_operator_wake_reaches_phase2_after_marker_clea
     suffix = review.payloads[0].get("prompt_suffix", "")
     assert "OPERATOR STEERING" in suffix
     assert steering_text in suffix
+    assert (
+        (review.context or {}).get("preferred_runner_target_id")
+        == preferred_runner_id
+    )
+    assert "runner_target_id" not in (review.context or {})
+    assert not (review.vm_instance_id or "").startswith("runner:")
 
 
 # ── persisted steering excerpt survives the conversation-thread aging out ─────

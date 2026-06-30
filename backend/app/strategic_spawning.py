@@ -4362,6 +4362,7 @@ async def _spawn_strategic_review(
     cycle_id: str | None = None,
     operator_steered: bool = False,
     steering_excerpt: str | None = None,
+    preferred_runner_target_id: str | None = None,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
@@ -4385,6 +4386,10 @@ async def _spawn_strategic_review(
     Either way it feeds ``_build_operator_steering_directive`` as the durable
     fallback so the directive survives the operator message aging out of the
     volatile conversation-thread snapshot.
+
+    ``preferred_runner_target_id`` is a non-authoritative local-runner affinity
+    hint from the preceding architecture phase. Dispatch may honor it only if
+    that runner is still live, eligible, agent-available, and has capacity.
     """
     from app.task_lifecycle import _has_active_strategic_task
 
@@ -6512,6 +6517,10 @@ async def _spawn_strategic_review(
         )
         return False
 
+    task_context: dict[str, Any] = {"strategic_cycle_id": cycle_id}
+    if preferred_runner_target_id:
+        task_context["preferred_runner_target_id"] = str(preferred_runner_target_id)
+
     new_task = Task(
         project_id=_project_id,
         title=f"Strategic review: {_project_name}",
@@ -6520,7 +6529,7 @@ async def _spawn_strategic_review(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
-        context={"strategic_cycle_id": cycle_id},
+        context=task_context,
         strategic_cycle_id=cycle_id,
     )
     session.add(new_task)

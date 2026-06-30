@@ -1109,6 +1109,201 @@ class TestOrchestratorRunnerRouting:
         assert task.vm_instance_id == f"runner:{idle.id}"
 
     @pytest.mark.asyncio
+    async def test_try_runner_dispatch_prefers_requested_runner_when_eligible(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        preferred, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": ["a", "b"],
+                "max_concurrent": 4,
+            },
+        )
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": [],
+                "max_concurrent": 4,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={"preferred_runner_target_id": str(preferred.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(
+            db_session, task, {project.id: [preferred, idle]}, {}
+        )
+        await db_session.refresh(task)
+        assert task.vm_instance_id == f"runner:{preferred.id}"
+        assert task.context["runner_target_id"] == str(preferred.id)
+
+    @pytest.mark.asyncio
+    async def test_try_runner_dispatch_falls_back_when_preferred_runner_at_capacity(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        preferred, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": ["existing-task"],
+                "max_concurrent": 1,
+            },
+        )
+        fallback, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": [],
+                "max_concurrent": 4,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={"preferred_runner_target_id": str(preferred.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(
+            db_session, task, {project.id: [preferred, fallback]}, {}
+        )
+        await db_session.refresh(task)
+        assert task.vm_instance_id == f"runner:{fallback.id}"
+        assert task.context["runner_target_id"] == str(fallback.id)
+
+    @pytest.mark.asyncio
+    async def test_try_runner_dispatch_falls_back_when_preferred_runner_at_cycle_capacity(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        preferred, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": [],
+                "max_concurrent": 1,
+            },
+        )
+        fallback, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": [],
+                "max_concurrent": 4,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={"preferred_runner_target_id": str(preferred.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        runner_pins_this_cycle = {preferred.id: 1}
+        assert await orch._try_runner_dispatch(
+            db_session,
+            task,
+            {project.id: [preferred, fallback]},
+            runner_pins_this_cycle,
+        )
+        await db_session.refresh(task)
+        assert task.vm_instance_id == f"runner:{fallback.id}"
+        assert task.context["runner_target_id"] == str(fallback.id)
+        assert runner_pins_this_cycle[preferred.id] == 1
+        assert runner_pins_this_cycle[fallback.id] == 1
+
+    @pytest.mark.asyncio
+    async def test_try_runner_dispatch_falls_back_when_preferred_runner_stale(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        stale, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={"task_types": "all", "max_concurrent": 4},
+        )
+        live, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "max_concurrent": 4},
+        )
+        cache = await orch._load_active_runners_cache(db_session)
+        assert {r.id for r in cache.get(project.id, [])} == {live.id}
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={"preferred_runner_target_id": str(stale.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(db_session, task, cache, {})
+        await db_session.refresh(task)
+        assert task.vm_instance_id == f"runner:{live.id}"
+        assert task.context["runner_target_id"] == str(live.id)
+
+    @pytest.mark.asyncio
+    async def test_try_runner_dispatch_falls_back_when_preferred_runner_ineligible(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        preferred, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["review"],
+                "active_task_ids": [],
+                "max_concurrent": 4,
+            },
+        )
+        fallback, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": [],
+                "max_concurrent": 4,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={"preferred_runner_target_id": str(preferred.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(
+            db_session, task, {project.id: [preferred, fallback]}, {}
+        )
+        await db_session.refresh(task)
+        assert task.vm_instance_id == f"runner:{fallback.id}"
+        assert task.context["runner_target_id"] == str(fallback.id)
+
+    @pytest.mark.asyncio
     async def test_try_runner_dispatch_skips_already_pinned(self, db_session):
         project = await _make_project(db_session)
         runner, _ = await _make_runner(db_session, project.id)
