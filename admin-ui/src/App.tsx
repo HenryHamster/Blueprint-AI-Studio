@@ -66,7 +66,10 @@ import { buildOptimisticStrategicWorkbench, normalizeStrategicInteractionMode, t
 type StrategicSessionRefs = StrategicWorkbenchState['selected_refs'];
 export default function App() {
   const refreshStrategicReadModelRef = useRef<() => void>(() => {});
-  const s = useAppState({ refreshStrategicReadModelRef });
+  const refreshMessagesRef = useRef<() => void>(() => {});
+  const [messageRealtimeRefreshSignal, setMessageRealtimeRefreshSignal] = useState(0);
+  refreshMessagesRef.current = () => setMessageRealtimeRefreshSignal(value => value + 1);
+  const s = useAppState({ refreshStrategicReadModelRef, refreshMessagesRef });
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [drawerWidth, setDrawerWidth] = useState(0);
   // Dedup guard: track the last lastCycleCompletion object we toasted for so a
@@ -1456,6 +1459,7 @@ export default function App() {
                 cycleProgress={s.cycleProgress}
                 lastCycleCompletion={s.lastCycleCompletion}
                 focusComposerSignal={strategicComposerFocusSignal}
+                realtimeRefreshSignal={messageRealtimeRefreshSignal}
                 targetMessage={strategicMessageTarget.target} onTargetMessageHandled={strategicMessageTarget.clear}
                 strategicState={strategicReadModel.data ?? null} strategicWorkbenchState={strategicWorkbenchState}
                 onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}

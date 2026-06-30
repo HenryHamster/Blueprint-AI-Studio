@@ -276,6 +276,8 @@ export interface MessagesPanelProps {
   lastCycleCompletion?: StrategicCycleCompletion | null;
   /** Incrementing signal from the workbench shell to focus the Strategic composer. */
   focusComposerSignal?: number;
+  /** Incrementing signal from realtime events to refresh messages immediately. */
+  realtimeRefreshSignal?: number;
   /** Compact Strategic context descriptor, shown only in the minimal chat surface. */
   contextPackage?: StrategicContextPackageDescriptor | null;
   /** Strategic workbench read model, used by the minimal chat surface. */
@@ -371,7 +373,25 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh }: MessagesPanelProps) {
+function messagesEqual(a: ProjectMessage, b: ProjectMessage): boolean {
+  return a.id === b.id
+    && a.project_id === b.project_id
+    && a.message_type === b.message_type
+    && a.from_type === b.from_type
+    && a.from_task_id === b.from_task_id
+    && a.content === b.content
+    && a.status === b.status
+    && a.resolution === b.resolution
+    && a.resolved_at === b.resolved_at
+    && a.created_at === b.created_at
+    && JSON.stringify(a.context ?? {}) === JSON.stringify(b.context ?? {});
+}
+
+function messageListsEqual(a: ProjectMessage[], b: ProjectMessage[]): boolean {
+  return a.length === b.length && a.every((message, i) => messagesEqual(message, b[i]));
+}
+
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -388,6 +408,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   }, [onStrategicInteraction]);
   const selectedProjectIdRef = useRef(selectedProjectId);
   selectedProjectIdRef.current = selectedProjectId;
+  const conversationModeRef = useRef(conversationMode);
+  conversationModeRef.current = conversationMode;
   const targetMessageId = targetMessage?.messageId ?? null;
   const targetMessageIdRef = useRef<string | null>(targetMessageId);
   targetMessageIdRef.current = targetMessageId;
@@ -450,7 +472,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showScrollDown, setShowScrollDown] = useState(false);
   const prevMessageCountRef = useRef(0);
+  const fetchMessagesRequestSeqRef = useRef(0);
   const lastStrategicSessionTargetFetchRef = useRef<string | null>(null);
+  const lastRealtimeRefreshSignalRef = useRef<number | null>(null);
   const getStrategicSessionIncludeMessageId = useCallback((projectId: string | null, currentTargetMessageId: string | null): string | null => {
     if (!projectId) return null;
     if (currentTargetMessageId) return currentTargetMessageId;
@@ -1036,7 +1060,16 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   }, [selectedProjectId, tempMutes]);
 
   const fetchMessages = useCallback(async () => {
+    const requestSeq = fetchMessagesRequestSeqRef.current + 1;
+    fetchMessagesRequestSeqRef.current = requestSeq;
     if (!selectedProjectId) { setLoading(false); return; }
+    const requestProjectId = selectedProjectId;
+    const requestConversationMode = conversationMode;
+    const isCurrentRequest = () => (
+      fetchMessagesRequestSeqRef.current === requestSeq
+      && selectedProjectIdRef.current === requestProjectId
+      && conversationModeRef.current === requestConversationMode
+    );
     try {
       if (conversationMode) {
         const includeMessageId = getStrategicSessionIncludeMessageId(selectedProjectId, targetMessageId);
@@ -1047,6 +1080,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         );
         if (
           selectedProjectIdRef.current !== selectedProjectId
+          || !isCurrentRequest()
           || currentIncludeMessageId !== includeMessageId
         ) {
           return;
@@ -1056,7 +1090,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         sessionMessages.forEach(m => seenMessageIdsRef.current.add(m.id));
         hasInitiallyLoadedRef.current = true;
         setMessages(prev => {
-          if (prev.length === sessionMessages.length && prev.every((m, i) => m.id === sessionMessages[i].id && m.status === sessionMessages[i].status)) return prev;
+          if (messageListsEqual(prev, sessionMessages)) return prev;
           return sessionMessages;
         });
         if (!usesStrategicReadModelRef.current) {
@@ -1069,6 +1103,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
+      if (!isCurrentRequest()) return;
       const msgs: ProjectMessage[] = data.messages ?? [];
 
       // Detect new high-signal messages for toast alerts
@@ -1116,14 +1151,17 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
       // Only update state if messages actually changed — prevents scroll jumps from polling
       setMessages(prev => {
-        if (prev.length === msgs.length && prev.every((m, i) => m.id === msgs[i].id && m.status === msgs[i].status)) return prev;
+        if (messageListsEqual(prev, msgs)) return prev;
         return msgs;
       });
       onMessageCountChange?.(countHighSignalMessages(msgs, eventPrefsRef.current, tempMutesRef.current));
       // Fetch webhook delivery stats (non-critical — errors are silently ignored)
       try {
         const statsRes = await apiFetch(`${API_BASE_URL}/api/admin/notification-dispatch/stats?project_id=${selectedProjectId}`);
-        if (statsRes.ok) setWebhookStats(await statsRes.json());
+        if (statsRes.ok) {
+          const stats = await statsRes.json();
+          if (isCurrentRequest()) setWebhookStats(stats);
+        }
       } catch { /* ignore */ }
       // Pending strategic-refresh marker — surfaced as a "strategic cycle pending"
       // badge until the autonomous loop consumes it (when it clears backend-side).
@@ -1136,7 +1174,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           const visRes = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`);
           if (visRes.ok) {
             const proj = await visRes.json() as { vision?: { _strategic_refresh?: StrategicRefreshMarker | null; _strategic_refresh_last_fired_at?: string; _strategic_refresh_last_fired_origin?: string } };
-            if (usesStrategicReadModelRef.current || selectedProjectIdRef.current !== selectedProjectId) return;
+            if (usesStrategicReadModelRef.current || selectedProjectIdRef.current !== selectedProjectId || !isCurrentRequest()) return;
             const marker = proj.vision?._strategic_refresh;
             const lastFiredAt = proj.vision?._strategic_refresh_last_fired_at;
             const lastFiredOrigin = proj.vision?._strategic_refresh_last_fired_origin;
@@ -1158,13 +1196,19 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         } catch { /* ignore */ }
       }
     } catch {
-      addToastRef.current('Failed to load messages', 'error');
+      if (isCurrentRequest()) addToastRef.current('Failed to load messages', 'error');
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) setLoading(false);
     }
   }, [conversationMode, getStrategicSessionIncludeMessageId, selectedProjectId, onMessageCountChange, searchQuery, targetMessageId, usesStrategicReadModel]);
 
   usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
+
+  useEffect(() => {
+    if (!realtimeRefreshSignal || realtimeRefreshSignal === lastRealtimeRefreshSignalRef.current) return;
+    lastRealtimeRefreshSignalRef.current = realtimeRefreshSignal;
+    void fetchMessages();
+  }, [fetchMessages, realtimeRefreshSignal]);
 
   // Auto-scroll to bottom only on initial load or when user sends a new message
   // (new message = count increased AND user is near the bottom)

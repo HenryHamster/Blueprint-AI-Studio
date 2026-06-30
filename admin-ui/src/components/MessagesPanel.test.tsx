@@ -590,9 +590,7 @@ describe('MessagesPanel chrome modes', () => {
     vi.clearAllMocks();
   });
 
-  async function renderPanel(props: Partial<MessagesPanelProps> = {}, messages: _MockMsg[] = []) {
-    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
-    _mockMessagesFetch(messages);
+  async function mountPanel(props: Partial<MessagesPanelProps> = {}) {
     host = document.createElement('div');
     document.body.appendChild(host);
     const r = createRoot(host);
@@ -609,6 +607,12 @@ describe('MessagesPanel chrome modes', () => {
     });
     await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
     return host as HTMLDivElement;
+  }
+
+  async function renderPanel(props: Partial<MessagesPanelProps> = {}, messages: _MockMsg[] = []) {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetch(messages);
+    return mountPanel(props);
   }
 
   function filterToggle(el: HTMLElement): HTMLButtonElement | undefined {
@@ -679,6 +683,121 @@ describe('MessagesPanel chrome modes', () => {
 
     expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1);
     expect(_strategicSessionGetCalls()).toHaveLength(0);
+  });
+
+  test('realtime refresh signal immediately reloads generic messages', async () => {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetchSequence([
+      [makeMsg({ id: 'initial-message', message_type: 'BLOCKER', from_type: 'agent', content: 'Initial message copy' })],
+      [makeMsg({ id: 'realtime-message', message_type: 'BLOCKER', from_type: 'agent', content: 'Realtime message copy' })],
+    ]);
+    const addToast = vi.fn();
+    const onMessageCountChange = vi.fn();
+
+    const el = await mountPanel({ addToast, onMessageCountChange, realtimeRefreshSignal: 0 });
+    await waitFor(() => expect(el.textContent).toContain('Initial message copy'));
+    const callsBefore = _messagesGetCalls().length;
+
+    await act(async () => {
+      root?.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          addToast={addToast}
+          onMessageCountChange={onMessageCountChange}
+          realtimeRefreshSignal={1}
+        />,
+      );
+    });
+
+    await waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThan(callsBefore));
+    await waitFor(() => expect(el.textContent).toContain('Realtime message copy'));
+  });
+
+  test('realtime refresh applies same-id message content updates', async () => {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetchSequence([
+      [makeMsg({ id: 'same-message', message_type: 'BLOCKER', from_type: 'agent', content: 'Original message copy' })],
+      [makeMsg({ id: 'same-message', message_type: 'BLOCKER', from_type: 'agent', content: 'Updated message copy' })],
+    ]);
+    const addToast = vi.fn();
+    const onMessageCountChange = vi.fn();
+
+    const el = await mountPanel({ addToast, onMessageCountChange, realtimeRefreshSignal: 0 });
+    await waitFor(() => expect(el.textContent).toContain('Original message copy'));
+
+    await act(async () => {
+      root?.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          addToast={addToast}
+          onMessageCountChange={onMessageCountChange}
+          realtimeRefreshSignal={1}
+        />,
+      );
+    });
+
+    await waitFor(() => expect(el.textContent).toContain('Updated message copy'));
+    expect(el.textContent).not.toContain('Original message copy');
+  });
+
+  test('late polling responses do not overwrite fresher realtime message loads', async () => {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    const messageResolvers: Array<(response: Response) => void> = [];
+    vi.mocked(apiFetch).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const initObj = init as RequestInit | undefined;
+      const method = initObj?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Promise<Response>(resolve => { messageResolvers.push(resolve); });
+      }
+      if (method === 'GET' && (
+        urlStr.includes('/api/admin/messages/noise-prefs') ||
+        urlStr.includes('/api/admin/messages/saved-views') ||
+        urlStr.includes('/api/admin/messages/temp-mutes') ||
+        urlStr.includes('/api/admin/messages/mute-window')
+      )) {
+        return new Response('', { status: 404 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    const addToast = vi.fn();
+    const onMessageCountChange = vi.fn();
+
+    const el = await mountPanel({ addToast, onMessageCountChange, realtimeRefreshSignal: 0 });
+    await waitFor(() => expect(messageResolvers).toHaveLength(1));
+
+    await act(async () => {
+      root?.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          addToast={addToast}
+          onMessageCountChange={onMessageCountChange}
+          realtimeRefreshSignal={1}
+        />,
+      );
+    });
+    await waitFor(() => expect(messageResolvers).toHaveLength(2));
+
+    await act(async () => {
+      messageResolvers[1](new Response(JSON.stringify({
+        messages: [makeMsg({ id: 'fresh-message', message_type: 'BLOCKER', from_type: 'agent', content: 'Fresh realtime message' })],
+      }), { status: 200 }));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(el.textContent).toContain('Fresh realtime message'));
+
+    await act(async () => {
+      messageResolvers[0](new Response(JSON.stringify({
+        messages: [makeMsg({ id: 'stale-message', message_type: 'BLOCKER', from_type: 'agent', content: 'Stale polling message' })],
+      }), { status: 200 }));
+      await Promise.resolve();
+    });
+
+    expect(el.textContent).toContain('Fresh realtime message');
+    expect(el.textContent).not.toContain('Stale polling message');
   });
 
   test('minimal chat chrome hides the ready-only Strategic context package strip', async () => {

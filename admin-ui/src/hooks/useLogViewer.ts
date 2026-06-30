@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import type { Task, TrackLogEntry } from '../types/task';
+import type { Task, TaskStatus, TrackLogEntry } from '../types/task';
 import type { DeployState } from '../types/settings';
 import type { StrategicChallengeSummary } from '../types/digest';
 import { API_BASE_URL, authHeaders, fetchTask } from '../api';
@@ -9,7 +9,9 @@ interface UseLogViewerDeps {
   setDeployState: (ds: DeployState) => void;
   fetchDirectionsRef?: React.MutableRefObject<() => void>;
   refreshStrategicReadModelRef?: React.MutableRefObject<() => void>;
+  refreshMessagesRef?: React.MutableRefObject<() => void>;
   selectedProjectId?: string | null;
+  realtimeWsEnabled?: boolean;
 }
 
 /** Live state captured from a strategic_cycle_started event. */
@@ -46,6 +48,32 @@ export interface StrategicCycleCompletion {
 
 let _trackLogIdCounter = 0;
 
+const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set(['COMPLETED', 'FAILED', 'CANCELLED']);
+const LOG_STREAM_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set(['IN_PROGRESS', 'PROVISIONING']);
+const KNOWN_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set([
+  'QUEUED',
+  'PROVISIONING',
+  'IN_PROGRESS',
+  'EVALUATING',
+  'BLOCKED',
+  'PARKED',
+  'COMPLETED',
+  'FAILED',
+  'CANCELLED',
+]);
+
+function isTerminalTaskStatus(status: unknown): status is TaskStatus {
+  return typeof status === 'string' && TERMINAL_TASK_STATUSES.has(status as TaskStatus);
+}
+
+function isKnownTaskStatus(status: unknown): status is TaskStatus {
+  return typeof status === 'string' && KNOWN_TASK_STATUSES.has(status as TaskStatus);
+}
+
+function isLogStreamTaskStatus(status: unknown): status is TaskStatus {
+  return typeof status === 'string' && LOG_STREAM_TASK_STATUSES.has(status as TaskStatus);
+}
+
 const STRATEGIC_READ_MODEL_REFRESH_EVENTS = new Set([
   'task_updated',
   'artifact_created',
@@ -58,12 +86,24 @@ const STRATEGIC_READ_MODEL_REFRESH_EVENTS = new Set([
   'strategic_cycle_completed',
 ]);
 
+function eventRefetchSurfaces(msg: unknown): Set<string> {
+  const data = typeof msg === 'object' && msg !== null && 'data' in msg ? (msg as { data?: unknown }).data : null;
+  const refetch = typeof data === 'object' && data !== null && 'refetch' in data ? (data as { refetch?: unknown }).refetch : null;
+  const surfaces = typeof refetch === 'object' && refetch !== null && 'surfaces' in refetch
+    ? (refetch as { surfaces?: unknown }).surfaces
+    : null;
+  if (!Array.isArray(surfaces)) return new Set();
+  return new Set(surfaces.filter((surface): surface is string => typeof surface === 'string'));
+}
+
 export function useLogViewer({
   fetchTasksRef,
   setDeployState,
   fetchDirectionsRef,
   refreshStrategicReadModelRef,
+  refreshMessagesRef,
   selectedProjectId,
+  realtimeWsEnabled = true,
 }: UseLogViewerDeps) {
   const [logTask, setLogTask] = useState<Task | null>(null);
   const [logLines, setLogLines] = useState<string[]>([]);
@@ -80,11 +120,14 @@ export function useLogViewer({
   const [lastCycleCompletion, setLastCycleCompletion] = useState<StrategicCycleCompletion | null>(null);
   const pipelineThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const wsConnectingProjectRef = useRef<string | null>(null);
+  const intentionallyClosedProjectRef = useRef<string | null>(null);
   const wsReconnectAttemptRef = useRef<number>(0);
   const wsReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchTasksDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchDirectionsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const refreshStrategicReadModelDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshMessagesDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsPingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastPongRef = useRef<number>(0);
   const wsPongTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -94,14 +137,18 @@ export function useLogViewer({
   const [trackedLogs, setTrackedLogs] = useState<Map<string, TrackLogEntry[]>>(new Map());
   const trackedTaskIdsRef = useRef<Set<string>>(trackedTaskIds);
   const logTaskRef = useRef<Task | null>(null);
+  const selectedProjectIdRef = useRef<string | null | undefined>(selectedProjectId);
   // Keep a ref to the current project_id for WS connections opened for tracking
   const trackingProjectIdRef = useRef<string | null>(null);
+  // Tracked tasks that currently justify a foreground project WebSocket.
+  const streamingTrackedTaskIdsRef = useRef<Set<string>>(new Set());
   // Track which tracked tasks have reached terminal state (for WS auto-close)
   const terminalTrackedRef = useRef<Set<string>>(new Set());
 
   // Sync refs
   useEffect(() => { trackedTaskIdsRef.current = trackedTaskIds; }, [trackedTaskIds]);
   useEffect(() => { logTaskRef.current = logTask; }, [logTask]);
+  useEffect(() => { selectedProjectIdRef.current = selectedProjectId; }, [selectedProjectId]);
 
   // Clear wsDisconnected banner when task reaches a terminal state
   useEffect(() => {
@@ -146,11 +193,69 @@ export function useLogViewer({
       if (refreshStrategicReadModelDebounceRef.current) {
         clearTimeout(refreshStrategicReadModelDebounceRef.current);
       }
+      if (refreshMessagesDebounceRef.current) {
+        clearTimeout(refreshMessagesDebounceRef.current);
+      }
     };
   }, []);
 
   // Keep a stable ref to connectWs for the online listener (avoids re-registering on each render)
   const connectWsRef = useRef<((projectId: string) => Promise<void>) | null>(null);
+
+  const hasActiveWsForProject = useCallback((projectId: string) => {
+    const ws = wsRef.current;
+    return trackingProjectIdRef.current === projectId
+      && (
+        wsConnectingProjectRef.current === projectId
+        || (ws != null && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING))
+      );
+  }, []);
+
+  const hasActiveTrackedTasks = useCallback(() => streamingTrackedTaskIdsRef.current.size > 0, []);
+
+  const hasForegroundLogTask = useCallback(() => {
+    const task = logTaskRef.current;
+    return Boolean(task && isLogStreamTaskStatus(task.status));
+  }, []);
+
+  const clearReconnectTimer = useCallback(() => {
+    if (wsReconnectTimerRef.current) {
+      clearTimeout(wsReconnectTimerRef.current);
+      wsReconnectTimerRef.current = null;
+    }
+  }, []);
+
+  const closeCurrentWs = useCallback((reason: string) => {
+    clearReconnectTimer();
+    if (wsPingIntervalRef.current) {
+      clearInterval(wsPingIntervalRef.current);
+      wsPingIntervalRef.current = null;
+    }
+    if (wsPongTimeoutRef.current) {
+      clearTimeout(wsPongTimeoutRef.current);
+      wsPongTimeoutRef.current = null;
+    }
+    trackingProjectIdRef.current = null;
+    wsConnectingProjectRef.current = null;
+    intentionallyClosedProjectRef.current = null;
+    if (wsRef.current) {
+      wsRef.current.close(1000, reason);
+      wsRef.current = null;
+    }
+    setWsConnected(false);
+  }, [clearReconnectTimer]);
+
+  const restoreSelectedProjectStream = useCallback((reason: string) => {
+    const selectedProjectIdForRestore = selectedProjectIdRef.current;
+    if (!realtimeWsEnabled || !selectedProjectIdForRestore) {
+      closeCurrentWs(reason);
+      return;
+    }
+    if (hasActiveWsForProject(selectedProjectIdForRestore)) return;
+    closeCurrentWs(reason);
+    wsReconnectAttemptRef.current = 0;
+    void connectWsRef.current?.(selectedProjectIdForRestore);
+  }, [closeCurrentWs, hasActiveWsForProject, realtimeWsEnabled]);
 
   // Reconnect immediately when the network comes back online
   useEffect(() => {
@@ -196,10 +301,22 @@ export function useLogViewer({
     }, 500);
   }, [refreshStrategicReadModelRef]);
 
+  const refreshMessages = useCallback(() => {
+    if (!refreshMessagesRef?.current) return;
+    if (refreshMessagesDebounceRef.current) {
+      clearTimeout(refreshMessagesDebounceRef.current);
+    }
+    refreshMessagesDebounceRef.current = setTimeout(() => {
+      refreshMessagesDebounceRef.current = null;
+      refreshMessagesRef.current();
+    }, 500);
+  }, [refreshMessagesRef]);
+
   // Shared WS message handler — dispatches to log drawer AND tracked tasks
   const handleWsMessage = useCallback((event: MessageEvent) => {
     try {
       const msg = JSON.parse(event.data);
+      const refetchSurfaces = eventRefetchSurfaces(msg);
 
       // Pong response — update last-pong timestamp for heartbeat tracking
       if (msg.event === 'pong') {
@@ -214,7 +331,18 @@ export function useLogViewer({
       if (msg.event === 'agent_log' && taskId && currentLogTask && taskId === currentLogTask.id) {
         setLogLines(prev => [...prev, msg.data.log]);
       } else if (msg.event === 'task_updated' && taskId && currentLogTask && taskId === currentLogTask.id) {
-        setLogLines(prev => [...prev, `[Status: ${msg.data.status}]`]);
+        const status = msg.data.status;
+        setLogLines(prev => [...prev, `[Status: ${status}]`]);
+        if (isKnownTaskStatus(status)) {
+          const nextLogTask = { ...currentLogTask, status };
+          logTaskRef.current = nextLogTask;
+          setLogTask(nextLogTask);
+        }
+        if (!isLogStreamTaskStatus(status)) {
+          if (!hasActiveTrackedTasks()) {
+            restoreSelectedProjectStream(isTerminalTaskStatus(status) ? 'Log task completed' : 'Log task stopped streaming');
+          }
+        }
       }
 
       // Tracked task events
@@ -225,16 +353,16 @@ export function useLogViewer({
           const status = msg.data.status;
           const statusMsg = msg.data.message;
           appendTrackLog(taskId, 'status', statusMsg ? `[${status}] ${statusMsg}` : `Status: ${status}`);
-          // When a tracked task reaches a terminal state, close WS if no active tracked tasks remain
-          if (['COMPLETED', 'FAILED', 'CANCELLED'].includes(status)) {
+          if (isLogStreamTaskStatus(status)) {
+            streamingTrackedTaskIdsRef.current.add(taskId);
+          } else {
+            streamingTrackedTaskIdsRef.current.delete(taskId);
+          }
+          if (isTerminalTaskStatus(status)) {
             terminalTrackedRef.current.add(taskId);
-            const allTerminal = [...trackedTaskIdsRef.current].every(id => terminalTrackedRef.current.has(id));
-            if (allTerminal && !logTaskRef.current && wsRef.current) {
-              // All tracked tasks finished and no log drawer open — close WS to free server resources
-              wsRef.current.close();
-              wsRef.current = null;
-              setWsConnected(false);
-            }
+          }
+          if (!isLogStreamTaskStatus(status) && !hasActiveTrackedTasks() && !hasForegroundLogTask()) {
+            restoreSelectedProjectStream(isTerminalTaskStatus(status) ? 'Tracked tasks completed' : 'Tracked tasks stopped streaming');
           }
         } else if (msg.event === 'artifact_created') {
           const aType = msg.data.artifact_type || 'artifact';
@@ -257,8 +385,18 @@ export function useLogViewer({
         if (fetchTasksDebounceRef.current) clearTimeout(fetchTasksDebounceRef.current);
         fetchTasksDebounceRef.current = setTimeout(() => { fetchTasksRef.current(); }, 500);
       }
-      if (STRATEGIC_READ_MODEL_REFRESH_EVENTS.has(msg.event)) {
+      if (
+        STRATEGIC_READ_MODEL_REFRESH_EVENTS.has(msg.event)
+        || refetchSurfaces.has('strategic_session')
+      ) {
         refreshStrategicReadModel();
+      }
+      if (
+        msg.event === 'message_created'
+        || msg.event === 'message_updated'
+        || refetchSurfaces.has('messages')
+      ) {
+        refreshMessages();
       }
 
       // Strategist activity events — drive a live refresh of the directions view.
@@ -268,7 +406,7 @@ export function useLogViewer({
         if (fetchDirectionsDebounceRef.current) clearTimeout(fetchDirectionsDebounceRef.current);
         fetchDirectionsDebounceRef.current = setTimeout(() => { fetchDirectionsRef?.current?.(); }, 500);
       };
-      if (msg.event === 'strategic_updated') {
+      if (msg.event === 'strategic_updated' || refetchSurfaces.has('directions')) {
         refetchDirections();
       } else if (msg.event === 'strategic_cycle_started') {
         setStrategistActive(true);
@@ -293,26 +431,49 @@ export function useLogViewer({
     } catch {
       // ignore parse errors
     }
-  }, [appendTrackLog, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel]);
+  }, [appendTrackLog, hasActiveTrackedTasks, hasForegroundLogTask, restoreSelectedProjectStream, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel, refreshMessages]);
 
   const connectWs = useCallback(async (projectId: string) => {
+    if (hasActiveWsForProject(projectId)) return;
+    intentionallyClosedProjectRef.current = null;
+    trackingProjectIdRef.current = projectId;
+    wsConnectingProjectRef.current = projectId;
     try {
       const ticketRes = await fetch(`${API_BASE_URL}/api/projects/${projectId}/ws-ticket`, {
         method: 'POST',
         headers: await authHeaders(),
       });
       if (!ticketRes.ok) {
+        if (wsConnectingProjectRef.current === projectId) wsConnectingProjectRef.current = null;
         setLogsConnecting(false);
         setLogLines(prev => [...prev, '[Failed to get WebSocket ticket]']);
         return;
       }
       const { ticket } = await ticketRes.json();
+      if (trackingProjectIdRef.current !== projectId || wsConnectingProjectRef.current !== projectId) {
+        return;
+      }
 
       const wsUrl = (API_BASE_URL || window.location.origin).replace(/^http/, 'ws');
       const ws = new WebSocket(`${wsUrl}/api/projects/${projectId}/ws`);
       wsRef.current = ws;
       trackingProjectIdRef.current = projectId;
+      wsConnectingProjectRef.current = null;
       let wasConnected = false;
+      let pingInterval: ReturnType<typeof setInterval> | null = null;
+      let pongTimeout: ReturnType<typeof setTimeout> | null = null;
+      const clearConnectionHeartbeat = () => {
+        if (pingInterval) {
+          clearInterval(pingInterval);
+          if (wsPingIntervalRef.current === pingInterval) wsPingIntervalRef.current = null;
+          pingInterval = null;
+        }
+        if (pongTimeout) {
+          clearTimeout(pongTimeout);
+          if (wsPongTimeoutRef.current === pongTimeout) wsPongTimeoutRef.current = null;
+          pongTimeout = null;
+        }
+      };
 
       ws.onopen = () => {
         ws.send(JSON.stringify({ ticket }));
@@ -335,21 +496,25 @@ export function useLogViewer({
 
         // Start application-level ping/pong heartbeat (30s interval)
         let lastPingTime = 0;
-        wsPingIntervalRef.current = setInterval(() => {
+        if (wsPingIntervalRef.current) clearInterval(wsPingIntervalRef.current);
+        if (wsPongTimeoutRef.current) clearTimeout(wsPongTimeoutRef.current);
+        pingInterval = setInterval(() => {
           if (ws.readyState === WebSocket.OPEN) {
             lastPingTime = Date.now();
             ws.send(JSON.stringify({ type: 'ping' }));
 
             // Expect a pong within 10 seconds
-            if (wsPongTimeoutRef.current) clearTimeout(wsPongTimeoutRef.current);
-            wsPongTimeoutRef.current = setTimeout(() => {
+            if (pongTimeout) clearTimeout(pongTimeout);
+            pongTimeout = setTimeout(() => {
               if (lastPongRef.current < lastPingTime && ws.readyState === WebSocket.OPEN) {
                 // No pong received — connection is silently dead, force reconnect
                 ws.close(4001, 'Pong timeout');
               }
             }, 10000);
+            wsPongTimeoutRef.current = pongTimeout;
           }
         }, 30000);
+        wsPingIntervalRef.current = pingInterval;
 
         // Refresh task list to catch up on any missed state changes during disconnect
         setLogLines(prev => [...prev, '[Refreshing task list after reconnect]']);
@@ -359,6 +524,7 @@ export function useLogViewer({
       ws.onmessage = handleWsMessage;
 
       ws.onerror = (e) => {
+        if (trackingProjectIdRef.current !== projectId) return;
         console.error('[WS] error:', e);
         setLogLines(prev => [...prev, `[WebSocket error — check browser console (F12)]`]);
         setLogsConnecting(false);
@@ -366,19 +532,11 @@ export function useLogViewer({
       };
 
       ws.onclose = (e) => {
+        clearConnectionHeartbeat();
+        if (trackingProjectIdRef.current !== projectId) return;
         setLogLines(prev => [...prev, `[Stream disconnected: code=${e.code} reason=${e.reason || 'none'}]`]);
         setWsConnected(false);
         setLogsConnecting(false);
-
-        // Clean up ping heartbeat for this connection
-        if (wsPingIntervalRef.current) {
-          clearInterval(wsPingIntervalRef.current);
-          wsPingIntervalRef.current = null;
-        }
-        if (wsPongTimeoutRef.current) {
-          clearTimeout(wsPongTimeoutRef.current);
-          wsPongTimeoutRef.current = null;
-        }
 
         if (!wasConnected) return;
 
@@ -399,6 +557,10 @@ export function useLogViewer({
             connectWs(projectId);
           }, delay);
         } else {
+          if (wsRef.current === ws) wsRef.current = null;
+          trackingProjectIdRef.current = null;
+          wsConnectingProjectRef.current = null;
+          intentionallyClosedProjectRef.current = projectId;
           setWsDisconnected(true);
           const reason = e.code === 1008
             ? 'Authentication failed — please refresh the page'
@@ -407,89 +569,112 @@ export function useLogViewer({
         }
       };
     } catch (err) {
+      if (wsConnectingProjectRef.current === projectId) wsConnectingProjectRef.current = null;
       setLogsConnecting(false);
       setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
     }
-  }, [handleWsMessage, appendTrackLog, fetchTasksRef]);
+  }, [handleWsMessage, appendTrackLog, fetchTasksRef, hasActiveWsForProject]);
 
   // Keep connectWsRef in sync so the online listener can call the latest version
   useEffect(() => { connectWsRef.current = connectWs; }, [connectWs]);
 
-  const handleViewLogs = useCallback((task: Task) => {
-    // Update drawer state immediately (non-destructive)
-    setLogTask(task);
-    setLogLines(task.error_logs ? [`[Error Log]\n${task.error_logs}`] : []);
-    fetchTask(task.id).then(fresh => setLogTask(fresh)).catch(() => {/* keep stale data */});
-    setWsDisconnected(false);
-
-    if (task.status !== 'IN_PROGRESS' && task.status !== 'PROVISIONING') return;
-    if (!task.project_id) return;
-
-    // If WS is already connected to the same project, reuse it
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN
-        && trackingProjectIdRef.current === task.project_id) {
+  useEffect(() => {
+    const hasForegroundConsumers = hasActiveTrackedTasks() || hasForegroundLogTask();
+    if (!realtimeWsEnabled || !selectedProjectId) {
+      if (!hasActiveTrackedTasks() && !hasForegroundLogTask()) {
+        trackingProjectIdRef.current = null;
+        wsConnectingProjectRef.current = null;
+        closeCurrentWs(!realtimeWsEnabled ? 'Realtime disabled' : 'Project cleared');
+        setLogsConnecting(false);
+      }
       return;
     }
 
-    // Different project or no WS — tear down and reconnect
-    if (wsReconnectTimerRef.current) {
-      clearTimeout(wsReconnectTimerRef.current);
-      wsReconnectTimerRef.current = null;
+    if (intentionallyClosedProjectRef.current && intentionallyClosedProjectRef.current !== selectedProjectId) {
+      intentionallyClosedProjectRef.current = null;
     }
-    if (wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-    }
+    if (intentionallyClosedProjectRef.current === selectedProjectId) return;
+
+    if (hasActiveWsForProject(selectedProjectId)) return;
+    if (hasForegroundConsumers) return;
+
+    closeCurrentWs('Project changed');
     wsReconnectAttemptRef.current = 0;
-    setLogsConnecting(true);
-    connectWs(task.project_id);
-  }, [connectWs]);
+    void connectWs(selectedProjectId);
+  }, [closeCurrentWs, connectWs, hasActiveTrackedTasks, hasActiveWsForProject, hasForegroundLogTask, realtimeWsEnabled, selectedProjectId]);
+
+  const handleViewLogs = useCallback((task: Task) => {
+    // Update drawer state immediately (non-destructive)
+    logTaskRef.current = task;
+    setLogTask(task);
+    setLogLines(task.error_logs ? [`[Error Log]\n${task.error_logs}`] : []);
+    const openLogStream = (streamTask: Task) => {
+      if (!isLogStreamTaskStatus(streamTask.status)) return;
+      if (!streamTask.project_id) return;
+      if (hasActiveWsForProject(streamTask.project_id)) return;
+
+      closeCurrentWs('Switching log project');
+      wsReconnectAttemptRef.current = 0;
+      setLogsConnecting(true);
+      connectWs(streamTask.project_id);
+    };
+    fetchTask(task.id).then(fresh => {
+      if (logTaskRef.current?.id !== task.id) return;
+      setLogTask(fresh);
+      logTaskRef.current = fresh;
+      if (!isLogStreamTaskStatus(fresh.status) && !hasActiveTrackedTasks()) {
+        restoreSelectedProjectStream('Log task stopped streaming');
+        return;
+      }
+      openLogStream(fresh);
+    }).catch(() => { openLogStream(task); });
+    setWsDisconnected(false);
+  }, [closeCurrentWs, connectWs, hasActiveTrackedTasks, hasActiveWsForProject, restoreSelectedProjectStream]);
 
   const closeLogViewer = useCallback(() => {
-    if (wsReconnectTimerRef.current) {
-      clearTimeout(wsReconnectTimerRef.current);
-      wsReconnectTimerRef.current = null;
-    }
-    if (wsPingIntervalRef.current) {
-      clearInterval(wsPingIntervalRef.current);
-      wsPingIntervalRef.current = null;
-    }
-    if (wsPongTimeoutRef.current) {
-      clearTimeout(wsPongTimeoutRef.current);
-      wsPongTimeoutRef.current = null;
-    }
-    wsReconnectAttemptRef.current = 0;
-    // Only close WS if no tracked tasks need it
-    if (trackedTaskIdsRef.current.size === 0) {
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-      }
-      setWsConnected(false);
+    const shouldCloseWs = !hasActiveTrackedTasks() && !selectedProjectIdRef.current;
+    const selectedProjectIdForRestore = selectedProjectIdRef.current;
+    logTaskRef.current = null;
+    if (shouldCloseWs) {
+      wsReconnectAttemptRef.current = 0;
+      closeCurrentWs('Log viewer closed');
+    } else if (!hasActiveTrackedTasks() && selectedProjectIdForRestore && !hasActiveWsForProject(selectedProjectIdForRestore)) {
+      restoreSelectedProjectStream('Restoring selected project stream');
     }
     setLogsConnecting(false);
     setWsDisconnected(false);
     setWsDisconnectReason(null);
     setLogTask(null);
     setLogLines([]);
-  }, []);
+  }, [closeCurrentWs, hasActiveTrackedTasks, hasActiveWsForProject, restoreSelectedProjectStream]);
 
   // --- Track / Untrack ---
   const trackTask = useCallback((task: Task) => {
+    const isTerminalTask = isTerminalTaskStatus(task.status);
+    const isStreamingTask = isLogStreamTaskStatus(task.status);
     setTrackedTaskIds(prev => {
       if (prev.size >= 10) return prev; // Cap at 10 simultaneous tracked tasks
       const next = new Set(prev);
       next.add(task.id);
       return next;
     });
-    if (task.project_id) trackingProjectIdRef.current = task.project_id;
+    if (isStreamingTask) {
+      streamingTrackedTaskIdsRef.current.add(task.id);
+    } else {
+      streamingTrackedTaskIdsRef.current.delete(task.id);
+    }
+    if (isTerminalTask) {
+      terminalTrackedRef.current.add(task.id);
+    }
     appendTrackLog(task.id, 'system', `Tracking started — ${task.title || task.id}`);
 
     // Open WS if not already connected and task is active
-    if (!wsRef.current && task.project_id) {
+    if (isStreamingTask && task.project_id && !hasActiveWsForProject(task.project_id)) {
+      closeCurrentWs('Tracking task project');
+      wsReconnectAttemptRef.current = 0;
       connectWs(task.project_id);
     }
-  }, [connectWs, appendTrackLog]);
+  }, [closeCurrentWs, connectWs, appendTrackLog, hasActiveWsForProject]);
 
   const untrackTask = useCallback((taskId: string) => {
     setTrackedTaskIds(prev => {
@@ -503,27 +688,25 @@ export function useLogViewer({
       return next;
     });
     terminalTrackedRef.current.delete(taskId);
+    streamingTrackedTaskIdsRef.current.delete(taskId);
     // Close WS if no log viewer open and no more tracked tasks
     // Use setTimeout to read the updated set size after state settles
     setTimeout(() => {
-      if (trackedTaskIdsRef.current.size === 0 && !logTaskRef.current && wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
-        setWsConnected(false);
+      if (!hasActiveTrackedTasks() && !hasForegroundLogTask()) {
+        restoreSelectedProjectStream('No tracked tasks');
       }
     }, 0);
-  }, []);
+  }, [hasActiveTrackedTasks, hasForegroundLogTask, restoreSelectedProjectStream]);
 
   const untrackAll = useCallback(() => {
     setTrackedTaskIds(new Set());
     setTrackedLogs(new Map());
     terminalTrackedRef.current.clear();
-    if (!logTaskRef.current && wsRef.current) {
-      wsRef.current.close();
-      wsRef.current = null;
-      setWsConnected(false);
+    streamingTrackedTaskIdsRef.current.clear();
+    if (!hasForegroundLogTask()) {
+      restoreSelectedProjectStream('Tracking cleared');
     }
-  }, []);
+  }, [hasForegroundLogTask, restoreSelectedProjectStream]);
 
   return {
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason,

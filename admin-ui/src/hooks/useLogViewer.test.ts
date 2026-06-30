@@ -6,8 +6,10 @@ import { useLogViewer } from './useLogViewer';
 vi.mock('../api', () => ({
   authHeaders: vi.fn().mockResolvedValue({ Authorization: 'Bearer ***' }),
   API_BASE_URL: '',
-  fetchTask: vi.fn(),
+  fetchTask: vi.fn(async (id: string) => ({ id, project_id: 'projA', status: 'IN_PROGRESS', title: 'T' })),
 }));
+
+import { fetchTask } from '../api';
 
 // Minimal WebSocket stub that captures the instance so tests can drive
 // onopen / onmessage manually.
@@ -33,19 +35,23 @@ class MockWebSocket {
 
 let fetchSpy: ReturnType<typeof vi.fn>;
 
-function setup() {
+function setup(options: { selectedProjectId?: string | null; realtimeWsEnabled?: boolean } = {}) {
   return renderHook(() => {
     const fetchTasksRef = useRef<() => void>(vi.fn());
     const fetchDirectionsRef = useRef<() => void>(vi.fn());
     const refreshStrategicReadModelRef = useRef<() => void>(vi.fn());
+    const refreshMessagesRef = useRef<() => void>(vi.fn());
     const setDeployState = vi.fn();
     const lv = useLogViewer({
       fetchTasksRef,
       setDeployState,
       fetchDirectionsRef,
       refreshStrategicReadModelRef,
+      refreshMessagesRef,
+      selectedProjectId: options.selectedProjectId,
+      realtimeWsEnabled: options.realtimeWsEnabled,
     });
-    return { lv, fetchDirectionsRef, refreshStrategicReadModelRef };
+    return { lv, fetchDirectionsRef, refreshStrategicReadModelRef, refreshMessagesRef };
   });
 }
 
@@ -70,7 +76,7 @@ describe('useLogViewer strategist events', () => {
     // connectWs awaits a ticket fetch (two microtask points) before
     // constructing the WebSocket — flush microtasks, then fire onopen.
     await act(async () => {
-      result.current.lv.trackTask({ id: 'task-1', project_id: 'proj1', title: 'T' } as never);
+      result.current.lv.trackTask({ id: 'task-1', project_id: 'proj1', status: 'IN_PROGRESS', title: 'T' } as never);
       await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();
@@ -80,6 +86,519 @@ describe('useLogViewer strategist events', () => {
     act(() => { ws.onopen?.({}); });
     return ws;
   }
+
+  it('connects the selected project websocket without opening logs or tracking a task', async () => {
+    const { result } = setup({ selectedProjectId: 'proj-live' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(MockWebSocket.instances).toHaveLength(1);
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+    const refreshMessages = result.current.refreshMessagesRef.current as ReturnType<typeof vi.fn>;
+    refreshMessages.mockClear();
+
+    act(() => { ws.emit({ event: 'message_created', data: { message_id: 'msg-1' } }); });
+    act(() => { vi.advanceTimersByTime(500); });
+
+    expect(refreshMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for realtime auth readiness before connecting the selected project websocket', async () => {
+    const { rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) => {
+        const fetchTasksRef = useRef<() => void>(vi.fn());
+        const fetchDirectionsRef = useRef<() => void>(vi.fn());
+        const refreshMessagesRef = useRef<() => void>(vi.fn());
+        const setDeployState = vi.fn();
+        return useLogViewer({
+          fetchTasksRef,
+          setDeployState,
+          fetchDirectionsRef,
+          refreshMessagesRef,
+          selectedProjectId: 'proj-live',
+          realtimeWsEnabled: enabled,
+        });
+      },
+      { initialProps: { enabled: false } },
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(MockWebSocket.instances).toHaveLength(0);
+
+    act(() => { rerender({ enabled: true }); });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it('keeps the selected project websocket open when tracked tasks finish', async () => {
+    const { result } = setup({ selectedProjectId: 'proj-live' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+
+    await act(async () => {
+      result.current.lv.trackTask({ id: 'task-1', project_id: 'proj-live', status: 'IN_PROGRESS', title: 'T' } as never);
+      await Promise.resolve();
+    });
+
+    act(() => {
+      ws.emit({ event: 'task_updated', data: { task_id: 'task-1', status: 'COMPLETED' } });
+    });
+
+    expect(ws.close).not.toHaveBeenCalled();
+    expect(result.current.lv.wsConnected).toBe(true);
+  });
+
+  it('does not close a tracked task stream when the selected project changes', async () => {
+    const { result, rerender } = renderHook(
+      ({ pid }: { pid: string | null }) => {
+        const fetchTasksRef = useRef<() => void>(vi.fn());
+        const fetchDirectionsRef = useRef<() => void>(vi.fn());
+        const refreshMessagesRef = useRef<() => void>(vi.fn());
+        const setDeployState = vi.fn();
+        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid });
+        return { lv };
+      },
+      { initialProps: { pid: 'projA' as string | null } },
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const wsA = MockWebSocket.instances[0];
+    act(() => { wsA.onopen?.({}); });
+
+    await act(async () => {
+      result.current.lv.trackTask({ id: 'task-1', project_id: 'projA', status: 'IN_PROGRESS', title: 'T' } as never);
+      await Promise.resolve();
+    });
+    act(() => { rerender({ pid: 'projB' }); });
+
+    expect(wsA.close).not.toHaveBeenCalled();
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it('switches the background stream after terminal tracked tasks stop being foreground work', async () => {
+    const { result, rerender } = renderHook(
+      ({ pid }: { pid: string | null }) => {
+        const fetchTasksRef = useRef<() => void>(vi.fn());
+        const fetchDirectionsRef = useRef<() => void>(vi.fn());
+        const refreshMessagesRef = useRef<() => void>(vi.fn());
+        const setDeployState = vi.fn();
+        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid });
+        return { lv };
+      },
+      { initialProps: { pid: 'projA' as string | null } },
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const wsA = MockWebSocket.instances[0];
+    act(() => { wsA.onopen?.({}); });
+
+    await act(async () => {
+      result.current.lv.trackTask({ id: 'task-1', project_id: 'projA', status: 'IN_PROGRESS', title: 'T' } as never);
+      await Promise.resolve();
+    });
+    act(() => {
+      wsA.emit({ event: 'task_updated', data: { task_id: 'task-1', status: 'COMPLETED' } });
+    });
+    expect(wsA.close).not.toHaveBeenCalled();
+
+    act(() => { rerender({ pid: 'projB' }); });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(wsA.close).toHaveBeenCalledWith(1000, 'Project changed');
+    expect(MockWebSocket.instances).toHaveLength(2);
+  });
+
+  it('restores the selected project stream when a viewed log task completes', async () => {
+    const { result } = setup({ selectedProjectId: 'projB' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const wsB = MockWebSocket.instances[0];
+    act(() => { wsB.onopen?.({}); });
+
+    await act(async () => {
+      result.current.lv.handleViewLogs({ id: 'task-log', project_id: 'projA', status: 'IN_PROGRESS', title: 'Log task' } as never);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const wsA = MockWebSocket.instances[1];
+    act(() => { wsA.onopen?.({}); });
+
+    act(() => {
+      wsA.emit({ event: 'task_updated', data: { task_id: 'task-log', status: 'COMPLETED' } });
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(wsA.close).toHaveBeenCalledWith(1000, 'Log task completed');
+    expect(MockWebSocket.instances).toHaveLength(3);
+  });
+
+  it('does not restore selected project stream after foreground work if realtime auth is disabled', async () => {
+    const { result, rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) => {
+        const fetchTasksRef = useRef<() => void>(vi.fn());
+        const fetchDirectionsRef = useRef<() => void>(vi.fn());
+        const refreshMessagesRef = useRef<() => void>(vi.fn());
+        const setDeployState = vi.fn();
+        const lv = useLogViewer({
+          fetchTasksRef,
+          setDeployState,
+          fetchDirectionsRef,
+          refreshMessagesRef,
+          selectedProjectId: 'projB',
+          realtimeWsEnabled: enabled,
+        });
+        return { lv };
+      },
+      { initialProps: { enabled: true } },
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    act(() => { MockWebSocket.instances[0].onopen?.({}); });
+
+    await act(async () => {
+      result.current.lv.trackTask({ id: 'task-1', project_id: 'projA', status: 'IN_PROGRESS', title: 'Foreground task' } as never);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const foregroundWs = MockWebSocket.instances[1];
+    act(() => { foregroundWs.onopen?.({}); });
+    act(() => { rerender({ enabled: false }); });
+
+    act(() => {
+      foregroundWs.emit({ event: 'task_updated', data: { task_id: 'task-1', status: 'COMPLETED' } });
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(MockWebSocket.instances).toHaveLength(2);
+  });
+
+  it('closeLogViewer does not restore selected project stream when realtime auth is disabled', async () => {
+    const { result, rerender } = renderHook(
+      ({ enabled }: { enabled: boolean }) => {
+        const fetchTasksRef = useRef<() => void>(vi.fn());
+        const fetchDirectionsRef = useRef<() => void>(vi.fn());
+        const refreshMessagesRef = useRef<() => void>(vi.fn());
+        const setDeployState = vi.fn();
+        const lv = useLogViewer({
+          fetchTasksRef,
+          setDeployState,
+          fetchDirectionsRef,
+          refreshMessagesRef,
+          selectedProjectId: 'projB',
+          realtimeWsEnabled: enabled,
+        });
+        return { lv };
+      },
+      { initialProps: { enabled: true } },
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    act(() => { MockWebSocket.instances[0].onopen?.({}); });
+
+    await act(async () => {
+      result.current.lv.handleViewLogs({ id: 'task-log', project_id: 'projA', status: 'IN_PROGRESS', title: 'Log task' } as never);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    act(() => { MockWebSocket.instances[1].onopen?.({}); });
+    act(() => { rerender({ enabled: false }); });
+
+    act(() => { result.current.lv.closeLogViewer(); });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(MockWebSocket.instances).toHaveLength(2);
+  });
+
+  it('non-streaming log statuses do not block selected project websocket changes', async () => {
+    vi.mocked(fetchTask).mockResolvedValueOnce({ id: 'queued-log', project_id: 'projB', status: 'QUEUED', title: 'Queued log task' } as never);
+    const { result, rerender } = renderHook(
+      ({ pid }: { pid: string | null }) => {
+        const fetchTasksRef = useRef<() => void>(vi.fn());
+        const fetchDirectionsRef = useRef<() => void>(vi.fn());
+        const refreshMessagesRef = useRef<() => void>(vi.fn());
+        const setDeployState = vi.fn();
+        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid });
+        return { lv };
+      },
+      { initialProps: { pid: 'projA' as string | null } },
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const wsA = MockWebSocket.instances[0];
+    act(() => { wsA.onopen?.({}); });
+
+    await act(async () => {
+      result.current.lv.handleViewLogs({ id: 'queued-log', project_id: 'projB', status: 'QUEUED', title: 'Queued log task' } as never);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(MockWebSocket.instances).toHaveLength(1);
+
+    act(() => { rerender({ pid: 'projC' }); });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(wsA.close).toHaveBeenCalledWith(1000, 'Project changed');
+    expect(MockWebSocket.instances).toHaveLength(2);
+  });
+
+  it('restores selected project stream when a viewed log task stops streaming', async () => {
+    const { result } = setup({ selectedProjectId: 'projB' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    act(() => { MockWebSocket.instances[0].onopen?.({}); });
+
+    await act(async () => {
+      result.current.lv.handleViewLogs({ id: 'task-log', project_id: 'projA', status: 'IN_PROGRESS', title: 'Log task' } as never);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const wsA = MockWebSocket.instances[1];
+    act(() => { wsA.onopen?.({}); });
+
+    act(() => {
+      wsA.emit({ event: 'task_updated', data: { task_id: 'task-log', status: 'EVALUATING' } });
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(wsA.close).toHaveBeenCalledWith(1000, 'Log task stopped streaming');
+    expect(MockWebSocket.instances).toHaveLength(3);
+  });
+
+  it('restores selected project stream when fresh log task status is non-streaming', async () => {
+    vi.mocked(fetchTask).mockResolvedValueOnce({ id: 'task-log', project_id: 'projA', status: 'EVALUATING', title: 'Log task' } as never);
+    const { result } = setup({ selectedProjectId: 'projB' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    act(() => { MockWebSocket.instances[0].onopen?.({}); });
+
+    await act(async () => {
+      result.current.lv.handleViewLogs({ id: 'task-log', project_id: 'projA', status: 'IN_PROGRESS', title: 'Stale log task' } as never);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(MockWebSocket.instances[0].close).not.toHaveBeenCalled();
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it('tracking a task from another project replaces the background selected-project stream', async () => {
+    const { result } = setup({ selectedProjectId: 'projA' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const wsA = MockWebSocket.instances[0];
+    act(() => { wsA.onopen?.({}); });
+
+    await act(async () => {
+      result.current.lv.trackTask({ id: 'task-2', project_id: 'projB', status: 'IN_PROGRESS', title: 'Other project task' } as never);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(wsA.close).toHaveBeenCalledWith(1000, 'Tracking task project');
+    expect(MockWebSocket.instances).toHaveLength(2);
+  });
+
+  it('tracking an already-terminal task does not replace the selected project stream', async () => {
+    const { result } = setup({ selectedProjectId: 'projA' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const wsA = MockWebSocket.instances[0];
+    act(() => { wsA.onopen?.({}); });
+
+    await act(async () => {
+      result.current.lv.trackTask({ id: 'task-done', project_id: 'projB', status: 'COMPLETED', title: 'Done elsewhere' } as never);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(wsA.close).not.toHaveBeenCalled();
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it('tracking a non-streaming non-terminal task does not replace the selected project stream', async () => {
+    const { result } = setup({ selectedProjectId: 'projA' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const wsA = MockWebSocket.instances[0];
+    act(() => { wsA.onopen?.({}); });
+
+    await act(async () => {
+      result.current.lv.trackTask({ id: 'task-parked', project_id: 'projB', status: 'PARKED', title: 'Parked elsewhere' } as never);
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(wsA.close).not.toHaveBeenCalled();
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it('does not reconnect on online after intentional close with no consumers', async () => {
+    const { result } = setup();
+    const ws = await connect(result);
+    act(() => {
+      ws.emit({ event: 'task_updated', data: { task_id: 'task-1', status: 'COMPLETED' } });
+    });
+    expect(ws.close).toHaveBeenCalledWith(1000, 'Tracked tasks completed');
+
+    act(() => { window.dispatchEvent(new Event('online')); });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it('does not reconnect on online after an intentional remote close', async () => {
+    setup({ selectedProjectId: 'proj-live' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+
+    act(() => { ws.onclose?.({ code: 1000, reason: 'remote normal close' }); });
+    act(() => { window.dispatchEvent(new Event('online')); });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it('closeLogViewer does not disable heartbeat for the selected project stream', async () => {
+    const { result } = setup({ selectedProjectId: 'proj-live' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+    ws.send.mockClear();
+
+    act(() => { result.current.lv.closeLogViewer(); });
+    expect(ws.close).not.toHaveBeenCalled();
+
+    act(() => { vi.advanceTimersByTime(30_000); });
+
+    expect(ws.send).toHaveBeenCalledWith(JSON.stringify({ type: 'ping' }));
+  });
+
+  it('stale project close events still clear their own heartbeat', async () => {
+    const { rerender } = renderHook(
+      ({ pid }: { pid: string | null }) => {
+        const fetchTasksRef = useRef<() => void>(vi.fn());
+        const fetchDirectionsRef = useRef<() => void>(vi.fn());
+        const refreshMessagesRef = useRef<() => void>(vi.fn());
+        const setDeployState = vi.fn();
+        return useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid });
+      },
+      { initialProps: { pid: 'projA' as string | null } },
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const wsA = MockWebSocket.instances[0];
+    act(() => { wsA.onopen?.({}); });
+    wsA.send.mockClear();
+
+    act(() => { rerender({ pid: 'projB' }); });
+    act(() => { wsA.onclose?.({ code: 1000, reason: 'Project changed' }); });
+    act(() => { vi.advanceTimersByTime(30_000); });
+
+    expect(wsA.send).not.toHaveBeenCalledWith(JSON.stringify({ type: 'ping' }));
+  });
 
   it('debounces a directions refetch on strategic_updated', async () => {
     const { result } = setup();
@@ -110,6 +629,79 @@ describe('useLogViewer strategist events', () => {
     expect(refreshStrategicReadModel).not.toHaveBeenCalled();
     act(() => { vi.advanceTimersByTime(1); });
     expect(refreshStrategicReadModel).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes envelope refetch surfaces to messages and Strategic session refreshes', async () => {
+    const { result } = setup();
+    const ws = await connect(result);
+    const refreshStrategicReadModel = result.current.refreshStrategicReadModelRef.current as ReturnType<typeof vi.fn>;
+    const refreshMessages = result.current.refreshMessagesRef.current as ReturnType<typeof vi.fn>;
+    refreshStrategicReadModel.mockClear();
+    refreshMessages.mockClear();
+
+    act(() => {
+      ws.emit({
+        event: 'workbench_refetch',
+        data: {
+          refetch: {
+            surfaces: ['messages', 'strategic_session'],
+          },
+        },
+      });
+    });
+
+    expect(refreshStrategicReadModel).not.toHaveBeenCalled();
+    expect(refreshMessages).not.toHaveBeenCalled();
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(refreshStrategicReadModel).toHaveBeenCalledTimes(1);
+    expect(refreshMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps legacy message events refreshing the message list', async () => {
+    const { result } = setup();
+    const ws = await connect(result);
+    const refreshStrategicReadModel = result.current.refreshStrategicReadModelRef.current as ReturnType<typeof vi.fn>;
+    const refreshMessages = result.current.refreshMessagesRef.current as ReturnType<typeof vi.fn>;
+
+    for (const eventName of ['message_created', 'message_updated']) {
+      refreshStrategicReadModel.mockClear();
+      refreshMessages.mockClear();
+
+      act(() => { ws.emit({ event: eventName, data: { message_id: 'msg-1' } }); });
+
+      expect(refreshStrategicReadModel, eventName).not.toHaveBeenCalled();
+      expect(refreshMessages, eventName).not.toHaveBeenCalled();
+      act(() => { vi.advanceTimersByTime(500); });
+      expect(refreshStrategicReadModel, eventName).toHaveBeenCalledTimes(1);
+      expect(refreshMessages, eventName).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('routes envelope directions surfaces to the directions fetcher', async () => {
+    const { result } = setup();
+    const ws = await connect(result);
+    const fetchDirections = result.current.fetchDirectionsRef.current as ReturnType<typeof vi.fn>;
+    const refreshStrategicReadModel = result.current.refreshStrategicReadModelRef.current as ReturnType<typeof vi.fn>;
+    const refreshMessages = result.current.refreshMessagesRef.current as ReturnType<typeof vi.fn>;
+    fetchDirections.mockClear();
+    refreshStrategicReadModel.mockClear();
+    refreshMessages.mockClear();
+
+    act(() => {
+      ws.emit({
+        event: 'workbench_refetch',
+        data: {
+          refetch: {
+            surfaces: ['directions'],
+          },
+        },
+      });
+    });
+
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(fetchDirections).toHaveBeenCalledTimes(1);
+    expect(refreshStrategicReadModel).not.toHaveBeenCalled();
+    expect(refreshMessages).not.toHaveBeenCalled();
   });
 
   it('refreshes the Strategic read model for every known workbench-changing event', async () => {
@@ -179,7 +771,7 @@ describe('useLogViewer strategist events', () => {
     );
 
     await act(async () => {
-      result.current.lv.trackTask({ id: 'task-1', project_id: 'projA', title: 'T' } as never);
+      result.current.lv.trackTask({ id: 'task-1', project_id: 'projA', status: 'IN_PROGRESS', title: 'T' } as never);
       await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();

@@ -40,9 +40,10 @@ export type { DeployState } from './types/settings';
  */
 interface UseAppStateOptions {
   refreshStrategicReadModelRef?: MutableRefObject<() => void>;
+  refreshMessagesRef?: MutableRefObject<() => void>;
 }
 
-export function useAppState({ refreshStrategicReadModelRef }: UseAppStateOptions = {}) {
+export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }: UseAppStateOptions = {}) {
   // ── Composed hooks ──────────────────────────────────────────────────────
   const { user, authLoading, userRole, accessDenied, error, setError } = useAuth();
   const { toasts, addToast, dismissToast } = useToasts();
@@ -93,7 +94,9 @@ export function useAppState({ refreshStrategicReadModelRef }: UseAppStateOptions
     setDeployState,
     fetchDirectionsRef,
     refreshStrategicReadModelRef,
+    refreshMessagesRef,
     selectedProjectId,
+    realtimeWsEnabled: !authLoading && Boolean(user),
   });
 
   const {
