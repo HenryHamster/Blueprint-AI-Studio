@@ -38,6 +38,106 @@ function costLabel(task: Task): string | null {
   return `$${task.estimated_cost_usd.toFixed(2)}`;
 }
 
+type TaskRailFact = {
+  key: string;
+  label: string;
+  value: string;
+  title?: string;
+};
+
+type ApiCallSummaryWithExtras = NonNullable<Task['api_call_summary']> & {
+  total_calls?: unknown;
+  provider?: unknown;
+  model?: unknown;
+  by_model?: Array<{ provider?: unknown; model?: unknown }> | null;
+};
+
+function stringValue(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function numberValue(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function countLabel(count: number, singular: string): string {
+  return `${count.toLocaleString()} ${singular}${count === 1 ? '' : 's'}`;
+}
+
+function compactIdentifier(value: string): string {
+  return value.length > 24 ? `${value.slice(0, 12)}...${value.slice(-6)}` : value;
+}
+
+function contextString(task: Task, key: string): string | null {
+  return stringValue((task.context as Record<string, unknown> | undefined)?.[key]);
+}
+
+function taskRunnerFact(task: Task): TaskRailFact | null {
+  const parts: string[] = [];
+  const titleParts: string[] = [];
+  const vmInstanceId = stringValue(task.vm_instance_id);
+  const runnerTargetId = contextString(task, 'runner_target_id');
+
+  if (task.vm_machine_type) parts.push(task.vm_machine_type);
+  if (task.vm_warm_start === true) parts.push('warm start');
+  if (task.vm_spot === true) parts.push('spot');
+  if (vmInstanceId) {
+    parts.push(`vm ${compactIdentifier(vmInstanceId)}`);
+    titleParts.push(`vm ${vmInstanceId}`);
+  }
+  if (runnerTargetId) {
+    parts.push(`runner ${compactIdentifier(runnerTargetId)}`);
+    titleParts.push(`runner ${runnerTargetId}`);
+  }
+
+  return parts.length > 0
+    ? { key: 'runner', label: 'runner', value: parts.join(' · '), title: titleParts.join(' · ') || undefined }
+    : null;
+}
+
+function taskLlmFact(task: Task): TaskRailFact | null {
+  const summary = task.api_call_summary as ApiCallSummaryWithExtras | null | undefined;
+  const modelRows = Array.isArray(summary?.by_model) ? summary.by_model : [];
+  const firstModelRow = modelRows.find(row => stringValue(row.provider) || stringValue(row.model));
+  const provider = stringValue(summary?.provider) ?? stringValue(firstModelRow?.provider) ?? contextString(task, 'llm_provider');
+  const model = stringValue(summary?.model) ?? stringValue(firstModelRow?.model) ?? contextString(task, 'llm_model');
+  const calls = numberValue(summary?.total_calls) ?? numberValue(summary?.llm_call_count);
+  const parts: string[] = [];
+
+  if (task.task_llm_cost_usd != null && task.task_llm_cost_usd > 0) {
+    parts.push(`${task.task_llm_cost_any_unpriced ? '~' : ''}$${task.task_llm_cost_usd.toFixed(4)}`);
+  }
+  if (calls != null && calls > 0) parts.push(countLabel(calls, 'call'));
+  if (provider || model) parts.push(provider && model ? `${provider}/${model}` : provider ?? model ?? '');
+
+  return parts.length > 0 ? { key: 'llm', label: 'llm', value: parts.join(' · ') } : null;
+}
+
+function taskSideboardFact(task: Task): TaskRailFact | null {
+  const context = task.sideboard_context;
+  if (!context) return null;
+
+  const artifactCount = numberValue(context.artifacts?.total);
+  const recentMessageCount = numberValue(context.messages?.total_recent);
+  const parts = [
+    stringValue(context.purpose),
+    artifactCount != null && artifactCount > 0 ? countLabel(artifactCount, 'artifact') : null,
+    recentMessageCount != null && recentMessageCount > 0 ? countLabel(recentMessageCount, 'recent message') : null,
+  ].filter((part): part is string => Boolean(part));
+
+  return parts.length > 0 ? { key: 'sideboard', label: 'sideboard', value: parts.join(' · ') } : null;
+}
+
+function taskRailFacts(task: Task): TaskRailFact[] {
+  return [
+    task.last_heartbeat ? { key: 'heartbeat', label: 'heartbeat', value: timeAgo(task.last_heartbeat) } : null,
+    task.last_tool_use_at ? { key: 'tool', label: 'tool use', value: timeAgo(task.last_tool_use_at) } : null,
+    taskRunnerFact(task),
+    taskLlmFact(task),
+    taskSideboardFact(task),
+  ].filter((fact): fact is TaskRailFact => Boolean(fact));
+}
+
 function attentionTone(task: Task): string {
   if (task.status === 'FAILED') return 'border-red-500/30 bg-red-500/5';
   if (task.status === 'BLOCKED' || task.status === 'PARKED') return 'border-amber-500/30 bg-amber-500/5';
@@ -65,6 +165,25 @@ function TaskRailButton({
     >
       {children}
     </button>
+  );
+}
+
+function TaskFactRows({ facts }: { facts: TaskRailFact[] }) {
+  if (facts.length === 0) return null;
+
+  return (
+    <dl className="grid min-w-0 gap-1.5">
+      {facts.map(fact => (
+        <div
+          key={fact.key}
+          data-testid={`task-rail-fact-${fact.key}`}
+          className="grid min-w-0 grid-cols-[4.8rem_minmax(0,1fr)] gap-2"
+        >
+          <dt className="text-ui-sm font-semibold uppercase text-neutral-600">{fact.label}</dt>
+          <dd className="min-w-0 break-words text-neutral-300" title={fact.title}>{fact.value}</dd>
+        </div>
+      ))}
+    </dl>
   );
 }
 
@@ -97,6 +216,7 @@ function CurrentTaskCard({
   const childCount = task.sideboard_context?.pipeline.child_count ?? task.child_task_ids?.length ?? 0;
   const direction = task.sideboard_context?.strategic.direction;
   const prUrl = task.pr_url ?? task.sideboard_context?.artifacts.primary_pr_url ?? null;
+  const facts = taskRailFacts(task);
 
   return (
     <div className="space-y-3">
@@ -119,8 +239,9 @@ function CurrentTaskCard({
         <WorkbenchMetric label="cost" value={costLabel(task) ?? 'n/a'} />
       </div>
 
-      {(dependencyCount > 0 || childCount > 0 || direction) && (
+      {(facts.length > 0 || dependencyCount > 0 || childCount > 0 || direction) && (
         <div className="space-y-1.5 border-t border-neutral-800 pt-2 text-xs text-neutral-400">
+          <TaskFactRows facts={facts} />
           {direction && (
             <div className="flex min-w-0 gap-2">
               <Route className="mt-0.5 h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />

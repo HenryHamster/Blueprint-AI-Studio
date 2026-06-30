@@ -76,6 +76,99 @@ describe('TaskContextRail', () => {
     expect(onOpenTask).toHaveBeenCalledWith(expect.objectContaining({ id: 'task-12345678' }));
   });
 
+  test('renders compact task facts when optional Task fields are present', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-06-29T12:35:00Z'));
+    const sideboardContext = makeTask().sideboard_context as NonNullable<Task['sideboard_context']>;
+
+    try {
+      render(
+        <TaskContextRail
+          currentTask={makeTask({
+            last_heartbeat: '2026-06-29T12:30:00Z',
+            last_tool_use_at: '2026-06-29T12:25:00Z',
+            estimated_cost_usd: 4.25,
+            vm_machine_type: 'n2-standard-4',
+            vm_warm_start: true,
+            vm_spot: true,
+            vm_instance_id: 'vm-blueprint-1',
+            task_llm_cost_usd: 0.1234,
+            task_llm_cost_any_unpriced: true,
+            api_call_summary: {
+              llm_call_count: 11,
+              total_calls: 19,
+              provider: 'openai',
+              model: 'gpt-5-mini',
+            } as NonNullable<Task['api_call_summary']> & {
+              total_calls: number;
+              provider: string;
+              model: string;
+            },
+            context: { runner_target_id: 'runner-west-1' },
+            sideboard_context: {
+              ...sideboardContext,
+              purpose: 'Passive task context',
+              artifacts: { ...sideboardContext.artifacts, total: 3 },
+              messages: { ...sideboardContext.messages, total_recent: 4 },
+            },
+          })}
+          attentionTasks={[]}
+          onOpenTask={vi.fn()}
+        />,
+      );
+
+      expect(screen.getByText('$4.25')).toBeInTheDocument();
+      expect(screen.getByTestId('task-rail-fact-heartbeat')).toHaveTextContent('5m ago');
+      expect(screen.getByTestId('task-rail-fact-tool')).toHaveTextContent('10m ago');
+      expect(screen.getByTestId('task-rail-fact-runner')).toHaveTextContent('n2-standard-4');
+      expect(screen.getByTestId('task-rail-fact-runner')).toHaveTextContent('warm start');
+      expect(screen.getByTestId('task-rail-fact-runner')).toHaveTextContent('spot');
+      expect(screen.getByTestId('task-rail-fact-runner')).toHaveTextContent('vm vm-blueprint-1');
+      expect(screen.getByTestId('task-rail-fact-runner')).toHaveTextContent('runner runner-west-1');
+      expect(screen.getByTestId('task-rail-fact-llm')).toHaveTextContent('~$0.1234');
+      expect(screen.getByTestId('task-rail-fact-llm')).toHaveTextContent('19 calls');
+      expect(screen.getByTestId('task-rail-fact-llm')).toHaveTextContent('openai/gpt-5-mini');
+      expect(screen.getByTestId('task-rail-fact-sideboard')).toHaveTextContent('Passive task context');
+      expect(screen.getByTestId('task-rail-fact-sideboard')).toHaveTextContent('3 artifacts');
+      expect(screen.getByTestId('task-rail-fact-sideboard')).toHaveTextContent('4 recent messages');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test('omits compact task facts when optional Task fields are absent', () => {
+    render(
+      <TaskContextRail
+        currentTask={makeTask({
+          sideboard_context: null,
+          depends_on: [],
+          child_task_ids: [],
+          last_heartbeat: undefined,
+          last_tool_use_at: null,
+          vm_instance_id: undefined,
+          vm_machine_type: null,
+          vm_warm_start: false,
+          vm_spot: false,
+          task_llm_cost_usd: 0,
+          api_call_summary: { llm_call_count: 0, total_calls: 0 } as NonNullable<Task['api_call_summary']> & {
+            total_calls: number;
+          },
+          context: {},
+        })}
+        attentionTasks={[]}
+        onOpenTask={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByTestId('task-rail-fact-heartbeat')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('task-rail-fact-tool')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('task-rail-fact-runner')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('task-rail-fact-llm')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('task-rail-fact-sideboard')).not.toBeInTheDocument();
+    expect(screen.queryByText(/recent message/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/artifact/i)).not.toBeInTheDocument();
+  });
+
   test('renders attention tasks when no task is currently open', async () => {
     const user = userEvent.setup();
     const onOpenTask = vi.fn();
