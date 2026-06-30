@@ -1062,6 +1062,7 @@ async def _do_rollup_post_merge_housekeeping(
                 _dir_representatives[_did] = c
         for _rep in _dir_representatives.values():
             await refresh_direction_outcomes_after_merge(_rep, session)
+        await _record_completed_children_merge_evidence(completed_children, session)
     try:
         await delete_branch(gh_token, owner, repo, staging_branch)
     except Exception as del_err:
@@ -1130,6 +1131,32 @@ async def _do_rollup_post_merge_housekeeping(
             f"[MERGE-QUEUE] Sibling nudge after rollup PR "
             f"#{rollup_pr_number} failed: {_queue_exc}"
         )
+
+
+async def _record_completed_children_merge_evidence(
+    completed_children: "list[Task]", session: "AsyncSession"
+) -> None:
+    """Best-effort acceptance evidence recording for landed completed children.
+
+    Force-dropped children (rollup_no_pr_artifact, malformed_pr_url,
+    review_respawn_cap) are intentionally excluded: they carry pr_merged=True
+    for orchestration bookkeeping but were never genuinely merged, so they must
+    not receive merge/reachability evidence.
+    """
+    from app.acceptance_criteria import record_task_merge_evidence
+
+    for _child in completed_children:
+        ctx = _child.context or {}
+        if ctx.get("_non_merge_unblock_reason") in _FORCE_DROP_REASONS:
+            continue
+        try:
+            await record_task_merge_evidence(session, _child, _child.project_id)
+        except Exception as exc:  # noqa: BLE001 — best-effort post-merge audit
+            logger.warning(
+                "[ROLLUP] criterion evidence recording failed for child %s: %r",
+                getattr(_child, "id", None),
+                exc,
+            )
 
 
 async def _check_and_trigger_rollup(
@@ -2464,6 +2491,9 @@ async def _check_and_trigger_rollup(
                                     await refresh_direction_outcomes_after_merge(
                                         _dir_child, session
                                     )
+                                await _record_completed_children_merge_evidence(
+                                    completed_children, session
+                                )
                             await _cleanup_branches(parent, session)
                             await broadcast_to_project(
                                 str(parent.project_id),
@@ -2865,6 +2895,9 @@ async def _check_and_trigger_rollup(
                             await refresh_direction_outcomes_after_merge(
                                 _dir_child, session
                             )
+                        await _record_completed_children_merge_evidence(
+                            completed_children, session
+                        )
                     await _cleanup_branches(parent, session)
                     await broadcast_to_project(
                         str(parent.project_id),
@@ -3301,6 +3334,9 @@ async def _check_and_trigger_rollup(
                                 await refresh_direction_outcomes_after_merge(
                                     _dir_child, session
                                 )
+                            await _record_completed_children_merge_evidence(
+                                completed_children, session
+                            )
                         try:
                             await delete_branch(gh_token, owner, repo, staging_branch)
                         except Exception as del_err:

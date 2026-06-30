@@ -2893,6 +2893,65 @@ async def test_post_merge_housekeeping_refreshes_all_directions(mocker):
     assert child_a2 not in refreshed_children, "duplicate direction A child must not be refreshed"
 
 
+@pytest.mark.asyncio
+async def test_record_completed_children_merge_evidence_records_every_child(mocker):
+    """The landed-child evidence helper must touch every completed child."""
+    from app.rollup_management import _record_completed_children_merge_evidence
+
+    mock_record = mocker.patch(
+        "app.acceptance_criteria.record_task_merge_evidence",
+        new_callable=AsyncMock,
+        return_value=1,
+    )
+
+    child_a = MagicMock(id="child-a", project_id="proj-a")
+    child_b = MagicMock(id="child-b", project_id="proj-b")
+    child_c = MagicMock(id="child-c", project_id="proj-c")
+    session = MagicMock()
+
+    await _record_completed_children_merge_evidence(
+        [child_a, child_b, child_c], session
+    )
+
+    assert mock_record.await_count == 3
+    assert [call.args[1] for call in mock_record.await_args_list] == [
+        child_a,
+        child_b,
+        child_c,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_record_completed_children_merge_evidence_skips_force_dropped_children(
+    mocker,
+):
+    """Force-dropped children must not receive merge evidence on landing."""
+    from app.rollup_management import _record_completed_children_merge_evidence
+
+    mock_record = mocker.patch(
+        "app.acceptance_criteria.record_task_merge_evidence",
+        new_callable=AsyncMock,
+        return_value=1,
+    )
+
+    landed_child = MagicMock(
+        id="child-keep",
+        project_id="proj-a",
+        context={"pr_merged": True},
+    )
+    dropped_child = MagicMock(
+        id="child-drop",
+        project_id="proj-b",
+        context={"pr_merged": True, "_non_merge_unblock_reason": "malformed_pr_url"},
+    )
+    session = MagicMock()
+
+    await _record_completed_children_merge_evidence([landed_child, dropped_child], session)
+
+    assert mock_record.await_count == 1
+    assert mock_record.await_args_list[0].args[1] is landed_child
+
+
 # ---------------------------------------------------------------------------
 # Integration test: _do_rollup_post_merge_housekeeping records CriterionEvidence
 # through the REAL production call chain (refresh_direction_outcomes_after_merge
@@ -2901,12 +2960,12 @@ async def test_post_merge_housekeeping_refreshes_all_directions(mocker):
 
 
 @pytest.mark.asyncio
-async def test_rollup_post_merge_housekeeping_records_criterion_evidence(
+async def test_rollup_post_merge_housekeeping_records_criterion_evidence_for_all_children(
     cleanup_db, mocker
 ):
     """_do_rollup_post_merge_housekeeping records CriterionEvidence rows through
-    the real production call chain when landed=True and the child task carries a
-    proven code-acceptance verdict.
+    the real production call chain for every landed child that carries a proven
+    code-acceptance verdict.
 
     The sibling test test_post_merge_housekeeping_refreshes_all_directions uses a
     MagicMock session and mocks refresh_direction_outcomes_after_merge, so the
@@ -2950,12 +3009,21 @@ async def test_rollup_post_merge_housekeeping_records_criterion_evidence(
     await cleanup_db.commit()
     await cleanup_db.refresh(version)
 
-    # Author a criterion for the open version.
+    # Author criteria for two same-direction children. Before the fix, only the
+    # first direction representative got evidence; the sibling's criterion was
+    # left uncovered.
     criterion = await create_criterion(
         cleanup_db,
         project_id=project.id,
         release_version_id=version.id,
         text="Integration test suite passes green under real merge verdict",
+        created_by="test",
+    )
+    criterion_b = await create_criterion(
+        cleanup_db,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Sibling child suite passes green under real merge verdict",
         created_by="test",
     )
 
@@ -2986,9 +3054,19 @@ async def test_rollup_post_merge_housekeeping_records_criterion_evidence(
         },
         criterion_ids=[criterion.criterion_key],
     )
+    child_b = _Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "implement sibling feature"}],
+        status=TaskStatus.COMPLETED,
+        context=dict(child.context or {}),
+        criterion_ids=[criterion_b.criterion_key],
+    )
     cleanup_db.add(child)
+    cleanup_db.add(child_b)
     await cleanup_db.commit()
     await cleanup_db.refresh(child)
+    await cleanup_db.refresh(child_b)
 
     # Drive _do_rollup_post_merge_housekeeping with landed=True.
     # refresh_direction_outcomes_after_merge is NOT mocked — the real function
@@ -3003,8 +3081,8 @@ async def test_rollup_post_merge_housekeeping_records_criterion_evidence(
         rollup_pr_number=4242,
         staging_branch="research/conflict-stg",
         target_branch="research/conflict-base",
-        completed_children=[child],
-        completed_count=1,
+        completed_children=[child, child_b],
+        completed_count=2,
         landed=True,
         terminal=False,
     )
@@ -3030,6 +3108,12 @@ async def test_rollup_post_merge_housekeeping_records_criterion_evidence(
     assert coverage == "covered", (
         f"Expected criterion coverage 'covered', got {coverage!r}"
     )
+
+    sibling_evidence = await get_evidence_for_criterion(cleanup_db, criterion_b.id)
+    assert len(sibling_evidence) == 2
+    assert {e.source_kind for e in sibling_evidence} == {"task_merge", "reachability"}
+    assert all(str(e.source_id) == str(child_b.id) for e in sibling_evidence)
+    assert compute_criterion_coverage(sibling_evidence) == "covered"
 
 
 @pytest.mark.asyncio
