@@ -30,6 +30,7 @@ export interface StrategicStateTask {
   latest_status_message?: string | null;
   started_at?: string | null;
   created_at?: string | null;
+  updated_at?: string | null;
 }
 
 export type StrategicStateMessagePreview = ProjectMessagePreview;
@@ -235,6 +236,12 @@ export interface StrategicRuntimeWakePreview {
   result_detail?: string | null;
 }
 
+export interface StrategicRuntimeLocalRunnerHoldPreview extends StrategicStateTask {
+  awaiting_since?: string | null;
+  blocked_reason?: string | null;
+  park_reason?: string | null;
+}
+
 export interface StrategicRuntimeWorkState {
   compute_jobs: {
     window_minutes: number;
@@ -263,6 +270,10 @@ export interface StrategicRuntimeWorkState {
   held_approvals: {
     count: number;
     items: StrategicStateTask[];
+  };
+  local_runner_holds?: {
+    count: number;
+    items: StrategicRuntimeLocalRunnerHoldPreview[];
   };
   parked_wakes: {
     counts: {

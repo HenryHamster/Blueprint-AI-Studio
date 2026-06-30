@@ -238,6 +238,11 @@ def _build_work_session_summary(
         if isinstance(runtime_work, dict)
         else {}
     )
+    local_runner_holds = (
+        runtime_work.get("local_runner_holds", {})
+        if isinstance(runtime_work, dict)
+        else {}
+    )
     parked_wakes = (
         runtime_work.get("parked_wakes", {}) if isinstance(runtime_work, dict) else {}
     )
@@ -247,6 +252,11 @@ def _build_work_session_summary(
     held_approval_count = (
         int(held_approvals.get("count") or 0)
         if isinstance(held_approvals, dict)
+        else 0
+    )
+    local_runner_hold_count = (
+        int(local_runner_holds.get("count") or 0)
+        if isinstance(local_runner_holds, dict)
         else 0
     )
 
@@ -331,6 +341,13 @@ def _build_work_session_summary(
             held_approval_count,
             tone="warning" if held_approval_count > 0 else "neutral",
             target={"surface": "pipeline"},
+        ),
+        _work_session_metric(
+            "runtime.local_runner_holds",
+            "local runner holds",
+            local_runner_hold_count,
+            tone="warning" if local_runner_hold_count > 0 else "neutral",
+            target={"surface": "runtime", "section": "devices"},
         ),
         _work_session_metric(
             "runtime.parked_wakes",

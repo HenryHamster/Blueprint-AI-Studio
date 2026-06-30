@@ -7,6 +7,7 @@ from datetime import timedelta
 from typing import Any, Dict
 
 from sqlalchemy import func
+from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -45,6 +46,7 @@ _PROBLEM_WAKE_STATES = (
     WakeDeliveryState.FAILED,
 )
 _RUNTIME_WORK_PREVIEW_LIMIT = 6
+LOCAL_RUNNER_HOLD_CONTEXT_KEY = "awaiting_local_runner_since"
 _LOCAL_STRATEGIC_RUNNING_STATUSES = frozenset(
     {
         TaskStatus.IN_PROGRESS,
@@ -84,6 +86,51 @@ def _string_or_none(value: Any) -> str | None:
         return None
     stripped = value.strip()
     return stripped or None
+
+
+def _task_type(task: Task | None) -> str | None:
+    if task is None:
+        return None
+    payload = task.first_payload or {}
+    if not isinstance(payload, dict):
+        return None
+    return _string_or_none(payload.get("type"))
+
+
+def task_awaiting_local_runner_since(task: Task | None) -> str | None:
+    if task is None:
+        return None
+    context = task.context or {}
+    raw = context.get(LOCAL_RUNNER_HOLD_CONTEXT_KEY)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return _string_or_none(raw)
+    return str(raw)
+
+
+def task_is_local_runner_hold(task: Task | None) -> bool:
+    if task is None:
+        return False
+    return (
+        task.status == TaskStatus.QUEUED
+        and not task.archived
+        and _task_type(task) == "compute_experiment"
+        and task_awaiting_local_runner_since(task) is not None
+    )
+
+
+def local_runner_hold_task_filters(project_id: uuid.UUID) -> tuple[ColumnElement[bool], ...]:
+    awaiting_since = Task.context[LOCAL_RUNNER_HOLD_CONTEXT_KEY].as_string()
+    return (
+        Task.project_id == project_id,
+        Task.archived.is_(False),
+        Task.status == TaskStatus.QUEUED,
+        Task.requires_approval.is_not(True),
+        Task.payloads[0]["type"].as_string() == "compute_experiment",
+        awaiting_since.is_not(None),
+        awaiting_since != "",
+    )
 
 
 def _runner_target_id(task: Task | None) -> str | None:
@@ -167,19 +214,32 @@ def _active_strategic_task_types(task: Task | None) -> frozenset[str]:
     return _CORE_STRATEGIC_CYCLE_TASK_TYPES
 
 
-def _task_summary(task: Task | None) -> Dict[str, Any] | None:
+def _task_summary(
+    task: Task | None,
+    *,
+    include_awaiting_since: bool = False,
+) -> Dict[str, Any] | None:
     if task is None:
         return None
-    payload = task.first_payload or {}
-    return {
+    summary = {
         "id": str(task.id),
         "status": _enum_value(task.status),
         "title": task.title,
-        "task_type": payload.get("type"),
+        "task_type": _task_type(task),
         "latest_status_message": task.latest_status_message,
         "started_at": _isoformat(task.started_at),
         "created_at": _isoformat(task.created_at),
+        "updated_at": _isoformat(task.updated_at),
     }
+    if include_awaiting_since:
+        summary["awaiting_since"] = task_awaiting_local_runner_since(task)
+    blocked_reason = _compact_text(task.blocked_reason, max_chars=180)
+    if blocked_reason:
+        summary["blocked_reason"] = blocked_reason
+    park_reason = _compact_text(task.park_reason, max_chars=180)
+    if park_reason:
+        summary["park_reason"] = park_reason
+    return summary
 
 
 def _local_operator_status(
@@ -597,6 +657,21 @@ async def build_runtime_work_summary(
         )
     ).scalar()
 
+    local_runner_hold_filters = local_runner_hold_task_filters(project_id)
+    local_runner_hold_tasks = (
+        await session.execute(
+            select(Task)
+            .where(*local_runner_hold_filters)
+            .order_by(Task.priority.asc(), Task.created_at.asc())
+            .limit(_RUNTIME_WORK_PREVIEW_LIMIT)
+        )
+    ).scalars().all()
+    local_runner_hold_count = (
+        await session.execute(
+            select(func.count()).select_from(Task).where(*local_runner_hold_filters)
+        )
+    ).scalar()
+
     wake_rows = (
         await session.execute(
             select(TaskWakeRegistration)
@@ -718,6 +793,13 @@ async def build_runtime_work_summary(
         "held_approvals": {
             "count": int(held_task_count or 0),
             "items": [_task_summary(task) for task in held_tasks],
+        },
+        "local_runner_holds": {
+            "count": int(local_runner_hold_count or 0),
+            "items": [
+                _task_summary(task, include_awaiting_since=True)
+                for task in local_runner_hold_tasks
+            ],
         },
         "parked_wakes": {
             "counts": {

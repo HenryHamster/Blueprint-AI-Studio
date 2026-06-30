@@ -811,6 +811,84 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).toContain('Compare embeddings');
   });
 
+  test('surfaces local runner holds as runtime work needing attention', () => {
+    const localRunnerHoldState: StrategicStateResponse = {
+      ...STATE,
+      runtime: {
+        ...STATE.runtime,
+        local_runner: null,
+        work: {
+          compute_jobs: {
+            window_minutes: 360,
+            counts: {
+              active: 0,
+              terminal_recent: 0,
+              total: 0,
+              queued: 0,
+              starting: 0,
+              running: 0,
+              polling: 0,
+              succeeded_recent: 0,
+              failed_recent: 0,
+              cancelled_recent: 0,
+              timed_out_recent: 0,
+              criterion_measured: 0,
+              criterion_met: 0,
+            },
+            spend: {
+              active_accrued_usd: 0,
+              recent_terminal_usd: 0,
+              window_total_usd: 0,
+            },
+            items: [],
+          },
+          held_approvals: { count: 0, items: [] },
+          local_runner_holds: {
+            count: 1,
+            items: [
+              {
+                id: 'task-local-hold',
+                status: 'QUEUED',
+                title: 'Run local GPU benchmark',
+                task_type: 'compute_experiment',
+                latest_status_message: 'Waiting for local runner.',
+                started_at: null,
+                created_at: '2026-06-29T01:01:00Z',
+                awaiting_since: '2026-06-29T01:02:00Z',
+              },
+            ],
+          },
+          parked_wakes: {
+            counts: {
+              active: 0,
+              pending: 0,
+              fired: 0,
+              problem: 0,
+              expired: 0,
+              failed: 0,
+            },
+            items: [],
+          },
+        },
+      },
+    };
+    const onOpenRuntimeDevices = vi.fn();
+    const onOpenRuntimeCompute = vi.fn();
+    const { host } = mount({ state: localRunnerHoldState, onOpenRuntimeDevices, onOpenRuntimeCompute });
+
+    expect(host.textContent).toContain('Runtime work');
+    expect(host.textContent).toContain('needs check');
+    expect(host.textContent).toContain('1 local runner hold');
+    expect(host.textContent).toContain('Run local GPU benchmark');
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Devices'))
+      ?.click();
+
+    expect(onOpenRuntimeDevices).toHaveBeenCalled();
+    expect(onOpenRuntimeCompute).not.toHaveBeenCalled();
+  });
+
   test('shows local Strategic fallback without adding a second runner list', () => {
     const noRunnerState: StrategicStateResponse = {
       ...STATE,

@@ -24,6 +24,10 @@ from app.models import (
     Task,
     TaskStatus,
 )
+from app.strategic_runtime_work import (
+    local_runner_hold_task_filters,
+    task_awaiting_local_runner_since,
+)
 
 
 _HIGH_SIGNAL_MESSAGE_TYPES = (
@@ -112,6 +116,7 @@ def _task_attention_item(task: Task, *, reason: str, severity: str) -> dict[str,
         "failed_task": "Task failed",
         "blocked_task": "Task blocked",
         "parked_task": "Task parked",
+        "local_runner_hold": "Local runner needed",
     }.get(reason, "Task needs attention")
     detail = (
         task.latest_status_message
@@ -135,6 +140,26 @@ def _task_attention_item(task: Task, *, reason: str, severity: str) -> dict[str,
             "project_id": str(task.project_id),
         },
     }
+
+
+def _local_runner_hold_attention_item(task: Task) -> dict[str, Any]:
+    awaiting_since = task_awaiting_local_runner_since(task)
+    hold_detail = (
+        f"Waiting for local runner hardware since {awaiting_since}"
+        if awaiting_since
+        else "Waiting for local runner hardware"
+    )
+    task_detail = task.latest_status_message or task.blocked_reason or task.park_reason
+    if task_detail:
+        hold_detail = f"{hold_detail}: {task_detail}"
+    item = _task_attention_item(
+        task,
+        reason="local_runner_hold",
+        severity="needs_operator",
+    )
+    item["detail"] = _compact_text(hold_detail, max_chars=180)
+    item["awaiting_since"] = awaiting_since
+    return item
 
 
 def _alert_attention_item(alert: Alert) -> dict[str, Any]:
@@ -329,6 +354,28 @@ async def build_operator_attention(
     blocked_count = int(task_count_result.blocked or 0)
     parked_count = int(task_count_result.parked or 0)
 
+    local_runner_hold_filters = local_runner_hold_task_filters(project.id)
+    local_runner_hold_count = int(
+        (
+            await session.execute(
+                select(func.count()).select_from(Task).where(*local_runner_hold_filters)
+            )
+        ).scalar()
+        or 0
+    )
+    local_runner_hold_tasks = list(
+        (
+            await session.execute(
+                select(Task)
+                .where(*local_runner_hold_filters)
+                .order_by(Task.priority.asc(), Task.created_at.asc())
+                .limit(4)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     alert_count_rows = (
         await session.execute(
             select(Alert.severity, func.count()).where(
@@ -444,6 +491,8 @@ async def build_operator_attention(
                 severity="needs_operator",
             )
         )
+    for task in local_runner_hold_tasks:
+        add_item(_local_runner_hold_attention_item(task))
     for direction in manual_directions[:3]:
         add_item(_direction_attention_item(project.id, direction))
     for alert in alerts:
@@ -469,6 +518,7 @@ async def build_operator_attention(
         open_question_count
         + open_blocker_count
         + approval_count
+        + local_runner_hold_count
         + len(manual_directions)
         + error_alert_count
     )
@@ -511,6 +561,7 @@ async def build_operator_attention(
             "bug_reports": bug_report_count,
             "feedback": feedback_count,
             "approvals": approval_count,
+            "local_runner_holds": local_runner_hold_count,
             "manual_directions": len(manual_directions),
             "alerts": error_alert_count + warning_alert_count,
             "error_alerts": error_alert_count,

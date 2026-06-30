@@ -1842,6 +1842,115 @@ async def test_strategic_state_includes_runtime_background_work(
 
 
 @pytest.mark.asyncio
+async def test_strategic_state_surfaces_local_runner_holds(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    awaiting_since = (_utcnow() - timedelta(minutes=45)).isoformat()
+    held_for_runner = Task(
+        project_id=project.id,
+        title="Run local-only GPU benchmark",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.QUEUED,
+        latest_status_message="require_local_runner is waiting for hardware.",
+        blocked_reason="No eligible local runner is online.",
+        park_reason="Waiting for self-hosted hardware.",
+        context={"awaiting_local_runner_since": awaiting_since},
+        priority=1,
+    )
+    approval_hold = Task(
+        project_id=project.id,
+        title="Approve local-only benchmark",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=True,
+        context={"awaiting_local_runner_since": awaiting_since},
+        priority=2,
+    )
+    archived_hold = Task(
+        project_id=project.id,
+        title="Archived hold",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.QUEUED,
+        archived=True,
+        context={"awaiting_local_runner_since": awaiting_since},
+    )
+    wrong_type_hold = Task(
+        project_id=project.id,
+        title="Non-compute hold marker",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        context={"awaiting_local_runner_since": awaiting_since},
+    )
+    running_hold_marker = Task(
+        project_id=project.id,
+        title="Running compute marker",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.IN_PROGRESS,
+        context={"awaiting_local_runner_since": awaiting_since},
+    )
+    db_session.add_all(
+        [
+            held_for_runner,
+            approval_hold,
+            archived_hold,
+            wrong_type_hold,
+            running_hold_marker,
+        ]
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    holds = data["runtime"]["work"]["local_runner_holds"]
+    assert holds["count"] == 1
+    hold_items = {item["id"]: item for item in holds["items"]}
+    assert set(hold_items) == {str(held_for_runner.id)}
+    held_item = hold_items[str(held_for_runner.id)]
+    assert held_item["status"] == "QUEUED"
+    assert held_item["title"] == "Run local-only GPU benchmark"
+    assert held_item["task_type"] == "compute_experiment"
+    assert held_item["awaiting_since"] == awaiting_since
+    assert held_item["blocked_reason"] == "No eligible local runner is online."
+    assert held_item["park_reason"] == "Waiting for self-hosted hardware."
+    assert held_item["latest_status_message"] == (
+        "require_local_runner is waiting for hardware."
+    )
+    assert held_item["created_at"]
+    assert held_item["updated_at"]
+
+    metrics = {
+        entry["id"]: entry for entry in data["work_session"]["curated_metrics"]
+    }
+    assert metrics["runtime.local_runner_holds"]["value"] == 1
+    assert metrics["runtime.local_runner_holds"]["tone"] == "warning"
+    assert metrics["runtime.local_runner_holds"]["target"] == {
+        "surface": "runtime",
+        "section": "devices",
+    }
+
+    attention = data["attention"]
+    assert attention["level"] == "needs_operator"
+    assert attention["summary"] == "2 operator items need review"
+    assert attention["counts"]["approvals"] == 1
+    assert attention["counts"]["local_runner_holds"] == 1
+    assert attention["counts"]["needs_operator"] == 2
+    assert attention["counts"]["watch"] == 0
+    attention_items = {item["id"]: item for item in attention["items"]}
+    assert f"task:{held_for_runner.id}:local_runner_hold" in attention_items
+    assert f"task:{approval_hold.id}:approval_required" in attention_items
+    assert f"task:{approval_hold.id}:local_runner_hold" not in attention_items
+    local_attention = attention_items[f"task:{held_for_runner.id}:local_runner_hold"]
+    assert local_attention["reason"] == "local_runner_hold"
+    assert local_attention["label"] == "Local runner needed"
+    assert local_attention["severity"] == "needs_operator"
+    assert local_attention["awaiting_since"] == awaiting_since
+    assert "Waiting for local runner hardware" in local_attention["detail"]
+
+
+@pytest.mark.asyncio
 async def test_strategic_state_does_not_return_terminal_task_as_active(
     client: AsyncClient, db_session
 ):

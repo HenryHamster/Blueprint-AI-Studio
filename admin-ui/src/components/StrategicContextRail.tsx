@@ -119,7 +119,11 @@ function localRunnerDetail(localRunner: StrategicLocalRunnerState): string {
 }
 
 function runtimeWorkTone(work: StrategicRuntimeWorkState): { dot: string; text: string; label: string } {
-  if ((work.held_approvals?.count ?? 0) > 0 || (work.parked_wakes?.counts.problem ?? 0) > 0) {
+  if (
+    (work.local_runner_holds?.count ?? 0) > 0 ||
+    (work.held_approvals?.count ?? 0) > 0 ||
+    (work.parked_wakes?.counts.problem ?? 0) > 0
+  ) {
     return { dot: 'bg-amber-300', text: 'text-amber-300', label: 'needs check' };
   }
   if ((work.compute_jobs?.counts.failed_recent ?? 0) > 0 || (work.compute_jobs?.counts.timed_out_recent ?? 0) > 0) {
@@ -135,9 +139,13 @@ function runtimeWorkTone(work: StrategicRuntimeWorkState): { dot: string; text: 
 }
 
 function runtimeWorkDetail(work: StrategicRuntimeWorkState): string {
+  const localRunnerHoldCount = work.local_runner_holds?.count ?? 0;
   const parts = [
     (work.compute_jobs?.counts.active ?? 0) > 0
       ? pluralize(work.compute_jobs.counts.active, 'compute job')
+      : null,
+    localRunnerHoldCount > 0
+      ? pluralize(localRunnerHoldCount, 'local runner hold')
       : null,
     (work.held_approvals?.count ?? 0) > 0
       ? pluralize(work.held_approvals.count, 'approval')
@@ -209,6 +217,7 @@ function runtimeWorkHasSignal(work?: StrategicRuntimeWorkState | null): work is 
     (work.compute_jobs?.counts.active ?? 0) > 0 ||
     (work.compute_jobs?.counts.failed_recent ?? 0) > 0 ||
     (work.compute_jobs?.counts.timed_out_recent ?? 0) > 0 ||
+    (work.local_runner_holds?.count ?? 0) > 0 ||
     (work.held_approvals?.count ?? 0) > 0 ||
     (work.parked_wakes?.counts.active ?? 0) > 0 ||
     (work.parked_wakes?.counts.problem ?? 0) > 0 ||
@@ -867,6 +876,8 @@ export function StrategicContextRail({
   const showRuntimeWork = runtimeWorkHasSignal(runtimeWork);
   const runtimeWorkStatus = showRuntimeWork ? runtimeWorkTone(runtimeWork) : null;
   const firstRuntimeJob = runtimeWork?.compute_jobs.items[0] ?? null;
+  const firstLocalRunnerHold = runtimeWork?.local_runner_holds?.items[0] ?? null;
+  const hasLocalRunnerHolds = (runtimeWork?.local_runner_holds?.count ?? 0) > 0;
   const selectedRefs = workbenchState?.selected_refs ?? state?.work_session?.selected_refs ?? state?.workbench?.selected_refs ?? [];
   const workSessionDescriptors = state?.work_session?.selected_ref_descriptors ?? [];
   const descriptorByRef = new Map(workSessionDescriptors.map(descriptor => [sessionRefKey(descriptor), descriptor]));
@@ -1002,13 +1013,21 @@ export function StrategicContextRail({
                 <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-neutral-500">
                   {runtimeWorkDetail(runtimeWork)}
                 </p>
-                {firstRuntimeJob?.task_title && (
+                {(firstLocalRunnerHold?.title || firstRuntimeJob?.task_title) && (
                   <p className="mt-1 truncate text-ui-sm text-neutral-600">
-                    {firstRuntimeJob.task_title}
+                    {firstLocalRunnerHold?.title ?? firstRuntimeJob?.task_title}
                   </p>
                 )}
               </div>
-              <RailButton onClick={onOpenRuntimeCompute ?? onOpenRuntimeHealth}>Compute</RailButton>
+              <RailButton
+                onClick={
+                  hasLocalRunnerHolds
+                    ? (onOpenRuntimeDevices ?? onOpenRuntimeHealth)
+                    : (onOpenRuntimeCompute ?? onOpenRuntimeHealth)
+                }
+              >
+                {hasLocalRunnerHolds ? 'Devices' : 'Compute'}
+              </RailButton>
             </div>
           </div>
         )}
