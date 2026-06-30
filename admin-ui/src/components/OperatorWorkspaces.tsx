@@ -2,7 +2,6 @@ import type { ComponentProps, MutableRefObject } from 'react';
 import {
   Activity,
   Bell,
-  Cpu,
   Gauge,
   GitBranch,
   RotateCw,
@@ -131,7 +130,7 @@ export function ProjectWorkspace({
     PROJECT_MANAGE_SECTIONS.find(item => item.id === projectManageSection) ?? PROJECT_MANAGE_SECTIONS[0]!;
   const ActiveProjectManageIcon = activeProjectManageItem.icon;
   const activeProjectSettingsSection = activeProjectManageItem.id === 'overview' ? null : activeProjectManageItem.id;
-  const actionButtonClass = 'inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100';
+  const actionButtonClass = 'inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-[#10151c] px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-[#151c25] hover:text-neutral-100';
 
   const projectSurfaceActions = (
     <>
@@ -425,9 +424,9 @@ export function RuntimeWorkspace({
 
   const runtimeSurfaceActions = (
     <>
-      <span className="hidden min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs text-neutral-500 md:inline-flex">
+      <span className="hidden min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-[#10151c] px-2.5 text-xs text-neutral-400 md:inline-flex">
         <span className={`h-1.5 w-1.5 rounded-full ${apiHealthy && wsConnected ? 'bg-emerald-400' : 'bg-amber-400'}`} />
-        {apiHealthy && wsConnected ? 'runtime healthy' : 'runtime degraded'}
+        {apiHealthy && wsConnected ? 'API + WS' : 'degraded'}
       </span>
       {userRole === 'admin' && (
         <button
@@ -445,7 +444,7 @@ export function RuntimeWorkspace({
   return (
     <WorkbenchSurface
       title="Runtime"
-      subtitle={runtimeSection === 'devices' && selectedProjectRepoLabel ? selectedProjectRepoLabel : 'Global operations, accounts, and fleet health'}
+      subtitle={runtimeSection === 'devices' && selectedProjectRepoLabel ? selectedProjectRepoLabel : 'Fleet, accounts, and system health'}
       tabs={[
         { id: 'health', label: 'Health' },
         { id: 'devices', label: 'Devices' },
@@ -459,7 +458,7 @@ export function RuntimeWorkspace({
       actions={runtimeSurfaceActions}
       tabLayout="stacked"
       flush
-      contentClassName={runtimeSection === 'settings' ? 'min-h-0 min-w-0 overflow-hidden' : 'min-h-0 min-w-0 overflow-auto p-4 custom-scrollbar'}
+      contentClassName={runtimeSection === 'settings' ? 'min-h-0 min-w-0 overflow-hidden' : 'min-h-0 min-w-0 overflow-auto p-3 custom-scrollbar'}
     >
       {runtimeSection === 'health' ? (
         <ConsoleHome
@@ -475,8 +474,8 @@ export function RuntimeWorkspace({
           onCreateTask={onCreateTask}
         />
       ) : runtimeSection === 'devices' ? (
-        <div className="grid min-h-full gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(360px,420px)]">
-          <div className="min-w-0 rounded-md border border-neutral-800 bg-[#111820] p-4">
+        <div className="grid min-h-full gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(340px,400px)]">
+          <div className="min-w-0 rounded-md border border-neutral-800 bg-[#10151c] p-2.5">
             <WarmVmPanel onViewTask={onViewTaskById} projects={projects} />
           </div>
           <WorkbenchPanel title="Self-hosted runners" meta={selectedProjectRepoLabel ?? 'select project'}>
@@ -494,15 +493,6 @@ export function RuntimeWorkspace({
         </div>
       ) : runtimeSection === 'compute' ? (
         <div className="mx-auto max-w-7xl">
-          <div className="mb-3 flex min-w-0 items-center gap-3 border-b border-neutral-800 pb-3">
-            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-[#111820] text-neutral-300">
-              <Cpu className="h-4 w-4" />
-            </span>
-            <div className="min-w-0">
-              <h2 className="text-sm font-semibold text-neutral-100">Compute jobs</h2>
-              <p className="mt-1 text-xs text-neutral-500">Active experiments, held approvals, and terminal run analysis.</p>
-            </div>
-          </div>
           <ComputeJobsPanel
             projectId={selectedProjectId}
             onNavigateToTask={onViewTaskById}
@@ -534,7 +524,7 @@ export function RuntimeWorkspace({
         </div>
       ) : (
         <div className="grid h-full min-h-0 grid-cols-1 overflow-hidden lg:grid-cols-[280px_minmax(0,1fr)]">
-          <aside className="min-h-0 overflow-auto border-b border-neutral-800 bg-[#0b0f14] p-3 custom-scrollbar lg:border-b-0 lg:border-r">
+          <aside className="min-h-0 overflow-auto border-b border-neutral-800 bg-[#080c11] p-2.5 custom-scrollbar lg:border-b-0 lg:border-r">
             <nav className="space-y-1" aria-label="Runtime settings sections">
               {runtimeSettingsSections.map(item => {
                 const Icon = item.icon;
@@ -544,26 +534,25 @@ export function RuntimeWorkspace({
                     key={item.id}
                     type="button"
                     onClick={() => onRuntimeConfigSectionChange(item.id)}
-                    className={`flex w-full items-start gap-2 rounded-md border px-2.5 py-2 text-left transition-colors ${
+                    className={`flex w-full items-center gap-2 rounded-md border px-2.5 py-2 text-left transition-colors ${
                       selected
-                        ? 'border-neutral-700 bg-neutral-800 text-neutral-100'
-                        : 'border-transparent text-neutral-400 hover:border-neutral-800 hover:bg-neutral-900/70 hover:text-neutral-200'
+                        ? 'border-neutral-700 bg-[#151c25] text-neutral-100'
+                        : 'border-transparent text-neutral-400 hover:border-neutral-800 hover:bg-[#10151c] hover:text-neutral-200'
                     }`}
                   >
-                    <Icon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-                    <span className="min-w-0">
+                    <Icon className="h-3.5 w-3.5 shrink-0" />
+                    <span className="min-w-0 flex-1">
                       <span className="block truncate text-xs font-medium">{item.label}</span>
-                      <span className="mt-0.5 block text-ui-md leading-snug text-neutral-500">{item.description}</span>
                     </span>
                   </button>
                 );
               })}
             </nav>
           </aside>
-          <div className="min-h-0 overflow-auto p-4 custom-scrollbar">
+          <div className="min-h-0 overflow-auto p-3 custom-scrollbar">
             <div className="mx-auto max-w-6xl space-y-4">
-              <div className="flex min-w-0 items-start gap-3 border-b border-neutral-800 pb-3">
-                <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-[#111820] text-neutral-300">
+              <div className="flex min-w-0 items-center gap-3 border-b border-neutral-800 pb-3">
+                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-[#10151c] text-neutral-300">
                   <ActiveRuntimeSettingsIcon className="h-4 w-4" />
                 </span>
                 <div className="min-w-0">

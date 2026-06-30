@@ -213,6 +213,7 @@ export interface HeaderBarProps {
   health: OrchestratorHealth | null;
   detailedHealth: DetailedHealth | null;
   pipelineThrottle?: PipelineThrottle | null;
+  costSectionAvailable?: boolean;
   /** Opens the ProjectManagementModal (archive/delete/unarchive + new-project). */
   onManageProjects?: () => void;
 }
@@ -400,6 +401,7 @@ export function HeaderBar(props: HeaderBarProps) {
             lastFetchTime={lastFetchTime}
             tasks={tasks}
             pipelineThrottle={props.pipelineThrottle}
+            costSectionAvailable={props.costSectionAvailable}
           />
         </div>
       )}

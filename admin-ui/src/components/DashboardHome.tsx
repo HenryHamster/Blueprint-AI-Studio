@@ -542,27 +542,29 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
             <MediumScopeWidget data={measurementData} loading={loading} />
           )}
 
-          {/* Section 2d: Provider Account Health */}
-          {!!selectedProjectId && (
-            <PoolAccountHealthPanel
+          <div id="cost-section" className="space-y-4 scroll-mt-16">
+            {/* Section 2d: Provider Account Health */}
+            {!!selectedProjectId && (
+              <PoolAccountHealthPanel
+                accounts={accountHealth}
+                loading={loading}
+                servedStale={accountHealthServedStale}
+                generatedAt={accountHealthGeneratedAt}
+              />
+            )}
+
+            {/* Section 2e: Provider / Model Breakdown */}
+            <ProviderModelBreakdownPanel
+              selectedProjectId={selectedProjectId}
               accounts={accountHealth}
-              loading={loading}
-              servedStale={accountHealthServedStale}
-              generatedAt={accountHealthGeneratedAt}
             />
-          )}
 
-          {/* Section 2e: Provider / Model Breakdown */}
-          <ProviderModelBreakdownPanel
-            selectedProjectId={selectedProjectId}
-            accounts={accountHealth}
-          />
+            {/* Section 2f: Provider Cost & Success */}
+            <ProviderCostPanel selectedProjectId={selectedProjectId} windowHours={windowHours} />
 
-          {/* Section 2f: Provider Cost & Success */}
-          <ProviderCostPanel selectedProjectId={selectedProjectId} windowHours={windowHours} />
-
-          {/* Section 2g: LLM Cost by Model */}
-          <LlmCostBreakdownPanel selectedProjectId={selectedProjectId} />
+            {/* Section 2g: LLM Cost by Model */}
+            <LlmCostBreakdownPanel selectedProjectId={selectedProjectId} />
+          </div>
 
           {/* Section 2g2: Capability Trials */}
           {!loading && <CapabilityTrialsPanel digest={digest} projectId={selectedProjectId ?? undefined} onRefreshDigest={refetchDigest} />}

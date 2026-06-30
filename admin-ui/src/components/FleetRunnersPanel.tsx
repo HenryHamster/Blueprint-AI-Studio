@@ -17,6 +17,7 @@ function fallbackLivenessLabel(lastSeenAt: string | null): { label: string; cls:
 }
 
 function livenessLabel(runner: FleetRunner): { label: string; cls: string } {
+  if (runner.status !== 'active') return { label: 'offline', cls: 'text-neutral-500' };
   const health = runner.health;
   if (!health) return fallbackLivenessLabel(runner.last_seen_at);
   if (health.is_live) return { label: 'live', cls: 'text-emerald-400' };
@@ -26,8 +27,9 @@ function livenessLabel(runner: FleetRunner): { label: string; cls: string } {
 }
 
 function isRunnerLive(runner: FleetRunner): boolean {
+  if (runner.status !== 'active') return false;
   if (runner.health) return runner.health.is_live;
-  return runner.status === 'active' && fallbackLivenessLabel(runner.last_seen_at).label === 'live';
+  return fallbackLivenessLabel(runner.last_seen_at).label === 'live';
 }
 
 /** Count of tasks the runner reported executing in its last heartbeat. */
@@ -71,8 +73,11 @@ function capsSummary(caps: FleetRunner['capabilities']): string {
 }
 
 function isStrategicRunner(runner: FleetRunner): boolean {
+  const taskTypes = runner.capabilities.task_types;
   return runner.capabilities.runner_preset === 'strategic_local'
-    || runner.capabilities.workload === 'strategic';
+    || runner.capabilities.workload === 'strategic'
+    || taskTypes === 'all'
+    || (Array.isArray(taskTypes) && (taskTypes.includes('strategic_review') || taskTypes.includes('design_doc_update')));
 }
 
 interface TokenDialogProps {
@@ -215,20 +220,23 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
   const liveComputeRunners = liveRunners.filter(isComputeCapable);
   const liveGpuRunners = liveRunners.filter(runner => runner.capabilities.has_gpu);
   const liveStrategicRunners = liveRunners.filter(isStrategicRunner);
-  const busyWork = runners.reduce((sum, runner) => sum + activeWorkCount(runner), 0);
-  const maxSlots = runners.reduce((sum, runner) => {
+  const busyWork = liveRunners.reduce((sum, runner) => sum + activeWorkCount(runner), 0);
+  const maxSlots = liveRunners.reduce((sum, runner) => {
     const max = runner.health?.max_concurrent ?? runner.capabilities.max_concurrent;
     return sum + (typeof max === 'number' ? max : 0);
   }, 0);
 
   return (
-    <div className="p-4">
-      <div className="flex items-center justify-between mb-3">
-        <h3 className="text-xs font-semibold text-neutral-400 uppercase tracking-wider">Self-hosted runners</h3>
-        <div className="flex items-center gap-2">
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="min-w-0">
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-neutral-300">Self-hosted runners</h3>
+          <div className="mt-0.5 truncate text-ui-md text-neutral-500">{projectId}</div>
+        </div>
+        <div className="flex flex-wrap items-center justify-end gap-2">
           <button
             onClick={load}
-            className="text-neutral-400 hover:text-neutral-200 transition-colors p-1 min-w-[44px] min-h-[44px] flex items-center justify-center"
+            className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-md border border-neutral-800 text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-[#151c25] hover:text-neutral-200 md:min-h-9 md:min-w-9"
             title="Refresh"
           >
             <RefreshCw className="w-3.5 h-3.5" />
@@ -236,7 +244,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
           <button
             onClick={() => handleEnroll('strategic_local')}
             disabled={enrollingPreset !== null}
-            className="px-3 py-1.5 text-xs font-medium border border-emerald-500/30 bg-emerald-500/10 hover:bg-emerald-500/15 disabled:opacity-50 text-emerald-300 rounded transition-colors min-h-[44px]"
+            className="min-h-[44px] rounded-md border border-emerald-500/30 bg-emerald-500/10 px-3 text-xs font-semibold text-emerald-300 transition-colors hover:bg-emerald-500/15 disabled:opacity-50 md:min-h-9"
             title="Enroll a local runner restricted to strategic_review and design_doc_update"
           >
             {enrollingPreset === 'strategic_local' ? 'Enrolling...' : 'Strategic runner'}
@@ -244,7 +252,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
           <button
             onClick={() => handleEnroll('default')}
             disabled={enrollingPreset !== null}
-            className="px-3 py-1.5 text-xs font-medium bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded transition-colors min-h-[44px]"
+            className="min-h-[44px] rounded-md border border-neutral-700 bg-[#151c25] px-3 text-xs font-semibold text-neutral-100 transition-colors hover:border-neutral-600 hover:bg-neutral-800 disabled:opacity-50 md:min-h-9"
           >
             {enrollingPreset === 'default' ? 'Enrolling...' : 'Enroll runner'}
           </button>
@@ -252,46 +260,46 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
       </div>
 
       {error && (
-        <div className="mb-3 text-xs text-red-400 bg-red-400/10 border border-red-400/20 rounded px-3 py-2">
+        <div className="rounded-md border border-red-400/20 bg-red-400/10 px-3 py-2 text-xs text-red-300">
           {error}
         </div>
       )}
 
       {!loading && runners.length > 0 && (
-        <div className="mb-3 grid grid-cols-2 gap-2 text-xs lg:grid-cols-4">
-          <div className="rounded border border-neutral-800 bg-neutral-950/60 px-3 py-2">
-            <div className="text-neutral-500">Live</div>
-            <div className="mt-0.5 font-mono text-neutral-200">{liveRunners.length}/{runners.length}</div>
+        <div className="grid grid-cols-2 gap-2 text-xs lg:grid-cols-4">
+          <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
+            <div className="text-ui-md uppercase tracking-wide text-neutral-500">live</div>
+            <div className="mt-0.5 font-mono text-neutral-100">{liveRunners.length}/{runners.length}</div>
           </div>
-          <div className="rounded border border-neutral-800 bg-neutral-950/60 px-3 py-2">
-            <div className="text-neutral-500">Busy</div>
-            <div className="mt-0.5 font-mono text-neutral-200">{busyWork}/{maxSlots || '-'}</div>
+          <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
+            <div className="text-ui-md uppercase tracking-wide text-neutral-500">work</div>
+            <div className="mt-0.5 font-mono text-neutral-100" data-testid="fleet-runner-work-capacity">{busyWork}/{maxSlots || '-'}</div>
           </div>
-          <div className="rounded border border-neutral-800 bg-neutral-950/60 px-3 py-2">
-            <div className="text-neutral-500">GPU</div>
+          <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
+            <div className="text-ui-md uppercase tracking-wide text-neutral-500">gpu</div>
             <div className={`mt-0.5 font-mono ${liveGpuRunners.length > 0 ? 'text-purple-300' : 'text-neutral-500'}`}>
               {liveGpuRunners.length > 0 ? `${liveGpuRunners.length} online` : 'offline'}
             </div>
           </div>
-          <div className="rounded border border-neutral-800 bg-neutral-950/60 px-3 py-2">
-            <div className="text-neutral-500">Strategic</div>
-            <div className={`mt-0.5 font-mono ${liveStrategicRunners.length > 0 ? 'text-emerald-300' : 'text-neutral-500'}`}>
-              {liveStrategicRunners.length > 0 ? 'visible' : 'none live'}
+          <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
+            <div className="text-ui-md uppercase tracking-wide text-neutral-500">strategic</div>
+            <div className={`mt-0.5 font-mono ${liveStrategicRunners.length > 0 ? 'text-emerald-300' : 'text-neutral-500'}`} data-testid="fleet-runner-strategic-readiness">
+              {liveStrategicRunners.length > 0 ? `${liveStrategicRunners.length} live` : 'none live'}
             </div>
           </div>
         </div>
       )}
 
       {requireLocalRunner && !loading && liveComputeRunners.length === 0 && (
-        <div className="mb-3 rounded border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+        <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
           Local-only compute is enabled for this project. Compute experiments will wait until a live compute-capable runner connects.
         </div>
       )}
 
       {loading ? (
-        <div className="text-xs text-neutral-500 py-4 text-center">Loading…</div>
+        <div className="py-4 text-center text-xs text-neutral-500">Loading…</div>
       ) : runners.length === 0 ? (
-        <div className="text-xs text-neutral-500 py-6 text-center border border-dashed border-neutral-800 rounded">
+        <div className="rounded-md border border-dashed border-neutral-800 py-6 text-center text-xs text-neutral-500">
           No runners enrolled. Click <span className="text-neutral-300">Enroll runner</span> to register one.
         </div>
       ) : (
@@ -301,56 +309,58 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
             // status is authoritative (set by the backend stale-runner sweep);
             // distinct from the timestamp-derived live/stale label above.
             const isActive = runner.status === 'active';
+            const runnerLive = isRunnerLive(runner);
             const activeCount = activeTaskCount(runner);
-            const slots = availableSlots(runner);
+            const slots = runnerLive ? availableSlots(runner) : null;
             const strategicRunner = isStrategicRunner(runner);
             return (
               <div
                 key={runner.id}
-                className="bg-neutral-900 border border-neutral-800 rounded p-3 flex items-start gap-3"
+                className="flex items-start gap-2.5 rounded-md border border-neutral-800 bg-[#0d1218] p-2.5"
+                data-testid="fleet-runner-row"
               >
-                <div className="shrink-0 mt-0.5">
-                  <div className="w-7 h-7 rounded bg-neutral-800 flex items-center justify-center">
-                    <Cpu className="w-3.5 h-3.5 text-neutral-400" />
+                <div className="mt-0.5 shrink-0">
+                  <div className="flex h-7 w-7 items-center justify-center rounded-md border border-neutral-800 bg-[#151c25]">
+                    <Cpu className="h-3.5 w-3.5 text-neutral-400" />
                   </div>
                 </div>
                 <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2 flex-wrap">
+                  <div className="flex flex-wrap items-center gap-1.5">
                     <span className="text-sm font-medium text-neutral-200 truncate">
                       {runner.hostname ?? runner.id.slice(0, 8)}
                     </span>
                     {runner.version && (
                       <span className="text-xs text-neutral-500">{runner.version}</span>
                     )}
-                    <span className={`text-xs font-medium ${livCls}`}>{livLabel}</span>
+                    <span className={`rounded border border-neutral-700 bg-neutral-950/40 px-1.5 py-0.5 text-xs font-medium ${livCls}`}>{livLabel}</span>
                     {strategicRunner && (
-                      <span className="inline-flex items-center gap-1 text-xs bg-emerald-500/10 border border-emerald-500/30 text-emerald-300 rounded px-1.5 py-0.5">
+                      <span className="inline-flex items-center gap-1 rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-0.5 text-xs text-emerald-300">
                         <Compass className="w-3 h-3" />
-                        Strategic
+                        Strategic capable
                       </span>
                     )}
                     {!isActive && (
-                      <span className="text-xs bg-neutral-700/40 border border-neutral-600/50 text-neutral-300 rounded px-1.5 py-0.5">
+                      <span className="rounded border border-neutral-600/50 bg-neutral-700/40 px-1.5 py-0.5 text-xs text-neutral-300">
                         {runner.status === 'inactive' ? 'offline (deactivated)' : runner.status}
                       </span>
                     )}
-                    {activeCount > 0 && (
-                      <span className="text-xs bg-blue-500/10 border border-blue-500/30 text-blue-400 rounded px-1.5 py-0.5">
+                    {runnerLive && activeCount > 0 && (
+                      <span className="rounded border border-blue-500/30 bg-blue-500/10 px-1.5 py-0.5 text-xs text-blue-300">
                         {activeCount} active
                       </span>
                     )}
                     {slots !== null && (
-                      <span className="text-xs bg-neutral-800 border border-neutral-700 text-neutral-300 rounded px-1.5 py-0.5">
+                      <span className="rounded border border-neutral-700 bg-[#151c25] px-1.5 py-0.5 text-xs text-neutral-300">
                         {slots} slots free
                       </span>
                     )}
                     {runner.capabilities.has_gpu && (
-                      <span className="text-xs bg-purple-500/10 border border-purple-500/30 text-purple-400 rounded px-1.5 py-0.5">GPU</span>
+                      <span className="rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">GPU</span>
                     )}
                   </div>
-                  <div className="text-xs text-neutral-500 mt-0.5">{capsSummary(runner.capabilities)}</div>
+                  <div className="mt-1 text-xs text-neutral-500">{capsSummary(runner.capabilities)}</div>
                   {runner.last_seen_at && (
-                    <div className="text-xs text-neutral-600 mt-0.5">
+                    <div className="mt-0.5 text-ui-md text-neutral-600">
                       last seen {timeAgo(runner.last_seen_at)}
                     </div>
                   )}
@@ -358,7 +368,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
                 <button
                   onClick={() => handleRevoke(runner)}
                   disabled={revoking === runner.id}
-                  className="shrink-0 text-neutral-500 hover:text-red-400 transition-colors p-1 min-w-[44px] min-h-[44px] flex items-center justify-center disabled:opacity-40"
+                  className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40 md:min-h-9 md:min-w-9"
                   title="Revoke runner"
                 >
                   <Trash2 className="w-3.5 h-3.5" />

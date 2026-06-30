@@ -263,10 +263,70 @@ describe('FleetRunnersPanel — behavioral', () => {
     ]);
     const el = await mount();
     expect(el.textContent).toContain('live');
-    expect(el.textContent).toContain('Strategic');
-    expect(el.textContent).toContain('visible');
+    expect(el.textContent).toContain('Strategic capable');
+    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('1 live');
     expect(el.textContent).toContain('1 slots free');
     expect(el.textContent).toContain('design_doc_update, strategic_review');
+  });
+
+  test('live all-capability runner counts as strategic-capable', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: false, max_concurrent: 2 },
+        health: {
+          is_live: true,
+          seconds_since_last_seen: 12,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 2,
+          available_slots: 2,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('1 live');
+    expect(el.textContent).toContain('Strategic capable');
+  });
+
+  test('summary capacity ignores inactive runners even with recent health', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        status: 'inactive',
+        capabilities: {
+          task_types: ['design_doc_update', 'strategic_review'],
+          has_gpu: false,
+          max_concurrent: 3,
+          runner_preset: 'strategic_local',
+          workload: 'strategic',
+        },
+        health: {
+          is_live: true,
+          seconds_since_last_seen: 5,
+          active_task_count: 1,
+          active_compute_job_count: 0,
+          active_work_count: 1,
+          max_concurrent: 3,
+          available_slots: 2,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    expect(el.querySelector('[data-testid="fleet-runner-work-capacity"]')?.textContent).toBe('0/-');
+    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('none live');
+    expect(el.textContent).toContain('offline (deactivated)');
+    expect(el.textContent).not.toContain('1 active');
+    expect(el.textContent).not.toContain('2 slots free');
   });
 
   test('local-only compute warning appears when no live compute runner exists', async () => {

@@ -41,6 +41,7 @@ interface OrchestratorHealthBarProps {
   lastFetchTime: number;
   tasks: Task[];
   pipelineThrottle?: PipelineThrottle | null;
+  costSectionAvailable?: boolean;
 }
 
 const DEP_LABELS: Record<string, string> = {
@@ -77,7 +78,7 @@ const COST_RED_THRESHOLD = 0.9;
 // progressing cycle is healthy on every surface, and degraded begins at 120s.
 const SLOW_CYCLE_THRESHOLD_SEC = 120;
 
-export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsConnected, lastFetchTime, tasks, pipelineThrottle }: OrchestratorHealthBarProps) {
+export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsConnected, lastFetchTime, tasks, pipelineThrottle, costSectionAvailable = false }: OrchestratorHealthBarProps) {
   const [now, setNow] = useState(() => Date.now());
   const [circuitExpanded, setCircuitExpanded] = useState(false);
   const [refreshingQuota, setRefreshingQuota] = useState(false);
@@ -267,16 +268,16 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
   const autonomousFailures = detailedHealth?.autonomous.consecutive_failures ?? 0;
 
   return (
-    <div data-testid="orchestrator-health-bar" className={`min-h-7 flex flex-wrap items-center justify-between gap-x-3 gap-y-1 px-3 py-1 bg-neutral-900 border border-neutral-800 rounded-lg text-xs mb-3 shrink-0${apiHealthy ? '' : ' bg-red-950/20'}`}>
+    <div data-testid="orchestrator-health-bar" className={`mb-3 flex min-h-8 shrink-0 flex-wrap items-center justify-between gap-x-3 gap-y-1 rounded-md border border-neutral-800 bg-[#10151c] px-2.5 py-1.5 text-xs${apiHealthy ? '' : ' bg-red-950/20'}`}>
       {/* Left: API + WS status */}
       <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
-        <div className="flex items-center gap-1.5" title={apiHealthy ? undefined : 'API connection error — data may be stale'}>
+        <div className="flex items-center gap-1.5 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1" title={apiHealthy ? undefined : 'API connection error — data may be stale'}>
           <span className={`w-1.5 h-1.5 rounded-full ${apiHealthy ? 'bg-emerald-500' : 'bg-red-500 animate-pulse'}`} />
           <span className={apiHealthy ? 'text-neutral-400' : 'text-red-400'}>
             {apiHealthy ? 'Connected' : 'API Error'}
           </span>
         </div>
-        <div className="flex items-center gap-1.5">
+        <div className="flex items-center gap-1.5 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1">
           <span className={`w-1.5 h-1.5 rounded-full ${wsConnected ? 'bg-blue-500' : 'bg-neutral-600'}`} />
           <span className={wsConnected ? 'text-blue-400' : 'text-neutral-500'}>
             WS
@@ -289,7 +290,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
         {health && (
           <>
             <div
-              className="flex items-center gap-1.5"
+              className="flex items-center gap-1.5 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1"
               title={cycleTitle}
             >
               <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${cycleDown ? 'bg-red-500 animate-pulse' : cycleDegraded ? 'bg-amber-400 animate-pulse' : 'bg-emerald-500'}`} />
@@ -307,7 +308,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
 
             <div className="w-px h-3 bg-neutral-800 shrink-0" />
 
-            <div className="flex items-center gap-2 text-neutral-400">
+            <div className="flex items-center gap-2 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1 text-neutral-400">
               <span><span className="text-neutral-300 font-medium">{Math.max(0, health.queued_tasks)}</span> queued</span>
               <span><span className="text-neutral-300 font-medium">{Math.max(0, health.active_tasks)}</span> active</span>
             </div>
@@ -316,7 +317,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
               <>
                 <div className="w-px h-3 bg-neutral-800 shrink-0" />
                 <div
-                  className="flex items-center gap-1.5"
+                  className="flex items-center gap-1.5 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1"
                   title={[
                     (deployState?.rollback_count ?? 0) > 0 ? `${deployState?.rollback_count ?? 0} rollback${(deployState?.rollback_count ?? 0) !== 1 ? 's' : ''}` : null,
                     deployState?.rollback_reason ? `Reason: ${deployState?.rollback_reason}` : null,
@@ -361,7 +362,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
             {orderedDeps.length > 0 && (
               <>
                 <div className="w-px h-3 bg-neutral-800 shrink-0" />
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1">
                   {orderedDeps.map(key => {
                     const val = externalHealth[key] as boolean | string;
                     return (
@@ -386,7 +387,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
             <div className="w-px h-3 bg-neutral-800 shrink-0" />
             <div className="relative flex items-center">
               <button
-                className="min-h-[44px] sm:min-h-0 flex items-center gap-1.5 cursor-pointer"
+                className="flex min-h-[44px] cursor-pointer items-center gap-1.5 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1 sm:min-h-0"
                 title={`Circuit breakers open for: ${openProjects.join(', ')}`}
                 onClick={() => setCircuitExpanded(v => !v)}
               >
@@ -410,7 +411,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
         {poolExhausted && (
           <>
             <div className="w-px h-3 bg-neutral-800 shrink-0" />
-            <div className="flex items-center gap-1.5" title="No Max Plan accounts available">
+            <div className="flex items-center gap-1.5 rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1" title="No Max Plan accounts available">
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
               <span className="text-amber-400">Pool empty</span>
             </div>
@@ -420,7 +421,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
         {providerApis && providerApis.required_providers.length > 0 && (
           <>
             <div className="w-px h-3 bg-neutral-800 shrink-0" />
-            <div className="flex items-center gap-2" title={`Provider health: ${providerApis.status}`}>
+            <div className="flex items-center gap-2 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1" title={`Provider health: ${providerApis.status}`}>
               <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${
                 providerApis.status === 'down' ? 'bg-red-500 animate-pulse' :
                 providerApis.status === 'degraded' ? 'bg-amber-400' :
@@ -462,7 +463,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
         {autonomousFailures >= 2 && (
           <>
             <div className="w-px h-3 bg-neutral-800 shrink-0" />
-            <div className="flex items-center gap-1.5" title={`Autonomous mode: ${autonomousFailures} consecutive failures`}>
+            <div className="flex items-center gap-1.5 rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1" title={`Autonomous mode: ${autonomousFailures} consecutive failures`}>
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse shrink-0" />
               <span className="text-amber-400">{autonomousFailures} auto-fail</span>
             </div>
@@ -494,7 +495,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                 ? 'GitHub quota: no recent observation (click ↻ to probe)'
                 : `GitHub API quota: ${remainingDisplay}/${limitDisplay} remaining${resetIn != null ? `, resets in ~${resetIn}min` : ''} (click ↻ to refresh)`;
               return (
-                <div className="flex items-center gap-1.5" title={title}>
+                <div className="flex items-center gap-1.5 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1" title={title}>
                   <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor}`} />
                   <span className={textColor}>
                     GH: {remainingDisplay}{q.status === 'critical' ? ' ⚠' : ''}
@@ -518,7 +519,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
         {pipelineThrottle && (
           <>
             <div className="w-px h-3 bg-neutral-800 shrink-0" />
-            <span className="inline-flex max-w-full min-w-0 items-center gap-1 px-2 py-0.5 bg-amber-900/40 text-amber-400 text-xs rounded">
+            <span className="inline-flex max-w-full min-w-0 items-center gap-1 rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-xs text-amber-300">
               <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
               <span className="min-w-0 truncate">Throttled: {pipelineThrottle.detail}</span>
               {pipelineThrottle.recovery_seconds != null && ` (~${pipelineThrottle.recovery_seconds}s)`}
@@ -540,14 +541,14 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
                 ? `$${dailyCostUsd.toFixed(2)} / $${dailyCostCeilingUsd.toFixed(2)}`
                 : `$${dailyCostUsd.toFixed(2)}`;
               const titleText = hasCeiling
-                ? `Daily cost: $${dailyCostUsd.toFixed(2)} / $${dailyCostCeilingUsd.toFixed(2)} ceiling (${Math.round(ratio * 100)}%). Click to view cost section.`
-                : `Daily cost: $${dailyCostUsd.toFixed(2)}. Click to view cost section.`;
+                ? `Daily cost: $${dailyCostUsd.toFixed(2)} / $${dailyCostCeilingUsd.toFixed(2)} ceiling (${Math.round(ratio * 100)}%).${costSectionAvailable ? ' Click to view cost section.' : ''}`
+                : `Daily cost: $${dailyCostUsd.toFixed(2)}.${costSectionAvailable ? ' Click to view cost section.' : ''}`;
               return (
                 <button
                   type="button"
-                  className={`inline-flex items-center gap-1 min-h-[44px] sm:min-h-0 px-1.5 py-0.5 text-xs rounded cursor-pointer ${isRed ? 'bg-red-900/40' : isAmber ? 'bg-amber-900/40' : ''} ${digestPollFailed ? 'border border-amber-500/30 opacity-75' : ''}`}
+                  className={`inline-flex min-h-[44px] cursor-pointer items-center gap-1 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1 text-xs sm:min-h-0 ${isRed ? 'bg-red-900/40' : isAmber ? 'bg-amber-900/40' : ''} ${digestPollFailed ? 'border-amber-500/30 opacity-75' : ''}`}
                   title={digestStaleSuffix ? `${titleText} ${digestStaleSuffix}` : titleText}
-                  onClick={() => { document.getElementById('cost-section')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }}
+                  onClick={() => { if (costSectionAvailable) document.getElementById('cost-section')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }}
                 >
                   <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${dotColor}`} />
                   <span className={textColor}>{label}{isRed && ratio >= 1 ? ' ⚠' : ''}</span>
@@ -562,10 +563,10 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
       </div>
 
       {/* Right: stale heartbeats + last update */}
-      <div className="flex items-center gap-3">
+      <div className="flex items-center gap-2">
         {staleHeartbeatCount > 0 && (
           <span
-            className={`text-amber-400 ${staleHeartbeatIsDigestStale ? 'opacity-75' : ''}`}
+            className={`rounded border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-amber-300 ${staleHeartbeatIsDigestStale ? 'opacity-75' : ''}`}
             title={`${staleHeartbeatCount} IN_PROGRESS task${staleHeartbeatCount !== 1 ? 's' : ''} with no heartbeat in the last 5 minutes${staleIsPageOnly ? ' (current page only — fleet count unavailable)' : ' (fleet-wide)'}${digestStaleSuffix ? ` — ${digestStaleSuffix}` : ''}`}
           >
             ⚠ {staleHeartbeatCount} stale
@@ -574,7 +575,7 @@ export function OrchestratorHealthBar({ health, detailedHealth, apiHealthy, wsCo
             )}
           </span>
         )}
-        <span className="text-neutral-500">Updated {lastFetchTime ? timeAgo(lastFetchTime) : '—'}</span>
+        <span className="rounded border border-neutral-800 bg-[#0d1218] px-2 py-1 text-neutral-500">Updated {lastFetchTime ? timeAgo(lastFetchTime) : '—'}</span>
       </div>
     </div>
   );
