@@ -22138,6 +22138,111 @@ class TestPostCommitPendingField:
         assert "huge" not in str(sideboard)
 
     @pytest.mark.asyncio
+    async def test_task_detail_sideboard_messages_include_context_linked_messages(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        other_project = await _make_project(db_session, name="Other Project")
+        task = Task(
+            project_id=project.id,
+            title="Task with linked messages",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create"}],
+        )
+        other_task = Task(
+            project_id=project.id,
+            title="Other task",
+            status=TaskStatus.QUEUED,
+            payloads=[{"type": "create"}],
+        )
+        reviewer_task = Task(
+            project_id=project.id,
+            title="Operator requested reviewer",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "review"}],
+            context={"operator_requested_review_for": str(task.id)},
+        )
+        db_session.add_all([task, other_task, reviewer_task])
+        await db_session.commit()
+        await db_session.refresh(task)
+        await db_session.refresh(other_task)
+        await db_session.refresh(reviewer_task)
+        base_created_at = datetime(2026, 1, 1, 12, 0, 0)
+        messages = [
+            ProjectMessage(
+                project_id=project.id,
+                from_task_id=other_task.id,
+                from_type="agent",
+                message_type=MessageType.NOTE,
+                content="unrelated newer task",
+                created_at=base_created_at + timedelta(minutes=6),
+            ),
+            ProjectMessage(
+                project_id=project.id,
+                from_task_id=reviewer_task.id,
+                from_type="agent",
+                message_type=MessageType.NOTE,
+                content="operator requested reviewer update",
+                created_at=base_created_at + timedelta(minutes=5),
+            ),
+            ProjectMessage(
+                project_id=project.id,
+                from_type="system",
+                message_type=MessageType.BLOCKER,
+                content="convergence link",
+                context={"_convergence_link": {"kind": "task", "id": str(task.id)}},
+                created_at=base_created_at + timedelta(minutes=4),
+            ),
+            ProjectMessage(
+                project_id=project.id,
+                from_type="agent",
+                message_type=MessageType.NOTE,
+                content="source task context",
+                context={"source_task_id": str(task.id)},
+                created_at=base_created_at + timedelta(minutes=3),
+            ),
+            ProjectMessage(
+                project_id=project.id,
+                from_type="agent",
+                message_type=MessageType.NOTE,
+                content="task context",
+                context={"task_id": str(task.id)},
+                created_at=base_created_at + timedelta(minutes=2),
+            ),
+            ProjectMessage(
+                project_id=project.id,
+                from_task_id=task.id,
+                from_type="agent",
+                message_type=MessageType.NOTE,
+                content="direct from task",
+                created_at=base_created_at + timedelta(minutes=1),
+            ),
+            ProjectMessage(
+                project_id=other_project.id,
+                from_type="agent",
+                message_type=MessageType.NOTE,
+                content="other project link",
+                context={"task_id": str(task.id)},
+                created_at=base_created_at + timedelta(minutes=7),
+            ),
+        ]
+        db_session.add_all(messages)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+
+        sideboard_messages = resp.json()["sideboard_context"]["messages"]
+        assert sideboard_messages["total_recent"] == 5
+        assert [item["content"] for item in sideboard_messages["items"]] == [
+            "operator requested reviewer update",
+            "convergence link",
+            "source task context",
+            "task context",
+            "direct from task",
+        ]
+
+    @pytest.mark.asyncio
     async def test_task_detail_sideboard_context_handles_plain_task(
         self, client: AsyncClient, db_session
     ):

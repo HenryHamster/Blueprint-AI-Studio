@@ -20,7 +20,7 @@ import json
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import func, update, case, delete
+from sqlalchemy import func, update, case, delete, and_, or_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 
@@ -1550,12 +1550,30 @@ async def get_task(
             )
         ).scalar_one_or_none()
 
+    task_id_str = str(tid)
+    operator_requested_reviewer_task_ids = select(Task.id).where(
+        Task.project_id == task.project_id,
+        Task.context["operator_requested_review_for"].as_string() == task_id_str,
+    )
     related_messages = (
         await session.execute(
             select(ProjectMessage)
             .where(
                 ProjectMessage.project_id == task.project_id,
-                ProjectMessage.from_task_id == tid,
+                or_(
+                    ProjectMessage.from_task_id == tid,
+                    ProjectMessage.from_task_id.in_(operator_requested_reviewer_task_ids),
+                    ProjectMessage.context["task_id"].as_string() == task_id_str,
+                    ProjectMessage.context["source_task_id"].as_string() == task_id_str,
+                    ProjectMessage.context["operator_requested_review_for"].as_string()
+                    == task_id_str,
+                    and_(
+                        ProjectMessage.context["_convergence_link"]["kind"].as_string()
+                        == "task",
+                        ProjectMessage.context["_convergence_link"]["id"].as_string()
+                        == task_id_str,
+                    ),
+                ),
             )
             .order_by(ProjectMessage.created_at.desc())
             .limit(5)
