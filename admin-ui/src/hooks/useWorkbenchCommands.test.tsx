@@ -226,6 +226,7 @@ describe('useWorkbenchCommands', () => {
       interaction_mode: 'continuous',
       active_surface: 'strategic',
       selected_refs: [
+        { kind: 'canvas', id: 'strategic-canvas:project-1', label: 'Strategic context map' },
         { kind: 'artifact', id: 'artifact:latest', label: 'Latest report' },
         { kind: 'task', id: 'task:optimistic', label: 'Optimistic task' },
       ],
@@ -243,9 +244,17 @@ describe('useWorkbenchCommands', () => {
     const contextCommand = captured.find(command => command.id === 'strategic.context.workspace');
     expect(contextCommand?.label).toBe('Strategic context');
     expect(contextCommand?.keywords).toContain('canvas');
+    expect(contextCommand?.detail).toBe('3 kept, 2 resources, 1 nodes');
     contextCommand?.run();
     expect(openStrategicContextWorkspace).toHaveBeenCalledTimes(1);
 
+    expect(captured.find(command => command.id === 'strategic.context.map')?.detail).toBe('3 kept, 2 resources, 1 nodes');
+    expect(captured.find(command => command.id === 'strategic.context.open.resource.canvas:strategic-canvas:project-1')).toBeUndefined();
+    expect(captured.find(command => command.id === 'strategic.context.keep.canvas:strategic-canvas:project-1')).toBeUndefined();
+    expect(captured.find(command => command.id === 'strategic.context.remove.canvas:strategic-canvas:project-1')).toMatchObject({
+      label: 'Remove from Strategic context: Strategic context map',
+      detail: 'context map / kept',
+    });
     expect(captured.filter(command => command.label.includes('Latest report'))).toHaveLength(2);
     expect(captured.filter(command => command.id === 'strategic.context.remove.artifact:artifact:latest')).toHaveLength(1);
     expect(captured.filter(command => command.id === 'strategic.context.open.kept.artifact:artifact:latest')).toHaveLength(1);
@@ -260,9 +269,19 @@ describe('useWorkbenchCommands', () => {
     captured.find(command => command.id === 'strategic.context.open.kept.artifact:artifact:latest')?.run();
     expect(openStrategicContextTarget).toHaveBeenCalledWith(target);
 
-    captured.find(command => command.id === 'strategic.context.keep.knowledge_document:knowledge:operator-notes')?.run();
+    captured.find(command => command.id === 'strategic.context.remove.canvas:strategic-canvas:project-1')?.run();
     expect(updateStrategicSessionRefs).toHaveBeenLastCalledWith(expect.any(Function));
     let updater = updateStrategicSessionRefs.mock.calls.at(-1)?.[0] as (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs'];
+    expect(updater([
+      { kind: 'canvas', id: 'strategic-canvas:project-1', label: 'Strategic context map' },
+      { kind: 'artifact', id: 'artifact:latest', label: 'Latest report' },
+    ])).toEqual([
+      { kind: 'artifact', id: 'artifact:latest', label: 'Latest report' },
+    ]);
+
+    captured.find(command => command.id === 'strategic.context.keep.knowledge_document:knowledge:operator-notes')?.run();
+    expect(updateStrategicSessionRefs).toHaveBeenLastCalledWith(expect.any(Function));
+    updater = updateStrategicSessionRefs.mock.calls.at(-1)?.[0] as (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs'];
     expect(updater([])).toEqual([
       { kind: 'knowledge_document', id: 'knowledge:operator-notes', label: 'Operator notes' },
     ]);
@@ -287,6 +306,80 @@ describe('useWorkbenchCommands', () => {
     updater = updateStrategicSessionRefs.mock.calls.at(-1)?.[0] as (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs'];
     expect(updater([{ kind: 'task', id: 'task:optimistic', label: 'Optimistic task' }])).toEqual([]);
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
+  test('offers a whole-map keep command when the context package has a canvas but no canvas resource', () => {
+    const updateStrategicSessionRefs = vi.fn();
+    const strategicState = {
+      context_package: {
+        canvas: {
+          id: 'canvas:synthetic',
+          title: 'Strategic discussion map',
+          node_count: 4,
+          edge_count: 5,
+          nodes: [],
+          edges: [],
+        },
+        resources: [
+          {
+            kind: 'artifact',
+            id: 'artifact:report',
+            label: 'Report',
+            summary: 'A regular resource',
+          },
+        ],
+      },
+    } as StrategicStateResponse;
+
+    mount({ strategicState, updateStrategicSessionRefs });
+
+    const keepMap = captured.find(command => command.id === 'strategic.context.keep.canvas:canvas:synthetic');
+    expect(keepMap).toMatchObject({
+      label: 'Keep in Strategic context: Strategic discussion map',
+      detail: 'context map / 4 nodes / 5 links',
+    });
+    expect(captured.find(command => command.id === 'strategic.context.keep.artifact:artifact:report')).toBeDefined();
+
+    keepMap?.run();
+
+    expect(updateStrategicSessionRefs).toHaveBeenCalledWith(expect.any(Function));
+    const updater = updateStrategicSessionRefs.mock.calls.at(-1)?.[0] as (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs'];
+    expect(updater([])).toEqual([
+      { kind: 'canvas', id: 'canvas:synthetic', label: 'Strategic discussion map' },
+    ]);
+  });
+
+  test('uses the canvas resource summary when keeping an unselected explicit map resource', () => {
+    const updateStrategicSessionRefs = vi.fn();
+    const strategicState = {
+      context_package: {
+        resources: [
+          {
+            kind: 'canvas',
+            id: 'canvas:explicit',
+            label: 'Explicit map resource',
+            summary: '7 nodes / 8 links',
+          },
+        ],
+        canvas: {
+          id: 'canvas:explicit',
+          title: 'Explicit map resource',
+          node_count: 7,
+          edge_count: 8,
+          nodes: [],
+          edges: [],
+        },
+      },
+    } as StrategicStateResponse;
+
+    mount({ strategicState, updateStrategicSessionRefs });
+
+    const keepMap = captured.find(command => command.id === 'strategic.context.keep.canvas:canvas:explicit');
+    expect(keepMap).toMatchObject({
+      label: 'Keep in Strategic context: Explicit map resource',
+      detail: 'context map / 7 nodes / 8 links',
+    });
+    expect(captured.find(command => command.id === 'strategic.context.open.resource.canvas:canvas:explicit')).toBeUndefined();
   });
 
   test('exposes attention items and actionable session metrics as commands', () => {

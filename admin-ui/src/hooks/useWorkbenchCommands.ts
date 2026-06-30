@@ -7,6 +7,7 @@ import type {
   StrategicContextArtifactEvidence,
   StrategicContextCanvasNode,
   StrategicContextKnowledgeEvidence,
+  StrategicContextPackageDescriptor,
   StrategicContextPackageDrilldown,
   StrategicContextResourceRef,
   StrategicMessageTarget,
@@ -23,6 +24,7 @@ import type { ViewMode } from './useViewPreferences';
 
 export type PipelineSection = 'flow' | 'board' | 'archive';
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
+type StrategicContextCanvas = NonNullable<StrategicContextPackageDescriptor['canvas']>;
 const WORK_SESSION_ACTION_COMMAND_LIMIT = 4;
 
 interface UseWorkbenchCommandsOptions {
@@ -72,7 +74,7 @@ interface UseWorkbenchCommandsOptions {
 
 function contextKindLabel(kind?: string | null): string {
   if (kind === 'knowledge_document') return 'knowledge';
-  if (kind === 'canvas') return 'map';
+  if (kind === 'canvas') return 'context map';
   return (kind || 'context').replace(/_/g, ' ');
 }
 
@@ -85,6 +87,15 @@ function selectedRefFromResource(resource: StrategicContextResourceRef): Strateg
     kind: resource.kind,
     id: resource.id,
     label: resource.label,
+  };
+}
+
+function selectedRefFromCanvas(canvas: StrategicContextCanvas): StrategicSelectedRef | null {
+  if (!canvas.id) return null;
+  return {
+    kind: 'canvas',
+    id: canvas.id,
+    label: canvas.title ?? 'Strategic context map',
   };
 }
 
@@ -127,6 +138,16 @@ function fallbackSelectedRefLabel(ref: StrategicSelectedRef): string {
 function compactContextDetail(...parts: Array<string | null | undefined>): string | null {
   const detailParts = parts.map(part => part?.trim()).filter((part): part is string => Boolean(part));
   return detailParts.length > 0 ? detailParts.join(' / ') : null;
+}
+
+function canvasSummaryDetail(
+  canvas: StrategicContextCanvas | null,
+  nodeCount: number,
+  edgeCount: number,
+): string {
+  const nodes = canvas?.node_count ?? nodeCount;
+  const edges = canvas?.edge_count ?? edgeCount;
+  return `${nodes} nodes / ${edges} links`;
 }
 
 function attentionItemLabel(item: StrategicStateAttentionItem): string {
@@ -272,6 +293,23 @@ export function useWorkbenchCommands({
     const selectedRefs = strategicWorkbenchState?.selected_refs ?? strategicState?.work_session?.selected_refs ?? strategicState?.workbench?.selected_refs ?? [];
     const selectedKeys = new Set(selectedRefs.map(contextRefKey));
     const contextPackage = strategicState?.context_package ?? null;
+    const canvas = contextPackage?.canvas ?? null;
+    const canvasNodeCount = canvas?.node_count ?? canvas?.nodes?.length ?? 0;
+    const canvasEdgeCount = canvas?.edge_count ?? canvas?.edges?.length ?? 0;
+    const resources = contextPackage?.resources ?? [];
+    const canvasResources = resources.filter(resource => resource.kind === 'canvas');
+    const listedResources = resources.filter(resource => resource.kind !== 'canvas');
+    const syntheticCanvasRef = canvas ? selectedRefFromCanvas(canvas) : null;
+    const canvasResourceRows = canvasResources.length > 0
+      ? canvasResources
+      : syntheticCanvasRef
+        ? [{
+            kind: 'canvas',
+            id: syntheticCanvasRef.id,
+            label: syntheticCanvasRef.label ?? 'Strategic context map',
+            summary: canvasSummaryDetail(canvas, canvasNodeCount, canvasEdgeCount),
+          } satisfies StrategicContextResourceRef]
+        : [];
     const contextCommandEntries: WorkbenchCommand[] = [];
     const seenContextCommandIds = new Set<string>();
     const seenContextOpenRefs = new Set<string>();
@@ -397,11 +435,12 @@ export function useWorkbenchCommands({
       detail?: string | null;
       target?: StrategicContextTarget | null;
       origin: 'kept' | 'resource' | 'map' | 'evidence';
+      allowOpen?: boolean;
     }) => {
       const key = contextRefKey(source.ref);
       const selected = selectedKeys.has(key);
       const detail = compactContextDetail(contextKindLabel(source.ref.kind), source.detail) ?? contextKindLabel(source.ref.kind);
-      if (source.target && openStrategicContextTarget && !seenContextOpenRefs.has(key)) {
+      if (source.allowOpen !== false && source.target && openStrategicContextTarget && !seenContextOpenRefs.has(key)) {
         seenContextOpenRefs.add(key);
         addContextCommand({
           id: `strategic.context.open.${source.origin}.${key}`,
@@ -427,15 +466,14 @@ export function useWorkbenchCommands({
       }
     };
     if (contextPackage) {
-      const resourceCount = contextPackage.resources?.length ?? 0;
-      const nodeCount = contextPackage.canvas?.node_count ?? contextPackage.canvas?.nodes?.length ?? 0;
-      const mapTarget = contextPackage.resources?.find(resource => resource.kind === 'canvas')?.target
+      const resourceCount = listedResources.length;
+      const mapTarget = canvasResources.find(resource => resource.target)?.target
         ?? { surface: 'project', section: 'problem-model' };
       addContextCommand({
         id: 'strategic.context.map',
         label: 'Strategic context map',
         section: 'Context',
-        detail: `${selectedRefs.length} kept, ${resourceCount} resources, ${nodeCount} nodes`,
+        detail: `${selectedRefs.length} kept, ${resourceCount} resources, ${canvasNodeCount} nodes`,
         keywords: ['strategic', 'context', 'map', 'canvas', 'kept'],
         disabled: projectDisabled,
         run: openStrategicContextTarget ? () => openContextTarget(mapTarget) : focusStrategicComposer,
@@ -479,7 +517,17 @@ export function useWorkbenchCommands({
         origin: 'kept',
       });
     });
-    (contextPackage?.resources ?? []).slice(0, 8).forEach(resource => {
+    canvasResourceRows.slice(0, 4).forEach(resource => {
+      addRefCommands({
+        ref: selectedRefFromResource(resource),
+        label: resource.label,
+        detail: resource.summary ?? canvasSummaryDetail(canvas, canvasNodeCount, canvasEdgeCount),
+        target: resource.target,
+        origin: 'map',
+        allowOpen: false,
+      });
+    });
+    listedResources.slice(0, 8).forEach(resource => {
       addRefCommands({
         ref: selectedRefFromResource(resource),
         label: resource.label,
@@ -608,7 +656,7 @@ export function useWorkbenchCommands({
         label: 'Strategic context',
         section: 'Context',
         detail: contextPackage
-          ? `${selectedRefs.length} kept, ${contextPackage.resources?.length ?? 0} resources, ${contextPackage.canvas?.node_count ?? contextPackage.canvas?.nodes?.length ?? 0} nodes`
+          ? `${selectedRefs.length} kept, ${listedResources.length} resources, ${canvasNodeCount} nodes`
           : `${selectedRefs.length} kept`,
         keywords: ['strategic', 'context', 'workspace', 'drawer', 'canvas', 'map', 'evidence', 'kept'],
         disabled: projectDisabled || !openStrategicContextWorkspace,
