@@ -2764,6 +2764,14 @@ def outcome_progress_summary_fields(direction: dict) -> dict:
     return fields
 
 
+def _outcome_progress_merged_total(history: list[dict], agg: dict) -> int:
+    return sum(credit_gate_merged_count(e) for e in history) + max(
+        0,
+        int(agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0)
+        - int(agg.get("total_stranded_prs_merged", 0) or 0),
+    )
+
+
 def record_outcome_progress_snapshot(direction: dict) -> None:
     """Append a per-cycle outcome-progress snapshot to the direction (bounded).
 
@@ -2782,16 +2790,8 @@ def record_outcome_progress_snapshot(direction: dict) -> None:
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
     total_cycles = len(history) + (agg.get("total_cycles") or 0)
-    # Verified basis: progress is only credited for merges that reproduced on
-    # HEAD. ``verified_merged_count`` falls back to raw ``prs_merged`` for legacy
-    # entries; the aggregate falls back from ``total_verified_prs_merged`` to
-    # ``total_prs_merged`` for legacy folds (same basis as line ~890 and
-    # ``_check_direction_completion``). The reset baseline in
-    # ``_reset_scaffolding_state_on_outcome_change`` MUST use this same basis so
-    # the ``post_merged = total - reset_merged`` delta math stays consistent.
-    total_merged = sum(verified_merged_count(e) for e in history) + agg.get(
-        "total_verified_prs_merged", agg.get("total_prs_merged", 0)
-    )
+    # Reachable credit basis; reset MUST use the same helper so deltas align.
+    total_merged = _outcome_progress_merged_total(history, agg)
     se_text = ((direction.get("context") or {}).get("success_evidence") or "").encode()
     success_evidence_fp = hashlib.sha256(se_text).hexdigest()[:16]
     snapshot = {
@@ -2875,11 +2875,8 @@ def _reset_scaffolding_state_on_outcome_change(direction: dict) -> bool:
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
     total_cycles = len(history) + (agg.get("total_cycles") or 0)
-    # Verified basis — MUST match ``record_outcome_progress_snapshot`` exactly so
-    # the latch's ``post_merged = total - reset_merged`` delta stays on one basis.
-    total_merged = sum(verified_merged_count(e) for e in history) + agg.get(
-        "total_verified_prs_merged", agg.get("total_prs_merged", 0)
-    )
+    # Reachable credit basis; MUST match ``record_outcome_progress_snapshot``.
+    total_merged = _outcome_progress_merged_total(history, agg)
     direction["outcome_progress_reset_at_cycle"] = total_cycles
     direction["outcome_progress_reset_at_merged"] = total_merged
     return cleared

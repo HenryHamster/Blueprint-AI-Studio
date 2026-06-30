@@ -12693,6 +12693,28 @@ class TestResetScaffoldingStateOnOutcomeChange:
         assert d["outcome_progress_reset_at_merged"] == 7
 
 
+def test_outcome_progress_excludes_stranded_merges():
+    d = {
+        "research_history": [
+            {"prs_merged": 4, "verified_prs_merged": 4, "stranded_prs_merged": 1},
+            {"prs_merged": 3, "verified_prs_merged": 2},
+        ],
+        "history_aggregate": {
+            "total_cycles": 5,
+            "total_prs_merged": 8,
+            "total_verified_prs_merged": 5,
+            "total_stranded_prs_merged": 2,
+        },
+        "outcome_progress_ever_met": True,
+    }
+    record_outcome_progress_snapshot(d)
+    assert d["outcome_progress_history"][-1]["merged"] == 8
+
+    _reset_scaffolding_state_on_outcome_change(d)
+    assert d["outcome_progress_reset_at_cycle"] == 7
+    assert d["outcome_progress_reset_at_merged"] == 8
+
+
 class TestRecordOutcomeProgressSnapshotPostReset:
     """After an outcome reset, the cumulative completion heuristic must NOT
     immediately re-latch ``outcome_progress_ever_met`` — fresh post-reset
