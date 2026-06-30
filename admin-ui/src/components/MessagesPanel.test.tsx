@@ -128,6 +128,13 @@ function _messagesGetCalls(): unknown[][] {
     return /\/api\/admin\/messages(\?|$)/.test(url) && (!init?.method || init.method === 'GET');
   });
 }
+function _messagesPostCalls(): unknown[][] {
+  return vi.mocked(apiFetch).mock.calls.filter((c) => {
+    const url = String(c[0]);
+    const init = c[1] as RequestInit | undefined;
+    return /\/api\/admin\/messages$/.test(url) && init?.method === 'POST';
+  });
+}
 function _strategicSessionGetCalls(): unknown[][] {
   return vi.mocked(apiFetch).mock.calls.filter((c) => {
     const url = String(c[0]);
@@ -1127,6 +1134,97 @@ describe('MessagesPanel chrome modes', () => {
     }
   });
 
+  test('minimal chat target primes reply for an open Strategic message', async () => {
+    const onTargetMessageHandled = vi.fn();
+    const scrollIntoView = vi.fn();
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scrollIntoView;
+    const strategic = makeMsg({
+      id: 'strategic-target',
+      from_type: 'strategic',
+      message_type: 'NOTE',
+      content: 'I can compare those two plans.',
+      status: 'open',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+
+    try {
+      const el = await renderPanel({
+        filterChrome: 'minimal',
+        targetMessage: { messageId: 'strategic-target', action: 'reply' },
+        onTargetMessageHandled,
+      }, [strategic]);
+
+      await waitFor(() => expect(onTargetMessageHandled).toHaveBeenCalledTimes(1));
+      const bubble = el.querySelector('[data-message-id="strategic-target"]');
+      expect(bubble?.className).toContain('ring-1');
+      expect(scrollIntoView).toHaveBeenCalled();
+      expect(el.textContent).toContain('Replying to Strategic');
+      expect(el.textContent).toContain('I can compare those two plans.');
+      const sessionCallUrl = String(_strategicSessionGetCalls()[0]?.[0] ?? '');
+      expect(sessionCallUrl).toContain('include_message_id=strategic-target');
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
+
+  test('minimal chat target keeps non-replyable messages highlight-only', async () => {
+    const onTargetMessageHandled = vi.fn();
+    const operator = makeMsg({
+      id: 'operator-target',
+      from_type: 'user',
+      message_type: 'FEEDBACK',
+      content: 'I already chose the smaller plan.',
+      status: 'open',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      targetMessage: { messageId: 'operator-target', action: 'reply' },
+      onTargetMessageHandled,
+    }, [operator]);
+
+    await waitFor(() => expect(onTargetMessageHandled).toHaveBeenCalledTimes(1));
+    const bubble = el.querySelector('[data-message-id="operator-target"]');
+    expect(bubble?.className).toContain('ring-1');
+    expect(el.textContent).not.toContain('Replying to Operator');
+    expect(el.querySelector('textarea')?.value).toBe('');
+  });
+
+  test('minimal chat target does not prime replies for filtered Strategic routine messages', async () => {
+    const onTargetMessageHandled = vi.fn();
+    const scrollIntoView = vi.fn();
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scrollIntoView;
+    const routine = makeMsg({
+      id: 'strategic-routine-target',
+      from_type: 'strategic',
+      message_type: 'NOTE',
+      content: 'cycle summary should stay out of chat',
+      context: { event_type: 'cycle_summary' },
+      status: 'open',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+
+    try {
+      const el = await renderPanel({
+        filterChrome: 'minimal',
+        targetMessage: { messageId: 'strategic-routine-target', action: 'reply' },
+        onTargetMessageHandled,
+      }, [routine]);
+
+      await waitFor(() => expect(onTargetMessageHandled).toHaveBeenCalledTimes(1));
+      expect(el.querySelector('[data-message-id="strategic-routine-target"]')).toBeNull();
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      expect(el.textContent).not.toContain('Replying to Strategic');
+      expect(el.textContent).not.toContain('cycle summary should stay out of chat');
+      expect(el.querySelector('textarea')?.value).toBe('');
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
+
   test('minimal chat question replies still resolve through the generic message patch', async () => {
     const question = makeMsg({
       id: 'question-target',
@@ -1169,6 +1267,52 @@ describe('MessagesPanel chrome modes', () => {
       expect(patchCall).toBeTruthy();
     });
     expect(_strategicSessionMessagePostCalls()).toHaveLength(0);
+  });
+
+  test('minimal chat non-question replies send through the Strategic session facade', async () => {
+    const strategic = makeMsg({
+      id: 'strategic-reply-target',
+      from_type: 'strategic',
+      message_type: 'NOTE',
+      content: 'I can compare those two plans.',
+      status: 'open',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+    const el = await renderPanel({ filterChrome: 'minimal' }, [strategic]);
+
+    const { fireEvent } = await import('@testing-library/react');
+    const replyButton = await waitFor(() => {
+      const button = el.querySelector('[data-message-id="strategic-reply-target"] button[title="Reply"]') as HTMLButtonElement | null;
+      expect(button).not.toBeNull();
+      return button;
+    });
+    await act(async () => {
+      fireEvent.click(replyButton);
+    });
+    await waitFor(() => expect(el.textContent).toContain('Replying to Strategic'));
+    const textarea = el.querySelector('textarea') as HTMLTextAreaElement;
+    const sendButton = [...el.querySelectorAll('button')]
+      .find(button => button.getAttribute('aria-label') === 'Send message') as HTMLButtonElement | undefined;
+    if (!sendButton) throw new Error('Expected send button');
+
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: 'Compare the smaller plan.' } });
+    });
+    await act(async () => {
+      sendButton.click();
+    });
+
+    await waitFor(() => expect(_strategicSessionMessagePostCalls()).toHaveLength(1));
+    expect(_messagesPostCalls()).toHaveLength(0);
+    const postBody = JSON.parse(String((_strategicSessionMessagePostCalls()[0][1] as RequestInit).body ?? '{}'));
+    expect(postBody).toMatchObject({
+      message_type: 'FEEDBACK',
+      content: 'Compare the smaller plan.',
+      context: {
+        reply_to: 'strategic-reply-target',
+        reply_preview: 'I can compare those two plans.',
+      },
+    });
   });
 
   test('minimal chat chrome keeps queued and working state in the compact strip only', async () => {

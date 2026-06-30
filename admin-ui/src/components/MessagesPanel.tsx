@@ -126,6 +126,14 @@ function messageReplyFromLabel(msg: ProjectMessage): string {
   return 'Operator';
 }
 
+function canPrimeStrategicChatReply(msg: ProjectMessage): boolean {
+  const fromType = (msg.from_type || '').toLowerCase();
+  return (
+    msg.status === 'open'
+    && (fromType === 'agent' || fromType === 'strategic' || fromType === 'strategist')
+  );
+}
+
 function isConversationMessage(
   msg: ProjectMessage,
   eventPrefs: Record<string, EventPref>,
@@ -792,9 +800,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       onTargetMessageHandled?.();
       return;
     }
-    const target = conversationMessages.find(msg => msg.id === targetMessageId)
-      ?? messages.find(msg => msg.id === targetMessageId)
-      ?? null;
+    const visibleTarget = conversationMessages.find(msg => msg.id === targetMessageId) ?? null;
+    const target = visibleTarget ?? messages.find(msg => msg.id === targetMessageId) ?? null;
     if (!target) {
       if (!loading && lastStrategicSessionTargetFetchRef.current === targetMessageId) {
         onTargetMessageHandled?.();
@@ -804,13 +811,13 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     setHighlightedMessageId(target.id);
     const node = scrollRef.current?.querySelector(`[data-message-id="${target.id}"]`);
     node?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    if (targetMessage?.action === 'reply' && target.message_type === 'QUESTION' && target.status === 'open') {
+    if (targetMessage?.action === 'reply' && visibleTarget && canPrimeStrategicChatReply(visibleTarget)) {
       setReplyTo({
-        id: target.id,
-        content: target.content,
-        from: messageReplyFromLabel(target),
-        message_type: target.message_type,
-        status: target.status,
+        id: visibleTarget.id,
+        content: visibleTarget.content,
+        from: messageReplyFromLabel(visibleTarget),
+        message_type: visibleTarget.message_type,
+        status: visibleTarget.status,
       });
       textareaRef.current?.focus();
     }
@@ -1275,7 +1282,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         idempotencyKeyRef.current = generateIdempotencyKey();
       }
       const submittedContent = newContent.trim();
-      if (conversationMode && !replyTo) {
+      if (conversationMode) {
         const data = await createStrategicSessionMessage(selectedProjectId, {
           message_type: effectiveNewType,
           content: submittedContent,
