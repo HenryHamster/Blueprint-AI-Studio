@@ -37,6 +37,7 @@ from app.models import (
     ProjectStatus,
     ProjectMember,
     _utcnow,
+    get_task_total_vm_cost_usd_or_none,
     notify_tasks_terminated,
 )
 from app.auth import get_current_user
@@ -1222,14 +1223,32 @@ async def get_project_strategic_state(
         elif status == TaskStatus.CANCELLED:
             task_counts["cancelled"] += n
 
-    cost_total = (
+    cost_tasks = (
         await session.execute(
-            select(func.coalesce(func.sum(Task.estimated_cost_usd), 0.0)).where(
+            select(Task)
+            .where(
                 Task.project_id == project.id,
                 Task.archived.is_(False),
             )
+            .options(
+                load_only(
+                    Task.id,
+                    Task.context,
+                    Task.vm_runtime_cost_banked_db,
+                    Task.vm_provisioned_at,
+                    Task.vm_stopped_at,
+                    Task.vm_machine_type,
+                    Task.vm_spot,
+                    raiseload=True,
+                )
+            )
         )
-    ).scalar()
+    ).scalars().all()
+    cost_total = sum(
+        cost
+        for task in cost_tasks
+        if (cost := get_task_total_vm_cost_usd_or_none(task)) is not None
+    )
 
     message_rows = (
         await session.execute(

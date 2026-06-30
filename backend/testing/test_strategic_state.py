@@ -133,14 +133,14 @@ async def test_strategic_state_returns_persistent_workbench_projection(
         payloads=[{"type": "strategic_review"}],
         status=TaskStatus.IN_PROGRESS,
         strategic_cycle_id="sc-active",
-        estimated_cost_usd=1.25,
+        vm_runtime_cost_banked_db=1.25,
     )
     queued_task = Task(
         project_id=project.id,
         title="Queued follow-up",
         payloads=[{"type": "create"}],
         status=TaskStatus.QUEUED,
-        estimated_cost_usd=0.75,
+        vm_runtime_cost_banked_db=0.75,
     )
     db_session.add(phase2_task)
     db_session.add(queued_task)
@@ -351,6 +351,43 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     assert "A blocker is owned by a direction" not in str(package)
     assert "DO NOT EMBED KNOWLEDGE BODY" not in str(package)
     assert "DO NOT EMBED ARTIFACT LOGS" not in str(package)
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_cost_uses_vm_cost_source_of_truth(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    stale_estimate_only = Task(
+        project_id=project.id,
+        title="Legacy estimate only",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        estimated_cost_usd=999.0,
+    )
+    banked_cost = Task(
+        project_id=project.id,
+        title="Banked retry cost",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        estimated_cost_usd=999.0,
+        vm_runtime_cost_banked_db=1.25,
+    )
+    archived_cost = Task(
+        project_id=project.id,
+        title="Archived retry cost",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        archived=True,
+        vm_runtime_cost_banked_db=10.0,
+    )
+    db_session.add_all([stale_estimate_only, banked_cost, archived_cost])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+
+    assert resp.status_code == 200
+    assert resp.json()["tasks"]["cumulative_estimated_cost_usd"] == pytest.approx(1.25)
 
 
 @pytest.mark.asyncio
