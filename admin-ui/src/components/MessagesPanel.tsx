@@ -717,6 +717,12 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     () => buildStrategicContextDescriptor(currentStrategicState, strategicWorkbenchState),
     [currentStrategicState, strategicWorkbenchState],
   );
+  const showStrategicStatusStrip = conversationMode && Boolean(
+    strategistActive
+      || strategicRefresh
+      || (effectiveContextPackage?.status && effectiveContextPackage.status !== 'ready')
+      || (strategicAttention?.level === 'needs_operator' && attentionNeeds > 0),
+  );
 
   const mutedCount = Object.values(eventPrefs).filter(v => v === 'mute').length;
 
@@ -1620,7 +1626,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         filterChrome={resolvedFilterChrome}
       />
 
-      {conversationMode && (effectiveContextPackage || currentStrategicState || strategicRefresh || strategistActive) && (
+      {showStrategicStatusStrip && (
         <div className="shrink-0 border-b border-neutral-800 bg-[#07090c] px-4 py-2 md:px-6" data-testid="strategic-context-package-strip">
           <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500" aria-label="Strategic chat status">
             <span className="shrink-0 font-semibold text-neutral-200">Strategic</span>

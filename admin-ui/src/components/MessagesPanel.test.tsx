@@ -674,7 +674,7 @@ describe('MessagesPanel chrome modes', () => {
     expect(_strategicSessionGetCalls()).toHaveLength(0);
   });
 
-  test('minimal chat chrome shows the compact Strategic context package strip', async () => {
+  test('minimal chat chrome hides the ready-only Strategic context package strip', async () => {
     const el = await renderPanel({
       filterChrome: 'minimal',
       contextPackage: {
@@ -695,12 +695,7 @@ describe('MessagesPanel chrome modes', () => {
     });
 
     const strip = el.querySelector('[data-testid="strategic-context-package-strip"]');
-    expect(strip?.textContent).toContain('Strategic');
-    expect(strip?.textContent).toContain('Chat');
-    expect(strip?.textContent).not.toContain('Workbench context');
-    expect(strip?.textContent).not.toContain('ready');
-    expect(strip?.textContent).not.toContain('18 items');
-    expect(strip?.textContent).not.toContain('canvas nodes');
+    expect(strip).toBeNull();
   });
 
   test('minimal chat chrome can render the Strategic work session strip from read model state', async () => {
