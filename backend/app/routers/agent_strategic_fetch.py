@@ -639,12 +639,15 @@ async def agent_fetch_version_phase(
 
     # Candidate-currency signal for the fetch/recovery path — same HEAD-vs-candidate
     # comparison the spawn payload provides in payload_staleness.  Best-effort:
-    # a GitHub API failure must not break the endpoint.
+    # a GitHub API failure must not break the endpoint. When freshness is
+    # indeterminate (currency=None), include a minimal marker with verdict="unknown"
+    # so the agent can distinguish indeterminate from absent/no-open-version.
     candidate_currency: dict | None = None
     if open_row is not None:
         try:
             from app.strategic_spawning import (  # noqa: PLC0415
                 _build_freshness_shas_block,
+                _freshness_generated_at,
                 _resolve_candidate_currency,
                 get_project_integration_branch,
             )
@@ -659,11 +662,26 @@ async def agent_fetch_version_phase(
                     **_raw_currency,
                     **_build_freshness_shas_block(_raw_currency),
                 }
+            else:
+                # Indeterminate: freshness could not be resolved (GitHub unreachable,
+                # no candidate SHA on record, etc.). Mark explicitly so agent knows
+                # the state is unknown, not current or stale.
+                candidate_currency = {
+                    "verdict": "unknown",
+                    "generated_at": _freshness_generated_at(),
+                }
         except Exception:
             logger.exception(
                 "[AGENT_FETCH] candidate_currency resolve failed for project %s",
                 project_id,
             )
+            # On exception, also include the indeterminate marker.
+            from app.strategic_spawning import _freshness_generated_at  # noqa: PLC0415
+
+            candidate_currency = {
+                "verdict": "unknown",
+                "generated_at": _freshness_generated_at(),
+            }
 
     return {
         "status": "success",

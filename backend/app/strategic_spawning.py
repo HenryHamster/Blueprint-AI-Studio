@@ -4107,6 +4107,10 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     return True
 
 
+def _freshness_generated_at() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _build_freshness_shas_block(currency: dict) -> dict:
     """Build a normalized SHA-freshness dict from a resolved candidate-currency dict.
 
@@ -4126,6 +4130,7 @@ def _build_freshness_shas_block(currency: dict) -> dict:
         "payload_compiled_sha": currency["candidate_sha"],
         "active_candidate_sha": currency["candidate_sha"],
         "integration_head_sha": currency["head_sha"],
+        "generated_at": _freshness_generated_at(),
         "stale": is_stale,
         "stale_reason": (
             "payload_sha_differs_from_integration_head" if is_stale else None
@@ -4144,6 +4149,7 @@ def _build_unknown_freshness_block() -> dict:
     return {
         "verdict": "unknown",
         "checked_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": _freshness_generated_at(),
     }
 
 

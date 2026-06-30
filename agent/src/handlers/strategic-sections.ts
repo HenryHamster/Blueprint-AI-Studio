@@ -1284,6 +1284,7 @@ export function buildPayloadStalenessSection(staleness: Record<string, unknown> 
     : (typeof staleness.payload_compiled_sha === 'string' ? staleness.payload_compiled_sha : '');
   const rawCandidateSha = typeof staleness.active_candidate_sha === 'string' ? staleness.active_candidate_sha : '';
   const rawIntegrationHeadSha = typeof staleness.integration_head_sha === 'string' ? staleness.integration_head_sha : '';
+  const generatedAt = typeof staleness.generated_at === 'string' ? staleness.generated_at : '';
 
   const payloadShaShort = rawPayloadSha ? rawPayloadSha.slice(0, 12) : '?';
   const candidateShaShort = rawCandidateSha ? rawCandidateSha.slice(0, 12) : '?';
@@ -1301,8 +1302,14 @@ export function buildPayloadStalenessSection(staleness: Record<string, unknown> 
     }
     lines.push('Audit findings, CI compliance, and direction scores in this payload were evaluated against the OLDER candidate commit, not the current integration HEAD.');
     lines.push('Do NOT treat unverified audit findings as current promotion blockers before confirming they still reproduce on current HEAD. Consider fetching a fresh qualification before acting on stale findings.');
+    if (generatedAt) {
+      lines.push(`_Generated at ${generatedAt}_`);
+    }
   } else {
     lines.push(`Candidate is CURRENT — payload compiled against \`${candidateShaShort}\`, which matches the active qualification candidate. Audit findings are scored against live HEAD.`);
+    if (generatedAt) {
+      lines.push(`_Checked at ${generatedAt}_`);
+    }
   }
   return lines.join('\n');
 }

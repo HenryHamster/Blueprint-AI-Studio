@@ -36,6 +36,14 @@ from app.models import (
 TEST_USER_ID = "test-user-123"
 
 
+def _assert_generated_at_iso_utc(payload: dict) -> None:
+    generated_at = payload.get("generated_at")
+    assert isinstance(generated_at, str) and generated_at
+    parsed = datetime.fromisoformat(generated_at)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(0)
+
+
 async def _make_project(session) -> Project:
     project = Project(
         name="Strategic State",
@@ -2166,6 +2174,7 @@ async def test_strategic_state_sha_freshness_unknown_when_no_open_version(
     freshness = resp.json()["sha_freshness"]
     assert freshness is not None
     assert freshness["verdict"] == "unknown"
+    _assert_generated_at_iso_utc(freshness)
     # No SHAs present when there is no open version
     assert "active_candidate_sha" not in freshness
     assert "integration_head_sha" not in freshness
@@ -2214,6 +2223,7 @@ async def test_strategic_state_exposes_sha_freshness_verdict_when_candidate_behi
     assert freshness["verdict"] == "stale"
     assert freshness["active_candidate_sha"] == candidate_sha
     assert freshness["integration_head_sha"] == head_sha
+    _assert_generated_at_iso_utc(freshness)
 
 
 @pytest.mark.asyncio
@@ -2254,6 +2264,7 @@ async def test_strategic_state_sha_freshness_fresh_when_candidate_matches_head(
     assert freshness["verdict"] == "fresh"
     assert freshness["active_candidate_sha"] == sha
     assert freshness["integration_head_sha"] == sha
+    _assert_generated_at_iso_utc(freshness)
 
 
 @pytest.mark.asyncio

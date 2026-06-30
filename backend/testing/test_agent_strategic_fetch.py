@@ -28,6 +28,14 @@ from app.models import (
 from app.auth import create_agent_token
 
 
+def _assert_generated_at_iso_utc(payload: dict) -> None:
+    generated_at = payload.get("generated_at")
+    assert isinstance(generated_at, str) and generated_at
+    parsed = datetime.fromisoformat(generated_at)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(0)
+
+
 async def _make_project_task(db_session, *, vm="agent-vm-msg"):
     project = Project(name="Msg Test", user_id="test-user-msg")
     db_session.add(project)
@@ -3758,6 +3766,7 @@ async def test_agent_fetch_version_phase_exposes_payload_freshness_shas(
     assert cc["payload_compiled_sha"] == candidate
     assert cc["active_candidate_sha"] == candidate
     assert cc["integration_head_sha"] == head
+    _assert_generated_at_iso_utc(cc)
     assert cc["stale_reason"] == "payload_sha_differs_from_integration_head"
     # backward-compat fields preserved
     assert cc["current"] is False
@@ -3800,16 +3809,19 @@ async def test_agent_fetch_version_phase_candidate_currency_current(
     assert cc["payload_sha"] == sha
     assert cc["active_candidate_sha"] == sha
     assert cc["integration_head_sha"] == sha
+    _assert_generated_at_iso_utc(cc)
     assert cc["stale_reason"] is None
     assert cc["current"] is True
 
 
 @pytest.mark.asyncio
-async def test_agent_fetch_version_phase_candidate_currency_absent_when_indeterminate(
+async def test_candidate_currency_indeterminate_marker(
     client: AsyncClient, db_session, mocker
 ):
-    """When GitHub resolution fails (resolved=None), candidate_currency is absent
-    from the response — the endpoint must not error."""
+    """Acceptance requirement: when GitHub resolution fails (resolved=None),
+    candidate_currency must include an explicit indeterminate marker with
+    verdict="unknown" so the agent can distinguish indeterminate from current/stale.
+    The endpoint must not error, and the marker must be present in the response."""
     from sqlalchemy.orm.attributes import flag_modified
 
     candidate = "d" * 40
@@ -3832,6 +3844,8 @@ async def test_agent_fetch_version_phase_candidate_currency_absent_when_indeterm
     assert res.status_code == 200, res.text
     data = res.json()["data"]
 
-    assert "candidate_currency" not in data, (
-        "candidate_currency must be absent when currency is indeterminate"
-    )
+    # Indeterminate marker must be present with verdict="unknown"
+    cc = data.get("candidate_currency")
+    assert cc is not None, "candidate_currency must be present when freshness is indeterminate"
+    assert cc.get("verdict") == "unknown", "verdict must be 'unknown' when currency is indeterminate"
+    _assert_generated_at_iso_utc(cc)

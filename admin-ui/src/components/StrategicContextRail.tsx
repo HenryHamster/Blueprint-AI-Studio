@@ -672,14 +672,41 @@ export function StrategicContextRail({
   );
   const isWorking = !staleCycle && (strategistActive || Boolean(activeCycle?.has_active_task));
   const statusTone = isWorking ? 'bg-cyan-400' : pendingSteer ? 'bg-amber-300' : 'bg-neutral-600';
+  const formatTimestampAsOf = (timestamp?: string | null): string => {
+    if (!timestamp) return '';
+    try {
+      const date = new Date(timestamp);
+      if (Number.isNaN(date.getTime())) return '';
+      const now = new Date();
+      const diffMs = now.getTime() - date.getTime();
+      const diffMins = Math.floor(diffMs / 60000);
+      const diffHours = Math.floor(diffMins / 60);
+      const diffDays = Math.floor(diffHours / 24);
+
+      if (diffMins < 1) return 'just now';
+      if (diffMins < 60) return `${diffMins}m ago`;
+      if (diffHours < 24) return `${diffHours}h ago`;
+      if (diffDays < 7) return `${diffDays}d ago`;
+      return date.toLocaleDateString();
+    } catch {
+      return '';
+    }
+  };
+
   const staleCycleLabel = ((): string => {
     if (!staleCycle) return '';
+    const asOfTime = formatTimestampAsOf(shaFreshness?.generated_at);
+    const asOfSuffix = asOfTime ? ` · ${asOfTime}` : '';
+
     if (shaFreshness?.verdict === 'stale') {
       const cSha = shaFreshness.active_candidate_sha?.slice(0, 7);
       const iSha = shaFreshness.integration_head_sha?.slice(0, 7);
-      if (cSha && iSha) return `Cycle stale · candidate @${cSha} vs integration @${iSha}`;
-      if (cSha) return `Cycle stale · candidate @${cSha}`;
-      if (iSha) return `Cycle stale · integration @${iSha}`;
+      if (cSha && iSha) return `Cycle stale · candidate @${cSha} vs integration @${iSha}${asOfSuffix}`;
+      if (cSha) return `Cycle stale · candidate @${cSha}${asOfSuffix}`;
+      if (iSha) return `Cycle stale · integration @${iSha}${asOfSuffix}`;
+    }
+    if (shaFreshness?.verdict === 'unknown' && asOfTime) {
+      return `Cycle freshness unknown${asOfSuffix}`;
     }
     return 'Cycle stale';
   })();

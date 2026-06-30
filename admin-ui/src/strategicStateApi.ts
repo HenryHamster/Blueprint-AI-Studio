@@ -480,6 +480,7 @@ export interface StrategicStateResponse {
     active_candidate_sha?: string | null;
     integration_head_sha?: string | null;
     verdict: 'stale' | 'fresh' | 'unknown' | string;
+    generated_at?: string | null;
     checked_at?: string | null;
     integration_branch?: string | null;
     stale?: boolean | null;

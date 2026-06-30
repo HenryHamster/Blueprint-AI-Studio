@@ -60,6 +60,14 @@ from app.task_evaluators import (
 )
 
 
+def _assert_generated_at_iso_utc(payload: dict) -> None:
+    generated_at = payload.get("generated_at")
+    assert isinstance(generated_at, str) and generated_at
+    parsed = datetime.fromisoformat(generated_at)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset().total_seconds() == 0
+
+
 # ── Account pool fixture (required by _spawn_research_task) ───────────────────
 
 
@@ -6923,7 +6931,7 @@ async def test_stabilize_carried_findings_degrades_when_sha_unresolvable(
 
 
 @pytest.mark.asyncio
-async def test_spawn_strategic_review_payload_staleness_stale_when_candidate_behind(
+async def test_spawn_strategic_review_payload_staleness_includes_generated_at(
     db_session, mocker, _lts_split_active
 ):
     """When the qualification candidate is BEHIND integration HEAD, the spawned
@@ -6968,6 +6976,7 @@ async def test_spawn_strategic_review_payload_staleness_stale_when_candidate_beh
     assert staleness["payload_sha"] == candidate
     assert staleness["active_candidate_sha"] == candidate
     assert staleness["integration_head_sha"] == head
+    _assert_generated_at_iso_utc(staleness)
     assert staleness["stale_reason"] == "payload_sha_differs_from_integration_head"
 
 
@@ -7013,6 +7022,7 @@ async def test_spawn_strategic_review_payload_staleness_current_when_candidate_m
     assert staleness["payload_compiled_sha"] == sha
     assert staleness["active_candidate_sha"] == sha
     assert staleness["integration_head_sha"] == sha
+    _assert_generated_at_iso_utc(staleness)
     assert staleness["stale_reason"] is None
 
 

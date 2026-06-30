@@ -1876,6 +1876,45 @@ describe('buildPayloadStalenessSection', () => {
     expect(result).toContain('## Payload Currency (cycle-start check)');
   });
 
+  it('stale branch with generated_at — appends _Generated at <timestamp>_ line', () => {
+    const result = buildPayloadStalenessSection({
+      stale: true,
+      payload_sha: STALE_SHA,
+      active_candidate_sha: CANDIDATE_SHA,
+      generated_at: '2026-06-30T12:00:00Z',
+    });
+    expect(result).toContain('⚠ STALE');
+    expect(result).toContain('_Generated at 2026-06-30T12:00:00Z_');
+    expect(result).not.toContain('_Checked at');
+  });
+
+  it('current branch with generated_at — appends _Checked at <timestamp>_ line', () => {
+    const result = buildPayloadStalenessSection({
+      stale: false,
+      payload_sha: STALE_SHA,
+      active_candidate_sha: STALE_SHA,
+      generated_at: '2026-06-30T12:00:00Z',
+    });
+    expect(result).toContain('CURRENT');
+    expect(result).toContain('_Checked at 2026-06-30T12:00:00Z_');
+    expect(result).not.toContain('_Generated at');
+  });
+
+  it('omits generated_at lines when generated_at field is absent', () => {
+    const staleResult = buildPayloadStalenessSection({
+      stale: true,
+      payload_sha: STALE_SHA,
+      active_candidate_sha: CANDIDATE_SHA,
+    });
+    expect(staleResult).not.toContain('_Generated at');
+    const currentResult = buildPayloadStalenessSection({
+      stale: false,
+      payload_sha: STALE_SHA,
+      active_candidate_sha: STALE_SHA,
+    });
+    expect(currentResult).not.toContain('_Checked at');
+  });
+
   it('position in prompt — staleness section appears before problem model', () => {
     const stalenessMarker = 'STALENESS_MARKER_XYZ';
     const problemModelMarker = 'PROBLEM_MODEL_MARKER_XYZ';
