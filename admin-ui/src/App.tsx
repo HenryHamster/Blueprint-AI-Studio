@@ -45,6 +45,7 @@ import { StrategicContextWorkspace } from './components/StrategicContextWorkspac
 import { StrategicSessionControl, type StrategicInteractionMode } from './components/StrategicSessionControl';
 import { TaskContextRail } from './components/TaskContextRail';
 import { CommandPaletteHost } from './components/CommandPaletteHost';
+import { parseArmingOutcome, workbenchArmingToastCopy } from './components/messageArming';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
 import { BoardSavedViewsBar, type BoardFilterSnapshot } from './components/BoardSavedViewsBar';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
@@ -145,7 +146,6 @@ export default function App() {
     setFailureClassFilter(snap.failureClassFilter);
     setSortBy(snap.sortBy);
   }, [setSearchQuery, setTaskTypeFilter, setStatusFilter, setDateRange, setBlockedFilter, setRequiresApproval, setStuckFilter, setStuckMinSeconds, setFailureClassFilter]);
-  // Update browser tab title with unread message count
   useEffect(() => {
     if (openMessageCount > 0) {
       document.title = `(${openMessageCount}) Blueprint AI Studio`;
@@ -153,8 +153,9 @@ export default function App() {
       document.title = 'Blueprint AI Studio';
     }
   }, [openMessageCount]);
-  // Fetch open message count periodically (when panel is closed the callback won't fire)
   const selectedProjectId = s.selectedProjectId;
+  const selectedProjectIdRef = useRef(selectedProjectId);
+  selectedProjectIdRef.current = selectedProjectId;
   const activeTab: PrimaryTab = s.activeTab;
   const messagesPanelOpen = activeTab === 'chat';
   const [directions, setDirections] = useState<StrategicCockpitDirection[]>([]);
@@ -470,24 +471,27 @@ export default function App() {
     strategicWorkbenchStateRef.current = optimistic;
     setOptimisticStrategicWorkbench(optimistic);
     setSavingStrategicWorkbench(true);
-
     const save = strategicWorkbenchSaveQueueRef.current
       .catch(() => undefined)
       .then(async () => {
         try {
-          const saved = await updateStrategicWorkbenchState(projectId, patch);
-          if (strategicWorkbenchSaveSeqRef.current !== saveSeq) return;
+          const result = await updateStrategicWorkbenchState(projectId, patch);
+          const armingOutcome = selectedProjectIdRef.current === projectId ? parseArmingOutcome(result.arming) : null;
+          const armingToast = workbenchArmingToastCopy(armingOutcome);
+          if (armingToast) s.addToast(armingToast, armingOutcome === 'not_armed' ? 'info' : 'success');
+          if (selectedProjectIdRef.current !== projectId || strategicWorkbenchSaveSeqRef.current !== saveSeq) return;
+          const saved = result.workbench;
           strategicWorkbenchStateRef.current = saved;
           setOptimisticStrategicWorkbench(saved);
           void strategicReadModel.refresh();
         } catch {
-          if (strategicWorkbenchSaveSeqRef.current === saveSeq) {
+          if (selectedProjectIdRef.current === projectId && strategicWorkbenchSaveSeqRef.current === saveSeq) {
             strategicWorkbenchStateRef.current = base;
             setOptimisticStrategicWorkbench(base);
             s.addToast('Could not save Strategic session', 'error');
           }
         } finally {
-          if (strategicWorkbenchSaveSeqRef.current === saveSeq) setSavingStrategicWorkbench(false);
+          if (selectedProjectIdRef.current === projectId && strategicWorkbenchSaveSeqRef.current === saveSeq) setSavingStrategicWorkbench(false);
         }
       });
     strategicWorkbenchSaveQueueRef.current = save.then(

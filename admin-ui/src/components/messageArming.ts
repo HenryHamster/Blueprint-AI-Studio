@@ -38,6 +38,11 @@ const ARMING_TOAST: Record<ArmingOutcome, string> = {
   duplicate: 'Message already sent — steer already armed',
 };
 
+const WORKBENCH_ARMING_TOAST: Record<Extract<ArmingOutcome, 'steering' | 'not_armed'>, string> = {
+  steering: 'Strategic mode saved — waking the strategist',
+  not_armed: 'Strategic mode saved, but the strategist wasn’t woken — try again',
+};
+
 /** Composer hint copy for a given (real or predicted) arming outcome. */
 export function armingHintCopy(outcome: ArmingOutcome): string {
   return ARMING_HINT[outcome];
@@ -46,6 +51,11 @@ export function armingHintCopy(outcome: ArmingOutcome): string {
 /** Post-send toast copy for a server-reported arming outcome. */
 export function armingToastCopy(outcome: ArmingOutcome | null | undefined): string {
   return outcome ? ARMING_TOAST[outcome] : 'Message sent';
+}
+
+/** Toast copy for Strategic workbench mode changes that wake or tried to wake Strategic. */
+export function workbenchArmingToastCopy(outcome: ArmingOutcome | null | undefined): string | null {
+  return outcome === 'steering' || outcome === 'not_armed' ? WORKBENCH_ARMING_TOAST[outcome] : null;
 }
 
 /**

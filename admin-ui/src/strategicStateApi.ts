@@ -378,6 +378,12 @@ export interface StrategicSessionMessageResponse {
   message?: StrategicStateMessage;
 }
 
+export interface StrategicWorkbenchStateResponse {
+  status?: string;
+  workbench: StrategicWorkbenchState;
+  arming?: string | null;
+}
+
 export interface StrategicStateResponse {
   project_id: string;
   strategic: {
@@ -523,15 +529,14 @@ export async function fetchStrategicWorkbenchState(
 export async function updateStrategicWorkbenchState(
   projectId: string,
   workbench: Partial<StrategicWorkbenchState>,
-): Promise<StrategicWorkbenchState> {
+): Promise<StrategicWorkbenchStateResponse> {
   const res = await apiFetch('/api/admin/messages/workbench-state', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ project_id: projectId, workbench }),
   });
   if (!res.ok) throw new Error(`Failed to update Strategic workbench state: ${res.status}`);
-  const data = await res.json() as { workbench: StrategicWorkbenchState };
-  return data.workbench;
+  return res.json() as Promise<StrategicWorkbenchStateResponse>;
 }
 
 export async function fetchStrategicSession(

@@ -5,6 +5,7 @@ import {
   composerHintCopy,
   predictArming,
   parseArmingOutcome,
+  workbenchArmingToastCopy,
 } from './messageArming';
 
 describe('armingToastCopy — post-send toast grounded in the real outcome', () => {
@@ -44,6 +45,24 @@ describe('armingHintCopy — composer hint per outcome', () => {
     const copy = armingHintCopy('not_armed');
     expect(copy).toContain('Couldn’t wake the strategist');
     expect(copy).toContain('resending');
+  });
+});
+
+describe('workbenchArmingToastCopy — mode-change wake receipts', () => {
+  test('steering confirms the strategist is being woken', () => {
+    expect(workbenchArmingToastCopy('steering')).toBe('Strategic mode saved — waking the strategist');
+  });
+
+  test('not_armed is truthful about the failed wake', () => {
+    const copy = workbenchArmingToastCopy('not_armed');
+    expect(copy).toContain('wasn’t woken');
+    expect(copy).not.toContain('waking the strategist');
+  });
+
+  test('passive and missing outcomes stay quiet', () => {
+    expect(workbenchArmingToastCopy('passive_note')).toBeNull();
+    expect(workbenchArmingToastCopy('routine_event')).toBeNull();
+    expect(workbenchArmingToastCopy(null)).toBeNull();
   });
 });
 
