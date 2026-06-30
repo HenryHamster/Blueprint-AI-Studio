@@ -68,12 +68,18 @@ function makeTask(overrides: Partial<Task> = {}): Task {
 }
 
 describe('TaskSideboardContextSection', () => {
-  test('groups sideboard context without dropping passive work details', async () => {
+  test('groups sideboard context into an integrated workbench surface without dropping passive work details', async () => {
     const user = userEvent.setup();
     const onNavigateToTask = vi.fn();
     render(<TaskSideboardContextSection task={makeTask()} onNavigateToTask={onNavigateToTask} />);
 
     expect(screen.getByText('Context')).toBeInTheDocument();
+    expect(screen.getByText('Project')).toBeInTheDocument();
+    expect(screen.getByText('Strategic')).toBeInTheDocument();
+    expect(screen.getByText('Pipeline')).toBeInTheDocument();
+    expect(screen.getByText('Evidence')).toBeInTheDocument();
+    expect(screen.getByText('Links')).toBeInTheDocument();
+    expect(screen.getByText('Messages')).toBeInTheDocument();
     expect(screen.getByText('HenryHamster/BlueprintAIStudio')).toBeInTheDocument();
     expect(screen.getByText('Make passive work readable from the task drawer.')).toBeInTheDocument();
     expect(screen.getByText('Keep monitoring context dense and legible for passive tasks.')).toBeInTheDocument();

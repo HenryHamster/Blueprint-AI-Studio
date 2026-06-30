@@ -128,7 +128,7 @@ describe('CommandPalette', () => {
     expect(screen.getByText('S')).toBeInTheDocument();
   });
 
-  test('renders above workbench drawers', () => {
+  test('renders above workbench drawers and sideboards', () => {
     const { container } = render(
       <CommandPalette
         open
@@ -137,7 +137,7 @@ describe('CommandPalette', () => {
       />,
     );
 
-    expect(container.firstElementChild).toHaveClass('z-[70]');
+    expect(container.firstElementChild).toHaveClass('z-[80]');
   });
 
   test('runs the active command with keyboard navigation and Enter', async () => {

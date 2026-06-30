@@ -1,4 +1,4 @@
-import type { ComponentProps, MutableRefObject } from 'react';
+import type { ComponentProps, MutableRefObject, ReactNode } from 'react';
 import {
   Activity,
   Bell,
@@ -82,6 +82,68 @@ const RUNTIME_SETTINGS_SECTIONS: SectionNavItem<RuntimeSettingsSection>[] = [
   { id: 'notifications', label: 'Notifications', description: 'Webhook, event, and spend alerts.', icon: Bell },
   { id: 'advanced', label: 'Advanced', description: 'Health-check endpoints and diagnostics.', icon: Wrench },
 ];
+
+const RUNTIME_SECTIONS: SectionNavItem<RuntimeSection>[] = [
+  { id: 'health', label: 'Health', description: 'Service health, task pressure, and fleet status at a glance.', icon: Activity },
+  { id: 'devices', label: 'Devices', description: 'Warm VMs, local runner hardware, and project-scoped device readiness.', icon: Server },
+  { id: 'compute', label: 'Compute', description: 'Running jobs, queued work, held approvals, and terminal run analysis.', icon: Gauge },
+  { id: 'accounts', label: 'Accounts', description: 'GitHub identity, LLM account roster, usage caps, and pool availability.', icon: Users },
+  { id: 'settings', label: 'Settings', description: 'Runtime defaults, automation limits, providers, deploy controls, and alerts.', icon: SlidersHorizontal },
+  { id: 'analytics', label: 'Analytics', description: 'Cost, account health, portfolio signals, and provider/model breakdowns.', icon: Activity },
+];
+
+function RuntimeSectionIntro<T extends string>({
+  item,
+  title = item.label,
+  children,
+}: {
+  item: SectionNavItem<T>;
+  title?: string;
+  children?: ReactNode;
+}) {
+  const Icon = item.icon;
+  return (
+    <div className="flex min-w-0 flex-col gap-2 border-b border-neutral-800/80 pb-3 md:flex-row md:items-end md:justify-between">
+      <div className="flex min-w-0 items-start gap-3">
+        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-[#10151c] text-neutral-300">
+          <Icon className="h-4 w-4" />
+        </span>
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold text-neutral-100">{title}</h2>
+        </div>
+      </div>
+      {children && (
+        <div className="flex min-w-0 shrink-0 flex-wrap items-center gap-1.5 md:justify-end">
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function RuntimeStatusPill({
+  label,
+  value,
+  tone = 'neutral',
+}: {
+  label: string;
+  value: ReactNode;
+  tone?: 'neutral' | 'good' | 'warn' | 'info';
+}) {
+  const valueClass = {
+    neutral: 'text-neutral-200',
+    good: 'text-emerald-300',
+    warn: 'text-amber-300',
+    info: 'text-cyan-300',
+  }[tone];
+
+  return (
+    <div className="inline-flex min-h-7 max-w-full items-center gap-1.5 rounded-md border border-neutral-800 bg-[#0d1218] px-2 text-ui-md">
+      <span className="shrink-0 uppercase tracking-wide text-neutral-500">{label}</span>
+      <span className={`min-w-0 truncate font-mono font-semibold ${valueClass}`}>{value}</span>
+    </div>
+  );
+}
 
 interface ProjectWorkspaceProps {
   projectSection: ProjectSection;
@@ -417,10 +479,19 @@ export function RuntimeWorkspace({
   onRestartOrchestrator,
 }: RuntimeWorkspaceProps) {
   const runtimeSettingsSections = RUNTIME_SETTINGS_SECTIONS.filter(item => !item.adminOnly || userRole === 'admin');
+  const activeRuntimeItem = RUNTIME_SECTIONS.find(item => item.id === runtimeSection) ?? RUNTIME_SECTIONS[0]!;
   const activeRuntimeSettingsItem =
     runtimeSettingsSections.find(item => item.id === runtimeConfigSection) ?? runtimeSettingsSections[0]!;
-  const ActiveRuntimeSettingsIcon = activeRuntimeSettingsItem.icon;
   const actionButtonClass = 'inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100';
+  const runtimeAccounts = settingsRouterProps.maxPlanAccounts ?? [];
+  const accountTotal = runtimeAccounts.length;
+  const enabledAccounts = runtimeAccounts.filter(account => account.enabled).length;
+  const activeAccountTasks = runtimeAccounts.reduce((sum, account) => sum + (account.active_tasks ?? 0), 0);
+  const cappedAccounts = runtimeAccounts.filter(account => account.daily_task_cap != null || account.max_concurrent_tasks != null).length;
+  const disabledModelCount = runtimeAccounts.reduce(
+    (sum, account) => sum + Object.keys(account.disabled_models ?? {}).length,
+    0,
+  );
 
   const runtimeSurfaceActions = (
     <>
@@ -444,15 +515,8 @@ export function RuntimeWorkspace({
   return (
     <WorkbenchSurface
       title="Runtime"
-      subtitle={runtimeSection === 'devices' && selectedProjectRepoLabel ? selectedProjectRepoLabel : 'Fleet, accounts, and system health'}
-      tabs={[
-        { id: 'health', label: 'Health' },
-        { id: 'devices', label: 'Devices' },
-        { id: 'compute', label: 'Compute' },
-        { id: 'accounts', label: 'Accounts' },
-        { id: 'settings', label: 'Settings' },
-        { id: 'analytics', label: 'Analytics' },
-      ]}
+      subtitle="Devices, compute, accounts, settings"
+      tabs={RUNTIME_SECTIONS.map(({ id, label }) => ({ id, label }))}
       activeTab={runtimeSection}
       onTabChange={onRuntimeSectionChange}
       actions={runtimeSurfaceActions}
@@ -474,25 +538,58 @@ export function RuntimeWorkspace({
           onCreateTask={onCreateTask}
         />
       ) : runtimeSection === 'devices' ? (
-        <div className="grid min-h-full gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(340px,400px)]">
-          <div className="min-w-0 rounded-md border border-neutral-800 bg-[#10151c] p-2.5">
-            <WarmVmPanel onViewTask={onViewTaskById} projects={projects} />
+        <div className="mx-auto flex max-w-7xl flex-col gap-3">
+          <RuntimeSectionIntro
+            item={activeRuntimeItem}
+            title="Devices and runner hardware"
+          >
+            <RuntimeStatusPill
+              label="project"
+              value={selectedProjectRepoLabel ?? 'none'}
+              tone={selectedProjectId ? 'info' : 'warn'}
+            />
+            <RuntimeStatusPill label="VMs" value="warm pool" tone="good" />
+            <RuntimeStatusPill
+              label="runners"
+              value={selectedProjectId ? 'project scoped' : 'select project'}
+              tone={selectedProjectId ? 'good' : 'warn'}
+            />
+          </RuntimeSectionIntro>
+          <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(360px,420px)]">
+            <section className="min-w-0 rounded-md border border-neutral-800 bg-[#10151c] p-3" aria-label="Warm VM devices">
+              <WarmVmPanel onViewTask={onViewTaskById} projects={projects} />
+            </section>
+            <section className="min-w-0 rounded-md border border-neutral-800 bg-[#10151c] p-3" aria-label="Self-hosted runner devices">
+              {selectedProjectId ? (
+                <FleetRunnersPanel
+                  projectId={selectedProjectId}
+                  requireLocalRunner={settingsRouterProps.resourceEnvelopeData?.require_local_runner ?? false}
+                />
+              ) : (
+                <div className="py-10 text-center text-xs text-neutral-500">
+                  Select a project to manage self-hosted runners.
+                </div>
+              )}
+            </section>
           </div>
-          <WorkbenchPanel title="Self-hosted runners" meta={selectedProjectRepoLabel ?? 'select project'}>
-            {selectedProjectId ? (
-              <FleetRunnersPanel
-                projectId={selectedProjectId}
-                requireLocalRunner={settingsRouterProps.resourceEnvelopeData?.require_local_runner ?? false}
-              />
-            ) : (
-              <div className="py-10 text-center text-xs text-neutral-500">
-                Select a project to manage self-hosted runners.
-              </div>
-            )}
-          </WorkbenchPanel>
         </div>
       ) : runtimeSection === 'compute' ? (
-        <div className="mx-auto max-w-7xl">
+        <div className="mx-auto flex max-w-7xl flex-col gap-3">
+          <RuntimeSectionIntro
+            item={activeRuntimeItem}
+            title="Compute queue"
+          >
+            <RuntimeStatusPill
+              label="project"
+              value={`${scopedActiveCount ?? 0} active / ${scopedQueuedCount ?? 0} queued`}
+              tone={(scopedActiveCount ?? 0) > 0 ? 'info' : 'neutral'}
+            />
+            <RuntimeStatusPill
+              label="fleet"
+              value={`${globalActiveCount} active / ${globalQueuedCount} queued`}
+              tone={globalActiveCount > 0 ? 'info' : 'neutral'}
+            />
+          </RuntimeSectionIntro>
           <ComputeJobsPanel
             projectId={selectedProjectId}
             onNavigateToTask={onViewTaskById}
@@ -519,12 +616,47 @@ export function RuntimeWorkspace({
           userRole={userRole}
         />
       ) : runtimeSection === 'accounts' ? (
-        <div className="mx-auto max-w-6xl">
-          <SettingsSectionRouter {...settingsRouterProps} activeSection="accounts" />
+        <div className="mx-auto flex max-w-6xl flex-col gap-3">
+          <RuntimeSectionIntro
+            item={activeRuntimeItem}
+            title="Accounts and usage"
+          >
+            <RuntimeStatusPill
+              label="GitHub"
+              value={settingsRouterProps.githubAccount ? 'connected' : 'not connected'}
+              tone={settingsRouterProps.githubAccount ? 'good' : 'warn'}
+            />
+            <RuntimeStatusPill
+              label="LLM"
+              value={`${enabledAccounts}/${accountTotal} enabled`}
+              tone={enabledAccounts > 0 ? 'good' : 'warn'}
+            />
+            <RuntimeStatusPill
+              label="active"
+              value={`${activeAccountTasks} tasks`}
+              tone={activeAccountTasks > 0 ? 'info' : 'neutral'}
+            />
+            {accountTotal > 0 && (
+              <RuntimeStatusPill
+                label="caps"
+                value={`${cappedAccounts} set`}
+                tone={cappedAccounts > 0 ? 'info' : 'neutral'}
+              />
+            )}
+            {disabledModelCount > 0 && (
+              <RuntimeStatusPill label="cooldowns" value={disabledModelCount} tone="warn" />
+            )}
+          </RuntimeSectionIntro>
+          <div className="rounded-md border border-neutral-800 bg-[#10151c] p-3">
+            <SettingsSectionRouter {...settingsRouterProps} activeSection="accounts" />
+          </div>
         </div>
       ) : (
-        <div className="grid h-full min-h-0 grid-cols-1 overflow-hidden lg:grid-cols-[280px_minmax(0,1fr)]">
-          <aside className="min-h-0 overflow-auto border-b border-neutral-800 bg-[#080c11] p-2.5 custom-scrollbar lg:border-b-0 lg:border-r">
+        <div className="grid h-full min-h-0 grid-cols-1 overflow-hidden lg:grid-cols-[260px_minmax(0,1fr)]">
+          <aside className="min-h-0 overflow-auto border-b border-neutral-800 bg-[#080c11] p-3 custom-scrollbar lg:border-b-0 lg:border-r">
+            <div className="mb-3 hidden lg:block">
+              <div className="text-ui-md font-semibold uppercase tracking-wide text-neutral-500">Runtime settings</div>
+            </div>
             <nav className="space-y-1" aria-label="Runtime settings sections">
               {runtimeSettingsSections.map(item => {
                 const Icon = item.icon;
@@ -541,9 +673,12 @@ export function RuntimeWorkspace({
                     }`}
                   >
                     <Icon className="h-3.5 w-3.5 shrink-0" />
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-xs font-medium">{item.label}</span>
-                    </span>
+                    <span className="min-w-0 flex-1 truncate text-xs font-medium">{item.label}</span>
+                    {item.adminOnly && (
+                      <span className="shrink-0 rounded border border-neutral-700 px-1.5 py-0.5 text-ui-sm uppercase tracking-wide text-neutral-500">
+                        admin
+                      </span>
+                    )}
                   </button>
                 );
               })}
@@ -551,15 +686,7 @@ export function RuntimeWorkspace({
           </aside>
           <div className="min-h-0 overflow-auto p-3 custom-scrollbar">
             <div className="mx-auto max-w-6xl space-y-4">
-              <div className="flex min-w-0 items-center gap-3 border-b border-neutral-800 pb-3">
-                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-[#10151c] text-neutral-300">
-                  <ActiveRuntimeSettingsIcon className="h-4 w-4" />
-                </span>
-                <div className="min-w-0">
-                  <h2 className="text-sm font-semibold text-neutral-100">{activeRuntimeSettingsItem.label}</h2>
-                  <p className="mt-1 text-xs text-neutral-500">{activeRuntimeSettingsItem.description}</p>
-                </div>
-              </div>
+              <RuntimeSectionIntro item={activeRuntimeSettingsItem} />
               <SettingsSectionRouter {...settingsRouterProps} activeSection={activeRuntimeSettingsItem.id} />
             </div>
           </div>

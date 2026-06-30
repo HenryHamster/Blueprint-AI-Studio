@@ -68,9 +68,11 @@ describe('TaskContextRail', () => {
 
     expect(screen.getByText('Task context')).toBeInTheDocument();
     expect(screen.getByText('Implement active work context')).toBeInTheDocument();
+    expect(screen.getByText('Latest status')).toBeInTheDocument();
     expect(screen.getByText('Reviewing the operator sideboard.')).toBeInTheDocument();
     expect(screen.getByText('Keep active work tied to Strategic context.')).toBeInTheDocument();
     expect(screen.getByText('2 child tasks')).toBeInTheDocument();
+    expect(screen.getByText('Task actions')).toBeInTheDocument();
 
     await user.click(screen.getByText('Details'));
     expect(onOpenTask).toHaveBeenCalledWith(expect.objectContaining({ id: 'task-12345678' }));

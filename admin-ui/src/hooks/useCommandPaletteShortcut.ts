@@ -5,8 +5,10 @@ export function useCommandPaletteShortcut(onOpen: () => void, enabled = true) {
     if (!enabled) return;
     const handleCommandShortcut = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
-      if (event.altKey || !(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'k') return;
+      if (event.altKey || event.shiftKey || !(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'k') return;
       event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
       onOpen();
     };
     document.addEventListener('keydown', handleCommandShortcut, true);

@@ -179,6 +179,20 @@ describe('useOperatorKeyboardShortcuts', () => {
     expect(routeEvent.defaultPrevented).toBe(false);
   });
 
+  test('closes transient settings chrome before opening the command palette', () => {
+    const toggleSettings = vi.fn();
+    const setCommandPaletteOpen = mount(false, false, {
+      showSettings: true,
+      toggleSettings,
+    });
+
+    const event = dispatchShortcut(document);
+
+    expect(toggleSettings).toHaveBeenCalledOnce();
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(true);
+    expect(event.defaultPrevented).toBe(true);
+  });
+
   test('does not focus search over a blocking modal', () => {
     mount(true);
     const searchInput = host?.querySelector<HTMLInputElement>('[aria-label="task search"]');

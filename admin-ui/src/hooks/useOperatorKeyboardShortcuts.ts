@@ -72,9 +72,10 @@ export function useOperatorKeyboardShortcuts({
   }, [closeTransientTargets, showSettings, toggleSettings]);
 
   const openCommandPalette = useCallback(() => {
-    closeTransientTargets();
+    if (commandPaletteOpen || commandPaletteShortcutBlocked) return;
+    closeTransientWorkbenchPanels();
     setCommandPaletteOpen(true);
-  }, [closeTransientTargets, setCommandPaletteOpen]);
+  }, [closeTransientWorkbenchPanels, commandPaletteOpen, commandPaletteShortcutBlocked, setCommandPaletteOpen]);
 
   useCommandPaletteShortcut(openCommandPalette, !commandPaletteOpen && !commandPaletteShortcutBlocked);
 

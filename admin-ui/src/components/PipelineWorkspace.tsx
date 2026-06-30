@@ -1,4 +1,5 @@
 import { useEffect, useState, type ComponentProps, type ReactNode } from 'react';
+import { ChevronDown, ChevronRight } from 'lucide-react';
 import ArchiveView from './ArchiveView';
 import { ErrorBoundary } from './ErrorBoundary';
 import { KanbanBoard } from './KanbanBoard';
@@ -7,7 +8,7 @@ import { PipelineView } from './PipelineView';
 import { TaskContextRail } from './TaskContextRail';
 import TaskStreamPanel, { type TaskStreamPanelProps } from './TaskStreamPanel';
 import type { Task } from './TaskCard';
-import { WorkbenchMetric, WorkbenchPanel, WorkbenchSurface } from './WorkbenchLayout';
+import { WorkbenchSurface } from './WorkbenchLayout';
 import type { PipelineSection } from '../hooks/useWorkbenchCommands';
 import { timeAgo } from '../utils/time';
 
@@ -137,6 +138,11 @@ function formatFetchLabel(value: number | Date | null | undefined, stale: boolea
   return stale ? `data stale ${timeAgo(ms)}` : `fetched ${timeAgo(ms)}`;
 }
 
+function formatRowsLabel(status: PipelineWorkspaceStatus): string {
+  if (status.displayedRows === status.loadedRows) return `${status.displayedRows} shown`;
+  return `${status.displayedRows}/${status.loadedRows} shown`;
+}
+
 function PipelineStatusPill({
   label,
   tone = 'neutral',
@@ -149,9 +155,9 @@ function PipelineStatusPill({
   className?: string;
 }) {
   const toneClass = {
-    neutral: 'border-neutral-800 bg-neutral-950/40 text-neutral-400',
+    neutral: 'border-neutral-800/80 bg-neutral-950/35 text-neutral-400',
     good: 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300',
-    warn: 'border-yellow-500/20 bg-yellow-500/10 text-yellow-300',
+    warn: 'border-amber-500/20 bg-amber-500/10 text-amber-300',
     bad: 'border-red-500/25 bg-red-500/10 text-red-300',
     info: 'border-cyan-500/20 bg-cyan-500/10 text-cyan-300',
   }[tone];
@@ -165,8 +171,36 @@ function PipelineStatusPill({
   );
 }
 
+function PipelineStatusDetail({
+  label,
+  value,
+  tone = 'neutral',
+  title,
+}: {
+  label: string;
+  value: ReactNode;
+  tone?: 'neutral' | 'good' | 'warn' | 'bad' | 'info';
+  title?: string;
+}) {
+  const valueClass = {
+    neutral: 'text-neutral-200',
+    good: 'text-emerald-300',
+    warn: 'text-amber-300',
+    bad: 'text-red-300',
+    info: 'text-cyan-300',
+  }[tone];
+
+  return (
+    <div className="min-w-0 bg-[#070b11] px-3 py-2" title={title}>
+      <dt className="text-ui-sm font-semibold uppercase text-neutral-600">{label}</dt>
+      <dd className={`mt-0.5 min-w-0 truncate font-mono text-ui-md ${valueClass}`}>{value}</dd>
+    </div>
+  );
+}
+
 function PipelineStatusStrip({ status }: { status: PipelineWorkspaceStatus }) {
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [detailsOpen, setDetailsOpen] = useState(false);
   useEffect(() => {
     const id = window.setInterval(() => setNowMs(Date.now()), 30_000);
     return () => window.clearInterval(id);
@@ -179,59 +213,166 @@ function PipelineStatusStrip({ status }: { status: PipelineWorkspaceStatus }) {
   const scoped = Boolean(status.selectedProjectId);
   const scopeValue = status.selectedProjectLabel || status.selectedProjectId;
   const scopeLabel = scoped
-    ? `Project: ${scopeValue}`
-    : 'Global';
+    ? `${scopeValue}`
+    : 'All projects';
+  const rowLabel = formatRowsLabel(status);
+  const streamLabel = typeof status.wsConnected === 'boolean'
+    ? (status.wsConnected ? 'Stream on' : 'Stream off')
+    : null;
 
   return (
-    <div
-      data-viewport-allow-overflow
-      className="flex w-full min-w-0 max-w-full flex-nowrap items-center gap-1.5 overflow-x-auto border-b border-neutral-800 bg-[#070b11] px-3 py-1.5 text-xs"
-    >
-      <PipelineStatusPill
-        label={scopeLabel}
-        tone={scoped ? 'info' : 'neutral'}
-        title={scoped ? `Project-scoped task view: ${scopeValue}` : 'Global task view'}
-        className="shrink min-w-[4rem] max-w-52 md:max-w-72"
-      />
-      <PipelineStatusPill
-        label={`displayed ${status.displayedRows}`}
-        tone={status.displayedRows !== status.loadedRows ? 'info' : 'neutral'}
-        title="Rows currently displayed after filters"
-      />
-      <PipelineStatusPill label={`loaded ${status.loadedRows}`} title="Rows loaded in the current server page" />
-      <PipelineStatusPill label={`server ${status.serverTotalRows}`} title="Total rows reported by the server for this scope" />
-      <PipelineStatusPill
-        label={formatFetchLabel(status.lastFetchTime, stale)}
-        tone={stale ? 'warn' : 'neutral'}
-        title="Task data freshness from the existing poller state"
-      />
-      <PipelineStatusPill label={apiLabel} tone={apiTone} title="Task API health from the existing poller state" />
-      {typeof status.wsConnected === 'boolean' && (
-        <PipelineStatusPill
-          label={status.wsConnected ? 'WS connected' : 'WS disconnected'}
-          tone={status.wsConnected ? 'good' : 'bad'}
-          title="Websocket state from the existing stream"
-        />
+    <section className="border-b border-neutral-800 bg-[#070b11] text-xs" data-testid="pipeline-status-strip">
+      <div
+        data-viewport-allow-overflow
+        className="flex w-full min-w-0 max-w-full items-center gap-1.5 px-2.5 py-1.5"
+      >
+        <button
+          type="button"
+          aria-expanded={detailsOpen}
+          aria-controls="pipeline-status-details"
+          onClick={() => setDetailsOpen(open => !open)}
+          className="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded border border-neutral-800 bg-neutral-950/45 text-neutral-500 transition-colors hover:border-neutral-700 hover:text-neutral-200 sm:min-h-7 sm:min-w-7"
+          title={detailsOpen ? 'Hide monitoring details' : 'Show monitoring details'}
+        >
+          {detailsOpen ? <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" /> : <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />}
+          <span className="sr-only">{detailsOpen ? 'Hide monitoring details' : 'Show monitoring details'}</span>
+        </button>
+        <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+          <span className="hidden shrink-0 text-ui-sm font-semibold uppercase text-neutral-600 sm:inline">Monitoring</span>
+          <PipelineStatusPill
+            label={scopeLabel}
+            tone={scoped ? 'info' : 'neutral'}
+            title={scoped ? `Project-scoped task view: ${scopeValue}` : 'Global task view'}
+            className="shrink min-w-[4rem] max-w-40 md:max-w-64"
+          />
+          <PipelineStatusPill
+            label={rowLabel}
+            tone={status.displayedRows !== status.loadedRows ? 'info' : 'neutral'}
+            title="Rows currently displayed compared with the loaded page"
+            className="hidden sm:inline-flex"
+          />
+          <span
+            className={`min-w-0 truncate font-mono text-ui-md ${stale ? 'text-amber-300' : 'text-neutral-400'}`}
+            title="Task data freshness from the existing poller state"
+          >
+            {formatFetchLabel(status.lastFetchTime, stale)}
+          </span>
+        </div>
+        <div className="flex shrink-0 items-center gap-1">
+          <PipelineStatusPill label={apiLabel} tone={apiTone} title="Task API health from the existing poller state" />
+          {streamLabel && (
+            <PipelineStatusPill
+              label={streamLabel}
+              tone={status.wsConnected ? 'good' : 'bad'}
+              title="Websocket state from the existing stream"
+              className="hidden sm:inline-flex"
+            />
+          )}
+        </div>
+      </div>
+      {detailsOpen && (
+        <dl
+          id="pipeline-status-details"
+          data-testid="pipeline-status-details"
+          className="grid min-w-0 grid-cols-2 gap-px border-t border-neutral-800/80 bg-neutral-900/70 sm:grid-cols-3 lg:grid-cols-6"
+        >
+          <PipelineStatusDetail
+            label="Scope"
+            value={scopeLabel}
+            tone={scoped ? 'info' : 'neutral'}
+            title={scoped ? `Project-scoped task view: ${scopeValue}` : 'Global task view'}
+          />
+          <PipelineStatusDetail
+            label="Displayed"
+            value={status.displayedRows}
+            tone={status.displayedRows !== status.loadedRows ? 'info' : 'neutral'}
+            title="Rows currently displayed after filters"
+          />
+          <PipelineStatusDetail
+            label="Loaded"
+            value={status.loadedRows}
+            title="Rows loaded in the current server page"
+          />
+          <PipelineStatusDetail
+            label="Server total"
+            value={status.serverTotalRows}
+            title="Total rows reported by the server for this scope"
+          />
+          <PipelineStatusDetail
+            label="API"
+            value={status.apiHealthy ? 'healthy' : 'degraded'}
+            tone={apiTone}
+            title="Task API health from the existing poller state"
+          />
+          <PipelineStatusDetail
+            label="Event stream"
+            value={typeof status.wsConnected === 'boolean' ? (status.wsConnected ? 'connected' : 'disconnected') : 'not reported'}
+            tone={typeof status.wsConnected === 'boolean' ? (status.wsConnected ? 'good' : 'bad') : 'neutral'}
+            title="Websocket state from the existing stream"
+          />
+        </dl>
       )}
+    </section>
+  );
+}
+
+function PipelineHealthRow({
+  label,
+  value,
+  tone = 'neutral',
+}: {
+  label: string;
+  value: number;
+  tone?: 'neutral' | 'good' | 'warn' | 'bad' | 'info';
+}) {
+  const toneClass = {
+    neutral: { dot: 'bg-neutral-500', value: 'text-neutral-200' },
+    good: { dot: 'bg-emerald-400', value: 'text-emerald-200' },
+    warn: { dot: 'bg-amber-400', value: 'text-amber-200' },
+    bad: { dot: 'bg-red-400', value: 'text-red-200' },
+    info: { dot: 'bg-cyan-400', value: 'text-cyan-200' },
+  }[tone];
+
+  return (
+    <div className="flex min-w-0 items-center justify-between gap-3 px-2.5 py-1.5">
+      <dt className="flex min-w-0 items-center gap-2 text-xs text-neutral-400">
+        <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${toneClass.dot}`} aria-hidden="true" />
+        <span className="truncate">{label}</span>
+      </dt>
+      <dd className={`shrink-0 font-mono text-sm font-semibold ${toneClass.value}`}>{value}</dd>
     </div>
   );
 }
 
 function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardProps) {
+  const attentionCount = metrics.blockedTasks.length + metrics.failedTasks.length;
+  const attentionLabel = attentionCount > 0
+    ? `${attentionCount} need attention`
+    : 'clear';
+
   return (
-    <div data-testid="pipeline-sideboard" className="grid min-w-0 gap-2">
-      <WorkbenchPanel title="Pipeline" meta={flow.hasActiveFilters ? 'filtered' : 'live'} className="bg-[#0d141c]">
-        <div className="grid grid-cols-2 gap-1.5">
-          <WorkbenchMetric label="active" value={metrics.activeTasks.length} tone="good" />
-          <WorkbenchMetric label="queued" value={metrics.queuedTasks.length} tone="neutral" />
-          <WorkbenchMetric label="blocked" value={metrics.blockedTasks.length} tone={metrics.blockedTasks.length > 0 ? 'warn' : 'neutral'} />
-          <WorkbenchMetric label="failed" value={metrics.failedTasks.length} tone={metrics.failedTasks.length > 0 ? 'bad' : 'neutral'} />
+    <div data-testid="pipeline-sideboard" className="grid min-w-0 gap-1.5">
+      <section
+        data-testid="pipeline-health-panel"
+        className="min-w-0 overflow-hidden rounded border border-neutral-800/80 bg-[#0b1118]/90"
+      >
+        <div className="flex min-w-0 items-center justify-between gap-3 border-b border-neutral-800/80 px-2.5 py-2">
+          <div className="min-w-0">
+            <h2 className="truncate text-sm font-semibold text-neutral-100">Task health</h2>
+            <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{flow.hasActiveFilters ? 'Filtered task view' : 'Live task view'}</div>
+          </div>
+          <span className={`shrink-0 rounded border px-2 py-0.5 font-mono text-ui-sm ${attentionCount > 0 ? 'border-amber-500/20 bg-amber-500/10 text-amber-300' : 'border-neutral-800 bg-neutral-950/40 text-neutral-500'}`}>
+            {attentionLabel}
+          </span>
         </div>
-        <div className="mt-2 flex items-center justify-between rounded-md border border-neutral-800 bg-neutral-950/35 px-2.5 py-1.5 text-xs">
-          <span className="text-neutral-500">terminal</span>
-          <span className="font-medium text-neutral-200">{metrics.terminalTasks.length}</span>
-        </div>
-      </WorkbenchPanel>
+        <dl className="divide-y divide-neutral-800/70">
+          <PipelineHealthRow label="Running" value={metrics.activeTasks.length} tone="good" />
+          <PipelineHealthRow label="Queued" value={metrics.queuedTasks.length} />
+          <PipelineHealthRow label="Blocked" value={metrics.blockedTasks.length} tone={metrics.blockedTasks.length > 0 ? 'warn' : 'neutral'} />
+          <PipelineHealthRow label="Failed" value={metrics.failedTasks.length} tone={metrics.failedTasks.length > 0 ? 'bad' : 'neutral'} />
+          <PipelineHealthRow label="Finished" value={metrics.terminalTasks.length} tone="info" />
+        </dl>
+      </section>
 
       {stream && stream.trackedTaskIds.size > 0 && (
         <TaskStreamPanel
@@ -300,7 +441,7 @@ export function PipelineWorkspace({
           {chrome.filterStrip}
           {status && <PipelineStatusStrip status={status} />}
           <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1 grid-rows-[auto_minmax(0,1fr)] overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(300px,25vw)] lg:grid-rows-1">
-            <aside className="max-h-[34vh] min-h-0 min-w-0 overflow-auto border-b border-neutral-800 bg-[#0b1118] p-2 custom-scrollbar lg:col-start-2 lg:row-start-1 lg:max-h-none lg:border-b-0 lg:border-l">
+            <aside className="max-h-[34vh] min-h-0 min-w-0 overflow-auto border-b border-neutral-800 bg-[#0b1118] p-1.5 custom-scrollbar lg:col-start-2 lg:row-start-1 lg:max-h-none lg:border-b-0 lg:border-l">
               <PipelineSideboard
                 flow={flow}
                 rail={rail}

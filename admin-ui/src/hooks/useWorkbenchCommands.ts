@@ -605,12 +605,12 @@ export function useWorkbenchCommands({
       ...sessionMetricCommands,
       {
         id: 'strategic.context.workspace',
-        label: 'Strategic sideboard',
+        label: 'Strategic context',
         section: 'Context',
         detail: contextPackage
           ? `${selectedRefs.length} kept, ${contextPackage.resources?.length ?? 0} resources, ${contextPackage.canvas?.node_count ?? contextPackage.canvas?.nodes?.length ?? 0} nodes`
           : `${selectedRefs.length} kept`,
-        keywords: ['strategic', 'context', 'sideboard', 'workspace', 'drawer', 'canvas', 'evidence', 'kept'],
+        keywords: ['strategic', 'context', 'workspace', 'drawer', 'canvas', 'map', 'evidence', 'kept'],
         disabled: projectDisabled || !openStrategicContextWorkspace,
         run: openStrategicContextWorkspace ? () => runAndClose(openStrategicContextWorkspace) : focusStrategicComposer,
       },

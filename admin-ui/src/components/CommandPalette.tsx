@@ -208,7 +208,7 @@ export function CommandPalette({
 
   return (
     <div
-      className="fixed inset-0 z-[70] flex items-start justify-center bg-black/70 px-3 py-4 backdrop-blur-sm sm:items-center"
+      className="fixed inset-0 z-[80] flex items-start justify-center bg-black/70 px-3 py-3 backdrop-blur-sm sm:items-center sm:py-5"
       onMouseDown={event => {
         if (event.target === event.currentTarget) {
           onClose();
@@ -219,12 +219,12 @@ export function CommandPalette({
         role="dialog"
         aria-modal="true"
         aria-labelledby="command-palette-title"
-        className="grid max-h-[calc(100vh-32px)] w-[min(720px,calc(100vw-24px))] min-w-0 grid-rows-[auto_auto_minmax(0,1fr)] overflow-hidden rounded-md border border-neutral-800 bg-[#10151c] shadow-2xl shadow-black/40"
+        className="grid max-h-[calc(100vh-24px)] w-[min(680px,calc(100vw-24px))] min-w-0 grid-rows-[auto_auto_minmax(0,1fr)] overflow-hidden rounded-md border border-neutral-800 bg-[#10151c] shadow-2xl shadow-black/40 sm:max-h-[calc(100vh-40px)]"
         onKeyDown={handleKeyDown}
       >
-        <header className="flex min-w-0 items-center justify-between gap-3 border-b border-neutral-800 bg-[#05070a] px-3 py-2.5">
+        <header className="flex min-w-0 items-center justify-between gap-2.5 border-b border-neutral-800 bg-[#05070a] px-3 py-2">
           <div className="flex min-w-0 items-center gap-2">
-            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-neutral-950 text-neutral-300">
+            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-neutral-950 text-neutral-300">
               <Command className="h-4 w-4" aria-hidden="true" />
             </span>
             <div className="min-w-0">
@@ -247,7 +247,7 @@ export function CommandPalette({
           </button>
         </header>
 
-        <div className="flex min-w-0 items-center gap-2 border-b border-neutral-800 bg-[#05080c] px-3 py-2">
+        <div className="flex min-w-0 items-center gap-2 border-b border-neutral-800 bg-[#05080c] px-3 py-1.5">
           <Search className="h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
           <input
             ref={inputRef}
@@ -271,13 +271,13 @@ export function CommandPalette({
           )}
         </div>
 
-        <div className="min-h-0 overflow-y-auto bg-[#10151c] p-1.5 custom-scrollbar">
+        <div className="min-h-0 overflow-y-auto bg-[#10151c] p-1 custom-scrollbar">
           {filteredCommands.length === 0 ? (
             <div className="px-3 py-8 text-center text-sm text-neutral-500">
               No commands found
             </div>
           ) : (
-            <div className="space-y-1" role="list" aria-label="Available commands">
+            <div className="space-y-0.5" role="list" aria-label="Available commands">
               {filteredCommands.map((command, index) => {
                 const active = index === resolvedActiveIndex;
                 const previousSection = filteredCommands[index - 1]?.section;
@@ -285,7 +285,7 @@ export function CommandPalette({
                 return (
                   <div key={command.id} className="min-w-0">
                     {showSection && (
-                      <div className="px-2 pb-1 pt-2 text-ui-md font-semibold uppercase tracking-wide text-neutral-500">
+                      <div className="px-2 pb-0.5 pt-1.5 text-ui-md font-semibold uppercase tracking-wide text-neutral-500">
                         {command.section}
                       </div>
                     )}
@@ -300,7 +300,7 @@ export function CommandPalette({
                         if (!command.disabled) setActiveIndex(index);
                       }}
                       onClick={() => executeCommand(command)}
-                      className={`flex min-h-11 w-full min-w-0 items-center gap-3 rounded-md border px-3 py-2 text-left transition-colors md:min-h-10 ${
+                      className={`flex min-h-11 w-full min-w-0 items-center gap-2.5 rounded-md border px-2.5 py-1.5 text-left transition-colors md:min-h-9 ${
                         command.disabled
                           ? 'cursor-not-allowed border-transparent text-neutral-500 opacity-65'
                           : active

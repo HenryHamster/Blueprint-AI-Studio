@@ -128,6 +128,43 @@ describe('useCommandPaletteShortcut', () => {
     expect(event.defaultPrevented).toBe(true);
   });
 
+  test('contains Ctrl+K so later document shortcuts do not also run', () => {
+    const onOpen = mount();
+    const competingShortcut = vi.fn();
+    document.addEventListener('keydown', competingShortcut, true);
+    const event = new KeyboardEvent('keydown', {
+      key: 'k',
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    try {
+      document.dispatchEvent(event);
+    } finally {
+      document.removeEventListener('keydown', competingShortcut, true);
+    }
+
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(competingShortcut).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(true);
+  });
+
+  test('does not capture shifted Ctrl+K variants', () => {
+    const onOpen = mount();
+    const event = new KeyboardEvent('keydown', {
+      key: 'k',
+      ctrlKey: true,
+      shiftKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+
+    document.dispatchEvent(event);
+
+    expect(onOpen).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+  });
+
   test('does not capture Ctrl+K while disabled', () => {
     const onOpen = mount(vi.fn(), false);
     const event = new KeyboardEvent('keydown', {

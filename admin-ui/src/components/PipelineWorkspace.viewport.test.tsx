@@ -186,6 +186,10 @@ describe('PipelineWorkspace viewport regression', () => {
     expect(Boolean(aside.compareDocumentPosition(main) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
     expect(aside.getBoundingClientRect().right).toBeLessThanOrEqual(376);
     expect(aside.getBoundingClientRect().bottom).toBeLessThanOrEqual(main.getBoundingClientRect().top + 1);
+    const detailsButton = host.querySelector<HTMLButtonElement>('button[aria-controls="pipeline-status-details"]');
+    const detailsButtonRect = detailsButton?.getBoundingClientRect();
+    expect(detailsButtonRect?.width).toBeGreaterThanOrEqual(44);
+    expect(detailsButtonRect?.height).toBeGreaterThanOrEqual(44);
   });
 
   test('desktop flow keeps sideboard in the right column with embedded monitoring', async () => {

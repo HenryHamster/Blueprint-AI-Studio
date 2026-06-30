@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
+import { Box, GitBranch, GitPullRequest, Link2, MessageSquare, Network, Route } from 'lucide-react';
 import type { Task } from '../types/task';
-import { DetailRow, SectionHeader } from './TaskDetailDrawerPrimitives';
+import { SectionHeader } from './TaskDetailDrawerPrimitives';
 
 type SideboardLink = NonNullable<Task['sideboard_context']>['links'][number];
 
@@ -58,11 +59,38 @@ function linkTargetLabel(target: SideboardLink['target']): string {
   return [target.surface, target.section, id].filter(Boolean).join(' / ');
 }
 
-function ContextBlock({ children }: { children: ReactNode }) {
+function formatInlineLabel(value?: string | null): string | null {
+  return value ? value.replace(/_/g, ' ') : null;
+}
+
+function ContextSurface({ children }: { children: ReactNode }) {
   return (
-    <div className="mb-2 min-w-0 rounded-md border border-neutral-800 bg-neutral-950/45 px-3 py-2.5 last:mb-0">
+    <div className="mb-3 min-w-0 overflow-hidden rounded-md border border-neutral-800 bg-[#0d141c] last:mb-0">
       {children}
     </div>
+  );
+}
+
+function ContextGroup({
+  icon,
+  label,
+  meta,
+  children,
+}: {
+  icon: ReactNode;
+  label: string;
+  meta?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section className="min-w-0 border-b border-neutral-800 p-2.5 last:border-b-0">
+      <div className="mb-1.5 flex min-w-0 items-center gap-2">
+        {icon}
+        <div className="min-w-0 flex-1 text-ui-sm font-semibold uppercase text-neutral-500">{label}</div>
+        {meta && <div className="shrink-0 text-ui-sm text-neutral-600">{meta}</div>}
+      </div>
+      {children}
+    </section>
   );
 }
 
@@ -80,7 +108,7 @@ function ContextValue({ children, muted = false }: { children: ReactNode; muted?
 
 function ContextStat({ label, value }: { label: string; value: ReactNode }) {
   return (
-    <div className="min-w-0 rounded-md border border-neutral-800/80 bg-[#10151c] px-2 py-1.5">
+    <div className="min-w-0 rounded border border-neutral-800/80 bg-[#10151c] px-2 py-1.5">
       <ContextLabel>{label}</ContextLabel>
       <div className="mt-0.5 min-w-0 break-words text-sm font-medium text-neutral-200">{value}</div>
     </div>
@@ -103,35 +131,62 @@ export function TaskSideboardContextSection({
   const hiddenMessageCount = Math.max(0, context.messages.total_recent - recentMessages.length);
   const hasMessages = recentMessages.length > 0 || context.messages.total_recent > 0;
   const primaryPrUrl = safeExternalUrl(context.artifacts.primary_pr_url);
+  const projectLabel = context.project.repo || context.project.name || context.project.id;
+  const projectSubLabel = context.project.repo && context.project.name ? context.project.name : context.project.id;
+  const strategicMeta = [
+    formatInlineLabel(direction?.priority),
+    formatInlineLabel(direction?.status),
+  ].filter(Boolean).join(' / ');
+  const cycleMeta = [
+    formatInlineLabel(cycle?.phase),
+    formatInlineLabel(cycle?.outcome),
+  ].filter(Boolean).join(' / ');
+  const hasPipeline = Boolean(
+    parentTaskId ||
+    context.pipeline.child_count > 0 ||
+    context.pipeline.dependency_count > 0 ||
+    context.pipeline.blocked_reason,
+  );
 
   return (
     <>
       <SectionHeader>Context</SectionHeader>
-      <ContextBlock>
-        <div className="grid min-w-0 gap-2">
-          <div className="min-w-0">
-            <ContextLabel>Project</ContextLabel>
-            <ContextValue>{context.project.repo || context.project.name || context.project.id}</ContextValue>
-            {context.project.repo && context.project.name && (
-              <div className="truncate text-xs text-neutral-500">{context.project.name}</div>
+      <ContextSurface>
+        <ContextGroup
+          icon={<Network className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
+          label="Project"
+          meta={context.project.id}
+        >
+          <div className="grid min-w-0 gap-2">
+            <div className="min-w-0">
+              <ContextValue>{projectLabel}</ContextValue>
+              {projectSubLabel !== projectLabel && (
+                <div className="truncate text-xs text-neutral-500">{projectSubLabel}</div>
+              )}
+            </div>
+            {context.purpose && (
+              <p className="break-words border-t border-neutral-800 pt-2 text-sm leading-relaxed text-neutral-300">
+                {context.purpose}
+              </p>
             )}
           </div>
-          {context.purpose && (
-            <div className="min-w-0 border-t border-neutral-800 pt-2">
-              <ContextLabel>Purpose</ContextLabel>
-              <ContextValue>{context.purpose}</ContextValue>
-            </div>
-          )}
-        </div>
-      </ContextBlock>
-      {(direction || cycle) && (
-        <ContextBlock>
-          <div className="grid min-w-0 gap-2">
+        </ContextGroup>
+
+        {(direction || cycle) && (
+          <ContextGroup
+            icon={<Route className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
+            label="Strategic"
+            meta={strategicMeta || cycleMeta || undefined}
+          >
             {direction && (
               <div className="min-w-0">
                 <ContextLabel>Direction</ContextLabel>
                 {direction.text && <ContextValue>{direction.text}</ContextValue>}
-                <div className="break-all font-mono text-xs text-neutral-500">{direction.id}</div>
+                <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500">
+                  <span className="break-all font-mono">{direction.id}</span>
+                  {direction.priority && <span>{formatInlineLabel(direction.priority)}</span>}
+                  {direction.status && <span>{formatInlineLabel(direction.status)}</span>}
+                </div>
               </div>
             )}
             {cycle && (
@@ -144,146 +199,163 @@ export function TaskSideboardContextSection({
                 </div>
               </div>
             )}
-          </div>
-        </ContextBlock>
-      )}
-      {(parentTaskId || context.pipeline.child_count > 0 || context.pipeline.dependency_count > 0) && (
-        <ContextBlock>
-          <ContextLabel>Pipeline</ContextLabel>
-          <div className="mt-1.5 grid min-w-0 grid-cols-2 gap-1.5 sm:grid-cols-3">
-            {parentTaskId && (
-              <ContextStat
-                label="Parent"
-                value={onNavigateToTask ? (
-                  <button
-                    type="button"
-                    onClick={() => onNavigateToTask(parentTaskId)}
-                    aria-label={`parent ${parentTaskId}`}
-                    data-viewport-allow-small-target
-                    className="break-all font-mono text-cyan-300 hover:text-cyan-200"
-                  >
-                    {parentTaskId.slice(0, 8)}
-                  </button>
-                ) : (
-                  <span className="break-all font-mono">{parentTaskId.slice(0, 8)}</span>
-                )}
-              />
-            )}
-            {context.pipeline.dependency_count > 0 && (
-              <ContextStat label="Dependencies" value={context.pipeline.dependency_count} />
-            )}
-            {context.pipeline.child_count > 0 && (
-              <ContextStat label="Children" value={context.pipeline.child_count} />
-            )}
-          </div>
-        </ContextBlock>
-      )}
-      {context.pipeline.blocked_reason && (
-        <ContextBlock>
-          <ContextLabel>Blocked</ContextLabel>
-          <div className="mt-1 break-words text-sm text-rose-300">{context.pipeline.blocked_reason}</div>
-        </ContextBlock>
-      )}
-      {context.artifacts.total > 0 && (
-        <ContextBlock>
-          <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
-            <div className="min-w-0">
-              <ContextLabel>Artifacts</ContextLabel>
-              <ContextValue>{artifactSummary(context.artifacts.by_type)}</ContextValue>
-              {context.artifacts.primary_commit && (
-                <div className="mt-0.5 break-all font-mono text-xs text-neutral-500">
-                  {context.artifacts.primary_commit.slice(0, 12)}
-                </div>
+          </ContextGroup>
+        )}
+
+        {hasPipeline && (
+          <ContextGroup
+            icon={<GitBranch className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
+            label="Pipeline"
+            meta={context.pipeline.blocked_reason ? 'blocked' : undefined}
+          >
+            <div className="grid min-w-0 grid-cols-2 gap-1.5 sm:grid-cols-3">
+              {parentTaskId && (
+                <ContextStat
+                  label="Parent"
+                  value={onNavigateToTask ? (
+                    <button
+                      type="button"
+                      onClick={() => onNavigateToTask(parentTaskId)}
+                      aria-label={`parent ${parentTaskId}`}
+                      data-viewport-allow-small-target
+                      className="break-all font-mono text-cyan-300 hover:text-cyan-200"
+                    >
+                      {parentTaskId.slice(0, 8)}
+                    </button>
+                  ) : (
+                    <span className="break-all font-mono">{parentTaskId.slice(0, 8)}</span>
+                  )}
+                />
+              )}
+              {context.pipeline.dependency_count > 0 && (
+                <ContextStat label="Dependencies" value={context.pipeline.dependency_count} />
+              )}
+              {context.pipeline.child_count > 0 && (
+                <ContextStat label="Children" value={context.pipeline.child_count} />
               )}
             </div>
-            {primaryPrUrl && (
-              <a
-                href={primaryPrUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                data-viewport-allow-small-target
-                className="inline-flex min-h-[44px] items-center rounded-md border border-neutral-800 bg-[#10151c] px-2 text-xs font-semibold text-cyan-300 hover:border-cyan-500/50 hover:text-cyan-200"
-              >
-                PR
-              </a>
+            {context.pipeline.blocked_reason && (
+              <div className="mt-2 break-words rounded border border-rose-500/25 bg-rose-500/5 px-2 py-1.5 text-sm text-rose-300">
+                {context.pipeline.blocked_reason}
+              </div>
             )}
-          </div>
-        </ContextBlock>
-      )}
-      {context.links.length > 0 && (
-        <DetailRow label="Links">
-          <div className="flex min-w-0 flex-wrap gap-1.5">
-            {context.links.map(link => {
-              const targetLabel = linkTargetLabel(link.target);
-              const taskId = resolveTaskTargetId(link.target);
-              const canOpenTask = Boolean(taskId && onNavigateToTask);
-              const externalUrl = externalTargetUrl(link.target);
-              const className = 'inline-flex max-w-full min-w-0 flex-col rounded-md border border-neutral-800 bg-neutral-950/60 px-2 py-1 text-left';
-              const children = (
-                <>
-                  <span className="break-words text-xs font-medium text-neutral-200">{link.label}</span>
-                  {targetLabel && (
-                    <span className="break-all font-mono text-xs leading-4 text-neutral-500">{targetLabel}</span>
-                  )}
-                </>
-              );
-              if (canOpenTask) {
-                return (
-                  <button
-                    key={link.id}
-                    type="button"
-                    onClick={() => {
-                      if (taskId) onNavigateToTask?.(taskId);
-                    }}
-                    aria-label={`${link.label} ${targetLabel}`}
-                    data-viewport-allow-small-target
-                    className={`${className} hover:border-cyan-500/50 hover:bg-cyan-950/30`}
-                  >
-                    {children}
-                  </button>
+          </ContextGroup>
+        )}
+
+        {context.artifacts.total > 0 && (
+          <ContextGroup
+            icon={<Box className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
+            label="Evidence"
+            meta={pluralize(context.artifacts.total, 'artifact')}
+          >
+            <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
+              <div className="min-w-0">
+                <ContextValue>{artifactSummary(context.artifacts.by_type)}</ContextValue>
+                {context.artifacts.primary_commit && (
+                  <div className="mt-0.5 break-all font-mono text-xs text-neutral-500">
+                    {context.artifacts.primary_commit.slice(0, 12)}
+                  </div>
+                )}
+              </div>
+              {primaryPrUrl && (
+                <a
+                  href={primaryPrUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  data-viewport-allow-small-target
+                  className="inline-flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-800 bg-[#10151c] px-2 text-xs font-semibold text-cyan-300 hover:border-cyan-500/50 hover:text-cyan-200"
+                >
+                  <GitPullRequest className="h-3.5 w-3.5" aria-hidden="true" />
+                  PR
+                </a>
+              )}
+            </div>
+          </ContextGroup>
+        )}
+
+        {context.links.length > 0 && (
+          <ContextGroup
+            icon={<Link2 className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
+            label="Links"
+            meta={context.links.length}
+          >
+            <div className="flex min-w-0 flex-wrap gap-1.5">
+              {context.links.map(link => {
+                const targetLabel = linkTargetLabel(link.target);
+                const taskId = resolveTaskTargetId(link.target);
+                const canOpenTask = Boolean(taskId && onNavigateToTask);
+                const externalUrl = externalTargetUrl(link.target);
+                const className = 'inline-flex max-w-full min-w-0 flex-col rounded border border-neutral-800 bg-[#10151c] px-2 py-1 text-left transition-colors';
+                const children = (
+                  <>
+                    <span className="break-words text-xs font-medium text-neutral-200">{link.label}</span>
+                    {targetLabel && (
+                      <span className="break-all font-mono text-xs leading-4 text-neutral-500">{targetLabel}</span>
+                    )}
+                  </>
                 );
-              }
-              if (externalUrl) {
+                if (canOpenTask) {
+                  return (
+                    <button
+                      key={link.id}
+                      type="button"
+                      onClick={() => {
+                        if (taskId) onNavigateToTask?.(taskId);
+                      }}
+                      aria-label={`${link.label} ${targetLabel}`}
+                      data-viewport-allow-small-target
+                      className={`${className} hover:border-cyan-500/50 hover:bg-cyan-950/30`}
+                    >
+                      {children}
+                    </button>
+                  );
+                }
+                if (externalUrl) {
+                  return (
+                    <a
+                      key={link.id}
+                      href={externalUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      data-viewport-allow-small-target
+                      className={`${className} hover:border-cyan-500/50 hover:bg-cyan-950/30`}
+                    >
+                      {children}
+                    </a>
+                  );
+                }
                 return (
-                  <a
-                    key={link.id}
-                    href={externalUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    data-viewport-allow-small-target
-                    className={`${className} hover:border-cyan-500/50 hover:bg-cyan-950/30`}
-                  >
+                  <span key={link.id} className={className}>
                     {children}
-                  </a>
+                  </span>
                 );
-              }
-              return (
-                <span key={link.id} className={className}>
-                  {children}
-                </span>
-              );
-            })}
-          </div>
-        </DetailRow>
-      )}
-      {hasMessages && (
-        <ContextBlock>
-          <ContextLabel>Messages</ContextLabel>
-          <div className="mt-1.5 min-w-0 space-y-1.5">
-            {recentMessages.map(message => (
-              <p key={message.id} className="line-clamp-2 border-l border-neutral-700 pl-2 text-sm text-neutral-300">
-                {message.content}
-              </p>
-            ))}
-            {hiddenMessageCount > 0 && (
-              <p className="text-xs text-neutral-500">+{pluralize(hiddenMessageCount, 'more recent message')}</p>
-            )}
-            {recentMessages.length === 0 && context.messages.total_recent > 0 && (
-              <p className="text-xs text-neutral-500">{pluralize(context.messages.total_recent, 'recent message')}</p>
-            )}
-          </div>
-        </ContextBlock>
-      )}
+              })}
+            </div>
+          </ContextGroup>
+        )}
+
+        {hasMessages && (
+          <ContextGroup
+            icon={<MessageSquare className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
+            label="Messages"
+            meta={context.messages.total_recent}
+          >
+            <div className="min-w-0 space-y-1.5">
+              {recentMessages.map(message => (
+                <p key={message.id} className="line-clamp-2 border-l border-neutral-700 pl-2 text-sm text-neutral-300">
+                  {message.content}
+                </p>
+              ))}
+              {hiddenMessageCount > 0 && (
+                <p className="text-xs text-neutral-500">+{pluralize(hiddenMessageCount, 'more recent message')}</p>
+              )}
+              {recentMessages.length === 0 && context.messages.total_recent > 0 && (
+                <p className="text-xs text-neutral-500">{pluralize(context.messages.total_recent, 'recent message')}</p>
+              )}
+            </div>
+          </ContextGroup>
+        )}
+      </ContextSurface>
     </>
   );
 }

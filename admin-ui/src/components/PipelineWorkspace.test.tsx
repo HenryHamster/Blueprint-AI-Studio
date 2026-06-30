@@ -155,13 +155,22 @@ describe('PipelineWorkspace status strip', () => {
       },
     });
 
-    expect(screen.getByText('Project: acme/widgets')).toHaveAttribute('title', 'Project-scoped task view: acme/widgets');
-    expect(screen.getByText('displayed 2')).toHaveAttribute('title', 'Rows currently displayed after filters');
-    expect(screen.getByText('loaded 7')).toHaveAttribute('title', 'Rows loaded in the current server page');
-    expect(screen.getByText('server 42')).toHaveAttribute('title', 'Total rows reported by the server for this scope');
+    expect(screen.queryByTestId('pipeline-status-details')).not.toBeInTheDocument();
+    expect(screen.getByText('acme/widgets')).toHaveAttribute('title', 'Project-scoped task view: acme/widgets');
+    expect(screen.getByText('2/7 shown')).toHaveAttribute('title', 'Rows currently displayed compared with the loaded page');
     expect(screen.getByText('fetched 30s ago')).toBeInTheDocument();
     expect(screen.getByText('API healthy')).toBeInTheDocument();
-    expect(screen.getByText('WS connected')).toBeInTheDocument();
+    expect(screen.getByText('Stream on')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle('Show monitoring details'));
+    const details = screen.getByTestId('pipeline-status-details');
+    expect(within(details).getByText('Scope')).toBeInTheDocument();
+    expect(within(details).getByText('Displayed')).toBeInTheDocument();
+    expect(within(details).getByText('Loaded')).toBeInTheDocument();
+    expect(within(details).getByText('Server total')).toBeInTheDocument();
+    expect(within(screen.getByTitle('Rows currently displayed after filters')).getByText('2')).toBeInTheDocument();
+    expect(within(screen.getByTitle('Rows loaded in the current server page')).getByText('7')).toBeInTheDocument();
+    expect(within(screen.getByTitle('Total rows reported by the server for this scope')).getByText('42')).toBeInTheDocument();
   });
 
   test('shows global stale state and omits websocket when not supplied', () => {
@@ -179,10 +188,14 @@ describe('PipelineWorkspace status strip', () => {
       },
     });
 
-    expect(screen.getByText('Global')).toHaveAttribute('title', 'Global task view');
+    expect(screen.getByText('All projects')).toHaveAttribute('title', 'Global task view');
     expect(screen.getByText('data stale 5m ago')).toHaveAttribute('title', 'Task data freshness from the existing poller state');
     expect(screen.getByText('API healthy')).toHaveAttribute('title', 'Task API health from the existing poller state');
-    expect(screen.queryByText(/WS /)).not.toBeInTheDocument();
+    expect(screen.queryByText(/Stream (on|off)/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle('Show monitoring details'));
+    expect(screen.getByText('Event stream')).toBeInTheDocument();
+    expect(screen.getByText('not reported')).toBeInTheDocument();
   });
 
   test('keeps degraded API separate from fetch staleness and renders disconnected websocket state', () => {
@@ -203,7 +216,10 @@ describe('PipelineWorkspace status strip', () => {
 
     expect(screen.getByText('API degraded')).toBeInTheDocument();
     expect(screen.getByText('data stale 5m ago')).toBeInTheDocument();
-    expect(screen.getByText('WS disconnected')).toBeInTheDocument();
+    expect(screen.getByText('Stream off')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle('Show monitoring details'));
+    expect(screen.getByText('disconnected')).toBeInTheDocument();
   });
 
   test('handles missing fetch time without overstating freshness', () => {
@@ -244,7 +260,7 @@ describe('PipelineWorkspace status strip', () => {
     });
 
     expect(screen.getByTestId('kanban-board')).toBeInTheDocument();
-    expect(screen.getByText('Project: very-long-owner-name/very-long-repository-name-that-should-not-stretch-the-strip'))
+    expect(screen.getByText('very-long-owner-name/very-long-repository-name-that-should-not-stretch-the-strip'))
       .toHaveAttribute(
         'title',
         'Project-scoped task view: very-long-owner-name/very-long-repository-name-that-should-not-stretch-the-strip',
@@ -292,9 +308,12 @@ describe('PipelineWorkspace task stream', () => {
     });
 
     const sideboard = screen.getByTestId('pipeline-sideboard');
-    expect(within(sideboard).getByText('active')).toBeInTheDocument();
-    expect(within(sideboard).getByText('queued')).toBeInTheDocument();
-    expect(within(sideboard).getByText('terminal')).toBeInTheDocument();
+    expect(within(sideboard).getByText('Task health')).toBeInTheDocument();
+    expect(within(sideboard).getByText('Filtered task view')).toBeInTheDocument();
+    expect(within(sideboard).getByText('Running')).toBeInTheDocument();
+    expect(within(sideboard).getByText('Queued')).toBeInTheDocument();
+    expect(within(sideboard).getByText('Finished')).toBeInTheDocument();
+    expect(within(sideboard).getByText('clear')).toBeInTheDocument();
     expect(within(sideboard).getByTestId('task-stream-panel')).toHaveAttribute('data-variant', 'embedded');
     expect(within(sideboard).getByTestId('task-context-rail')).toBeInTheDocument();
 
