@@ -19,8 +19,6 @@ from app.models import (
     TaskStatus,
     TaskHistory,
     ProjectMessage,
-    MessageType,
-    MESSAGE_CONTENT_MAX,
     RECOMMENDED_MODE_META_KEY,
     _utcnow,
 )
@@ -37,11 +35,11 @@ from app.strategic_events import STRATEGIC_KIND_DIRECTIONS, emit_strategic_updat
 from app.capability_proof import enrich_problem_model_capability_proofs
 from app.direction_refractory import get_direction_refractory_info
 from app.project_message_projection import legacy_direction_message_dict
-from app.problem_model import compute_model_size_signal, ProblemModel
-from app.workbench_state import (
-    build_message_strategic_session_snapshot,
-    workbench_state_exceeds_max_bytes,
+from app.project_message_creation import (
+    create_operator_project_message,
+    parse_operator_message_type,
 )
+from app.problem_model import compute_model_size_signal, ProblemModel
 
 logger = logging.getLogger(__name__)
 
@@ -1410,138 +1408,22 @@ async def create_message(
 ):
     """Create a message from the user to the autonomous system."""
     project = await _get_user_project(project_id, user["user_id"], session)
-    if not payload.content.strip():
-        raise HTTPException(status_code=400, detail="Content cannot be empty")
-    if len(payload.content) > MESSAGE_CONTENT_MAX:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
-        )
-    if workbench_state_exceeds_max_bytes(payload.workbench_context):
-        raise HTTPException(
-            status_code=400,
-            detail="Workbench context too large (max 50KB)",
-        )
-
-    raw_message_type = str(payload.message_type or "NOTE").upper()
-    try:
-        msg_type = MessageType(raw_message_type)
-    except ValueError:
-        raise HTTPException(
-            status_code=400, detail=f"Invalid message type: {payload.message_type}"
-        ) from None
-
-    # Idempotency: if this send carries a client key and a message with that
-    # key already exists for the project, return the existing row instead of
-    # inserting a duplicate. This collapses an accidental double-submit /
-    # network retry to a single logical message (and a single arming),
-    # identically to the live-chat endpoint (admin_notifications.create_message).
-    idem_key = (payload.idempotency_key or "").strip() or None
-    if idem_key:
-        if len(idem_key) > 255:
-            raise HTTPException(
-                status_code=400, detail="idempotency_key exceeds 255 characters"
-            )
-        existing = (
-            await session.execute(
-                select(ProjectMessage).where(
-                    ProjectMessage.project_id == project.id,
-                    ProjectMessage.idempotency_key == idem_key,
-                )
-            )
-        ).scalar_one_or_none()
-        if existing is not None:
-            return {
-                "id": str(existing.id),
-                "status": "duplicate",
-                "arming": "duplicate",
-            }
-
-    # Reproduce-on-HEAD citation grounding for free-text bug reports: validate
-    # any file/symbol the report cites against the project's real integration
-    # branch and stash an ``_provenance_warnings`` signal when a citation is
-    # unambiguously absent, so a stale report is discounted rather than trusted.
-    # Best-effort and conservative — indeterminate never flags, never fails create.
-    msg_context: Optional[Dict[str, Any]] = None
-    if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
-        from app.source_ref_validation import compute_message_citation_warning
-
-        warning = await compute_message_citation_warning(
-            session, project, payload.content.strip()
-        )
-        if warning:
-            msg_context = {"_provenance_warnings": warning}
-    strategic_session = await build_message_strategic_session_snapshot(
-        session, user["user_id"], project.id, payload.workbench_context
+    result = await create_operator_project_message(
+        session,
+        project=project,
+        user_id=user["user_id"],
+        message_type=parse_operator_message_type(
+            payload.message_type,
+            default_note_for_empty=True,
+        ),
+        content=payload.content,
+        context=None,
+        workbench_context=payload.workbench_context,
+        idempotency_key=payload.idempotency_key,
+        enforce_raw_content_max=True,
     )
-    if strategic_session:
-        msg_context = {**(msg_context or {}), "strategic_session": strategic_session}
 
-    msg = ProjectMessage(
-        project_id=project.id,
-        message_type=msg_type,
-        from_type="user",
-        content=payload.content.strip(),
-        idempotency_key=idem_key,
-        **({"context": msg_context} if msg_context else {}),
-    )
-    session.add(msg)
-    # Concurrency backstop: two simultaneous sends sharing the same key both
-    # passed the pre-insert query, but the partial unique index lets only one
-    # row land. Roll back and return the winner so the loser is still an
-    # idempotent success rather than a 500.
-    try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        if idem_key:
-            existing = (
-                await session.execute(
-                    select(ProjectMessage).where(
-                        ProjectMessage.project_id == project.id,
-                        ProjectMessage.idempotency_key == idem_key,
-                    )
-                )
-            ).scalar_one_or_none()
-            if existing is not None:
-                return {
-                    "id": str(existing.id),
-                    "status": "duplicate",
-                    "arming": "duplicate",
-                }
-        raise
-    await session.refresh(msg)
-    # Snapshot the id before arming: maybe_arm_operator_refresh's bounded lock
-    # acquire can OperationalError + roll back under project-row contention,
-    # expiring this committed msg; a later ``str(msg.id)`` would then sync
-    # lazy-load (MissingGreenlet) and 500 an already-committed message.
-    message_id = str(msg.id)
-
-    # An operator message that warrants strategist attention (steering /
-    # feedback / question / blocker — anything but a passive NOTE) arms the
-    # coalescing strategic-refresh marker so the autonomous loop wakes the
-    # strategist promptly (bypassing strategic_spawn_cooldown) instead of
-    # waiting for the next scheduled cycle. Routed through the shared gate so
-    # this CLI path and the canonical live-chat endpoint
-    # (admin_notifications.create_message) can never diverge again. Best-effort
-    # and coalescing: the helper does not commit (we own the txn), swallows its
-    # own errors so message creation never fails on it, and the min-interval
-    # floor + failure breaker keep a burst of messages from storming spawns.
-    #
-    # The gate returns the truthful arming outcome (steering / passive note /
-    # routine event, or ``not_armed`` when a genuine steering message could not
-    # persist its marker under row contention). Surfaced verbatim and committed
-    # only on a real arm, identically to admin_notifications.create_message, so
-    # the two endpoints cannot diverge.
-    from app.strategic_trigger import ARMING_STEERING, maybe_arm_operator_refresh
-
-    arming = await maybe_arm_operator_refresh(
-        session, project.id, msg_type, message_content=payload.content.strip()
-    )
-    if arming == ARMING_STEERING:
-        await session.commit()
-
-    return {"id": message_id, "status": "created", "arming": arming}
+    return {"id": result.message_id, "status": result.status, "arming": result.arming}
 
 
 @router.get("/projects/{project_id}/messages")

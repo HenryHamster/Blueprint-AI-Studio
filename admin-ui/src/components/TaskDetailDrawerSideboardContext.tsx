@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import type { Task } from '../types/task';
 import { DetailRow, SectionHeader } from './TaskDetailDrawerPrimitives';
 
@@ -57,6 +58,35 @@ function linkTargetLabel(target: SideboardLink['target']): string {
   return [target.surface, target.section, id].filter(Boolean).join(' / ');
 }
 
+function ContextBlock({ children }: { children: ReactNode }) {
+  return (
+    <div className="mb-2 min-w-0 rounded-md border border-neutral-800 bg-neutral-950/45 px-3 py-2.5 last:mb-0">
+      {children}
+    </div>
+  );
+}
+
+function ContextLabel({ children }: { children: ReactNode }) {
+  return <div className="text-ui-sm font-semibold uppercase text-neutral-600">{children}</div>;
+}
+
+function ContextValue({ children, muted = false }: { children: ReactNode; muted?: boolean }) {
+  return (
+    <div className={`min-w-0 break-words text-sm ${muted ? 'text-neutral-500' : 'text-neutral-200'}`}>
+      {children}
+    </div>
+  );
+}
+
+function ContextStat({ label, value }: { label: string; value: ReactNode }) {
+  return (
+    <div className="min-w-0 rounded-md border border-neutral-800/80 bg-[#10151c] px-2 py-1.5">
+      <ContextLabel>{label}</ContextLabel>
+      <div className="mt-0.5 min-w-0 break-words text-sm font-medium text-neutral-200">{value}</div>
+    </div>
+  );
+}
+
 export function TaskSideboardContextSection({
   task,
   onNavigateToTask,
@@ -77,87 +107,108 @@ export function TaskSideboardContextSection({
   return (
     <>
       <SectionHeader>Context</SectionHeader>
-      <DetailRow label="Project">
-        <div className="min-w-0">
-          <span className="block truncate text-sm text-neutral-200">
-            {context.project.repo || context.project.name || context.project.id}
-          </span>
-          {context.project.repo && context.project.name && (
-            <span className="block truncate text-xs text-neutral-500">{context.project.name}</span>
+      <ContextBlock>
+        <div className="grid min-w-0 gap-2">
+          <div className="min-w-0">
+            <ContextLabel>Project</ContextLabel>
+            <ContextValue>{context.project.repo || context.project.name || context.project.id}</ContextValue>
+            {context.project.repo && context.project.name && (
+              <div className="truncate text-xs text-neutral-500">{context.project.name}</div>
+            )}
+          </div>
+          {context.purpose && (
+            <div className="min-w-0 border-t border-neutral-800 pt-2">
+              <ContextLabel>Purpose</ContextLabel>
+              <ContextValue>{context.purpose}</ContextValue>
+            </div>
           )}
         </div>
-      </DetailRow>
-      {context.purpose && (
-        <DetailRow label="Purpose">
-          <span className="text-sm text-neutral-200 break-words">{context.purpose}</span>
-        </DetailRow>
-      )}
-      {direction && (
-        <DetailRow label="Direction">
-          <div className="min-w-0">
-            {direction.text && (
-              <span className="block break-words text-sm text-neutral-200">{direction.text}</span>
+      </ContextBlock>
+      {(direction || cycle) && (
+        <ContextBlock>
+          <div className="grid min-w-0 gap-2">
+            {direction && (
+              <div className="min-w-0">
+                <ContextLabel>Direction</ContextLabel>
+                {direction.text && <ContextValue>{direction.text}</ContextValue>}
+                <div className="break-all font-mono text-xs text-neutral-500">{direction.id}</div>
+              </div>
             )}
-            <span className="font-mono text-xs text-neutral-500">{direction.id}</span>
+            {cycle && (
+              <div className="min-w-0 border-t border-neutral-800 pt-2">
+                <ContextLabel>Strategic cycle</ContextLabel>
+                <div className="flex min-w-0 flex-wrap gap-x-2 gap-y-1 text-sm">
+                  <span className="break-all font-mono text-neutral-300">{cycle.id}</span>
+                  {cycle.phase && <span className="text-neutral-500">{cycle.phase.replace(/_/g, ' ')}</span>}
+                  <span className="text-neutral-500">{cycle.outcome}</span>
+                </div>
+              </div>
+            )}
           </div>
-        </DetailRow>
-      )}
-      {cycle && (
-        <DetailRow label="Strategic cycle">
-          <span className="inline-flex min-w-0 flex-wrap gap-x-2 gap-y-1 text-sm">
-            <span className="font-mono text-neutral-300">{cycle.id}</span>
-            {cycle.phase && <span className="text-neutral-500">{cycle.phase.replace(/_/g, ' ')}</span>}
-            <span className="text-neutral-500">{cycle.outcome}</span>
-          </span>
-        </DetailRow>
+        </ContextBlock>
       )}
       {(parentTaskId || context.pipeline.child_count > 0 || context.pipeline.dependency_count > 0) && (
-        <DetailRow label="Pipeline">
-          <div className="flex min-w-0 flex-wrap items-center gap-2 text-sm text-neutral-300">
-            {parentTaskId && onNavigateToTask ? (
-              <button
-                type="button"
-                onClick={() => onNavigateToTask(parentTaskId)}
-                data-viewport-allow-small-target
-                className="font-mono text-cyan-300 hover:text-cyan-200"
-              >
-                parent {parentTaskId.slice(0, 8)}
-              </button>
-            ) : parentTaskId ? (
-              <span className="font-mono">parent {parentTaskId.slice(0, 8)}</span>
-            ) : null}
-            {context.pipeline.dependency_count > 0 && <span>{context.pipeline.dependency_count} dependencies</span>}
-            {context.pipeline.child_count > 0 && <span>{context.pipeline.child_count} children</span>}
+        <ContextBlock>
+          <ContextLabel>Pipeline</ContextLabel>
+          <div className="mt-1.5 grid min-w-0 grid-cols-2 gap-1.5 sm:grid-cols-3">
+            {parentTaskId && (
+              <ContextStat
+                label="Parent"
+                value={onNavigateToTask ? (
+                  <button
+                    type="button"
+                    onClick={() => onNavigateToTask(parentTaskId)}
+                    aria-label={`parent ${parentTaskId}`}
+                    data-viewport-allow-small-target
+                    className="break-all font-mono text-cyan-300 hover:text-cyan-200"
+                  >
+                    {parentTaskId.slice(0, 8)}
+                  </button>
+                ) : (
+                  <span className="break-all font-mono">{parentTaskId.slice(0, 8)}</span>
+                )}
+              />
+            )}
+            {context.pipeline.dependency_count > 0 && (
+              <ContextStat label="Dependencies" value={context.pipeline.dependency_count} />
+            )}
+            {context.pipeline.child_count > 0 && (
+              <ContextStat label="Children" value={context.pipeline.child_count} />
+            )}
           </div>
-        </DetailRow>
+        </ContextBlock>
       )}
       {context.pipeline.blocked_reason && (
-        <DetailRow label="Blocked">
-          <span className="text-sm text-amber-300 break-words">{context.pipeline.blocked_reason}</span>
-        </DetailRow>
+        <ContextBlock>
+          <ContextLabel>Blocked</ContextLabel>
+          <div className="mt-1 break-words text-sm text-rose-300">{context.pipeline.blocked_reason}</div>
+        </ContextBlock>
       )}
       {context.artifacts.total > 0 && (
-        <DetailRow label="Artifacts">
-          <div className="min-w-0 text-sm">
-            <span className="block text-neutral-300">{artifactSummary(context.artifacts.by_type)}</span>
-            <span className="mt-0.5 flex min-w-0 flex-wrap gap-x-2 gap-y-1 text-xs text-neutral-500">
-              {primaryPrUrl && (
-                <a
-                  href={primaryPrUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  data-viewport-allow-small-target
-                  className="text-cyan-300 hover:text-cyan-200"
-                >
-                  pull request
-                </a>
-              )}
+        <ContextBlock>
+          <div className="grid min-w-0 grid-cols-[minmax(0,1fr)_auto] items-start gap-3">
+            <div className="min-w-0">
+              <ContextLabel>Artifacts</ContextLabel>
+              <ContextValue>{artifactSummary(context.artifacts.by_type)}</ContextValue>
               {context.artifacts.primary_commit && (
-                <span className="font-mono">{context.artifacts.primary_commit.slice(0, 12)}</span>
+                <div className="mt-0.5 break-all font-mono text-xs text-neutral-500">
+                  {context.artifacts.primary_commit.slice(0, 12)}
+                </div>
               )}
-            </span>
+            </div>
+            {primaryPrUrl && (
+              <a
+                href={primaryPrUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                data-viewport-allow-small-target
+                className="inline-flex min-h-[44px] items-center rounded-md border border-neutral-800 bg-[#10151c] px-2 text-xs font-semibold text-cyan-300 hover:border-cyan-500/50 hover:text-cyan-200"
+              >
+                PR
+              </a>
+            )}
           </div>
-        </DetailRow>
+        </ContextBlock>
       )}
       {context.links.length > 0 && (
         <DetailRow label="Links">
@@ -216,10 +267,11 @@ export function TaskSideboardContextSection({
         </DetailRow>
       )}
       {hasMessages && (
-        <DetailRow label="Messages">
-          <div className="min-w-0 space-y-1">
+        <ContextBlock>
+          <ContextLabel>Messages</ContextLabel>
+          <div className="mt-1.5 min-w-0 space-y-1.5">
             {recentMessages.map(message => (
-              <p key={message.id} className="line-clamp-2 text-sm text-neutral-300">
+              <p key={message.id} className="line-clamp-2 border-l border-neutral-700 pl-2 text-sm text-neutral-300">
                 {message.content}
               </p>
             ))}
@@ -230,7 +282,7 @@ export function TaskSideboardContextSection({
               <p className="text-xs text-neutral-500">{pluralize(context.messages.total_recent, 'recent message')}</p>
             )}
           </div>
-        </DetailRow>
+        </ContextBlock>
       )}
     </>
   );

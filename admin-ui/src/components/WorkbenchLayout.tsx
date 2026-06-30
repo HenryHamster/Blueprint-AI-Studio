@@ -43,8 +43,8 @@ export function WorkbenchSurface<T extends string>({
     <nav
       data-viewport-allow-overflow
       data-viewport-allow-truncation
-      className={`flex min-w-0 items-center gap-1 overflow-x-auto ${
-        tabLayout === 'stacked' ? '-mx-2.5 border-t border-neutral-800 px-2.5 pt-2 md:-mx-3 md:px-3' : 'flex-1'
+      className={`flex min-w-0 items-center gap-0.5 overflow-x-auto ${
+        tabLayout === 'stacked' ? '-mx-2 border-t border-neutral-800/90 px-2 pt-1.5 md:-mx-2.5 md:px-2.5' : 'flex-1'
       }`}
       aria-label={`${title} sections`}
     >
@@ -57,10 +57,10 @@ export function WorkbenchSurface<T extends string>({
             disabled={tab.disabled}
             onClick={() => onTabChange?.(tab.id)}
             aria-pressed={selected}
-            className={`inline-flex min-h-[44px] shrink-0 items-center gap-1.5 rounded-md border px-2.5 text-sm font-semibold transition-colors md:min-h-0 md:py-1 ${
+            className={`inline-flex min-h-[44px] shrink-0 items-center gap-1.5 rounded border px-2.5 text-sm font-semibold transition-colors md:min-h-0 md:px-2 md:py-1 ${
               selected
-                ? 'border-neutral-700 bg-neutral-800 text-neutral-100 shadow-[0_1px_0_rgba(255,255,255,0.05)]'
-                : 'border-transparent text-neutral-300 hover:bg-neutral-900 hover:text-neutral-100'
+                ? 'border-neutral-700/80 bg-neutral-800/90 text-neutral-100 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]'
+                : 'border-transparent text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100'
             } disabled:cursor-not-allowed disabled:opacity-40`}
           >
             <span>{tab.label}</span>
@@ -78,16 +78,16 @@ export function WorkbenchSurface<T extends string>({
 
   return (
     <section className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] bg-[#05080c]">
-      <header className="min-w-0 border-b border-neutral-800 bg-[#05070a] px-2.5 py-2 md:px-3">
-        <div className="flex min-w-0 items-center gap-2.5">
+      <header className="min-w-0 border-b border-neutral-800/90 bg-[#030508] px-2 py-1.5 md:px-2.5">
+        <div className="flex min-w-0 items-center gap-2">
           <div className="min-w-0 shrink-0">
             <h1 className="truncate text-sm font-semibold leading-5 text-neutral-100">{title}</h1>
             {subtitle && <div className="mt-0.5 truncate text-xs text-neutral-500">{subtitle}</div>}
           </div>
           {tabLayout === 'inline' && tabStrip}
-          {actions && <div className="ml-auto flex min-w-0 shrink-0 flex-wrap items-center justify-end gap-1.5">{actions}</div>}
+          {actions && <div className="ml-auto flex min-w-0 shrink-0 flex-wrap items-center justify-end gap-1">{actions}</div>}
         </div>
-        {tabLayout === 'stacked' && <div className="mt-2">{tabStrip}</div>}
+        {tabLayout === 'stacked' && <div className="mt-1.5">{tabStrip}</div>}
       </header>
       <div className={bodyClassName}>
         {children}

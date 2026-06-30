@@ -76,6 +76,29 @@ describe('TaskContextRail', () => {
     expect(onOpenTask).toHaveBeenCalledWith(expect.objectContaining({ id: 'task-12345678' }));
   });
 
+  test('uses sideboard pipeline dependency counts when dependency ids are absent', () => {
+    const sideboardContext = makeTask().sideboard_context as NonNullable<Task['sideboard_context']>;
+    render(
+      <TaskContextRail
+        currentTask={makeTask({
+          depends_on: undefined,
+          sideboard_context: {
+            ...sideboardContext,
+            pipeline: {
+              ...sideboardContext.pipeline,
+              dependency_count: 3,
+            },
+          },
+        })}
+        attentionTasks={[]}
+        trackedTaskIds={new Set()}
+        onOpenTask={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('waiting on 3')).toBeInTheDocument();
+  });
+
   test('renders compact task facts when optional Task fields are present', () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-06-29T12:35:00Z'));
@@ -130,7 +153,7 @@ describe('TaskContextRail', () => {
       expect(screen.getByTestId('task-rail-fact-llm')).toHaveTextContent('openai/gpt-5-mini');
       expect(screen.getByTestId('task-rail-fact-sideboard')).toHaveTextContent('Passive task context');
       expect(screen.getByTestId('task-rail-fact-sideboard')).toHaveTextContent('3 artifacts');
-      expect(screen.getByTestId('task-rail-fact-sideboard')).toHaveTextContent('4 recent messages');
+      expect(screen.getByTestId('task-rail-fact-sideboard')).toHaveTextContent('4 messages');
     } finally {
       vi.useRealTimers();
     }
@@ -375,7 +398,7 @@ describe('TaskContextRail', () => {
       />,
     );
 
-    expect(screen.getByText('1002 child tasks')).toBeInTheDocument();
-    expect(screen.queryByText('1000 child tasks')).not.toBeInTheDocument();
+    expect(screen.getByText('1,002 child tasks')).toBeInTheDocument();
+    expect(screen.queryByText('1,000 child tasks')).not.toBeInTheDocument();
   });
 });

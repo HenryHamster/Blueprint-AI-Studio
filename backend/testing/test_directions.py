@@ -17,7 +17,16 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from app.models import Alert, AlertSeverity, Direction, Project, Task, TaskStatus
+from app.models import (
+    Alert,
+    AlertSeverity,
+    Direction,
+    MessagesNoisePrefs,
+    Project,
+    ProjectMessage,
+    Task,
+    TaskStatus,
+)
 from app.autonomous_research import _spawn_research_task
 from app.direction_lifecycle import _process_direction_lifecycle
 from app.research_completion import (
@@ -9403,6 +9412,100 @@ async def test_operator_message_idempotency_key_dedupes(
     assert third.status_code == 200, third.text
     assert third.json()["status"] == "created"
     assert third.json()["id"] != first_id
+
+
+@pytest.mark.asyncio
+async def test_project_scoped_and_canonical_messages_share_workbench_capture(
+    client: AsyncClient, db_session, mocker
+):
+    """The legacy project-scoped endpoint uses the durable operator create path.
+
+    Workbench state persistence and sanitized strategic-session snapshots are
+    distinctive shared-helper behavior; keeping both endpoints aligned here
+    prevents the legacy route from growing a second create flow again.
+    """
+
+    async def _stored_message_context(message_id: str) -> dict:
+        msg = await db_session.get(ProjectMessage, uuid.UUID(message_id))
+        assert msg is not None
+        return msg.context or {}
+
+    async def _stored_workbench(project_id: str) -> dict:
+        prefs = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.project_id == uuid.UUID(project_id),
+                    MessagesNoisePrefs.user_id == "test-user-123",
+                )
+            )
+        ).scalar_one()
+        return prefs.prefs["_strategic_workbench"]
+
+    project_scoped_id = await _deploy_project(client, mocker, "Legacy message project")
+    canonical_id = await _deploy_project(client, mocker, "Canonical message project")
+    workbench_context = {
+        "interaction_mode": "invalid",
+        "active_surface": "runtime",
+        "session_started_at": "2026-06-29T12:00:00Z",
+        "context_package_id": "strategic-context:shared",
+        "selected_refs": [
+            {"kind": "canvas", "id": "strategic-canvas:shared", "label": "Context map"},
+            {"kind": "canvas", "id": "strategic-canvas:shared", "label": "Duplicate"},
+            {
+                "kind": "artifact",
+                "id": "artifact-1",
+                "label": "x" * 500,
+                "storage_uri": "gs://secret",
+            },
+        ],
+        "storage_uri": "gs://secret",
+    }
+
+    legacy_resp = await client.post(
+        f"/api/admin/projects/{project_scoped_id}/messages",
+        json={
+            "content": "Keep this runtime context attached.",
+            "message_type": "FEEDBACK",
+            "workbench_context": workbench_context,
+        },
+    )
+    canonical_resp = await client.post(
+        "/api/admin/messages",
+        json={
+            "project_id": canonical_id,
+            "content": "Keep this runtime context attached.",
+            "message_type": "FEEDBACK",
+            "workbench_context": workbench_context,
+        },
+    )
+
+    assert legacy_resp.status_code == 200, legacy_resp.text
+    assert canonical_resp.status_code == 200, canonical_resp.text
+    assert set(legacy_resp.json()) == {"id", "status", "arming"}
+    assert canonical_resp.json()["message"]["id"] == canonical_resp.json()["id"]
+
+    for project_id, message_id in (
+        (project_scoped_id, legacy_resp.json()["id"]),
+        (canonical_id, canonical_resp.json()["id"]),
+    ):
+        context = await _stored_message_context(message_id)
+        session = context["strategic_session"]
+        assert session["interaction_mode"] == "chat"
+        assert session["active_surface"] == "runtime"
+        assert session["session_started_at"] == "2026-06-29T12:00:00Z"
+        assert session["context_package_id"] == "strategic-context:shared"
+        assert session["selected_refs"] == [
+            {"kind": "canvas", "id": "strategic-canvas:shared", "label": "Context map"},
+            {"kind": "artifact", "id": "artifact-1", "label": "x" * 160},
+        ]
+        assert "storage_uri" not in session
+
+        stored_workbench = await _stored_workbench(project_id)
+        assert stored_workbench["interaction_mode"] == "chat"
+        assert stored_workbench["active_surface"] == "runtime"
+        assert stored_workbench["selected_refs"] == session["selected_refs"]
+        assert "context_package_id" not in stored_workbench
+        assert "storage_uri" not in stored_workbench
 
 
 @pytest.mark.asyncio

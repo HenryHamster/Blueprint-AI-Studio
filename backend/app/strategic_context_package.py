@@ -15,7 +15,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
-from app.models import Artifact, KnowledgeDocument, Project, StrategicCycle, Task
+from app.models import (
+    Artifact,
+    Direction,
+    KnowledgeDocument,
+    Project,
+    ProjectMessage,
+    StrategicCycle,
+    Task,
+)
 
 
 def _compact_text(value: Any, *, max_chars: int = 360) -> str | None:
@@ -97,9 +105,12 @@ _REF_PREFIX_BY_KIND = {
     "artifact": "artifact",
     "direction": "direction",
     "knowledge_document": "knowledge",
+    "message": "message",
     "strategic_cycle": "cycle",
     "task": "task",
 }
+
+_SELECTED_REF_DESCRIPTOR_LIMIT = 12
 
 
 def _ref_identity_values(kind: str, ref_id: str) -> set[str]:
@@ -164,6 +175,306 @@ def _candidate_descriptor(
     if isinstance(target, dict):
         descriptor["target"] = target
     return descriptor
+
+
+def _descriptor_lookup_key(kind: Any, ref_id: Any) -> tuple[str, str] | None:
+    compact_kind = _compact_text(kind, max_chars=40)
+    compact_id = _compact_text(ref_id, max_chars=160)
+    if not compact_kind or not compact_id:
+        return None
+    return compact_kind, compact_id
+
+
+def _parse_uuid_ref(kind: str, ref_id: str) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(_unprefixed_ref_id(kind, ref_id))
+    except (TypeError, ValueError):
+        return None
+
+
+def _store_resolved_descriptor(
+    resolved: dict[tuple[str, str], Dict[str, Any]],
+    descriptor: Dict[str, Any] | None,
+) -> None:
+    if not descriptor:
+        return
+    key = _descriptor_lookup_key(descriptor.get("kind"), descriptor.get("id"))
+    if key and key not in resolved:
+        resolved[key] = descriptor
+
+
+def _merge_descriptor_fields(
+    descriptor: Dict[str, Any],
+    source: Dict[str, Any] | None,
+    *,
+    overwrite_label: bool = False,
+) -> None:
+    if not isinstance(source, dict):
+        return
+    if overwrite_label:
+        descriptor["label"] = _compact_text(
+            source.get("label") or descriptor["label"],
+            max_chars=180,
+        )
+    summary = _compact_text(source.get("summary"), max_chars=220)
+    if summary and not descriptor.get("summary"):
+        descriptor["summary"] = summary
+    target = source.get("target")
+    if isinstance(target, dict) and not descriptor.get("target"):
+        descriptor["target"] = target
+    status = _compact_text(source.get("status"), max_chars=80)
+    if status and not descriptor.get("status"):
+        descriptor["status"] = status
+
+
+async def resolve_selected_ref_descriptors(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    refs: List[Dict[str, Any]],
+    *,
+    limit: int = _SELECTED_REF_DESCRIPTOR_LIMIT,
+) -> dict[tuple[str, str], Dict[str, Any]]:
+    """Resolve selected refs with small batched lookups and no heavy bodies/logs."""
+
+    buckets: dict[str, list[tuple[str, uuid.UUID | str]]] = {
+        "artifact": [],
+        "direction": [],
+        "knowledge_document": [],
+        "message": [],
+        "task": [],
+    }
+    seen: set[tuple[str, str]] = set()
+    for ref in refs[:limit]:
+        if not isinstance(ref, dict):
+            continue
+        key = _descriptor_lookup_key(ref.get("kind"), ref.get("id"))
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        kind, ref_id = key
+        if kind not in buckets:
+            continue
+        if kind == "direction":
+            buckets[kind].append((ref_id, _unprefixed_ref_id(kind, ref_id)))
+            continue
+        parsed = _parse_uuid_ref(kind, ref_id)
+        if parsed:
+            buckets[kind].append((ref_id, parsed))
+
+    resolved: dict[tuple[str, str], Dict[str, Any]] = {}
+
+    task_ids = [parsed for _ref_id, parsed in buckets["task"]]
+    if task_ids:
+        rows = (
+            await session.execute(
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.title,
+                        Task.latest_status_message,
+                        Task.status,
+                    )
+                )
+                .where(Task.project_id == project_id, Task.id.in_(task_ids))
+            )
+        ).scalars().all()
+        by_id = {task.id: task for task in rows}
+        for ref_id, parsed in buckets["task"]:
+            task = by_id.get(parsed)
+            if not task:
+                continue
+            _store_resolved_descriptor(
+                resolved,
+                _candidate_descriptor(
+                    kind="task",
+                    ref_id=ref_id,
+                    label=task.title,
+                    summary=task.latest_status_message,
+                    status=getattr(task.status, "value", task.status),
+                    target={"surface": "task", "task_id": str(task.id)},
+                ),
+            )
+
+    message_ids = [parsed for _ref_id, parsed in buckets["message"]]
+    if message_ids:
+        rows = (
+            await session.execute(
+                select(ProjectMessage)
+                .options(
+                    load_only(
+                        ProjectMessage.id,
+                        ProjectMessage.content,
+                        ProjectMessage.message_type,
+                        ProjectMessage.from_type,
+                        ProjectMessage.status,
+                    )
+                )
+                .where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.id.in_(message_ids),
+                )
+            )
+        ).scalars().all()
+        by_id = {message.id: message for message in rows}
+        for ref_id, parsed in buckets["message"]:
+            message = by_id.get(parsed)
+            if not message:
+                continue
+            message_type = getattr(
+                message.message_type, "value", message.message_type
+            )
+            _store_resolved_descriptor(
+                resolved,
+                _candidate_descriptor(
+                    kind="message",
+                    ref_id=ref_id,
+                    label=f"{message_type or 'message'} from {message.from_type}",
+                    summary=message.content,
+                    status=message.status,
+                    target={"surface": "messages", "message_id": str(message.id)},
+                ),
+            )
+
+    direction_keys = [parsed for _ref_id, parsed in buckets["direction"]]
+    if direction_keys:
+        rows = (
+            await session.execute(
+                select(Direction)
+                .options(
+                    load_only(
+                        Direction.direction_key,
+                        Direction.text,
+                        Direction.status,
+                        Direction.priority,
+                    )
+                )
+                .where(
+                    Direction.project_id == project_id,
+                    Direction.direction_key.in_(direction_keys),
+                )
+            )
+        ).scalars().all()
+        by_key = {direction.direction_key: direction for direction in rows}
+        for ref_id, parsed in buckets["direction"]:
+            direction = by_key.get(parsed)
+            if not direction:
+                continue
+            _store_resolved_descriptor(
+                resolved,
+                _candidate_descriptor(
+                    kind="direction",
+                    ref_id=ref_id,
+                    label=direction.text or direction.direction_key,
+                    summary=direction.priority,
+                    status=direction.status,
+                    target={
+                        "surface": "project",
+                        "section": "directions",
+                        "direction_id": direction.direction_key,
+                    },
+                ),
+            )
+
+    knowledge_ids = [parsed for _ref_id, parsed in buckets["knowledge_document"]]
+    if knowledge_ids:
+        rows = (
+            await session.execute(
+                select(KnowledgeDocument)
+                .options(
+                    load_only(
+                        KnowledgeDocument.id,
+                        KnowledgeDocument.title,
+                        KnowledgeDocument.summary,
+                        KnowledgeDocument.source_kind,
+                        KnowledgeDocument.direction_id,
+                        KnowledgeDocument.source_task_id,
+                    )
+                )
+                .where(
+                    KnowledgeDocument.project_id == project_id,
+                    KnowledgeDocument.id.in_(knowledge_ids),
+                )
+            )
+        ).scalars().all()
+        by_id = {doc.id: doc for doc in rows}
+        for ref_id, parsed in buckets["knowledge_document"]:
+            doc = by_id.get(parsed)
+            if not doc:
+                continue
+            _store_resolved_descriptor(
+                resolved,
+                _candidate_descriptor(
+                    kind="knowledge_document",
+                    ref_id=ref_id,
+                    label=doc.title,
+                    summary=doc.summary,
+                    status=doc.source_kind,
+                    target={
+                        "surface": "knowledge",
+                        "document_id": str(doc.id),
+                        "direction_id": _compact_text(
+                            doc.direction_id,
+                            max_chars=80,
+                        ),
+                        "task_id": str(doc.source_task_id)
+                        if doc.source_task_id
+                        else None,
+                    },
+                ),
+            )
+
+    artifact_ids = [parsed for _ref_id, parsed in buckets["artifact"]]
+    if artifact_ids:
+        rows = (
+            await session.execute(
+                select(Artifact, Task.id, Task.title, Task.status)
+                .options(
+                    load_only(
+                        Artifact.id,
+                        Artifact.artifact_type,
+                        Artifact.logical_key,
+                        Artifact.task_id,
+                    )
+                )
+                .join(Task, Artifact.task_id == Task.id)
+                .where(
+                    Task.project_id == project_id,
+                    Artifact.id.in_(artifact_ids),
+                )
+            )
+        ).all()
+        by_id = {
+            artifact.id: (artifact, task_id, task_title, task_status)
+            for artifact, task_id, task_title, task_status in rows
+        }
+        for ref_id, parsed in buckets["artifact"]:
+            row = by_id.get(parsed)
+            if not row:
+                continue
+            artifact, task_id, task_title, task_status = row
+            artifact_type = getattr(
+                artifact.artifact_type,
+                "value",
+                artifact.artifact_type,
+            )
+            _store_resolved_descriptor(
+                resolved,
+                _candidate_descriptor(
+                    kind="artifact",
+                    ref_id=ref_id,
+                    label=artifact.logical_key or artifact_type,
+                    summary=task_title,
+                    status=artifact_type or getattr(task_status, "value", task_status),
+                    target={
+                        "surface": "task",
+                        "task_id": str(task_id),
+                        "artifact_id": str(artifact.id),
+                    },
+                ),
+            )
+
+    return resolved
 
 
 def _context_package_descriptor_candidates(
@@ -256,6 +567,7 @@ def _context_package_descriptor_candidates(
 def selected_ref_descriptor(
     ref: Dict[str, Any],
     context_package: Dict[str, Any] | None,
+    resolved_descriptors: dict[tuple[str, str], Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     kind = _compact_text(ref.get("kind"), max_chars=40) or "ref"
     ref_id = _compact_text(ref.get("id"), max_chars=160) or ""
@@ -278,20 +590,20 @@ def selected_ref_descriptor(
             continue
 
         if not matched:
-            descriptor["label"] = _compact_text(
-                candidate.get("label") or descriptor["label"],
-                max_chars=180,
-            )
-        summary = _compact_text(candidate.get("summary"), max_chars=220)
-        if summary and not descriptor.get("summary"):
-            descriptor["summary"] = summary
-        target = candidate.get("target")
-        if isinstance(target, dict) and not descriptor.get("target"):
-            descriptor["target"] = target
-        status = _compact_text(candidate.get("status"), max_chars=80)
-        if status and not descriptor.get("status"):
-            descriptor["status"] = status
+            _merge_descriptor_fields(descriptor, candidate, overwrite_label=True)
+        else:
+            _merge_descriptor_fields(descriptor, candidate)
         matched = True
+    resolved = (
+        resolved_descriptors.get((kind, ref_id))
+        if isinstance(resolved_descriptors, dict)
+        else None
+    )
+    _merge_descriptor_fields(
+        descriptor,
+        resolved,
+        overwrite_label=not matched,
+    )
     if fallback_target and not descriptor.get("target"):
         descriptor["target"] = fallback_target
     return descriptor

@@ -91,6 +91,7 @@ async def create_operator_project_message(
     idempotency_key: str | None,
     persist_empty_workbench_context: bool = False,
     compact_context_size: bool = True,
+    enforce_raw_content_max: bool = False,
 ) -> OperatorMessageCreateResult:
     """Create or idempotently return an operator-authored ProjectMessage."""
 
@@ -98,7 +99,8 @@ async def create_operator_project_message(
     trimmed_content = content.strip()
     if not trimmed_content:
         raise HTTPException(status_code=400, detail="Content cannot be empty")
-    if len(trimmed_content) > MESSAGE_CONTENT_MAX:
+    content_for_limit = content if enforce_raw_content_max else trimmed_content
+    if len(content_for_limit) > MESSAGE_CONTENT_MAX:
         raise HTTPException(
             status_code=400,
             detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",

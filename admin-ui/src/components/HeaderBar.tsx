@@ -404,11 +404,11 @@ export function HeaderBar(props: HeaderBarProps) {
       )}
 
       {/* Unified top bar: compact global shell with fixed utility clusters and a scrolling tab strip. */}
-      <header className="flex min-h-10 flex-wrap items-center gap-1.5 border-b border-neutral-800 bg-[#05070a] px-2 py-1 md:min-h-10 md:flex-nowrap">
+      <header className="flex min-h-10 flex-wrap items-center gap-1 border-b border-neutral-800/90 bg-[#030508] px-1.5 py-0.5 md:min-h-9 md:flex-nowrap md:px-2">
         {/* LEFT: ProjectSwitcher + Manage projects slot */}
-        <div className="flex min-w-0 shrink-0 items-center gap-1.5">
-          <div className="hidden items-center pr-0.5 lg:flex" aria-label="Blueprint">
-            <span className="flex h-4 w-4 items-center justify-center rounded border border-neutral-800/80 bg-transparent text-neutral-600">
+        <div className="flex min-w-0 shrink-0 items-center gap-1">
+          <div className="hidden items-center lg:flex" aria-label="Blueprint">
+            <span className="flex h-3.5 w-3.5 items-center justify-center rounded border border-neutral-800/70 bg-[#070a0f] text-neutral-600">
               <Compass className="h-2.5 w-2.5" />
             </span>
           </div>
@@ -421,7 +421,7 @@ export function HeaderBar(props: HeaderBarProps) {
             /* eslint-disable-next-line viewport/min-touch-target */
             <button
               onClick={props.onManageProjects}
-              className="hidden rounded px-2 py-1 text-xs text-neutral-600 transition-colors hover:bg-neutral-900 hover:text-neutral-300 sm:inline-flex"
+              className="hidden rounded px-1.5 py-1 text-xs text-neutral-600 transition-colors hover:bg-neutral-900 hover:text-neutral-300 sm:inline-flex"
               title="Manage projects"
             >
               Manage
@@ -437,7 +437,7 @@ export function HeaderBar(props: HeaderBarProps) {
         <nav
           data-viewport-allow-overflow
           data-viewport-allow-truncation
-          className="order-3 flex min-w-0 flex-1 basis-full items-center gap-0.5 overflow-x-auto rounded-md border border-neutral-800 bg-[#0b0f14] p-0.5 sm:order-none sm:basis-auto md:flex-none"
+          className="order-3 flex min-w-0 flex-1 basis-full items-center gap-0.5 overflow-x-auto rounded border border-neutral-800/80 bg-[#070a0f] p-0.5 sm:order-none sm:basis-auto md:flex-none"
         >
           {(['chat', 'pipeline', 'project', 'runtime'] as const).map(tab => {
             const isActive = props.activeTab === tab;
@@ -451,10 +451,10 @@ export function HeaderBar(props: HeaderBarProps) {
               <button
                 key={tab}
                 onClick={() => props.onTabChange(tab)}
-                className={`inline-flex min-h-[44px] shrink-0 items-center rounded px-2.5 py-1 text-sm font-semibold leading-none transition-colors whitespace-nowrap md:min-h-8 md:text-xs ${
+                className={`inline-flex min-h-[44px] shrink-0 items-center rounded px-2.5 py-1 text-sm font-semibold leading-none transition-colors whitespace-nowrap md:min-h-7 md:px-2 md:text-xs ${
                   isActive
-                    ? 'bg-neutral-800 text-neutral-100 shadow-[0_1px_0_rgba(255,255,255,0.06)]'
-                    : 'text-neutral-300 hover:bg-neutral-900 hover:text-neutral-100'
+                    ? 'bg-neutral-800/90 text-neutral-100 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]'
+                    : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100'
                 }`}
               >
                 {label}
@@ -469,17 +469,17 @@ export function HeaderBar(props: HeaderBarProps) {
         </nav>
 
         {/* RIGHT: Icon cluster + SettingsDropdown + mobile controls + Launch Task */}
-        <div className="ml-auto flex shrink-0 items-center gap-1">
+        <div className="ml-auto flex shrink-0 items-center gap-0.5">
 
           {/* Desktop icon cluster */}
-          <div className="hidden items-center gap-0.5 rounded-md border border-neutral-800 bg-[#0b0f14] p-0.5 md:flex">
+          <div className="hidden items-center gap-0.5 rounded border border-neutral-800/80 bg-[#070a0f] p-0.5 md:flex">
             {/* Alerts — only when active alerts exist */}
             {(props.alertCount ?? 0) > 0 && (
               /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
               <button
                 onClick={props.onToggleAlertsPopover}
                 title={`${props.alertCount} alert${(props.alertCount ?? 0) > 1 ? 's' : ''}`}
-                className={`flex h-8 items-center gap-1 rounded px-2 text-xs transition-colors ${
+                className={`flex h-7 items-center gap-1 rounded px-1.5 text-xs transition-colors ${
                   props.showAlertsPopover
                     ? (props.alertMaxSeverity === 'ERROR' ? 'text-red-400 bg-red-500/10'
                       : props.alertMaxSeverity === 'WARNING' ? 'text-amber-400 bg-amber-500/10'
@@ -499,11 +499,11 @@ export function HeaderBar(props: HeaderBarProps) {
               onClick={onToggleResearchBrowser}
               title="Research findings"
               aria-pressed={showResearchBrowser}
-              className={`relative flex h-8 w-8 items-center justify-center rounded text-xs transition-colors ${
+              className={`relative flex h-7 w-7 items-center justify-center rounded text-xs transition-colors ${
                 showResearchBrowser ? 'bg-cyan-500/10 text-cyan-300' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'
               }`}
             >
-              <Microscope className="w-4 h-4" />
+              <Microscope className="h-3.5 w-3.5" />
               {pendingFindingsCount > 0 && (
                 <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-cyan-400 px-0.5 text-ui-2xs font-bold leading-none text-neutral-950">
                   {pendingFindingsCount > 9 ? '9+' : pendingFindingsCount}
@@ -514,20 +514,20 @@ export function HeaderBar(props: HeaderBarProps) {
               onClick={onToggleKnowledgeBrowser}
               title="Knowledge library"
               aria-pressed={showKnowledgeBrowser}
-              className={`flex h-8 w-8 items-center justify-center rounded text-xs transition-colors ${
+              className={`flex h-7 w-7 items-center justify-center rounded text-xs transition-colors ${
                 showKnowledgeBrowser ? 'bg-violet-500/10 text-violet-300' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'
               }`}
             >
-              <BookOpen className="w-4 h-4" />
+              <BookOpen className="h-3.5 w-3.5" />
             </button>
             {props.activeTab !== 'pipeline' && (
               /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
               <button
                 onClick={onOpenNewTaskModal}
                 title="New task"
-                className="flex h-8 items-center gap-1 rounded px-2 text-xs font-semibold text-neutral-300 transition-colors hover:bg-neutral-900 hover:text-neutral-100"
+                className="flex h-7 items-center gap-1 rounded px-1.5 text-xs font-semibold text-neutral-300 transition-colors hover:bg-neutral-900 hover:text-neutral-100"
               >
-                <Plus className="w-3.5 h-3.5" />
+                <Plus className="h-3.5 w-3.5" />
                 <span>New</span>
               </button>
             )}
@@ -536,9 +536,9 @@ export function HeaderBar(props: HeaderBarProps) {
               <button
                 onClick={onOpenActivityFeed}
                 title="Chronological activity stream"
-                className="flex h-8 w-8 items-center justify-center rounded text-xs text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
+                className="flex h-7 w-7 items-center justify-center rounded text-xs text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
               >
-                <Activity className="w-4 h-4" />
+                <Activity className="h-3.5 w-3.5" />
               </button>
             )}
             {/* Health pill — expands/collapses the full OrchestratorHealthBar */}
@@ -546,7 +546,7 @@ export function HeaderBar(props: HeaderBarProps) {
             <button
               onClick={() => setHealthExpanded(prev => !prev)}
               title={healthExpanded ? 'Hide health panel' : 'Show orchestrator health'}
-              className={`flex h-8 items-center gap-1 rounded px-2 text-xs transition-colors ${healthExpanded ? 'text-neutral-200 bg-neutral-800' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'}`}
+              className={`flex h-7 items-center gap-1 rounded px-1.5 text-xs transition-colors ${healthExpanded ? 'bg-neutral-800/90 text-neutral-200' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'}`}
             >
               <span className={`w-2 h-2 rounded-full shrink-0 ${healthDotColor}`} />
               <span className="hidden font-mono xl:inline">health</span>
@@ -556,7 +556,7 @@ export function HeaderBar(props: HeaderBarProps) {
           {/* SettingsDropdown — always in DOM so its fixed overlay renders when triggered from mobile menu.
               The trigger button is hidden on mobile via triggerClassName; the fixed panel bypasses parent display:none. */}
           <SettingsDropdown
-            triggerClassName="hidden md:inline-flex h-9 w-9 items-center justify-center rounded-md border border-neutral-800 bg-[#0b0f14] hover:bg-neutral-900"
+            triggerClassName="hidden md:inline-flex h-8 w-8 items-center justify-center rounded border border-neutral-800/80 bg-[#070a0f] hover:bg-neutral-900"
           showSettings={showSettings}
           onToggleSettings={onToggleSettings}
           settingsRef={settingsRef}

@@ -150,8 +150,10 @@ describe('DetailsTab — sideboard context', () => {
     expect(screen.getByText('sc-1')).toBeInTheDocument();
     expect(screen.getByText('strategic review')).toBeInTheDocument();
     expect(screen.getByText('phase2_running')).toBeInTheDocument();
-    expect(screen.getByText('1 dependencies')).toBeInTheDocument();
-    expect(screen.getByText('2 children')).toBeInTheDocument();
+    const dependenciesStat = screen.getByText('Dependencies').parentElement;
+    const childrenStat = screen.getByText('Children').parentElement;
+    expect(dependenciesStat).toHaveTextContent('1');
+    expect(childrenStat).toHaveTextContent('2');
     expect(screen.getByText('Waiting for reviewer feedback.')).toBeInTheDocument();
     expect(screen.getByText('pull request 1')).toBeInTheDocument();
     expect(screen.getByText('abcdef123456')).toBeInTheDocument();
@@ -166,7 +168,7 @@ describe('DetailsTab — sideboard context', () => {
       'https://github.com/HenryHamster/BlueprintAIStudio/pull/42',
     );
 
-    fireEvent.click(screen.getByText('parent parent-t'));
+    fireEvent.click(screen.getByRole('button', { name: 'parent parent-task-123456' }));
     expect(onNavigateToTask).toHaveBeenCalledWith('parent-task-123456');
     fireEvent.click(screen.getByRole('button', { name: 'Linked task linked-task-abcdef' }));
     expect(onNavigateToTask).toHaveBeenCalledWith('linked-task-abcdef');

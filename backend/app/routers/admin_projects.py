@@ -61,6 +61,7 @@ from app.onboarding_proof import build_onboarding_proof_block
 from app.strategic_context_package import (
     build_strategic_context_package_summary,
     load_strategic_context_evidence,
+    resolve_selected_ref_descriptors,
     selected_ref_descriptor,
 )
 from app.strategic_runtime_work import build_strategic_runtime_summary
@@ -190,11 +191,33 @@ def _dedupe_workbench_refs(refs: Any, *, limit: int = 12) -> list[Dict[str, Any]
     return deduped
 
 
+def _message_selected_refs(message: ProjectMessage) -> list[Dict[str, Any]]:
+    context = message.context if isinstance(message.context, dict) else {}
+    strategic_session = context.get("strategic_session")
+    if not isinstance(strategic_session, dict):
+        return []
+    return _dedupe_workbench_refs(strategic_session.get("selected_refs"))
+
+
+def _collect_selected_refs_for_resolution(
+    *ref_groups: Any,
+    limit: int = 48,
+) -> list[Dict[str, Any]]:
+    selected_refs: list[Dict[str, Any]] = []
+    for refs in ref_groups:
+        if isinstance(refs, ProjectMessage):
+            selected_refs.extend(_message_selected_refs(refs))
+        elif isinstance(refs, list):
+            selected_refs.extend(_dedupe_workbench_refs(refs, limit=limit))
+    return _dedupe_workbench_refs(selected_refs, limit=limit)
+
+
 def _build_work_session_summary(
     project: Project,
     *,
     workbench_state: Dict[str, Any],
     context_package: Dict[str, Any] | None,
+    selected_ref_descriptors: dict[tuple[str, str], Dict[str, Any]] | None,
     attention: Dict[str, Any] | None,
     runtime_summary: Dict[str, Any] | None,
     message_counts: Dict[str, int],
@@ -405,7 +428,7 @@ def _build_work_session_summary(
         else "clear",
         "selected_refs": selected_refs,
         "selected_ref_descriptors": [
-            selected_ref_descriptor(ref, context_package)
+            selected_ref_descriptor(ref, context_package, selected_ref_descriptors)
             for ref in selected_refs[:12]
             if isinstance(ref, dict)
         ],
@@ -474,6 +497,7 @@ def _message_preview(
     message: ProjectMessage,
     *,
     context_package: Dict[str, Any] | None = None,
+    selected_ref_descriptors: dict[tuple[str, str], Dict[str, Any]] | None = None,
     content_max_chars: int | None = 280,
 ) -> Dict[str, Any]:
     preview = message_preview_dict(message, content_max_chars=content_max_chars)
@@ -487,7 +511,11 @@ def _message_preview(
         selected_refs = strategic_session.get("selected_refs")
         if isinstance(selected_refs, list):
             strategic_session["selected_ref_descriptors"] = [
-                selected_ref_descriptor(ref, context_package)
+                selected_ref_descriptor(
+                    ref,
+                    context_package,
+                    selected_ref_descriptors,
+                )
                 for ref in selected_refs[:12]
                 if isinstance(ref, dict)
             ]
@@ -541,8 +569,13 @@ def _session_output_from_message(
     message: ProjectMessage,
     *,
     context_package: Dict[str, Any] | None,
+    selected_ref_descriptors: dict[tuple[str, str], Dict[str, Any]] | None,
 ) -> Dict[str, Any]:
-    preview = _message_preview(message, context_package=context_package)
+    preview = _message_preview(
+        message,
+        context_package=context_package,
+        selected_ref_descriptors=selected_ref_descriptors,
+    )
     return {
         "kind": "message",
         "id": preview["id"],
@@ -624,6 +657,12 @@ async def _recent_session_conversation(
             str(message.id),
         )
     )
+    selected_ref_descriptors = await resolve_selected_ref_descriptors(
+        session,
+        project_id,
+        _collect_selected_refs_for_resolution(*visible_rows),
+        limit=48,
+    )
     return {
         "limit": _SESSION_CONVERSATION_LIMIT,
         "has_more": len(rows) > _SESSION_CONVERSATION_LIMIT,
@@ -632,6 +671,7 @@ async def _recent_session_conversation(
             _message_preview(
                 message,
                 context_package=context_package,
+                selected_ref_descriptors=selected_ref_descriptors,
                 content_max_chars=None,
             )
             for message in visible_rows
@@ -661,8 +701,18 @@ async def _recent_session_outputs(
             .limit(_SESSION_OUTPUT_LIMIT)
         )
     ).scalars().all()
+    selected_ref_descriptors = await resolve_selected_ref_descriptors(
+        session,
+        project_id,
+        _collect_selected_refs_for_resolution(*message_rows),
+        limit=48,
+    )
     outputs.extend(
-        _session_output_from_message(message, context_package=context_package)
+        _session_output_from_message(
+            message,
+            context_package=context_package,
+            selected_ref_descriptors=selected_ref_descriptors,
+        )
         for message in message_rows
     )
     outputs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
@@ -747,9 +797,16 @@ async def _message_preview_for_session_response(
         if isinstance(state_response.get("context_package"), dict)
         else None
     )
+    selected_ref_descriptors = await resolve_selected_ref_descriptors(
+        session,
+        project_id,
+        _collect_selected_refs_for_resolution(message),
+        limit=48,
+    )
     return _message_preview(
         message,
         context_package=context_package,
+        selected_ref_descriptors=selected_ref_descriptors,
         content_max_chars=None,
     )
 
@@ -1563,10 +1620,20 @@ async def get_project_strategic_state(
         current_user["user_id"],
         project.id,
     )
+    resolved_selected_ref_descriptors = await resolve_selected_ref_descriptors(
+        session,
+        project.id,
+        _collect_selected_refs_for_resolution(
+            workbench_state.get("selected_refs"),
+            *message_rows,
+        ),
+        limit=48,
+    )
     work_session = _build_work_session_summary(
         project,
         workbench_state=workbench_state,
         context_package=context_package,
+        selected_ref_descriptors=resolved_selected_ref_descriptors,
         attention=attention,
         runtime_summary=runtime_summary,
         message_counts=message_counts,
@@ -1647,7 +1714,11 @@ async def get_project_strategic_state(
         "messages": {
             "counts": message_counts,
             "items": [
-                _message_preview(message, context_package=context_package)
+                _message_preview(
+                    message,
+                    context_package=context_package,
+                    selected_ref_descriptors=resolved_selected_ref_descriptors,
+                )
                 for message in message_rows
             ],
         },

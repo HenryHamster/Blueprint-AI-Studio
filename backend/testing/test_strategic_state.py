@@ -15,6 +15,7 @@ from app.models import (
     ArtifactType,
     ComputeJob,
     ComputeJobStatus,
+    Direction,
     KnowledgeDocument,
     LocalRunner,
     MessageType,
@@ -1147,6 +1148,233 @@ async def test_strategic_state_includes_operator_workbench_state(
 
 
 @pytest.mark.asyncio
+async def test_strategic_state_resolves_selected_refs_absent_from_context_package(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    source_task = Task(
+        project_id=project.id,
+        title="Older durable context source",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+        latest_status_message="Finished durable context output.",
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    selected_message = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BLOCKER,
+        from_type="user",
+        content="This old blocker should stay navigable." + (" extra" * 80),
+        status="linked",
+        context={
+            "strategic_session": {
+                "selected_refs": [
+                    {"kind": "direction", "id": "direction:d-older-kept"}
+                ]
+            }
+        },
+        created_at=now - timedelta(days=10),
+    )
+    selected_direction = Direction(
+        project_id=project.id,
+        direction_key="d-older-kept",
+        text="Keep the older selected direction navigable",
+        status="paused",
+        priority="medium",
+        data={"id": "d-older-kept"},
+    )
+    selected_doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=source_task.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Older selected knowledge",
+        summary="Older knowledge should be resolved without loading the body.",
+        body="DO NOT EMBED OLD KNOWLEDGE BODY " + ("body " * 200),
+        topic="older-context",
+        direction_id="d-older-kept",
+        tags=[],
+        source_citations=[],
+        forward_quality_verdict={"passed": True},
+        created_at=now - timedelta(days=10),
+        updated_at=now - timedelta(days=10),
+    )
+    selected_artifact = Artifact(
+        task_id=source_task.id,
+        artifact_type=ArtifactType.INVESTIGATION_REPORT,
+        storage_uri="gs://blueprint-test/older-report.md",
+        logical_key="older-selected-report",
+        logs="DO NOT EMBED OLD ARTIFACT LOGS " + ("logs " * 200),
+        created_at=now - timedelta(days=10),
+    )
+    db_session.add(selected_message)
+    db_session.add(selected_direction)
+    db_session.add(selected_doc)
+    db_session.add(selected_artifact)
+    await db_session.commit()
+    await db_session.refresh(selected_message)
+    await db_session.refresh(selected_doc)
+    await db_session.refresh(selected_artifact)
+
+    for index in range(5):
+        newer_task = Task(
+            project_id=project.id,
+            title=f"Newer context source {index}",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(newer_task)
+        await db_session.flush()
+        db_session.add(
+            KnowledgeDocument(
+                project_id=project.id,
+                source_task_id=newer_task.id,
+                source_kind=SourceKind.DESIGN.value,
+                title=f"Newer knowledge {index}",
+                summary="newer",
+                body="body",
+                tags=[],
+                source_citations=[],
+                forward_quality_verdict={"passed": True},
+                created_at=now - timedelta(minutes=index),
+                updated_at=now - timedelta(minutes=index),
+            )
+        )
+        db_session.add(
+            Artifact(
+                task_id=newer_task.id,
+                artifact_type=ArtifactType.INVESTIGATION_REPORT,
+                storage_uri=f"gs://blueprint-test/newer-report-{index}.md",
+                logical_key=f"newer-report-{index}",
+                created_at=now - timedelta(minutes=index),
+            )
+        )
+    await db_session.commit()
+
+    db_session.add(
+        MessagesNoisePrefs(
+            user_id=TEST_USER_ID,
+            project_id=project.id,
+            prefs={
+                "_strategic_workbench": {
+                    "version": 1,
+                    "interaction_mode": "check_in",
+                    "active_surface": "strategic",
+                    "selected_refs": [
+                        {"kind": "message", "id": f"message:{selected_message.id}"},
+                        {"kind": "direction", "id": "direction:d-older-kept"},
+                        {
+                            "kind": "knowledge_document",
+                            "id": f"knowledge:{selected_doc.id}",
+                        },
+                        {"kind": "artifact", "id": f"artifact:{selected_artifact.id}"},
+                        {
+                            "kind": "message",
+                            "id": f"message:{uuid.uuid4()}",
+                            "label": "Missing message",
+                        },
+                    ],
+                }
+            },
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200, resp.text
+    context_package = resp.json()["context_package"]
+    evidence = context_package["evidence"]
+    assert str(selected_doc.id) not in {
+        item["id"] for item in evidence["knowledge"]["items"]
+    }
+    assert str(selected_artifact.id) not in {
+        item["id"] for item in evidence["artifacts"]["items"]
+    }
+
+    descriptors = {
+        (entry["kind"], entry["id"]): entry
+        for entry in resp.json()["work_session"]["selected_ref_descriptors"]
+    }
+    message_descriptor = descriptors[("message", f"message:{selected_message.id}")]
+    assert message_descriptor["label"] == "BLOCKER from user"
+    assert message_descriptor["summary"].startswith(
+        "This old blocker should stay navigable."
+    )
+    assert message_descriptor["status"] == "linked"
+    assert message_descriptor["target"] == {
+        "surface": "messages",
+        "message_id": str(selected_message.id),
+    }
+    direction_descriptor = descriptors[("direction", "direction:d-older-kept")]
+    assert (
+        direction_descriptor["label"]
+        == "Keep the older selected direction navigable"
+    )
+    assert direction_descriptor["summary"] == "medium"
+    assert direction_descriptor["status"] == "paused"
+    assert direction_descriptor["target"] == {
+        "surface": "project",
+        "section": "directions",
+        "direction_id": "d-older-kept",
+    }
+    knowledge_descriptor = descriptors[
+        ("knowledge_document", f"knowledge:{selected_doc.id}")
+    ]
+    assert knowledge_descriptor["label"] == "Older selected knowledge"
+    assert (
+        knowledge_descriptor["summary"]
+        == "Older knowledge should be resolved without loading the body."
+    )
+    assert knowledge_descriptor["status"] == SourceKind.DESIGN.value
+    assert knowledge_descriptor["target"]["document_id"] == str(selected_doc.id)
+    assert "DO NOT EMBED" not in str(knowledge_descriptor)
+    artifact_descriptor = descriptors[("artifact", f"artifact:{selected_artifact.id}")]
+    assert artifact_descriptor["label"] == "older-selected-report"
+    assert artifact_descriptor["summary"] == "Older durable context source"
+    assert artifact_descriptor["status"] == ArtifactType.INVESTIGATION_REPORT.value
+    assert artifact_descriptor["target"] == {
+        "surface": "task",
+        "task_id": str(source_task.id),
+        "artifact_id": str(selected_artifact.id),
+    }
+    missing_descriptor = next(
+        entry
+        for entry in resp.json()["work_session"]["selected_ref_descriptors"]
+        if entry["label"] == "Missing message"
+    )
+    assert missing_descriptor == {
+        "kind": "message",
+        "id": missing_descriptor["id"],
+        "label": "Missing message",
+    }
+    preview_message = next(
+        item
+        for item in resp.json()["messages"]["items"]
+        if item["id"] == str(selected_message.id)
+    )
+    preview_descriptors = preview_message["context"]["strategic_session"][
+        "selected_ref_descriptors"
+    ]
+    assert preview_descriptors == [
+        {
+            "kind": "direction",
+            "id": "direction:d-older-kept",
+            "label": "Keep the older selected direction navigable",
+            "summary": "medium",
+            "status": "paused",
+            "target": {
+                "surface": "project",
+                "section": "directions",
+                "direction_id": "d-older-kept",
+            },
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_strategic_session_endpoint_resumes_persisted_state_and_outputs(
     client: AsyncClient, db_session
 ):
@@ -1375,6 +1603,62 @@ async def test_strategic_session_conversation_filters_routine_before_limit(
     assert [item["content"] for item in conversation["items"]] == [
         "operator asks about the workday",
         "strategic replies with the current plan",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_conversation_resolves_message_selected_refs(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-conversation-kept",
+        text="Keep conversation context navigable",
+        status="active",
+        priority="high",
+        data={"id": "d-conversation-kept"},
+    )
+    message = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="user",
+        content="Use the older direction context in this session.",
+        context={
+            "strategic_session": {
+                "selected_refs": [
+                    {"kind": "direction", "id": "direction:d-conversation-kept"}
+                ]
+            }
+        },
+    )
+    db_session.add_all([direction, message])
+    await db_session.commit()
+    await db_session.refresh(message)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-session")
+
+    assert resp.status_code == 200, resp.text
+    conversation_message = next(
+        item
+        for item in resp.json()["conversation"]["items"]
+        if item["id"] == str(message.id)
+    )
+    assert conversation_message["context"]["strategic_session"][
+        "selected_ref_descriptors"
+    ] == [
+        {
+            "kind": "direction",
+            "id": "direction:d-conversation-kept",
+            "label": "Keep conversation context navigable",
+            "summary": "high",
+            "status": "active",
+            "target": {
+                "surface": "project",
+                "section": "directions",
+                "direction_id": "d-conversation-kept",
+            },
+        }
     ]
 
 

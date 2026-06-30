@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { Activity, ArrowUpRight, BookmarkMinus, BookmarkPlus, GitPullRequest, ListTree, Radio, Route, Star } from 'lucide-react';
+import { ArrowUpRight, BookmarkMinus, BookmarkPlus, GitPullRequest, ListTree, Radio, Route, Star } from 'lucide-react';
 import type { StrategicWorkbenchState } from '../strategicStateApi';
 import type { Task } from '../types/task';
 import { timeAgo } from '../utils/time';
@@ -122,10 +122,10 @@ function taskSideboardFact(task: Task): TaskRailFact | null {
   const parts = [
     stringValue(context.purpose),
     artifactCount != null && artifactCount > 0 ? countLabel(artifactCount, 'artifact') : null,
-    recentMessageCount != null && recentMessageCount > 0 ? countLabel(recentMessageCount, 'recent message') : null,
+    recentMessageCount != null && recentMessageCount > 0 ? countLabel(recentMessageCount, 'message') : null,
   ].filter((part): part is string => Boolean(part));
 
-  return parts.length > 0 ? { key: 'sideboard', label: 'sideboard', value: parts.join(' · ') } : null;
+  return parts.length > 0 ? { key: 'sideboard', label: 'context', value: parts.join(' · ') } : null;
 }
 
 function taskRailFacts(task: Task): TaskRailFact[] {
@@ -172,18 +172,53 @@ function TaskFactRows({ facts }: { facts: TaskRailFact[] }) {
   if (facts.length === 0) return null;
 
   return (
-    <dl className="grid min-w-0 gap-1.5">
+    <dl className="grid min-w-0 gap-1">
       {facts.map(fact => (
         <div
           key={fact.key}
           data-testid={`task-rail-fact-${fact.key}`}
-          className="grid min-w-0 grid-cols-[4.8rem_minmax(0,1fr)] gap-2"
+          className="grid min-w-0 grid-cols-[5.4rem_minmax(0,1fr)] gap-2 rounded-md border border-neutral-800/70 bg-neutral-950/35 px-2 py-1.5"
         >
           <dt className="text-ui-sm font-semibold uppercase text-neutral-600">{fact.label}</dt>
           <dd className="min-w-0 break-words text-neutral-300" title={fact.title}>{fact.value}</dd>
         </div>
       ))}
     </dl>
+  );
+}
+
+function PipelineContextRows({
+  parentTaskId,
+  dependencyCount,
+  childCount,
+  blockedReason,
+}: {
+  parentTaskId?: string | null;
+  dependencyCount: number;
+  childCount: number;
+  blockedReason?: string | null;
+}) {
+  if (!parentTaskId && dependencyCount === 0 && childCount === 0 && !blockedReason) return null;
+
+  return (
+    <div className="grid min-w-0 gap-1">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 rounded-md border border-neutral-800/70 bg-neutral-950/35 px-2 py-1.5">
+        <ListTree className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />
+        {parentTaskId && (
+          <span className="min-w-0 break-all font-mono text-neutral-300">parent {compactIdentifier(parentTaskId)}</span>
+        )}
+        {dependencyCount > 0 && <span className="text-neutral-400">waiting on {dependencyCount}</span>}
+        {childCount > 0 && (
+          <span className="text-neutral-400">{countLabel(childCount, 'child task')}</span>
+        )}
+      </div>
+      {blockedReason && (
+        <div className="rounded-md border border-rose-500/25 bg-rose-500/5 px-2 py-1.5 text-rose-200">
+          <span className="font-semibold uppercase text-rose-400/80">Blocked </span>
+          <span className="break-words">{blockedReason}</span>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -212,8 +247,10 @@ function CurrentTaskCard({
   onKeepContext?: () => void;
   onRemoveContext?: () => void;
 }) {
-  const dependencyCount = task.depends_on?.length ?? 0;
+  const dependencyCount = task.sideboard_context?.pipeline.dependency_count ?? task.depends_on?.length ?? 0;
   const childCount = task.sideboard_context?.pipeline.child_count ?? task.child_task_ids?.length ?? 0;
+  const parentTaskId = task.sideboard_context?.pipeline.parent_task_id ?? null;
+  const blockedReason = task.sideboard_context?.pipeline.blocked_reason ?? null;
   const direction = task.sideboard_context?.strategic.direction;
   const prUrl = task.pr_url ?? task.sideboard_context?.artifacts.primary_pr_url ?? null;
   const facts = taskRailFacts(task);
@@ -239,27 +276,21 @@ function CurrentTaskCard({
         <WorkbenchMetric label="cost" value={costLabel(task) ?? 'n/a'} />
       </div>
 
-      {(facts.length > 0 || dependencyCount > 0 || childCount > 0 || direction) && (
-        <div className="space-y-1.5 border-t border-neutral-800 pt-2 text-xs text-neutral-400">
+      {(facts.length > 0 || dependencyCount > 0 || childCount > 0 || parentTaskId || blockedReason || direction) && (
+        <div className="space-y-2 border-t border-neutral-800 pt-2 text-xs text-neutral-400">
           <TaskFactRows facts={facts} />
           {direction && (
-            <div className="flex min-w-0 gap-2">
+            <div className="flex min-w-0 gap-2 rounded-md border border-neutral-800/70 bg-neutral-950/35 px-2 py-1.5">
               <Route className="mt-0.5 h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />
               <span className="line-clamp-2">{direction.text || direction.id}</span>
             </div>
           )}
-          {dependencyCount > 0 && (
-            <div className="flex items-center gap-2">
-              <ListTree className="h-3.5 w-3.5 text-neutral-600" aria-hidden="true" />
-              <span>waiting on {dependencyCount}</span>
-            </div>
-          )}
-          {childCount > 0 && (
-            <div className="flex items-center gap-2">
-              <Activity className="h-3.5 w-3.5 text-neutral-600" aria-hidden="true" />
-              <span>{childCount} child task{childCount === 1 ? '' : 's'}</span>
-            </div>
-          )}
+          <PipelineContextRows
+            parentTaskId={parentTaskId}
+            dependencyCount={dependencyCount}
+            childCount={childCount}
+            blockedReason={blockedReason}
+          />
         </div>
       )}
 
