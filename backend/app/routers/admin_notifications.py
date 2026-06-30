@@ -56,6 +56,7 @@ from app.strategic_trigger import (
     ARMING_PASSIVE_NOTE,
     ARMING_STEERING,
     ORIGIN_OPERATOR,
+    maybe_arm_operator_refresh,
     request_strategic_refresh,
 )
 from app import notification_dispatch as _nd
@@ -720,54 +721,80 @@ async def resolve_message(
             resolved_at=_utcnow()
         )
     )
-    await session.commit()
     if result.rowcount > 0:
+        reply_msg: ProjectMessage | None = None
+        reply_message_event: dict[str, str] | None = None
+        reply_message_id: str | None = None
+        arming: str | None = None
         if resolution and message_type in (
             MessageType.QUESTION,
             MessageType.FEEDBACK,
         ):
-            try:
-                from app.notification_dispatch import (
-                    post_feedback_acknowledgment as _post_feedback_ack,
-                    post_question_answer as _post_qa,
-                )
+            from app.notification_dispatch import (
+                post_feedback_acknowledgment as _post_feedback_ack,
+                post_question_answer as _post_qa,
+            )
 
-                strategic_session = await build_message_strategic_session_snapshot(
+            strategic_session = await build_message_strategic_session_snapshot(
+                session,
+                current_user["user_id"],
+                message_project_uuid,
+                payload.workbench_context,
+            )
+            if message_type == MessageType.QUESTION:
+                reply_msg = await _post_qa(
                     session,
-                    current_user["user_id"],
                     message_project_uuid,
-                    payload.workbench_context,
+                    message_id,
+                    resolution,
+                    from_type="user",
                 )
-                if message_type == MessageType.QUESTION:
-                    reply_msg = await _post_qa(
-                        session,
-                        message_project_uuid,
-                        message_id,
-                        resolution,
-                        from_type="user",
-                    )
-                else:
-                    reply_msg = await _post_feedback_ack(
-                        session,
-                        message_project_uuid,
-                        message_id,
-                        resolution,
-                    )
-                if strategic_session:
-                    reply_msg.context = {
-                        **(reply_msg.context or {}),
-                        "strategic_session": strategic_session,
-                    }
+            else:
+                reply_msg = await _post_feedback_ack(
+                    session,
+                    message_project_uuid,
+                    message_id,
+                    resolution,
+                )
+            if strategic_session:
+                reply_msg.context = {
+                    **(reply_msg.context or {}),
+                    "strategic_session": strategic_session,
+                }
+        await session.commit()
+        if reply_msg is not None:
+            await session.refresh(reply_msg)
+            reply_message_id = str(reply_msg.id)
+            reply_message_event = message_event_payload(reply_msg)
+            event_type = (
+                reply_msg.context.get("event_type")
+                if isinstance(reply_msg.context, dict)
+                else None
+            )
+            arming = await maybe_arm_operator_refresh(
+                session,
+                message_project_uuid,
+                MessageType(reply_msg.message_type),
+                event_type=str(event_type) if event_type else None,
+                message_content=resolution,
+            )
+            if arming == ARMING_STEERING:
                 await session.commit()
-            except Exception:
-                logging.getLogger(__name__).warning(
-                    "post resolution reply failed for message %s",
-                    message_id_str,
-                    exc_info=True,
-                )
         await broadcast_to_project(str(message_project_uuid), "message_updated", message_event)
-        return {"id": message_id_str, "status": "resolved"}
+        if reply_message_event is not None:
+            await broadcast_to_project(
+                str(message_project_uuid),
+                "message_created",
+                reply_message_event,
+            )
+        response = {"id": message_id_str, "status": "resolved"}
+        if reply_message_id is not None:
+            response["reply_message_id"] = reply_message_id
+        if arming is not None:
+            response["arming"] = arming
+        return response
     else:
+        await session.commit()
         # Message was already resolved by a concurrent request
         return {"id": message_id_str, "status": "already_resolved"}
 

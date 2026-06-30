@@ -212,7 +212,7 @@ def test_clear_drops_origin_and_notified_on_consume():
 
 
 def test_classify_passive_note():
-    """A NOTE is passive regardless of any event_type."""
+    """A normal NOTE is passive, including routine digest event types."""
     from app.models import MessageType
 
     assert (
@@ -221,6 +221,16 @@ def test_classify_passive_note():
     assert (
         st.classify_operator_arming(MessageType.NOTE, event_type="pr_merged")
         == st.ARMING_PASSIVE_NOTE
+    )
+
+
+def test_classify_question_answer_note_as_steering():
+    """An operator answer to a Strategic question is active steering."""
+    from app.models import MessageType
+
+    assert (
+        st.classify_operator_arming(MessageType.NOTE, event_type="question_answer")
+        == st.ARMING_STEERING
     )
 
 

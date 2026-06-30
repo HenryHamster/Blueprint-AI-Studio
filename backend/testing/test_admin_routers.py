@@ -4886,6 +4886,7 @@ class TestMessages:
         self, client: AsyncClient, db_session
     ):
         """Resolving a QUESTION via PATCH /messages/{id} creates a question_answer NOTE."""
+        from app.strategic_trigger import strategic_refresh_pending
         from sqlmodel import select
 
         project = await _make_project(db_session)
@@ -4905,7 +4906,9 @@ class TestMessages:
             json={"resolution": "Do X instead."},
         )
         assert resp.status_code == 200
-        assert resp.json()["status"] == "resolved"
+        body = resp.json()
+        assert body["status"] == "resolved"
+        assert body["arming"] == "steering"
 
         # Exactly one question_answer NOTE should exist, reply_to set to the question id
         notes = (
@@ -4923,6 +4926,13 @@ class TestMessages:
         assert note.context.get("event_type") == "question_answer"
         assert note.context.get("reply_to") == str(question.id)
         assert note.context.get("answer") == "Do X instead."
+        assert body["reply_message_id"] == str(note.id)
+        vision = await self._reload_vision(db_session, project.id)
+        assert strategic_refresh_pending(vision) is True
+        marker = vision["_strategic_refresh"]
+        assert marker["origin"] == "operator"
+        assert marker["reason"] == "operator_message"
+        assert marker["excerpt"] == "Do X instead."
 
     @pytest.mark.asyncio
     async def test_operator_reply_resolves_open_question(
@@ -4949,28 +4959,34 @@ class TestMessages:
         await db_session.commit()
         await db_session.refresh(question)
 
-        resp = await client.patch(
-            f"/api/admin/messages/{question.id}",
-            json={
-                "resolution": "Use approach A.",
-                "workbench_context": {
-                    "version": 1,
-                    "interaction_mode": "continuous",
-                    "active_surface": "strategic",
-                    "selected_refs": [
-                        {
-                            "kind": "knowledge_document",
-                            "id": "knowledge:kdoc-1",
-                            "label": "Operator notes",
-                        },
-                    ],
-                    "session_started_at": "2026-06-29T01:00:00Z",
-                    "context_package_id": "strategic-context:test",
+        with patch(
+            "app.routers.admin_notifications.broadcast_to_project",
+            new_callable=AsyncMock,
+        ) as broadcast:
+            resp = await client.patch(
+                f"/api/admin/messages/{question.id}",
+                json={
+                    "resolution": "Use approach A.",
+                    "workbench_context": {
+                        "version": 1,
+                        "interaction_mode": "continuous",
+                        "active_surface": "strategic",
+                        "selected_refs": [
+                            {
+                                "kind": "knowledge_document",
+                                "id": "knowledge:kdoc-1",
+                                "label": "Operator notes",
+                            },
+                        ],
+                        "session_started_at": "2026-06-29T01:00:00Z",
+                        "context_package_id": "strategic-context:test",
+                    },
                 },
-            },
-        )
+            )
         assert resp.status_code == 200
-        assert resp.json()["status"] == "resolved"
+        body = resp.json()
+        assert body["status"] == "resolved"
+        assert body["arming"] == "steering"
 
         # Question row is now resolved with the operator's answer stored
         await db_session.refresh(question)
@@ -5003,6 +5019,86 @@ class TestMessages:
                 "label": "Operator notes",
             }
         ]
+        assert body["reply_message_id"] == str(note.id)
+        assert broadcast.await_count == 2
+        assert [
+            (call.args[1], call.args[2])
+            for call in broadcast.await_args_list
+        ] == [
+            (
+                "message_updated",
+                {
+                    "message_id": str(question.id),
+                    "type": "QUESTION",
+                    "from": "system",
+                    "status": "resolved",
+                },
+            ),
+            (
+                "message_created",
+                {
+                    "message_id": str(note.id),
+                    "type": "NOTE",
+                    "from": "user",
+                },
+            ),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_operator_question_answer_survives_arming_rollback(
+        self, client: AsyncClient, db_session
+    ):
+        """A contended Strategic wake must not erase a committed operator answer."""
+        from app.strategic_trigger import strategic_refresh_pending
+
+        project = await _make_project(db_session)
+        question = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="system",
+            content="Which path should Strategic take?",
+            status="open",
+        )
+        db_session.add(question)
+        await db_session.commit()
+        await db_session.refresh(question)
+
+        async def _rollback_then_fail(session, *args, **kwargs):
+            await session.rollback()
+            return False
+
+        with patch(
+            "app.strategic_trigger.request_strategic_refresh",
+            new=AsyncMock(side_effect=_rollback_then_fail),
+        ):
+            resp = await client.patch(
+                f"/api/admin/messages/{question.id}",
+                json={"resolution": "Take the simpler path."},
+            )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "resolved"
+        assert body["arming"] == "not_armed"
+        assert isinstance(body["reply_message_id"], str)
+
+        await db_session.refresh(question)
+        assert question.status == "resolved"
+        notes = (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.message_type == MessageType.NOTE,
+                    ProjectMessage.from_type == "user",
+                )
+            )
+        ).scalars().all()
+        assert len(notes) == 1
+        assert notes[0].context.get("event_type") == "question_answer"
+        assert notes[0].context.get("answer") == "Take the simpler path."
+        assert body["reply_message_id"] == str(notes[0].id)
+        vision = await self._reload_vision(db_session, project.id)
+        assert strategic_refresh_pending(vision) is False
 
     @pytest.mark.asyncio
     async def test_resolve_feedback_posts_feedback_acknowledgment_note(
@@ -5040,7 +5136,9 @@ class TestMessages:
         )
 
         assert resp.status_code == 200, resp.text
-        assert resp.json()["status"] == "resolved"
+        body = resp.json()
+        assert body["status"] == "resolved"
+        assert body["arming"] == "passive_note"
         await db_session.refresh(feedback)
         assert feedback.status == "resolved"
         assert feedback.resolution == "Deploy summary now cites the active release."
@@ -5068,6 +5166,7 @@ class TestMessages:
         assert session["selected_refs"] == [
             {"kind": "release", "id": "release:v2", "label": "v2 release"}
         ]
+        assert body["reply_message_id"] == str(note.id)
 
     @pytest.mark.asyncio
     async def test_delete_message(self, client: AsyncClient, db_session):
