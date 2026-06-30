@@ -17,6 +17,14 @@ vi.mock('./usePoller', () => ({
 
 const mockFetch = vi.mocked(fetchStrategicState);
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
 function makeState(projectId = 'proj-1'): StrategicStateResponse {
   return {
     project_id: projectId,
@@ -101,6 +109,31 @@ describe('useStrategicReadModel', () => {
     expect(result.current.data).toEqual(state);
     expect(result.current.loading).toBe(false);
     expect(result.current.error).toBeNull();
+  });
+
+  it('ignores a stale response when the selected project changes before fetch resolves', async () => {
+    const slowProjectOne = deferred<StrategicStateResponse>();
+    mockFetch.mockReturnValueOnce(slowProjectOne.promise);
+    const { result, rerender } = renderHook(
+      ({ projectId }: { projectId: string | null }) => useStrategicReadModel(projectId),
+      { initialProps: { projectId: 'proj-1' as string | null } },
+    );
+
+    let refreshPromise: Promise<void> = Promise.resolve();
+    await act(async () => {
+      refreshPromise = result.current.refresh();
+      await Promise.resolve();
+    });
+    act(() => { rerender({ projectId: 'proj-2' }); });
+
+    await act(async () => {
+      slowProjectOne.resolve(makeState('proj-1'));
+      await refreshPromise;
+    });
+
+    expect(result.current.data).toBeNull();
+    expect(result.current.error).toBeNull();
+    expect(result.current.loading).toBe(true);
   });
 
   it('sets error message and clears loading when fetch fails with non-abort error', async () => {

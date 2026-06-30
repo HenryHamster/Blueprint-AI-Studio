@@ -148,6 +148,13 @@ describe('useWorkbenchCommands', () => {
       context_package: {
         resources: [
           {
+            kind: 'canvas',
+            id: 'strategic-canvas:project-1',
+            label: 'Strategic context map',
+            summary: '9 nodes / 12 links',
+            target: { surface: 'project', section: 'problem-model' },
+          },
+          {
             kind: 'artifact',
             id: 'artifact:latest',
             label: 'Latest report',
@@ -173,6 +180,39 @@ describe('useWorkbenchCommands', () => {
             },
           ],
         },
+        drilldowns: [
+          {
+            id: 'runtime',
+            label: 'Runtime',
+            target: { surface: 'runtime', section: 'compute' },
+          },
+        ],
+        evidence: {
+          knowledge: {
+            total: 1,
+            items: [
+              {
+                id: 'operator-notes-deep',
+                kind: 'knowledge_document',
+                label: 'Detailed operator notes',
+                summary: 'Not included in the short resource list',
+                target: { surface: 'knowledge', document_id: 'operator-notes-deep' },
+              },
+            ],
+          },
+          artifacts: {
+            total: 1,
+            items: [
+              {
+                id: 'latest-pr',
+                kind: 'pull_request',
+                label: 'Latest pull request',
+                task_title: 'Validate context command pass',
+                target: { surface: 'task', task_id: 'task-context-2', artifact_id: 'latest-pr' },
+              },
+            ],
+          },
+        },
       },
     } as StrategicStateResponse;
     const strategicWorkbenchState = {
@@ -195,7 +235,13 @@ describe('useWorkbenchCommands', () => {
 
     expect(captured.filter(command => command.label.includes('Latest report'))).toHaveLength(2);
     expect(captured.filter(command => command.id === 'strategic.context.remove.artifact:artifact:latest')).toHaveLength(1);
-    expect(captured.filter(command => command.id.includes('strategic.context.open') && command.id.includes('artifact:artifact:latest'))).toHaveLength(1);
+    expect(captured.filter(command => command.id === 'strategic.context.open.kept.artifact:artifact:latest')).toHaveLength(1);
+
+    captured.find(command => command.id === 'strategic.context.map')?.run();
+    expect(openStrategicContextTarget).toHaveBeenCalledWith({ surface: 'project', section: 'problem-model' });
+
+    captured.find(command => command.id === 'strategic.context.open.drilldown.runtime')?.run();
+    expect(openStrategicContextTarget).toHaveBeenCalledWith({ surface: 'runtime', section: 'compute' });
 
     captured.find(command => command.id === 'strategic.context.open.kept.artifact:artifact:latest')?.run();
     expect(openStrategicContextTarget).toHaveBeenCalledWith(target);
@@ -206,6 +252,16 @@ describe('useWorkbenchCommands', () => {
     expect(updater([])).toEqual([
       { kind: 'knowledge_document', id: 'knowledge:operator-notes', label: 'Operator notes' },
     ]);
+
+    captured.find(command => command.id === 'strategic.context.keep.knowledge_document:knowledge:operator-notes-deep')?.run();
+    expect(updateStrategicSessionRefs).toHaveBeenLastCalledWith(expect.any(Function));
+    updater = updateStrategicSessionRefs.mock.calls.at(-1)?.[0] as (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs'];
+    expect(updater([])).toEqual([
+      { kind: 'knowledge_document', id: 'knowledge:operator-notes-deep', label: 'Detailed operator notes' },
+    ]);
+
+    captured.find(command => command.id === 'strategic.context.open.evidence.artifact:artifact:latest-pr')?.run();
+    expect(openStrategicContextTarget).toHaveBeenCalledWith({ surface: 'task', task_id: 'task-context-2', artifact_id: 'latest-pr' });
 
     captured.find(command => command.id === 'strategic.context.remove.artifact:artifact:latest')?.run();
     expect(updateStrategicSessionRefs).toHaveBeenLastCalledWith(expect.any(Function));

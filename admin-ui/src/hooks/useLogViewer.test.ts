@@ -37,9 +37,15 @@ function setup() {
   return renderHook(() => {
     const fetchTasksRef = useRef<() => void>(vi.fn());
     const fetchDirectionsRef = useRef<() => void>(vi.fn());
+    const refreshStrategicReadModelRef = useRef<() => void>(vi.fn());
     const setDeployState = vi.fn();
-    const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef });
-    return { lv, fetchDirectionsRef };
+    const lv = useLogViewer({
+      fetchTasksRef,
+      setDeployState,
+      fetchDirectionsRef,
+      refreshStrategicReadModelRef,
+    });
+    return { lv, fetchDirectionsRef, refreshStrategicReadModelRef };
   });
 }
 
@@ -85,6 +91,51 @@ describe('useLogViewer strategist events', () => {
     expect(fetchDirections).not.toHaveBeenCalled(); // debounced
     act(() => { vi.advanceTimersByTime(500); });
     expect(fetchDirections).toHaveBeenCalledTimes(1);
+  });
+
+  it('debounces Strategic read-model refreshes for operator workbench events', async () => {
+    const { result } = setup();
+    const ws = await connect(result);
+    const refreshStrategicReadModel = result.current.refreshStrategicReadModelRef.current as ReturnType<typeof vi.fn>;
+    refreshStrategicReadModel.mockClear();
+
+    act(() => {
+      ws.emit({ event: 'task_updated', data: { task_id: 'task-1', status: 'IN_PROGRESS' } });
+      ws.emit({ event: 'message_created', data: { message_id: 'msg-1' } });
+      ws.emit({ event: 'alert_created', data: { alert_id: 'alert-1' } });
+      ws.emit({ event: 'strategic_updated', data: { kind: 'running_update' } });
+    });
+    expect(refreshStrategicReadModel).not.toHaveBeenCalled();
+    act(() => { vi.advanceTimersByTime(499); });
+    expect(refreshStrategicReadModel).not.toHaveBeenCalled();
+    act(() => { vi.advanceTimersByTime(1); });
+    expect(refreshStrategicReadModel).toHaveBeenCalledTimes(1);
+  });
+
+  it('refreshes the Strategic read model for every known workbench-changing event', async () => {
+    const { result } = setup();
+    const ws = await connect(result);
+    const refreshStrategicReadModel = result.current.refreshStrategicReadModelRef.current as ReturnType<typeof vi.fn>;
+    refreshStrategicReadModel.mockClear();
+
+    const events = [
+      'task_updated',
+      'artifact_created',
+      'alert_created',
+      'alert_dismissed',
+      'message_created',
+      'message_updated',
+      'strategic_updated',
+      'strategic_cycle_started',
+      'strategic_cycle_completed',
+    ];
+
+    for (const eventName of events) {
+      refreshStrategicReadModel.mockClear();
+      act(() => { ws.emit({ event: eventName, data: { task_id: 'task-1' } }); });
+      act(() => { vi.advanceTimersByTime(500); });
+      expect(refreshStrategicReadModel, eventName).toHaveBeenCalledTimes(1);
+    }
   });
 
   it('toggles strategistActive on cycle start/completed and refetches on complete', async () => {
@@ -148,11 +199,14 @@ describe('useLogViewer strategist events', () => {
     const { result } = setup();
     const ws = await connect(result);
     const fetchDirections = result.current.fetchDirectionsRef.current as ReturnType<typeof vi.fn>;
+    const refreshStrategicReadModel = result.current.refreshStrategicReadModelRef.current as ReturnType<typeof vi.fn>;
     fetchDirections.mockClear();
+    refreshStrategicReadModel.mockClear();
 
     act(() => { ws.emit({ event: 'pong' }); });
     act(() => { vi.advanceTimersByTime(500); });
     expect(fetchDirections).not.toHaveBeenCalled();
+    expect(refreshStrategicReadModel).not.toHaveBeenCalled();
     expect(result.current.lv.strategistActive).toBe(false);
   });
 

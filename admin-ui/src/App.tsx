@@ -66,7 +66,8 @@ import { buildOptimisticStrategicWorkbench, normalizeStrategicInteractionMode, t
 type StrategicSessionRefs = StrategicWorkbenchState['selected_refs'];
 
 export default function App() {
-  const s = useAppState();
+  const refreshStrategicReadModelRef = useRef<() => void>(() => {});
+  const s = useAppState({ refreshStrategicReadModelRef });
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [drawerWidth, setDrawerWidth] = useState(0);
   // Dedup guard: track the last lastCycleCompletion object we toasted for so a
@@ -443,6 +444,14 @@ export default function App() {
   const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
   const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
   const strategicReadModel = useStrategicReadModel(s.selectedProjectId);
+  useEffect(() => {
+    refreshStrategicReadModelRef.current = () => {
+      void strategicReadModel.refresh();
+    };
+    return () => {
+      refreshStrategicReadModelRef.current = () => {};
+    };
+  }, [strategicReadModel.refresh]);
   const [optimisticStrategicWorkbench, setOptimisticStrategicWorkbench] = useState<StrategicWorkbenchState | null>(null);
   const [savingStrategicWorkbench, setSavingStrategicWorkbench] = useState(false);
   const strategicWorkbenchStateRef = useRef<StrategicWorkbenchState | null>(null);

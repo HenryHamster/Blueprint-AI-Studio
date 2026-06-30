@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, type MutableRefObject } from 'react';
 import type { Task } from './types/task';
 import type { Project } from './types/project';
 import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api';
@@ -38,7 +38,11 @@ export type { DeployState } from './types/settings';
  * Behavior is preserved end-to-end: the domain hooks own their own state and
  * callbacks; only the shape of the source file changed, not the runtime API.
  */
-export function useAppState() {
+interface UseAppStateOptions {
+  refreshStrategicReadModelRef?: MutableRefObject<() => void>;
+}
+
+export function useAppState({ refreshStrategicReadModelRef }: UseAppStateOptions = {}) {
   // ── Composed hooks ──────────────────────────────────────────────────────
   const { user, authLoading, userRole, accessDenied, error, setError } = useAuth();
   const { toasts, addToast, dismissToast } = useToasts();
@@ -84,7 +88,13 @@ export function useAppState() {
     cycleProgress,
     lastCycleCompletion,
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
-  } = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, selectedProjectId });
+  } = useLogViewer({
+    fetchTasksRef,
+    setDeployState,
+    fetchDirectionsRef,
+    refreshStrategicReadModelRef,
+    selectedProjectId,
+  });
 
   const {
     activeTab, setActiveTab,

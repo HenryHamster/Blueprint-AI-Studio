@@ -3,7 +3,16 @@ import type { WorkbenchCommand } from '../components/CommandPalette';
 import type { ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import type { SectionId } from '../components/SettingsDropdown';
-import type { StrategicContextCanvasNode, StrategicContextPackageDrilldown, StrategicContextResourceRef, StrategicStateResponse, StrategicWorkbenchState, StrategicWorkSessionRefDescriptor } from '../strategicStateApi';
+import type {
+  StrategicContextArtifactEvidence,
+  StrategicContextCanvasNode,
+  StrategicContextKnowledgeEvidence,
+  StrategicContextPackageDrilldown,
+  StrategicContextResourceRef,
+  StrategicStateResponse,
+  StrategicWorkbenchState,
+  StrategicWorkSessionRefDescriptor,
+} from '../strategicStateApi';
 import { removeStrategicSelectedRef, upsertStrategicSelectedRef, type StrategicSelectedRef } from '../utils/strategicWorkbenchSession';
 import type { PrimaryTab } from './useUIState';
 import type { ViewMode } from './useViewPreferences';
@@ -66,6 +75,22 @@ function selectedRefFromResource(resource: StrategicContextResourceRef): Strateg
     kind: resource.kind,
     id: resource.id,
     label: resource.label,
+  };
+}
+
+function selectedRefFromKnowledgeEvidence(item: StrategicContextKnowledgeEvidence): StrategicSelectedRef {
+  return {
+    kind: 'knowledge_document',
+    id: item.id.startsWith('knowledge:') ? item.id : `knowledge:${item.id}`,
+    label: item.label ?? item.topic ?? 'Knowledge document',
+  };
+}
+
+function selectedRefFromArtifactEvidence(item: StrategicContextArtifactEvidence): StrategicSelectedRef {
+  return {
+    kind: 'artifact',
+    id: item.id.startsWith('artifact:') ? item.id : `artifact:${item.id}`,
+    label: item.label ?? item.logical_key ?? item.artifact_type ?? 'Artifact',
   };
 }
 
@@ -184,7 +209,7 @@ export function useWorkbenchCommands({
       label: string;
       detail?: string | null;
       target?: StrategicContextTarget | null;
-      origin: 'kept' | 'resource' | 'map';
+      origin: 'kept' | 'resource' | 'map' | 'evidence';
     }) => {
       const key = contextRefKey(source.ref);
       const selected = selectedKeys.has(key);
@@ -217,6 +242,8 @@ export function useWorkbenchCommands({
     if (contextPackage) {
       const resourceCount = contextPackage.resources?.length ?? 0;
       const nodeCount = contextPackage.canvas?.node_count ?? contextPackage.canvas?.nodes?.length ?? 0;
+      const mapTarget = contextPackage.resources?.find(resource => resource.kind === 'canvas')?.target
+        ?? { surface: 'project', section: 'problem-model' };
       addContextCommand({
         id: 'strategic.context.map',
         label: 'Strategic context map',
@@ -224,7 +251,27 @@ export function useWorkbenchCommands({
         detail: `${selectedRefs.length} kept, ${resourceCount} resources, ${nodeCount} nodes`,
         keywords: ['strategic', 'context', 'map', 'canvas', 'kept'],
         disabled: projectDisabled,
-        run: focusStrategicComposer,
+        run: openStrategicContextTarget ? () => openContextTarget(mapTarget) : focusStrategicComposer,
+      });
+      const drilldowns = [
+        ...(contextPackage.drilldowns ?? []),
+        ...(contextPackage.canvas?.drilldowns ?? []),
+      ];
+      const seenDrilldownTargets = new Set<string>();
+      drilldowns.slice(0, 12).forEach(drilldown => {
+        const targetKey = JSON.stringify(drilldown.target ?? {});
+        const key = `${drilldown.id}:${targetKey}`;
+        if (seenDrilldownTargets.has(key)) return;
+        seenDrilldownTargets.add(key);
+        addContextCommand({
+          id: `strategic.context.open.drilldown.${drilldown.id}`,
+          label: `Open context: ${drilldown.label}`,
+          section: 'Context',
+          detail: 'context package',
+          keywords: ['strategic', 'context', 'open', 'drilldown', drilldown.label],
+          disabled: projectDisabled || !openStrategicContextTarget,
+          run: () => openContextTarget(drilldown.target),
+        });
       });
     }
     selectedRefs.slice(0, 12).forEach(ref => {
@@ -266,6 +313,24 @@ export function useWorkbenchCommands({
           origin: 'map',
         });
       });
+    (contextPackage?.evidence?.knowledge?.items ?? []).slice(0, 8).forEach(item => {
+      addRefCommands({
+        ref: selectedRefFromKnowledgeEvidence(item),
+        label: item.label ?? item.topic ?? 'Knowledge document',
+        detail: item.summary ?? item.source_kind ?? null,
+        target: item.target,
+        origin: 'evidence',
+      });
+    });
+    (contextPackage?.evidence?.artifacts?.items ?? []).slice(0, 8).forEach(item => {
+      addRefCommands({
+        ref: selectedRefFromArtifactEvidence(item),
+        label: item.label ?? item.logical_key ?? item.artifact_type ?? 'Artifact',
+        detail: item.task_title ?? item.artifact_type ?? null,
+        target: item.target,
+        origin: 'evidence',
+      });
+    });
     const strategicModeCommands: Array<{
       id: string;
       mode: StrategicInteractionMode;

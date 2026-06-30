@@ -8,6 +8,7 @@ interface UseLogViewerDeps {
   fetchTasksRef: React.MutableRefObject<() => void>;
   setDeployState: (ds: DeployState) => void;
   fetchDirectionsRef?: React.MutableRefObject<() => void>;
+  refreshStrategicReadModelRef?: React.MutableRefObject<() => void>;
   selectedProjectId?: string | null;
 }
 
@@ -45,7 +46,25 @@ export interface StrategicCycleCompletion {
 
 let _trackLogIdCounter = 0;
 
-export function useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, selectedProjectId }: UseLogViewerDeps) {
+const STRATEGIC_READ_MODEL_REFRESH_EVENTS = new Set([
+  'task_updated',
+  'artifact_created',
+  'alert_created',
+  'alert_dismissed',
+  'message_created',
+  'message_updated',
+  'strategic_updated',
+  'strategic_cycle_started',
+  'strategic_cycle_completed',
+]);
+
+export function useLogViewer({
+  fetchTasksRef,
+  setDeployState,
+  fetchDirectionsRef,
+  refreshStrategicReadModelRef,
+  selectedProjectId,
+}: UseLogViewerDeps) {
   const [logTask, setLogTask] = useState<Task | null>(null);
   const [logLines, setLogLines] = useState<string[]>([]);
   const [logsConnecting, setLogsConnecting] = useState(false);
@@ -65,6 +84,7 @@ export function useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef
   const wsReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchTasksDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fetchDirectionsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const refreshStrategicReadModelDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsPingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastPongRef = useRef<number>(0);
   const wsPongTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -123,6 +143,9 @@ export function useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef
       if (fetchDirectionsDebounceRef.current) {
         clearTimeout(fetchDirectionsDebounceRef.current);
       }
+      if (refreshStrategicReadModelDebounceRef.current) {
+        clearTimeout(refreshStrategicReadModelDebounceRef.current);
+      }
     };
   }, []);
 
@@ -161,6 +184,17 @@ export function useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef
       return next;
     });
   }, []);
+
+  const refreshStrategicReadModel = useCallback(() => {
+    if (!refreshStrategicReadModelRef?.current) return;
+    if (refreshStrategicReadModelDebounceRef.current) {
+      clearTimeout(refreshStrategicReadModelDebounceRef.current);
+    }
+    refreshStrategicReadModelDebounceRef.current = setTimeout(() => {
+      refreshStrategicReadModelDebounceRef.current = null;
+      refreshStrategicReadModelRef.current();
+    }, 500);
+  }, [refreshStrategicReadModelRef]);
 
   // Shared WS message handler — dispatches to log drawer AND tracked tasks
   const handleWsMessage = useCallback((event: MessageEvent) => {
@@ -223,6 +257,9 @@ export function useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef
         if (fetchTasksDebounceRef.current) clearTimeout(fetchTasksDebounceRef.current);
         fetchTasksDebounceRef.current = setTimeout(() => { fetchTasksRef.current(); }, 500);
       }
+      if (STRATEGIC_READ_MODEL_REFRESH_EVENTS.has(msg.event)) {
+        refreshStrategicReadModel();
+      }
 
       // Strategist activity events — drive a live refresh of the directions view.
       // These only trigger refetches (the data still comes from the REST endpoints);
@@ -256,7 +293,7 @@ export function useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef
     } catch {
       // ignore parse errors
     }
-  }, [appendTrackLog, setDeployState, fetchTasksRef, fetchDirectionsRef]);
+  }, [appendTrackLog, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel]);
 
   const connectWs = useCallback(async (projectId: string) => {
     try {
