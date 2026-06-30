@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +22,7 @@ from app.models import _utcnow
 
 WORKBENCH_STATE_KEY = "_strategic_workbench"
 WORKBENCH_STATE_MAX_BYTES = 50_000
+SESSION_IDLE_TTL_SECONDS = 14_400  # 4 hours
 
 _ALLOWED_INTERACTION_MODES = frozenset(
     {"chat", "check_in", "monitor", "continuous"}
@@ -215,11 +217,43 @@ def sanitize_workbench_state(
     }
 
 
+def _effective_last_active(state: dict[str, Any]) -> str | None:
+    """Return the best freshness timestamp for TTL purposes.
+
+    Prefers last_interaction_at (written on every save); falls back to
+    session_started_at for legacy rows where the interaction field was never
+    populated.
+    """
+    return state.get("last_interaction_at") or state.get("session_started_at")
+
+
+def _workbench_session_expired(state: dict[str, Any]) -> bool:
+    """Return True when the session has been idle longer than SESSION_IDLE_TTL_SECONDS."""
+    ts = _effective_last_active(state)
+    if not ts:
+        return False
+    try:
+        last_active = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return False
+    elapsed = (_utcnow() - last_active).total_seconds()
+    return elapsed > SESSION_IDLE_TTL_SECONDS
+
+
 def workbench_state_from_prefs(prefs: dict[str, Any] | None) -> dict[str, Any]:
     raw = (prefs or {}).get(WORKBENCH_STATE_KEY)
     if raw is None:
         return default_workbench_state()
-    return sanitize_workbench_state(raw, touch=False)
+    state = sanitize_workbench_state(raw, touch=False)
+    if _workbench_session_expired(state):
+        state = {
+            **state,
+            "interaction_mode": "chat",
+            "active_surface": "strategic",
+            "selected_refs": [],
+            "session_started_at": None,
+        }
+    return state
 
 
 def workbench_mode_should_arm_strategic_refresh(

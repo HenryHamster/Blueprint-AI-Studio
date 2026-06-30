@@ -1,5 +1,8 @@
 import type { ProjectMessageContext } from '../types/messages';
 import type { StrategicStateResponse, StrategicWorkbenchState } from '../strategicStateApi';
+import { parseTimestamp } from './time';
+
+export const SESSION_IDLE_TTL_MS = 14_400_000; // 4 hours — mirror of backend SESSION_IDLE_TTL_SECONDS
 
 interface StrategicContextRefDescriptor {
   id: string;
@@ -22,11 +25,20 @@ type StrategicSessionLike = {
   interaction_mode?: string | null;
   active_surface?: string | null;
   session_started_at?: string | null;
+  last_interaction_at?: string | null;
   context_package_id?: string | null;
   selected_refs?: StrategicWorkbenchState['selected_refs'];
   selected_ref_descriptors?: Array<StrategicContextRefDescriptor>;
   captured_at?: string | null;
 };
+
+function isSessionFresh(session: StrategicSessionLike): boolean {
+  const ts = session.last_interaction_at ?? session.session_started_at;
+  if (!ts) return false;
+  const parsed = parseTimestamp(ts);
+  if (isNaN(parsed.getTime())) return false;
+  return Date.now() - parsed.getTime() <= SESSION_IDLE_TTL_MS;
+}
 
 function modeLabel(mode?: string | null): string {
   if (mode === 'check_in') return 'Check-in';
@@ -61,13 +73,23 @@ function contextLabel(status?: string | null, hasContextPackage?: boolean): stri
   return hasContextPackage ? 'Context captured' : null;
 }
 
+export function isSessionStartedAtStale(session: StrategicSessionLike): boolean {
+  const ts = session.last_interaction_at ?? session.session_started_at;
+  if (!ts) return false;
+  return !isSessionFresh(session);
+}
+
 function hasStrategicSignal(session: StrategicSessionLike): boolean {
+  const fresh = isSessionFresh(session);
   return Boolean(
-    (session.selected_refs?.length ?? 0) > 0 ||
-    session.interaction_mode && session.interaction_mode !== 'chat' ||
-    session.active_surface && session.active_surface !== 'strategic' ||
-    session.session_started_at ||
-    session.context_package_id,
+    session.context_package_id ||
+    (fresh && (
+      (session.selected_refs?.length ?? 0) > 0 ||
+      session.interaction_mode && session.interaction_mode !== 'chat' ||
+      session.active_surface && session.active_surface !== 'strategic' ||
+      Boolean(session.session_started_at) ||
+      Boolean(session.last_interaction_at)
+    )),
   );
 }
 
@@ -96,12 +118,41 @@ function buildDescriptor(
   contextStatus?: string | null,
 ): StrategicContextDescriptorModel | null {
   if (!hasStrategicSignal(session)) return null;
+  const fresh = isSessionFresh(session);
+  const refs = fresh ? buildRefs(session, session.selected_ref_descriptors) : [];
+  return {
+    modeLabel: fresh ? modeLabel(session.interaction_mode) : 'Chat',
+    surfaceLabel: fresh ? surfaceLabel(session.active_surface) : 'Strategic',
+    contextLabel: contextLabel(contextStatus, Boolean(session.context_package_id)),
+    contextTone: contextTone(contextStatus),
+    refCount: refs.length,
+    refs: refs.slice(0, 3),
+    capturedAt: session.captured_at ?? null,
+  };
+}
+
+function hasCapturedStrategicSignal(session: StrategicSessionLike): boolean {
+  return Boolean(
+    session.context_package_id ||
+    (session.selected_refs?.length ?? 0) > 0 ||
+    session.interaction_mode && session.interaction_mode !== 'chat' ||
+    session.active_surface && session.active_surface !== 'strategic' ||
+    session.session_started_at ||
+    session.last_interaction_at ||
+    session.captured_at
+  );
+}
+
+function buildCapturedDescriptor(
+  session: StrategicSessionLike,
+): StrategicContextDescriptorModel | null {
+  if (!hasCapturedStrategicSignal(session)) return null;
   const refs = buildRefs(session, session.selected_ref_descriptors);
   return {
     modeLabel: modeLabel(session.interaction_mode),
     surfaceLabel: surfaceLabel(session.active_surface),
-    contextLabel: contextLabel(contextStatus, Boolean(session.context_package_id)),
-    contextTone: contextTone(contextStatus),
+    contextLabel: contextLabel(null, Boolean(session.context_package_id)),
+    contextTone: 'neutral',
     refCount: refs.length,
     refs: refs.slice(0, 3),
     capturedAt: session.captured_at ?? null,
@@ -120,6 +171,7 @@ export function buildStrategicContextDescriptor(
       interaction_mode: workbench?.interaction_mode ?? session?.mode ?? 'chat',
       active_surface: workbench?.active_surface ?? session?.active_surface ?? 'strategic',
       session_started_at: workbench?.session_started_at ?? session?.session_started_at ?? null,
+      last_interaction_at: workbench?.last_interaction_at ?? session?.last_interaction_at ?? null,
       context_package_id: session?.context_package_id ?? state?.context_package?.id ?? null,
       selected_refs: selectedRefs,
       selected_ref_descriptors: state?.work_session?.selected_ref_descriptors ?? [],
@@ -172,10 +224,11 @@ export function buildMessageStrategicContextDescriptor(
 ): StrategicContextDescriptorModel | null {
   const snapshot = asRecord(context.strategic_session);
   if (!snapshot) return null;
-  return buildDescriptor({
+  return buildCapturedDescriptor({
     interaction_mode: asString(snapshot.interaction_mode) ?? 'chat',
     active_surface: asString(snapshot.active_surface) ?? 'strategic',
     session_started_at: asString(snapshot.session_started_at),
+    last_interaction_at: asString(snapshot.last_interaction_at),
     context_package_id: asString(snapshot.context_package_id),
     selected_refs: parseSelectedRefs(snapshot.selected_refs),
     selected_ref_descriptors: parseRefDescriptors(snapshot.selected_ref_descriptors),

@@ -35,6 +35,7 @@ from app.release_artifacts import required_release_artifact_kinds
 from app.release_promotion import _notify_operator, _resolve_github_with_session
 from app.release_reconciliation import (
     _confirm_serving_or_fail,
+    _reconcile_if_ci_unresolved_now_green,
     _reconcile_if_deploy_failed_recovered,
     _reconcile_if_managed_check_wait,
     _reconcile_if_not_promoted_but_pr_merged,
@@ -1047,6 +1048,32 @@ async def sweep_stuck_qualifications(
                 "[RELEASE_QUALIFIER] sweep auto-staled %d finding(s) for "
                 "version %s (automain advanced past candidate SHA)",
                 staled,
+                version_id,
+            )
+
+    # Re-drive quiescent ``not_promoted`` versions whose only blocker was the
+    # transient ``ci_unresolved`` state.  If automain still equals the stored
+    # candidate SHA and CI has since gone green, Guard 3 must not treat the
+    # stale transient verdict as settled; this reconciliation path triggers the
+    # fresh qualification before the generic stale-not-promoted loop below.
+    for version_id in version_ids:
+        try:
+            reconciled = await _reconcile_if_ci_unresolved_now_green(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: ci_unresolved-now-green reconcile "
+                "failed for version %s",
+                version_id,
+            )
+            continue
+        if reconciled:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove ci_unresolved version %s "
+                "(CI green on unchanged automain — qualification spawned)",
                 version_id,
             )
 

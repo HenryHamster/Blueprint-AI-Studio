@@ -1,6 +1,8 @@
 import type { PrimaryTab } from '../hooks/useUIState';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import type { StrategicWorkbenchState } from '../strategicStateApi';
+import { SESSION_IDLE_TTL_MS } from './strategicContextDescriptor';
+import { parseTimestamp } from './time';
 
 export const MAX_STRATEGIC_SELECTED_REFS = 12;
 export type StrategicSelectedRef = StrategicWorkbenchState['selected_refs'][number];
@@ -70,11 +72,20 @@ export function removeStrategicSelectedRef(
     .filter(existing => !(existing.kind === ref.kind && existing.id === ref.id));
 }
 
+function isBaseSessionStale(base: StrategicWorkbenchState | null | undefined): boolean {
+  const ts = base?.last_interaction_at ?? base?.session_started_at;
+  if (!ts) return false;
+  const parsed = parseTimestamp(ts);
+  if (isNaN(parsed.getTime())) return false;
+  return Date.now() - parsed.getTime() > SESSION_IDLE_TTL_MS;
+}
+
 export function buildOptimisticStrategicWorkbench(
   base: StrategicWorkbenchState | null | undefined,
   patch: Partial<StrategicWorkbenchState>,
 ): StrategicWorkbenchState {
   const now = new Date().toISOString();
+  const baseSessionStartedAt = !isBaseSessionStale(base) ? (base?.session_started_at ?? null) : null;
   return {
     version: 1,
     interaction_mode: normalizeStrategicInteractionMode(
@@ -84,7 +95,7 @@ export function buildOptimisticStrategicWorkbench(
     selected_refs: normalizeStrategicSelectedRefs(
       Array.isArray(patch.selected_refs) ? patch.selected_refs : base?.selected_refs ?? [],
     ),
-    session_started_at: base?.session_started_at ?? now,
+    session_started_at: baseSessionStartedAt ?? now,
     last_interaction_at: now,
   };
 }

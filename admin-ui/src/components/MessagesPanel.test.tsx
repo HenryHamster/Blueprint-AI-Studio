@@ -663,6 +663,8 @@ describe('MessagesPanel chrome modes', () => {
   });
 
   test('minimal chat composer shows optimistic Strategic session context descriptor', async () => {
+    const sessionStartedAt = new Date(Date.now() - 30 * 60_000).toISOString();
+    const lastInteractionAt = new Date(Date.now() - 5 * 60_000).toISOString();
     const el = await renderPanel({
       filterChrome: 'minimal',
       strategicState: makeStrategicState({
@@ -671,8 +673,8 @@ describe('MessagesPanel chrome modes', () => {
           id: 'strategic-session:proj-1:2026-06-29T01:00:00Z',
           mode: 'continuous',
           active_surface: 'strategic',
-          session_started_at: '2026-06-29T01:00:00Z',
-          last_interaction_at: '2026-06-29T01:08:00Z',
+          session_started_at: sessionStartedAt,
+          last_interaction_at: lastInteractionAt,
           context_package_id: 'strategic-context:proj-1',
           attention_level: 'needs_operator',
           selected_refs: [
@@ -696,8 +698,8 @@ describe('MessagesPanel chrome modes', () => {
         selected_refs: [
           { kind: 'artifact', id: 'artifact:operator-context-report', label: 'Latest context report' },
         ],
-        session_started_at: '2026-06-29T01:00:00Z',
-        last_interaction_at: '2026-06-29T01:09:00Z',
+        session_started_at: sessionStartedAt,
+        last_interaction_at: lastInteractionAt,
       },
     });
 
@@ -4127,6 +4129,8 @@ describe('MessagesPanel send arming receipt', () => {
   });
 
   test('answering a question refreshes Strategic state for attention counts', async () => {
+    const sessionStartedAt = new Date(Date.now() - 30 * 60_000).toISOString();
+    const lastInteractionAt = new Date(Date.now() - 5 * 60_000).toISOString();
     const question = makeMsg({
       id: 'q-refresh',
       message_type: 'QUESTION',
@@ -4141,16 +4145,16 @@ describe('MessagesPanel send arming receipt', () => {
     const onStrategicInteraction = vi.fn();
     const el = await renderPanel(addToast, false, {
       strategicState: makeStrategicState(),
-      strategicWorkbenchState: {
-        version: 1,
-        interaction_mode: 'continuous',
-        active_surface: 'strategic',
-        selected_refs: [
-          { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
-        ],
-        session_started_at: '2026-06-29T01:00:00Z',
-        last_interaction_at: '2026-06-29T01:08:00Z',
-      },
+        strategicWorkbenchState: {
+          version: 1,
+          interaction_mode: 'continuous',
+          active_surface: 'strategic',
+          selected_refs: [
+            { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
+          ],
+          session_started_at: sessionStartedAt,
+          last_interaction_at: lastInteractionAt,
+        },
       onStrategicStateRefresh,
       onStrategicInteraction,
     });
@@ -4170,7 +4174,7 @@ describe('MessagesPanel send arming receipt', () => {
         selected_refs: [
           { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
         ],
-        session_started_at: '2026-06-29T01:00:00Z',
+        session_started_at: sessionStartedAt,
       },
     });
     expect(onStrategicStateRefresh).toHaveBeenCalledTimes(1);
@@ -4998,6 +5002,8 @@ describe('MessagesPanel composer draft persistence', () => {
     const draftKey = 'messages_composer_draft:test-user@example.com:proj-draft';
     localStorage.setItem(draftKey, JSON.stringify({ type: 'BLOCKER', content: 'use the clean chat path' }));
     const postedBodies: unknown[] = [];
+    const sessionStartedAt = new Date(Date.now() - 30 * 60_000).toISOString();
+    const lastInteractionAt = new Date(Date.now() - 5 * 60_000).toISOString();
 
     (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
       const urlStr = String(url);
@@ -5032,8 +5038,8 @@ describe('MessagesPanel composer draft persistence', () => {
             id: 'strategic-session:proj-draft:2026-06-29T01:00:00Z',
             mode: 'continuous',
             active_surface: 'strategic',
-            session_started_at: '2026-06-29T01:00:00Z',
-            last_interaction_at: '2026-06-29T01:08:00Z',
+            session_started_at: sessionStartedAt,
+            last_interaction_at: lastInteractionAt,
             context_package_id: 'strategic-context:proj-draft',
             attention_level: 'watch',
             selected_refs: [
@@ -5056,8 +5062,8 @@ describe('MessagesPanel composer draft persistence', () => {
           selected_refs: [
             { kind: 'artifact', id: 'artifact:latest-context', label: 'Latest context report' },
           ],
-          session_started_at: '2026-06-29T01:00:00Z',
-          last_interaction_at: '2026-06-29T01:09:00Z',
+          session_started_at: sessionStartedAt,
+          last_interaction_at: lastInteractionAt,
         }}
       />,
     );
@@ -5087,10 +5093,88 @@ describe('MessagesPanel composer draft persistence', () => {
         selected_refs: [
           { kind: 'artifact', id: 'artifact:latest-context', label: 'Latest context report' },
         ],
-        session_started_at: '2026-06-29T01:00:00Z',
+        session_started_at: sessionStartedAt,
         context_package_id: 'strategic-context:proj-draft',
       },
     });
+  });
+
+  test('stale Strategic workbench state does not keep routing workbench_context', async () => {
+    const staleNaive = new Date(Date.now() - 5 * 3600_000).toISOString().replace('Z', '');
+    const postedBodies: unknown[] = [];
+
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const initObj = init as RequestInit | undefined;
+      const method = initObj?.method ?? 'GET';
+      if (method === 'POST' && urlStr.includes('/api/admin/messages')) {
+        postedBodies.push(JSON.parse(String(initObj?.body ?? '{}')));
+        return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
+      }
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+
+    _suppressSinceLastVisit('test-user@example.com', 'proj-draft');
+    const { container, getByText } = render(
+      <MessagesPanel
+        selectedProjectId="proj-draft"
+        variant="page"
+        filterChrome="minimal"
+        showCloseButton={false}
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        strategicState={makeStrategicState({
+          context_package: null,
+          work_session: {
+            version: 1,
+            id: 'strategic-session:proj-draft',
+            mode: 'continuous',
+            active_surface: 'pipeline',
+            session_started_at: staleNaive,
+            last_interaction_at: null,
+            context_package_id: null,
+            attention_level: 'clear',
+            selected_refs: [
+              { kind: 'artifact', id: 'artifact:stale', label: 'Stale ref' },
+            ],
+            selected_ref_descriptors: [],
+            curated_metrics: [],
+          },
+        })}
+        strategicWorkbenchState={{
+          version: 1,
+          interaction_mode: 'continuous',
+          active_surface: 'pipeline',
+          selected_refs: [
+            { kind: 'artifact', id: 'artifact:stale', label: 'Stale ref' },
+          ],
+          session_started_at: staleNaive,
+          last_interaction_at: null,
+        }}
+      />,
+    );
+    await waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1));
+
+    const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
+    expect(textarea.value).toBe('');
+
+    const { fireEvent } = await import('@testing-library/react');
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: 'stale workbench should not route' } });
+    });
+
+    await act(async () => {
+      getByText('Send').click();
+    });
+
+    await waitFor(() => expect(postedBodies).toHaveLength(1));
+    expect(postedBodies[0]).not.toHaveProperty('workbench_context');
   });
 
   test('draft is scoped per project — switching projects loads the new project draft', async () => {

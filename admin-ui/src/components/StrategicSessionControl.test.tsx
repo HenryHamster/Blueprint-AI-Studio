@@ -83,6 +83,31 @@ describe('StrategicSessionControl', () => {
     expect(onOpenCompute).toHaveBeenCalledTimes(1);
   });
 
+  it('test_active_count_matches_rail_for_parked_wakes', async () => {
+    const onOpenCompute = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <StrategicSessionControl
+        currentMode="monitor"
+        runtimeWorkStatus={{
+          status: 'running',
+          compute_jobs: { counts: { active: 0 } },
+          parked_wakes: { counts: { active: 1 } },
+        }}
+        onModeChange={vi.fn()}
+        onOpenCompute={onOpenCompute}
+      />,
+    );
+
+    const compute = screen.getByRole('button', { name: /open compute: runtime work active, 1 active/i });
+    expect(compute).toHaveAttribute('title', 'Open compute');
+    expect(screen.getByText('Active')).toBeInTheDocument();
+
+    await user.click(compute);
+    expect(onOpenCompute).toHaveBeenCalledTimes(1);
+  });
+
   it('does not make idle runtime work open compute', () => {
     render(
       <StrategicSessionControl

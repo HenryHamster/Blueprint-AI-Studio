@@ -969,6 +969,146 @@ async def _reconcile_if_not_promoted_but_pr_merged(
             return False
 
 
+async def _reconcile_if_ci_unresolved_now_green(
+    version_id: uuid.UUID,
+    *,
+    session_factory=None,
+) -> bool:
+    """Re-qualify a quiescent not_promoted/ci_unresolved version once CI is green.
+
+    ``ci_unresolved`` means the prior finalization saw pending or absent CI, not
+    a settled quality failure.  If automain still points at that exact candidate
+    SHA and CI later resolves green, re-run qualification on the same candidate.
+    When automain has advanced, the existing stale-not-promoted re-drive owns the
+    fresh-SHA path.
+
+    Returns True iff a new qualification was spawned.
+    """
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            version: release_version.ReleaseVersion | None = (
+                (
+                    await session.execute(
+                        select(release_version.ReleaseVersion)
+                        .where(release_version.ReleaseVersion.id == version_id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if version is None:
+                return False
+            if version.status != "open" or version.phase != "stabilize":
+                return False
+            qual = version.last_qualification or {}
+            if qual.get("status") != "not_promoted":
+                return False
+            if qual.get("blocker") != "ci_unresolved":
+                return False
+            candidate_sha: str | None = qual.get("candidate_sha")
+            if not candidate_sha:
+                return False
+
+            project = await session.get(Project, version.project_id)
+            if project is None:
+                return False
+            integration_branch, _promotion_target = _lts_branch_names(project)
+
+            try:
+                await session.commit()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
+                    "failed to release row lock for v%d — skipping",
+                    version.version_number,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
+                        "rollback failed for v%d after commit error",
+                        version.version_number,
+                    )
+                return False
+
+            resolved = await _resolve_github_with_session(session, project)
+            if resolved is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
+                    "no GitHub credentials for v%d — skipping",
+                    version.version_number,
+                )
+                return False
+            token, owner, repo = resolved
+
+            try:
+                automain_sha = await github.get_branch_sha(
+                    token,
+                    owner,
+                    repo,
+                    integration_branch,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
+                    "could not resolve %s HEAD SHA for v%d (%s) — skipping",
+                    integration_branch,
+                    version.version_number,
+                    exc,
+                )
+                return False
+            if automain_sha != candidate_sha:
+                return False
+
+            from app import release_qualifier as _rq_mod
+
+            ci_resolution = await _rq_mod._resolve_candidate_ci(
+                token,
+                owner,
+                repo,
+                candidate_sha,
+                project_id=str(version.project_id),
+            )
+            if ci_resolution.get("state") != _CI_GREEN or not ci_resolution.get(
+                "ci_green"
+            ):
+                return False
+
+            logger.info(
+                "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
+                "candidate %s for v%d now has green CI on unchanged automain — "
+                "spawning fresh qualification",
+                candidate_sha[:8],
+                version.version_number,
+            )
+            result = await _rq_mod.run_qualification(
+                session, version.project_id, version
+            )
+            if result and result.get("status") == "spawned":
+                await session.commit()
+                return True
+            await session.rollback()
+            return False
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
+                "unexpected error for version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
+                    "rollback failed for version %s after unexpected error",
+                    version_id,
+                )
+            return False
+
+
 async def _reconcile_if_pending_auto_merge_landed(
     version_id: uuid.UUID,
     *,

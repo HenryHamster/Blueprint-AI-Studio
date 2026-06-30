@@ -226,8 +226,9 @@ function runtimeTone(status: StrategicRuntimeWorkStatus): Tone {
 
 function runtimeActiveCount(status: StrategicRuntimeWorkStatus): number {
   const counts = runtimeComputeCounts(status);
-  return firstCount(status.runningCount, status.activeCount, counts?.active)
-    ?? (firstCount(counts?.running) ?? 0) + (firstCount(counts?.polling) ?? 0) + runtimeParkedWakeActiveCount(status);
+  const computeActive = firstCount(status.runningCount, status.activeCount, counts?.active)
+    ?? (firstCount(counts?.running) ?? 0) + (firstCount(counts?.polling) ?? 0);
+  return computeActive + runtimeParkedWakeActiveCount(status);
 }
 
 function runtimeIsUseful(status: StrategicRuntimeWorkStatus): boolean {

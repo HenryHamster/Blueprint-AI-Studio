@@ -6867,6 +6867,63 @@ async def test_run_qualification_cached_not_promoted_same_sha_is_noop(
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_ci_unresolved_bypasses_cached_verdict(
+    db_session, mocker
+):
+    """A same-SHA not_promoted/ci_unresolved verdict is transient, not cached."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "ciunres0" * 5
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "ci_unresolved",
+        "ci_green": False,
+        "ci_resolution": {"state": "pending", "ci_green": False},
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate_sha),
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["candidate_sha"] == candidate_sha
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_cached_promoted_same_sha_is_noop(db_session, mocker):
     """Idempotent qualification: when a conclusive promoted verdict exists
     for this candidate_sha and automain HEAD still equals it, run_qualification
@@ -14627,6 +14684,110 @@ async def test_sweep_leaves_not_promoted_when_head_unchanged(db_session, mocker)
     await db_session.refresh(version)
     # Still not_promoted — cached_verdict guard fired.
     assert version.last_qualification["status"] == "not_promoted"
+    assert await _audit_tasks(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
+async def test_sweep_requalifies_ci_unresolved_when_ci_now_green(db_session, mocker):
+    """A quiescent ci_unresolved verdict requalifies once same-SHA CI is green."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate_sha = "ciunres0" * 5
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "ci_unresolved",
+        "ci_green": False,
+        "ci_resolution": {"state": "pending", "ci_green": False},
+        "confidence": 0.0,
+        "audit_findings": [],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate_sha),
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 1
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_ci_unresolved_noop_when_still_pending(db_session, mocker):
+    """A same-SHA ci_unresolved verdict remains untouched while CI is pending."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate_sha = "ciunres0" * 5
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "ci_unresolved",
+        "ci_green": False,
+        "ci_resolution": {"state": "pending", "ci_green": False},
+        "confidence": 0.0,
+        "audit_findings": [],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate_sha),
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "pending",
+                "ci_green": False,
+                "resolved_sha": candidate_sha,
+                "detail": "checks pending",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 0
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+    assert version.last_qualification["blocker"] == "ci_unresolved"
     assert await _audit_tasks(db_session, project.id) == []
 
 

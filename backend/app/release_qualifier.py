@@ -120,6 +120,7 @@ from app.release_promotion import (
     promote,
 )
 from app.release_reconciliation import (
+    _reconcile_if_ci_unresolved_now_green,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_deploy_failed_recovered,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_not_promoted_but_pr_merged,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_pending_auto_merge_landed,  # noqa: F401 — re-exported for back-compat
@@ -1346,11 +1347,20 @@ async def run_qualification(
     # Infra/error outcomes are non-conclusive; they must re-run when the
     # qualification is re-requested.  Once automain moves to a new commit, that
     # new candidate is unscored and a fresh qualification is always permitted.
+    # ``ci_unresolved`` is the narrow transient exception: a same-SHA
+    # not_promoted verdict may re-run once the fresh CI snapshot is green.
     prior_qual = version.last_qualification or {}
     prior_status = prior_qual.get("status")
+    ci_unresolved_recovered_same_sha = (
+        prior_status == "not_promoted"
+        and prior_qual.get("blocker") == "ci_unresolved"
+        and prior_qual.get("candidate_sha") == candidate_sha
+        and ci_green
+    )
     if (
         prior_status in _CONCLUSIVE_VERDICT_STATUSES
         and prior_qual.get("candidate_sha") == candidate_sha
+        and not ci_unresolved_recovered_same_sha
     ):
         logger.info(
             "[RELEASE_QUALIFIER] run_qualification: version v%d already has a "

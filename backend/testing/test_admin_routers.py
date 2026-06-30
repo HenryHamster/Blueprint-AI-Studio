@@ -5939,6 +5939,91 @@ class TestMessagesWorkbenchState:
         )
         assert put_resp.status_code == 404
 
+    @pytest.mark.asyncio
+    async def test_workbench_state_from_prefs_decays_stale_session(
+        self, client: AsyncClient, db_session
+    ):
+        """workbench_state_from_prefs clears session_started_at when idle > 4 hours."""
+        from app.workbench_state import workbench_state_from_prefs, SESSION_IDLE_TTL_SECONDS, WORKBENCH_STATE_KEY
+
+        stale_ts = (
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(seconds=SESSION_IDLE_TTL_SECONDS + 60)
+        ).isoformat()
+        prefs = {
+            WORKBENCH_STATE_KEY: {
+                "version": 1,
+                "interaction_mode": "check_in",
+                "active_surface": "strategic",
+                "selected_refs": [],
+                "session_started_at": stale_ts,
+                "last_interaction_at": stale_ts,
+            }
+        }
+        result = workbench_state_from_prefs(prefs)
+        assert result["session_started_at"] is None, (
+            "Stale session must decay: session_started_at should be None when last_interaction_at exceeds TTL"
+        )
+        assert result["interaction_mode"] == "chat"
+        assert result["active_surface"] == "strategic"
+        assert result["selected_refs"] == []
+
+    @pytest.mark.asyncio
+    async def test_workbench_state_from_prefs_keeps_recent_session(
+        self, client: AsyncClient, db_session
+    ):
+        """workbench_state_from_prefs preserves session_started_at for fresh sessions."""
+        from app.workbench_state import workbench_state_from_prefs, SESSION_IDLE_TTL_SECONDS, WORKBENCH_STATE_KEY
+
+        recent_ts = (
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(seconds=SESSION_IDLE_TTL_SECONDS - 60)
+        ).isoformat()
+        started_ts = (
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(hours=2)
+        ).isoformat()
+        prefs = {
+            WORKBENCH_STATE_KEY: {
+                "version": 1,
+                "interaction_mode": "continuous",
+                "active_surface": "pipeline",
+                "selected_refs": [],
+                "session_started_at": started_ts,
+                "last_interaction_at": recent_ts,
+            }
+        }
+        result = workbench_state_from_prefs(prefs)
+        assert result["session_started_at"] == started_ts, (
+            "Recent session must not decay: session_started_at should be preserved"
+        )
+
+    @pytest.mark.asyncio
+    async def test_workbench_state_from_prefs_legacy_fallback_decays_stale_session_started_at(
+        self, client: AsyncClient, db_session
+    ):
+        """Legacy rows with no last_interaction_at fall back to session_started_at for TTL."""
+        from app.workbench_state import workbench_state_from_prefs, SESSION_IDLE_TTL_SECONDS, WORKBENCH_STATE_KEY
+
+        stale_ts = (
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(seconds=SESSION_IDLE_TTL_SECONDS + 3600)
+        ).isoformat()
+        prefs = {
+            WORKBENCH_STATE_KEY: {
+                "version": 1,
+                "interaction_mode": "check_in",
+                "active_surface": "strategic",
+                "selected_refs": [],
+                "session_started_at": stale_ts,
+                "last_interaction_at": None,
+            }
+        }
+        result = workbench_state_from_prefs(prefs)
+        assert result["session_started_at"] is None, (
+            "Legacy session with stale session_started_at (no last_interaction_at) must decay"
+        )
+
 
 class TestMessagesSavedViews:
     @pytest.mark.asyncio

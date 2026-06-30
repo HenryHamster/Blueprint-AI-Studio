@@ -24,7 +24,7 @@ import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { DirectionsAddForm } from './DirectionsAddForm';
 import type { StrategicContextPackageDescriptor, StrategicMessageTarget, StrategicStateResponse, StrategicWorkbenchState } from '../strategicStateApi';
-import { buildStrategicContextDescriptor } from '../utils/strategicContextDescriptor';
+import { buildStrategicContextDescriptor, SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -144,14 +144,16 @@ function buildMessageWorkbenchContext(
   const interactionMode = workbench?.interaction_mode ?? session?.mode ?? 'chat';
   const activeSurface = workbench?.active_surface ?? session?.active_surface ?? 'strategic';
   const sessionStartedAt = workbench?.session_started_at ?? session?.session_started_at ?? null;
+  const lastInteractionAt = workbench?.last_interaction_at ?? session?.last_interaction_at ?? null;
   const contextPackageId = session?.context_package_id ?? state?.context_package?.id ?? null;
-  const hasSignal =
-    selectedRefs.length > 0 ||
-    interactionMode !== 'chat' ||
-    activeSurface !== 'strategic' ||
-    Boolean(sessionStartedAt) ||
-    Boolean(contextPackageId);
-  if (!hasSignal) return null;
+  const sessionFreshTs = lastInteractionAt ?? sessionStartedAt;
+  const sessionIsFresh = sessionFreshTs != null && (() => {
+    const parsed = parseTimestamp(sessionFreshTs);
+    return !isNaN(parsed.getTime()) && Date.now() - parsed.getTime() <= SESSION_IDLE_TTL_MS;
+  })();
+  if (!sessionIsFresh) {
+    return contextPackageId ? { version: 1, context_package_id: contextPackageId } : null;
+  }
   return {
     version: 1,
     interaction_mode: interactionMode,
