@@ -1,7 +1,9 @@
-import { afterEach, describe, test, vi } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
-import { act } from 'react';
+import { act, createRef } from 'react';
+import { MessagesComposer } from './MessagesComposer';
 import { StrategicContextRail } from './StrategicContextRail';
+import { WorkbenchSplit, WorkbenchSurface } from './WorkbenchLayout';
 import { expectMinTouchTargetAt, expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 import type { StrategicStateResponse } from '../strategicStateApi';
 
@@ -338,5 +340,106 @@ describe('StrategicContextRail — viewport regression', () => {
 
   test('important labels are not silently clipped at 375px', async () => {
     await expectNoTextTruncationAt(375, async () => { await mount(375); });
+  });
+
+  async function mountStrategicChatSideboard(onOpenContext = vi.fn()) {
+    host = document.createElement('div');
+    host.style.height = '800px';
+    document.body.appendChild(host);
+    root = createRoot(host);
+    await act(async () => {
+      root!.render(
+        <WorkbenchSurface
+          title="Strategic"
+          showTitle={false}
+          actions={(
+            <button
+              type="button"
+              onClick={onOpenContext}
+              className="inline-flex min-h-11 items-center rounded-md border border-neutral-800 px-2.5 text-xs font-semibold text-neutral-300 sm:min-h-9 lg:hidden"
+              aria-label="Open Strategic context"
+            >
+              Context
+            </button>
+          )}
+          flush
+        >
+          <WorkbenchSplit
+            main={(
+              <div
+                className="flex min-h-0 min-w-0 flex-col overflow-hidden bg-[#05080c] text-neutral-200"
+                data-testid="strategic-chat-primary"
+              >
+                <div className="min-h-0 flex-1 p-3">Strategic chat</div>
+                <MessagesComposer
+                  textareaRef={createRef<HTMLTextAreaElement>()}
+                  newType="FEEDBACK"
+                  newContent=""
+                  submitting={false}
+                  replyTo={null}
+                  strategistBusy={false}
+                  strategicContext={{
+                    modeLabel: 'Chat',
+                    surfaceLabel: 'Strategic',
+                    contextLabel: 'Context ready',
+                    contextTone: 'ready',
+                    refCount: 1,
+                    refs: [{ kind: 'canvas', id: 'canvas:proj-1', label: 'Strategic map' }],
+                  }}
+                  onChangeType={() => {}}
+                  onChangeContent={() => {}}
+                  onCancelReply={() => {}}
+                  onSubmit={() => {}}
+                  chrome="minimal"
+                />
+              </div>
+            )}
+            rail={(
+              <StrategicContextRail
+                state={STATE}
+                onOpenProjectSection={vi.fn()}
+                onOpenPipeline={vi.fn()}
+                onOpenRuntimeHealth={vi.fn()}
+                onOpenRuntimeDevices={vi.fn()}
+                onOpenRuntimeCompute={vi.fn()}
+                onOpenTask={vi.fn()}
+                onOpenMessages={vi.fn()}
+                onOpenTarget={vi.fn()}
+              />
+            )}
+            railClassName="bg-[#0b1017]"
+          />
+        </WorkbenchSurface>,
+      );
+    });
+  }
+
+  test('composed Strategic chat sideboard shows the rail only on desktop', async () => {
+    await expectNoOverflowAt(1280, async () => { await mountStrategicChatSideboard(); }, { height: 800 });
+
+    const rail = host?.querySelector('aside');
+    const contextButton = host?.querySelector<HTMLButtonElement>('button[aria-label="Open Strategic context"]');
+    expect(host?.querySelector('[data-testid="strategic-chat-primary"]')?.textContent).toContain('Strategic chat');
+    expect(host?.querySelector('[data-testid="strategic-context-descriptor"]')?.tagName).toBe('DIV');
+    expect(rail).toBeTruthy();
+    expect(contextButton).toBeTruthy();
+    expect(getComputedStyle(rail!).display).not.toBe('none');
+    expect(getComputedStyle(contextButton!).display).toBe('none');
+  });
+
+  test('composed Strategic chat shell keeps the mobile context drawer button path', async () => {
+    const onOpenContext = vi.fn();
+    await expectNoOverflowAt(375, async () => { await mountStrategicChatSideboard(onOpenContext); }, { height: 800 });
+
+    const rail = host?.querySelector('aside');
+    const contextButton = host?.querySelector<HTMLButtonElement>('button[aria-label="Open Strategic context"]');
+    expect(rail).toBeTruthy();
+    expect(contextButton).toBeTruthy();
+    expect(host?.querySelector('[data-testid="strategic-context-descriptor"]')?.tagName).toBe('DIV');
+    expect(getComputedStyle(rail!).display).toBe('none');
+    expect(getComputedStyle(contextButton!).display).not.toBe('none');
+
+    await act(async () => { contextButton!.click(); });
+    expect(onOpenContext).toHaveBeenCalledTimes(1);
   });
 });

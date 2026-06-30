@@ -38,6 +38,7 @@ import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
 import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
+import { StrategicContextRail } from './components/StrategicContextRail';
 import { StrategicContextWorkspace } from './components/StrategicContextWorkspace';
 import { StrategicSessionControl, type StrategicInteractionMode } from './components/StrategicSessionControl';
 import { CommandPaletteHost } from './components/CommandPaletteHost';
@@ -50,7 +51,7 @@ import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
 import { ProjectWorkspace, RuntimeWorkspace, type ProjectManageSection, type ProjectSection, type RuntimeSection, type RuntimeSettingsSection } from './components/OperatorWorkspaces';
 import { PipelineWorkspace } from './components/PipelineWorkspace';
-import { WorkbenchFrame, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
+import { WorkbenchFrame, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
 import { useStrategicReadModel } from './hooks/useStrategicReadModel';
 import { useOperatorKeyboardShortcuts } from './hooks/useOperatorKeyboardShortcuts';
 import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
@@ -1427,7 +1428,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={openStrategicContextWorkspace}
-                className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950 px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9"
+                className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950 px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9 lg:hidden"
                 title="Open Strategic context"
                 aria-label="Open Strategic context"
               >
@@ -1438,27 +1439,52 @@ export default function App() {
           )}
           flush
         >
-          <MessagesPanel
-            selectedProjectId={s.selectedProjectId}
-            githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
-            defaultBranch={s.promotionTargetData?.promotion_target || s.integrationBranchData?.integration_branch || undefined}
-            variant="page"
-            filterChrome="minimal"
-            showCloseButton={false}
-            addToast={s.addToast}
-            onMessageCountChange={handleMessageCountChange}
-            onOpenTask={handleViewTask}
-            notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
-            strategistActive={s.strategistActive}
-            cycleProgress={s.cycleProgress}
-            lastCycleCompletion={s.lastCycleCompletion}
-            focusComposerSignal={strategicComposerFocusSignal}
-            targetMessage={strategicMessageTarget.target} onTargetMessageHandled={strategicMessageTarget.clear}
-            strategicState={strategicReadModel.data ?? null} strategicWorkbenchState={strategicWorkbenchState}
-            onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
-            onStrategicInteraction={() => { void persistStrategicWorkbench({ active_surface: 'strategic' }); }}
-            onOpenStrategicContextWorkspace={openStrategicContextWorkspace}
-            onOpenCommandPalette={openCommandPalette}
+          <WorkbenchSplit
+            main={(
+              <MessagesPanel
+                selectedProjectId={s.selectedProjectId}
+                githubRepo={selectedProject ? `${selectedProject.github_owner}/${selectedProject.github_repo}` : undefined}
+                defaultBranch={s.promotionTargetData?.promotion_target || s.integrationBranchData?.integration_branch || undefined}
+                variant="page"
+                filterChrome="minimal"
+                showCloseButton={false}
+                addToast={s.addToast}
+                onMessageCountChange={handleMessageCountChange}
+                onOpenTask={handleViewTask}
+                notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
+                strategistActive={s.strategistActive}
+                cycleProgress={s.cycleProgress}
+                lastCycleCompletion={s.lastCycleCompletion}
+                focusComposerSignal={strategicComposerFocusSignal}
+                targetMessage={strategicMessageTarget.target} onTargetMessageHandled={strategicMessageTarget.clear}
+                strategicState={strategicReadModel.data ?? null} strategicWorkbenchState={strategicWorkbenchState}
+                onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
+                onStrategicInteraction={() => { void persistStrategicWorkbench({ active_surface: 'strategic' }); }}
+                onOpenCommandPalette={openCommandPalette}
+              />
+            )}
+            rail={(
+              <StrategicContextRail
+                state={strategicReadModel.data ?? null}
+                loading={strategicReadModel.loading}
+                error={strategicReadModel.error}
+                strategistActive={s.strategistActive}
+                cycleProgress={s.cycleProgress}
+                lastCycleCompletion={s.lastCycleCompletion}
+                onOpenProjectSection={(section) => openStrategicContextTarget({ surface: 'project', section })}
+                onOpenPipeline={() => openStrategicContextTarget({ surface: 'pipeline', section: 'flow' })}
+                onOpenRuntimeHealth={() => openStrategicContextTarget({ surface: 'runtime', section: 'health' })}
+                onOpenRuntimeDevices={() => openStrategicContextTarget({ surface: 'runtime', section: 'devices' })}
+                onOpenRuntimeCompute={() => openStrategicContextTarget({ surface: 'runtime', section: 'compute' })}
+                onOpenTask={handleViewTaskById}
+                onOpenMessages={strategicMessageTarget.open}
+                onOpenTarget={openStrategicContextTarget}
+                workbenchState={strategicWorkbenchState}
+                savingSessionRefs={savingStrategicWorkbench}
+                onUpdateSessionRefs={updateStrategicSessionRefs}
+              />
+            )}
+            railClassName="bg-[#0b1017]"
           />
         </WorkbenchSurface>
       ) : activeTab !== 'pipeline' && s.showArchive ? (
