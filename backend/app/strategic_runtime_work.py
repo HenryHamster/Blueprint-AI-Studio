@@ -182,6 +182,48 @@ def _task_summary(task: Task | None) -> Dict[str, Any] | None:
     }
 
 
+def _local_operator_status(
+    mode: str,
+    fallback_reason: str | None,
+    active_task: Task | None,
+) -> Dict[str, Any]:
+    """Map runner dispatch detail to the operator-facing Strategic vocabulary."""
+
+    if active_task is not None:
+        if mode == "local":
+            return {"status": "working", "location": "locally", "reason": None}
+        if mode == "cloud":
+            if active_task.vm_instance_id:
+                return {
+                    "status": "working",
+                    "location": "cloud",
+                    "reason": fallback_reason,
+                }
+            return {
+                "status": "unavailable",
+                "location": "unavailable",
+                "reason": fallback_reason,
+            }
+        return {
+            "status": "unavailable",
+            "location": "locally",
+            "reason": fallback_reason,
+        }
+    if mode == "local_ready":
+        return {"status": "idle", "location": "locally", "reason": None}
+    if mode == "cloud":
+        return {
+            "status": "unavailable",
+            "location": "unavailable",
+            "reason": fallback_reason,
+        }
+    return {
+        "status": "unavailable",
+        "location": "locally",
+        "reason": fallback_reason,
+    }
+
+
 def _compute_job_preview(job: ComputeJob, task: Task | None) -> Dict[str, Any]:
     cost = job.final_cost_usd if job.final_cost_usd is not None else job.accrued_cost_usd
     payload = task.first_payload if task is not None else {}
@@ -375,10 +417,14 @@ async def build_strategic_runtime_summary(
     else:
         mode = "pending_local"
         fallback_reason = "runner_unavailable"
+    operator_status = _local_operator_status(mode, fallback_reason, active_task)
 
     return {
         "local_runner": {
             "mode": mode,
+            "status": operator_status["status"],
+            "location": operator_status["location"],
+            "status_reason": operator_status["reason"],
             "strategic_runner_count": len(strategic_runners),
             "live_runner_count": live_runner_count,
             "eligible_live_count": eligible_live_count,

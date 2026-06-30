@@ -8,12 +8,14 @@ self-improvement flags.
 """
 
 import logging
+import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, delete
 from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from typing import Dict, Any, List
 import uuid
 from datetime import timedelta
@@ -25,6 +27,8 @@ from app.database import get_session, resolve_dialect_name
 from app.shared_state import limiter
 from app.models import (
     ProjectMessage,
+    MessageType,
+    MESSAGE_CONTENT_MAX,
     ReleaseVersion,
     StrategicCycle,
     Task,
@@ -56,7 +60,24 @@ from app.strategic_context_package import (
     load_strategic_context_evidence,
 )
 from app.strategic_runtime_work import build_strategic_runtime_summary
-from app.workbench_state import get_strategic_workbench_state
+from app.workbench_state import (
+    WORKBENCH_STATE_MAX_BYTES,
+    build_message_strategic_session_snapshot,
+    get_strategic_workbench_state,
+    upsert_strategic_workbench_state_with_previous,
+    workbench_mode_refresh_excerpt,
+    workbench_mode_should_arm_strategic_refresh,
+    workbench_state_exceeds_max_bytes,
+    workbench_state_size_bytes,
+)
+from app.strategic_trigger import (
+    ARMING_NOT_ARMED,
+    ARMING_PASSIVE_NOTE,
+    ARMING_STEERING,
+    ORIGIN_OPERATOR,
+    maybe_arm_operator_refresh,
+    request_strategic_refresh,
+)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -329,6 +350,23 @@ _LIVE_STRATEGIC_TASK_STATUSES = frozenset(
     }
 )
 
+
+class StrategicSessionUpdate(BaseModel):
+    workbench: Dict[str, Any] = Field(default_factory=dict)
+
+
+class StrategicSessionMessageCreate(BaseModel):
+    content: str
+    message_type: str = "NOTE"
+    context: Dict[str, Any] | None = None
+    workbench_context: Dict[str, Any] | None = None
+    idempotency_key: str | None = None
+
+
+_SESSION_CONVERSATION_LIMIT = 20
+_SESSION_OUTPUT_LIMIT = 8
+
+
 def _is_live_strategic_task(task: Task | None) -> bool:
     return bool(task is not None and task.status in _LIVE_STRATEGIC_TASK_STATUSES)
 
@@ -354,6 +392,207 @@ def _message_preview(
                 if isinstance(ref, dict)
             ]
     return preview
+
+
+def _session_status_from_state(state: Dict[str, Any]) -> Dict[str, Any]:
+    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
+    local_runner = (
+        runtime.get("local_runner") if isinstance(runtime.get("local_runner"), dict) else {}
+    )
+    strategic = state.get("strategic") if isinstance(state.get("strategic"), dict) else {}
+    active_task = strategic.get("active_task")
+    status = _compact_text(local_runner.get("status"), max_chars=40)
+    location = _compact_text(local_runner.get("location"), max_chars=40)
+    reason = _compact_text(local_runner.get("status_reason"), max_chars=80)
+    if status is None:
+        mode = local_runner.get("mode")
+        active_task_runtime = local_runner.get("active_task_runtime")
+        runtime_vm_id = (
+            active_task_runtime.get("vm_instance_id")
+            if isinstance(active_task_runtime, dict)
+            else None
+        )
+        if active_task is not None and (
+            mode == "local" or (mode == "cloud" and runtime_vm_id)
+        ):
+            status = "working"
+        elif local_runner.get("mode") == "local_ready":
+            status = "idle"
+        else:
+            status = "unavailable"
+    if location is None:
+        mode = local_runner.get("mode")
+        active_task_runtime = local_runner.get("active_task_runtime")
+        runtime_vm_id = (
+            active_task_runtime.get("vm_instance_id")
+            if isinstance(active_task_runtime, dict)
+            else None
+        )
+        if mode in ("local", "local_ready", "pending_local"):
+            location = "locally"
+        elif mode == "cloud":
+            location = "cloud" if active_task is not None and runtime_vm_id else "unavailable"
+        else:
+            location = "unavailable"
+    return {"status": status, "location": location, "reason": reason}
+
+
+def _session_output_from_message(
+    message: ProjectMessage,
+    *,
+    context_package: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    preview = _message_preview(message, context_package=context_package)
+    return {
+        "kind": "message",
+        "id": preview["id"],
+        "message_type": preview["message_type"],
+        "from_type": preview["from_type"],
+        "from_task_id": preview.get("from_task_id"),
+        "content": preview["content"],
+        "status": preview["status"],
+        "created_at": preview["created_at"],
+        "context": preview.get("context") or {},
+    }
+
+
+def _session_output_from_cycle(cycle: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    if not isinstance(cycle, dict):
+        return None
+    content = (
+        _compact_text(cycle.get("summary_text"), max_chars=300)
+        or _compact_text(cycle.get("failure_reason"), max_chars=240)
+    )
+    if not content:
+        return None
+    created_at = (
+        cycle.get("phase2_completed_at")
+        or cycle.get("phase1_completed_at")
+        or cycle.get("phase1_started_at")
+    )
+    return {
+        "kind": "cycle",
+        "id": cycle.get("id"),
+        "message_type": "NOTE",
+        "from_type": "strategic",
+        "content": content,
+        "status": cycle.get("outcome"),
+        "created_at": created_at,
+        "context": {
+            "phase1_task_id": cycle.get("phase1_task_id"),
+            "phase2_task_id": cycle.get("phase2_task_id"),
+        },
+    }
+
+
+async def _recent_session_conversation(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    context_package: Dict[str, Any] | None,
+) -> list[Dict[str, Any]]:
+    rows = (
+        await session.execute(
+            select(ProjectMessage)
+            .where(ProjectMessage.project_id == project_id)
+            .order_by(ProjectMessage.created_at.desc())
+            .limit(_SESSION_CONVERSATION_LIMIT)
+        )
+    ).scalars().all()
+    return [
+        _message_preview(message, context_package=context_package)
+        for message in rows
+    ]
+
+
+async def _recent_session_outputs(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    latest_cycle: Dict[str, Any] | None,
+    context_package: Dict[str, Any] | None,
+) -> list[Dict[str, Any]]:
+    outputs: list[Dict[str, Any]] = []
+    cycle_output = _session_output_from_cycle(latest_cycle)
+    if cycle_output is not None:
+        outputs.append(cycle_output)
+    message_rows = (
+        await session.execute(
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.from_type.in_(["strategic", "system"]),
+            )
+            .order_by(ProjectMessage.created_at.desc())
+            .limit(_SESSION_OUTPUT_LIMIT)
+        )
+    ).scalars().all()
+    outputs.extend(
+        _session_output_from_message(message, context_package=context_package)
+        for message in message_rows
+    )
+    outputs.sort(key=lambda item: item.get("created_at") or "", reverse=True)
+    return outputs[:_SESSION_OUTPUT_LIMIT]
+
+
+async def _build_strategic_session_response(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    state: Dict[str, Any],
+) -> Dict[str, Any]:
+    context_package = (
+        state.get("context_package")
+        if isinstance(state.get("context_package"), dict)
+        else None
+    )
+    conversation = await _recent_session_conversation(
+        session,
+        project_id,
+        context_package=context_package,
+    )
+    latest_cycle = (
+        (state.get("strategic") or {}).get("latest_cycle")
+        if isinstance(state.get("strategic"), dict)
+        else None
+    )
+    recent_outputs = await _recent_session_outputs(
+        session,
+        project_id,
+        latest_cycle=latest_cycle,
+        context_package=context_package,
+    )
+    status = _session_status_from_state(state)
+    runtime = state.get("runtime") if isinstance(state.get("runtime"), dict) else {}
+    local_runner = (
+        runtime.get("local_runner") if isinstance(runtime.get("local_runner"), dict) else {}
+    )
+    work_session = dict(state.get("work_session") or {})
+    work_session.update(
+        {
+            "status": status["status"],
+            "location": status["location"],
+            "status_reason": status["reason"],
+            "runtime": local_runner,
+            "conversation": {
+                "limit": _SESSION_CONVERSATION_LIMIT,
+                "items": conversation,
+            },
+            "recent_outputs": recent_outputs,
+        }
+    )
+    return {
+        "project_id": str(project_id),
+        "status": status["status"],
+        "location": status["location"],
+        "status_reason": status["reason"],
+        "session": work_session,
+        "workbench": state.get("workbench"),
+        "strategic": state.get("strategic"),
+        "runtime": runtime,
+        "context_package": context_package,
+        "conversation": work_session["conversation"],
+        "recent_outputs": recent_outputs,
+    }
 
 
 def _task_summary(task: Task | None) -> Dict[str, Any] | None:
@@ -732,8 +971,11 @@ async def get_project(
         try:
             pm = ProblemModel(**problem_model_dict)
             size_health = compute_model_size_signal(pm)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[STRATEGIC_STATE] problem model size signal skipped: %s",
+                exc,
+            )
     return {
         "id": str(project.id),
         "name": project.name,
@@ -946,6 +1188,18 @@ async def get_project_strategic_state(
         message_counts=message_counts,
         task_counts=task_counts,
     )
+    session_status = _session_status_from_state(
+        {
+            "strategic": {"active_task": _task_summary(active_task)},
+            "runtime": runtime_summary,
+        }
+    )
+    work_session = {
+        **work_session,
+        "status": session_status["status"],
+        "location": session_status["location"],
+        "status_reason": session_status["reason"],
+    }
 
     # SHA-aware freshness: resolve candidate vs integration HEAD, best-effort.
     # A GitHub API failure must not break the endpoint — verdict degrades to unknown.
@@ -963,7 +1217,7 @@ async def get_project_strategic_state(
     ).scalars().first()
     if open_version is not None:
         try:
-            from app.strategic_spawning import (  # noqa: PLC0415
+            from app.strategic_spawning import (
                 _resolve_candidate_currency,
                 get_project_integration_branch,
             )
@@ -1026,6 +1280,224 @@ async def get_project_strategic_state(
             else None,
         },
         "sha_freshness": sha_freshness,
+    }
+
+
+@router.get("/projects/{project_id}/strategic-session")
+@limiter.limit("30/minute")
+async def get_project_strategic_session(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Resume the persistent Strategic operator session for a project."""
+
+    state = await get_project_strategic_state(
+        request,
+        project_id,
+        session=session,
+        current_user=current_user,
+    )
+    return await _build_strategic_session_response(session, project_id, state)
+
+
+@router.post("/projects/{project_id}/strategic-session")
+@limiter.limit("30/minute")
+async def upsert_project_strategic_session(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: StrategicSessionUpdate | None = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Create or resume a Strategic operator session for an existing project."""
+
+    await _get_user_project_with_role(
+        project_id,
+        current_user["user_id"],
+        session,
+        "member",
+    )
+    workbench = payload.workbench if payload is not None else {}
+    if workbench_state_size_bytes(workbench) > WORKBENCH_STATE_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail="Workbench state too large (max 50KB)",
+        )
+
+    previous_state, state = await upsert_strategic_workbench_state_with_previous(
+        session,
+        current_user["user_id"],
+        project_id,
+        workbench,
+    )
+    arming = ARMING_PASSIVE_NOTE
+    should_arm = workbench_mode_should_arm_strategic_refresh(previous_state, state)
+    await session.commit()
+    if should_arm:
+        armed = await request_strategic_refresh(
+            session,
+            project_id,
+            "workbench_interaction_mode",
+            origin=ORIGIN_OPERATOR,
+            steering_excerpt=workbench_mode_refresh_excerpt(state),
+            skip_locked=False,
+        )
+        arming = ARMING_STEERING if armed else ARMING_NOT_ARMED
+        if armed:
+            await session.commit()
+
+    state_response = await get_project_strategic_state(
+        request,
+        project_id,
+        session=session,
+        current_user=current_user,
+    )
+    response = await _build_strategic_session_response(
+        session,
+        project_id,
+        state_response,
+    )
+    response["arming"] = arming
+    return response
+
+
+@router.post("/projects/{project_id}/strategic-session/messages")
+@limiter.limit("30/minute")
+async def create_project_strategic_session_message(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: StrategicSessionMessageCreate,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Record an operator message in the durable Strategic project thread."""
+
+    project = await _get_user_project_with_role(
+        project_id,
+        current_user["user_id"],
+        session,
+        "member",
+    )
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail="Content cannot be empty")
+    if len(content) > MESSAGE_CONTENT_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
+        )
+    if workbench_state_exceeds_max_bytes(payload.workbench_context):
+        raise HTTPException(
+            status_code=400,
+            detail="Workbench context too large (max 50KB)",
+        )
+
+    raw_message_type = str(payload.message_type or "NOTE").upper()
+    try:
+        msg_type = MessageType(raw_message_type)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid message_type. Must be one of: {', '.join(t.value for t in MessageType)}",
+        ) from None
+
+    idem_key = (payload.idempotency_key or "").strip() or None
+    if idem_key:
+        if len(idem_key) > 255:
+            raise HTTPException(
+                status_code=400,
+                detail="idempotency_key exceeds 255 characters",
+            )
+        existing = (
+            await session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.idempotency_key == idem_key,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            return {
+                "id": str(existing.id),
+                "status": "duplicate",
+                "arming": "duplicate",
+                "message": _message_preview(existing),
+            }
+
+    ctx = dict(payload.context or {})
+    user_supplied_event_type = ctx.pop("event_type", None)
+    if user_supplied_event_type is not None:
+        ctx["user_event_type"] = str(user_supplied_event_type)[:120]
+    if len(json.dumps(ctx, separators=(",", ":"), default=str)) > 50_000:
+        raise HTTPException(status_code=400, detail="Context too large (max 50KB)")
+
+    if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
+        from app.source_ref_validation import compute_message_citation_warning
+
+        warning = await compute_message_citation_warning(session, project, content)
+        if warning:
+            ctx = {**ctx, "_provenance_warnings": warning}
+
+    strategic_session = await build_message_strategic_session_snapshot(
+        session,
+        current_user["user_id"],
+        project_id,
+        payload.workbench_context,
+    )
+    if strategic_session:
+        ctx = {**ctx, "strategic_session": strategic_session}
+    if len(json.dumps(ctx, separators=(",", ":"), default=str)) > 50_000:
+        raise HTTPException(status_code=400, detail="Context too large (max 50KB)")
+
+    msg = ProjectMessage(
+        project_id=project_id,
+        message_type=msg_type,
+        from_type="user",
+        content=content,
+        context=ctx,
+        idempotency_key=idem_key,
+    )
+    session.add(msg)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        if idem_key:
+            existing = (
+                await session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.idempotency_key == idem_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return {
+                    "id": str(existing.id),
+                    "status": "duplicate",
+                    "arming": "duplicate",
+                    "message": _message_preview(existing),
+                }
+        raise
+    await session.refresh(msg)
+    message_id = str(msg.id)
+    message_preview = _message_preview(msg)
+
+    arming = await maybe_arm_operator_refresh(
+        session,
+        project_id,
+        msg_type,
+        message_content=content,
+    )
+    if arming == ARMING_STEERING:
+        await session.commit()
+    return {
+        "id": message_id,
+        "status": "created",
+        "arming": arming,
+        "message": message_preview,
     }
 
 

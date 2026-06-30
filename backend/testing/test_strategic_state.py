@@ -1,8 +1,11 @@
+import uuid
 from datetime import timedelta
 from unittest.mock import AsyncMock
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import func
+from sqlmodel import select
 
 from app.models import (
     ReleaseVersion,
@@ -259,6 +262,9 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     assert data["attention"]["counts"]["needs_operator"] == 0
     local_runner = data["runtime"]["local_runner"]
     assert local_runner["mode"] == "cloud"
+    assert local_runner["status"] == "unavailable"
+    assert local_runner["location"] == "unavailable"
+    assert local_runner["status_reason"] == "no_runner"
     assert local_runner["fallback_reason"] == "no_runner"
     assert local_runner["strategic_runner_count"] == 0
     assert local_runner["active_task_pinned"] is False
@@ -396,9 +402,13 @@ async def test_strategic_state_reports_active_local_strategic_runner(
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
     assert resp.status_code == 200
-    local_runner = resp.json()["runtime"]["local_runner"]
+    data = resp.json()
+    local_runner = data["runtime"]["local_runner"]
 
     assert local_runner["mode"] == "local"
+    assert local_runner["status"] == "working"
+    assert local_runner["location"] == "locally"
+    assert local_runner["status_reason"] is None
     assert local_runner["strategic_runner_count"] == 1
     assert local_runner["live_runner_count"] == 1
     assert local_runner["eligible_live_count"] == 1
@@ -413,9 +423,11 @@ async def test_strategic_state_reports_active_local_strategic_runner(
         "runner_target_id": str(runner.id),
     }
     assert local_runner["liveness_window_seconds"] == 300
+    assert data["work_session"]["status"] == "working"
+    assert data["work_session"]["location"] == "locally"
 
 
-
+@pytest.mark.asyncio
 async def test_strategic_state_reports_offline_strategic_runner(
     client: AsyncClient, db_session
 ):
@@ -444,11 +456,96 @@ async def test_strategic_state_reports_offline_strategic_runner(
     local_runner = resp.json()["runtime"]["local_runner"]
 
     assert local_runner["mode"] == "pending_local"
+    assert local_runner["status"] == "unavailable"
+    assert local_runner["location"] == "locally"
+    assert local_runner["status_reason"] == "runner_offline"
     assert local_runner["fallback_reason"] == "runner_offline"
     assert local_runner["strategic_runner_count"] == 1
     assert local_runner["live_runner_count"] == 0
     assert local_runner["eligible_live_count"] == 0
     assert local_runner["stale_runner_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_reports_live_local_runner_as_idle(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    db_session.add(
+        LocalRunner(
+            project_id=project.id,
+            token_hash="f" * 64,
+            hostname="idle-desk",
+            status="active",
+            last_seen_at=_utcnow(),
+            capabilities={
+                "task_types": ["design_doc_update", "strategic_review"],
+                "has_gpu": False,
+                "max_concurrent": 1,
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+                "active_task_ids": [],
+            },
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+    local_runner = data["runtime"]["local_runner"]
+
+    assert local_runner["mode"] == "local_ready"
+    assert local_runner["status"] == "idle"
+    assert local_runner["location"] == "locally"
+    assert local_runner["status_reason"] is None
+    assert local_runner["eligible_live_count"] == 1
+    assert resp.json()["work_session"]["status"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_reports_active_cloud_strategic_task_as_working(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    phase2_task = Task(
+        project_id=project.id,
+        title="Strategic review on cloud VM",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.IN_PROGRESS,
+        strategic_cycle_id="sc-cloud",
+        vm_instance_id="gce-strategic-1",
+    )
+    db_session.add(phase2_task)
+    await db_session.commit()
+    await db_session.refresh(phase2_task)
+
+    active_cycle = StrategicCycle(
+        id="sc-cloud",
+        project_id=project.id,
+        outcome="phase2_running",
+        phase1_started_at=_utcnow() - timedelta(minutes=10),
+        phase1_completed_at=_utcnow() - timedelta(minutes=5),
+        phase2_started_at=_utcnow() - timedelta(minutes=5),
+        phase2_task_id=phase2_task.id,
+    )
+    db_session.add(active_cycle)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+    local_runner = data["runtime"]["local_runner"]
+
+    assert local_runner["mode"] == "cloud"
+    assert local_runner["status"] == "working"
+    assert local_runner["location"] == "cloud"
+    assert local_runner["status_reason"] == "cloud_dispatch"
+    assert local_runner["fallback_reason"] == "cloud_dispatch"
+    assert local_runner["active_task_runtime"]["vm_instance_id"] == "gce-strategic-1"
+    assert data["work_session"]["status"] == "working"
+    assert data["work_session"]["location"] == "cloud"
 
 
 @pytest.mark.asyncio
@@ -546,13 +643,18 @@ async def test_strategic_state_does_not_mark_partial_strategic_runner_ready(
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
     assert resp.status_code == 200
-    local_runner = resp.json()["runtime"]["local_runner"]
+    data = resp.json()
+    local_runner = data["runtime"]["local_runner"]
 
     assert local_runner["mode"] == "pending_local"
+    assert local_runner["status"] == "unavailable"
+    assert local_runner["location"] == "locally"
+    assert local_runner["status_reason"] == "capability_mismatch"
     assert local_runner["fallback_reason"] == "capability_mismatch"
     assert local_runner["strategic_runner_count"] == 1
     assert local_runner["live_runner_count"] == 1
     assert local_runner["eligible_live_count"] == 0
+    assert data["work_session"]["status"] == "unavailable"
 
 
 @pytest.mark.asyncio
@@ -604,14 +706,19 @@ async def test_strategic_state_reports_stale_pinned_runner_as_pending(
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
     assert resp.status_code == 200
-    local_runner = resp.json()["runtime"]["local_runner"]
+    data = resp.json()
+    local_runner = data["runtime"]["local_runner"]
 
     assert local_runner["mode"] == "pending_local"
+    assert local_runner["status"] == "unavailable"
+    assert local_runner["location"] == "locally"
+    assert local_runner["status_reason"] == "runner_offline"
     assert local_runner["fallback_reason"] == "runner_offline"
     assert local_runner["active_runner_id"] == str(runner.id)
     assert local_runner["active_task_pinned"] is True
     assert local_runner["live_runner_count"] == 0
     assert local_runner["eligible_live_count"] == 0
+    assert data["work_session"]["status"] == "unavailable"
 
 
 @pytest.mark.asyncio
@@ -663,14 +770,19 @@ async def test_strategic_state_reports_live_pinned_task_waiting_for_runner_claim
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
     assert resp.status_code == 200
-    local_runner = resp.json()["runtime"]["local_runner"]
+    data = resp.json()
+    local_runner = data["runtime"]["local_runner"]
 
     assert local_runner["mode"] == "pending_local"
+    assert local_runner["status"] == "unavailable"
+    assert local_runner["location"] == "locally"
+    assert local_runner["status_reason"] == "runner_claim_pending"
     assert local_runner["fallback_reason"] == "runner_claim_pending"
     assert local_runner["active_runner_id"] == str(runner.id)
     assert local_runner["active_task_pinned"] is True
     assert local_runner["live_runner_count"] == 1
     assert local_runner["eligible_live_count"] == 1
+    assert data["work_session"]["status"] == "unavailable"
 
 
 @pytest.mark.asyncio
@@ -782,6 +894,224 @@ async def test_strategic_state_includes_operator_workbench_state(
     assert metrics["messages.open"]["label"] == "open messages"
     assert metrics["tasks.running"]["target"] == {"surface": "pipeline"}
     assert metrics["context.items"]["value"] == resp.json()["context_package"]["item_count"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_endpoint_resumes_persisted_state_and_outputs(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    db_session.add(
+        MessagesNoisePrefs(
+            user_id=TEST_USER_ID,
+            project_id=project.id,
+            prefs={
+                "_strategic_workbench": {
+                    "version": 1,
+                    "interaction_mode": "continuous",
+                    "active_surface": "runtime",
+                    "selected_refs": [
+                        {
+                            "kind": "canvas",
+                            "id": f"strategic-canvas:{project.id}",
+                            "label": "Context map",
+                        }
+                    ],
+                    "session_started_at": "2026-06-29T12:00:00",
+                    "last_interaction_at": "2026-06-29T12:05:00",
+                }
+            },
+        )
+    )
+    user_message = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="What should I watch next?",
+        status="resolved",
+    )
+    strategic_message = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        content="Watch the local Strategic runner registration path.",
+        status="open",
+        context={"event_type": "strategic_reply"},
+    )
+    latest_cycle = StrategicCycle(
+        id="sc-session",
+        project_id=project.id,
+        outcome="completed",
+        phase1_started_at=_utcnow() - timedelta(minutes=30),
+        phase1_completed_at=_utcnow() - timedelta(minutes=25),
+        phase2_started_at=_utcnow() - timedelta(minutes=25),
+        phase2_completed_at=_utcnow() - timedelta(minutes=20),
+        summary_text="Strategic refreshed the local operator session.",
+    )
+    db_session.add_all([user_message, strategic_message, latest_cycle])
+    await db_session.commit()
+
+    first = await client.get(f"/api/admin/projects/{project.id}/strategic-session")
+    second = await client.get(f"/api/admin/projects/{project.id}/strategic-session")
+    assert first.status_code == 200
+    assert second.status_code == 200
+    data = first.json()
+    repeat = second.json()
+
+    assert data["status"] == "unavailable"
+    assert data["location"] == "unavailable"
+    assert data["status_reason"] == "no_runner"
+    assert data["session"]["mode"] == "continuous"
+    assert data["session"]["active_surface"] == "runtime"
+    assert data["session"]["selected_refs"] == [
+        {
+            "kind": "canvas",
+            "id": f"strategic-canvas:{project.id}",
+            "label": "Context map",
+        }
+    ]
+    assert data["session"]["id"] == repeat["session"]["id"]
+    conversation_ids = {item["id"] for item in data["conversation"]["items"]}
+    assert str(user_message.id) in conversation_ids
+    assert str(strategic_message.id) in conversation_ids
+    output_contents = [item["content"] for item in data["recent_outputs"]]
+    assert "Strategic refreshed the local operator session." in output_contents
+    assert "Watch the local Strategic runner registration path." in output_contents
+    assert "What should I watch next?" not in output_contents
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_create_persists_project_session(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session",
+        json={
+            "workbench": {
+                "interaction_mode": "check_in",
+                "active_surface": "project",
+                "selected_refs": [
+                    {
+                        "kind": "direction",
+                        "id": "d-high",
+                        "label": "Operator workbench direction",
+                    }
+                ],
+            }
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["arming"] == "steering"
+    assert data["session"]["mode"] == "check_in"
+    assert data["session"]["active_surface"] == "project"
+    assert data["session"]["selected_refs"] == [
+        {
+            "kind": "direction",
+            "id": "d-high",
+            "label": "Operator workbench direction",
+        }
+    ]
+    assert data["session"]["status"] == "unavailable"
+    assert data["session"]["location"] == "unavailable"
+
+    stored = (
+        await db_session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.user_id == TEST_USER_ID,
+                MessagesNoisePrefs.project_id == project.id,
+            )
+        )
+    ).scalar_one()
+    assert stored.prefs["_strategic_workbench"]["interaction_mode"] == "check_in"
+    await db_session.refresh(project)
+    marker = (project.vision or {})["_strategic_refresh"]
+    assert marker["reason"] == "workbench_interaction_mode"
+    assert marker["origin"] == "operator"
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_message_records_operator_message_and_snapshot(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session",
+        json={
+            "workbench": {
+                "interaction_mode": "monitor",
+                "active_surface": "pipeline",
+                "selected_refs": [
+                    {"kind": "task", "id": "task-9", "label": "Watch task"}
+                ],
+            }
+        },
+    )
+
+    body = {
+        "message_type": "FEEDBACK",
+        "content": "Keep this session pinned to the local Strategic runner.",
+        "idempotency_key": "strategic-session-message-1",
+    }
+    first = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json=body,
+    )
+    second = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json=body,
+    )
+
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "created"
+    assert first.json()["arming"] == "steering"
+    assert second.status_code == 200
+    assert second.json()["status"] == "duplicate"
+    assert second.json()["id"] == first.json()["id"]
+
+    msg = await db_session.get(ProjectMessage, uuid.UUID(first.json()["id"]))
+    assert msg.from_type == "user"
+    assert msg.message_type == MessageType.FEEDBACK
+    assert msg.idempotency_key == "strategic-session-message-1"
+    session_snapshot = (msg.context or {})["strategic_session"]
+    assert session_snapshot["interaction_mode"] == "monitor"
+    assert session_snapshot["active_surface"] == "pipeline"
+    assert session_snapshot["selected_refs"] == [
+        {"kind": "task", "id": "task-9", "label": "Watch task"}
+    ]
+    count = await db_session.scalar(
+        select(func.count())
+        .select_from(ProjectMessage)
+        .where(ProjectMessage.project_id == project.id)
+        .where(ProjectMessage.idempotency_key == "strategic-session-message-1")
+    )
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_note_message_is_passive(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "message_type": "NOTE",
+            "content": "Keep this note with the persistent Strategic session.",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "created"
+    assert resp.json()["arming"] == "passive_note"
+    msg = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
+    assert msg.from_type == "user"
+    assert msg.message_type == MessageType.NOTE
+    assert msg.content == "Keep this note with the persistent Strategic session."
 
 
 @pytest.mark.asyncio
