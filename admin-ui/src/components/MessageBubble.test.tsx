@@ -227,9 +227,11 @@ describe('MessageBubble', () => {
   });
 
   test('chat presentation shows operator Strategic context receipt when captured', () => {
+    const onOpenStrategicContext = vi.fn();
     render(<MessageBubble {...makeProps({
       presentation: 'chat',
       actionMode: 'reply-only',
+      onOpenStrategicContext,
       msg: makeMsg({
         from_type: 'operator',
         content: 'Use the current context.',
@@ -242,6 +244,15 @@ describe('MessageBubble', () => {
             selected_refs: [
               { kind: 'artifact', id: 'artifact:latest-context', label: 'Latest context report' },
             ],
+            selected_ref_descriptors: [
+              {
+                kind: 'artifact',
+                id: 'artifact:latest-context',
+                label: 'Latest context report',
+                summary: 'Fresh context report from the active wave',
+                status: 'INVESTIGATION_REPORT',
+              },
+            ],
             captured_at: '2026-06-29T12:00:00Z',
           },
         },
@@ -253,6 +264,8 @@ describe('MessageBubble', () => {
     expect(receipt.textContent).toContain('Workday');
     expect(receipt.textContent).toContain('Pipeline');
     expect(receipt.textContent).toContain('Latest context report');
+    fireEvent.click(receipt);
+    expect(onOpenStrategicContext).toHaveBeenCalledTimes(1);
   });
 
   test('triage presentation keeps operator Strategic context receipt hidden', () => {

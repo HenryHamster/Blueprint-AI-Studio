@@ -218,6 +218,7 @@ export interface MessageBubbleProps {
   onStartInvestigate: (msgId: string) => void;
   onCancelInvestigate: () => void;
   onReply: (replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => void;
+  onOpenStrategicContext?: () => void;
 }
 
 export function MessageBubble({
@@ -248,6 +249,7 @@ export function MessageBubble({
   onStartInvestigate,
   onCancelInvestigate,
   onReply,
+  onOpenStrategicContext,
 }: MessageBubbleProps) {
   const config = TYPE_CONFIG[msg.message_type] || TYPE_CONFIG.NOTE;
   const Icon = config.icon;
@@ -379,7 +381,11 @@ export function MessageBubble({
           {showOpsChrome && <ContextBadges context={msg.context} fromType={msg.from_type} />}
           {strategicContextReceipt && (
             <div className="mt-2 border-t border-neutral-700/50 pt-1.5">
-              <StrategicContextDescriptor model={strategicContextReceipt} variant="receipt" />
+              <StrategicContextDescriptor
+                model={strategicContextReceipt}
+                variant="receipt"
+                onOpen={onOpenStrategicContext}
+              />
             </div>
           )}
         </div>

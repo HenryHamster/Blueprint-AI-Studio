@@ -1564,6 +1564,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       setReplyTo(replyTo);
       textareaRef.current?.focus();
     },
+    onOpenStrategicContext: conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined,
   };
 
   return (

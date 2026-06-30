@@ -842,6 +842,48 @@ async def test_strategic_state_includes_operator_workbench_state(
 ):
     project = await _make_project(db_session)
     last_interaction_at = _utcnow().isoformat()
+    context_task = Task(
+        project_id=project.id,
+        title="Review active wave",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.IN_PROGRESS,
+        latest_status_message="Reviewing context descriptors.",
+    )
+    db_session.add(context_task)
+    await db_session.commit()
+    await db_session.refresh(context_task)
+    context_cycle = StrategicCycle(
+        id="sc-workbench-context",
+        project_id=project.id,
+        outcome="phase2_running",
+        phase1_started_at=_utcnow() - timedelta(minutes=15),
+        phase2_task_id=context_task.id,
+    )
+    knowledge_doc = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=context_task.id,
+        source_kind=SourceKind.DESIGN.value,
+        title="Operator context notes",
+        summary="Context package evidence should rehydrate kept refs.",
+        body="body",
+        topic="operator-context",
+        direction_id="d-workbench",
+        tags=[],
+        source_citations=[],
+        forward_quality_verdict={"passed": True},
+    )
+    artifact = Artifact(
+        task_id=context_task.id,
+        artifact_type=ArtifactType.INVESTIGATION_REPORT,
+        storage_uri="gs://blueprint-test/context-report.md",
+        logical_key="operator-context-report",
+    )
+    db_session.add(context_cycle)
+    db_session.add(knowledge_doc)
+    db_session.add(artifact)
+    await db_session.commit()
+    await db_session.refresh(knowledge_doc)
+    await db_session.refresh(artifact)
     db_session.add(
         MessagesNoisePrefs(
             user_id=TEST_USER_ID,
@@ -854,8 +896,21 @@ async def test_strategic_state_includes_operator_workbench_state(
                     "selected_refs": [
                         {
                             "kind": "task",
-                            "id": "task-123",
-                            "label": "Review active wave",
+                            "id": str(context_task.id),
+                            "label": "Stale task label",
+                        },
+                        {
+                            "kind": "knowledge_document",
+                            "id": f"knowledge:{knowledge_doc.id}",
+                        },
+                        {
+                            "kind": "artifact",
+                            "id": f"artifact:{artifact.id}",
+                        },
+                        {
+                            "kind": "task",
+                            "id": "task-not-in-package",
+                            "label": "Missing task",
                         },
                         {
                             "kind": "canvas",
@@ -883,7 +938,10 @@ async def test_strategic_state_includes_operator_workbench_state(
     assert workbench["interaction_mode"] == "check_in"
     assert workbench["active_surface"] == "pipeline"
     assert workbench["selected_refs"] == [
-        {"kind": "task", "id": "task-123", "label": "Review active wave"},
+        {"kind": "task", "id": str(context_task.id), "label": "Stale task label"},
+        {"kind": "knowledge_document", "id": f"knowledge:{knowledge_doc.id}"},
+        {"kind": "artifact", "id": f"artifact:{artifact.id}"},
+        {"kind": "task", "id": "task-not-in-package", "label": "Missing task"},
         {"kind": "canvas", "id": f"strategic-canvas:{project.id}"},
     ]
     assert "cycle_summary" not in workbench
@@ -894,14 +952,44 @@ async def test_strategic_state_includes_operator_workbench_state(
     assert work_session["active_surface"] == "pipeline"
     assert work_session["context_package_id"] == f"strategic-context:{project.id}"
     assert work_session["selected_refs"] == [
-        {"kind": "task", "id": "task-123", "label": "Review active wave"},
+        {"kind": "task", "id": str(context_task.id), "label": "Stale task label"},
+        {"kind": "knowledge_document", "id": f"knowledge:{knowledge_doc.id}"},
+        {"kind": "artifact", "id": f"artifact:{artifact.id}"},
+        {"kind": "task", "id": "task-not-in-package", "label": "Missing task"},
         {"kind": "canvas", "id": f"strategic-canvas:{project.id}"},
     ]
     descriptors = {
         (entry["kind"], entry["id"]): entry
         for entry in work_session["selected_ref_descriptors"]
     }
-    assert descriptors[("task", "task-123")]["label"] == "Review active wave"
+    task_descriptor = descriptors[("task", str(context_task.id))]
+    assert task_descriptor["label"] == "Review active wave"
+    assert task_descriptor["summary"] == "Reviewing context descriptors."
+    assert task_descriptor["status"] == "IN_PROGRESS"
+    assert task_descriptor["target"] == {
+        "surface": "task",
+        "task_id": str(context_task.id),
+    }
+    knowledge_descriptor = descriptors[
+        ("knowledge_document", f"knowledge:{knowledge_doc.id}")
+    ]
+    assert knowledge_descriptor["label"] == "Operator context notes"
+    assert knowledge_descriptor["summary"] == "Context package evidence should rehydrate kept refs."
+    assert knowledge_descriptor["status"] == SourceKind.DESIGN.value
+    assert knowledge_descriptor["target"]["surface"] == "knowledge"
+    assert knowledge_descriptor["target"]["document_id"] == str(knowledge_doc.id)
+    artifact_descriptor = descriptors[("artifact", f"artifact:{artifact.id}")]
+    assert artifact_descriptor["label"] == "operator-context-report"
+    assert artifact_descriptor["summary"] == "Review active wave"
+    assert artifact_descriptor["status"] == ArtifactType.INVESTIGATION_REPORT.value
+    assert artifact_descriptor["target"] == {
+        "surface": "task",
+        "task_id": str(context_task.id),
+        "artifact_id": str(artifact.id),
+    }
+    stale_task_descriptor = descriptors[("task", "task-not-in-package")]
+    assert stale_task_descriptor["label"] == "Missing task"
+    assert "target" not in stale_task_descriptor
     canvas_descriptor = descriptors[("canvas", f"strategic-canvas:{project.id}")]
     assert canvas_descriptor["label"] == "Strategic context map"
     assert canvas_descriptor["target"] == {
@@ -1220,6 +1308,7 @@ async def test_strategic_session_message_response_enriches_selected_refs(
         "workbench_context": {
             "interaction_mode": "continuous",
             "active_surface": "project",
+            "context_package_id": f"strategic-context:{project.id}",
             "selected_refs": [
                 {"kind": "canvas", "id": f"strategic-canvas:{project.id}"}
             ],
@@ -1243,6 +1332,8 @@ async def test_strategic_session_message_response_enriches_selected_refs(
     assert duplicate_message["content"] == long_content
     strategic_session = message["context"]["strategic_session"]
     duplicate_session = duplicate_message["context"]["strategic_session"]
+    assert strategic_session["context_package_id"] == f"strategic-context:{project.id}"
+    assert duplicate_session["context_package_id"] == f"strategic-context:{project.id}"
     descriptors = strategic_session["selected_ref_descriptors"]
     duplicate_descriptors = duplicate_session["selected_ref_descriptors"]
     assert len(descriptors) == 1
@@ -1255,6 +1346,22 @@ async def test_strategic_session_message_response_enriches_selected_refs(
         "section": "problem-model",
     }
     assert duplicate_descriptors == descriptors
+    stored = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
+    assert stored is not None
+    assert (
+        (stored.context or {})["strategic_session"]["context_package_id"]
+        == f"strategic-context:{project.id}"
+    )
+    prefs = (
+        await db_session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.user_id == TEST_USER_ID,
+                MessagesNoisePrefs.project_id == project.id,
+            )
+        )
+    ).scalar_one()
+    stored_workbench = (prefs.prefs or {}).get("_strategic_workbench") or {}
+    assert "context_package_id" not in stored_workbench
 
 
 @pytest.mark.asyncio

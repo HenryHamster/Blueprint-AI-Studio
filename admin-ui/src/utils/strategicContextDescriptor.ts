@@ -8,14 +8,21 @@ interface StrategicContextRefDescriptor {
   id: string;
   kind: string;
   label: string;
+  summary?: string | null;
   status?: string | null;
 }
 
 export interface StrategicContextDescriptorModel {
   modeLabel: string;
   surfaceLabel: string;
+  packageTitle?: string | null;
   contextLabel: string | null;
   contextTone: 'ready' | 'building' | 'stale' | 'neutral';
+  itemCount?: number | null;
+  canvas?: {
+    nodeCount: number;
+    edgeCount: number;
+  } | null;
   refCount: number;
   refs: StrategicContextRefDescriptor[];
   capturedAt?: string | null;
@@ -106,6 +113,7 @@ function buildRefs(
         id: `${ref.kind}:${ref.id}`,
         kind: ref.kind,
         label: descriptor?.label ?? fallbackRefLabel(ref.kind, ref.id, ref.label),
+        summary: descriptor?.summary,
         status: descriptor?.status,
       };
     });
@@ -116,6 +124,7 @@ function buildRefs(
 function buildDescriptor(
   session: StrategicSessionLike,
   contextStatus?: string | null,
+  packageDetails?: Pick<StrategicContextDescriptorModel, 'packageTitle' | 'itemCount' | 'canvas'>,
 ): StrategicContextDescriptorModel | null {
   if (!hasStrategicSignal(session)) return null;
   const fresh = isSessionFresh(session);
@@ -123,8 +132,11 @@ function buildDescriptor(
   return {
     modeLabel: fresh ? modeLabel(session.interaction_mode) : 'Chat',
     surfaceLabel: fresh ? surfaceLabel(session.active_surface) : 'Strategic',
+    packageTitle: packageDetails?.packageTitle ?? null,
     contextLabel: contextLabel(contextStatus, Boolean(session.context_package_id)),
     contextTone: contextTone(contextStatus),
+    itemCount: packageDetails?.itemCount ?? null,
+    canvas: packageDetails?.canvas ?? null,
     refCount: refs.length,
     refs: refs.slice(0, 3),
     capturedAt: session.captured_at ?? null,
@@ -151,8 +163,11 @@ function buildCapturedDescriptor(
   return {
     modeLabel: modeLabel(session.interaction_mode),
     surfaceLabel: surfaceLabel(session.active_surface),
+    packageTitle: null,
     contextLabel: contextLabel(null, Boolean(session.context_package_id)),
     contextTone: 'neutral',
+    itemCount: null,
+    canvas: null,
     refCount: refs.length,
     refs: refs.slice(0, 3),
     capturedAt: session.captured_at ?? null,
@@ -166,6 +181,7 @@ export function buildStrategicContextDescriptor(
   const session = state?.work_session ?? null;
   const workbench = workbenchOverride ?? state?.workbench ?? null;
   const selectedRefs = workbench?.selected_refs ?? session?.selected_refs ?? [];
+  const packageCanvas = state?.context_package?.canvas;
   return buildDescriptor(
     {
       interaction_mode: workbench?.interaction_mode ?? session?.mode ?? 'chat',
@@ -177,6 +193,16 @@ export function buildStrategicContextDescriptor(
       selected_ref_descriptors: state?.work_session?.selected_ref_descriptors ?? [],
     },
     state?.context_package?.status ?? null,
+    {
+      packageTitle: state?.context_package?.title ?? null,
+      itemCount: state?.context_package?.item_count ?? null,
+      canvas: packageCanvas
+        ? {
+          nodeCount: packageCanvas.node_count ?? packageCanvas.nodes?.length ?? 0,
+          edgeCount: packageCanvas.edge_count ?? packageCanvas.edges?.length ?? 0,
+        }
+        : null,
+    },
   );
 }
 
@@ -214,6 +240,7 @@ function parseRefDescriptors(value: unknown): StrategicContextRefDescriptor[] {
       id,
       kind,
       label,
+      summary: asString(record?.summary),
       status: asString(record?.status),
     }];
   });

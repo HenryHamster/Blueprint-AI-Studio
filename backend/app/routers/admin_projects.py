@@ -59,6 +59,7 @@ from app.onboarding_proof import build_onboarding_proof_block
 from app.strategic_context_package import (
     build_strategic_context_package_summary,
     load_strategic_context_evidence,
+    selected_ref_descriptor,
 )
 from app.strategic_runtime_work import build_strategic_runtime_summary
 from app.workbench_state import (
@@ -159,52 +160,6 @@ def _work_session_metric(
     if target:
         metric["target"] = target
     return metric
-
-
-def _selected_ref_descriptor(
-    ref: Dict[str, Any],
-    context_package: Dict[str, Any] | None,
-) -> Dict[str, Any]:
-    kind = _compact_text(ref.get("kind"), max_chars=40) or "ref"
-    ref_id = _compact_text(ref.get("id"), max_chars=160) or ""
-    label = _compact_text(ref.get("label"), max_chars=180)
-    descriptor: Dict[str, Any] = {
-        "kind": kind,
-        "id": ref_id,
-        "label": label or f"{kind}:{ref_id}",
-    }
-    if not context_package:
-        return descriptor
-
-    candidates: list[Dict[str, Any]] = []
-    resources = context_package.get("resources")
-    if isinstance(resources, list):
-        candidates.extend(entry for entry in resources if isinstance(entry, dict))
-    canvas = context_package.get("canvas")
-    if isinstance(canvas, dict):
-        nodes = canvas.get("nodes")
-        if isinstance(nodes, list):
-            candidates.extend(entry for entry in nodes if isinstance(entry, dict))
-
-    for candidate in candidates:
-        candidate_kind = candidate.get("kind")
-        candidate_id = candidate.get("id")
-        if candidate_kind == kind and candidate_id == ref_id:
-            descriptor["label"] = _compact_text(
-                candidate.get("label") or descriptor["label"],
-                max_chars=180,
-            )
-            summary = _compact_text(candidate.get("summary"), max_chars=220)
-            if summary:
-                descriptor["summary"] = summary
-            target = candidate.get("target")
-            if isinstance(target, dict):
-                descriptor["target"] = target
-            status = _compact_text(candidate.get("status"), max_chars=80)
-            if status:
-                descriptor["status"] = status
-            break
-    return descriptor
 
 
 def _dedupe_workbench_refs(refs: Any, *, limit: int = 12) -> list[Dict[str, Any]]:
@@ -426,7 +381,7 @@ def _build_work_session_summary(
         else "clear",
         "selected_refs": selected_refs,
         "selected_ref_descriptors": [
-            _selected_ref_descriptor(ref, context_package)
+            selected_ref_descriptor(ref, context_package)
             for ref in selected_refs[:12]
             if isinstance(ref, dict)
         ],
@@ -507,7 +462,7 @@ def _message_preview(
         selected_refs = strategic_session.get("selected_refs")
         if isinstance(selected_refs, list):
             strategic_session["selected_ref_descriptors"] = [
-                _selected_ref_descriptor(ref, context_package)
+                selected_ref_descriptor(ref, context_package)
                 for ref in selected_refs[:12]
                 if isinstance(ref, dict)
             ]
@@ -1607,17 +1562,23 @@ async def create_project_strategic_session_message(
         if warning:
             ctx = {**ctx, "_provenance_warnings": warning}
 
-    await upsert_strategic_workbench_state_with_previous(
+    _previous_workbench, stored_workbench = await upsert_strategic_workbench_state_with_previous(
         session,
         current_user["user_id"],
         project_id,
         payload.workbench_context or {},
     )
+    workbench_context_for_snapshot = None
+    if payload.workbench_context is not None:
+        workbench_context_for_snapshot = {
+            **stored_workbench,
+            "context_package_id": payload.workbench_context.get("context_package_id"),
+        }
     strategic_session = await build_message_strategic_session_snapshot(
         session,
         current_user["user_id"],
         project_id,
-        None,
+        workbench_context_for_snapshot,
     )
     if strategic_session:
         ctx = {**ctx, "strategic_session": strategic_session}

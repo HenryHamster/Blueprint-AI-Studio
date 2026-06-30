@@ -93,6 +93,210 @@ def _artifact_context_kind(artifact: Artifact, *, has_logs: bool) -> str:
     return "artifact"
 
 
+_REF_PREFIX_BY_KIND = {
+    "artifact": "artifact",
+    "direction": "direction",
+    "knowledge_document": "knowledge",
+    "strategic_cycle": "cycle",
+    "task": "task",
+}
+
+
+def _ref_identity_values(kind: str, ref_id: str) -> set[str]:
+    values = {ref_id}
+    prefix = _REF_PREFIX_BY_KIND.get(kind)
+    if prefix:
+        marker = f"{prefix}:"
+        if ref_id.startswith(marker):
+            values.add(ref_id[len(marker):])
+        else:
+            values.add(f"{marker}{ref_id}")
+    return values
+
+
+def _prefixed_ref_id(kind: str, ref_id: str) -> str:
+    prefix = _REF_PREFIX_BY_KIND.get(kind)
+    if not prefix:
+        return ref_id
+    marker = f"{prefix}:"
+    return ref_id if ref_id.startswith(marker) else f"{marker}{ref_id}"
+
+
+def _unprefixed_ref_id(kind: str, ref_id: str) -> str:
+    prefix = _REF_PREFIX_BY_KIND.get(kind)
+    if not prefix:
+        return ref_id
+    marker = f"{prefix}:"
+    return ref_id[len(marker):] if ref_id.startswith(marker) else ref_id
+
+
+def _fallback_ref_target(kind: str, ref_id: str) -> Dict[str, Any] | None:
+    if kind == "canvas":
+        return {"surface": "project", "section": "problem-model"}
+    return None
+
+
+def _candidate_descriptor(
+    *,
+    kind: str,
+    ref_id: Any,
+    label: Any = None,
+    summary: Any = None,
+    status: Any = None,
+    target: Dict[str, Any] | None = None,
+) -> Dict[str, Any] | None:
+    candidate_id = _compact_text(ref_id, max_chars=160)
+    candidate_kind = _compact_text(kind, max_chars=40)
+    if not candidate_kind or not candidate_id:
+        return None
+    descriptor: Dict[str, Any] = {
+        "kind": candidate_kind,
+        "id": candidate_id,
+        "label": _compact_text(label, max_chars=180)
+        or f"{candidate_kind}:{candidate_id}",
+    }
+    compact_summary = _compact_text(summary, max_chars=220)
+    if compact_summary:
+        descriptor["summary"] = compact_summary
+    compact_status = _compact_text(status, max_chars=80)
+    if compact_status:
+        descriptor["status"] = compact_status
+    if isinstance(target, dict):
+        descriptor["target"] = target
+    return descriptor
+
+
+def _context_package_descriptor_candidates(
+    context_package: Dict[str, Any] | None,
+) -> list[Dict[str, Any]]:
+    if not isinstance(context_package, dict):
+        return []
+
+    candidates: list[Dict[str, Any]] = []
+
+    resources = context_package.get("resources")
+    if isinstance(resources, list):
+        candidates.extend(entry for entry in resources if isinstance(entry, dict))
+
+    canvas = context_package.get("canvas")
+    if isinstance(canvas, dict):
+        nodes = canvas.get("nodes")
+        if isinstance(nodes, list):
+            candidates.extend(entry for entry in nodes if isinstance(entry, dict))
+
+    evidence = context_package.get("evidence")
+    if isinstance(evidence, dict):
+        knowledge = evidence.get("knowledge")
+        if isinstance(knowledge, dict):
+            for doc in (knowledge.get("items") or [])[:8]:
+                if not isinstance(doc, dict):
+                    continue
+                doc_id = _compact_text(doc.get("id"), max_chars=140)
+                if not doc_id:
+                    continue
+                descriptor = _candidate_descriptor(
+                    kind="knowledge_document",
+                    ref_id=_prefixed_ref_id("knowledge_document", doc_id),
+                    label=doc.get("label") or doc.get("topic"),
+                    summary=doc.get("summary"),
+                    status=doc.get("source_kind"),
+                    target=doc.get("target"),
+                )
+                if descriptor:
+                    candidates.append(descriptor)
+                source_task_id = doc.get("source_task_id")
+                if source_task_id:
+                    task_descriptor = _candidate_descriptor(
+                        kind="task",
+                        ref_id=_prefixed_ref_id("task", str(source_task_id)),
+                        label=doc.get("label") or "Knowledge source task",
+                        summary=doc.get("summary"),
+                        status="knowledge source",
+                        target={"surface": "task", "task_id": str(source_task_id)},
+                    )
+                    if task_descriptor:
+                        candidates.append(task_descriptor)
+
+        artifacts = evidence.get("artifacts")
+        if isinstance(artifacts, dict):
+            for artifact in (artifacts.get("items") or [])[:8]:
+                if not isinstance(artifact, dict):
+                    continue
+                artifact_id = _compact_text(artifact.get("id"), max_chars=140)
+                if not artifact_id:
+                    continue
+                descriptor = _candidate_descriptor(
+                    kind="artifact",
+                    ref_id=_prefixed_ref_id("artifact", artifact_id),
+                    label=artifact.get("label")
+                    or artifact.get("logical_key")
+                    or artifact.get("artifact_type"),
+                    summary=artifact.get("task_title"),
+                    status=artifact.get("artifact_type") or artifact.get("task_status"),
+                    target=artifact.get("target"),
+                )
+                if descriptor:
+                    candidates.append(descriptor)
+                task_id = artifact.get("task_id")
+                if task_id:
+                    task_descriptor = _candidate_descriptor(
+                        kind="task",
+                        ref_id=_prefixed_ref_id("task", str(task_id)),
+                        label=artifact.get("task_title") or "Artifact task",
+                        summary=artifact.get("label") or artifact.get("artifact_type"),
+                        status=artifact.get("task_status"),
+                        target={"surface": "task", "task_id": str(task_id)},
+                    )
+                    if task_descriptor:
+                        candidates.append(task_descriptor)
+
+    return candidates
+
+
+def selected_ref_descriptor(
+    ref: Dict[str, Any],
+    context_package: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    kind = _compact_text(ref.get("kind"), max_chars=40) or "ref"
+    ref_id = _compact_text(ref.get("id"), max_chars=160) or ""
+    label = _compact_text(ref.get("label"), max_chars=180)
+    descriptor: Dict[str, Any] = {
+        "kind": kind,
+        "id": ref_id,
+        "label": label or f"{kind}:{ref_id}",
+    }
+    fallback_target = _fallback_ref_target(kind, ref_id)
+
+    ref_identities = _ref_identity_values(kind, ref_id)
+    matched = False
+    for candidate in _context_package_descriptor_candidates(context_package):
+        candidate_kind = candidate.get("kind")
+        candidate_id = _compact_text(candidate.get("id"), max_chars=160)
+        if candidate_kind != kind or not candidate_id:
+            continue
+        if ref_identities.isdisjoint(_ref_identity_values(kind, candidate_id)):
+            continue
+
+        if not matched:
+            descriptor["label"] = _compact_text(
+                candidate.get("label") or descriptor["label"],
+                max_chars=180,
+            )
+        summary = _compact_text(candidate.get("summary"), max_chars=220)
+        if summary and not descriptor.get("summary"):
+            descriptor["summary"] = summary
+        target = candidate.get("target")
+        if isinstance(target, dict) and not descriptor.get("target"):
+            descriptor["target"] = target
+        status = _compact_text(candidate.get("status"), max_chars=80)
+        if status and not descriptor.get("status"):
+            descriptor["status"] = status
+        matched = True
+    if fallback_target and not descriptor.get("target"):
+        descriptor["target"] = fallback_target
+    return descriptor
+
+
 async def load_strategic_context_evidence(
     session: AsyncSession,
     project_id: uuid.UUID,

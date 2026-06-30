@@ -92,6 +92,77 @@ describe('strategicContextDescriptor freshness', () => {
     expect(descriptor?.modeLabel).toBe('Workday');
   });
 
+  test('includes package, canvas, and selected ref descriptor details', () => {
+    const recentNaive = new Date(Date.now() - 30 * 60_000).toISOString().replace('Z', '');
+
+    const descriptor = buildStrategicContextDescriptor(
+      makeStrategicState({
+        context_package: {
+          id: 'strategic-context:proj-1',
+          title: 'Operator workbench plan',
+          status: 'building',
+          item_count: 14,
+          token_count: null,
+          sources: [],
+          resources: [],
+          drilldowns: [],
+          canvas: {
+            id: 'strategic-canvas:proj-1',
+            node_count: 8,
+            edge_count: 7,
+            nodes: [],
+            edges: [],
+          },
+        },
+        workbench: {
+          version: 1,
+          interaction_mode: 'continuous',
+          active_surface: 'project',
+          session_started_at: recentNaive,
+          last_interaction_at: recentNaive,
+          selected_refs: [
+            { kind: 'task', id: 'task-1', label: 'Stale task label' },
+          ],
+        },
+        work_session: {
+          version: 1,
+          id: 'strategic-session:proj-1',
+          mode: 'continuous',
+          active_surface: 'project',
+          session_started_at: recentNaive,
+          last_interaction_at: recentNaive,
+          context_package_id: 'strategic-context:proj-1',
+          attention_level: 'clear',
+          selected_refs: [],
+          selected_ref_descriptors: [
+            {
+              kind: 'task',
+              id: 'task-1',
+              label: 'Review active wave',
+              summary: 'Reviewing context descriptors.',
+              status: 'IN_PROGRESS',
+              target: { surface: 'task', task_id: 'task-1' },
+            },
+          ],
+          curated_metrics: [],
+          context_sources: [],
+        },
+      }),
+    );
+
+    expect(descriptor).not.toBeNull();
+    expect(descriptor?.packageTitle).toBe('Operator workbench plan');
+    expect(descriptor?.contextLabel).toBe('Building context');
+    expect(descriptor?.canvas).toEqual({ nodeCount: 8, edgeCount: 7 });
+    expect(descriptor?.itemCount).toBe(14);
+    expect(descriptor?.refs[0]).toMatchObject({
+      kind: 'task',
+      label: 'Review active wave',
+      summary: 'Reviewing context descriptors.',
+      status: 'IN_PROGRESS',
+    });
+  });
+
   test('suppresses stale session-only workbench signal', () => {
     const staleNaive = new Date(Date.now() - 5 * 3600_000).toISOString().replace('Z', '');
 
@@ -165,6 +236,36 @@ describe('buildMessageStrategicContextDescriptor', () => {
     expect(descriptor?.contextLabel).toBe('Context captured');
     expect(descriptor?.refCount).toBe(1);
     expect(descriptor?.refs[0]?.label).toBe('Latest context report');
+  });
+
+  test('preserves captured selected-ref summaries from message receipts', () => {
+    const context = {
+      strategic_session: {
+        interaction_mode: 'continuous',
+        active_surface: 'project',
+        context_package_id: 'strategic-context:proj-1',
+        selected_refs: [
+          { kind: 'task', id: 'task-1', label: 'Old task label' },
+        ],
+        selected_ref_descriptors: [
+          {
+            kind: 'task',
+            id: 'task-1',
+            label: 'Review active wave',
+            summary: 'Reviewing context descriptors.',
+            status: 'IN_PROGRESS',
+          },
+        ],
+      },
+    } as ProjectMessageContext;
+
+    const descriptor = buildMessageStrategicContextDescriptor(context);
+
+    expect(descriptor?.refs[0]).toMatchObject({
+      label: 'Review active wave',
+      summary: 'Reviewing context descriptors.',
+      status: 'IN_PROGRESS',
+    });
   });
 
   test('preserves last_interaction_at from message strategic_session snapshots', () => {

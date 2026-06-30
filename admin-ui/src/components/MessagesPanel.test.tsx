@@ -726,6 +726,23 @@ describe('MessagesPanel chrome modes', () => {
     const el = await renderPanel({
       filterChrome: 'minimal',
       strategicState: makeStrategicState({
+        context_package: {
+          id: 'strategic-context:proj-1',
+          title: 'Workbench context',
+          status: 'ready',
+          item_count: 18,
+          token_count: null,
+          sources: [],
+          drilldowns: [],
+          resources: [],
+          canvas: {
+            id: 'strategic-canvas:proj-1',
+            node_count: 8,
+            edge_count: 7,
+            nodes: [],
+            edges: [],
+          },
+        },
         work_session: {
           version: 1,
           id: 'strategic-session:proj-1:2026-06-29T01:00:00Z',
@@ -763,7 +780,10 @@ describe('MessagesPanel chrome modes', () => {
 
     const descriptor = el.querySelector('[data-testid="strategic-context-descriptor"]');
     expect(descriptor?.textContent).toContain('Context');
+    expect(descriptor?.textContent).toContain('Workbench context');
     expect(descriptor?.textContent).toContain('Workday');
+    expect(descriptor?.textContent).toContain('8 nodes / 7 links');
+    expect(descriptor?.textContent).toContain('18 items');
     expect(descriptor?.textContent).toContain('Latest context report');
     expect(descriptor?.textContent).not.toContain('Operator notes');
   });
@@ -796,6 +816,51 @@ describe('MessagesPanel chrome modes', () => {
     expect(descriptor).not.toBeNull();
     await act(async () => {
       descriptor?.click();
+    });
+    expect(onOpenStrategicContextWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  test('minimal chat context receipts open Strategic context workspace', async () => {
+    const onOpenStrategicContextWorkspace = vi.fn();
+    const operator = makeMsg({
+      id: 'operator-context',
+      from_type: 'user',
+      message_type: 'FEEDBACK',
+      content: 'Use this context.',
+      context: {
+        strategic_session: {
+          version: 1,
+          interaction_mode: 'continuous',
+          active_surface: 'project',
+          context_package_id: 'strategic-context:proj-1',
+          selected_refs: [
+            { kind: 'task', id: 'task-1', label: 'Old task label' },
+          ],
+          selected_ref_descriptors: [
+            {
+              kind: 'task',
+              id: 'task-1',
+              label: 'Review active wave',
+              summary: 'Reviewing context descriptors.',
+              status: 'IN_PROGRESS',
+            },
+          ],
+          captured_at: '2026-06-29T12:00:00Z',
+        },
+      },
+      created_at: '2026-06-01T10:00:00Z',
+    });
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      onOpenStrategicContextWorkspace,
+    }, [operator]);
+
+    const receipt = el.querySelector('[data-testid="strategic-context-receipt"]') as HTMLButtonElement | null;
+    expect(receipt).not.toBeNull();
+    expect(receipt?.textContent).toContain('Sent with context');
+    expect(receipt?.textContent).toContain('Review active wave');
+    await act(async () => {
+      receipt?.click();
     });
     expect(onOpenStrategicContextWorkspace).toHaveBeenCalledTimes(1);
   });

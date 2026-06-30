@@ -7,6 +7,12 @@ function toneClass(tone: StrategicContextDescriptorModel['contextTone']): string
   return 'bg-neutral-500';
 }
 
+function refKindLabel(kind: string): string {
+  if (kind === 'knowledge_document') return 'knowledge';
+  if (kind === 'strategic_cycle') return 'cycle';
+  return kind.replace(/_/g, ' ');
+}
+
 export function StrategicContextDescriptor({
   model,
   variant = 'composer',
@@ -19,16 +25,28 @@ export function StrategicContextDescriptor({
   const visibleRefs = model.refs.slice(0, 2);
   const hiddenRefCount = Math.max(0, model.refCount - visibleRefs.length);
   const compact = variant === 'receipt';
-  const title = onOpen ? 'Open Strategic context' : model.capturedAt ? `Captured ${model.capturedAt}` : undefined;
+  const canvasLabel = model.canvas && (model.canvas.nodeCount > 0 || model.canvas.edgeCount > 0)
+    ? `${model.canvas.nodeCount} nodes / ${model.canvas.edgeCount} links`
+    : null;
+  const packageLabel = !compact && model.packageTitle ? model.packageTitle : null;
+  const title = onOpen
+    ? 'Open Strategic context'
+    : model.capturedAt
+      ? `Captured ${model.capturedAt}`
+      : undefined;
   const className = compact
     ? 'flex max-w-full flex-wrap items-center gap-x-1.5 gap-y-1 text-ui-md leading-snug text-neutral-500'
-    : 'mx-auto mb-2 flex w-full max-w-4xl flex-wrap items-center gap-x-2 gap-y-1 text-ui-md leading-snug text-neutral-500';
+    : 'mx-auto mb-2 flex w-full max-w-4xl flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-neutral-800/70 bg-neutral-950/45 px-2 py-1.5 text-ui-md leading-snug text-neutral-500';
+  const testId = compact ? 'strategic-context-receipt' : 'strategic-context-descriptor';
   const content = (
     <>
       <span className="inline-flex min-w-0 items-center gap-1.5 font-medium text-neutral-400">
         <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${toneClass(model.contextTone)}`} />
         {compact ? 'Sent with context' : 'Context'}
       </span>
+      {packageLabel && (
+        <span className="min-w-0 max-w-full truncate text-neutral-300">{packageLabel}</span>
+      )}
       <span aria-hidden="true" className="text-neutral-700">/</span>
       <span>{model.modeLabel}</span>
       {model.surfaceLabel !== 'Strategic' && (
@@ -45,16 +63,30 @@ export function StrategicContextDescriptor({
           </span>
         </>
       )}
+      {canvasLabel && (
+        <>
+          <span aria-hidden="true" className="text-neutral-700">/</span>
+          <span className="text-neutral-500">{canvasLabel}</span>
+        </>
+      )}
+      {!compact && model.itemCount != null && model.itemCount > 0 && (
+        <>
+          <span aria-hidden="true" className="text-neutral-700">/</span>
+          <span className="text-neutral-500">{model.itemCount} items</span>
+        </>
+      )}
       {visibleRefs.map(ref => (
         <span
           key={ref.id}
           className={compact
             ? 'min-w-0 max-w-full truncate text-neutral-400'
-            : 'min-w-0 max-w-full rounded-md border border-neutral-800 bg-neutral-900/70 px-1.5 py-0.5 text-neutral-300'
+            : 'inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-900/70 px-1.5 py-0.5 text-neutral-300'
           }
+          title={ref.summary ?? undefined}
         >
-          {ref.label}
-          {ref.status && !compact && <span className="ml-1 text-neutral-600">{ref.status}</span>}
+          {!compact && <span className="shrink-0 text-neutral-600">{refKindLabel(ref.kind)}</span>}
+          <span className="min-w-0 truncate">{ref.label}</span>
+          {ref.status && !compact && <span className="shrink-0 text-neutral-600">{ref.status}</span>}
         </span>
       ))}
       {hiddenRefCount > 0 && (
@@ -66,10 +98,10 @@ export function StrategicContextDescriptor({
     return (
       <button
         type="button"
-        data-testid="strategic-context-descriptor"
+        data-testid={testId}
         title={title}
         onClick={onOpen}
-        className={`${className} min-h-11 rounded-md px-1 text-left transition-colors hover:text-neutral-300 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-700`}
+        className={`${className} min-h-11 text-left transition-colors hover:border-neutral-700 hover:text-neutral-300 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-700`}
       >
         {content}
       </button>
@@ -77,7 +109,7 @@ export function StrategicContextDescriptor({
   }
   return (
     <div
-      data-testid={compact ? 'strategic-context-receipt' : 'strategic-context-descriptor'}
+      data-testid={testId}
       title={title}
       className={className}
     >
