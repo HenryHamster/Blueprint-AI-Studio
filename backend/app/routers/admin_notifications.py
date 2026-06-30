@@ -4,6 +4,7 @@ import logging
 import re
 import uuid
 import json
+import math
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, List
 
@@ -105,7 +106,7 @@ class _NoisePrefUpdate(BaseModel):
 
 class _SavedViewsUpdate(BaseModel):
     project_id: str
-    saved_views: List[Dict[str, Any]] = Field(default_factory=list)
+    saved_views: List[Any] = Field(default_factory=list)
 
 
 class _TempMutesUpdate(BaseModel):
@@ -138,6 +139,66 @@ class _AdminPlaybookSet(BaseModel):
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _ADMIN_PLAYBOOK_KEY_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9\-]{0,49}$")
+_MESSAGES_SAVED_VIEWS_CAP = 10
+_MESSAGES_SAVED_VIEW_PREF_VALUES = {"mute", "routine", "surfaced"}
+
+
+def _sanitize_message_saved_view(raw: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return None
+
+    view_id = raw.get("id")
+    name = raw.get("name")
+    if not isinstance(view_id, str) or not view_id:
+        return None
+    if not isinstance(name, str) or not name:
+        return None
+
+    prefs_raw = raw.get("prefs")
+    prefs: Dict[str, str] = {}
+    if isinstance(prefs_raw, dict):
+        for key, value in prefs_raw.items():
+            if (
+                isinstance(key, str)
+                and isinstance(value, str)
+                and value in _MESSAGES_SAVED_VIEW_PREF_VALUES
+            ):
+                prefs[key] = value
+
+    created_at = raw.get("createdAt")
+    if not isinstance(created_at, (int, float)) or isinstance(created_at, bool) or not math.isfinite(created_at):
+        created_at = int(datetime.now(timezone.utc).timestamp() * 1000)
+
+    saved_view: Dict[str, Any] = {
+        "id": view_id,
+        "name": name,
+        "query": raw.get("query") if isinstance(raw.get("query"), str) else "",
+        "prefs": prefs,
+        "sort": "recent" if raw.get("sort") == "recent" else "importance",
+        "showResolved": raw.get("showResolved") is True,
+        "routineExpanded": raw.get("routineExpanded") is True,
+        "showOnlyNew": raw.get("showOnlyNew") is True,
+        "createdAt": created_at,
+    }
+    description = raw.get("description")
+    if isinstance(description, str):
+        saved_view["description"] = description
+    return saved_view
+
+
+def _sanitize_message_saved_views(saved_views: Any) -> List[Dict[str, Any]]:
+    if not isinstance(saved_views, list):
+        return []
+
+    sanitized: List[Dict[str, Any]] = []
+    for raw in saved_views:
+        saved_view = _sanitize_message_saved_view(raw)
+        if saved_view is None:
+            continue
+        sanitized.append(saved_view)
+        if len(sanitized) >= _MESSAGES_SAVED_VIEWS_CAP:
+            break
+    return sanitized
 
 # Mirrors ROUTINE_EVENT_LABELS keys in admin-ui/src/components/MessagesPanel.utils.ts.
 # Events in this set trigger a one-line digest appended to project.running_update.
@@ -1092,7 +1153,7 @@ async def get_messages_saved_views(
         )
     ).scalar_one_or_none()
 
-    return {"saved_views": row.saved_views if row is not None else []}
+    return {"saved_views": _sanitize_message_saved_views(row.saved_views if row is not None else [])}
 
 
 @router.put("/messages/saved-views")
@@ -1111,6 +1172,8 @@ async def put_messages_saved_views(
     if len(json.dumps(payload.saved_views)) > 50_000:
         raise HTTPException(status_code=400, detail="Saved views too large (max 50KB)")
 
+    saved_views = _sanitize_message_saved_views(payload.saved_views)
+
     row = (
         await session.execute(
             select(MessagesSavedViews).where(
@@ -1124,10 +1187,10 @@ async def put_messages_saved_views(
         row = MessagesSavedViews(
             user_id=current_user["user_id"],
             project_id=pid,
-            saved_views=payload.saved_views,
+            saved_views=saved_views,
         )
     else:
-        row.saved_views = payload.saved_views
+        row.saved_views = saved_views
         flag_modified(row, "saved_views")
 
     session.add(row)

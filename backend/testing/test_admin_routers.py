@@ -39,6 +39,7 @@ from app.models import (
     MessageType,
     MessagesLastSeen,
     MessagesNoisePrefs,
+    MessagesSavedViews,
     StrategicCycle,
     Direction,
     SystemMaturity,
@@ -6345,7 +6346,29 @@ class TestMessagesWorkbenchState:
         )
 
 
+def _message_saved_view(idx: int = 1, **overrides):
+    view = {
+        "id": f"view-{idx}",
+        "name": f"View {idx}",
+        "query": "",
+        "prefs": {},
+        "sort": "importance",
+        "showResolved": False,
+        "routineExpanded": False,
+        "showOnlyNew": False,
+        "createdAt": 1_700_000_000_000 + idx,
+    }
+    view.update(overrides)
+    return view
+
+
 class TestMessagesSavedViews:
+    def test_sanitizer_handles_corrupt_non_list_rows(self):
+        """Old/corrupt JSONB values read back as an empty saved-view list."""
+        from app.routers.admin_notifications import _sanitize_message_saved_views
+
+        assert _sanitize_message_saved_views({"views": [_message_saved_view()]}) == []
+
     @pytest.mark.asyncio
     async def test_get_saved_views_empty(self, client: AsyncClient, db_session):
         """Returns empty list when no saved-views record exists for the operator."""
@@ -6357,10 +6380,48 @@ class TestMessagesSavedViews:
         assert resp.json()["saved_views"] == []
 
     @pytest.mark.asyncio
+    async def test_get_sanitizes_corrupt_saved_views_row(self, client: AsyncClient, db_session):
+        """GET sanitizes legacy/corrupt rows before returning them to the UI."""
+        project = await _make_project(db_session)
+        db_session.add(
+            MessagesSavedViews(
+                user_id=TEST_USER_ID,
+                project_id=project.id,
+                saved_views=[
+                    {"id": "bad"},
+                    _message_saved_view(1, prefs={"deploy": "surfaced", "list": [], "dict": {}}, extra="drop"),
+                    *[_message_saved_view(i) for i in range(2, 13)],
+                ],
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/messages/saved-views?project_id={project.id}"
+        )
+
+        assert resp.status_code == 200
+        saved_views = resp.json()["saved_views"]
+        assert len(saved_views) == 10
+        assert saved_views[0] == {
+            "id": "view-1",
+            "name": "View 1",
+            "query": "",
+            "prefs": {"deploy": "surfaced"},
+            "sort": "importance",
+            "showResolved": False,
+            "routineExpanded": False,
+            "showOnlyNew": False,
+            "createdAt": 1_700_000_000_001,
+        }
+        assert "extra" not in saved_views[0]
+        assert saved_views[-1]["id"] == "view-10"
+
+    @pytest.mark.asyncio
     async def test_round_trip(self, client: AsyncClient, db_session):
         """PUT stores saved views; subsequent GET returns the same value."""
         project = await _make_project(db_session)
-        views = [{"name": "Blockers only", "query": "", "sort": "desc"}]
+        views = [_message_saved_view(name="Blockers only", query="blocked", sort="recent")]
 
         put_resp = await client.put(
             "/api/admin/messages/saved-views",
@@ -6379,8 +6440,8 @@ class TestMessagesSavedViews:
     async def test_update_replaces_views(self, client: AsyncClient, db_session):
         """A second PUT replaces the previous saved views."""
         project = await _make_project(db_session)
-        views1 = [{"name": "First view"}]
-        views2 = [{"name": "Second view"}, {"name": "Third view"}]
+        views1 = [_message_saved_view(1, name="First view")]
+        views2 = [_message_saved_view(2, name="Second view"), _message_saved_view(3, name="Third view")]
 
         await client.put(
             "/api/admin/messages/saved-views",
@@ -6394,6 +6455,61 @@ class TestMessagesSavedViews:
             f"/api/admin/messages/saved-views?project_id={project.id}"
         )
         assert get_resp.json()["saved_views"] == views2
+
+    @pytest.mark.asyncio
+    async def test_put_sanitizes_and_caps_saved_views(self, client: AsyncClient, db_session):
+        """PUT stores only valid saved-view fields and caps the list at ten."""
+        project = await _make_project(db_session)
+        views = [
+            "not a view",
+            {"id": "missing-name"},
+            _message_saved_view(
+                0,
+                name="Primary",
+                query=123,
+                prefs={"deployment": "mute", "noise": "invalid", "list": [], "dict": {}},
+                sort="recent",
+                showResolved=True,
+                showOnlyNew=True,
+                extra="dropped",
+            ),
+            *[_message_saved_view(i) for i in range(1, 12)],
+        ]
+
+        put_resp = await client.put(
+            "/api/admin/messages/saved-views",
+            json={"project_id": str(project.id), "saved_views": views},
+        )
+        assert put_resp.status_code == 200
+
+        row = (
+            await db_session.execute(
+                select(MessagesSavedViews).where(
+                    MessagesSavedViews.user_id == TEST_USER_ID,
+                    MessagesSavedViews.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        saved_views = row.saved_views
+
+        get_resp = await client.get(
+            f"/api/admin/messages/saved-views?project_id={project.id}"
+        )
+        assert get_resp.json()["saved_views"] == saved_views
+        assert len(saved_views) == 10
+        assert saved_views[0] == {
+            "id": "view-0",
+            "name": "Primary",
+            "query": "",
+            "prefs": {"deployment": "mute"},
+            "sort": "recent",
+            "showResolved": True,
+            "routineExpanded": False,
+            "showOnlyNew": True,
+            "createdAt": 1_700_000_000_000,
+        }
+        assert "extra" not in saved_views[0]
+        assert saved_views[-1]["id"] == "view-9"
 
     @pytest.mark.asyncio
     async def test_no_access_returns_404(self, client: AsyncClient, db_session):

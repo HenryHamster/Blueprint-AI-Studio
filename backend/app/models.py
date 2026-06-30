@@ -893,8 +893,9 @@ class MessagesSavedViews(SQLModel, table=True):
     this table is the authoritative source when the backend is reachable.
 
     saved_views shape (stored as JSONB, validated by the admin_notifications router):
-      [{"name": str, "query": str, "event_prefs": {...}, "sort_mode": str,
-        "show_resolved": bool, "show_routine": bool, "only_new": bool}, ...]
+      [{"id": str, "name": str, "query": str, "prefs": {...}, "sort": str,
+        "showResolved": bool, "routineExpanded": bool, "showOnlyNew": bool,
+        "createdAt": number}, ...]
     """
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
