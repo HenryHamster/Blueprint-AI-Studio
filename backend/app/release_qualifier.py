@@ -1519,6 +1519,9 @@ async def run_qualification(
         "previous_infra_failure_candidate_sha": prior_infra_failure_candidate_sha,
         "infra_attempt_history": infra_attempt_history,
         "prior_superseded": prior_superseded,
+        "keyless_requalification_consumed_at": prior_qual.get(
+            "keyless_requalification_consumed_at"
+        ),
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic

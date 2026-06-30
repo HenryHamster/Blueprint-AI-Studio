@@ -15192,7 +15192,9 @@ async def test_auto_stale_clears_keyless_challenger_independent_blocker(
 
 
 @pytest.mark.asyncio
-async def test_keyless_blocker_on_current_head_does_not_strand(db_session, mocker):
+async def test_keyless_blocker_on_current_head_spawns_bounded_requalification(
+    db_session, mocker
+):
     """Keyless gating finding on the CURRENT HEAD (HEAD == candidate_sha) is
     auto-staled by the sweep, unblocking re-qualification.
 
@@ -15288,21 +15290,189 @@ async def test_keyless_blocker_on_current_head_does_not_strand(db_session, mocke
     assert ledger_rows[0].finding_key == _KEYLESS_FINDING_SENTINEL
     assert ledger_rows[0].state == "stale"
 
-    # After the stale row is written, requalification_ready flips to True —
-    # this is the "does not strand" proof: an operator-triggered or next-HEAD-
-    # advance re-drive is no longer permanently blocked.
+    # After the stale row is written, requalification_ready flips to True.
     after = await compute_requalification_readiness(db_session, project.id)
     assert after["requalification_ready"], (
         "expected requalification_ready=True after auto-stale of keyless finding — "
         f"got: {after}"
     )
 
-    # count=0 is expected: HEAD == candidate_sha means run_qualification returns
-    # cached_verdict (no new spawn on same SHA).  The fix is that the ledger row
-    # was written so the NEXT sweep after HEAD advances will fire the re-drive.
-    # (Without the fix, the stale row would never be written and the ledger gate
-    # would block re-qualification permanently.)
-    _ = count  # unused — re-drive deferred to next HEAD-advance sweep
+    # The same sweep must re-drive once the keyless blocker is stale, even though
+    # HEAD == candidate_sha. This is bounded: the stale not_promoted record is
+    # overwritten with a pending qualification, so the next sweep sees an
+    # in-flight/current qualification instead of repeatedly spawning.
+    assert count == 1
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == current_sha
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_keyless_blocker_requalification_is_consumed_once(
+    db_session, mocker
+):
+    """A stale keyless blocker may re-drive once, then stops after settling.
+
+    This protects against the sweep loop where a stale sentinel survives a
+    completed requalification and would otherwise keep re-opening the same SHA
+    forever.
+    """
+    from app.release_readiness import (
+        _KEYLESS_FINDING_SENTINEL,
+        apply_finding_resolution,
+        compute_requalification_readiness,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    current_sha = "cursha1" * 5 + "00000"
+    blocker_findings = [
+        {
+            "severity": "high",
+            "summary": "Challenger confirmed independent blocker (no key)",
+        },
+    ]
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "audit_challenge_independent_blocker",
+        "candidate_sha": current_sha,
+        "audit_findings": blocker_findings,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    await apply_finding_resolution(
+        db_session,
+        project.id,
+        version.id,
+        _KEYLESS_FINDING_SENTINEL,
+        "stale",
+        severity="high",
+        note="seeded stale blocker",
+        verified_against_sha=current_sha,
+    )
+    await db_session.commit()
+
+    before = await compute_requalification_readiness(db_session, project.id)
+    assert before["requalification_ready"], f"expected ready state, got {before}"
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=current_sha))
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=type("SpawnedTask", (), {"id": uuid.uuid4()})()),
+    )
+
+    first = await rq._redrive_not_promoted_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.refresh(version)
+    assert first is True
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["keyless_requalification_consumed_at"]
+
+    # Simulate the completed requalification settling back to not_promoted via
+    # the real finalize helper, which must preserve the consumed marker.
+    pending_qual = dict(version.last_qualification)
+    mocker.patch("app.release_qualifier._notify_operator", new=AsyncMock())
+    await rq._handle_independent_blocker(
+        db_session, version, pending_qual, blocker_findings
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+    assert version.last_qualification["keyless_requalification_consumed_at"]
+
+    second = await rq._redrive_not_promoted_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.refresh(version)
+    assert second is False
+    assert spawn_mock.await_count == 1
+    assert version.last_qualification["status"] == "not_promoted"
+    assert version.last_qualification["keyless_requalification_consumed_at"]
+
+
+@pytest.mark.asyncio
+async def test_keyless_blocker_consumed_marker_does_not_block_new_head(
+    db_session, mocker
+):
+    """A consumed keyless blocker still re-drives when automain advances.
+
+    The consumed marker only suppresses the same-HEAD re-drive.  Once the
+    integration branch moves to a new SHA, run_qualification must be allowed
+    to re-snapshot and spawn a fresh qualification for the new candidate.
+    """
+    from app.release_readiness import (
+        _KEYLESS_FINDING_SENTINEL,
+        apply_finding_resolution,
+        compute_requalification_readiness,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "cursha2" * 5 + "00000"
+    pending_qual = {
+        "status": "pending",
+        "candidate_sha": old_sha,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-06-30T00:00:00+00:00",
+        "audit_task_id": str(uuid.uuid4()),
+        "audit_challenge_task_id": str(uuid.uuid4()),
+        "smoketest_task_id": None,
+        "keyless_requalification_consumed_at": "2026-06-30T00:00:00+00:00",
+    }
+    blocker_findings = [
+        {
+            "severity": "high",
+            "summary": "Challenger confirmed independent blocker (no key)",
+        },
+    ]
+
+    mocker.patch("app.release_qualifier._notify_operator", new=AsyncMock())
+    await rq._handle_independent_blocker(
+        db_session, version, pending_qual, blocker_findings
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await apply_finding_resolution(
+        db_session,
+        project.id,
+        version.id,
+        _KEYLESS_FINDING_SENTINEL,
+        "stale",
+        severity="high",
+        note="seeded stale blocker",
+        verified_against_sha=old_sha,
+    )
+    await db_session.commit()
+
+    before = await compute_requalification_readiness(db_session, project.id)
+    assert before["requalification_ready"], f"expected ready state, got {before}"
+
+    new_sha = "automn1" * 5 + "00000"
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=new_sha))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=type("SpawnedTask", (), {"id": uuid.uuid4()})()),
+    )
+
+    result = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.refresh(version)
+
+    assert result == 1
+    assert spawn_mock.await_count == 1
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == new_sha
 
 
 @pytest.mark.asyncio

@@ -405,9 +405,12 @@ async def _redrive_not_promoted_qualification(
          HEAD advancement is the signal that warrants a fresh qualification.
       2. Re-invokes ``run_qualification``, which under its own ``FOR UPDATE`` lock
          re-resolves the candidate SHA.  If ``automain`` has NOT advanced (same
-         SHA), ``run_qualification`` returns ``cached_verdict`` and this returns
-         False — nothing to do.  If ``automain`` HAS advanced, the cached-verdict
-         guard is a miss (new SHA) and a fresh qualification spawns.
+         SHA), ``run_qualification`` normally returns ``cached_verdict``.  The
+         bounded exception is a stale keyless finding: it has no code anchor, so
+         the sweep marks the old verdict non-conclusive once and lets a fresh
+         qualification re-confirm or refute it on the current HEAD.  If
+         ``automain`` HAS advanced, the cached-verdict guard is a miss (new SHA)
+         and a fresh qualification spawns.
 
     Returns True only when the re-entry actually STARTED a new qualification
     (``status == "spawned"``).  Any guard no-op or readiness miss returns False.
@@ -419,8 +422,11 @@ async def _redrive_not_promoted_qualification(
     # Both ``run_qualification`` and ``compute_requalification_readiness`` live
     # in modules that import this one (directly or transitively), so import
     # them lazily to avoid load-time import cycles.
-    from app import release_qualifier
-    from app.release_readiness import compute_requalification_readiness
+    from app import github, release_qualifier
+    from app.release_readiness import (
+        _KEYLESS_FINDING_SENTINEL,
+        compute_requalification_readiness,
+    )
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as redrive_session:
@@ -445,11 +451,57 @@ async def _redrive_not_promoted_qualification(
         )
         if not readiness.get("requalification_ready"):
             return False
+        keyless_stale = any(
+            f.get("key") == _KEYLESS_FINDING_SENTINEL and f.get("state") == "stale"
+            for f in readiness.get("findings", [])
+            if isinstance(f, dict)
+        )
+        if keyless_stale and qual.get("keyless_requalification_consumed_at"):
+            project = await redrive_session.get(Project, version.project_id)
+            current_head_sha = None
+            if project is not None:
+                resolved = await release_qualifier._resolve_github_with_session(
+                    redrive_session, project
+                )
+                if resolved is not None:
+                    token, owner, repo = resolved
+                    integration_branch, _promotion_target = (
+                        release_qualifier._lts_branch_names(project)
+                    )
+                    try:
+                        current_head_sha = await github.get_branch_sha(
+                            token, owner, repo, integration_branch
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[RELEASE_QUALIFIER] sweep: failed to resolve %s HEAD "
+                            "for version %s while checking consumed keyless marker",
+                            integration_branch,
+                            version_id,
+                        )
+            if current_head_sha is None or current_head_sha == qual.get(
+                "candidate_sha"
+            ):
+                logger.info(
+                    "[RELEASE_QUALIFIER] sweep: version v%d keyless stale blocker "
+                    "already consumed for this candidate — skipping re-drive",
+                    version.version_number,
+                )
+                return False
+        if keyless_stale:
+            version.last_qualification = {
+                **qual,
+                "status": "requalification_requested",
+                "previous_status": "not_promoted",
+                "keyless_requalification_consumed_at": _utcnow().isoformat(),
+            }
+            flag_modified(version, "last_qualification")
+            redrive_session.add(version)
         # The real backstop against redundant re-runs is run_qualification's cached-
         # verdict guard: under its FOR UPDATE lock, it re-resolves the candidate SHA.
-        # If automain has NOT advanced (same SHA), run_qualification returns cached_
-        # verdict (no-op).  If automain HAS advanced, the cached-verdict miss spawns a
-        # fresh qualification.
+        # Stale keyless findings are the bounded same-SHA exception because they
+        # have no code anchor; rewriting the old status to non-conclusive lets
+        # exactly one fresh pending qualification replace it.
         result = await release_qualifier.run_qualification(
             redrive_session, version.project_id, version
         )
