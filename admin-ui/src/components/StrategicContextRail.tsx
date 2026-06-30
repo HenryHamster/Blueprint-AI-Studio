@@ -47,6 +47,7 @@ interface StrategicContextRailProps {
   onOpenTask?: (taskId: string) => void;
   onOpenMessages?: (target?: StrategicMessageTarget) => void;
   onOpenKnowledge?: (documentId?: string | null, directionId?: string | null) => void;
+  onOpenTarget?: (target?: StrategicContextPackageDrilldown['target'] | null) => void;
   workbenchState?: StrategicWorkbenchState | null;
   savingSessionRefs?: boolean;
   onUpdateSessionRefs?: (
@@ -786,6 +787,7 @@ export function StrategicContextRail({
   onOpenTask,
   onOpenMessages,
   onOpenKnowledge,
+  onOpenTarget,
   workbenchState,
   savingSessionRefs = false,
   onUpdateSessionRefs,
@@ -891,7 +893,7 @@ export function StrategicContextRail({
     return undefined;
   }
 
-  function openContextTarget(target?: StrategicContextPackageDrilldown['target'] | null): void {
+  function fallbackOpenContextTarget(target?: StrategicContextPackageDrilldown['target'] | null): void {
     if (!target) return;
     if (target.surface === 'project') {
       if (isProjectTarget(target.section)) onOpenProjectSection(target.section);
@@ -921,6 +923,11 @@ export function StrategicContextRail({
       if (onOpenKnowledge) onOpenKnowledge(target.document_id, target.direction_id);
       else onOpenProjectSection('directions');
     }
+  }
+
+  function openContextTarget(target?: StrategicContextPackageDrilldown['target'] | null): void {
+    if (!target) return;
+    (onOpenTarget ?? fallbackOpenContextTarget)(target);
   }
 
   function openContextResource(resource: StrategicContextResourceRef): void {

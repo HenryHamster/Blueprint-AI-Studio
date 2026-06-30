@@ -1468,6 +1468,7 @@ export default function App() {
                     s.setShowKnowledgeBrowser(true);
                   }}
                   onOpenMessages={strategicMessageTarget.open}
+                  onOpenTarget={openStrategicContextTarget}
                   workbenchState={strategicWorkbenchState}
                   savingSessionRefs={savingStrategicWorkbench}
                   onUpdateSessionRefs={updateStrategicSessionRefs}

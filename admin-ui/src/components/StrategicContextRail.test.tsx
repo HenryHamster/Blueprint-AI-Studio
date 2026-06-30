@@ -632,6 +632,63 @@ describe('StrategicContextRail', () => {
     expect(onOpenRuntimeCompute).toHaveBeenCalled();
   });
 
+  test('delegates context package targets to the canonical handler when provided', () => {
+    const onOpenTarget = vi.fn();
+    const { host, props } = mount({ onOpenTarget });
+
+    const buttons = Array.from(host.querySelectorAll('button'));
+    buttons.find(button => button.textContent?.includes('Strategic context map'))?.click();
+    buttons.find(button => button.textContent?.includes('Operator notes'))?.click();
+    buttons.find(button => button.textContent?.includes('operator-context-report'))?.click();
+
+    expect(onOpenTarget).toHaveBeenCalledWith({ surface: 'project', section: 'problem-model' });
+    expect(onOpenTarget).toHaveBeenCalledWith({
+      surface: 'knowledge',
+      document_id: 'kdoc-1',
+      direction_id: 'd-1',
+      task_id: 'task-strat',
+    });
+    expect(onOpenTarget).toHaveBeenCalledWith({
+      surface: 'task',
+      task_id: 'task-strat',
+      artifact_id: 'artifact-1',
+    });
+    expect(props.onOpenProjectSection).not.toHaveBeenCalled();
+    expect(props.onOpenPipeline).not.toHaveBeenCalled();
+  });
+
+  test('does not delegate context resources without targets', () => {
+    const contextPackage = STATE.context_package;
+    if (!contextPackage) throw new Error('Expected fixture context package');
+    const onOpenTarget = vi.fn();
+    const { host, props } = mount({
+      onOpenTarget,
+      state: {
+        ...STATE,
+        context_package: {
+          ...contextPackage,
+          canvas: contextPackage.canvas ? { ...contextPackage.canvas, nodes: [] } : undefined,
+          resources: [
+            {
+              id: 'artifact-without-target',
+              kind: 'artifact',
+              label: 'Unrouted context report',
+              summary: 'No target yet',
+            },
+          ],
+        },
+      },
+    });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Unrouted context report'))
+      ?.click();
+
+    expect(onOpenTarget).not.toHaveBeenCalled();
+    expect(props.onOpenPipeline).not.toHaveBeenCalled();
+    expect(props.onOpenProjectSection).not.toHaveBeenCalled();
+  });
+
   test('applies Strategic session ref updates against the latest workbench state', () => {
     const baseWorkbench = STATE.workbench;
     if (!baseWorkbench) throw new Error('Expected fixture workbench state');
@@ -876,7 +933,8 @@ describe('StrategicContextRail', () => {
       },
     };
     const onOpenMessages = vi.fn();
-    const { host, props } = mount({ state: attentionState, onOpenMessages });
+    const onOpenTarget = vi.fn();
+    const { host, props } = mount({ state: attentionState, onOpenMessages, onOpenTarget });
 
     const btn = Array.from(host.querySelectorAll('button')).find(b =>
       b.textContent?.includes('Question waiting'),
@@ -885,6 +943,7 @@ describe('StrategicContextRail', () => {
     btn?.click();
 
     expect(onOpenMessages).toHaveBeenCalledWith({ messageId: 'msg-1', action: 'reply' });
+    expect(onOpenTarget).not.toHaveBeenCalled();
     expect(props.onOpenPipeline).not.toHaveBeenCalled();
   });
 
