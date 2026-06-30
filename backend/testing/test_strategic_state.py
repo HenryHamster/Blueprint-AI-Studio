@@ -391,6 +391,113 @@ async def test_strategic_state_cost_uses_vm_cost_source_of_truth(
 
 
 @pytest.mark.asyncio
+async def test_strategic_state_task_focus_uses_full_project_scope(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(days=2)
+    approval_task = Task(
+        project_id=project.id,
+        title="Older approval still needs judgment",
+        payloads=[{"type": "create", "direction_id": "d-approval"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=True,
+        latest_status_message="Waiting for operator approval",
+        created_at=base_time,
+    )
+    blocked_task = Task(
+        project_id=project.id,
+        title="Older blocked task still matters",
+        payloads=[{"type": "research", "direction_id": "d-blocked"}],
+        status=TaskStatus.BLOCKED,
+        blocker_kind="missing_capability",
+        blocked_reason="Needs local runner registration",
+        created_at=base_time + timedelta(minutes=1),
+    )
+    old_queued_task = Task(
+        project_id=project.id,
+        title="Older queued backlog still matters",
+        context={"direction_id": "d-queued-context"},
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        created_at=base_time + timedelta(minutes=2),
+    )
+    recently_completed_task = Task(
+        project_id=project.id,
+        title="Recently completed old task",
+        payloads=[{"type": "create", "direction_id": "d-done"}],
+        status=TaskStatus.COMPLETED,
+        created_at=base_time,
+        completed_at=base_time + timedelta(days=2),
+    )
+    older_completed_task = Task(
+        project_id=project.id,
+        title="Older completion from newer task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        created_at=base_time + timedelta(days=1),
+        completed_at=base_time + timedelta(days=1, hours=1),
+    )
+    newer_routine_tasks = [
+        Task(
+            project_id=project.id,
+            title=f"Newer routine task {index:03d}",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+            created_at=base_time + timedelta(hours=1, minutes=index),
+        )
+        for index in range(220)
+    ]
+    db_session.add_all([
+        approval_task,
+        blocked_task,
+        old_queued_task,
+        recently_completed_task,
+        older_completed_task,
+        *newer_routine_tasks,
+    ])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+
+    assert resp.status_code == 200, resp.text
+    focus = resp.json()["tasks"]["focus"]
+    assert focus["version"] == 1
+    assert focus["bucket_limit"] == 8
+    assert focus["has_more"] is True
+
+    judgment = focus["buckets"]["needs_judgment"]
+    assert judgment["total"] == 1
+    assert judgment["has_more"] is False
+    approval_row = judgment["items"][0]
+    assert approval_row["id"] == str(approval_task.id)
+    assert approval_row["direction_id"] == "d-approval"
+    assert approval_row["requires_approval"] is True
+    assert "approval" in approval_row["reasons"]
+
+    friction = focus["buckets"]["friction"]
+    assert friction["total"] == 1
+    blocked_row = friction["items"][0]
+    assert blocked_row["id"] == str(blocked_task.id)
+    assert blocked_row["direction_id"] == "d-blocked"
+    assert blocked_row["blocked_reason"] == "Needs local runner registration"
+    assert "blocked" in blocked_row["reasons"]
+
+    queued = focus["buckets"]["queued"]
+    assert queued["total"] == 221
+    assert queued["has_more"] is True
+    assert queued["items"][0]["id"] == str(old_queued_task.id)
+    assert queued["items"][0]["direction_id"] == "d-queued-context"
+    assert all(row["id"] != str(approval_task.id) for row in queued["items"])
+
+    completed = focus["buckets"]["recent_completed"]
+    assert completed["total"] == 2
+    assert completed["items"][0]["id"] == str(recently_completed_task.id)
+    assert completed["items"][0]["completed_at"] == recently_completed_task.completed_at.isoformat()
+    assert completed["items"][0]["direction_id"] == "d-done"
+
+
+@pytest.mark.asyncio
 async def test_strategic_state_reports_active_local_strategic_runner(
     client: AsyncClient, db_session
 ):

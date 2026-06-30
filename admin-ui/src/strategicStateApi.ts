@@ -384,6 +384,43 @@ export interface StrategicWorkbenchStateResponse {
   arming?: string | null;
 }
 
+export interface StrategicStateTaskFocusItem {
+  id: string;
+  bucket: 'needs_judgment' | 'active' | 'friction' | 'queued' | 'recent_completed' | string;
+  status: string;
+  title: string | null;
+  task_type?: string | null;
+  latest_status_message?: string | null;
+  detail?: string | null;
+  requires_approval: boolean;
+  reasons: string[];
+  direction_id?: string | null;
+  parent_task_id?: string | null;
+  blocker_kind?: string | null;
+  blocked_reason?: string | null;
+  blocked_at?: string | null;
+  recheck_after?: string | null;
+  park_reason?: string | null;
+  parked_at?: string | null;
+  created_at?: string | null;
+  started_at?: string | null;
+  completed_at?: string | null;
+}
+
+export interface StrategicStateTaskFocusBucket {
+  total: number;
+  limit: number;
+  has_more: boolean;
+  items: StrategicStateTaskFocusItem[];
+}
+
+export interface StrategicStateTaskFocus {
+  version: 1;
+  bucket_limit: number;
+  has_more: boolean;
+  buckets: Record<string, StrategicStateTaskFocusBucket>;
+}
+
 export interface StrategicStateResponse {
   project_id: string;
   strategic: {
@@ -445,6 +482,7 @@ export interface StrategicStateResponse {
       total: number;
     };
     cumulative_estimated_cost_usd: number;
+    focus?: StrategicStateTaskFocus;
   };
   attention?: {
     level: 'clear' | 'watch' | 'needs_operator' | string;

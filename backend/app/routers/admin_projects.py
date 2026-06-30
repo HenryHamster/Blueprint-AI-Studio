@@ -89,6 +89,8 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 
+TASK_FOCUS_BUCKET_LIMIT = 8
+
 logger = logging.getLogger(__name__)
 
 
@@ -746,6 +748,211 @@ def _task_summary(task: Task | None) -> Dict[str, Any] | None:
     }
 
 
+def _task_focus_reasons(task: Task) -> list[str]:
+    reasons: list[str] = []
+    status = task.status
+    if task.requires_approval and status not in (
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    ):
+        reasons.append("approval")
+    if status == TaskStatus.BLOCKED:
+        reasons.append("blocked")
+    elif status == TaskStatus.PARKED:
+        reasons.append("parked")
+    elif status == TaskStatus.FAILED:
+        reasons.append("failed")
+    elif status == TaskStatus.EVALUATING:
+        reasons.append("evaluating")
+    elif status in (TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING):
+        reasons.append("active")
+    elif status == TaskStatus.QUEUED:
+        reasons.append("queued")
+    return reasons
+
+
+def _task_focus_item(
+    task: Task,
+    *,
+    bucket: str,
+    task_type: str | None = None,
+    direction_id: str | None = None,
+) -> Dict[str, Any]:
+    status = _enum_value(task.status)
+    detail = (
+        task.blocked_reason
+        or task.park_reason
+        or task.latest_status_message
+    )
+    return {
+        "id": str(task.id),
+        "bucket": bucket,
+        "status": status,
+        "title": _compact_text(task.title, max_chars=180),
+        "task_type": _compact_text(task_type, max_chars=80),
+        "latest_status_message": _compact_text(task.latest_status_message, max_chars=180),
+        "detail": _compact_text(detail, max_chars=220),
+        "requires_approval": bool(task.requires_approval),
+        "reasons": _task_focus_reasons(task),
+        "direction_id": direction_id,
+        "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
+        "blocker_kind": _compact_text(task.blocker_kind, max_chars=80),
+        "blocked_reason": _compact_text(task.blocked_reason, max_chars=180),
+        "blocked_at": task.blocked_at.isoformat() if task.blocked_at else None,
+        "recheck_after": task.recheck_after.isoformat() if task.recheck_after else None,
+        "park_reason": _compact_text(task.park_reason, max_chars=180),
+        "parked_at": task.parked_at.isoformat() if task.parked_at else None,
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "started_at": task.started_at.isoformat() if task.started_at else None,
+        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
+    }
+
+
+async def _task_focus_bucket(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    bucket: str,
+    filters: list[Any],
+    order_by: list[Any],
+    limit: int = TASK_FOCUS_BUCKET_LIMIT,
+) -> Dict[str, Any]:
+    base_filters = [
+        Task.project_id == project_id,
+        Task.archived.is_(False),
+        *filters,
+    ]
+    total = (
+        await session.execute(
+            select(func.count()).select_from(Task).where(*base_filters)
+        )
+    ).scalar() or 0
+    direction_id_expr = func.coalesce(
+        Task.context["direction_id"].as_string(),
+        Task.context["current_direction_id"].as_string(),
+        Task.payloads[0]["direction_id"].as_string(),
+        Task.payloads[0]["current_direction_id"].as_string(),
+        Task.payloads[0]["source_direction_id"].as_string(),
+        Task.payloads[0]["target_direction_id"].as_string(),
+    ).label("direction_id")
+    task_type_expr = Task.payloads[0]["type"].as_string().label("task_type")
+    rows = (
+        await session.execute(
+            select(Task, task_type_expr, direction_id_expr)
+            .where(*base_filters)
+            .options(
+                load_only(
+                    Task.id,
+                    Task.status,
+                    Task.title,
+                    Task.latest_status_message,
+                    Task.requires_approval,
+                    Task.parent_task_id,
+                    Task.created_at,
+                    Task.started_at,
+                    Task.completed_at,
+                    Task.blocker_kind,
+                    Task.blocked_reason,
+                    Task.blocked_at,
+                    Task.recheck_after,
+                    Task.park_reason,
+                    Task.parked_at,
+                    raiseload=True,
+                )
+            )
+            .order_by(*order_by)
+            .limit(limit)
+        )
+    ).all()
+    return {
+        "total": int(total),
+        "limit": limit,
+        "has_more": int(total) > limit,
+        "items": [
+            _task_focus_item(
+                task,
+                bucket=bucket,
+                task_type=task_type,
+                direction_id=direction_id,
+            )
+            for task, task_type, direction_id in rows
+        ],
+    }
+
+
+async def _build_task_focus(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> Dict[str, Any]:
+    nonterminal = (
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+        TaskStatus.BLOCKED,
+        TaskStatus.PARKED,
+    )
+    buckets = {
+        "needs_judgment": await _task_focus_bucket(
+            session,
+            project_id,
+            bucket="needs_judgment",
+            filters=[
+                Task.requires_approval.is_(True),
+                Task.status.in_(nonterminal),
+            ],
+            order_by=[Task.created_at.asc(), Task.id.asc()],
+        ),
+        "active": await _task_focus_bucket(
+            session,
+            project_id,
+            bucket="active",
+            filters=[
+                Task.status.in_(
+                    [
+                        TaskStatus.PROVISIONING,
+                        TaskStatus.IN_PROGRESS,
+                        TaskStatus.EVALUATING,
+                    ]
+                )
+            ],
+            order_by=[Task.started_at.desc().nullslast(), Task.created_at.desc(), Task.id.desc()],
+        ),
+        "friction": await _task_focus_bucket(
+            session,
+            project_id,
+            bucket="friction",
+            filters=[
+                Task.status.in_(
+                    [TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.PARKED]
+                )
+            ],
+            order_by=[Task.created_at.desc(), Task.id.desc()],
+        ),
+        "queued": await _task_focus_bucket(
+            session,
+            project_id,
+            bucket="queued",
+            filters=[Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False)],
+            order_by=[Task.created_at.asc(), Task.id.asc()],
+        ),
+        "recent_completed": await _task_focus_bucket(
+            session,
+            project_id,
+            bucket="recent_completed",
+            filters=[Task.status == TaskStatus.COMPLETED],
+            order_by=[Task.completed_at.desc().nullslast(), Task.created_at.desc(), Task.id.desc()],
+        ),
+    }
+    return {
+        "version": 1,
+        "bucket_limit": TASK_FOCUS_BUCKET_LIMIT,
+        "buckets": buckets,
+        "has_more": any(bucket["has_more"] for bucket in buckets.values()),
+    }
+
+
 def _cycle_summary(
     cycle: StrategicCycle | None,
     *,
@@ -1273,6 +1480,7 @@ async def get_project_strategic_state(
         for task in cost_tasks
         if (cost := get_task_total_vm_cost_usd_or_none(task)) is not None
     )
+    task_focus = await _build_task_focus(session, project.id)
 
     message_rows = (
         await session.execute(
@@ -1425,6 +1633,7 @@ async def get_project_strategic_state(
         "tasks": {
             "counts": task_counts,
             "cumulative_estimated_cost_usd": float(cost_total or 0.0),
+            "focus": task_focus,
         },
         "attention": attention,
         "context_package": context_package,
