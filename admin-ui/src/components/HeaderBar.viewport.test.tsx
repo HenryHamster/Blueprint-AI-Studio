@@ -316,7 +316,19 @@ describe('HeaderBar — viewport regression', () => {
     expect(onOpenCommandPalette).not.toHaveBeenCalled();
   });
 
-  test('mobile menu exposes command palette action', async () => {
+  test('desktop header keeps the Blueprint brand icon-only and project switcher primary', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} />); });
+
+    expect(host.textContent).not.toContain('Blueprint');
+    expect(host.querySelector('[aria-label="Blueprint"]')).not.toBeNull();
+  });
+
+  test('mobile menu does not duplicate the Strategic composer command launcher', async () => {
     const onOpenCommandPalette = vi.fn();
     host = document.createElement('div');
     host.style.padding = '12px';
@@ -330,9 +342,8 @@ describe('HeaderBar — viewport regression', () => {
 
     const commandButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button'))
       .find(button => button.textContent?.includes('Command palette'));
-    expect(commandButton).toBeTruthy();
-    await act(async () => { commandButton?.click(); });
-    expect(onOpenCommandPalette).toHaveBeenCalledOnce();
+    expect(commandButton).toBeUndefined();
+    expect(onOpenCommandPalette).not.toHaveBeenCalled();
   });
 
   test('pipeline tab shows attention badge from existing count prop', async () => {

@@ -241,4 +241,32 @@ describe('MessageBubble — viewport regression', () => {
     });
     if (host) expect(host.textContent).toContain('task-abc');
   });
+
+  test('chat user bubble uses dense developer-tool styling', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessageBubble
+          {...makeProps({
+            presentation: 'chat',
+            actionMode: 'reply-only',
+            msg: makeMsg({
+              from_type: 'user',
+              content: 'Tighten this up.',
+            }),
+          })}
+        />,
+      );
+    });
+
+    const innerBubble = host.querySelector('[data-testid="message-bubble"] > div > div');
+    expect(innerBubble?.className).toContain('rounded-md');
+    expect(innerBubble?.className).toContain('px-3');
+    expect(innerBubble?.className).not.toContain('rounded-2xl');
+    expect(innerBubble?.className).not.toContain('0_6px_24px');
+  });
 });

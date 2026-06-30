@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, within } from '@testing-library/react';
 import { PipelineWorkspace, type PipelineWorkspaceProps } from './PipelineWorkspace';
 import type { Task } from './TaskCard';
 import type { TrackLogEntry } from '../types/task';
@@ -253,6 +253,57 @@ describe('PipelineWorkspace status strip', () => {
 });
 
 describe('PipelineWorkspace task stream', () => {
+  test('composes pipeline metrics, embedded stream, and task context in the flow sideboard', () => {
+    const trackedTask = makeTask({ id: 'task-stream-1', title: 'Tracked pipeline task', status: 'IN_PROGRESS' });
+
+    renderWorkspace({
+      flow: {
+        tasks: [trackedTask],
+        hasActiveFilters: true,
+        onViewLogs: vi.fn(),
+        onNavigateToParent: vi.fn(),
+        onArchiveGroup: vi.fn(),
+        onUnarchiveTask: vi.fn(),
+      },
+      metrics: {
+        activeTasks: [trackedTask],
+        queuedTasks: [makeTask({ id: 'queued-task', status: 'QUEUED' })],
+        blockedTasks: [],
+        failedTasks: [],
+        terminalTasks: [makeTask({ id: 'done-task', status: 'COMPLETED' })],
+      },
+      rail: {
+        currentTask: trackedTask,
+        attentionTasks: [],
+        localFallbackTasks: [],
+        trackedTaskIds: new Set([trackedTask.id]),
+        taskContextSessionProps: {},
+        onOpenTask: vi.fn(),
+        onOpenPipeline: vi.fn(),
+        onTrackTask: vi.fn(),
+      },
+      stream: {
+        trackedTaskIds: new Set([trackedTask.id]),
+        trackedLogs: new Map([[trackedTask.id, [{ id: 1, t: '2026-06-30T12:00:01Z', type: 'system', msg: 'stream attached' }]]]),
+        tasks: [trackedTask],
+        onUntrack: vi.fn(),
+        onUntrackAll: vi.fn(),
+      },
+    });
+
+    const sideboard = screen.getByTestId('pipeline-sideboard');
+    expect(within(sideboard).getByText('active')).toBeInTheDocument();
+    expect(within(sideboard).getByText('queued')).toBeInTheDocument();
+    expect(within(sideboard).getByText('terminal')).toBeInTheDocument();
+    expect(within(sideboard).getByTestId('task-stream-panel')).toHaveAttribute('data-variant', 'embedded');
+    expect(within(sideboard).getByTestId('task-context-rail')).toBeInTheDocument();
+
+    const sideboardShell = sideboard.closest('aside');
+    expect(sideboardShell).toHaveClass('max-h-[34vh]');
+    expect(sideboardShell).toHaveClass('lg:col-start-2');
+    expect(sideboardShell).toHaveClass('lg:border-l');
+  });
+
   test('does not render embedded stream when no tasks are tracked', () => {
     renderWorkspace({
       stream: {

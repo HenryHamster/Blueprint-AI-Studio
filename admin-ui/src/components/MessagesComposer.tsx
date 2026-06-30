@@ -92,7 +92,7 @@ export function MessagesComposer({
       <div
         data-testid={minimal ? 'strategic-composer-box' : undefined}
         className={minimal
-        ? `${minimalColumnClass} flex items-end gap-1 rounded-md border border-neutral-800 bg-[#0c1117] p-1 shadow-inner shadow-black/20`
+        ? `${minimalColumnClass} flex items-end gap-0 rounded border border-neutral-800 bg-[#0b1016] p-0.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]`
         : 'flex gap-2 items-end'
       }>
         {!minimal && (
@@ -104,10 +104,10 @@ export function MessagesComposer({
             onClick={onOpenCommandPalette}
             title="Open command palette (Ctrl+K)"
             aria-label="Open command palette"
-            className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded border border-neutral-800 bg-[#080c11] px-2 text-xs font-semibold text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 md:min-h-9 md:min-w-9"
+            className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-sm border-r border-neutral-800/80 px-2 text-xs font-semibold text-neutral-500 transition-colors hover:bg-neutral-900/70 hover:text-neutral-100 md:min-h-8 md:min-w-8"
           >
             <Command className="h-3.5 w-3.5" />
-            <kbd className="hidden rounded border border-neutral-700 bg-neutral-950 px-1 py-0.5 font-mono text-ui-sm text-neutral-500 sm:inline-block">
+            <kbd className="hidden rounded-sm border border-neutral-800 bg-transparent px-1 py-0.5 font-mono text-ui-sm text-neutral-500 sm:inline-block">
               Ctrl K
             </kbd>
           </button>
@@ -123,7 +123,7 @@ export function MessagesComposer({
             placeholder={minimal ? 'Message Strategic...' : 'Type a message...'}
             rows={1}
             className={minimal
-              ? 'min-h-[44px] w-full resize-none rounded border-0 bg-transparent px-2.5 py-2 text-sm leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-600 md:min-h-9 md:py-1.5'
+              ? 'min-h-[44px] w-full resize-none rounded-sm border-0 bg-transparent px-2.5 py-2 text-sm leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-600 md:min-h-8 md:py-1'
               : 'w-full bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600 resize-none min-h-[44px] leading-relaxed'
             }
           />
@@ -135,7 +135,7 @@ export function MessagesComposer({
           aria-label="Send message"
           title="Send message"
           className={minimal
-            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded bg-emerald-600 text-white transition-colors hover:bg-emerald-500 disabled:opacity-40 md:min-h-9 md:min-w-9'
+            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-sm bg-emerald-600 text-white transition-colors hover:bg-emerald-500 disabled:opacity-40 md:min-h-8 md:min-w-8'
             : 'bg-blue-600 hover:bg-blue-500 text-white p-2.5 rounded-xl text-xs font-medium transition-colors disabled:opacity-40 shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center'
           }
         >

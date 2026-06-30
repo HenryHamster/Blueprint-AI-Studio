@@ -12,7 +12,6 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, update, or_, and_
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -34,6 +33,10 @@ from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
 from app.message_convergence import LINKED_STATUS
+from app.project_message_creation import (
+    create_operator_project_message,
+    parse_operator_message_type,
+)
 from app.project_message_projection import admin_message_dict, message_event_payload
 from app.messages_noise_prefs_store import (
     get_messages_noise_prefs_row,
@@ -599,168 +602,33 @@ async def create_message(
     # so its read-append-write on running_update is concurrency-safe.
     project = await _get_user_project(project_id, current_user["user_id"], session)
 
-    valid_types = {t.value for t in MessageType}
-    msg_type = payload.message_type.upper()
-    if msg_type not in valid_types:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid message_type. Must be one of: {', '.join(valid_types)}",
-        )
-    content = payload.content.strip()
-    if not content:
-        raise HTTPException(status_code=400, detail="Content cannot be empty")
-    if len(content) > MESSAGE_CONTENT_MAX:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
-        )
-    # Cap context size to prevent storage abuse. ``event_type`` is a trusted
-    # system-message field; preserve any operator-supplied value under a
-    # non-reserved key so user messages cannot masquerade as routine events.
-    ctx = dict(payload.context or {})
-    user_supplied_event_type = ctx.pop("event_type", None)
-    if user_supplied_event_type is not None:
-        ctx["user_event_type"] = str(user_supplied_event_type)[:120]
-    if len(json.dumps(ctx)) > 50_000:
-        raise HTTPException(status_code=400, detail="Context too large (max 50KB)")
-    if workbench_state_exceeds_max_bytes(payload.workbench_context):
-        raise HTTPException(status_code=400, detail="Workbench context too large (max 50KB)")
-
-    # Idempotency: if this send carries a client key and a message with that
-    # key already exists for the project, return the existing row instead of
-    # inserting a duplicate. This collapses an accidental double-submit /
-    # network retry to a single logical message (and a single arming).
-    idem_key = (payload.idempotency_key or "").strip() or None
-    if idem_key:
-        if len(idem_key) > 255:
-            raise HTTPException(
-                status_code=400, detail="idempotency_key exceeds 255 characters"
-            )
-        existing = (
-            await session.execute(
-                select(ProjectMessage).where(
-                    ProjectMessage.project_id == project_id,
-                    ProjectMessage.idempotency_key == idem_key,
-                )
-            )
-        ).scalar_one_or_none()
-        if existing is not None:
-            return {
-                "id": str(existing.id),
-                "status": "duplicate",
-                "arming": "duplicate",
-                "message": admin_message_dict(existing),
-            }
-
-    # Reproduce-on-HEAD citation grounding: a free-text BUG_REPORT/BLOCKER can
-    # cite code that was already refactored away or fixed. Validate its cited
-    # files/symbols against the project's real integration branch and stash an
-    # ``_provenance_warnings`` signal on the message context when a citation is
-    # unambiguously absent, so the strategist (and any spawned investigation)
-    # discounts a stale report rather than trusting it. Best-effort and
-    # conservative: indeterminate never flags, and it never fails message create.
-    # Computed after the idempotency early-return so a retried send does no work.
-    if MessageType(msg_type) in (MessageType.BUG_REPORT, MessageType.BLOCKER):
-        from app.source_ref_validation import compute_message_citation_warning
-
-        warning = await compute_message_citation_warning(session, project, content)
-        if warning:
-            ctx = {**ctx, "_provenance_warnings": warning}
-
-    workbench_context_for_snapshot = payload.workbench_context
-    if payload.workbench_context is not None:
-        _previous_workbench, stored_workbench = await upsert_strategic_workbench_state_with_previous(
-            session,
-            current_user["user_id"],
-            project_id,
-            payload.workbench_context,
-        )
-        workbench_context_for_snapshot = {
-            **stored_workbench,
-            "context_package_id": payload.workbench_context.get("context_package_id"),
-        }
-    strategic_session = await build_message_strategic_session_snapshot(
+    result = await create_operator_project_message(
         session,
-        current_user["user_id"],
-        project_id,
-        workbench_context_for_snapshot,
+        project=project,
+        user_id=current_user["user_id"],
+        message_type=parse_operator_message_type(
+            payload.message_type,
+            default_note_for_empty=False,
+        ),
+        content=payload.content,
+        context=payload.context,
+        workbench_context=payload.workbench_context,
+        idempotency_key=payload.idempotency_key,
+        compact_context_size=False,
     )
-    if strategic_session:
-        ctx = {**ctx, "strategic_session": strategic_session}
-    if len(json.dumps(ctx, default=str)) > 50_000:
-        raise HTTPException(status_code=400, detail="Context too large (max 50KB)")
-
-    msg = ProjectMessage(
-        project_id=project_id,
-        message_type=MessageType(msg_type),
-        from_type="user",
-        content=content,
-        context=ctx,
-        idempotency_key=idem_key,
-    )
-    session.add(msg)
-    try:
-        await session.commit()
-    except IntegrityError:
-        # Concurrency backstop: two simultaneous sends sharing the same key
-        # both passed the pre-insert query, but the partial unique index lets
-        # only one row land. Roll back and return the winner so the loser is
-        # still an idempotent success rather than a 500.
-        await session.rollback()
-        if idem_key:
-            existing = (
-                await session.execute(
-                    select(ProjectMessage).where(
-                        ProjectMessage.project_id == project_id,
-                        ProjectMessage.idempotency_key == idem_key,
-                    )
-                )
-            ).scalar_one_or_none()
-            if existing is not None:
-                return {
-                    "id": str(existing.id),
-                    "status": "duplicate",
-                    "arming": "duplicate",
-                    "message": admin_message_dict(existing),
-                }
-        raise
-    await session.refresh(msg)
-    # Snapshot the id before arming. maybe_arm_operator_refresh's bounded lock
-    # acquire can raise OperationalError under project-row contention (an active
-    # strategic cycle) and roll the session back, which EXPIRES this committed
-    # msg. A later ``str(msg.id)`` would then trigger a sync lazy-load
-    # (MissingGreenlet) and 500 a request whose message already durably
-    # committed. The captured scalar is immune to that expire.
-    message_id = str(msg.id)
-    message_event = message_event_payload(msg)
-    message_response = admin_message_dict(msg)
-
-    # Wake the strategist on genuine operator steering. This is the live-chat
-    # surface the admin MessagesPanel composer hits, and it must steer exactly
-    # like the project-scoped CLI endpoint (routers/directions.py). The shared
-    # gate decides whether to arm (non-passive type, not a routine digest event)
-    # so the two paths cannot diverge again. Best-effort: the helper does not
-    # commit (we own the txn) and swallows its own errors, so message creation
-    # never fails on it; the second commit persists the marker independently.
-    from app.strategic_trigger import maybe_arm_operator_refresh
-
-    # The shared gate returns the *truthful* arming outcome — the actual wake
-    # decision for this message (steering / passive note / routine event), or
-    # ``not_armed`` when a genuine steering message could NOT persist its marker
-    # because the project row was momentarily contended. We surface that string
-    # verbatim and commit only when the marker was really armed, so the operator
-    # is never told their message reached the strategist when it did not.
-    # Additive ``arming`` field — existing ``id``/``status`` are unchanged.
-    arming = await maybe_arm_operator_refresh(
-        session,
-        project_id,
-        MessageType(msg_type),
-        message_content=content,
-    )
-    if arming == ARMING_STEERING:
-        await session.commit()
-    await broadcast_to_project(str(project_id), "message_created", message_event)
-    return {"id": message_id, "status": "created", "arming": arming, "message": message_response}
+    response = {
+        "id": result.message_id,
+        "status": result.status,
+        "arming": result.arming,
+        "message": admin_message_dict(result.message),
+    }
+    if result.message_event is not None:
+        await broadcast_to_project(
+            str(project_id),
+            "message_created",
+            result.message_event,
+        )
+    return response
 
 
 @router.patch("/messages/{message_id}")

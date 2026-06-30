@@ -4175,6 +4175,60 @@ class TestMessages:
         assert resp.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_create_message_empty_type_returns_400(
+        self, client: AsyncClient, db_session
+    ):
+        """The canonical message endpoint does not default an empty type to NOTE."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "",
+                "content": "Test",
+            },
+        )
+        assert resp.status_code == 400
+        assert "Invalid message_type" in resp.json()["error"]["message"]
+
+    @pytest.mark.asyncio
+    async def test_create_message_uses_canonical_context_size_limit(
+        self, client: AsyncClient, db_session
+    ):
+        """The canonical endpoint preserves its default-json 50KB context limit."""
+        project = await _make_project(db_session)
+        context = {f"k{i}": "x" * 52 for i in range(800)}
+        assert len(json.dumps(context, separators=(",", ":"), default=str)) <= 50_000
+        assert len(json.dumps(context, default=str)) > 50_000
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "This context is too large for the canonical route.",
+                "context": context,
+            },
+        )
+
+        assert resp.status_code == 400
+        assert "Context too large" in resp.json()["error"]["message"]
+
+        rows = (
+            (
+                await db_session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert rows == []
+
+    @pytest.mark.asyncio
     async def test_create_message_empty_content_returns_400(
         self, client: AsyncClient, db_session
     ):
@@ -5718,6 +5772,137 @@ class TestMessages:
         assert len(contents) == 1
         assert "authentication" in contents[0]
         assert all(m["project_id"] == str(project.id) for m in data["messages"])
+
+    @pytest.mark.asyncio
+    async def test_strategic_session_message_idempotency_preserves_response_shape_and_broadcast(
+        self, client: AsyncClient, db_session
+    ):
+        """Strategic-session message retries return the existing ProjectMessage."""
+        from sqlalchemy import func as sa_func
+
+        project = await _make_project(db_session)
+        body = {
+            "message_type": "NOTE",
+            "content": "Keep this visible in the Strategic workbench.",
+            "idempotency_key": "strategic-session-message-idem-1",
+        }
+
+        with patch(
+            "app.routers.admin_projects.broadcast_to_project",
+            new_callable=AsyncMock,
+        ) as broadcast:
+            first = await client.post(
+                f"/api/admin/projects/{project.id}/strategic-session/messages",
+                json=body,
+            )
+            second = await client.post(
+                f"/api/admin/projects/{project.id}/strategic-session/messages",
+                json=body,
+            )
+
+        assert first.status_code == 200, first.text
+        assert second.status_code == 200, second.text
+        first_body = first.json()
+        second_body = second.json()
+        assert first_body["status"] == "created"
+        assert first_body["arming"] == "passive_note"
+        assert first_body["message"]["id"] == first_body["id"]
+        assert first_body["message"]["message_type"] == "NOTE"
+        assert first_body["message"]["content"] == body["content"]
+        assert second_body["status"] == "duplicate"
+        assert second_body["arming"] == "duplicate"
+        assert second_body["id"] == first_body["id"]
+        assert second_body["message"]["id"] == first_body["id"]
+
+        count = await db_session.scalar(
+            select(sa_func.count())
+            .select_from(ProjectMessage)
+            .where(ProjectMessage.project_id == project.id)
+        )
+        assert count == 1
+        broadcast.assert_awaited_once_with(
+            str(project.id),
+            "message_created",
+            {
+                "message_id": first_body["id"],
+                "type": "NOTE",
+                "from": "user",
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_strategic_session_message_persists_workbench_snapshot_and_arms(
+        self, client: AsyncClient, db_session
+    ):
+        """Strategic-session messages share workbench snapshot and arming behavior."""
+        project = await _make_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/strategic-session/messages",
+            json={
+                "message_type": "FEEDBACK",
+                "content": "Prioritize the release blocker.",
+                "context": {"event_type": "operator_supplied", "reply_to": "m-1"},
+                "workbench_context": {
+                    "interaction_mode": "continuous",
+                    "active_surface": "pipeline",
+                    "session_started_at": "2026-06-29T12:00:00Z",
+                    "context_package_id": "strategic-context:test",
+                    "selected_refs": [
+                        {"kind": "task", "id": "task-1", "label": "Release blocker"},
+                        {"kind": "task", "id": "task-1", "label": "Duplicate"},
+                    ],
+                },
+                "idempotency_key": "strategic-session-message-workbench-1",
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "created"
+        assert body["arming"] == "steering"
+        assert body["message"]["id"] == body["id"]
+        assert body["message"]["message_type"] == "FEEDBACK"
+        assert body["message"]["context"]["strategic_session"]["selected_refs"] == [
+            {"kind": "task", "id": "task-1", "label": "Release blocker"}
+        ]
+
+        msg = await db_session.get(ProjectMessage, uuid.UUID(body["id"]))
+        assert msg is not None
+        context = msg.context or {}
+        assert context["reply_to"] == "m-1"
+        assert context["user_event_type"] == "operator_supplied"
+        assert "event_type" not in context
+        session = context["strategic_session"]
+        assert session["interaction_mode"] == "continuous"
+        assert session["active_surface"] == "pipeline"
+        assert session["session_started_at"] == "2026-06-29T12:00:00Z"
+        assert session["context_package_id"] == "strategic-context:test"
+        assert session["selected_refs"] == [
+            {"kind": "task", "id": "task-1", "label": "Release blocker"}
+        ]
+        assert session["captured_at"]
+
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.project_id == project.id,
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                )
+            )
+        ).scalar_one()
+        stored_workbench = prefs_row.prefs["_strategic_workbench"]
+        assert stored_workbench["interaction_mode"] == "continuous"
+        assert stored_workbench["active_surface"] == "pipeline"
+        assert stored_workbench["selected_refs"] == [
+            {"kind": "task", "id": "task-1", "label": "Release blocker"}
+        ]
+        assert "context_package_id" not in stored_workbench
+
+        vision = await self._reload_vision(db_session, project.id)
+        marker = vision.get("_strategic_refresh")
+        assert marker["origin"] == "operator"
+        assert marker["reason"] == "operator_message"
+        assert marker["excerpt"] == "Prioritize the release blocker."
 
 
 class TestMessagesLastSeen:

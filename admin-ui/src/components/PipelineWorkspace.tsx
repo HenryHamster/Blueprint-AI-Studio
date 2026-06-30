@@ -7,7 +7,7 @@ import { PipelineView } from './PipelineView';
 import { TaskContextRail } from './TaskContextRail';
 import TaskStreamPanel, { type TaskStreamPanelProps } from './TaskStreamPanel';
 import type { Task } from './TaskCard';
-import { WorkbenchMetric, WorkbenchPanel, WorkbenchSplit, WorkbenchSurface } from './WorkbenchLayout';
+import { WorkbenchMetric, WorkbenchPanel, WorkbenchSurface } from './WorkbenchLayout';
 import type { PipelineSection } from '../hooks/useWorkbenchCommands';
 import { timeAgo } from '../utils/time';
 
@@ -90,6 +90,13 @@ interface PipelineBoardProps {
   hasActiveFilters: boolean;
   searchQuery: string;
   onDirectionClick: (directionId: string) => void;
+}
+
+interface PipelineSideboardProps {
+  flow: PipelineFlowProps;
+  rail: PipelineRailProps;
+  metrics: PipelineMetricsProps;
+  stream?: PipelineStreamProps;
 }
 
 export interface PipelineWorkspaceStatus {
@@ -176,7 +183,10 @@ function PipelineStatusStrip({ status }: { status: PipelineWorkspaceStatus }) {
     : 'Global';
 
   return (
-    <div className="flex min-w-0 flex-nowrap items-center gap-1.5 overflow-x-auto border-b border-neutral-800 bg-[#070b11] px-3 py-1.5 text-xs">
+    <div
+      data-viewport-allow-overflow
+      className="flex w-full min-w-0 max-w-full flex-nowrap items-center gap-1.5 overflow-x-auto border-b border-neutral-800 bg-[#070b11] px-3 py-1.5 text-xs"
+    >
       <PipelineStatusPill
         label={scopeLabel}
         tone={scoped ? 'info' : 'neutral'}
@@ -203,6 +213,43 @@ function PipelineStatusStrip({ status }: { status: PipelineWorkspaceStatus }) {
           title="Websocket state from the existing stream"
         />
       )}
+    </div>
+  );
+}
+
+function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardProps) {
+  return (
+    <div data-testid="pipeline-sideboard" className="grid min-w-0 gap-2">
+      <WorkbenchPanel title="Pipeline" meta={flow.hasActiveFilters ? 'filtered' : 'live'} className="bg-[#0d141c]">
+        <div className="grid grid-cols-2 gap-1.5">
+          <WorkbenchMetric label="active" value={metrics.activeTasks.length} tone="good" />
+          <WorkbenchMetric label="queued" value={metrics.queuedTasks.length} tone="neutral" />
+          <WorkbenchMetric label="blocked" value={metrics.blockedTasks.length} tone={metrics.blockedTasks.length > 0 ? 'warn' : 'neutral'} />
+          <WorkbenchMetric label="failed" value={metrics.failedTasks.length} tone={metrics.failedTasks.length > 0 ? 'bad' : 'neutral'} />
+        </div>
+        <div className="mt-2 flex items-center justify-between rounded-md border border-neutral-800 bg-neutral-950/35 px-2.5 py-1.5 text-xs">
+          <span className="text-neutral-500">terminal</span>
+          <span className="font-medium text-neutral-200">{metrics.terminalTasks.length}</span>
+        </div>
+      </WorkbenchPanel>
+
+      {stream && stream.trackedTaskIds.size > 0 && (
+        <TaskStreamPanel
+          {...stream}
+          variant="embedded"
+        />
+      )}
+
+      <TaskContextRail
+        currentTask={rail.currentTask}
+        attentionTasks={rail.attentionTasks}
+        localFallbackTasks={rail.localFallbackTasks}
+        trackedTaskIds={rail.trackedTaskIds}
+        {...rail.taskContextSessionProps}
+        onOpenTask={rail.onOpenTask}
+        onOpenPipeline={rail.onOpenPipeline}
+        onTrackTask={rail.onTrackTask}
+      />
     </div>
   );
 }
@@ -249,62 +296,34 @@ export function PipelineWorkspace({
           }}
         />
       ) : surface.viewMode === 'pipeline' ? (
-        <WorkbenchSplit
-          main={(
-            <div className="flex h-full min-h-0 flex-col">
-              {chrome.filterStrip}
-              {status && <PipelineStatusStrip status={status} />}
-              <ErrorBoundary level="panel">
-                <main className="flex min-h-0 flex-1 flex-col overflow-hidden px-3 py-3 md:px-4">
-                  <PipelineView
-                    tasks={flow.tasks}
-                    hasActiveFilters={flow.hasActiveFilters}
-                    onViewLogs={flow.onViewLogs}
-                    onNavigateToParent={flow.onNavigateToParent}
-                    onClearWaveDeps={flow.onClearWaveDeps}
-                    onArchiveGroup={flow.onArchiveGroup}
-                    onUnarchiveTask={flow.onUnarchiveTask}
-                  />
-                </main>
-              </ErrorBoundary>
-              {chrome.pagination}
-            </div>
-          )}
-          rail={(
-            <div className="space-y-3">
-              <WorkbenchPanel title="Pipeline" meta={flow.hasActiveFilters ? 'filtered' : 'live'}>
-                <div className="grid grid-cols-2 gap-2">
-                  <WorkbenchMetric label="active" value={metrics.activeTasks.length} tone="good" />
-                  <WorkbenchMetric label="queued" value={metrics.queuedTasks.length} tone="neutral" />
-                  <WorkbenchMetric label="blocked" value={metrics.blockedTasks.length} tone={metrics.blockedTasks.length > 0 ? 'warn' : 'neutral'} />
-                  <WorkbenchMetric label="failed" value={metrics.failedTasks.length} tone={metrics.failedTasks.length > 0 ? 'bad' : 'neutral'} />
-                </div>
-                <div className="mt-3 flex items-center justify-between rounded-md border border-neutral-800 bg-neutral-900/40 px-3 py-2 text-xs">
-                  <span className="text-neutral-500">terminal</span>
-                  <span className="font-medium text-neutral-200">{metrics.terminalTasks.length}</span>
-                </div>
-              </WorkbenchPanel>
-
-              {stream && stream.trackedTaskIds.size > 0 && (
-                <TaskStreamPanel
-                  {...stream}
-                  variant="embedded"
-                />
-              )}
-
-              <TaskContextRail
-                currentTask={rail.currentTask}
-                attentionTasks={rail.attentionTasks}
-                localFallbackTasks={rail.localFallbackTasks}
-                trackedTaskIds={rail.trackedTaskIds}
-                {...rail.taskContextSessionProps}
-                onOpenTask={rail.onOpenTask}
-                onOpenPipeline={rail.onOpenPipeline}
-                onTrackTask={rail.onTrackTask}
+        <div className="flex h-full min-h-0 flex-col">
+          {chrome.filterStrip}
+          {status && <PipelineStatusStrip status={status} />}
+          <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1 grid-rows-[auto_minmax(0,1fr)] overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(300px,25vw)] lg:grid-rows-1">
+            <aside className="max-h-[34vh] min-h-0 min-w-0 overflow-auto border-b border-neutral-800 bg-[#0b1118] p-2 custom-scrollbar lg:col-start-2 lg:row-start-1 lg:max-h-none lg:border-b-0 lg:border-l">
+              <PipelineSideboard
+                flow={flow}
+                rail={rail}
+                metrics={metrics}
+                stream={stream}
               />
-            </div>
-          )}
-        />
+            </aside>
+            <ErrorBoundary level="panel">
+              <main data-testid="pipeline-flow-main" className="flex min-h-0 min-w-0 flex-col overflow-hidden px-3 py-2.5 md:px-4 lg:col-start-1 lg:row-start-1 lg:py-3">
+                <PipelineView
+                  tasks={flow.tasks}
+                  hasActiveFilters={flow.hasActiveFilters}
+                  onViewLogs={flow.onViewLogs}
+                  onNavigateToParent={flow.onNavigateToParent}
+                  onClearWaveDeps={flow.onClearWaveDeps}
+                  onArchiveGroup={flow.onArchiveGroup}
+                  onUnarchiveTask={flow.onUnarchiveTask}
+                />
+              </main>
+            </ErrorBoundary>
+          </div>
+          {chrome.pagination}
+        </div>
       ) : (
         <div className="flex h-full min-h-0 flex-col">
           {chrome.filterStrip}

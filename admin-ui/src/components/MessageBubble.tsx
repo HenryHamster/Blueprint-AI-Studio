@@ -280,7 +280,7 @@ export function MessageBubble({
     <div
       data-testid="message-bubble"
       data-message-id={msg.id}
-      className={`group flex scroll-mt-24 rounded-xl transition-colors ${userMsg ? 'justify-end' : 'justify-start'} ${faded ? 'opacity-75' : ''} ${highlighted ? 'bg-amber-400/5 ring-1 ring-amber-300/35' : ''}`}
+      className={`group flex scroll-mt-24 rounded-md transition-colors ${userMsg ? 'justify-end' : 'justify-start'} ${faded ? 'opacity-75' : ''} ${highlighted ? 'bg-amber-400/5 ring-1 ring-amber-300/35' : ''}`}
     >
       <div className={`${
         chatMode
@@ -290,7 +290,7 @@ export function MessageBubble({
           : 'max-w-[85%] md:max-w-[70%]'
       } ${userMsg ? 'items-end' : 'items-start'} flex flex-col`}>
         {chatMode && !userMsg && (
-          <div className="relative mb-1 flex items-center gap-2 px-1 text-ui-md text-neutral-500">
+          <div className="relative mb-0.5 flex items-center gap-1.5 px-0.5 text-ui-md text-neutral-500">
             <span className="font-medium text-neutral-400">{formatChatFromType(msg)}</span>
             <span aria-hidden="true">·</span>
             <span>{formatAge(msg.created_at)}</span>
@@ -309,7 +309,7 @@ export function MessageBubble({
               <button
                 onClick={() => onReply({ id: msg.id, content: msg.content, from: formatChatFromType(msg), message_type: msg.message_type, status: msg.status })}
                 title="Reply"
-                className="absolute -right-1 -top-3 flex min-h-[44px] min-w-[44px] items-center justify-center rounded-md p-2 text-neutral-600 opacity-40 transition-colors hover:text-neutral-300 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-600 md:opacity-0 md:group-hover:opacity-100"
+                className="absolute -right-1 -top-3 flex min-h-[44px] min-w-[44px] items-center justify-center rounded p-2 text-neutral-600 opacity-40 transition-colors hover:text-neutral-300 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-600 md:opacity-0 md:group-hover:opacity-100"
               >
                 <Reply className="w-3.5 h-3.5" />
               </button>
@@ -319,8 +319,8 @@ export function MessageBubble({
         {/* Bubble */}
         <div className={chatMode
           ? userMsg
-            ? 'rounded-2xl border border-neutral-700/60 bg-neutral-800/80 px-4 py-3 shadow-[0_6px_24px_rgba(0,0,0,0.16)]'
-            : 'rounded-xl border border-transparent bg-transparent px-1 py-1'
+            ? 'rounded-md border border-neutral-700/50 bg-neutral-800/70 px-3 py-2 shadow-[0_1px_0_rgba(255,255,255,0.03)]'
+            : 'rounded-md border border-transparent bg-transparent px-0.5 py-0.5'
           : `rounded-2xl border px-4 py-3 ${config.bubbleBg} ${
             msg.message_type === 'BLOCKER' ? 'border-amber-600/60 ring-1 ring-amber-500/20' :
             msg.message_type === 'BUG_REPORT' ? 'border-red-700/60' : ''
@@ -350,7 +350,7 @@ export function MessageBubble({
           )}
           {/* Reply context for feedback acknowledgment and question answer */}
           {replyContextMsg && (
-            <div className="mb-1.5 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
+            <div className="mb-1 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
               <p className="text-ui-md text-neutral-500 mb-0.5">
                 {replyContextType === 'question' ? 'Answering your question:' : 'In reply to your feedback:'}
               </p>
@@ -359,17 +359,17 @@ export function MessageBubble({
           )}
           {/* Reply quote (if this message is a reply) */}
           {typeof msg.context.reply_preview === 'string' && (
-            <div className="mb-1.5 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
+            <div className="mb-1 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
               <p className="text-ui-md text-neutral-500 truncate">{msg.context.reply_preview}</p>
             </div>
           )}
           {/* Content */}
           {userMsg ? (
-            <div className="text-sm text-neutral-200 leading-relaxed">
+            <div className={chatMode ? 'text-sm text-neutral-200 leading-normal' : 'text-sm text-neutral-200 leading-relaxed'}>
               <MarkdownContent content={msg.content} />
             </div>
           ) : (
-            <div className="text-sm text-neutral-200 leading-relaxed">
+            <div className={chatMode ? 'text-sm text-neutral-200 leading-normal' : 'text-sm text-neutral-200 leading-relaxed'}>
               <MarkdownContent content={msg.content} />
             </div>
           )}
@@ -377,7 +377,7 @@ export function MessageBubble({
           {/* Context badges */}
           {showOpsChrome && <ContextBadges context={msg.context} fromType={msg.from_type} />}
           {strategicContextReceipt && (
-            <div className="mt-2 border-t border-neutral-700/50 pt-1.5">
+            <div className="mt-1.5 border-t border-neutral-700/50 pt-1.5">
               <StrategicContextDescriptor
                 model={strategicContextReceipt}
                 variant="receipt"
@@ -414,7 +414,7 @@ export function MessageBubble({
 
         {/* Resolution (for resolved messages) */}
         {msg.status === 'resolved' && msg.resolution && (
-          <div className={`mt-1 ${userMsg ? 'mr-3' : 'ml-3'} px-3 py-1.5 ${chatMode ? 'rounded-md border border-neutral-800/70 bg-neutral-900/40' : 'rounded-lg bg-neutral-800/50 border border-neutral-700/30'}`}>
+          <div className={`mt-1 ${userMsg ? 'mr-2' : 'ml-2'} px-2.5 py-1 ${chatMode ? 'rounded border border-neutral-800/70 bg-neutral-900/40' : 'rounded-lg bg-neutral-800/50 border border-neutral-700/30'}`}>
             <p className="text-ui-md text-neutral-500">
               <span className="text-emerald-500/70 font-medium">Resolved:</span> {msg.resolution}
             </p>

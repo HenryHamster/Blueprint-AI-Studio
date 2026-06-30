@@ -8,14 +8,11 @@ self-improvement flags.
 """
 
 import logging
-import json
-
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, delete
 from sqlalchemy import and_, func, or_, update
-from sqlalchemy.exc import IntegrityError
 from typing import Dict, Any, List
 import uuid
 from datetime import timedelta
@@ -28,7 +25,6 @@ from app.shared_state import limiter
 from app.models import (
     ProjectMessage,
     MessageType,
-    MESSAGE_CONTENT_MAX,
     ReleaseVersion,
     StrategicCycle,
     Task,
@@ -53,7 +49,11 @@ from app.capability_proof import enrich_problem_model_capability_proofs
 from app.message_convergence import LINKED_STATUS, OPEN_STATUS
 from app.notification_dispatch import HIGH_SIGNAL_NOTE_EVENT_TYPES
 from app.operator_attention import build_operator_attention
-from app.project_message_projection import message_event_payload, message_preview_dict
+from app.project_message_creation import (
+    create_operator_project_message,
+    parse_operator_message_type,
+)
+from app.project_message_projection import message_preview_dict
 from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
 from app.task_direction_refs import task_primary_direction_ids
@@ -67,12 +67,10 @@ from app.strategic_runtime_work import build_strategic_runtime_summary
 from app.work_session_actions import build_work_session_actions
 from app.workbench_state import (
     WORKBENCH_STATE_MAX_BYTES,
-    build_message_strategic_session_snapshot,
     get_strategic_workbench_state,
     upsert_strategic_workbench_state_with_previous,
     workbench_mode_refresh_excerpt,
     workbench_mode_should_arm_strategic_refresh,
-    workbench_state_exceeds_max_bytes,
     workbench_state_size_bytes,
 )
 from app.strategic_trigger import (
@@ -80,7 +78,6 @@ from app.strategic_trigger import (
     ARMING_PASSIVE_NOTE,
     ARMING_STEERING,
     ORIGIN_OPERATOR,
-    maybe_arm_operator_refresh,
     request_strategic_refresh,
 )
 
@@ -1777,162 +1774,38 @@ async def create_project_strategic_session_message(
         session,
         "member",
     )
-    content = payload.content.strip()
-    if not content:
-        raise HTTPException(status_code=400, detail="Content cannot be empty")
-    if len(content) > MESSAGE_CONTENT_MAX:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
-        )
-    if workbench_state_exceeds_max_bytes(payload.workbench_context):
-        raise HTTPException(
-            status_code=400,
-            detail="Workbench context too large (max 50KB)",
-        )
 
-    raw_message_type = str(payload.message_type or "NOTE").upper()
-    try:
-        msg_type = MessageType(raw_message_type)
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid message_type. Must be one of: {', '.join(t.value for t in MessageType)}",
-        ) from None
-
-    idem_key = (payload.idempotency_key or "").strip() or None
-    if idem_key:
-        if len(idem_key) > 255:
-            raise HTTPException(
-                status_code=400,
-                detail="idempotency_key exceeds 255 characters",
-            )
-        existing = (
-            await session.execute(
-                select(ProjectMessage).where(
-                    ProjectMessage.project_id == project_id,
-                    ProjectMessage.idempotency_key == idem_key,
-                )
-            )
-        ).scalar_one_or_none()
-        if existing is not None:
-            message_preview = await _message_preview_for_session_response(
-                request,
-                session,
-                project_id,
-                current_user,
-                existing,
-            )
-            return {
-                "id": str(existing.id),
-                "status": "duplicate",
-                "arming": "duplicate",
-                "message": message_preview,
-            }
-
-    ctx = dict(payload.context or {})
-    user_supplied_event_type = ctx.pop("event_type", None)
-    if user_supplied_event_type is not None:
-        ctx["user_event_type"] = str(user_supplied_event_type)[:120]
-    if len(json.dumps(ctx, separators=(",", ":"), default=str)) > 50_000:
-        raise HTTPException(status_code=400, detail="Context too large (max 50KB)")
-
-    if msg_type in (MessageType.BUG_REPORT, MessageType.BLOCKER):
-        from app.source_ref_validation import compute_message_citation_warning
-
-        warning = await compute_message_citation_warning(session, project, content)
-        if warning:
-            ctx = {**ctx, "_provenance_warnings": warning}
-
-    _previous_workbench, stored_workbench = await upsert_strategic_workbench_state_with_previous(
+    result = await create_operator_project_message(
         session,
-        current_user["user_id"],
-        project_id,
-        payload.workbench_context or {},
+        project=project,
+        user_id=current_user["user_id"],
+        message_type=parse_operator_message_type(payload.message_type),
+        content=payload.content,
+        context=payload.context,
+        workbench_context=payload.workbench_context,
+        idempotency_key=payload.idempotency_key,
+        persist_empty_workbench_context=True,
     )
-    workbench_context_for_snapshot = None
-    if payload.workbench_context is not None:
-        workbench_context_for_snapshot = {
-            **stored_workbench,
-            "context_package_id": payload.workbench_context.get("context_package_id"),
-        }
-    strategic_session = await build_message_strategic_session_snapshot(
-        session,
-        current_user["user_id"],
-        project_id,
-        workbench_context_for_snapshot,
-    )
-    if strategic_session:
-        ctx = {**ctx, "strategic_session": strategic_session}
-    if len(json.dumps(ctx, separators=(",", ":"), default=str)) > 50_000:
-        raise HTTPException(status_code=400, detail="Context too large (max 50KB)")
-
-    msg = ProjectMessage(
-        project_id=project_id,
-        message_type=msg_type,
-        from_type="user",
-        content=content,
-        context=ctx,
-        idempotency_key=idem_key,
-    )
-    session.add(msg)
-    try:
-        await session.commit()
-    except IntegrityError:
-        await session.rollback()
-        if idem_key:
-            existing = (
-                await session.execute(
-                    select(ProjectMessage).where(
-                        ProjectMessage.project_id == project_id,
-                        ProjectMessage.idempotency_key == idem_key,
-                    )
-                )
-            ).scalar_one_or_none()
-            if existing is not None:
-                message_preview = await _message_preview_for_session_response(
-                    request,
-                    session,
-                    project_id,
-                    current_user,
-                    existing,
-                )
-                return {
-                    "id": str(existing.id),
-                    "status": "duplicate",
-                    "arming": "duplicate",
-                    "message": message_preview,
-                }
-        raise
-    await session.refresh(msg)
-    message_id = str(msg.id)
-    message_event = message_event_payload(msg)
-
-    arming = await maybe_arm_operator_refresh(
-        session,
-        project_id,
-        msg_type,
-        message_content=content,
-    )
-    if arming == ARMING_STEERING:
-        await session.commit()
-    msg = await session.get(ProjectMessage, uuid.UUID(message_id))
-    if msg is None:
-        raise HTTPException(status_code=500, detail="Created message could not be reloaded")
     message_preview = await _message_preview_for_session_response(
         request,
         session,
         project_id,
         current_user,
-        msg,
+        result.message,
     )
-    await broadcast_to_project(str(project_id), "message_created", message_event)
-    return {
-        "id": message_id,
-        "status": "created",
-        "arming": arming,
+    response = {
+        "id": result.message_id,
+        "status": result.status,
+        "arming": result.arming,
         "message": message_preview,
     }
+    if result.message_event is not None:
+        await broadcast_to_project(
+            str(project_id),
+            "message_created",
+            result.message_event,
+        )
+    return response
 
 
 class ProjectUpdate(BaseModel):

@@ -469,7 +469,7 @@ export function VmCard({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId
           className="w-full text-left hover:text-blue-400 transition-colors mb-1"
         >
           <div className="flex items-center gap-1.5">
-            {cur.warm_start && <Flame aria-label="Warm start" className="w-2.5 h-2.5 text-orange-400 shrink-0"><title>Warm start</title></Flame>}
+            {cur.warm_start && <Flame aria-label="Warm start" className="w-2.5 h-2.5 text-cyan-300 shrink-0"><title>Warm start</title></Flame>}
             <span className="text-neutral-200 truncate" title={cur.title}>{cur.title || '(untitled)'}</span>
           </div>
           <div className="text-ui-sm text-neutral-500 font-mono mt-0.5">
@@ -482,7 +482,7 @@ export function VmCard({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId
               <> · <span className="text-emerald-400">pool</span></>
             )}
             {cur.warm_start && cur.warm_claim_origin !== 'backlog_reuse' && cur.warm_claim_origin !== 'warm_pool' && cur.prior_role_vm_id && (
-              <> · <span className="text-orange-400">chain</span></>
+              <> · <span className="text-cyan-300">chain</span></>
             )}
             {cur.warm_start && cur.prior_role_vm_id && (
               <> · from <span title={cur.prior_role_vm_id}>{shortVm(cur.prior_role_vm_id)}</span></>
@@ -544,7 +544,7 @@ export function VmRow({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId:
             className="text-left hover:text-blue-400 transition-colors"
           >
             <div className="flex items-center gap-1.5">
-              {cur.warm_start && <Flame aria-label="Warm start" className="w-2.5 h-2.5 text-orange-400 shrink-0"><title>Warm start</title></Flame>}
+              {cur.warm_start && <Flame aria-label="Warm start" className="w-2.5 h-2.5 text-cyan-300 shrink-0"><title>Warm start</title></Flame>}
               <span className="text-neutral-200 truncate max-w-[280px]" title={cur.title}>{cur.title || '(untitled)'}</span>
             </div>
             <div className="text-ui-sm text-neutral-500 font-mono mt-0.5">
@@ -557,7 +557,7 @@ export function VmRow({ vm, onViewTask }: { vm: WarmVmRow; onViewTask?: (taskId:
                 <> · <span className="text-emerald-400">pool</span></>
               )}
               {cur.warm_start && cur.warm_claim_origin !== 'backlog_reuse' && cur.warm_claim_origin !== 'warm_pool' && cur.prior_role_vm_id && (
-                <> · <span className="text-orange-400">chain</span></>
+                <> · <span className="text-cyan-300">chain</span></>
               )}
               {cur.warm_start && cur.prior_role_vm_id && (
                 <> · from <span title={cur.prior_role_vm_id}>{shortVm(cur.prior_role_vm_id)}</span></>

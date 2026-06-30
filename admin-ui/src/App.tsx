@@ -1100,6 +1100,7 @@ export default function App() {
   const pipelinePagination = (
     <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />
   );
+  const pipelineFlowOwnsTaskStream = activeTab === 'pipeline' && pipelineSection === 'flow' && s.viewMode === 'pipeline';
 
   if (s.authLoading) {
     return (
@@ -1901,7 +1902,7 @@ export default function App() {
         </ErrorBoundary>
       )}
 
-      {s.trackedTaskIds.size > 0 && (
+      {s.trackedTaskIds.size > 0 && !pipelineFlowOwnsTaskStream && (
         <TaskStreamPanel
           trackedTaskIds={s.trackedTaskIds}
           trackedLogs={s.trackedLogs}
@@ -1909,7 +1910,6 @@ export default function App() {
           onUntrack={s.untrackTask}
           onUntrackAll={s.untrackAll}
           offsetRight={s.logTask ? drawerWidth : 0}
-          hideOnDesktop={activeTab === 'pipeline' && pipelineSection === 'flow' && s.viewMode === 'pipeline'}
         />
       )}
 

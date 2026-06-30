@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Command, Compass, Microscope, BookOpen, MoreHorizontal, Settings, Bell, Plus } from 'lucide-react';
+import { Activity, Compass, Microscope, BookOpen, MoreHorizontal, Settings, Bell, Plus } from 'lucide-react';
 import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
@@ -407,11 +407,10 @@ export function HeaderBar(props: HeaderBarProps) {
       <header className="flex min-h-10 flex-wrap items-center gap-1.5 border-b border-neutral-800 bg-[#05070a] px-2 py-1 md:min-h-10 md:flex-nowrap">
         {/* LEFT: ProjectSwitcher + Manage projects slot */}
         <div className="flex min-w-0 shrink-0 items-center gap-1.5">
-          <div className="hidden items-center gap-1.5 pr-0.5 lg:flex">
-            <span className="flex h-5 w-5 items-center justify-center rounded border border-neutral-800 bg-[#0b0f14] text-neutral-500 shadow-inner shadow-black/20">
+          <div className="hidden items-center pr-0.5 lg:flex" aria-label="Blueprint">
+            <span className="flex h-4 w-4 items-center justify-center rounded border border-neutral-800/80 bg-transparent text-neutral-600">
               <Compass className="h-2.5 w-2.5" />
             </span>
-            <span className="text-ui-md font-semibold text-neutral-300">Blueprint</span>
           </div>
           <ProjectSwitcherDropdown
             projects={props.projects}
@@ -733,18 +732,6 @@ export function HeaderBar(props: HeaderBarProps) {
             </button>
             {showMobileMenu && (
               <div className="absolute right-0 top-full z-50 mt-2 max-h-[calc(100vh-96px)] w-60 overflow-auto rounded-md border border-neutral-800 bg-[#0b0f14] p-2 shadow-2xl">
-                {props.onOpenCommandPalette && (
-                  <button
-                    onClick={() => { props.onOpenCommandPalette?.(); setShowMobileMenu(false); }}
-                    className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
-                  >
-                    <Command className="w-4 h-4 shrink-0" />
-                    <span>Command palette</span>
-                    <kbd className="ml-auto rounded border border-neutral-700 bg-neutral-900 px-1.5 py-0.5 font-mono text-ui-sm text-neutral-500">
-                      Ctrl+K
-                    </kbd>
-                  </button>
-                )}
                 <button
                   onClick={() => { onToggleResearchBrowser(); setShowMobileMenu(false); }}
                   className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}

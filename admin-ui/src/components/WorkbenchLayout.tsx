@@ -44,7 +44,7 @@ export function WorkbenchSurface<T extends string>({
       data-viewport-allow-overflow
       data-viewport-allow-truncation
       className={`flex min-w-0 items-center gap-1 overflow-x-auto ${
-        tabLayout === 'stacked' ? '-mx-3 border-t border-neutral-800 px-3 pt-2 md:-mx-4 md:px-4' : 'flex-1'
+        tabLayout === 'stacked' ? '-mx-2.5 border-t border-neutral-800 px-2.5 pt-2 md:-mx-3 md:px-3' : 'flex-1'
       }`}
       aria-label={`${title} sections`}
     >
