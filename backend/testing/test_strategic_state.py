@@ -1837,6 +1837,17 @@ async def test_strategic_state_includes_runtime_background_work(
     assert session_metrics["runtime.wake_problems"]["value"] == 1
     assert session_metrics["runtime.compute_spend"]["unit"] == "USD"
     assert session_metrics["runtime.compute_spend"]["value"] == pytest.approx(3.75)
+    session_actions = {
+        entry["id"]: entry for entry in data["work_session"]["actions"]
+    }
+    compute_action = session_actions["runtime.compute.problem_recent"]
+    assert compute_action["kind"] == "inspect"
+    assert compute_action["priority"] == "high"
+    assert compute_action["source"] == "runtime"
+    assert compute_action["target"] == {
+        "surface": "runtime",
+        "section": "compute",
+    }
     expired_item = next(item for item in wakes["items"] if item["delivery_state"] == "EXPIRED")
     assert len(expired_item["result_detail"]) <= 180
 
@@ -1948,6 +1959,19 @@ async def test_strategic_state_surfaces_local_runner_holds(
     assert local_attention["severity"] == "needs_operator"
     assert local_attention["awaiting_since"] == awaiting_since
     assert "Waiting for local runner hardware" in local_attention["detail"]
+
+    actions = {entry["id"]: entry for entry in data["work_session"]["actions"]}
+    hold_action = actions[f"attention.task:{held_for_runner.id}:local_runner_hold"]
+    assert hold_action["kind"] == "inspect"
+    assert hold_action["label"] == "Check local runner"
+    assert hold_action["priority"] == "critical"
+    assert hold_action["target"] == {
+        "surface": "runtime",
+        "project_id": str(project.id),
+        "task_id": str(held_for_runner.id),
+        "section": "devices",
+    }
+    assert "runtime.local_runner_holds" not in actions
 
 
 @pytest.mark.asyncio
@@ -2146,7 +2170,8 @@ async def test_strategic_state_includes_operator_attention(
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
     assert resp.status_code == 200
-    attention = resp.json()["attention"]
+    data = resp.json()
+    attention = data["attention"]
 
     assert attention["level"] == "needs_operator"
     assert attention["summary"] == "5 operator items need review"
@@ -2174,6 +2199,37 @@ async def test_strategic_state_includes_operator_attention(
     assert f"alert:{dismissed_alert.id}" not in item_ids
     assert "direction:d-manual:manual_intervention" in item_ids
     assert all(len(item.get("detail") or "") <= 180 for item in attention["items"])
+
+    actions = data["work_session"]["actions"]
+    assert len(actions) <= 10
+    assert actions[0]["id"] == f"attention.message:{question.id}"
+    assert actions[0]["kind"] == "reply"
+    assert actions[0]["label"] == "Reply to Strategic question"
+    assert actions[0]["priority"] == "critical"
+    assert actions[0]["target"] == {
+        "surface": "messages",
+        "project_id": str(project.id),
+        "message_id": str(question.id),
+        "action": "reply",
+    }
+    actions_by_id = {entry["id"]: entry for entry in actions}
+    approval_action = actions_by_id[
+        f"attention.task:{approval_task.id}:approval_required"
+    ]
+    assert approval_action["kind"] == "approve"
+    assert approval_action["priority"] == "high"
+    assert approval_action["target"] == {
+        "surface": "task",
+        "project_id": str(project.id),
+        "task_id": str(approval_task.id),
+        "action": "approve",
+    }
+    failed_action = actions_by_id[f"attention.task:{failed_task.id}:failed_task"]
+    assert failed_action["kind"] == "review"
+    assert failed_action["target"]["task_id"] == str(failed_task.id)
+    assert all(entry["enabled"] is True for entry in actions)
+    assert all(len(entry["label"]) <= 96 for entry in actions)
+    assert all(len(entry["reason"]) <= 180 for entry in actions)
 
 
 @pytest.mark.asyncio

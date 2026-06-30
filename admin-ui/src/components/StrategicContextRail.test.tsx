@@ -3,7 +3,7 @@ import type { ComponentProps } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { StrategicContextRail } from './StrategicContextRail';
-import type { StrategicStateResponse, StrategicWorkbenchState } from '../strategicStateApi';
+import type { StrategicStateResponse, StrategicWorkbenchState, StrategicWorkSessionAction } from '../strategicStateApi';
 
 type SessionRefs = StrategicWorkbenchState['selected_refs'];
 
@@ -563,6 +563,18 @@ describe('StrategicContextRail', () => {
     return { host, props };
   }
 
+  function stateWithWorkSessionActions(actions: StrategicWorkSessionAction[]): StrategicStateResponse {
+    const workSession = STATE.work_session;
+    if (!workSession) throw new Error('STATE fixture must include work_session');
+    return {
+      ...STATE,
+      work_session: {
+        ...workSession,
+        actions,
+      },
+    };
+  }
+
   test('renders compact persistent Strategic context', () => {
     const { host } = mount({ strategistActive: true, cycleProgress: { task_id: 'task-strat', phase_label: 'Strategic review' } });
 
@@ -1023,6 +1035,265 @@ describe('StrategicContextRail', () => {
     expect(onOpenMessages).toHaveBeenCalledWith({ messageId: 'msg-1', action: 'reply' });
     expect(onOpenTarget).not.toHaveBeenCalled();
     expect(props.onOpenPipeline).not.toHaveBeenCalled();
+  });
+
+  test('renders work session next actions and routes message actions to the message opener', () => {
+    const onOpenMessages = vi.fn();
+    const onOpenTask = vi.fn();
+    const onOpenTarget = vi.fn();
+    const { host, props } = mount({
+      state: stateWithWorkSessionActions([
+        {
+          id: 'action-reply',
+          kind: 'reply',
+          label: 'Reply to operator question',
+          reason: 'A high-signal project message is waiting for a direct answer.',
+          priority: 'critical',
+          source: 'message',
+          target: { surface: 'messages', message_id: 'msg-action' },
+          enabled: true,
+        },
+        {
+          id: 'action-review-task',
+          kind: 'review',
+          label: 'Review rollout task',
+          reason: 'The active task needs operator judgment.',
+          priority: 'high',
+          source: 'task',
+          target: { surface: 'task', task_id: 'task-action' },
+          enabled: true,
+        },
+        {
+          id: 'action-runtime',
+          kind: 'inspect',
+          label: 'Inspect runtime work',
+          reason: 'Runtime work has a recent failure.',
+          priority: 'normal',
+          source: 'runtime',
+          target: { surface: 'runtime', section: 'compute' },
+          enabled: true,
+        },
+        {
+          id: 'action-context',
+          kind: 'open',
+          label: 'Open project model',
+          reason: 'Context points at the current problem model.',
+          priority: 'normal',
+          source: 'context',
+          target: { surface: 'project', section: 'problem-model' },
+          enabled: true,
+        },
+        {
+          id: 'action-hidden',
+          kind: 'open',
+          label: 'Hidden fifth action',
+          reason: 'Only the top four actions should render.',
+          priority: 'low',
+          source: 'session',
+          target: { surface: 'pipeline' },
+          enabled: true,
+        },
+      ]),
+      onOpenMessages,
+      onOpenTask,
+      onOpenTarget,
+    });
+
+    expect(host.textContent).toContain('Next actions');
+    expect(host.textContent).toContain('Reply to operator question');
+    expect(host.textContent).toContain('Review rollout task');
+    expect(host.textContent).toContain('Question waiting');
+    expect(host.textContent).not.toContain('Hidden fifth action');
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Reply to operator question'))
+      ?.click();
+
+    expect(onOpenMessages).toHaveBeenCalledWith({ messageId: 'msg-action', action: 'reply' });
+    expect(onOpenTask).not.toHaveBeenCalled();
+    expect(onOpenTarget).not.toHaveBeenCalled();
+    expect(props.onOpenPipeline).not.toHaveBeenCalled();
+  });
+
+  test('routes work session task actions through task navigation', () => {
+    const onOpenTask = vi.fn();
+    const onOpenTarget = vi.fn();
+    const { host, props } = mount({
+      state: stateWithWorkSessionActions([
+        {
+          id: 'action-review-task',
+          kind: 'review',
+          label: 'Review rollout task',
+          reason: 'The active task needs operator judgment.',
+          priority: 'high',
+          source: 'task',
+          target: { surface: 'task', task_id: 'task-action' },
+          enabled: true,
+        },
+      ]),
+      onOpenTask,
+      onOpenTarget,
+    });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Review rollout task'))
+      ?.click();
+
+    expect(onOpenTask).toHaveBeenCalledWith('task-action');
+    expect(onOpenTarget).not.toHaveBeenCalled();
+    expect(props.onOpenPipeline).not.toHaveBeenCalled();
+  });
+
+  test('keeps attention rows when matching work session action is outside the visible action cap', () => {
+    const { host } = mount({
+      state: stateWithWorkSessionActions([
+        {
+          id: 'action-one',
+          kind: 'open',
+          label: 'First action',
+          reason: 'Visible non-attention action.',
+          priority: 'high',
+          source: 'session',
+          target: { surface: 'runtime', section: 'health' },
+          enabled: true,
+        },
+        {
+          id: 'action-two',
+          kind: 'open',
+          label: 'Second action',
+          reason: 'Visible non-attention action.',
+          priority: 'high',
+          source: 'session',
+          target: { surface: 'runtime', section: 'compute' },
+          enabled: true,
+        },
+        {
+          id: 'action-three',
+          kind: 'open',
+          label: 'Third action',
+          reason: 'Visible non-attention action.',
+          priority: 'normal',
+          source: 'session',
+          target: { surface: 'pipeline' },
+          enabled: true,
+        },
+        {
+          id: 'action-four',
+          kind: 'open',
+          label: 'Fourth action',
+          reason: 'Visible non-attention action.',
+          priority: 'normal',
+          source: 'session',
+          target: { surface: 'project', section: 'problem-model' },
+          enabled: true,
+        },
+        {
+          id: 'attention.message:msg-1',
+          kind: 'reply',
+          label: 'Hidden duplicate attention action',
+          reason: 'This duplicate is outside the rendered action cap.',
+          priority: 'low',
+          source: 'attention',
+          target: { surface: 'messages', message_id: 'msg-1' },
+          enabled: true,
+        },
+      ]),
+    });
+
+    expect(host.textContent).toContain('Question waiting');
+    expect(host.textContent).not.toContain('Hidden duplicate attention action');
+  });
+
+  test('routes work session runtime actions through the canonical target opener', () => {
+    const onOpenTarget = vi.fn();
+    const onOpenTask = vi.fn();
+    const { host, props } = mount({
+      state: stateWithWorkSessionActions([
+        {
+          id: 'action-runtime',
+          kind: 'inspect',
+          label: 'Inspect runtime work',
+          reason: 'Runtime work has a recent failure.',
+          priority: 'normal',
+          source: 'runtime',
+          target: { surface: 'runtime', section: 'compute', task_id: 'task-runtime' },
+          enabled: true,
+        },
+      ]),
+      onOpenTarget,
+      onOpenTask,
+    });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Inspect runtime work'))
+      ?.click();
+
+    expect(onOpenTarget).toHaveBeenCalledWith({ surface: 'runtime', section: 'compute', task_id: 'task-runtime' });
+    expect(onOpenTask).not.toHaveBeenCalled();
+    expect(props.onOpenRuntimeHealth).not.toHaveBeenCalled();
+  });
+
+  test('routes work session pipeline actions through the canonical target opener', () => {
+    const onOpenTarget = vi.fn();
+    const onOpenTask = vi.fn();
+    const { host } = mount({
+      state: stateWithWorkSessionActions([
+        {
+          id: 'action-pipeline',
+          kind: 'open',
+          label: 'Open pipeline flow',
+          reason: 'Pipeline flow is the intended target, not direct task navigation.',
+          priority: 'normal',
+          source: 'session',
+          target: { surface: 'pipeline', section: 'flow', task_id: 'task-pipeline' },
+          enabled: true,
+        },
+      ]),
+      onOpenTarget,
+      onOpenTask,
+    });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Open pipeline flow'))
+      ?.click();
+
+    expect(onOpenTarget).toHaveBeenCalledWith({ surface: 'pipeline', section: 'flow', task_id: 'task-pipeline' });
+    expect(onOpenTask).not.toHaveBeenCalled();
+  });
+
+  test('preserves canonical work session target fields for knowledge actions', () => {
+    const onOpenTarget = vi.fn();
+    const { host } = mount({
+      state: stateWithWorkSessionActions([
+        {
+          id: 'action-knowledge',
+          kind: 'open',
+          label: 'Open evidence note',
+          reason: 'Evidence should retain its document and artifact target fields.',
+          priority: 'normal',
+          source: 'context',
+          target: {
+            surface: 'knowledge',
+            document_id: 'kdoc-action',
+            artifact_id: 'artifact-action',
+            direction_id: 'd-action',
+          },
+          enabled: true,
+        },
+      ]),
+      onOpenTarget,
+    });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Open evidence note'))
+      ?.click();
+
+    expect(onOpenTarget).toHaveBeenCalledWith({
+      surface: 'knowledge',
+      document_id: 'kdoc-action',
+      artifact_id: 'artifact-action',
+      direction_id: 'd-action',
+    });
   });
 
   test('message attention item falls back to pipeline when onOpenMessages is absent', () => {

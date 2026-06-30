@@ -64,6 +64,7 @@ from app.strategic_context_package import (
     selected_ref_descriptor,
 )
 from app.strategic_runtime_work import build_strategic_runtime_summary
+from app.work_session_actions import build_work_session_actions
 from app.workbench_state import (
     WORKBENCH_STATE_MAX_BYTES,
     build_message_strategic_session_snapshot,
@@ -387,6 +388,11 @@ def _build_work_session_summary(
             target={"surface": "project", "section": "problem-model"},
         ),
     ]
+    actions = build_work_session_actions(
+        attention=attention,
+        runtime_work=runtime_work,
+        context_status=context_status,
+    )
     return {
         "version": 1,
         "id": session_id[:240],
@@ -407,6 +413,7 @@ def _build_work_session_summary(
             if isinstance(ref, dict)
         ],
         "curated_metrics": metrics,
+        "actions": actions,
         "context_sources": context_sources[:8] if isinstance(context_sources, list) else [],
     }
 

@@ -15,6 +15,7 @@ import type {
   StrategicStateAttentionItem,
   StrategicStateResponse,
   StrategicWorkbenchState,
+  StrategicWorkSessionAction,
   StrategicWorkSessionRefDescriptor,
 } from '../strategicStateApi';
 import {
@@ -531,6 +532,71 @@ function AttentionItem({
   );
 }
 
+function workSessionActionPriorityText(priority?: string | null): string {
+  if (priority === 'critical') return 'text-rose-300';
+  if (priority === 'high') return 'text-amber-300';
+  if (priority === 'low') return 'text-neutral-600';
+  return 'text-neutral-500';
+}
+
+function workSessionMessageIntent(action: StrategicWorkSessionAction): StrategicMessageTarget['action'] {
+  const targetAction = action.target?.action;
+  if (targetAction === 'reply' || targetAction === 'highlight') return targetAction;
+  return action.kind === 'reply' ? 'reply' : 'highlight';
+}
+
+function contextTargetFromWorkSessionTarget(
+  target?: StrategicContextPackageDrilldown['target'] | null,
+): StrategicContextPackageDrilldown['target'] | null {
+  return target?.surface ? target : null;
+}
+
+function WorkSessionActionRow({
+  action,
+  onClick,
+}: {
+  action: StrategicWorkSessionAction;
+  onClick?: () => void;
+}) {
+  const detail = !action.enabled && action.blocked_reason ? action.blocked_reason : action.reason;
+  const showPriority = action.priority === 'critical' || action.priority === 'high';
+  const content = (
+    <>
+      <div className="flex min-w-0 items-center justify-between gap-2">
+        <span className="truncate text-xs font-semibold text-neutral-200">{action.label}</span>
+        {showPriority && (
+          <span className={`shrink-0 text-ui-sm font-semibold uppercase ${workSessionActionPriorityText(action.priority)}`}>
+            {action.priority}
+          </span>
+        )}
+      </div>
+      {detail && (
+        <p className="mt-0.5 line-clamp-2 text-xs leading-relaxed text-neutral-500">
+          {detail}
+        </p>
+      )}
+    </>
+  );
+
+  if (!onClick) {
+    return (
+      <div className={`min-w-0 border-t border-neutral-800/70 py-1.5 first:border-t-0 ${action.enabled ? '' : 'opacity-70'}`}>
+        {content}
+      </div>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex min-h-11 w-full min-w-0 flex-col justify-center border-t border-neutral-800/70 py-1.5 text-left transition-colors first:border-t-0 hover:text-neutral-100"
+    >
+      {content}
+    </button>
+  );
+}
+
 const TASK_FOCUS_SECTIONS: Array<{
   key: TaskFocusBucketKey;
   label: string;
@@ -878,6 +944,10 @@ export function StrategicContextRail({
   const firstRuntimeJob = runtimeWork?.compute_jobs.items[0] ?? null;
   const firstLocalRunnerHold = runtimeWork?.local_runner_holds?.items[0] ?? null;
   const hasLocalRunnerHolds = (runtimeWork?.local_runner_holds?.count ?? 0) > 0;
+  const workSessionActions = state?.work_session?.actions ?? [];
+  const visibleWorkSessionActions = workSessionActions.slice(0, 4);
+  const visibleWorkSessionActionIds = new Set(visibleWorkSessionActions.filter(action => action.enabled).map(action => action.id));
+  const visibleAttentionItems = attentionItems.filter(item => !visibleWorkSessionActionIds.has(`attention.${item.id}`));
   const selectedRefs = workbenchState?.selected_refs ?? state?.work_session?.selected_refs ?? state?.workbench?.selected_refs ?? [];
   const workSessionDescriptors = state?.work_session?.selected_ref_descriptors ?? [];
   const descriptorByRef = new Map(workSessionDescriptors.map(descriptor => [sessionRefKey(descriptor), descriptor]));
@@ -943,6 +1013,35 @@ export function StrategicContextRail({
 
   function openContextResource(resource: StrategicContextResourceRef): void {
     openContextTarget(resource.target);
+  }
+
+  function workSessionActionClick(action: StrategicWorkSessionAction): (() => void) | undefined {
+    if (!action.enabled) return undefined;
+    const target = action.target ?? null;
+    const messageId = target?.message_id ?? null;
+    if (messageId || target?.surface === 'messages') {
+      if (!onOpenMessages) return onOpenPipeline;
+      return () => onOpenMessages(messageId ? {
+        messageId,
+        action: workSessionMessageIntent(action),
+      } : undefined);
+    }
+
+    const contextTarget = contextTargetFromWorkSessionTarget(target);
+    if (
+      contextTarget
+      && target?.surface
+      && target.surface !== 'task'
+    ) {
+      return () => openContextTarget(contextTarget);
+    }
+
+    const taskId = target?.task_id ?? null;
+    if (target?.surface === 'task' || (!target?.surface && taskId)) {
+      return taskId && onOpenTask ? () => onOpenTask(taskId) : onOpenPipeline;
+    }
+
+    return contextTarget ? () => openContextTarget(contextTarget) : undefined;
   }
 
   function useSessionRef(ref: StrategicSelectedRef): void {
@@ -1049,13 +1148,32 @@ export function StrategicContextRail({
                 </p>
               </div>
             </div>
-            {attentionItems.length > 0 && (
+            {visibleAttentionItems.length > 0 && (
               <div className="mt-2 space-y-1.5">
-                {attentionItems.map(item => (
+                {visibleAttentionItems.map(item => (
                   <AttentionItem key={item.id} item={item} onClick={attentionItemAction(item)} />
                 ))}
               </div>
             )}
+          </div>
+        )}
+        {visibleWorkSessionActions.length > 0 && (
+          <div className="mt-3 border-t border-neutral-800 pt-3" data-testid="strategic-next-actions">
+            <div className="mb-1 flex min-w-0 items-center justify-between gap-2">
+              <span className="truncate text-xs font-semibold text-neutral-100">Next actions</span>
+              <span className="shrink-0 font-mono text-ui-sm text-neutral-600">
+                {formatCompactNumber(workSessionActions.length)}
+              </span>
+            </div>
+            <div className="space-y-1">
+              {visibleWorkSessionActions.map(action => (
+                <WorkSessionActionRow
+                  key={action.id}
+                  action={action}
+                  onClick={workSessionActionClick(action)}
+                />
+              ))}
+            </div>
           </div>
         )}
         <ShaFreshnessBlock shaFreshness={shaFreshness} />

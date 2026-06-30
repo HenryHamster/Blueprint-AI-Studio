@@ -67,17 +67,23 @@ export interface StrategicContextPackageSource {
   count: number;
 }
 
+export interface StrategicContextTarget {
+  surface: 'project' | 'pipeline' | 'runtime' | 'messages' | 'task' | 'knowledge' | string;
+  project_id?: string | null;
+  section?: string | null;
+  task_id?: string | null;
+  message_id?: string | null;
+  direction_id?: string | null;
+  alert_id?: string | null;
+  action?: string | null;
+  document_id?: string | null;
+  artifact_id?: string | null;
+}
+
 export interface StrategicContextPackageDrilldown {
   id: string;
   label: string;
-  target: {
-    surface: 'project' | 'pipeline' | 'runtime' | 'messages' | 'task' | 'knowledge' | string;
-    section?: string | null;
-    task_id?: string | null;
-    document_id?: string | null;
-    direction_id?: string | null;
-    artifact_id?: string | null;
-  };
+  target: StrategicContextTarget;
 }
 
 export interface StrategicContextCanvasNode {
@@ -310,6 +316,18 @@ export interface StrategicWorkSessionMetric {
   target?: StrategicContextPackageDrilldown['target'] | null;
 }
 
+export interface StrategicWorkSessionAction {
+  id: string;
+  kind: 'reply' | 'review' | 'approve' | 'inspect' | 'resume' | 'open' | string;
+  label: string;
+  reason: string;
+  priority: 'critical' | 'high' | 'normal' | 'low' | string;
+  source: 'attention' | 'runtime' | 'message' | 'task' | 'context' | 'session' | string;
+  target?: StrategicContextPackageDrilldown['target'] | null;
+  enabled: boolean;
+  blocked_reason?: string | null;
+}
+
 export interface StrategicWorkSessionRefDescriptor {
   kind: string;
   id: string;
@@ -332,6 +350,7 @@ export interface StrategicWorkSession {
   selected_ref_descriptors: StrategicWorkSessionRefDescriptor[];
   curated_metrics: StrategicWorkSessionMetric[];
   context_sources?: StrategicContextPackageSource[];
+  actions?: StrategicWorkSessionAction[];
 }
 
 export interface StrategicSessionConversation {
