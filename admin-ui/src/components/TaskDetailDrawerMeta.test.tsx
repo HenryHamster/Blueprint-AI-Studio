@@ -100,22 +100,41 @@ describe('DetailsTab — sideboard context', () => {
               primary_commit: 'abcdef1234567890',
             },
             messages: {
-              total_recent: 1,
-              items: [{
-                id: 'msg-1',
-                project_id: 'proj-1',
-                message_type: 'NOTE',
-                from_type: 'agent',
-                from_task_id: 'task-sideboard',
-                content: 'Recent task update',
-                context: {},
-                status: 'open',
-                resolution: null,
-                resolved_at: null,
-                created_at: '2026-06-29T12:00:00Z',
-              }],
+              total_recent: 3,
+              items: [
+                {
+                  id: 'msg-1',
+                  project_id: 'proj-1',
+                  message_type: 'NOTE',
+                  from_type: 'agent',
+                  from_task_id: 'task-sideboard',
+                  content: 'Recent task update',
+                  context: {},
+                  status: 'open',
+                  resolution: null,
+                  resolved_at: null,
+                  created_at: '2026-06-29T12:00:00Z',
+                },
+                {
+                  id: 'msg-2',
+                  project_id: 'proj-1',
+                  message_type: 'STATUS',
+                  from_type: 'agent',
+                  from_task_id: 'task-sideboard',
+                  content: 'Second bounded task update',
+                  context: {},
+                  status: 'open',
+                  resolution: null,
+                  resolved_at: null,
+                  created_at: '2026-06-29T12:02:00Z',
+                },
+              ],
             },
-            links: [],
+            links: [
+              { id: 'pipeline', label: 'Pipeline', target: { surface: 'pipeline', id: 'task-sideboard' } },
+              { id: 'linked-task', label: 'Linked task', target: { surface: 'task', id: 'linked-task-abcdef' } },
+              { id: 'direction', label: 'Direction', target: { surface: 'project', section: 'directions', id: 'd-active' } },
+            ],
           },
         })}
         onNavigateToTask={onNavigateToTask}
@@ -135,9 +154,16 @@ describe('DetailsTab — sideboard context', () => {
     expect(screen.getByText('pull request 1')).toBeInTheDocument();
     expect(screen.getByText('abcdef123456')).toBeInTheDocument();
     expect(screen.getByText('Recent task update')).toBeInTheDocument();
+    expect(screen.getByText('Second bounded task update')).toBeInTheDocument();
+    expect(screen.getByText('+1 more recent message')).toBeInTheDocument();
+    expect(screen.getByText('pipeline / task-sideboard')).toBeInTheDocument();
+    expect(screen.getByText('task / linked-task-abcdef')).toBeInTheDocument();
+    expect(screen.getByText('project / directions / d-active')).toBeInTheDocument();
 
     fireEvent.click(screen.getByText('parent parent-t'));
     expect(onNavigateToTask).toHaveBeenCalledWith('parent-task-123456');
+    fireEvent.click(screen.getByRole('button', { name: 'Linked task task / linked-task-abcdef' }));
+    expect(onNavigateToTask).toHaveBeenCalledWith('linked-task-abcdef');
   });
 
   it('falls back to legacy direction lookup when sideboard context is absent', async () => {
