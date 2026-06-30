@@ -402,15 +402,16 @@ function ContextResourceButton({
   onRemove?: () => void;
   disabled?: boolean;
 }) {
-  const openDisabled = !onOpen;
+  const canOpen = Boolean(onOpen && resource.target);
   const detail = resource.kind === 'canvas' ? null : resource.summary;
   return (
     <div className="flex min-w-0 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950/60 px-2.5 py-2">
       <button
         type="button"
-        disabled={openDisabled}
+        disabled={!canOpen}
         onClick={() => onOpen?.(resource)}
         className="min-h-11 min-w-0 flex-1 text-left disabled:cursor-default"
+        title={canOpen ? `Open ${resource.label}` : resource.label}
       >
         <span className="min-w-0">
           <span className="block truncate text-xs font-semibold text-neutral-200">
@@ -422,7 +423,7 @@ function ContextResourceButton({
           </span>
         </span>
       </button>
-      {!openDisabled && <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
+      {canOpen && <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
       {(onUse || onRemove) && (
         <SessionRefAction
           selected={Boolean(selected)}
@@ -543,6 +544,18 @@ function workSessionMessageIntent(action: StrategicWorkSessionAction): Strategic
   const targetAction = action.target?.action;
   if (targetAction === 'reply' || targetAction === 'highlight') return targetAction;
   return action.kind === 'reply' ? 'reply' : 'highlight';
+}
+
+function messageTargetFromContextTarget(
+  target?: StrategicContextPackageDrilldown['target'] | null,
+  fallbackAction?: StrategicMessageTarget['action'],
+): StrategicMessageTarget | undefined {
+  const messageId = target?.message_id ?? null;
+  if (!messageId) return undefined;
+  const action = target?.action === 'reply' || target?.action === 'highlight'
+    ? target.action
+    : fallbackAction;
+  return action ? { messageId, action } : { messageId };
 }
 
 function contextTargetFromWorkSessionTarget(
@@ -991,7 +1004,7 @@ export function StrategicContextRail({
       return;
     }
     if (target.surface === 'messages') {
-      if (onOpenMessages) onOpenMessages();
+      if (onOpenMessages) onOpenMessages(messageTargetFromContextTarget(target));
       else onOpenPipeline();
       return;
     }
@@ -1018,13 +1031,10 @@ export function StrategicContextRail({
   function workSessionActionClick(action: StrategicWorkSessionAction): (() => void) | undefined {
     if (!action.enabled) return undefined;
     const target = action.target ?? null;
-    const messageId = target?.message_id ?? null;
-    if (messageId || target?.surface === 'messages') {
+    const messageTarget = messageTargetFromContextTarget(target, workSessionMessageIntent(action));
+    if (messageTarget || target?.surface === 'messages') {
       if (!onOpenMessages) return onOpenPipeline;
-      return () => onOpenMessages(messageId ? {
-        messageId,
-        action: workSessionMessageIntent(action),
-      } : undefined);
+      return () => onOpenMessages(messageTarget);
     }
 
     const contextTarget = contextTargetFromWorkSessionTarget(target);

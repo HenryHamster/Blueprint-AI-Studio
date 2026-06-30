@@ -245,4 +245,26 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     await expectNoTextTruncationAt(375, async () => {});
     await expectMinTouchTargetAt(375, async () => {});
   });
+
+  test('minimal chat composer short context descriptor keeps a mobile tap target', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderComposer(r, 'FEEDBACK', null, false, 'minimal', {
+        modeLabel: 'Chat',
+        surfaceLabel: 'Strategic',
+        contextLabel: 'Context captured',
+        contextTone: 'ready',
+        refCount: 0,
+        refs: [],
+      });
+    });
+    const descriptor = host?.querySelector<HTMLElement>('[data-testid="strategic-context-descriptor"]');
+    expect(descriptor).not.toBeNull();
+    expect(descriptor!.getBoundingClientRect().height).toBeGreaterThanOrEqual(44);
+    await expectMinTouchTargetAt(375, async () => {});
+  });
 });

@@ -238,7 +238,7 @@ function PipelineStatusStrip({ status }: { status: PipelineWorkspaceStatus }) {
           <span className="sr-only">{detailsOpen ? 'Hide monitoring details' : 'Show monitoring details'}</span>
         </button>
         <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
-          <span className="hidden shrink-0 text-ui-sm font-semibold uppercase text-neutral-600 sm:inline">Monitoring</span>
+          <span className="hidden shrink-0 text-ui-sm font-semibold uppercase text-neutral-600 sm:inline">Task monitor</span>
           <PipelineStatusPill
             label={scopeLabel}
             tone={scoped ? 'info' : 'neutral'}
@@ -359,7 +359,7 @@ function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardPro
         <div className="flex min-w-0 items-center justify-between gap-3 border-b border-neutral-800/80 px-2.5 py-2">
           <div className="min-w-0">
             <h2 className="truncate text-sm font-semibold text-neutral-100">Task health</h2>
-            <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{flow.hasActiveFilters ? 'Filtered task view' : 'Live task view'}</div>
+            <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{flow.hasActiveFilters ? 'Filtered task monitor' : 'Live task monitor'}</div>
           </div>
           <span className={`shrink-0 rounded border px-2 py-0.5 font-mono text-ui-sm ${attentionCount > 0 ? 'border-amber-500/20 bg-amber-500/10 text-amber-300' : 'border-neutral-800 bg-neutral-950/40 text-neutral-500'}`}>
             {attentionLabel}
@@ -408,9 +408,9 @@ export function PipelineWorkspace({
 }: PipelineWorkspaceProps) {
   return (
     <WorkbenchSurface
-      title="Pipeline"
+      title="Pipeline tasks"
       tabs={[
-        { id: 'flow', label: 'Flow' },
+        { id: 'flow', label: 'Tasks' },
         { id: 'board', label: 'Board' },
         { id: 'archive', label: 'Archive' },
       ]}

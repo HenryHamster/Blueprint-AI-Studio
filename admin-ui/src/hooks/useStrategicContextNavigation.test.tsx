@@ -102,12 +102,12 @@ describe('useStrategicContextNavigation', () => {
     });
 
     act(() => {
-      open({ surface: 'messages' } as Target);
+      open({ surface: 'messages', message_id: 'msg-1', action: 'reply' } as Target);
       open({ surface: 'task', task_id: 'task-1' } as Target);
       open({ surface: 'knowledge', document_id: 'doc-1', direction_id: 'dir-1' } as Target);
     });
 
-    expect(openMessages).toHaveBeenCalledTimes(1);
+    expect(openMessages).toHaveBeenCalledWith({ messageId: 'msg-1', action: 'reply' });
     expect(handleViewTaskById).toHaveBeenCalledWith('task-1');
     expect(setKnowledgeBrowserInitialDocId).toHaveBeenCalledWith('doc-1');
     expect(setKnowledgeBrowserDirectionId).toHaveBeenCalledWith('dir-1');

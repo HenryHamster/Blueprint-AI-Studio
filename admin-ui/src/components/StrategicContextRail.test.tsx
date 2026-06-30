@@ -669,6 +669,38 @@ describe('StrategicContextRail', () => {
     expect(props.onOpenPipeline).not.toHaveBeenCalled();
   });
 
+  test('fallback context resource routing preserves message target intent', () => {
+    const contextPackage = STATE.context_package;
+    if (!contextPackage) throw new Error('Expected fixture context package');
+    const onOpenMessages = vi.fn();
+    const { host, props } = mount({
+      onOpenMessages,
+      state: {
+        ...STATE,
+        context_package: {
+          ...contextPackage,
+          canvas: contextPackage.canvas ? { ...contextPackage.canvas, nodes: [] } : undefined,
+          resources: [
+            {
+              id: 'message:msg-resource',
+              kind: 'message',
+              label: 'Operator follow-up thread',
+              summary: 'Needs a highlighted answer.',
+              target: { surface: 'messages', message_id: 'msg-resource', action: 'highlight' },
+            },
+          ],
+        },
+      },
+    });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Operator follow-up thread'))
+      ?.click();
+
+    expect(onOpenMessages).toHaveBeenCalledWith({ messageId: 'msg-resource', action: 'highlight' });
+    expect(props.onOpenPipeline).not.toHaveBeenCalled();
+  });
+
   test('does not delegate context resources without targets', () => {
     const contextPackage = STATE.context_package;
     if (!contextPackage) throw new Error('Expected fixture context package');
@@ -692,9 +724,12 @@ describe('StrategicContextRail', () => {
       },
     });
 
-    Array.from(host.querySelectorAll('button'))
-      .find(button => button.textContent?.includes('Unrouted context report'))
-      ?.click();
+    const resourceButton = Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Unrouted context report'));
+    expect(resourceButton).toBeTruthy();
+    expect(resourceButton?.disabled).toBe(true);
+    expect(resourceButton?.title).toBe('Unrouted context report');
+    resourceButton?.click();
 
     expect(onOpenTarget).not.toHaveBeenCalled();
     expect(props.onOpenPipeline).not.toHaveBeenCalled();

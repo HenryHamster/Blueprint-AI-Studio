@@ -33,7 +33,7 @@ export function StrategicContextDescriptor({
       : undefined;
   const className = compact
     ? 'flex max-w-full flex-wrap items-center gap-x-1.5 gap-y-1 text-ui-md leading-snug text-neutral-500'
-    : 'mx-auto mb-2 flex w-full max-w-[940px] flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-neutral-800/70 bg-neutral-950/45 px-2.5 py-1.5 text-ui-md leading-snug text-neutral-500 lg:mx-0';
+    : 'mx-auto mb-1.5 flex w-full max-w-[900px] flex-wrap items-center gap-x-2 gap-y-1 rounded-sm border border-transparent px-1 py-0.5 text-ui-md leading-snug text-neutral-500';
   const testId = compact ? 'strategic-context-receipt' : 'strategic-context-descriptor';
   const content = (
     <>
@@ -65,7 +65,7 @@ export function StrategicContextDescriptor({
           key={ref.id}
           className={compact
             ? 'min-w-0 max-w-full truncate text-neutral-400'
-            : 'inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-900/70 px-1.5 py-0.5 text-neutral-300'
+            : 'inline-flex min-w-0 max-w-full items-center gap-1.5 rounded-sm border border-neutral-800/70 bg-neutral-950/50 px-1.5 py-0.5 text-neutral-300'
           }
           title={ref.summary ?? undefined}
         >
@@ -86,7 +86,7 @@ export function StrategicContextDescriptor({
         data-testid={testId}
         title={title}
         onClick={onOpen}
-        className={`${className} min-h-11 text-left transition-colors hover:border-neutral-700 hover:text-neutral-300 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-700`}
+        className={`${className} min-h-11 text-left transition-colors hover:border-neutral-800 hover:bg-neutral-950/45 hover:text-neutral-300 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-700 md:min-h-8`}
       >
         {content}
       </button>

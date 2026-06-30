@@ -247,7 +247,7 @@ export function useWorkbenchCommands({
     const openRuntimeSection = (section: RuntimeSection) => {
       setRuntimeSection(section);
       handleTabChange('runtime');
-      if (section === 'accounts') closeGlobalSettings?.();
+      closeGlobalSettings?.();
       closePalette();
     };
     const openRuntimeSettingsSection = (section: RuntimeSettingsSection) => {
@@ -626,10 +626,10 @@ export function useWorkbenchCommands({
       },
       {
         id: 'pipeline.flow',
-        label: 'Pipeline',
+        label: 'Pipeline tasks',
         section: 'Pipeline',
         detail: `${visibleActiveCount} active, ${visibleQueuedCount} queued`,
-        keywords: ['tasks', 'flow', 'monitor'],
+        keywords: ['tasks', 'flow', 'monitor', 'passive', 'pipeline'],
         shortcut: '2',
         run: () => openPipelineSection('flow'),
       },
@@ -760,10 +760,10 @@ export function useWorkbenchCommands({
       },
       {
         id: 'runtime.health',
-        label: 'Runtime',
+        label: 'Runtime overview',
         section: 'Runtime',
         detail: apiHealthy ? 'API healthy' : 'API degraded',
-        keywords: ['devices', 'runner', 'orchestrator'],
+        keywords: ['overview', 'health', 'devices', 'runner', 'orchestrator', 'accounts', 'settings'],
         shortcut: '4',
         run: () => openRuntimeSection('health'),
       },
@@ -771,40 +771,40 @@ export function useWorkbenchCommands({
         id: 'runtime.analytics',
         label: 'Runtime analytics',
         section: 'Runtime',
-        detail: 'Dashboard metrics',
-        keywords: ['analytics', 'dashboard', 'metrics'],
+        detail: 'Cost and portfolio metrics',
+        keywords: ['analytics', 'dashboard', 'metrics', 'cost', 'portfolio'],
         run: () => openRuntimeSection('analytics'),
       },
       {
         id: 'runtime.devices',
-        label: 'Devices',
+        label: 'Runtime devices',
         section: 'Runtime',
-        detail: 'Runners',
-        keywords: ['runner', 'local', 'hardware'],
+        detail: 'Warm VMs and runners',
+        keywords: ['devices', 'runner', 'local', 'hardware', 'vm', 'warm'],
         run: () => openRuntimeSection('devices'),
       },
       {
         id: 'runtime.accounts',
-        label: 'Accounts',
+        label: 'Runtime accounts',
         section: 'Runtime',
-        detail: `${maxPlanAccountCount} accounts`,
-        keywords: ['cost', 'spend', 'models'],
+        detail: `${maxPlanAccountCount} LLM accounts`,
+        keywords: ['accounts', 'cost', 'spend', 'models', 'usage', 'caps', 'pool', 'github', 'llm'],
         run: () => openRuntimeSection('accounts'),
       },
       {
         id: 'runtime.compute',
-        label: 'Compute jobs',
+        label: 'Runtime compute',
         section: 'Runtime',
-        detail: 'Experiments',
-        keywords: ['jobs', 'experiments'],
+        detail: 'Jobs and held approvals',
+        keywords: ['compute', 'jobs', 'experiments', 'approvals', 'queue'],
         run: () => openRuntimeSection('compute'),
       },
       {
         id: 'runtime.settings',
         label: 'Runtime settings',
         section: 'Runtime',
-        detail: 'Orchestrator',
-        keywords: ['orchestrator', 'provider', 'routing'],
+        detail: 'Orchestrator defaults',
+        keywords: ['settings', 'runtime', 'orchestrator', 'provider', 'routing', 'configuration'],
         run: () => openRuntimeSettingsSection('orchestrator'),
       },
       {
@@ -891,10 +891,10 @@ export function useWorkbenchCommands({
       },
       {
         id: 'settings.general',
-        label: 'Settings',
+        label: 'Workbench settings',
         section: 'Workbench',
-        detail: 'Defaults and controls',
-        keywords: ['preferences', 'config'],
+        detail: 'UI defaults and controls',
+        keywords: ['settings', 'preferences', 'config', 'workbench'],
         shortcut: 'S',
         run: () => runAndClose(() => openGlobalSettings('general')),
       },

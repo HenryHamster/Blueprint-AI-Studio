@@ -84,7 +84,7 @@ const RUNTIME_SETTINGS_SECTIONS: SectionNavItem<RuntimeSettingsSection>[] = [
 ];
 
 const RUNTIME_SECTIONS: SectionNavItem<RuntimeSection>[] = [
-  { id: 'health', label: 'Health', description: 'Service health, task pressure, and fleet status at a glance.', icon: Activity },
+  { id: 'health', label: 'Overview', description: 'Runtime health, task pressure, and fleet status at a glance.', icon: Activity },
   { id: 'devices', label: 'Devices', description: 'Warm VMs, local runner hardware, and project-scoped device readiness.', icon: Server },
   { id: 'compute', label: 'Compute', description: 'Running jobs, queued work, held approvals, and terminal run analysis.', icon: Gauge },
   { id: 'accounts', label: 'Accounts', description: 'GitHub identity, LLM account roster, usage caps, and pool availability.', icon: Users },
@@ -482,7 +482,7 @@ export function RuntimeWorkspace({
   const activeRuntimeItem = RUNTIME_SECTIONS.find(item => item.id === runtimeSection) ?? RUNTIME_SECTIONS[0]!;
   const activeRuntimeSettingsItem =
     runtimeSettingsSections.find(item => item.id === runtimeConfigSection) ?? runtimeSettingsSections[0]!;
-  const actionButtonClass = 'inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100';
+  const actionButtonClass = 'inline-flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-0 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9 sm:min-w-0 sm:px-3';
   const runtimeAccounts = settingsRouterProps.maxPlanAccounts ?? [];
   const accountTotal = runtimeAccounts.length;
   const enabledAccounts = runtimeAccounts.filter(account => account.enabled).length;
@@ -504,9 +504,11 @@ export function RuntimeWorkspace({
           type="button"
           onClick={() => { void onRestartOrchestrator(); }}
           className={actionButtonClass}
+          title="Restart orchestrator"
+          aria-label="Restart orchestrator"
         >
           <RotateCw className="h-3.5 w-3.5" />
-          Restart orchestrator
+          <span className="hidden sm:inline">Restart orchestrator</span>
         </button>
       )}
     </>
@@ -515,7 +517,7 @@ export function RuntimeWorkspace({
   return (
     <WorkbenchSurface
       title="Runtime"
-      subtitle="Devices, compute, accounts, settings"
+      subtitle="Overview, devices, compute, accounts, settings"
       tabs={RUNTIME_SECTIONS.map(({ id, label }) => ({ id, label }))}
       activeTab={runtimeSection}
       onTabChange={onRuntimeSectionChange}
@@ -541,7 +543,7 @@ export function RuntimeWorkspace({
         <div className="mx-auto flex max-w-7xl flex-col gap-3">
           <RuntimeSectionIntro
             item={activeRuntimeItem}
-            title="Devices and runner hardware"
+            title="Devices and runners"
           >
             <RuntimeStatusPill
               label="project"
@@ -577,7 +579,7 @@ export function RuntimeWorkspace({
         <div className="mx-auto flex max-w-7xl flex-col gap-3">
           <RuntimeSectionIntro
             item={activeRuntimeItem}
-            title="Compute queue"
+            title="Compute jobs"
           >
             <RuntimeStatusPill
               label="project"

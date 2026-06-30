@@ -3,14 +3,14 @@ import type { ProjectSection, RuntimeSection } from '../components/OperatorWorks
 import type { PipelineSection } from './useWorkbenchCommands';
 import type { PrimaryTab } from './useUIState';
 import type { ViewMode } from './useViewPreferences';
-import type { StrategicContextPackageDrilldown } from '../strategicStateApi';
+import type { StrategicContextPackageDrilldown, StrategicMessageTarget } from '../strategicStateApi';
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
 
 interface UseStrategicContextNavigationOptions {
   handleTabChange: (tab: PrimaryTab) => void;
   handleViewTaskById: (taskId: string) => void;
-  openMessages: () => void;
+  openMessages: (target?: StrategicMessageTarget) => void;
   setKnowledgeBrowserDirectionId: (directionId: string | null) => void;
   setKnowledgeBrowserInitialDocId: (documentId: string | null) => void;
   setPipelineSection: (section: PipelineSection) => void;
@@ -41,6 +41,13 @@ function isRuntimeSection(value?: string | null): value is RuntimeSection {
 function normalizePipelineSection(value?: string | null): PipelineSection {
   if (value === 'board' || value === 'archive' || value === 'flow') return value;
   return 'flow';
+}
+
+function messageTargetFromContextTarget(target: StrategicContextTarget): StrategicMessageTarget | undefined {
+  const messageId = target.message_id ?? null;
+  if (!messageId) return undefined;
+  const action = target.action === 'reply' || target.action === 'highlight' ? target.action : undefined;
+  return action ? { messageId, action } : { messageId };
 }
 
 export function useStrategicContextNavigation({
@@ -81,7 +88,7 @@ export function useStrategicContextNavigation({
       return;
     }
     if (target.surface === 'messages') {
-      openMessages();
+      openMessages(messageTargetFromContextTarget(target));
       return;
     }
     if (target.surface === 'task') {

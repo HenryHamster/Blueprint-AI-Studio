@@ -64,14 +64,14 @@ export function MessagesComposer({
   // and, when the strategist is mid-cycle, flagging that a steer is queued rather
   // than acting immediately.
   const minimal = chrome === 'minimal';
-  const minimalColumnClass = 'mx-auto w-full max-w-[940px] lg:mx-0';
+  const minimalColumnClass = 'mx-auto w-full max-w-[900px]';
   const hintArming = minimal && strategistBusy && lastArming !== 'not_armed' ? null : lastArming;
   const hintText = composerHintCopy(newType, hintArming, strategistBusy);
   const showHint = !minimal || Boolean(strategistBusy) || lastArming === 'not_armed';
 
   return (
     <div className={minimal
-      ? 'shrink-0 border-t border-neutral-800 bg-[#05080c] px-2.5 py-2 md:px-3'
+      ? 'shrink-0 border-t border-neutral-800 bg-[#05080c] px-2 py-1.5 md:px-2.5'
       : 'px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50'
     }>
       {minimal && strategicContext && (
@@ -79,8 +79,8 @@ export function MessagesComposer({
       )}
       {/* Reply quote bar */}
       {replyTo && (
-        <div className={`${minimal ? minimalColumnClass : ''} mb-2 flex items-center gap-2 rounded-r-lg border-l-2 border-blue-500/50 bg-neutral-800/60 px-3 py-1.5`}>
-          <Reply className="w-3 h-3 text-blue-400 shrink-0" />
+        <div className={`${minimal ? minimalColumnClass : ''} mb-1.5 flex items-center gap-2 rounded-r-md border-l-2 border-neutral-600 bg-neutral-900/75 px-2.5 py-1.5`}>
+          <Reply className="w-3 h-3 text-neutral-400 shrink-0" />
           <span className="text-xs text-neutral-400 truncate flex-1">
             Replying to <span className="text-neutral-300">{replyTo.from}</span>: {replyTo.content.slice(0, 80)}{replyTo.content.length > 80 ? '...' : ''}
           </span>
@@ -92,7 +92,7 @@ export function MessagesComposer({
       <div
         data-testid={minimal ? 'strategic-composer-box' : undefined}
         className={minimal
-        ? `${minimalColumnClass} flex items-end gap-0 rounded-md border border-neutral-800 bg-[#0b1016] p-0.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]`
+        ? `${minimalColumnClass} flex items-end gap-0 rounded-md border border-neutral-800/90 bg-[#080c11] p-0.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]`
         : 'flex gap-2 items-end'
       }>
         {!minimal && (
@@ -118,7 +118,7 @@ export function MessagesComposer({
             onKeyDown={e => {
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSubmit(); }
             }}
-            placeholder={minimal ? 'Ask Strategic...' : 'Type a message...'}
+            placeholder={minimal ? 'Message Strategic' : 'Type a message...'}
             rows={1}
             className={minimal
               ? 'min-h-[44px] w-full resize-none rounded-sm border-0 bg-transparent px-2.5 py-2 text-sm leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-600 md:min-h-8 md:py-1'

@@ -155,7 +155,10 @@ describe('PipelineWorkspace status strip', () => {
       },
     });
 
+    expect(screen.getByRole('button', { name: 'Tasks' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: 'Board' })).toBeInTheDocument();
     expect(screen.queryByTestId('pipeline-status-details')).not.toBeInTheDocument();
+    expect(screen.getByText('Task monitor')).toBeInTheDocument();
     expect(screen.getByText('acme/widgets')).toHaveAttribute('title', 'Project-scoped task view: acme/widgets');
     expect(screen.getByText('2/7 shown')).toHaveAttribute('title', 'Rows currently displayed compared with the loaded page');
     expect(screen.getByText('fetched 30s ago')).toBeInTheDocument();
@@ -309,7 +312,7 @@ describe('PipelineWorkspace task stream', () => {
 
     const sideboard = screen.getByTestId('pipeline-sideboard');
     expect(within(sideboard).getByText('Task health')).toBeInTheDocument();
-    expect(within(sideboard).getByText('Filtered task view')).toBeInTheDocument();
+    expect(within(sideboard).getByText('Filtered task monitor')).toBeInTheDocument();
     expect(within(sideboard).getByText('Running')).toBeInTheDocument();
     expect(within(sideboard).getByText('Queued')).toBeInTheDocument();
     expect(within(sideboard).getByText('Finished')).toBeInTheDocument();

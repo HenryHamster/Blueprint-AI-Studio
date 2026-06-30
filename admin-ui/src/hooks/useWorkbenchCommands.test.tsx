@@ -629,6 +629,7 @@ describe('useWorkbenchCommands', () => {
 
     captured.find(command => command.id === 'pipeline.board')?.run();
     captured.find(command => command.id === 'runtime.analytics')?.run();
+    captured.find(command => command.id === 'runtime.devices')?.run();
     captured.find(command => command.id === 'runtime.accounts')?.run();
     captured.find(command => command.id === 'runtime.settings')?.run();
     captured.find(command => command.id === 'runtime.settings.provider-routing')?.run();
@@ -640,6 +641,7 @@ describe('useWorkbenchCommands', () => {
     expect(setViewMode).toHaveBeenCalledWith('kanban');
     expect(setShowArchive).toHaveBeenCalledWith(false);
     expect(setRuntimeSection).toHaveBeenCalledWith('analytics');
+    expect(setRuntimeSection).toHaveBeenCalledWith('devices');
     expect(setRuntimeSection).toHaveBeenCalledWith('accounts');
     expect(setRuntimeSection).toHaveBeenCalledWith('settings');
     expect(setRuntimeConfigSection.mock.calls.map(([section]) => section)).toEqual([
@@ -651,8 +653,40 @@ describe('useWorkbenchCommands', () => {
     ]);
     expect(handleTabChange).toHaveBeenCalledWith('pipeline');
     expect(handleTabChange).toHaveBeenCalledWith('runtime');
-    expect(closeGlobalSettings).toHaveBeenCalledTimes(6);
+    expect(closeGlobalSettings).toHaveBeenCalledTimes(8);
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
+  test('uses specific labels for task monitoring and runtime entry points', () => {
+    mount();
+
+    expect(captured.find(command => command.id === 'pipeline.flow')).toMatchObject({
+      label: 'Pipeline tasks',
+      detail: '3 active, 4 queued',
+      section: 'Pipeline',
+      shortcut: '2',
+    });
+    expect(captured.find(command => command.id === 'runtime.health')).toMatchObject({
+      label: 'Runtime overview',
+      section: 'Runtime',
+      shortcut: '4',
+    });
+    expect(captured.find(command => command.id === 'runtime.devices')).toMatchObject({
+      label: 'Runtime devices',
+      detail: 'Warm VMs and runners',
+    });
+    expect(captured.find(command => command.id === 'runtime.accounts')).toMatchObject({
+      label: 'Runtime accounts',
+      detail: '5 LLM accounts',
+    });
+    expect(captured.find(command => command.id === 'runtime.settings')).toMatchObject({
+      label: 'Runtime settings',
+      detail: 'Orchestrator defaults',
+    });
+    expect(captured.find(command => command.id === 'settings.general')).toMatchObject({
+      label: 'Workbench settings',
+      detail: 'UI defaults and controls',
+    });
   });
 
   test('disables project-scoped commands when no project is selected', () => {
