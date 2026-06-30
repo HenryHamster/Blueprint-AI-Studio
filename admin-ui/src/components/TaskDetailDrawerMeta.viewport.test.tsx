@@ -285,17 +285,29 @@ describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
           {
             id: 'pipeline',
             label: 'Pipeline flow for the currently selected operator task',
-            target: { surface: 'pipeline', id: 'task-550e8400e29b41d4a716446655440000' },
+            target: {
+              surface: 'pipeline',
+              id: 'task-550e8400e29b41d4a716446655440000',
+              task_id: 'task-550e8400e29b41d4a716446655440000',
+            },
           },
           {
             id: 'parent_task',
             label: 'Parent task with a very long context label',
-            target: { surface: 'task', id: 'task-parent-viewport-long-id-550e8400e29b41d4a716446655440000' },
+            target: {
+              surface: 'task',
+              id: 'task-parent-viewport-long-id-550e8400e29b41d4a716446655440000',
+              task_id: 'task-parent-viewport-long-id-550e8400e29b41d4a716446655440000',
+            },
           },
           {
             id: 'pull_request',
             label: 'Pull request',
-            target: { surface: 'external', id: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/4829' },
+            target: {
+              surface: 'external',
+              id: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/4829',
+              url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/4829',
+            },
           },
         ],
       },
@@ -307,6 +319,7 @@ describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
       const r = createRoot(host);
       root = r;
       await act(async () => { r.render(<DetailsTab task={task} onNavigateToTask={vi.fn()} />); });
+      expect(host.querySelector('a[href="https://github.com/HenryHamster/BlueprintAIStudio/pull/4829"]')).toBeTruthy();
     });
   });
 

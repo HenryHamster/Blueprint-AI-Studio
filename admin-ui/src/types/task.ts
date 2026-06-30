@@ -135,6 +135,9 @@ export interface TaskSideboardContext {
       surface: string;
       section?: string | null;
       id?: string | null;
+      task_id?: string | null;
+      direction_id?: string | null;
+      url?: string | null;
     };
   }>;
 }

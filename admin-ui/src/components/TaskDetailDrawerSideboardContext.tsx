@@ -15,8 +15,46 @@ function pluralize(count: number, singular: string, plural = `${singular}s`): st
   return `${count} ${count === 1 ? singular : plural}`;
 }
 
+function safeExternalUrl(value?: string | null): string | null {
+  if (!value) return null;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+function compactTargetId(value?: string | null): string | null {
+  if (!value) return null;
+  return value.length > 28 ? `${value.slice(0, 18)}...${value.slice(-6)}` : value;
+}
+
+function externalTargetUrl(target: SideboardLink['target']): string | null {
+  if (target.surface !== 'external') return null;
+  return safeExternalUrl(target.url ?? target.id);
+}
+
+function resolveTaskTargetId(target: SideboardLink['target']): string | null {
+  if (target.surface !== 'task') return null;
+  return target.task_id ?? target.id ?? null;
+}
+
 function linkTargetLabel(target: SideboardLink['target']): string {
-  return [target.surface, target.section, target.id].filter(Boolean).join(' / ');
+  const id = target.id ?? null;
+  if (target.surface === 'task') return compactTargetId(target.task_id ?? id) ?? 'task';
+  if (target.surface === 'pipeline') return compactTargetId(target.task_id ?? id) ?? 'pipeline';
+  if (target.surface === 'project' && target.section === 'directions') {
+    const directionId = compactTargetId(target.direction_id ?? id);
+    return directionId ? `direction ${directionId}` : 'directions';
+  }
+  if (target.surface === 'project') return target.section?.replace(/_/g, ' ') ?? 'project';
+  const externalUrl = externalTargetUrl(target);
+  if (externalUrl) {
+    const url = new URL(externalUrl);
+    return `${url.hostname}${url.pathname}`;
+  }
+  return [target.surface, target.section, id].filter(Boolean).join(' / ');
 }
 
 export function TaskSideboardContextSection({
@@ -34,6 +72,7 @@ export function TaskSideboardContextSection({
   const recentMessages = context.messages.items.slice(0, 2);
   const hiddenMessageCount = Math.max(0, context.messages.total_recent - recentMessages.length);
   const hasMessages = recentMessages.length > 0 || context.messages.total_recent > 0;
+  const primaryPrUrl = safeExternalUrl(context.artifacts.primary_pr_url);
 
   return (
     <>
@@ -102,9 +141,9 @@ export function TaskSideboardContextSection({
           <div className="min-w-0 text-sm">
             <span className="block text-neutral-300">{artifactSummary(context.artifacts.by_type)}</span>
             <span className="mt-0.5 flex min-w-0 flex-wrap gap-x-2 gap-y-1 text-xs text-neutral-500">
-              {context.artifacts.primary_pr_url && (
+              {primaryPrUrl && (
                 <a
-                  href={context.artifacts.primary_pr_url}
+                  href={primaryPrUrl}
                   target="_blank"
                   rel="noopener noreferrer"
                   data-viewport-allow-small-target
@@ -125,8 +164,9 @@ export function TaskSideboardContextSection({
           <div className="flex min-w-0 flex-wrap gap-1.5">
             {context.links.map(link => {
               const targetLabel = linkTargetLabel(link.target);
-              const taskTargetId = link.target.surface === 'task' ? link.target.id : null;
-              const canOpenTask = Boolean(taskTargetId && onNavigateToTask);
+              const taskId = resolveTaskTargetId(link.target);
+              const canOpenTask = Boolean(taskId && onNavigateToTask);
+              const externalUrl = externalTargetUrl(link.target);
               const className = 'inline-flex max-w-full min-w-0 flex-col rounded-md border border-neutral-800 bg-neutral-950/60 px-2 py-1 text-left';
               const children = (
                 <>
@@ -142,7 +182,7 @@ export function TaskSideboardContextSection({
                     key={link.id}
                     type="button"
                     onClick={() => {
-                      if (taskTargetId) onNavigateToTask?.(taskTargetId);
+                      if (taskId) onNavigateToTask?.(taskId);
                     }}
                     aria-label={`${link.label} ${targetLabel}`}
                     data-viewport-allow-small-target
@@ -150,6 +190,20 @@ export function TaskSideboardContextSection({
                   >
                     {children}
                   </button>
+                );
+              }
+              if (externalUrl) {
+                return (
+                  <a
+                    key={link.id}
+                    href={externalUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    data-viewport-allow-small-target
+                    className={`${className} hover:border-cyan-500/50 hover:bg-cyan-950/30`}
+                  >
+                    {children}
+                  </a>
                 );
               }
               return (

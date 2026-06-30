@@ -1310,7 +1310,11 @@ def _task_sideboard_context(
         {
             "id": "pipeline",
             "label": "Pipeline",
-            "target": {"surface": "pipeline", "id": str(task.id)},
+            "target": {
+                "surface": "pipeline",
+                "id": str(task.id),
+                "task_id": str(task.id),
+            },
         }
     ]
     if pipeline["parent_task_id"]:
@@ -1318,7 +1322,11 @@ def _task_sideboard_context(
             {
                 "id": "parent_task",
                 "label": "Parent",
-                "target": {"surface": "task", "id": pipeline["parent_task_id"]},
+                "target": {
+                    "surface": "task",
+                    "id": pipeline["parent_task_id"],
+                    "task_id": pipeline["parent_task_id"],
+                },
             }
         )
     direction = _find_task_direction_ref(task, project)
@@ -1331,6 +1339,7 @@ def _task_sideboard_context(
                     "surface": "project",
                     "section": "directions",
                     "id": direction["id"],
+                    "direction_id": direction["id"],
                 },
             }
         )
@@ -1339,7 +1348,11 @@ def _task_sideboard_context(
             {
                 "id": "pull_request",
                 "label": "PR",
-                "target": {"surface": "external", "id": primary_pr_url},
+                "target": {
+                    "surface": "external",
+                    "id": primary_pr_url,
+                    "url": primary_pr_url,
+                },
             }
         )
 

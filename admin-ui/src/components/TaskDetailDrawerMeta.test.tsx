@@ -4,6 +4,7 @@ import { DetailsTab } from './TaskDetailDrawerMeta';
 import type { Task } from '../types/task';
 import { authGet, fetchComputeJobs, resolveArtifactDownloadUrl, resolveViewportFailureDownloadUrl, resolveViewportShotDownloadUrl } from '../api';
 import type { ComputeJob, ComputeJobsListResponse } from '../api';
+import { formatAbsolute } from '../utils/time';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
@@ -131,9 +132,10 @@ describe('DetailsTab — sideboard context', () => {
               ],
             },
             links: [
-              { id: 'pipeline', label: 'Pipeline', target: { surface: 'pipeline', id: 'task-sideboard' } },
-              { id: 'linked-task', label: 'Linked task', target: { surface: 'task', id: 'linked-task-abcdef' } },
-              { id: 'direction', label: 'Direction', target: { surface: 'project', section: 'directions', id: 'd-active' } },
+              { id: 'pipeline', label: 'Pipeline', target: { surface: 'pipeline', id: 'task-sideboard', task_id: 'task-sideboard' } },
+              { id: 'linked-task', label: 'Linked task', target: { surface: 'task', id: 'legacy-linked-task-id', task_id: 'linked-task-abcdef' } },
+              { id: 'direction', label: 'Direction', target: { surface: 'project', section: 'directions', id: 'd-active', direction_id: 'd-active' } },
+              { id: 'pull_request', label: 'PR', target: { surface: 'external', id: 'legacy-pr-url', url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/42' } },
             ],
           },
         })}
@@ -156,14 +158,61 @@ describe('DetailsTab — sideboard context', () => {
     expect(screen.getByText('Recent task update')).toBeInTheDocument();
     expect(screen.getByText('Second bounded task update')).toBeInTheDocument();
     expect(screen.getByText('+1 more recent message')).toBeInTheDocument();
-    expect(screen.getByText('pipeline / task-sideboard')).toBeInTheDocument();
-    expect(screen.getByText('task / linked-task-abcdef')).toBeInTheDocument();
-    expect(screen.getByText('project / directions / d-active')).toBeInTheDocument();
+    expect(screen.getAllByText('task-sideboard').length).toBeGreaterThan(0);
+    expect(screen.getByText('linked-task-abcdef')).toBeInTheDocument();
+    expect(screen.getByText('direction d-active')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'PR github.com/HenryHamster/BlueprintAIStudio/pull/42' })).toHaveAttribute(
+      'href',
+      'https://github.com/HenryHamster/BlueprintAIStudio/pull/42',
+    );
 
     fireEvent.click(screen.getByText('parent parent-t'));
     expect(onNavigateToTask).toHaveBeenCalledWith('parent-task-123456');
-    fireEvent.click(screen.getByRole('button', { name: 'Linked task task / linked-task-abcdef' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Linked task linked-task-abcdef' }));
     expect(onNavigateToTask).toHaveBeenCalledWith('linked-task-abcdef');
+  });
+
+  it('guards sideboard external links while preserving legacy id URLs', () => {
+    render(
+      <DetailsTab
+        task={makeTask({
+          sideboard_context: {
+            project: { id: 'proj-1', name: 'Blueprint', repo: null },
+            purpose: null,
+            strategic: { direction: null, cycle: null },
+            pipeline: { parent_task_id: null, child_count: 0, dependency_count: 0, blocked_reason: null },
+            artifacts: { total: 0, by_type: {}, primary_pr_url: 'javascript:alert(1)', primary_commit: null },
+            messages: { total_recent: 0, items: [] },
+            links: [
+              {
+                id: 'legacy_pr',
+                label: 'Legacy PR',
+                target: {
+                  surface: 'external',
+                  id: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/43',
+                },
+              },
+              {
+                id: 'unsafe_pr',
+                label: 'Unsafe PR',
+                target: {
+                  surface: 'external',
+                  id: 'legacy-unsafe-url',
+                  url: 'javascript:alert(1)',
+                },
+              },
+            ],
+          },
+        })}
+      />,
+    );
+
+    expect(screen.queryByRole('link', { name: 'pull request' })).toBeNull();
+    expect(screen.getByRole('link', { name: 'Legacy PR github.com/HenryHamster/BlueprintAIStudio/pull/43' })).toHaveAttribute(
+      'href',
+      'https://github.com/HenryHamster/BlueprintAIStudio/pull/43',
+    );
+    expect(screen.getByText('Unsafe PR').closest('a')).toBeNull();
   });
 
   it('falls back to legacy direction lookup when sideboard context is absent', async () => {
@@ -239,8 +288,8 @@ describe('DetailsTab — parked wake registration', () => {
     expect(screen.getByText('job-123')).toBeInTheDocument();
     expect(screen.getByText('Delivery')).toBeInTheDocument();
     expect(screen.getByText('Delivered')).toBeInTheDocument();
-    expect(screen.getByText(/12:10:00 PM/)).toBeInTheDocument();
-    expect(screen.getByText(/01:00:00 PM/)).toBeInTheDocument();
+    expect(screen.getByText(formatAbsolute('2026-06-01T12:10:00Z'))).toBeInTheDocument();
+    expect(screen.getByText(formatAbsolute('2026-06-01T13:00:00Z'))).toBeInTheDocument();
     expect(screen.getByText('resumed: Task re-queued after compute job completed')).toBeInTheDocument();
   });
 });

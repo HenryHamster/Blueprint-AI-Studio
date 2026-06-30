@@ -22280,6 +22280,15 @@ class TestPostCommitPendingField:
             "direction",
             "pull_request",
         }
+        links_by_id = {link["id"]: link for link in sideboard["links"]}
+        assert links_by_id["pipeline"]["target"]["id"] == str(task.id)
+        assert links_by_id["pipeline"]["target"]["task_id"] == str(task.id)
+        assert links_by_id["parent_task"]["target"]["id"] == str(parent.id)
+        assert links_by_id["parent_task"]["target"]["task_id"] == str(parent.id)
+        assert links_by_id["direction"]["target"]["id"] == "d-active"
+        assert links_by_id["direction"]["target"]["direction_id"] == "d-active"
+        assert links_by_id["pull_request"]["target"]["id"].endswith("/pull/42")
+        assert links_by_id["pull_request"]["target"]["url"].endswith("/pull/42")
         assert "problem_model" not in sideboard
         assert "design_doc" not in str(sideboard)
         assert "huge" not in str(sideboard)
