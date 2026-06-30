@@ -239,6 +239,7 @@ def _build_work_session_summary(
     workbench_state: Dict[str, Any],
     context_package: Dict[str, Any] | None,
     attention: Dict[str, Any] | None,
+    runtime_summary: Dict[str, Any] | None,
     message_counts: Dict[str, int],
     task_counts: Dict[str, int],
 ) -> Dict[str, Any]:
@@ -254,6 +255,39 @@ def _build_work_session_summary(
     context_item_count = (
         int(context_package.get("item_count") or 0)
         if isinstance(context_package, dict)
+        else 0
+    )
+    context_status = (
+        _compact_text(context_package.get("status"), max_chars=40)
+        if isinstance(context_package, dict)
+        else None
+    )
+    runtime_work = (
+        runtime_summary.get("work", {}) if isinstance(runtime_summary, dict) else {}
+    )
+    compute_jobs = (
+        runtime_work.get("compute_jobs", {}) if isinstance(runtime_work, dict) else {}
+    )
+    compute_counts = (
+        compute_jobs.get("counts", {}) if isinstance(compute_jobs, dict) else {}
+    )
+    compute_spend = (
+        compute_jobs.get("spend", {}) if isinstance(compute_jobs, dict) else {}
+    )
+    held_approvals = (
+        runtime_work.get("held_approvals", {})
+        if isinstance(runtime_work, dict)
+        else {}
+    )
+    parked_wakes = (
+        runtime_work.get("parked_wakes", {}) if isinstance(runtime_work, dict) else {}
+    )
+    wake_counts = (
+        parked_wakes.get("counts", {}) if isinstance(parked_wakes, dict) else {}
+    )
+    held_approval_count = (
+        int(held_approvals.get("count") or 0)
+        if isinstance(held_approvals, dict)
         else 0
     )
 
@@ -303,11 +337,72 @@ def _build_work_session_summary(
             target={"surface": "pipeline"},
         ),
         _work_session_metric(
+            "tasks.parked",
+            "parked tasks",
+            int(task_counts.get("parked") or 0),
+            tone="watch" if int(task_counts.get("parked") or 0) > 0 else "neutral",
+            target={"surface": "pipeline"},
+        ),
+        _work_session_metric(
             "tasks.failed",
             "failed tasks",
             int(task_counts.get("failed") or 0),
             tone="critical" if int(task_counts.get("failed") or 0) > 0 else "neutral",
             target={"surface": "pipeline"},
+        ),
+        _work_session_metric(
+            "runtime.compute_active",
+            "active compute",
+            int(compute_counts.get("active") or 0),
+            tone="active" if int(compute_counts.get("active") or 0) > 0 else "neutral",
+            target={"surface": "runtime", "section": "compute"},
+        ),
+        _work_session_metric(
+            "runtime.compute_failed",
+            "failed compute",
+            int(compute_counts.get("failed_recent") or 0),
+            tone="critical"
+            if int(compute_counts.get("failed_recent") or 0) > 0
+            else "neutral",
+            target={"surface": "runtime", "section": "compute"},
+        ),
+        _work_session_metric(
+            "runtime.held_approvals",
+            "held approvals",
+            held_approval_count,
+            tone="warning" if held_approval_count > 0 else "neutral",
+            target={"surface": "pipeline"},
+        ),
+        _work_session_metric(
+            "runtime.parked_wakes",
+            "parked wakes",
+            int(wake_counts.get("active") or 0),
+            tone="watch" if int(wake_counts.get("active") or 0) > 0 else "neutral",
+            target={"surface": "runtime", "section": "compute"},
+        ),
+        _work_session_metric(
+            "runtime.wake_problems",
+            "wake problems",
+            int(wake_counts.get("problem") or 0),
+            tone="critical" if int(wake_counts.get("problem") or 0) > 0 else "neutral",
+            target={"surface": "runtime", "section": "compute"},
+        ),
+        _work_session_metric(
+            "runtime.compute_spend",
+            "compute spend",
+            float(compute_spend.get("window_total_usd") or 0.0),
+            tone="watch"
+            if float(compute_spend.get("window_total_usd") or 0.0) > 0
+            else "neutral",
+            target={"surface": "runtime", "section": "compute"},
+            unit="USD",
+        ),
+        _work_session_metric(
+            "context.stale",
+            "stale context",
+            1 if context_status == "stale" else 0,
+            tone="warning" if context_status == "stale" else "neutral",
+            target={"surface": "project", "section": "problem-model"},
         ),
         _work_session_metric(
             "context.items",
@@ -1246,6 +1341,7 @@ async def get_project_strategic_state(
         workbench_state=workbench_state,
         context_package=context_package,
         attention=attention,
+        runtime_summary=runtime_summary,
         message_counts=message_counts,
         task_counts=task_counts,
     )

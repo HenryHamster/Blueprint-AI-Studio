@@ -917,7 +917,7 @@ export default function App() {
     savingStrategicWorkbench,
     switchStrategicInteractionMode,
     focusStrategicComposer,
-    openStrategicContextTarget, openStrategicContextWorkspace, updateStrategicSessionRefs,
+    openStrategicContextTarget, openStrategicContextWorkspace, openStrategicMessageTarget: strategicMessageTarget.open, updateStrategicSessionRefs,
     handleTabChange,
     setCommandPaletteOpen,
     setPipelineSection,

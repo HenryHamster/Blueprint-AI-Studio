@@ -283,6 +283,76 @@ describe('useWorkbenchCommands', () => {
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
+  test('exposes attention items and actionable session metrics as commands', () => {
+    const openStrategicContextTarget = vi.fn();
+    const openStrategicMessageTarget = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const strategicState = {
+      attention: {
+        items: [
+          {
+            id: 'attention-msg-1',
+            kind: 'message',
+            severity: 'needs_operator',
+            reason: 'question',
+            label: 'Choose a runner',
+            detail: 'Strategic needs a routing choice',
+            ref: { kind: 'message', id: 'msg-1', project_id: 'project-1' },
+          },
+          {
+            id: 'attention-task-1',
+            kind: 'task',
+            severity: 'watch',
+            reason: 'blocked',
+            label: 'Fix worker bootstrap',
+            ref: { kind: 'task', id: 'task-1', project_id: 'project-1' },
+          },
+        ],
+      },
+      work_session: {
+        curated_metrics: [
+          ...Array.from({ length: 11 }, (_, index) => ({
+            id: `routine.${index}`,
+            label: `routine ${index}`,
+            value: 1,
+            tone: 'neutral',
+            target: { surface: 'project', section: 'running-update' },
+          })),
+          {
+            id: 'messages.open',
+            label: 'open messages',
+            value: 0,
+            tone: 'neutral',
+            target: { surface: 'messages' },
+          },
+          {
+            id: 'runtime.compute_failed',
+            label: 'failed compute',
+            value: 2,
+            tone: 'critical',
+            target: { surface: 'runtime', section: 'compute' },
+          },
+        ],
+      },
+    } as StrategicStateResponse;
+
+    mount({ strategicState, openStrategicContextTarget, openStrategicMessageTarget, setCommandPaletteOpen });
+
+    const questionCommand = captured.find(command => command.id === 'strategic.attention.message.attention-msg-1');
+    expect(questionCommand?.label).toBe('Reply to question: Choose a runner');
+    questionCommand?.run();
+    expect(openStrategicMessageTarget).toHaveBeenCalledWith({ messageId: 'msg-1', action: 'reply' });
+
+    captured.find(command => command.id === 'strategic.attention.task.attention-task-1')?.run();
+    expect(openStrategicContextTarget).toHaveBeenCalledWith({ surface: 'task', task_id: 'task-1' });
+
+    captured.find(command => command.id === 'strategic.session.metric.runtime.compute_failed')?.run();
+    expect(openStrategicContextTarget).toHaveBeenCalledWith({ surface: 'runtime', section: 'compute' });
+    expect(captured.filter(command => command.id.startsWith('strategic.session.metric.'))).toHaveLength(10);
+    expect(captured.find(command => command.id === 'strategic.session.metric.messages.open')).toBeUndefined();
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
   test('routes pipeline and runtime commands without introducing backend actions', () => {
     const handleTabChange = vi.fn();
     const setPipelineSection = vi.fn<(section: PipelineSection) => void>();

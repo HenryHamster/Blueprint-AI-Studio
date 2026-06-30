@@ -588,6 +588,15 @@ async def test_strategic_state_marks_active_cycle_with_cancelled_task_as_stale(
     assert active["stale"] is True
     assert resp.json()["strategic"]["active_task"] is None
     assert resp.json()["context_package"]["status"] == "stale"
+    metrics = {
+        entry["id"]: entry for entry in resp.json()["work_session"]["curated_metrics"]
+    }
+    assert metrics["context.stale"]["value"] == 1
+    assert metrics["context.stale"]["tone"] == "warning"
+    assert metrics["context.stale"]["target"] == {
+        "surface": "project",
+        "section": "problem-model",
+    }
 
 
 @pytest.mark.asyncio
@@ -1493,6 +1502,26 @@ async def test_strategic_state_includes_runtime_background_work(
         "EXPIRED",
     }
     assert all(item["wake_source_ref"] != "old-job" for item in wakes["items"])
+
+    session_metrics = {
+        entry["id"]: entry for entry in data["work_session"]["curated_metrics"]
+    }
+    assert session_metrics["tasks.parked"]["value"] == 1
+    assert session_metrics["runtime.compute_active"]["value"] == 1
+    assert session_metrics["runtime.compute_active"]["target"] == {
+        "surface": "runtime",
+        "section": "compute",
+    }
+    assert session_metrics["runtime.compute_failed"]["value"] == 1
+    assert session_metrics["runtime.compute_failed"]["tone"] == "critical"
+    assert session_metrics["runtime.held_approvals"]["value"] == 1
+    assert session_metrics["runtime.held_approvals"]["target"] == {
+        "surface": "pipeline",
+    }
+    assert session_metrics["runtime.parked_wakes"]["value"] == 1
+    assert session_metrics["runtime.wake_problems"]["value"] == 1
+    assert session_metrics["runtime.compute_spend"]["unit"] == "USD"
+    assert session_metrics["runtime.compute_spend"]["value"] == pytest.approx(3.75)
     expired_item = next(item for item in wakes["items"] if item["delivery_state"] == "EXPIRED")
     assert len(expired_item["result_detail"]) <= 180
 

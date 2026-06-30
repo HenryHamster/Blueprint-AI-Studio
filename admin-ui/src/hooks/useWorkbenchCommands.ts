@@ -9,8 +9,11 @@ import type {
   StrategicContextKnowledgeEvidence,
   StrategicContextPackageDrilldown,
   StrategicContextResourceRef,
+  StrategicMessageTarget,
   StrategicStateResponse,
+  StrategicStateAttentionItem,
   StrategicWorkbenchState,
+  StrategicWorkSessionMetric,
   StrategicWorkSessionRefDescriptor,
 } from '../strategicStateApi';
 import { removeStrategicSelectedRef, upsertStrategicSelectedRef, type StrategicSelectedRef } from '../utils/strategicWorkbenchSession';
@@ -40,6 +43,7 @@ interface UseWorkbenchCommandsOptions {
   focusStrategicComposer: () => void;
   openStrategicContextTarget?: (target?: StrategicContextTarget | null) => void;
   openStrategicContextWorkspace?: () => void;
+  openStrategicMessageTarget?: (target?: StrategicMessageTarget) => void;
   updateStrategicSessionRefs?: (
     updateRefs: (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs']
   ) => void;
@@ -120,6 +124,35 @@ function compactContextDetail(...parts: Array<string | null | undefined>): strin
   return detailParts.length > 0 ? detailParts.join(' / ') : null;
 }
 
+function attentionItemLabel(item: StrategicStateAttentionItem): string {
+  const label = item.label?.trim() || item.detail?.trim() || 'attention item';
+  if (item.kind === 'message' && item.reason === 'question') return `Reply to question: ${label}`;
+  if (item.kind === 'message') return `Open message: ${label}`;
+  if (item.kind === 'task') return `Open attention task: ${label}`;
+  if (item.kind === 'direction') return `Open direction: ${label}`;
+  if (item.kind === 'alert') return `Open alert: ${label}`;
+  return `Open attention: ${label}`;
+}
+
+function metricValueDetail(metric: StrategicWorkSessionMetric): string {
+  const value = Number.isInteger(metric.value) ? String(metric.value) : metric.value.toFixed(2);
+  const unit = metric.unit?.trim();
+  return unit ? `${value} ${unit}` : value;
+}
+
+function metricIsActionable(metric: StrategicWorkSessionMetric): boolean {
+  return Boolean(metric.target) && (Number(metric.value) > 0 || (metric.tone != null && metric.tone !== 'neutral'));
+}
+
+function metricPriority(metric: StrategicWorkSessionMetric): number {
+  if (metric.tone === 'critical') return 50;
+  if (metric.tone === 'warning') return 40;
+  if (metric.tone === 'active') return 30;
+  if (metric.tone === 'watch') return 20;
+  if (Number(metric.value) > 0) return 10;
+  return 0;
+}
+
 export function useWorkbenchCommands({
   selectedProjectId,
   selectedProjectRepoLabel,
@@ -140,6 +173,7 @@ export function useWorkbenchCommands({
   focusStrategicComposer,
   openStrategicContextTarget,
   openStrategicContextWorkspace,
+  openStrategicMessageTarget,
   updateStrategicSessionRefs,
   handleTabChange,
   setCommandPaletteOpen,
@@ -202,6 +236,38 @@ export function useWorkbenchCommands({
     const openContextTarget = (target?: StrategicContextTarget | null) => {
       openStrategicContextTarget?.(target);
       closePalette();
+    };
+    const openAttentionItem = (item: StrategicStateAttentionItem) => {
+      if (item.kind === 'message') {
+        const messageId = item.ref?.id;
+        if (openStrategicMessageTarget) {
+          openStrategicMessageTarget(messageId ? {
+            messageId,
+            action: item.reason === 'question' ? 'reply' : 'highlight',
+          } : undefined);
+          closePalette();
+        } else {
+          openContextTarget({ surface: 'messages' });
+        }
+        return;
+      }
+      if (item.kind === 'task') {
+        openContextTarget({ surface: 'task', task_id: item.task_id ?? item.ref?.id });
+        return;
+      }
+      if (item.kind === 'direction') {
+        openProjectSection('directions');
+        return;
+      }
+      if (item.kind === 'alert' && item.task_id) {
+        openContextTarget({ surface: 'task', task_id: item.task_id });
+        return;
+      }
+      if (item.kind === 'alert') {
+        openRuntimeSection('health');
+        return;
+      }
+      runAndClose(focusStrategicComposer);
     };
     const keepContextRef = (ref: StrategicSelectedRef) => {
       updateStrategicSessionRefs?.(refs => upsertStrategicSelectedRef(refs, ref));
@@ -338,6 +404,30 @@ export function useWorkbenchCommands({
         origin: 'evidence',
       });
     });
+    const attentionCommandEntries = (strategicState?.attention?.items ?? [])
+      .slice(0, 8)
+      .map((item): WorkbenchCommand => ({
+        id: `strategic.attention.${item.kind}.${item.id}`,
+        label: attentionItemLabel(item),
+        section: 'Attention',
+        detail: compactContextDetail(item.reason, item.detail ?? item.status ?? item.severity) ?? undefined,
+        keywords: ['strategic', 'attention', item.kind, item.reason, item.label, item.detail ?? '', item.status ?? ''],
+        disabled: projectDisabled,
+        run: () => openAttentionItem(item),
+      }));
+    const sessionMetricCommands = (strategicState?.work_session?.curated_metrics ?? [])
+      .filter(metricIsActionable)
+      .sort((a, b) => metricPriority(b) - metricPriority(a) || Number(b.value) - Number(a.value))
+      .slice(0, 10)
+      .map((metric): WorkbenchCommand => ({
+        id: `strategic.session.metric.${metric.id}`,
+        label: `Open ${metric.label}`,
+        section: 'Session',
+        detail: compactContextDetail(metricValueDetail(metric), metric.tone === 'neutral' ? null : metric.tone) ?? undefined,
+        keywords: ['strategic', 'session', 'metric', metric.id, metric.label, metric.tone ?? '', metric.unit ?? ''],
+        disabled: projectDisabled || !openStrategicContextTarget,
+        run: () => openContextTarget(metric.target),
+      }));
     const strategicModeCommands: Array<{
       id: string;
       mode: StrategicInteractionMode;
@@ -395,6 +485,8 @@ export function useWorkbenchCommands({
         disabled: projectDisabled || savingStrategicWorkbench || command.mode === strategicInteractionMode,
         run: command.mode === strategicInteractionMode ? closePalette : () => setStrategicModeAndOpenChat(command.mode),
       })),
+      ...attentionCommandEntries,
+      ...sessionMetricCommands,
       {
         id: 'strategic.context.workspace',
         label: 'Strategic context',
@@ -620,6 +712,7 @@ export function useWorkbenchCommands({
     maxPlanAccountCount,
     openStrategicContextWorkspace,
     openStrategicContextTarget,
+    openStrategicMessageTarget,
     openGlobalSettings,
     openNewTaskModal,
     openProjectManagement,
