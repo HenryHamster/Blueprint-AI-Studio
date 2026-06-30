@@ -323,19 +323,11 @@ def compute_composite(
       * ``not ci_green`` + ``ci_state == _CI_RED``  — confirmed failing build
         (``"ci_not_green"``).  Always a hard blocker, regardless of
         ``ci_required`` — never promote over a known-failing build.
-      * ``not ci_green`` + ``ci_state != _CI_RED`` + ``ci_required``  — CI could
-        not be evaluated (pending, no check-runs, or I/O degraded) on a
-        CI-gated project (``"ci_unresolved"``).  When ``ci_required`` is False
-        (the project relaxed per-PR CI on its integration branch — e.g.
-        ``automain`` pushes that legitimately carry zero check-runs, so the
-        candidate has NO direct CI signal to resolve) an unresolved CI is NOT a
-        blocker: it falls through to the weighted score.  The real CI gate for
-        such a project is the promotion PR -> ``main`` itself, which stays
-        strictly CI-gated (``proceed_on_no_checks`` keeps ``main`` in
-        ``ci_required_branches``), so an unresolved candidate CI never bypasses
-        validation — it is checked for real at the promotion-PR merge.  Without
-        this, a relaxed-CI project's every candidate is permanently wedged on
-        ``ci_unresolved`` (no automain commit ever carries a green CI signal).
+      * ``not ci_green`` + ``ci_state != _CI_RED`` + unresolved CI must block
+        (``"ci_unresolved"``).  ``ci_required`` can only relax a definitive
+        ``ci_state == "no_checks"`` absence that the caller already proved is
+        topologically allowed. Pending checks and degraded GitHub/API lookups
+        still block even when ``ci_required`` is False.
       * ``migration_collision`` is True — a deterministic Alembic
         revision-identity collision between the candidate and the deployed
         promotion target (the back-merge renumber class, prod incident
@@ -432,14 +424,12 @@ def compute_composite(
         # known-failing build, regardless of whether the project gates per-PR
         # merges on CI.
         blocker = "ci_not_green"
-    elif not ci_green and ci_required:
-        # Unresolved CI (pending, no check-runs, or GitHub I/O degraded) is a
-        # resolution/infrastructure concern, not a quality signal.  It blocks
-        # ONLY on a CI-gated project.  A project that relaxed per-PR CI on its
-        # integration branch (``ci_required`` False) has no candidate-level CI
-        # signal to resolve, so blocking here would permanently wedge every
-        # promotion; the promotion PR -> ``main`` carries the real, still-strict
-        # CI gate instead.
+    elif not ci_green and (ci_required or ci_state != "no_checks"):
+        # Unresolved CI (pending or GitHub I/O degraded) is a resolution /
+        # infrastructure concern, not a quality signal, and must keep blocking.
+        # The only relaxed state is a definitive absence of checks that the
+        # caller already classified as topology-safe by setting ci_required
+        # False. A project-wide CI relaxation must not mask pending/API errors.
         blocker = "ci_unresolved"
     elif migration_collision:
         # A deterministic Alembic revision-identity collision between the

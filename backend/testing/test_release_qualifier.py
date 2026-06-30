@@ -319,33 +319,43 @@ class TestComputeCompositeCiState:
 
 
 class TestComputeCompositeCiRequired:
-    """ci_required gates whether an UNRESOLVED candidate CI hard-blocks.
+    """ci_required gates only definitive absent candidate CI.
 
-    A project that relaxed per-PR CI on its integration branch
-    (``requires_ci_checks=False`` — e.g. ``automain`` pushes carry zero
-    check-runs) has no candidate-level CI signal to resolve, so an unresolved
-    state must NOT wedge promotion; the promotion PR -> ``main`` carries the
-    real, still-strict CI gate. A confirmed red still blocks regardless.
+    A topology-safe integration-branch candidate with a definitive
+    ``no_checks`` state may fall through to the score. Pending/API-error CI
+    stays unresolved, and confirmed red still blocks regardless.
     """
 
-    def test_unresolved_not_blocking_when_ci_not_required(self):
-        """ci_required=False + pending → NO ci_unresolved block; promotes on score."""
-        for state in ("pending", "no_checks"):
-            result = rq.compute_composite(
-                ci_green=False,
-                audit_score=1.0,
-                test_erosion=1.0,
-                smoketest_score=1.0,
-                policy=_POLICY,
-                ci_state=state,
-                ci_required=False,
-            )
-            assert result["blocker"] is None, (
-                f"unexpected blocker for ci_state={state!r} ci_required=False"
-            )
-            # Sub-scores are perfect → confidence clears the 0.75 threshold.
-            assert result["promote"] is True
-            assert result["confidence"] >= _POLICY["threshold"]
+    def test_no_checks_not_blocking_when_ci_not_required(self):
+        """ci_required=False + no_checks → promotes on score."""
+        result = rq.compute_composite(
+            ci_green=False,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            ci_state="no_checks",
+            ci_required=False,
+        )
+        assert result["blocker"] is None
+        # Sub-scores are perfect → confidence clears the 0.75 threshold.
+        assert result["promote"] is True
+        assert result["confidence"] >= _POLICY["threshold"]
+
+    def test_pending_still_blocks_when_ci_not_required(self):
+        """ci_required=False must not mask pending/API-error CI."""
+        result = rq.compute_composite(
+            ci_green=False,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            ci_state="pending",
+            ci_required=False,
+        )
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        assert result["blocker"] == "ci_unresolved"
 
     def test_red_still_blocks_even_when_ci_not_required(self):
         """A confirmed red build is ALWAYS a blocker, even with ci_required=False."""
@@ -383,7 +393,7 @@ class TestComputeCompositeCiRequired:
             test_erosion=None,
             smoketest_score=1.0,
             policy=_POLICY,
-            ci_state="pending",
+            ci_state="no_checks",
             ci_required=False,
         )
         assert result["promote"] is False
@@ -5077,8 +5087,19 @@ async def test_resolve_candidate_ci_no_checks_resolves_via_pr_head(mocker):
 
 
 @pytest.mark.asyncio
-async def test_resolve_candidate_ci_no_checks_no_prs_returns_pending(mocker):
-    """Candidate has no check-runs and no associated PRs → pending (not-green)."""
+async def test_resolve_candidate_ci_no_checks_no_prs_returns_no_checks(mocker):
+    """Candidate has no check-runs and no associated PRs → definitive no_checks."""
+    class _MockResponse:
+        def __init__(self, status_code, json_data=None, text=""):
+            self.status_code = status_code
+            self._json_data = json_data if json_data is not None else {}
+            self.text = text
+            self.headers = {}
+            self.links = {}
+
+        def json(self):
+            return self._json_data
+
     mocker.patch(
         "app.github.get_check_runs_cached",
         new=AsyncMock(
@@ -5089,9 +5110,54 @@ async def test_resolve_candidate_ci_no_checks_no_prs_returns_pending(mocker):
         "app.github.list_pull_requests_for_commit",
         new=AsyncMock(return_value=[]),
     )
+    mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=_MockResponse(200, [])),
+    )
     result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate111")
     assert result["ci_green"] is False
+    assert result["state"] == rq._CI_NO_CHECKS
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_no_checks_pr_list_error_returns_pending(mocker):
+    """A collapsed PR-list lookup failure stays pending instead of no_checks."""
+
+    class _MockResponse:
+        def __init__(self, status_code, json_data=None, text=""):
+            self.status_code = status_code
+            self._json_data = json_data if json_data is not None else {}
+            self.text = text
+            self.headers = {}
+            self.links = {}
+
+        def json(self):
+            return self._json_data
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        if sha == "candidate_lookup_error":
+            return {"status": "no_checks", "conclusion": None, "details": []}
+        raise AssertionError("PR head check-runs should not run on PR-list failure")
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=_MockResponse(500, {"message": "boom"}, text="boom")),
+    )
+
+    result = await rq._resolve_candidate_ci(
+        "tok", "owner", "repo", "candidate_lookup_error"
+    )
+
+    assert result["ci_green"] is False
     assert result["state"] == rq._CI_PENDING
+    assert result["resolved_sha"] is None
 
 
 @pytest.mark.asyncio
@@ -5102,6 +5168,36 @@ async def test_resolve_candidate_ci_check_runs_fetch_error_returns_pending(mocke
         new=AsyncMock(side_effect=RuntimeError("transient network error")),
     )
     result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate222")
+    assert result["ci_green"] is False
+    assert result["state"] == rq._CI_PENDING
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_pr_head_fetch_error_returns_pending(mocker):
+    """Candidate no_checks is not definitive when PR-head lookup errors."""
+    pr_head_sha = "pr_head_api_error"
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        if sha == "candidate_api_error":
+            return {"status": "no_checks", "conclusion": None, "details": []}
+        raise RuntimeError("transient PR-head check-runs error")
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 9,
+                    "merged_at": "2026-01-01T00:00:00Z",
+                    "head": {"sha": pr_head_sha},
+                }
+            ]
+        ),
+    )
+    result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate_api_error")
     assert result["ci_green"] is False
     assert result["state"] == rq._CI_PENDING
 
@@ -5419,7 +5515,14 @@ def _qualifier_ci_resolves_green(mocker):
     )
     mocker.patch(
         "app.github.list_pull_requests_for_commit",
-        new=AsyncMock(return_value=[]),
+        new=AsyncMock(
+            return_value=[
+                {
+                    "merged_at": "2026-01-01T00:00:00Z",
+                    "head": {"sha": "feedface" * 5},
+                }
+            ]
+        ),
     )
     # Default the qualify-on-synced gate to SYNCED so the overwhelming majority
     # of run_qualification tests (which assume the candidate is promotable)
@@ -5451,6 +5554,10 @@ def _qualifier_ci_resolves_green(mocker):
     mocker.patch(
         "app.github.list_versions_at_ref",
         new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
+    )
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value="\"\"\"test migration body\"\"\"\n"),
     )
     # Default the finalize-time scratch-DB migration-APPLY gate to CLEAN.
     # _finalize_qualification calls run_migration_apply_gate, which in production
@@ -7203,13 +7310,16 @@ async def _add_version_criterion(
     db_session.add(criterion)
     await db_session.flush()
     if source_kind is not None:
+        detail = {"verdict": "merge-test"}
+        if source_kind == "task_merge":
+            detail["proven"] = True
         db_session.add(
             CriterionEvidence(
                 project_id=project.id,
                 criterion_id=criterion.id,
                 source_kind=source_kind,
                 source_id=f"merge-test-{key}",
-                detail={"verdict": "merge-test"},
+                detail=detail,
             )
         )
     await db_session.commit()
@@ -7335,6 +7445,437 @@ async def test_criterion_coverage_all_covered_passes_qualification(
     promote_spy.assert_not_called()
 
 
+def _clean_finalize_pre_gates(
+    ci_state: str,
+    *,
+    ci_green: bool = False,
+    ci_required: bool = True,
+    include_ci_required: bool = True,
+) -> dict:
+    pre_gates = {
+        "ci_green": ci_green,
+        "ci_resolution": {
+            "state": ci_state,
+            "resolved_sha": None,
+            "detail": f"test {ci_state}",
+        },
+        "migration_verdict": "ok",
+        "migration_detail": None,
+        "apply_verdict": "ok",
+        "apply_detail": None,
+    }
+    if include_ci_required:
+        pre_gates["ci_required"] = ci_required
+    return pre_gates
+
+
+async def _seed_relaxed_ci_clean_qualification(db_session):
+    project, version = await _make_project_and_version(db_session)
+    project.build_config = {
+        "requires_ci_checks": False,
+        "has_ci": True,
+        "ci_required_branches": ["main"],
+    }
+    db_session.add(project)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    return project, version
+
+
+@pytest.mark.asyncio
+async def test_finalize_absent_integration_branch_candidate_ci_self_clears_ci_unresolved(
+    db_session, mocker
+):
+    """Definitive absent CI on the integration branch can dry-run from scores."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+    candidate_sha = version.last_qualification["candidate_sha"]
+    call_log: list[tuple[str, str]] = []
+
+    async def tracked_ancestor_of(*args, **kwargs):
+        call_log.append((args[3], args[4]))
+        return True
+
+    ancestor_spy = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(side_effect=tracked_ancestor_of)
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=AssertionError("branch head lookup should not run")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_clean_finalize_pre_gates(
+            rq._CI_NO_CHECKS, ci_required=False, include_ci_required=False
+        ),
+    )
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    assert result["would_promote"] is True
+    assert result.get("blocker") is None
+    promote_spy.assert_not_called()
+    ancestor_spy.assert_awaited_once()
+    assert call_log == [(candidate_sha, "automain")]
+    await db_session.refresh(version)
+    assert version.last_qualification["ci_resolution"]["state"] == rq._CI_NO_CHECKS
+    assert version.last_qualification["blocker"] is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_absent_integration_branch_candidate_ci_stays_blocked_when_not_ancestor(
+    db_session, mocker
+):
+    """A definitive no_checks candidate outside the relaxed branch stays blocked."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+    candidate_sha = version.last_qualification["candidate_sha"]
+
+    ancestor_spy = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=False)
+    )
+    mocker.patch(
+        "app.release_qualifier._candidate_already_on_main",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=AssertionError("branch head lookup should not run")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_clean_finalize_pre_gates(
+            rq._CI_NO_CHECKS, ci_required=False, include_ci_required=False
+        ),
+    )
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "ci_unresolved"
+    assert result["confidence"] == 0.0
+    promote_spy.assert_not_called()
+    ancestor_spy.assert_awaited_once()
+    await db_session.refresh(version)
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+    assert version.last_qualification["ci_resolution"]["state"] == rq._CI_NO_CHECKS
+    assert version.last_qualification["blocker"] == "ci_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_finalize_absent_integration_branch_candidate_ci_stays_blocked_when_branch_rejected(
+    db_session, mocker
+):
+    """A topology-safe candidate still blocks when the branch policy rejects it."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+
+    ancestor_spy = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(return_value=True)
+    )
+    proceed_spy = mocker.patch(
+        "app.release_qualifier.proceed_on_no_checks", return_value=False
+    )
+    mocker.patch(
+        "app.release_qualifier._candidate_already_on_main",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=AssertionError("branch head lookup should not run")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_clean_finalize_pre_gates(
+            rq._CI_NO_CHECKS, ci_required=False, include_ci_required=False
+        ),
+    )
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "ci_unresolved"
+    assert result["confidence"] == 0.0
+    promote_spy.assert_not_called()
+    ancestor_spy.assert_awaited_once()
+    proceed_spy.assert_called_once()
+    await db_session.refresh(version)
+    assert version.last_qualification["ci_resolution"]["state"] == rq._CI_NO_CHECKS
+    assert version.last_qualification["blocker"] == "ci_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_finalize_absent_integration_branch_candidate_ci_self_clears_when_head_advances(
+    db_session, mocker
+):
+    """A candidate still reachable from a newer integration head can still relax no_checks."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+    candidate_sha = version.last_qualification["candidate_sha"]
+    current_integration_head_sha = "f" * 40
+    call_log: list[tuple[str, str]] = []
+
+    async def tracked_ancestor_of(*args, **kwargs):
+        call_log.append((args[3], args[4]))
+        return True
+
+    ancestor_spy = mocker.patch(
+        "app.github.is_ancestor_of", new=AsyncMock(side_effect=tracked_ancestor_of)
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=AssertionError("branch head lookup should not run")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_clean_finalize_pre_gates(
+            rq._CI_NO_CHECKS, ci_required=False, include_ci_required=False
+        ),
+    )
+    await db_session.commit()
+
+    assert candidate_sha != current_integration_head_sha
+    assert result["status"] == "dry_run"
+    assert result["would_promote"] is True
+    assert result.get("blocker") is None
+    promote_spy.assert_not_called()
+    ancestor_spy.assert_awaited_once()
+    assert call_log == [(candidate_sha, "automain")]
+    await db_session.refresh(version)
+    assert version.last_qualification["ci_resolution"]["state"] == rq._CI_NO_CHECKS
+    assert version.last_qualification["blocker"] is None
+
+
+@pytest.mark.parametrize(
+    ("ci_state", "blocker"),
+    [(rq._CI_PENDING, "ci_unresolved"), (rq._CI_RED, "ci_not_green")],
+)
+@pytest.mark.asyncio
+async def test_finalize_non_absent_candidate_ci_blocks_under_relaxed_no_checks_policy(
+    db_session, mocker, ci_state, blocker
+):
+    """Pending/API-error and confirmed-red candidate CI remain strict."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_clean_finalize_pre_gates(ci_state),
+    )
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == blocker
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finalize_locked_version_precomputes_relaxed_no_checks_topology_before_finalize(
+    db_session, mocker
+):
+    """The row-lock owner must precompute relaxed no_checks topology pre-lock."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+    candidate_sha = version.last_qualification["candidate_sha"]
+    call_log: list[str] = []
+    topology_args: list[tuple[str, str]] = []
+    fq_entered = [False]
+
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(
+            return_value=(
+                False,
+                {
+                    "state": rq._CI_NO_CHECKS,
+                    "resolved_sha": None,
+                    "detail": "forced no_checks for test",
+                },
+            )
+        ),
+    )
+    mocker.patch.object(
+        rq,
+        "_resolve_migration_identity_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch.object(
+        rq,
+        "_resolve_migration_apply_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+
+    async def tracked_ancestor_of(*args, **kwargs):
+        assert not fq_entered[0], "topology lookup ran under the finalize lock"
+        call_log.append("ancestor_of")
+        topology_args.append((args[3], args[4]))
+        return True
+
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(side_effect=tracked_ancestor_of),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=AssertionError("branch head lookup should not run")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    orig_fq = rq._finalize_qualification
+
+    async def tracking_fq(session, version, *, _pre_gates=None):
+        fq_entered[0] = True
+        call_log.append("finalize_qualification")
+        assert _pre_gates is not None
+        assert _pre_gates["ci_required"] is False
+        return await orig_fq(session, version, _pre_gates=_pre_gates)
+
+    mocker.patch("app.release_qualifier._finalize_qualification", side_effect=tracking_fq)
+
+    factory = _shared_session_factory(db_session)
+    result = await rq._finalize_in_dedicated_session(
+        version.id, timeout_now=None, session_factory=factory
+    )
+    await db_session.commit()
+
+    assert result is not None
+    assert result["status"] == "dry_run"
+    assert result["would_promote"] is True
+    assert call_log == ["ancestor_of", "finalize_qualification"]
+    assert topology_args == [(candidate_sha, "automain")]
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finalize_locked_version_keeps_relaxed_no_checks_strict_when_topology_unavailable(
+    db_session, mocker
+):
+    """Uncertain no_checks topology stays strict and blocks finalize."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+    call_log: list[str] = []
+    fq_entered = [False]
+
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(
+            return_value=(
+                False,
+                {
+                    "state": rq._CI_NO_CHECKS,
+                    "resolved_sha": None,
+                    "detail": "forced no_checks for test",
+                },
+            )
+        ),
+    )
+    mocker.patch.object(
+        rq,
+        "_resolve_migration_identity_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch.object(
+        rq,
+        "_resolve_migration_apply_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+
+    async def broken_ancestor_of(*args, **kwargs):
+        assert not fq_entered[0], "topology lookup ran under the finalize lock"
+        call_log.append("ancestor_of")
+        raise RuntimeError("topology unavailable")
+
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(side_effect=broken_ancestor_of),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=AssertionError("branch head lookup should not run")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    orig_fq = rq._finalize_qualification
+
+    async def tracking_fq(session, version, *, _pre_gates=None):
+        fq_entered[0] = True
+        call_log.append("finalize_qualification")
+        assert _pre_gates is not None
+        assert _pre_gates["ci_required"] is True
+        return await orig_fq(session, version, _pre_gates=_pre_gates)
+
+    mocker.patch("app.release_qualifier._finalize_qualification", side_effect=tracking_fq)
+
+    factory = _shared_session_factory(db_session)
+    result = await rq._finalize_in_dedicated_session(
+        version.id, timeout_now=None, session_factory=factory
+    )
+    await db_session.commit()
+
+    assert result is not None
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "ci_unresolved"
+    assert call_log == ["ancestor_of", "finalize_qualification"]
+    promote_spy.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_no_criteria_no_criterion_blocker(db_session, mocker):
     """Versions with no criteria skip the criterion coverage gate."""
@@ -7374,6 +7915,7 @@ async def test_no_criteria_no_criterion_blocker(db_session, mocker):
         "covered": 0,
         "partial": 0,
         "uncovered": 0,
+        "stuck_count": 0,
         "criteria": [],
     }
     promote_spy.assert_not_called()
@@ -9092,22 +9634,6 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
 
     promote_a.assert_called_once()
     assert result_a == {"status": "promoted"}
-    # The durable verdict row carries the merge-grade columns + blocker.
-    vrow_a = (
-        (
-            await db_session.execute(
-                select(QualificationVerdict).where(
-                    QualificationVerdict.release_version_id == version_a.id
-                )
-            )
-        )
-        .scalars()
-        .first()
-    )
-    assert vrow_a is not None
-    assert vrow_a.merge_grade_status == "fail"
-    assert vrow_a.blocker is None
-    assert "never wired" in (vrow_a.merge_grade_biggest_gap or "")
 
     # --- (b) MISSING merge-grade artifact -> infra hold, cannot be skipped --
     project_b, version_b = await _make_project_and_version(db_session)

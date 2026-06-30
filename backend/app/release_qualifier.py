@@ -133,7 +133,7 @@ from app.release_qualifier_audit import (
     _MIN_INFRA_ERROR_STREAK,  # noqa: F401 — re-exported for callers/tests
     append_infra_failure_child_event,
     _enrich_infra_error,
-    _handle_independent_blocker,  # noqa: F401 — re-exported for callers/tests
+    _handle_independent_blocker,  # re-exported for callers/tests
     _handle_infra_failure,
     _latest_artifact_logs,
     _select_lifecycle_audit,  # noqa: F401 — re-exported for callers/tests
@@ -149,11 +149,11 @@ from app.release_qualifier_audit import (
 )
 from app.ci_resolution import (
     _CI_GREEN,
-    _CI_NO_CHECKS,  # noqa: F401
+    _CI_NO_CHECKS,
     _CI_PENDING,
     _CI_RED,
     _classify_check_runs,
-    requires_ci_checks,
+    proceed_on_no_checks,
 )
 from app.release_scoring import (
     # Re-exports — release_qualifier is the canonical import + test-patch
@@ -170,7 +170,7 @@ from app.release_scoring import (
     _MAX_DELETED_TEST_FILES,  # noqa: F401 — re-exported for callers/tests
     _MAX_FAILED_SMOKE_TESTS,  # noqa: F401 — re-exported for callers/tests
     _MIN_TELEMETRY_SAMPLE,  # noqa: F401 — re-exported for callers/tests
-    _SEVERITY_RANK,  # noqa: F401
+    _SEVERITY_RANK,
     _SEVERITIES_REQUIRING_VERIFICATION,
     _audit_finding_key,  # noqa: F401 — re-exported for callers/tests
     _audit_findings_carry_meta,
@@ -713,6 +713,75 @@ async def _resolve_candidate_ci(
             "detail": f"pr-for-commit lookup failed: {exc}",
         }
 
+    if not prs:
+        # ``list_pull_requests_for_commit`` collapses API failures and genuine
+        # empty results to ``[]``. Re-check the raw response so a transient
+        # ``commits/{sha}/pulls`` failure stays strict instead of self-clearing
+        # as definitive ``no_checks``.
+        try:
+            response = await github._github_request(  # type: ignore[attr-defined]
+                "GET",
+                f"https://api.github.com/repos/{owner}/{repo}/commits/{candidate_sha}/pulls?per_page=100",
+                {
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github.v3+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                project_id=project_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — raw PR lookup failure → pending
+            logger.warning(
+                "[RELEASE_QUALIFIER] PR-for-commit lookup failed for %s/%s@%s: %s",
+                owner,
+                repo,
+                candidate_sha[:8],
+                exc,
+            )
+            return {
+                "state": _CI_PENDING,
+                "ci_green": False,
+                "resolved_sha": None,
+                "detail": f"pr-for-commit lookup failed: {exc}",
+            }
+        if response.status_code != 200:
+            logger.warning(
+                "[RELEASE_QUALIFIER] PR-for-commit lookup failed for %s/%s@%s: "
+                "HTTP %s",
+                owner,
+                repo,
+                candidate_sha[:8],
+                response.status_code,
+            )
+            return {
+                "state": _CI_PENDING,
+                "ci_green": False,
+                "resolved_sha": None,
+                "detail": f"pr-for-commit lookup failed: HTTP {response.status_code}",
+            }
+        try:
+            prs = response.json()
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "[RELEASE_QUALIFIER] PR-for-commit lookup failed for %s/%s@%s: %s",
+                owner,
+                repo,
+                candidate_sha[:8],
+                exc,
+            )
+            return {
+                "state": _CI_PENDING,
+                "ci_green": False,
+                "resolved_sha": None,
+                "detail": f"pr-for-commit lookup failed: {exc}",
+            }
+        if not isinstance(prs, list):
+            return {
+                "state": _CI_PENDING,
+                "ci_green": False,
+                "resolved_sha": None,
+                "detail": "pr-for-commit lookup returned a non-list body",
+            }
+
     # Prefer merged PRs; fall back to every associated PR when none carry merged_at.
     merged_prs = [pr for pr in prs if isinstance(pr, dict) and pr.get("merged_at")]
     use_prs = merged_prs or [pr for pr in prs if isinstance(pr, dict)]
@@ -741,10 +810,10 @@ async def _resolve_candidate_ci(
 
     if not head_shas:
         return {
-            "state": _CI_PENDING,
+            "state": _CI_NO_CHECKS,
             "ci_green": False,
             "resolved_sha": None,
-            "detail": "no check-runs on candidate and no PR head with CI",
+            "detail": "no check-runs on candidate and no associated PR heads",
         }
 
     # Exhaustive RED-preferring sweep: inspect every PR head before deciding.
@@ -753,6 +822,8 @@ async def _resolve_candidate_ci(
     # green AND no associated head is red.
     first_red_sha: str | None = None
     first_green_sha: str | None = None
+    saw_pending = False
+    saw_error = False
     for head_sha in head_shas:
         try:
             pr_checks = await github.get_check_runs_cached(
@@ -772,12 +843,15 @@ async def _resolve_candidate_ci(
                 head_sha[:8],
                 exc,
             )
+            saw_error = True
             continue
         pr_state = _classify_check_runs(pr_checks)
         if pr_state == _CI_RED and first_red_sha is None:
             first_red_sha = head_sha
         elif pr_state == _CI_GREEN and first_green_sha is None:
             first_green_sha = head_sha
+        elif pr_state == _CI_PENDING:
+            saw_pending = True
         # pending / no_checks — keep inspecting remaining heads.
 
     if first_red_sha is not None:
@@ -794,11 +868,18 @@ async def _resolve_candidate_ci(
             "resolved_sha": first_green_sha,
             "detail": "PR head check-runs passed",
         }
+    if saw_pending or saw_error:
+        return {
+            "state": _CI_PENDING,
+            "ci_green": False,
+            "resolved_sha": None,
+            "detail": "PR head check-runs still pending or unavailable",
+        }
     return {
-        "state": _CI_PENDING,
+        "state": _CI_NO_CHECKS,
         "ci_green": False,
         "resolved_sha": None,
-        "detail": "PR head check-runs still pending / absent",
+        "detail": "no check-runs on candidate or associated PR heads",
     }
 
 
@@ -878,6 +959,53 @@ async def _resolve_ci_at_finalize(
             exc,
         )
         return False, degenerate_resolution
+
+
+async def _resolve_finalize_ci_required(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+) -> bool:
+    """Return whether finalize must still treat ``no_checks`` as blocking.
+
+    Only a definitive ``no_checks`` on an integration-branch candidate can
+    relax CI, and only when ``proceed_on_no_checks`` permits that branch.
+    Any indeterminate topology or GitHub failure stays strict.
+    """
+    if not candidate_sha:
+        return True
+    try:
+        project = await session.get(Project, version.project_id)
+        if project is None:
+            return True
+        integration_branch = get_project_integration_branch(project)
+        if not integration_branch:
+            return True
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            return True
+        token, owner, repo = resolved
+        candidate_reachable = await github.is_ancestor_of(
+            token,
+            owner,
+            repo,
+            candidate_sha,
+            integration_branch,
+            project_id=str(version.project_id),
+        )
+        return not (
+            candidate_reachable is True
+            and proceed_on_no_checks(project, integration_branch)
+        )
+    except Exception as exc:  # noqa: BLE001 — uncertain topology stays strict
+        logger.warning(
+            "[RELEASE_QUALIFIER] finalize CI topology check failed for v%d "
+            "candidate %s: %s",
+            version.version_number,
+            str(candidate_sha)[:8],
+            exc,
+        )
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -3199,15 +3327,12 @@ async def _finalize_qualification(
             )
             return await _handle_infra_failure(session, version, qual, label)
 
-    # --- Compute the composite ---------------------------------------------
-    # Whether an UNRESOLVED candidate CI (pending / no check-runs) hard-blocks
-    # depends on the project: one that relaxed per-PR CI on its integration
-    # branch (``requires_ci_checks`` False — e.g. automain pushes carry zero
-    # check-runs) has no candidate-level CI signal to resolve, so the candidate
-    # gate must NOT block on ci_unresolved (the promotion PR -> main carries the
-    # real, still-strict CI gate). A confirmed red still blocks regardless.
-    _ci_project = await session.get(Project, version.project_id)
-    ci_required = requires_ci_checks(_ci_project) if _ci_project is not None else True
+    ci_state = ci_resolution.get("state", _CI_RED)
+    ci_required = True
+    if _pre_gates is not None and "ci_required" in _pre_gates:
+        ci_required = bool(_pre_gates["ci_required"])
+    elif ci_state == _CI_NO_CHECKS:
+        ci_required = await _resolve_finalize_ci_required(session, version, candidate_sha)
     criterion_coverage = await get_version_coverage_summary(session, version.id)
     composite = compute_composite(
         ci_green=ci_green,
@@ -3216,7 +3341,7 @@ async def _finalize_qualification(
         smoketest_score=smoketest_score,
         policy=policy,
         smoketest_enabled=smoketest_enabled,
-        ci_state=ci_resolution.get("state", _CI_RED),
+        ci_state=ci_state,
         ci_required=ci_required,
         migration_collision=migration_collision,
         migration_apply_blocked=migration_apply_blocked,
@@ -3993,6 +4118,10 @@ async def _finalize_locked_version(
             "apply_verdict": pre_apply_verdict,
             "apply_detail": pre_apply_detail,
         }
+        if pre_ci_resolution.get("state") == _CI_NO_CHECKS:
+            _pre_gates["ci_required"] = await _resolve_finalize_ci_required(
+                session, peek, peek_candidate_sha
+            )
 
     # Expire the peek instance so the FOR UPDATE select below forces a fresh
     # read from the DB (mirrors _relock_version_for_promotion_write pattern —

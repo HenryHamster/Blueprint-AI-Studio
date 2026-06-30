@@ -6260,6 +6260,68 @@ async def test_managed_check_wait_no_checks_persists_snapshot_idempotently(
 
 
 @pytest.mark.asyncio
+async def test_managed_check_wait_no_checks_on_required_promotion_target_blocks(
+    db_session, mocker
+):
+    """A relaxed integration branch must not make promotion-target no_checks pass."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "cafe1234" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": pr_head},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "no_checks",
+                "conclusion": None,
+                "details": [],
+            }
+        ),
+    )
+    merge_mock = mocker.patch("app.github.merge_pull_request", new=AsyncMock())
+
+    project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="main"
+    )
+    project.build_config = {
+        "requires_ci_checks": False,
+        "has_ci": True,
+        "ci_required_branches": ["main"],
+    }
+    db_session.add(project)
+    candidate_sha = "abcd" * 10
+    version.last_qualification = _managed_check_wait_qual(candidate_sha)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    merge_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["managed_check_wait"] is True
+    assert pending["ci_state"] == "no_checks"
+    assert pending["check_snapshot"]["state"] == "no_checks"
+
+
+@pytest.mark.asyncio
 async def test_managed_check_wait_no_checks_no_ci_repo_proceeds_to_merge(
     db_session, mocker
 ):
