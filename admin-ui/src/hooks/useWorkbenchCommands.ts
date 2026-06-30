@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
 import type { WorkbenchCommand } from '../components/CommandPalette';
-import type { ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
+import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import type { SectionId } from '../components/SettingsDropdown';
 import type {
@@ -34,6 +34,7 @@ interface UseWorkbenchCommandsOptions {
   visibleQueuedCount: number;
   maxPlanAccountCount: number;
   apiHealthy: boolean;
+  isAdmin?: boolean;
   problemModelRevision?: number | null;
   hasDesignDoc?: boolean;
   designRevision?: number | null;
@@ -53,6 +54,7 @@ interface UseWorkbenchCommandsOptions {
   setCommandPaletteOpen: (open: boolean) => void;
   setPipelineSection: (section: PipelineSection) => void;
   setProjectSection: (section: ProjectSection) => void;
+  setProjectManageSection?: (section: ProjectManageSection) => void;
   setRuntimeSection: (section: RuntimeSection) => void;
   setRuntimeConfigSection: (section: RuntimeSettingsSection) => void;
   setViewMode: (mode: ViewMode) => void;
@@ -62,6 +64,7 @@ interface UseWorkbenchCommandsOptions {
   setShowKnowledgeBrowser: (show: boolean) => void;
   openNewTaskModal: () => void;
   openGlobalSettings: (section: SectionId | null) => void;
+  closeGlobalSettings?: () => void;
   refreshWorkbench: () => void;
   openProjectManagement: () => void;
   openProjectMembers: () => void;
@@ -207,6 +210,7 @@ export function useWorkbenchCommands({
   visibleQueuedCount,
   maxPlanAccountCount,
   apiHealthy,
+  isAdmin = true,
   problemModelRevision,
   hasDesignDoc,
   designRevision,
@@ -224,6 +228,7 @@ export function useWorkbenchCommands({
   setCommandPaletteOpen,
   setPipelineSection,
   setProjectSection,
+  setProjectManageSection,
   setRuntimeSection,
   setRuntimeConfigSection,
   setViewMode,
@@ -233,6 +238,7 @@ export function useWorkbenchCommands({
   setShowKnowledgeBrowser,
   openNewTaskModal,
   openGlobalSettings,
+  closeGlobalSettings,
   refreshWorkbench,
   openProjectManagement,
   openProjectMembers,
@@ -249,9 +255,28 @@ export function useWorkbenchCommands({
       handleTabChange('project');
       closePalette();
     };
+    const openProjectManageSection = (section: ProjectManageSection) => {
+      setProjectSection('manage');
+      setProjectManageSection?.(section);
+      handleTabChange('project');
+      if (setProjectManageSection) {
+        closeGlobalSettings?.();
+      } else if (section !== 'overview') {
+        openGlobalSettings(section);
+      }
+      closePalette();
+    };
     const openRuntimeSection = (section: RuntimeSection) => {
       setRuntimeSection(section);
       handleTabChange('runtime');
+      if (section === 'accounts') closeGlobalSettings?.();
+      closePalette();
+    };
+    const openRuntimeSettingsSection = (section: RuntimeSettingsSection) => {
+      setRuntimeSection('settings');
+      setRuntimeConfigSection(section);
+      handleTabChange('runtime');
+      closeGlobalSettings?.();
       closePalette();
     };
     const openPipelineSection = (section: PipelineSection) => {
@@ -691,7 +716,52 @@ export function useWorkbenchCommands({
         detail: 'Repo, members, policy',
         keywords: ['settings', 'members', 'repo'],
         disabled: projectDisabled,
-        run: () => openProjectSection('manage'),
+        run: () => openProjectManageSection('overview'),
+      },
+      {
+        id: 'project.build',
+        label: 'Project build settings',
+        section: 'Project',
+        detail: 'Detection, test, install commands',
+        keywords: ['settings', 'build', 'test', 'install', 'commands'],
+        disabled: projectDisabled,
+        run: () => openProjectManageSection('build-config'),
+      },
+      {
+        id: 'project.branches',
+        label: 'Project branches',
+        section: 'Project',
+        detail: 'Integration and promotion targets',
+        keywords: ['settings', 'branches', 'integration', 'promotion'],
+        disabled: projectDisabled,
+        run: () => openProjectManageSection('branches'),
+      },
+      {
+        id: 'project.review',
+        label: 'Project auto-review',
+        section: 'Project',
+        detail: 'Review gates and autonomous decisions',
+        keywords: ['settings', 'review', 'auto-review', 'approval', 'gates'],
+        disabled: projectDisabled,
+        run: () => openProjectManageSection('auto-review'),
+      },
+      {
+        id: 'project.resources',
+        label: 'Project resources',
+        section: 'Project',
+        detail: 'Runtime and budget envelope',
+        keywords: ['settings', 'resources', 'budget', 'runtime', 'envelope'],
+        disabled: projectDisabled,
+        run: () => openProjectManageSection('resource-envelope'),
+      },
+      {
+        id: 'project.access',
+        label: 'Project access settings',
+        section: 'Project',
+        detail: 'Roles and project access policy',
+        keywords: ['settings', 'access', 'members', 'roles', 'users'],
+        disabled: projectDisabled,
+        run: () => openProjectManageSection('access'),
       },
       {
         id: 'project.members',
@@ -757,12 +827,41 @@ export function useWorkbenchCommands({
         section: 'Runtime',
         detail: 'Orchestrator',
         keywords: ['orchestrator', 'provider', 'routing'],
-        run: () => {
-          setRuntimeSection('settings');
-          setRuntimeConfigSection('orchestrator');
-          handleTabChange('runtime');
-          closePalette();
-        },
+        run: () => openRuntimeSettingsSection('orchestrator'),
+      },
+      {
+        id: 'runtime.settings.provider-routing',
+        label: 'Provider routing',
+        section: 'Runtime',
+        detail: 'Task and category policy',
+        keywords: ['settings', 'provider', 'routing', 'models', 'policy'],
+        disabled: !isAdmin,
+        run: () => openRuntimeSettingsSection('provider-routing'),
+      },
+      {
+        id: 'runtime.settings.provider-settings',
+        label: 'Provider settings',
+        section: 'Runtime',
+        detail: 'Model defaults and effort routing',
+        keywords: ['settings', 'provider', 'models', 'effort', 'defaults'],
+        disabled: !isAdmin,
+        run: () => openRuntimeSettingsSection('provider-settings'),
+      },
+      {
+        id: 'runtime.settings.notifications',
+        label: 'Runtime notifications',
+        section: 'Runtime',
+        detail: 'Webhook, event, and spend alerts',
+        keywords: ['settings', 'notifications', 'alerts', 'webhook', 'spend'],
+        run: () => openRuntimeSettingsSection('notifications'),
+      },
+      {
+        id: 'runtime.settings.advanced',
+        label: 'Runtime advanced settings',
+        section: 'Runtime',
+        detail: 'Health checks and diagnostics',
+        keywords: ['settings', 'advanced', 'health checks', 'diagnostics'],
+        run: () => openRuntimeSettingsSection('advanced'),
       },
       {
         id: 'activity.open',
@@ -819,17 +918,19 @@ export function useWorkbenchCommands({
         detail: 'Defaults and controls',
         keywords: ['preferences', 'config'],
         shortcut: 'S',
-        run: () => openGlobalSettings('general'),
+        run: () => runAndClose(() => openGlobalSettings('general')),
       },
     ];
   }, [
     apiHealthy,
+    closeGlobalSettings,
     designRevision,
     directionsCount,
     filteredTaskCount,
     focusStrategicComposer,
     handleTabChange,
     hasDesignDoc,
+    isAdmin,
     maxPlanAccountCount,
     openStrategicContextWorkspace,
     openStrategicContextTarget,
@@ -845,6 +946,7 @@ export function useWorkbenchCommands({
     selectedProjectRepoLabel,
     setCommandPaletteOpen,
     setPipelineSection,
+    setProjectManageSection,
     setProjectSection,
     setRuntimeConfigSection,
     setRuntimeSection,

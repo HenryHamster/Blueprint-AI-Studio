@@ -46,8 +46,6 @@ function makeProps() {
     onToggleResearchBrowser: noop,
     showKnowledgeBrowser: false,
     onToggleKnowledgeBrowser: noop,
-    showArchive: false,
-    onToggleArchive: noop,
     openMessageCount: 0,
     onOpenNewTaskModal: noop,
     onSignOut: noop,

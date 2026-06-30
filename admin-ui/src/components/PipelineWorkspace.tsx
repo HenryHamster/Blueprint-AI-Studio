@@ -5,6 +5,7 @@ import { KanbanBoard } from './KanbanBoard';
 import type { KanbanColumn, SortBy } from './KanbanBoard';
 import { PipelineView } from './PipelineView';
 import { TaskContextRail } from './TaskContextRail';
+import TaskStreamPanel, { type TaskStreamPanelProps } from './TaskStreamPanel';
 import type { Task } from './TaskCard';
 import { WorkbenchMetric, WorkbenchPanel, WorkbenchSplit, WorkbenchSurface } from './WorkbenchLayout';
 import type { PipelineSection } from '../hooks/useWorkbenchCommands';
@@ -12,6 +13,7 @@ import { timeAgo } from '../utils/time';
 
 type ArchiveProps = ComponentProps<typeof ArchiveView>;
 type TaskContextRailProps = ComponentProps<typeof TaskContextRail>;
+type PipelineStreamProps = Pick<TaskStreamPanelProps, 'trackedTaskIds' | 'trackedLogs' | 'tasks' | 'onUntrack' | 'onUntrackAll'>;
 
 interface PipelineSurfaceProps {
   pipelineSection: PipelineSection;
@@ -111,6 +113,7 @@ export interface PipelineWorkspaceProps {
   board: PipelineBoardProps;
   metrics: PipelineMetricsProps;
   status?: PipelineWorkspaceStatus;
+  stream?: PipelineStreamProps;
 }
 
 const DEFAULT_STALE_AFTER_MS = 2 * 60 * 1000;
@@ -213,6 +216,7 @@ export function PipelineWorkspace({
   board,
   metrics,
   status,
+  stream,
 }: PipelineWorkspaceProps) {
   return (
     <WorkbenchSurface
@@ -280,6 +284,13 @@ export function PipelineWorkspace({
                   <span className="font-medium text-neutral-200">{metrics.terminalTasks.length}</span>
                 </div>
               </WorkbenchPanel>
+
+              {stream && stream.trackedTaskIds.size > 0 && (
+                <TaskStreamPanel
+                  {...stream}
+                  variant="embedded"
+                />
+              )}
 
               <TaskContextRail
                 currentTask={rail.currentTask}

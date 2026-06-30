@@ -59,8 +59,9 @@ export interface SettingsSectionRouterProps {
   isAdmin: boolean;
   /** Navigate to another section (used by the General section's CTA). */
   onNavigateToSection: (section: SectionId) => void;
-  /** Close the whole settings panel (used by the Accounts section). */
+  /** Close the whole settings panel when this router is hosted in the modal. */
   onToggleSettings: () => void;
+  closeOnExternalPanelOpen?: boolean;
   /** Computed union of every model name referenced by routing/preferences. */
   allModelOptions: string[];
   /** Health-check URLs textarea buffer + setter (owned by the dropdown). */
@@ -246,6 +247,10 @@ export interface SettingsSectionRouterProps {
  * moved, isolating the section-routing concern from the modal chrome.
  */
 export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
+  const closeExternalPanelHost = () => {
+    if (props.closeOnExternalPanelOpen ?? true) props.onToggleSettings();
+  };
+
   switch (props.activeSection) {
     case 'general':
       return (
@@ -401,7 +406,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
               <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">User Management</h3>
               <p className="text-xs text-neutral-500 mb-3">Manage which users can access this Blueprint instance and their roles.</p>
               <button
-                onClick={() => { props.onToggleUserManagement(); props.onToggleSettings(); }}
+                onClick={() => { props.onToggleUserManagement(); closeExternalPanelHost(); }}
                 className={`flex items-center gap-2 min-h-[44px] text-xs py-2 px-4 rounded-lg transition-colors border ${
                   props.showUserManagement
                     ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
@@ -419,7 +424,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
               <p className="text-xs text-neutral-500 mb-3">Control who has access to this project and their roles.</p>
               <button
                 data-testid="toggle-project-members"
-                onClick={() => { props.onToggleProjectMembers(); props.onToggleSettings(); }}
+                onClick={() => { props.onToggleProjectMembers(); closeExternalPanelHost(); }}
                 className={`flex items-center gap-2 min-h-[44px] text-xs py-2 px-4 rounded-lg transition-colors border ${
                   props.showProjectMembers
                     ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'

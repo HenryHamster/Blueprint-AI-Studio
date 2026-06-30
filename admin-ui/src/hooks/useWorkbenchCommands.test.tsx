@@ -3,7 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { useEffect } from 'react';
 import { useWorkbenchCommands, type PipelineSection } from './useWorkbenchCommands';
-import type { ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
+import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import type { StrategicStateResponse, StrategicWorkbenchState, StrategicWorkSessionAction } from '../strategicStateApi';
 import type { ViewMode } from './useViewPreferences';
@@ -21,6 +21,7 @@ function Harness(overrides: Partial<Parameters<typeof useWorkbenchCommands>[0]> 
     visibleQueuedCount: 4,
     maxPlanAccountCount: 5,
     apiHealthy: true,
+    isAdmin: true,
     problemModelRevision: 7,
     hasDesignDoc: true,
     designRevision: 8,
@@ -32,6 +33,7 @@ function Harness(overrides: Partial<Parameters<typeof useWorkbenchCommands>[0]> 
     setCommandPaletteOpen: vi.fn(),
     setPipelineSection: vi.fn(),
     setProjectSection: vi.fn(),
+    setProjectManageSection: vi.fn(),
     setRuntimeSection: vi.fn(),
     setRuntimeConfigSection: vi.fn(),
     setViewMode: vi.fn(),
@@ -41,6 +43,7 @@ function Harness(overrides: Partial<Parameters<typeof useWorkbenchCommands>[0]> 
     setShowKnowledgeBrowser: vi.fn(),
     openNewTaskModal: vi.fn(),
     openGlobalSettings: vi.fn(),
+    closeGlobalSettings: vi.fn(),
     refreshWorkbench: vi.fn(),
     openProjectManagement: vi.fn(),
     openProjectMembers: vi.fn(),
@@ -353,6 +356,57 @@ describe('useWorkbenchCommands', () => {
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
+  test('routes project manage subsection commands through the embedded project workspace', () => {
+    const handleTabChange = vi.fn();
+    const setProjectSection = vi.fn<(section: ProjectSection) => void>();
+    const setProjectManageSection = vi.fn<(section: ProjectManageSection) => void>();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const openGlobalSettings = vi.fn();
+    const closeGlobalSettings = vi.fn();
+    mount({ handleTabChange, setProjectSection, setProjectManageSection, setCommandPaletteOpen, openGlobalSettings, closeGlobalSettings });
+
+    captured.find(command => command.id === 'project.build')?.run();
+    captured.find(command => command.id === 'project.branches')?.run();
+    captured.find(command => command.id === 'project.review')?.run();
+    captured.find(command => command.id === 'project.resources')?.run();
+    captured.find(command => command.id === 'project.access')?.run();
+
+    expect(setProjectSection).toHaveBeenCalledTimes(5);
+    expect(setProjectSection).toHaveBeenCalledWith('manage');
+    expect(setProjectManageSection.mock.calls.map(([section]) => section)).toEqual([
+      'build-config',
+      'branches',
+      'auto-review',
+      'resource-envelope',
+      'access',
+    ]);
+    expect(handleTabChange).toHaveBeenCalledWith('project');
+    expect(openGlobalSettings).not.toHaveBeenCalled();
+    expect(closeGlobalSettings).toHaveBeenCalledTimes(5);
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
+  test('falls back to precise settings sections when project manage subsection setter is unavailable', () => {
+    const handleTabChange = vi.fn();
+    const setProjectSection = vi.fn<(section: ProjectSection) => void>();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const openGlobalSettings = vi.fn();
+    mount({
+      handleTabChange,
+      setProjectSection,
+      setProjectManageSection: undefined,
+      setCommandPaletteOpen,
+      openGlobalSettings,
+    });
+
+    captured.find(command => command.id === 'project.build')?.run();
+
+    expect(setProjectSection).toHaveBeenCalledWith('manage');
+    expect(handleTabChange).toHaveBeenCalledWith('project');
+    expect(openGlobalSettings).toHaveBeenCalledWith('build-config');
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
   test('routes visible work session message reply actions to the message target', () => {
     const openStrategicContextTarget = vi.fn();
     const openStrategicMessageTarget = vi.fn();
@@ -566,20 +620,36 @@ describe('useWorkbenchCommands', () => {
     const setRuntimeConfigSection = vi.fn<(section: RuntimeSettingsSection) => void>();
     const setViewMode = vi.fn<(mode: ViewMode) => void>();
     const setShowArchive = vi.fn<(show: boolean) => void>();
-    mount({ handleTabChange, setPipelineSection, setRuntimeSection, setRuntimeConfigSection, setViewMode, setShowArchive });
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const closeGlobalSettings = vi.fn();
+    mount({ handleTabChange, setPipelineSection, setRuntimeSection, setRuntimeConfigSection, setViewMode, setShowArchive, setCommandPaletteOpen, closeGlobalSettings });
 
     captured.find(command => command.id === 'pipeline.board')?.run();
     captured.find(command => command.id === 'runtime.analytics')?.run();
+    captured.find(command => command.id === 'runtime.accounts')?.run();
     captured.find(command => command.id === 'runtime.settings')?.run();
+    captured.find(command => command.id === 'runtime.settings.provider-routing')?.run();
+    captured.find(command => command.id === 'runtime.settings.provider-settings')?.run();
+    captured.find(command => command.id === 'runtime.settings.notifications')?.run();
+    captured.find(command => command.id === 'runtime.settings.advanced')?.run();
 
     expect(setPipelineSection).toHaveBeenCalledWith('board');
     expect(setViewMode).toHaveBeenCalledWith('kanban');
     expect(setShowArchive).toHaveBeenCalledWith(false);
     expect(setRuntimeSection).toHaveBeenCalledWith('analytics');
+    expect(setRuntimeSection).toHaveBeenCalledWith('accounts');
     expect(setRuntimeSection).toHaveBeenCalledWith('settings');
-    expect(setRuntimeConfigSection).toHaveBeenCalledWith('orchestrator');
+    expect(setRuntimeConfigSection.mock.calls.map(([section]) => section)).toEqual([
+      'orchestrator',
+      'provider-routing',
+      'provider-settings',
+      'notifications',
+      'advanced',
+    ]);
     expect(handleTabChange).toHaveBeenCalledWith('pipeline');
     expect(handleTabChange).toHaveBeenCalledWith('runtime');
+    expect(closeGlobalSettings).toHaveBeenCalledTimes(6);
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
   test('disables project-scoped commands when no project is selected', () => {
@@ -588,10 +658,24 @@ describe('useWorkbenchCommands', () => {
     expect(captured.find(command => command.id === 'strategic.focus')?.disabled).toBe(true);
     expect(captured.filter(command => command.id.startsWith('strategic.mode.')).every(command => command.disabled)).toBe(true);
     expect(captured.find(command => command.id === 'strategic.context.workspace')?.disabled).toBe(true);
+    expect(captured.find(command => command.id === 'project.build')?.disabled).toBe(true);
+    expect(captured.find(command => command.id === 'project.branches')?.disabled).toBe(true);
+    expect(captured.find(command => command.id === 'project.review')?.disabled).toBe(true);
+    expect(captured.find(command => command.id === 'project.resources')?.disabled).toBe(true);
+    expect(captured.find(command => command.id === 'project.access')?.disabled).toBe(true);
     expect(captured.find(command => command.id === 'project.members')?.disabled).toBe(true);
     expect(captured.find(command => command.id === 'pipeline.flow')?.disabled).toBeFalsy();
     expect(captured.find(command => command.id === 'runtime.health')?.disabled).toBeFalsy();
     expect(captured.find(command => command.id === 'runtime.analytics')?.disabled).toBeFalsy();
+  });
+
+  test('disables admin-only runtime settings commands for non-admin users', () => {
+    mount({ isAdmin: false });
+
+    expect(captured.find(command => command.id === 'runtime.settings.provider-routing')?.disabled).toBe(true);
+    expect(captured.find(command => command.id === 'runtime.settings.provider-settings')?.disabled).toBe(true);
+    expect(captured.find(command => command.id === 'runtime.settings.notifications')?.disabled).toBeFalsy();
+    expect(captured.find(command => command.id === 'runtime.settings.advanced')?.disabled).toBeFalsy();
   });
 
   test('disables Strategic mode commands while saving without blocking navigation commands', () => {

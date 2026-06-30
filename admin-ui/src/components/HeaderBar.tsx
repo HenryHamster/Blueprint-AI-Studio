@@ -29,8 +29,6 @@ export interface HeaderBarProps {
   onToggleResearchBrowser: () => void;
   showKnowledgeBrowser: boolean;
   onToggleKnowledgeBrowser: () => void;
-  showArchive: boolean;
-  onToggleArchive: () => void;
   onOpenActivityFeed?: () => void;
   openMessageCount: number;
   newSinceLastVisitCount?: number;

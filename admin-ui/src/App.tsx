@@ -356,21 +356,6 @@ export default function App() {
 
   const [settingsInitialSection, setSettingsInitialSection] = useState<SectionId | null>(null);
 
-  const handleConfigureTargets = useCallback(() => {
-    setSettingsInitialSection('build-config');
-    s.handleToggleSettings();
-    setTimeout(() => {
-      const element = document.getElementById('sr-catch-rate-targets');
-      element?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-    }, 100);
-  }, [s]);
-
-  const handleConfigureBranchProject = useCallback((projectId: string) => {
-    s.setSelectedProjectId(projectId);
-    setSettingsInitialSection('branches');
-    if (!s.showSettings) s.handleToggleSettings();
-  }, [s]);
-
   // Clear the deep-link section once Settings closes, so a subsequent plain
   // Settings open is not forced back to the build-config tab.
   useEffect(() => {
@@ -683,7 +668,13 @@ export default function App() {
   }, [s.healthCheckUrls]);
   const settingsRouterProps: Omit<SettingsSectionRouterProps, 'activeSection'> = {
     isAdmin: s.userRole === 'admin',
-    onNavigateToSection: () => undefined,
+    onNavigateToSection: (section) => {
+      if (section === 'notifications') {
+        setRuntimeSection('settings');
+        setRuntimeConfigSection('notifications');
+      }
+    },
+    closeOnExternalPanelOpen: false,
     onToggleSettings: s.handleToggleSettings,
     allModelOptions,
     healthCheckUrlsInput,
@@ -846,6 +837,26 @@ export default function App() {
     s.setActiveTab(tab);
   }, [s, persistStrategicWorkbench]);
 
+  const openProjectManageWorkspace = useCallback((section: ProjectManageSection, projectId?: string) => {
+    if (projectId && projectId !== s.selectedProjectId) s.setSelectedProjectId(projectId);
+    if (s.showSettings) s.handleToggleSettings();
+    setProjectSection('manage');
+    setProjectManageSection(section);
+    handleTabChange('project');
+  }, [handleTabChange, s]);
+
+  const handleConfigureTargets = useCallback(() => {
+    openProjectManageWorkspace('build-config');
+    window.setTimeout(() => {
+      const element = document.getElementById('sr-catch-rate-targets');
+      element?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 100);
+  }, [openProjectManageWorkspace]);
+
+  const handleConfigureBranchProject = useCallback((projectId: string) => {
+    openProjectManageWorkspace('branches', projectId);
+  }, [openProjectManageWorkspace]);
+
   const focusStrategicComposer = useCallback(() => {
     handleTabChange('chat'); setStrategicComposerFocusSignal(value => value + 1); setCommandPaletteOpen(false);
   }, [handleTabChange, setCommandPaletteOpen]);
@@ -882,6 +893,9 @@ export default function App() {
     if (!s.showSettings) s.handleToggleSettings();
     setCommandPaletteOpen(false);
   }, [s, setCommandPaletteOpen]);
+  const closeGlobalSettings = useCallback(() => {
+    if (s.showSettings) s.handleToggleSettings();
+  }, [s]);
 
   const workbenchCommands = useWorkbenchCommands({
     selectedProjectId: s.selectedProjectId,
@@ -892,6 +906,7 @@ export default function App() {
     visibleQueuedCount: visibleQueuedTasks.length,
     maxPlanAccountCount: s.maxPlanAccounts.length,
     apiHealthy: s.apiHealthy,
+    isAdmin: s.userRole === 'admin',
     problemModelRevision: strategicReadModel.data?.problem_model.revision,
     hasDesignDoc: strategicReadModel.data?.design.has_design_doc,
     designRevision: strategicReadModel.data?.design.revision,
@@ -905,6 +920,7 @@ export default function App() {
     setCommandPaletteOpen,
     setPipelineSection,
     setProjectSection,
+    setProjectManageSection,
     setRuntimeSection,
     setRuntimeConfigSection,
     setViewMode: s.setViewMode,
@@ -914,6 +930,7 @@ export default function App() {
     setShowKnowledgeBrowser: s.setShowKnowledgeBrowser,
     openNewTaskModal: s.openNewTaskModal,
     openGlobalSettings,
+    closeGlobalSettings,
     refreshWorkbench: () => {
       void s.fetchTasks();
       void strategicReadModel.refresh();
@@ -1177,8 +1194,6 @@ export default function App() {
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
         showKnowledgeBrowser={s.showKnowledgeBrowser}
         onToggleKnowledgeBrowser={() => s.setShowKnowledgeBrowser(prev => !prev)}
-        showArchive={s.showArchive}
-        onToggleArchive={() => s.setShowArchive(!s.showArchive)}
         alertCount={combinedAlerts.length}
         alertMaxSeverity={alertMaxSeverity}
         showAlertsPopover={s.showAlertsPopover}
@@ -1696,6 +1711,13 @@ export default function App() {
             apiHealthy: s.apiHealthy,
             wsConnected: s.wsConnected,
           }}
+          stream={{
+            trackedTaskIds: s.trackedTaskIds,
+            trackedLogs: s.trackedLogs,
+            tasks: s.tasks,
+            onUntrack: s.untrackTask,
+            onUntrackAll: s.untrackAll,
+          }}
         />
       )}
       </WorkbenchFrame>
@@ -1887,6 +1909,7 @@ export default function App() {
           onUntrack={s.untrackTask}
           onUntrackAll={s.untrackAll}
           offsetRight={s.logTask ? drawerWidth : 0}
+          hideOnDesktop={activeTab === 'pipeline' && pipelineSection === 'flow' && s.viewMode === 'pipeline'}
         />
       )}
 

@@ -40,6 +40,23 @@ const sampleLogs: TrackLogEntry[] = [
   { id: 5, t: '2026-05-06T00:00:05Z', type: 'artifact', msg: 'pr_url=https://github.com/example/repo/pull/12345' },
 ];
 
+function assertFloatingPanelFits(width: number) {
+  const panel = document.querySelector<HTMLDivElement>('[class*="fixed"][class*="bottom-0"]');
+  if (!panel) {
+    throw new Error('TaskStreamPanel floating panel was not rendered');
+  }
+  if (panel.dataset.variant !== 'floating') {
+    throw new Error(`TaskStreamPanel default variant was ${panel.dataset.variant || 'unset'}, expected floating`);
+  }
+  const rect = panel.getBoundingClientRect();
+  if (rect.left < 0) {
+    throw new Error(`TaskStreamPanel left edge (${Math.round(rect.left)}px) extends off-screen at ${width}px viewport`);
+  }
+  if (rect.right > width) {
+    throw new Error(`TaskStreamPanel right edge (${Math.round(rect.right)}px) exceeds ${width}px viewport`);
+  }
+}
+
 describe('TaskStreamPanel — viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
@@ -76,17 +93,8 @@ describe('TaskStreamPanel — viewport regression', () => {
           />,
         );
       });
-      // Assert panel's bounding box fits entirely within viewport (both edges)
-      const panel = document.querySelector<HTMLDivElement>('[class*="fixed"][class*="bottom-0"]');
-      if (panel) {
-        const rect = panel.getBoundingClientRect();
-        if (rect.left < 0) {
-          throw new Error(`TaskStreamPanel left edge (${Math.round(rect.left)}px) extends off-screen at 375px viewport`);
-        }
-        if (rect.right > 375) {
-          throw new Error(`TaskStreamPanel right edge (${Math.round(rect.right)}px) exceeds 375px viewport`);
-        }
-      }
+      // Assert the default floating panel's bounding box fits entirely within viewport (both edges).
+      assertFloatingPanelFits(375);
     });
   });
 
@@ -111,17 +119,8 @@ describe('TaskStreamPanel — viewport regression', () => {
           />,
         );
       });
-      // Assert panel's bounding box fits entirely within viewport (both edges)
-      const panel = document.querySelector<HTMLDivElement>('[class*="fixed"][class*="bottom-0"]');
-      if (panel) {
-        const rect = panel.getBoundingClientRect();
-        if (rect.left < 0) {
-          throw new Error(`TaskStreamPanel left edge (${Math.round(rect.left)}px) extends off-screen at 375px viewport`);
-        }
-        if (rect.right > 375) {
-          throw new Error(`TaskStreamPanel right edge (${Math.round(rect.right)}px) exceeds 375px viewport`);
-        }
-      }
+      // Assert the default floating panel's bounding box fits entirely within viewport (both edges).
+      assertFloatingPanelFits(375);
     });
   });
 });

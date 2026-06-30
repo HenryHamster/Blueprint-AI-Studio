@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { fireEvent, render, screen } from '@testing-library/react';
 import { PipelineWorkspace, type PipelineWorkspaceProps } from './PipelineWorkspace';
 import type { Task } from './TaskCard';
+import type { TrackLogEntry } from '../types/task';
 
 vi.mock('./ArchiveView', () => ({
   default: () => <div data-testid="archive-view" />,
@@ -115,6 +116,7 @@ function renderWorkspace(overrides: Partial<PipelineWorkspaceProps> = {}) {
       ...overrides.metrics,
     },
     status: overrides.status,
+    stream: overrides.stream,
   };
 
   return render(<PipelineWorkspace {...props} />);
@@ -247,5 +249,85 @@ describe('PipelineWorkspace status strip', () => {
         'title',
         'Project-scoped task view: very-long-owner-name/very-long-repository-name-that-should-not-stretch-the-strip',
       );
+  });
+});
+
+describe('PipelineWorkspace task stream', () => {
+  test('does not render embedded stream when no tasks are tracked', () => {
+    renderWorkspace({
+      stream: {
+        trackedTaskIds: new Set<string>(),
+        trackedLogs: new Map<string, TrackLogEntry[]>(),
+        tasks: [],
+        onUntrack: vi.fn(),
+        onUntrackAll: vi.fn(),
+      },
+    });
+
+    expect(screen.queryByTestId('task-stream-panel')).not.toBeInTheDocument();
+  });
+
+  test('renders embedded stream with tracked task title and log count', () => {
+    const trackedTask = makeTask({ id: 'task-stream-1', title: 'Tracked pipeline task', status: 'IN_PROGRESS' });
+    const logs: TrackLogEntry[] = [
+      { id: 1, t: '2026-06-30T12:00:01Z', type: 'system', msg: 'stream attached' },
+      { id: 2, t: '2026-06-30T12:00:02Z', type: 'log', msg: 'agent started' },
+    ];
+
+    renderWorkspace({
+      stream: {
+        trackedTaskIds: new Set([trackedTask.id]),
+        trackedLogs: new Map([[trackedTask.id, logs]]),
+        tasks: [trackedTask],
+        onUntrack: vi.fn(),
+        onUntrackAll: vi.fn(),
+      },
+    });
+
+    const panel = screen.getByTestId('task-stream-panel');
+    expect(panel).toHaveAttribute('data-variant', 'embedded');
+    expect(panel).not.toHaveClass('fixed');
+    expect(screen.getByText('Tracked pipeline task')).toBeInTheDocument();
+    expect(screen.getByText('2 entries')).toBeInTheDocument();
+    expect(screen.getByText('agent started')).toBeInTheDocument();
+  });
+
+  test('renders embedded stream waiting state', () => {
+    const trackedTask = makeTask({ id: 'task-stream-2', title: 'Waiting pipeline task', status: 'PROVISIONING' });
+
+    renderWorkspace({
+      stream: {
+        trackedTaskIds: new Set([trackedTask.id]),
+        trackedLogs: new Map<string, TrackLogEntry[]>(),
+        tasks: [trackedTask],
+        onUntrack: vi.fn(),
+        onUntrackAll: vi.fn(),
+      },
+    });
+
+    expect(screen.getByTestId('task-stream-panel')).toHaveAttribute('data-variant', 'embedded');
+    expect(screen.getByText('Waiting pipeline task')).toBeInTheDocument();
+    expect(screen.getByText('Waiting for events')).toBeInTheDocument();
+    expect(screen.getByText('0 entries')).toBeInTheDocument();
+  });
+
+  test('keeps an untrackable id fallback when the tracked task is not loaded', () => {
+    const onUntrack = vi.fn();
+
+    renderWorkspace({
+      stream: {
+        trackedTaskIds: new Set(['missing-tracked-task']),
+        trackedLogs: new Map<string, TrackLogEntry[]>([
+          ['missing-tracked-task', [{ id: 1, t: '2026-06-30T12:00:01Z', type: 'system', msg: 'still tracking' }]],
+        ]),
+        tasks: [],
+        onUntrack,
+        onUntrackAll: vi.fn(),
+      },
+    });
+
+    expect(screen.getByText('missing-')).toBeInTheDocument();
+    fireEvent.click(screen.getByText('Untrack'));
+    expect(onUntrack).toHaveBeenCalledWith('missing-tracked-task');
   });
 });
