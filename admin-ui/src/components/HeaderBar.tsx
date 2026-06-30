@@ -406,14 +406,14 @@ export function HeaderBar(props: HeaderBarProps) {
       )}
 
       {/* Unified top bar: compact global shell with fixed utility clusters and a scrolling tab strip. */}
-      <header className="flex min-h-10 flex-wrap items-center gap-1.5 border-b border-neutral-800 bg-[#05070a] px-2 py-1 md:min-h-11 md:flex-nowrap">
+      <header className="flex min-h-10 flex-wrap items-center gap-1.5 border-b border-neutral-800 bg-[#05070a] px-2 py-1 md:min-h-10 md:flex-nowrap">
         {/* LEFT: ProjectSwitcher + Manage projects slot */}
         <div className="flex min-w-0 shrink-0 items-center gap-1.5">
-          <div className="hidden items-center gap-1.5 pr-1 lg:flex">
-            <span className="flex h-6 w-6 items-center justify-center rounded-md border border-neutral-800 bg-[#0b0f14] text-neutral-400 shadow-inner shadow-black/20">
-              <Compass className="h-3 w-3" />
+          <div className="hidden items-center gap-1.5 pr-0.5 lg:flex">
+            <span className="flex h-5 w-5 items-center justify-center rounded border border-neutral-800 bg-[#0b0f14] text-neutral-500 shadow-inner shadow-black/20">
+              <Compass className="h-2.5 w-2.5" />
             </span>
-            <span className="text-xs font-semibold tracking-normal text-neutral-200">Blueprint</span>
+            <span className="text-ui-md font-semibold text-neutral-300">Blueprint</span>
           </div>
           <ProjectSwitcherDropdown
             projects={props.projects}
@@ -454,7 +454,7 @@ export function HeaderBar(props: HeaderBarProps) {
               <button
                 key={tab}
                 onClick={() => props.onTabChange(tab)}
-                className={`inline-flex min-h-[44px] shrink-0 items-center rounded px-2.5 py-1 text-sm font-semibold transition-colors whitespace-nowrap md:min-h-0 ${
+                className={`inline-flex min-h-[44px] shrink-0 items-center rounded px-2.5 py-1 text-sm font-semibold leading-none transition-colors whitespace-nowrap md:min-h-8 md:text-xs ${
                   isActive
                     ? 'bg-neutral-800 text-neutral-100 shadow-[0_1px_0_rgba(255,255,255,0.06)]'
                     : 'text-neutral-300 hover:bg-neutral-900 hover:text-neutral-100'

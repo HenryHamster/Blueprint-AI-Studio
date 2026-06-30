@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { FleetRunnersPanel } from './FleetRunnersPanel';
+import { runnerSetupSnippets } from './FleetRunnersPanel.utils';
 import type { FleetRunner } from '../api';
 
 const SAMPLE_RUNNERS: FleetRunner[] = [
@@ -58,6 +59,22 @@ describe('FleetRunnersPanel — behavioral', () => {
     await act(async () => {});
     return host as HTMLDivElement;
   }
+
+  test('runnerSetupSnippets safely quotes setup commands', () => {
+    const snippets = runnerSetupSnippets("tok'abc", 'https://blueprint.test/a path', 'strategic_local');
+
+    expect(Object.keys(snippets)).toEqual(expect.arrayContaining(['windowsPowerShell', 'macosLinux']));
+    expect(snippets.windowsPowerShell).toContain("$env:BLUEPRINT_RUNNER_TOKEN = 'tok''abc'");
+    expect(snippets.windowsPowerShell).toContain("$env:BLUEPRINT_ORCHESTRATOR_URL = 'https://blueprint.test/a path'");
+    expect(snippets.windowsPowerShell).toContain("$env:BLUEPRINT_RUNNER_MAX_CONCURRENT = '1'");
+    expect(snippets.windowsPowerShell).toContain('py -3 scripts/local_runner.py');
+    expect(snippets.macosLinux).toContain("BLUEPRINT_RUNNER_TOKEN='tok'\\''abc'");
+    expect(snippets.macosLinux).toContain("BLUEPRINT_ORCHESTRATOR_URL='https://blueprint.test/a path'");
+    expect(snippets.macosLinux).toContain('BLUEPRINT_RUNNER_MAX_CONCURRENT=1');
+    expect(snippets.macosLinux).toContain('python3 scripts/local_runner.py');
+
+    expect(runnerSetupSnippets('tok', 'https://blueprint.test').macosLinux).not.toContain('BLUEPRINT_RUNNER_MAX_CONCURRENT');
+  });
 
   // ── livenessLabel ────────────────────────────────────────────────────────────
 
@@ -128,6 +145,11 @@ describe('FleetRunnersPanel — behavioral', () => {
   });
 
   test('enrolling a strategic runner sends the strategic preset', async () => {
+    const clipboardWrite = vi.fn(async () => {});
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: clipboardWrite },
+    });
     const el = await mount();
 
     const strategicBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('Strategic runner'));
@@ -138,7 +160,42 @@ describe('FleetRunnersPanel — behavioral', () => {
 
     expect(registerFleetRunner).toHaveBeenCalledWith('proj-test', { preset: 'strategic_local' });
     expect(el.textContent).toContain('Strategic runner enrolled');
+    expect(el.textContent).toContain('Windows PowerShell');
+    expect(el.textContent).toContain('macOS/Linux');
+    expect(el.textContent).toContain("$env:BLUEPRINT_RUNNER_MAX_CONCURRENT = '1'");
     expect(el.textContent).toContain('BLUEPRINT_RUNNER_MAX_CONCURRENT=1');
+    expect(el.textContent).toContain('Next: start the runner; first heartbeat marks it live.');
+
+    const psCopyBtn = el.querySelector('button[title="Copy Windows PowerShell setup snippet"]');
+    const shellCopyBtn = el.querySelector('button[title="Copy macOS/Linux setup snippet"]');
+    expect(psCopyBtn).not.toBeNull();
+    expect(shellCopyBtn).not.toBeNull();
+
+    await act(async () => { (psCopyBtn as HTMLButtonElement).click(); });
+    expect(clipboardWrite).toHaveBeenLastCalledWith(expect.stringContaining("$env:BLUEPRINT_RUNNER_MAX_CONCURRENT = '1'"));
+    expect((psCopyBtn as HTMLButtonElement).querySelector('.text-emerald-400')).not.toBeNull();
+    expect((shellCopyBtn as HTMLButtonElement).querySelector('.text-emerald-400')).toBeNull();
+
+    await act(async () => { (shellCopyBtn as HTMLButtonElement).click(); });
+    expect(clipboardWrite).toHaveBeenLastCalledWith(expect.stringContaining('BLUEPRINT_RUNNER_MAX_CONCURRENT=1'));
+    expect((psCopyBtn as HTMLButtonElement).querySelector('.text-emerald-400')).not.toBeNull();
+    expect((shellCopyBtn as HTMLButtonElement).querySelector('.text-emerald-400')).not.toBeNull();
+  });
+
+  test('token dialog shows token expiry when registration returns it', async () => {
+    vi.mocked(registerFleetRunner).mockResolvedValueOnce({
+      runner_id: 'runner-new',
+      token: 'tok-secret-xyz',
+      token_expires_at: '2026-07-01T12:00:00Z',
+    });
+    const el = await mount();
+
+    const enrollBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('Enroll runner'));
+    await act(async () => { (enrollBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(el.textContent).toContain('Runner enrolled');
+    expect(el.textContent).toContain('Token expires');
   });
 
   test('dismissing the token dialog removes it', async () => {

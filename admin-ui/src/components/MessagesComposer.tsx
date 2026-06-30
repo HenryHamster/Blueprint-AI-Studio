@@ -64,14 +64,14 @@ export function MessagesComposer({
   // and, when the strategist is mid-cycle, flagging that a steer is queued rather
   // than acting immediately.
   const minimal = chrome === 'minimal';
-  const minimalColumnClass = 'mx-auto w-full max-w-[940px] lg:mx-0';
+  const minimalColumnClass = 'mx-auto w-full max-w-[900px] lg:mx-0';
   const hintArming = minimal && strategistBusy && lastArming !== 'not_armed' ? null : lastArming;
   const hintText = composerHintCopy(newType, hintArming, strategistBusy);
   const showHint = !minimal || Boolean(strategistBusy) || lastArming === 'not_armed';
 
   return (
     <div className={minimal
-      ? 'shrink-0 border-t border-neutral-800 bg-[#05080c] px-2.5 py-2 md:px-3'
+      ? 'shrink-0 border-t border-neutral-800 bg-[#05080c] px-2 py-1.5 md:px-2.5'
       : 'px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50'
     }>
       {minimal && strategicContext && (
@@ -92,7 +92,7 @@ export function MessagesComposer({
       <div
         data-testid={minimal ? 'strategic-composer-box' : undefined}
         className={minimal
-        ? `${minimalColumnClass} flex items-end gap-1.5 rounded-md border border-neutral-800 bg-[#10151c] p-1.5 shadow-inner shadow-black/20`
+        ? `${minimalColumnClass} flex items-end gap-1 rounded-md border border-neutral-800 bg-[#0c1117] p-1 shadow-inner shadow-black/20`
         : 'flex gap-2 items-end'
       }>
         {!minimal && (
@@ -104,11 +104,11 @@ export function MessagesComposer({
             onClick={onOpenCommandPalette}
             title="Open command palette (Ctrl+K)"
             aria-label="Open command palette"
-            className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-md border border-neutral-800 bg-[#0b0f14] px-2 text-xs font-semibold text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
+            className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded border border-neutral-800 bg-[#080c11] px-2 text-xs font-semibold text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 md:min-h-9 md:min-w-9"
           >
             <Command className="h-3.5 w-3.5" />
             <kbd className="hidden rounded border border-neutral-700 bg-neutral-950 px-1 py-0.5 font-mono text-ui-sm text-neutral-500 sm:inline-block">
-              Ctrl+K
+              Ctrl K
             </kbd>
           </button>
         )}
@@ -123,7 +123,7 @@ export function MessagesComposer({
             placeholder={minimal ? 'Message Strategic...' : 'Type a message...'}
             rows={1}
             className={minimal
-              ? 'min-h-[44px] w-full resize-none rounded-md border-0 bg-transparent px-2.5 py-2 text-sm leading-relaxed text-neutral-100 placeholder-neutral-500 outline-none'
+              ? 'min-h-[44px] w-full resize-none rounded border-0 bg-transparent px-2.5 py-2 text-sm leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-600 md:min-h-9 md:py-1.5'
               : 'w-full bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600 resize-none min-h-[44px] leading-relaxed'
             }
           />
@@ -135,7 +135,7 @@ export function MessagesComposer({
           aria-label="Send message"
           title="Send message"
           className={minimal
-            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md bg-emerald-600 text-white transition-colors hover:bg-emerald-500 disabled:opacity-40'
+            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded bg-emerald-600 text-white transition-colors hover:bg-emerald-500 disabled:opacity-40 md:min-h-9 md:min-w-9'
             : 'bg-blue-600 hover:bg-blue-500 text-white p-2.5 rounded-xl text-xs font-medium transition-colors disabled:opacity-40 shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center'
           }
         >

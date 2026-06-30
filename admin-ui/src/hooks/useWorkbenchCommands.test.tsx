@@ -363,11 +363,13 @@ describe('useWorkbenchCommands', () => {
     mount({ handleTabChange, setPipelineSection, setRuntimeSection, setRuntimeConfigSection, setViewMode, setShowArchive });
 
     captured.find(command => command.id === 'pipeline.board')?.run();
+    captured.find(command => command.id === 'runtime.analytics')?.run();
     captured.find(command => command.id === 'runtime.settings')?.run();
 
     expect(setPipelineSection).toHaveBeenCalledWith('board');
     expect(setViewMode).toHaveBeenCalledWith('kanban');
     expect(setShowArchive).toHaveBeenCalledWith(false);
+    expect(setRuntimeSection).toHaveBeenCalledWith('analytics');
     expect(setRuntimeSection).toHaveBeenCalledWith('settings');
     expect(setRuntimeConfigSection).toHaveBeenCalledWith('orchestrator');
     expect(handleTabChange).toHaveBeenCalledWith('pipeline');
@@ -380,8 +382,10 @@ describe('useWorkbenchCommands', () => {
     expect(captured.find(command => command.id === 'strategic.focus')?.disabled).toBe(true);
     expect(captured.filter(command => command.id.startsWith('strategic.mode.')).every(command => command.disabled)).toBe(true);
     expect(captured.find(command => command.id === 'strategic.context.workspace')?.disabled).toBe(true);
+    expect(captured.find(command => command.id === 'project.members')?.disabled).toBe(true);
     expect(captured.find(command => command.id === 'pipeline.flow')?.disabled).toBeFalsy();
     expect(captured.find(command => command.id === 'runtime.health')?.disabled).toBeFalsy();
+    expect(captured.find(command => command.id === 'runtime.analytics')?.disabled).toBeFalsy();
   });
 
   test('disables Strategic mode commands while saving without blocking navigation commands', () => {
@@ -410,7 +414,14 @@ describe('useWorkbenchCommands', () => {
     const openProjectManagement = vi.fn();
     const openProjectMembers = vi.fn();
     const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
-    mount({ refreshWorkbench, openNewTaskModal, openGlobalSettings, openProjectManagement, openProjectMembers, setCommandPaletteOpen });
+    mount({
+      refreshWorkbench,
+      openNewTaskModal,
+      openGlobalSettings,
+      openProjectManagement,
+      openProjectMembers,
+      setCommandPaletteOpen,
+    });
 
     captured.find(command => command.id === 'workbench.refresh')?.run();
     captured.find(command => command.id === 'task.new')?.run();

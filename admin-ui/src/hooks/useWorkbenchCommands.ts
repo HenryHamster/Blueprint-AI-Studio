@@ -610,6 +610,14 @@ export function useWorkbenchCommands({
         run: () => openRuntimeSection('health'),
       },
       {
+        id: 'runtime.analytics',
+        label: 'Runtime analytics',
+        section: 'Runtime',
+        detail: 'Dashboard metrics',
+        keywords: ['analytics', 'dashboard', 'metrics'],
+        run: () => openRuntimeSection('analytics'),
+      },
+      {
         id: 'runtime.devices',
         label: 'Devices',
         section: 'Runtime',

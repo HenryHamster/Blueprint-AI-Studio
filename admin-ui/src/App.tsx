@@ -1686,6 +1686,16 @@ export default function App() {
             failedTasks: visibleFailedTasks,
             terminalTasks: visibleTerminalTasks,
           }}
+          status={{
+            selectedProjectId: s.selectedProjectId,
+            selectedProjectLabel: selectedProjectRepoLabel,
+            displayedRows: filteredTasks.length,
+            loadedRows: s.tasks.length,
+            serverTotalRows: s.totalTasks,
+            lastFetchTime: s.lastFetchTime,
+            apiHealthy: s.apiHealthy,
+            wsConnected: s.wsConnected,
+          }}
         />
       )}
       </WorkbenchFrame>

@@ -1,11 +1,18 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
 import { Compass, Cpu, Copy, Check, RefreshCw, Trash2 } from 'lucide-react';
 import { listFleetRunners, registerFleetRunner, revokeFleetRunner } from '../api';
-import type { FleetRunner } from '../api';
-import { timeAgo, parseTimestamp } from '../utils/time';
+import type { FleetRunner, FleetRunnerRegistrationResult } from '../api';
+import { timeAgo, parseTimestamp, formatAbsolute, formatDurationSec } from '../utils/time';
+import {
+  runnerSetupSnippets,
+  type RunnerSetupPreset,
+  type RunnerSetupSnippetCommands,
+} from './FleetRunnersPanel.utils';
 
 const LIVENESS_THRESHOLD_SEC = 300;
 const STALE_THRESHOLD_SEC = 600;
+
+type CopyTarget = 'token' | keyof RunnerSetupSnippetCommands;
 
 function fallbackLivenessLabel(lastSeenAt: string | null): { label: string; cls: string } {
   if (!lastSeenAt) return { label: 'never seen', cls: 'text-neutral-500' };
@@ -80,29 +87,59 @@ function isStrategicRunner(runner: FleetRunner): boolean {
     || (Array.isArray(taskTypes) && (taskTypes.includes('strategic_review') || taskTypes.includes('design_doc_update')));
 }
 
+function heartbeatLabel(runner: FleetRunner): string {
+  const secondsSinceLastSeen = runner.health?.seconds_since_last_seen;
+  if (typeof secondsSinceLastSeen === 'number' && Number.isFinite(secondsSinceLastSeen)) {
+    return `heartbeat ${formatDurationSec(Math.max(0, secondsSinceLastSeen))} ago`;
+  }
+  if (runner.last_seen_at) return `heartbeat ${timeAgo(runner.last_seen_at)}`;
+  return 'no heartbeat yet';
+}
+
+function runnerReadinessDetail(runner: FleetRunner, runnerLive: boolean, slots: number | null): string {
+  const heartbeat = heartbeatLabel(runner);
+  if (runner.status !== 'active') return `${heartbeat}; inactive`;
+  if (!runner.last_seen_at && runner.health?.seconds_since_last_seen == null) {
+    return `${heartbeat}; start runner`;
+  }
+  if (!runnerLive) return `${heartbeat}; waiting for next heartbeat`;
+  if (slots === 0) return `${heartbeat}; no slots free`;
+  return `${heartbeat}; ready`;
+}
+
 interface TokenDialogProps {
   runnerId: string;
   token: string;
-  preset?: 'default' | 'strategic_local';
+  preset?: RunnerSetupPreset;
+  tokenExpiresAt?: string | null;
   onDismiss: () => void;
 }
 
-function TokenDialog({ runnerId, token, preset = 'default', onDismiss }: TokenDialogProps) {
-  const [copied, setCopied] = useState(false);
+function TokenDialog({ runnerId, token, preset = 'default', tokenExpiresAt, onDismiss }: TokenDialogProps) {
+  const [copied, setCopied] = useState<Record<CopyTarget, boolean>>({
+    token: false,
+    windowsPowerShell: false,
+    macosLinux: false,
+  });
   const origin = typeof window !== 'undefined' ? window.location.origin : 'https://your-orchestrator';
-  const modePrefix = preset === 'strategic_local' ? 'BLUEPRINT_RUNNER_MAX_CONCURRENT=1 ' : '';
-  const snippet = `${modePrefix}BLUEPRINT_RUNNER_TOKEN=${token} BLUEPRINT_ORCHESTRATOR_URL=${origin} python3 scripts/local_runner.py`;
+  const snippets = runnerSetupSnippets(token, origin, preset);
+  const setupSnippetItems: Array<{ id: keyof RunnerSetupSnippetCommands; label: string; command: string }> = [
+    { id: 'windowsPowerShell', label: 'Windows PowerShell', command: snippets.windowsPowerShell },
+    { id: 'macosLinux', label: 'macOS/Linux', command: snippets.macosLinux },
+  ];
 
-  const copy = async (text: string) => {
-    await navigator.clipboard.writeText(text);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+  const copy = async (target: CopyTarget, text: string) => {
+    await navigator.clipboard?.writeText(text);
+    setCopied(prev => ({ ...prev, [target]: true }));
+    window.setTimeout(() => {
+      setCopied(prev => ({ ...prev, [target]: false }));
+    }, 2000);
   };
 
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center">
       <div className="absolute inset-0 bg-black/60" />
-      <div className="relative z-10 w-full max-w-lg bg-neutral-900 border border-neutral-700 rounded-lg p-5 shadow-2xl mx-4">
+      <div className="relative z-10 w-full max-w-2xl bg-neutral-900 border border-neutral-700 rounded-lg p-5 shadow-2xl mx-4">
         <h3 className="text-sm font-semibold text-neutral-200 mb-1">
           {preset === 'strategic_local' ? 'Strategic runner enrolled' : 'Runner enrolled'}
         </h3>
@@ -115,27 +152,44 @@ function TokenDialog({ runnerId, token, preset = 'default', onDismiss }: TokenDi
           <div className="flex items-center gap-2 bg-neutral-950 border border-neutral-700 rounded px-3 py-2">
             <code className="flex-1 text-xs text-emerald-300 break-all font-mono">{token}</code>
             <button
-              onClick={() => copy(token)}
+              onClick={() => copy('token', token)}
               className="shrink-0 text-neutral-400 hover:text-neutral-200 transition-colors p-1 min-w-[44px] min-h-[44px] flex items-center justify-center"
               title="Copy token"
+              aria-label="Copy token"
             >
-              {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+              {copied.token ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
             </button>
           </div>
         </div>
 
-        <div className="mb-4">
-          <div className="text-xs text-neutral-400 mb-1">Setup snippet</div>
-          <div className="flex items-start gap-2 bg-neutral-950 border border-neutral-700 rounded px-3 py-2">
-            <code className="flex-1 text-xs text-neutral-300 break-all font-mono whitespace-pre-wrap">{snippet}</code>
-            <button
-              onClick={() => copy(snippet)}
-              className="shrink-0 text-neutral-400 hover:text-neutral-200 transition-colors p-1 min-w-[44px] min-h-[44px] flex items-center justify-center"
-              title="Copy setup snippet"
-            >
-              <Copy className="w-3.5 h-3.5" />
-            </button>
+        <div className="mb-4 space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-xs text-neutral-400">Setup snippets</div>
+            {tokenExpiresAt && (
+              <div className="text-ui-md text-neutral-500">Token expires {formatAbsolute(tokenExpiresAt)}</div>
+            )}
           </div>
+          <div className="grid gap-2 md:grid-cols-2">
+            {setupSnippetItems.map(item => (
+              <div key={item.id} className="min-w-0 rounded border border-neutral-700 bg-neutral-950">
+                <div className="flex items-center justify-between border-b border-neutral-800 px-3 py-1.5">
+                  <div className="text-ui-md font-semibold uppercase tracking-wide text-neutral-500">{item.label}</div>
+                  <button
+                    onClick={() => copy(item.id, item.command)}
+                    className="flex min-h-[44px] min-w-[44px] items-center justify-center text-neutral-400 transition-colors hover:text-neutral-200 md:min-h-8 md:min-w-8"
+                    title={`Copy ${item.label} setup snippet`}
+                    aria-label={`Copy ${item.label} setup snippet`}
+                  >
+                    {copied[item.id] ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                  </button>
+                </div>
+                <code className="block max-h-28 overflow-auto whitespace-pre-wrap break-all px-3 py-2 font-mono text-xs text-neutral-300">
+                  {item.command}
+                </code>
+              </div>
+            ))}
+          </div>
+          <div className="text-ui-md text-neutral-500">Next: start the runner; first heartbeat marks it live.</div>
         </div>
 
         <div className="text-xs text-neutral-500 mb-4">Runner ID: {runnerId}</div>
@@ -156,12 +210,21 @@ interface Props {
   requireLocalRunner?: boolean;
 }
 
+function tokenExpiryFromRegisterResult(result: FleetRunnerRegistrationResult): string | null {
+  return result.token_expires_at ?? result.expires_at ?? result.expiresAt ?? null;
+}
+
 export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Props) {
   const [runners, setRunners] = useState<FleetRunner[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [enrollingPreset, setEnrollingPreset] = useState<'default' | 'strategic_local' | null>(null);
-  const [pendingToken, setPendingToken] = useState<{ runnerId: string; token: string; preset: 'default' | 'strategic_local' } | null>(null);
+  const [enrollingPreset, setEnrollingPreset] = useState<RunnerSetupPreset | null>(null);
+  const [pendingToken, setPendingToken] = useState<{
+    runnerId: string;
+    token: string;
+    preset: RunnerSetupPreset;
+    tokenExpiresAt: string | null;
+  } | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
   const mountedRef = useRef(true);
 
@@ -188,13 +251,18 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
     return () => clearInterval(interval);
   }, [load]);
 
-  const handleEnroll = async (preset: 'default' | 'strategic_local' = 'default') => {
+  const handleEnroll = async (preset: RunnerSetupPreset = 'default') => {
     setEnrollingPreset(preset);
     try {
       const result = preset === 'strategic_local'
         ? await registerFleetRunner(projectId, { preset: 'strategic_local' })
         : await registerFleetRunner(projectId);
-      setPendingToken({ runnerId: result.runner_id, token: result.token, preset });
+      setPendingToken({
+        runnerId: result.runner_id,
+        token: result.token,
+        preset,
+        tokenExpiresAt: tokenExpiryFromRegisterResult(result),
+      });
       await load();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -313,6 +381,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
             const activeCount = activeTaskCount(runner);
             const slots = runnerLive ? availableSlots(runner) : null;
             const strategicRunner = isStrategicRunner(runner);
+            const readinessDetail = runnerReadinessDetail(runner, runnerLive, slots);
             return (
               <div
                 key={runner.id}
@@ -359,11 +428,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
                     )}
                   </div>
                   <div className="mt-1 text-xs text-neutral-500">{capsSummary(runner.capabilities)}</div>
-                  {runner.last_seen_at && (
-                    <div className="mt-0.5 text-ui-md text-neutral-600">
-                      last seen {timeAgo(runner.last_seen_at)}
-                    </div>
-                  )}
+                  <div className="mt-0.5 text-ui-md text-neutral-600">{readinessDetail}</div>
                 </div>
                 <button
                   onClick={() => handleRevoke(runner)}
@@ -384,6 +449,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
           runnerId={pendingToken.runnerId}
           token={pendingToken.token}
           preset={pendingToken.preset}
+          tokenExpiresAt={pendingToken.tokenExpiresAt}
           onDismiss={() => setPendingToken(null)}
         />
       )}

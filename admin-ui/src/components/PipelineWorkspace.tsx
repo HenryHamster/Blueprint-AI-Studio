@@ -1,4 +1,4 @@
-import type { ComponentProps, ReactNode } from 'react';
+import { useEffect, useState, type ComponentProps, type ReactNode } from 'react';
 import ArchiveView from './ArchiveView';
 import { ErrorBoundary } from './ErrorBoundary';
 import { KanbanBoard } from './KanbanBoard';
@@ -8,6 +8,7 @@ import { TaskContextRail } from './TaskContextRail';
 import type { Task } from './TaskCard';
 import { WorkbenchMetric, WorkbenchPanel, WorkbenchSplit, WorkbenchSurface } from './WorkbenchLayout';
 import type { PipelineSection } from '../hooks/useWorkbenchCommands';
+import { timeAgo } from '../utils/time';
 
 type ArchiveProps = ComponentProps<typeof ArchiveView>;
 type TaskContextRailProps = ComponentProps<typeof TaskContextRail>;
@@ -89,6 +90,18 @@ interface PipelineBoardProps {
   onDirectionClick: (directionId: string) => void;
 }
 
+export interface PipelineWorkspaceStatus {
+  selectedProjectId?: string | null;
+  selectedProjectLabel?: string | null;
+  displayedRows: number;
+  loadedRows: number;
+  serverTotalRows: number;
+  lastFetchTime?: number | Date | null;
+  apiHealthy: boolean;
+  wsConnected?: boolean | null;
+  staleAfterMs?: number;
+}
+
 export interface PipelineWorkspaceProps {
   surface: PipelineSurfaceProps;
   chrome: PipelineChromeProps;
@@ -97,6 +110,98 @@ export interface PipelineWorkspaceProps {
   rail: PipelineRailProps;
   board: PipelineBoardProps;
   metrics: PipelineMetricsProps;
+  status?: PipelineWorkspaceStatus;
+}
+
+const DEFAULT_STALE_AFTER_MS = 2 * 60 * 1000;
+
+function normalizeFetchMs(value: number | Date | null | undefined): number | null {
+  if (value == null) return null;
+  if (value instanceof Date) return value.getTime();
+  return value > 0 ? value : null;
+}
+
+function formatFetchLabel(value: number | Date | null | undefined, stale: boolean): string {
+  const ms = normalizeFetchMs(value);
+  if (ms == null) return 'fetch pending';
+  return stale ? `data stale ${timeAgo(ms)}` : `fetched ${timeAgo(ms)}`;
+}
+
+function PipelineStatusPill({
+  label,
+  tone = 'neutral',
+  title,
+  className = '',
+}: {
+  label: string;
+  tone?: 'neutral' | 'good' | 'warn' | 'bad' | 'info';
+  title?: string;
+  className?: string;
+}) {
+  const toneClass = {
+    neutral: 'border-neutral-800 bg-neutral-950/40 text-neutral-400',
+    good: 'border-emerald-500/20 bg-emerald-500/10 text-emerald-300',
+    warn: 'border-yellow-500/20 bg-yellow-500/10 text-yellow-300',
+    bad: 'border-red-500/25 bg-red-500/10 text-red-300',
+    info: 'border-cyan-500/20 bg-cyan-500/10 text-cyan-300',
+  }[tone];
+  return (
+    <span
+      className={`inline-flex min-h-6 max-w-full items-center rounded border px-2 font-mono text-ui-md whitespace-nowrap ${toneClass} ${className}`}
+      title={title}
+    >
+      <span className="min-w-0 truncate" title={title}>{label}</span>
+    </span>
+  );
+}
+
+function PipelineStatusStrip({ status }: { status: PipelineWorkspaceStatus }) {
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  useEffect(() => {
+    const id = window.setInterval(() => setNowMs(Date.now()), 30_000);
+    return () => window.clearInterval(id);
+  }, []);
+  const fetchMs = normalizeFetchMs(status.lastFetchTime);
+  const staleAfterMs = status.staleAfterMs ?? DEFAULT_STALE_AFTER_MS;
+  const stale = fetchMs != null && nowMs - fetchMs > staleAfterMs;
+  const apiLabel = status.apiHealthy ? 'API healthy' : 'API degraded';
+  const apiTone = status.apiHealthy ? 'good' : 'bad';
+  const scoped = Boolean(status.selectedProjectId);
+  const scopeValue = status.selectedProjectLabel || status.selectedProjectId;
+  const scopeLabel = scoped
+    ? `Project: ${scopeValue}`
+    : 'Global';
+
+  return (
+    <div className="flex min-w-0 flex-nowrap items-center gap-1.5 overflow-x-auto border-b border-neutral-800 bg-[#070b11] px-3 py-1.5 text-xs">
+      <PipelineStatusPill
+        label={scopeLabel}
+        tone={scoped ? 'info' : 'neutral'}
+        title={scoped ? `Project-scoped task view: ${scopeValue}` : 'Global task view'}
+        className="shrink min-w-[4rem] max-w-52 md:max-w-72"
+      />
+      <PipelineStatusPill
+        label={`displayed ${status.displayedRows}`}
+        tone={status.displayedRows !== status.loadedRows ? 'info' : 'neutral'}
+        title="Rows currently displayed after filters"
+      />
+      <PipelineStatusPill label={`loaded ${status.loadedRows}`} title="Rows loaded in the current server page" />
+      <PipelineStatusPill label={`server ${status.serverTotalRows}`} title="Total rows reported by the server for this scope" />
+      <PipelineStatusPill
+        label={formatFetchLabel(status.lastFetchTime, stale)}
+        tone={stale ? 'warn' : 'neutral'}
+        title="Task data freshness from the existing poller state"
+      />
+      <PipelineStatusPill label={apiLabel} tone={apiTone} title="Task API health from the existing poller state" />
+      {typeof status.wsConnected === 'boolean' && (
+        <PipelineStatusPill
+          label={status.wsConnected ? 'WS connected' : 'WS disconnected'}
+          tone={status.wsConnected ? 'good' : 'bad'}
+          title="Websocket state from the existing stream"
+        />
+      )}
+    </div>
+  );
 }
 
 export function PipelineWorkspace({
@@ -107,6 +212,7 @@ export function PipelineWorkspace({
   rail,
   board,
   metrics,
+  status,
 }: PipelineWorkspaceProps) {
   return (
     <WorkbenchSurface
@@ -143,6 +249,7 @@ export function PipelineWorkspace({
           main={(
             <div className="flex h-full min-h-0 flex-col">
               {chrome.filterStrip}
+              {status && <PipelineStatusStrip status={status} />}
               <ErrorBoundary level="panel">
                 <main className="flex min-h-0 flex-1 flex-col overflow-hidden px-3 py-3 md:px-4">
                   <PipelineView
@@ -190,6 +297,7 @@ export function PipelineWorkspace({
       ) : (
         <div className="flex h-full min-h-0 flex-col">
           {chrome.filterStrip}
+          {status && <PipelineStatusStrip status={status} />}
           <ErrorBoundary level="panel">
             <div className="min-h-0 flex-1 overflow-hidden px-3 py-3 md:px-4">
               <KanbanBoard

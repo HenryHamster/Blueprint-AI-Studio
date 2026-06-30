@@ -4213,6 +4213,14 @@ export interface FleetRunner {
 }
 
 /** Register a new fleet runner for a project. Returns the one-time token. */
+export interface FleetRunnerRegistrationResult {
+  runner_id: string;
+  token: string;
+  token_expires_at?: string | null;
+  expires_at?: string | null;
+  expiresAt?: string | null;
+}
+
 export async function registerFleetRunner(
   projectId: string,
   opts: {
@@ -4221,7 +4229,7 @@ export async function registerFleetRunner(
     capabilities?: Record<string, unknown>;
     preset?: 'default' | 'strategic_local';
   } = {},
-): Promise<{ runner_id: string; token: string }> {
+): Promise<FleetRunnerRegistrationResult> {
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/runners/register`,
     { method: 'POST', body: JSON.stringify(opts) },
