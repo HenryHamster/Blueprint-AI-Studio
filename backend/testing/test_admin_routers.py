@@ -3824,12 +3824,15 @@ class TestMessages:
         assert first.status_code == 200
         assert first.json()["status"] == "created"
         first_id = first.json()["id"]
+        assert first.json()["message"]["id"] == first_id
 
         # Identical retry with the same key — idempotent success, same row.
         second = await client.post("/api/admin/messages", json=body)
         assert second.status_code == 200
         assert second.json()["status"] == "duplicate"
         assert second.json()["id"] == first_id
+        assert second.json()["message"]["id"] == first_id
+        assert second.json()["message"]["message_type"] == "FEEDBACK"
 
         # Exactly one row landed for this project.
         count = await db_session.scalar(
@@ -3926,9 +3929,13 @@ class TestMessages:
         )
 
         assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["message"]["id"] == body["id"]
+        assert body["message"]["message_type"] == "FEEDBACK"
+        assert body["message"]["context"]["reply_to"] == "question-1"
         msg = (
             await db_session.execute(
-                select(ProjectMessage).where(ProjectMessage.id == uuid.UUID(resp.json()["id"]))
+                select(ProjectMessage).where(ProjectMessage.id == uuid.UUID(body["id"]))
             )
         ).scalar_one()
         context = msg.context or {}
@@ -3944,6 +3951,25 @@ class TestMessages:
             {"kind": "artifact", "id": "artifact-1", "label": "x" * 160},
         ]
         assert "storage_uri" not in session
+
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.project_id == project.id,
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                )
+            )
+        ).scalar_one()
+        stored_workbench = prefs_row.prefs["_strategic_workbench"]
+        assert stored_workbench["interaction_mode"] == "chat"
+        assert stored_workbench["active_surface"] == "runtime"
+        assert stored_workbench["session_started_at"] == "2026-06-29T12:00:00Z"
+        assert stored_workbench["last_interaction_at"]
+        assert stored_workbench["selected_refs"][:2] == [
+            {"kind": "canvas", "id": "strategic-canvas:proj-1", "label": "Context map"},
+            {"kind": "artifact", "id": "artifact-1", "label": "x" * 160},
+        ]
+        assert "context_package_id" not in stored_workbench
 
     @pytest.mark.asyncio
     async def test_create_message_rejects_oversized_workbench_context(
@@ -4293,6 +4319,13 @@ class TestMessages:
                     "project_id": str(project.id),
                     "message_type": "FEEDBACK",
                     "content": "steer me while a cycle is running",
+                    "workbench_context": {
+                        "interaction_mode": "continuous",
+                        "active_surface": "strategic",
+                        "selected_refs": [
+                            {"kind": "task", "id": "task-rollback", "label": "Rollback task"}
+                        ],
+                    },
                 },
             )
 
@@ -4302,6 +4335,20 @@ class TestMessages:
         assert body["arming"] == "not_armed"
         # The id is the scalar snapshotted before the expire, not a lazy-load.
         assert isinstance(body["id"], str) and len(body["id"]) == 36
+        assert body["message"]["id"] == body["id"]
+        assert body["message"]["content"] == "steer me while a cycle is running"
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.project_id == project.id,
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                )
+            )
+        ).scalar_one()
+        assert prefs_row.prefs["_strategic_workbench"]["interaction_mode"] == "continuous"
+        assert prefs_row.prefs["_strategic_workbench"]["selected_refs"] == [
+            {"kind": "task", "id": "task-rollback", "label": "Rollback task"}
+        ]
 
     @pytest.mark.asyncio
     async def test_canonical_message_burst_coalesces(
@@ -4741,14 +4788,40 @@ class TestMessages:
 
         resp = await client.patch(
             f"/api/admin/messages/{msg.id}",
-            json={"resolution": "Direction finished."},
+            json={
+                "resolution": "Direction finished.",
+                "workbench_context": {
+                    "interaction_mode": "monitor",
+                    "active_surface": "pipeline",
+                    "selected_refs": [
+                        {"kind": "task", "id": "task-linked", "label": "Linked blocker"}
+                    ],
+                },
+            },
         )
 
         assert resp.status_code == 200
-        assert resp.json()["status"] == "resolved"
+        body = resp.json()
+        assert body["status"] == "resolved"
+        assert body["message"]["id"] == str(msg.id)
+        assert body["message"]["status"] == "resolved"
+        assert body["message"]["resolution"] == "Direction finished."
         await db_session.refresh(msg)
         assert msg.status == "resolved"
         assert msg.resolution == "Direction finished."
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.project_id == project.id,
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                )
+            )
+        ).scalar_one()
+        assert prefs_row.prefs["_strategic_workbench"]["interaction_mode"] == "monitor"
+        assert prefs_row.prefs["_strategic_workbench"]["active_surface"] == "pipeline"
+        assert prefs_row.prefs["_strategic_workbench"]["selected_refs"] == [
+            {"kind": "task", "id": "task-linked", "label": "Linked blocker"}
+        ]
 
     @pytest.mark.asyncio
     async def test_resolve_message_over_limit_returns_400(
@@ -4797,9 +4870,36 @@ class TestMessages:
         await db_session.commit()
         await db_session.refresh(msg)
 
-        resp = await client.patch(f"/api/admin/messages/{msg.id}", json={})
+        resp = await client.patch(
+            f"/api/admin/messages/{msg.id}",
+            json={
+                "workbench_context": {
+                    "interaction_mode": "monitor",
+                    "active_surface": "project",
+                    "selected_refs": [
+                        {"kind": "message", "id": str(msg.id), "label": "Resolved note"}
+                    ],
+                }
+            },
+        )
         assert resp.status_code == 200
-        assert resp.json()["status"] == "already_resolved"
+        body = resp.json()
+        assert body["status"] == "already_resolved"
+        assert body["message"]["id"] == str(msg.id)
+        assert body["message"]["status"] == "resolved"
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.project_id == project.id,
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                )
+            )
+        ).scalar_one()
+        assert prefs_row.prefs["_strategic_workbench"]["interaction_mode"] == "monitor"
+        assert prefs_row.prefs["_strategic_workbench"]["active_surface"] == "project"
+        assert prefs_row.prefs["_strategic_workbench"]["selected_refs"] == [
+            {"kind": "message", "id": str(msg.id), "label": "Resolved note"}
+        ]
 
     @pytest.mark.asyncio
     async def test_resolve_message_concurrent_requests_are_safe(
@@ -4842,6 +4942,11 @@ class TestMessages:
         await db_session.refresh(msg)
         assert msg.status == "resolved"
         assert msg.resolution is not None
+        for resp in (resp1, resp2):
+            body = resp.json()
+            assert body["message"]["id"] == str(msg.id)
+            assert body["message"]["status"] == "resolved"
+            assert body["message"]["resolution"] == msg.resolution
 
     @pytest.mark.asyncio
     async def test_resolve_message_retried_request_is_safe(
@@ -4909,6 +5014,9 @@ class TestMessages:
         body = resp.json()
         assert body["status"] == "resolved"
         assert body["arming"] == "steering"
+        assert body["message"]["id"] == str(question.id)
+        assert body["message"]["status"] == "resolved"
+        assert body["message"]["resolution"] == "Do X instead."
 
         # Exactly one question_answer NOTE should exist, reply_to set to the question id
         notes = (
@@ -5020,6 +5128,34 @@ class TestMessages:
             }
         ]
         assert body["reply_message_id"] == str(note.id)
+        assert body["reply_message"]["id"] == str(note.id)
+        assert body["reply_message"]["message_type"] == "NOTE"
+        assert body["reply_message"]["context"]["strategic_session"]["selected_refs"] == [
+            {
+                "kind": "knowledge_document",
+                "id": "knowledge:kdoc-1",
+                "label": "Operator notes",
+            }
+        ]
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.project_id == project.id,
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                )
+            )
+        ).scalar_one()
+        stored_workbench = prefs_row.prefs["_strategic_workbench"]
+        assert stored_workbench["interaction_mode"] == "continuous"
+        assert stored_workbench["active_surface"] == "strategic"
+        assert stored_workbench["selected_refs"] == [
+            {
+                "kind": "knowledge_document",
+                "id": "knowledge:kdoc-1",
+                "label": "Operator notes",
+            }
+        ]
+        assert "context_package_id" not in stored_workbench
         assert broadcast.await_count == 2
         assert [
             (call.args[1], call.args[2])
@@ -5081,6 +5217,9 @@ class TestMessages:
         assert body["status"] == "resolved"
         assert body["arming"] == "not_armed"
         assert isinstance(body["reply_message_id"], str)
+        assert body["message"]["id"] == str(question.id)
+        assert body["message"]["status"] == "resolved"
+        assert body["message"]["resolution"] == "Take the simpler path."
 
         await db_session.refresh(question)
         assert question.status == "resolved"
@@ -5097,6 +5236,8 @@ class TestMessages:
         assert notes[0].context.get("event_type") == "question_answer"
         assert notes[0].context.get("answer") == "Take the simpler path."
         assert body["reply_message_id"] == str(notes[0].id)
+        assert body["reply_message"]["id"] == str(notes[0].id)
+        assert body["reply_message"]["context"]["event_type"] == "question_answer"
         vision = await self._reload_vision(db_session, project.id)
         assert strategic_refresh_pending(vision) is False
 
@@ -5139,6 +5280,9 @@ class TestMessages:
         body = resp.json()
         assert body["status"] == "resolved"
         assert body["arming"] == "passive_note"
+        assert body["message"]["id"] == str(feedback.id)
+        assert body["message"]["status"] == "resolved"
+        assert body["message"]["resolution"] == "Deploy summary now cites the active release."
         await db_session.refresh(feedback)
         assert feedback.status == "resolved"
         assert feedback.resolution == "Deploy summary now cites the active release."
@@ -5167,6 +5311,9 @@ class TestMessages:
             {"kind": "release", "id": "release:v2", "label": "v2 release"}
         ]
         assert body["reply_message_id"] == str(note.id)
+        assert body["reply_message"]["id"] == str(note.id)
+        assert body["reply_message"]["message_type"] == "NOTE"
+        assert body["reply_message"]["context"]["event_type"] == "feedback_acknowledgment"
 
     @pytest.mark.asyncio
     async def test_delete_message(self, client: AsyncClient, db_session):

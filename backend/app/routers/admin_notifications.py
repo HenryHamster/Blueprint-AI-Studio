@@ -584,7 +584,12 @@ async def create_message(
             )
         ).scalar_one_or_none()
         if existing is not None:
-            return {"id": str(existing.id), "status": "duplicate", "arming": "duplicate"}
+            return {
+                "id": str(existing.id),
+                "status": "duplicate",
+                "arming": "duplicate",
+                "message": admin_message_dict(existing),
+            }
 
     # Reproduce-on-HEAD citation grounding: a free-text BUG_REPORT/BLOCKER can
     # cite code that was already refactored away or fixed. Validate its cited
@@ -601,8 +606,23 @@ async def create_message(
         if warning:
             ctx = {**ctx, "_provenance_warnings": warning}
 
+    workbench_context_for_snapshot = payload.workbench_context
+    if payload.workbench_context is not None:
+        _previous_workbench, stored_workbench = await upsert_strategic_workbench_state_with_previous(
+            session,
+            current_user["user_id"],
+            project_id,
+            payload.workbench_context,
+        )
+        workbench_context_for_snapshot = {
+            **stored_workbench,
+            "context_package_id": payload.workbench_context.get("context_package_id"),
+        }
     strategic_session = await build_message_strategic_session_snapshot(
-        session, current_user["user_id"], project_id, payload.workbench_context
+        session,
+        current_user["user_id"],
+        project_id,
+        workbench_context_for_snapshot,
     )
     if strategic_session:
         ctx = {**ctx, "strategic_session": strategic_session}
@@ -640,6 +660,7 @@ async def create_message(
                     "id": str(existing.id),
                     "status": "duplicate",
                     "arming": "duplicate",
+                    "message": admin_message_dict(existing),
                 }
         raise
     await session.refresh(msg)
@@ -651,6 +672,7 @@ async def create_message(
     # committed. The captured scalar is immune to that expire.
     message_id = str(msg.id)
     message_event = message_event_payload(msg)
+    message_response = admin_message_dict(msg)
 
     # Wake the strategist on genuine operator steering. This is the live-chat
     # surface the admin MessagesPanel composer hits, and it must steer exactly
@@ -677,7 +699,7 @@ async def create_message(
     if arming == ARMING_STEERING:
         await session.commit()
     await broadcast_to_project(str(project_id), "message_created", message_event)
-    return {"id": message_id, "status": "created", "arming": arming}
+    return {"id": message_id, "status": "created", "arming": arming, "message": message_response}
 
 
 @router.patch("/messages/{message_id}")
@@ -694,12 +716,12 @@ async def resolve_message(
     # Verify user has access to the project
     await _get_user_project(msg.project_id, current_user["user_id"], session)
 
-    if msg.status == "resolved":
-        return {"id": str(msg.id), "status": "already_resolved"}
-    message_event = message_event_payload(msg, status="resolved")
     message_project_uuid = msg.project_id
     message_type = msg.message_type
     message_id_str = str(msg.id)
+    base_message_response = admin_message_dict(msg)
+    was_resolved = base_message_response.get("status") == "resolved"
+    message_event = message_event_payload(msg, status="resolved")
     resolution = (payload.resolution or "").strip()
     if len(resolution) > MESSAGE_CONTENT_MAX:
         raise HTTPException(
@@ -708,6 +730,22 @@ async def resolve_message(
         )
     if workbench_state_exceeds_max_bytes(payload.workbench_context):
         raise HTTPException(status_code=400, detail=f"workbench_context exceeds {WORKBENCH_STATE_MAX_BYTES} byte limit")
+    workbench_context_for_snapshot = payload.workbench_context
+    if payload.workbench_context is not None:
+        _previous_workbench, stored_workbench = await upsert_strategic_workbench_state_with_previous(
+            session,
+            current_user["user_id"],
+            message_project_uuid,
+            payload.workbench_context,
+        )
+        workbench_context_for_snapshot = {
+            **stored_workbench,
+            "context_package_id": payload.workbench_context.get("context_package_id"),
+        }
+    if was_resolved:
+        await session.commit()
+        return {"id": message_id_str, "status": "already_resolved", "message": base_message_response}
+    resolved_at = _utcnow()
     # Use update with status check for idempotency: only update if still open.
     # If a concurrent request also resolves before this one commits, the update
     # will find 0 rows and we return already_resolved for both paths.
@@ -718,13 +756,20 @@ async def resolve_message(
         ).values(
             status="resolved",
             resolution=resolution or None,
-            resolved_at=_utcnow()
+            resolved_at=resolved_at,
         )
     )
     if result.rowcount > 0:
+        message_response = {
+            **base_message_response,
+            "status": "resolved",
+            "resolution": resolution or None,
+            "resolved_at": resolved_at.isoformat(),
+        }
         reply_msg: ProjectMessage | None = None
         reply_message_event: dict[str, str] | None = None
         reply_message_id: str | None = None
+        reply_message_response: dict[str, Any] | None = None
         arming: str | None = None
         if resolution and message_type in (
             MessageType.QUESTION,
@@ -739,7 +784,7 @@ async def resolve_message(
                 session,
                 current_user["user_id"],
                 message_project_uuid,
-                payload.workbench_context,
+                workbench_context_for_snapshot,
             )
             if message_type == MessageType.QUESTION:
                 reply_msg = await _post_qa(
@@ -766,6 +811,7 @@ async def resolve_message(
             await session.refresh(reply_msg)
             reply_message_id = str(reply_msg.id)
             reply_message_event = message_event_payload(reply_msg)
+            reply_message_response = admin_message_dict(reply_msg)
             event_type = (
                 reply_msg.context.get("event_type")
                 if isinstance(reply_msg.context, dict)
@@ -787,16 +833,20 @@ async def resolve_message(
                 "message_created",
                 reply_message_event,
             )
-        response = {"id": message_id_str, "status": "resolved"}
+        response = {"id": message_id_str, "status": "resolved", "message": message_response}
         if reply_message_id is not None:
             response["reply_message_id"] = reply_message_id
+        if reply_message_response is not None:
+            response["reply_message"] = reply_message_response
         if arming is not None:
             response["arming"] = arming
         return response
     else:
+        await session.refresh(msg)
+        current_message_response = admin_message_dict(msg)
         await session.commit()
         # Message was already resolved by a concurrent request
-        return {"id": message_id_str, "status": "already_resolved"}
+        return {"id": message_id_str, "status": "already_resolved", "message": current_message_response}
 
 
 @router.delete("/messages/{message_id}")
