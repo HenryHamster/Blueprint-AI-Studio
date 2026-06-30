@@ -21,6 +21,7 @@ import {
   upsertStrategicSelectedRef,
   type StrategicSelectedRef,
 } from '../utils/strategicWorkbenchSession';
+import { StrategicContextMap } from './StrategicContextMap';
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
 
@@ -809,8 +810,9 @@ export function StrategicContextWorkspace({
               meta={`${formatCompactNumber(canvas?.node_count ?? nodes.length)} nodes / ${formatCompactNumber(canvas?.edge_count ?? edges.length)} links`}
               testId="strategic-context-workspace-map"
             >
-              {nodes.length > 0 ? (
-                <div className="rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5">
+              <StrategicContextMap canvas={canvas} onOpenTarget={handleOpenTarget} />
+              {nodes.length > 0 && (
+                <div className="mt-3 rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5">
                   {nodes.map(node => renderKeepableRow({
                     key: node.id,
                     label: node.label,
@@ -830,14 +832,12 @@ export function StrategicContextWorkspace({
                     ),
                   }))}
                 </div>
-              ) : (
-                <EmptyState>No map nodes are available.</EmptyState>
               )}
               {edges.length > 0 && (
                 <div className="mt-3 rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5" data-testid="strategic-context-workspace-edges">
                   {edges.map((edge, index) => (
                     <EdgeRow
-                      key={`${edge.source}:${edge.target}:${edge.label ?? index}`}
+                      key={`${edge.source}:${edge.target}:${edge.label ?? 'link'}:${index}`}
                       source={nodeLabelById.get(edge.source) ?? edge.source}
                       target={nodeLabelById.get(edge.target) ?? edge.target}
                       label={edge.label}

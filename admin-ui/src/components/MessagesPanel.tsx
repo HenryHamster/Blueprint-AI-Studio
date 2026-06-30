@@ -31,7 +31,7 @@ import {
   type StrategicStateResponse,
   type StrategicWorkbenchState,
 } from '../strategicStateApi';
-import { SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
+import { buildStrategicContextDescriptor, SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
 
 const DEFAULT_VIEW_ID = '__default__';
 
@@ -729,6 +729,12 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       || strategicRefresh
       || (effectiveContextPackage?.status && effectiveContextPackage.status !== 'ready')
       || (strategicAttention?.level === 'needs_operator' && attentionNeeds > 0),
+  );
+  const strategicComposerContext = useMemo(
+    () => conversationMode
+      ? buildStrategicContextDescriptor(currentStrategicState, strategicWorkbenchState)
+      : null,
+    [conversationMode, currentStrategicState, strategicWorkbenchState],
   );
 
   const mutedCount = Object.values(eventPrefs).filter(v => v === 'mute').length;
@@ -1937,7 +1943,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         onCancelReply={() => setReplyTo(null)}
         onSubmit={handleSubmit}
         chrome={conversationMode ? 'minimal' : 'full'}
-        strategicContext={null}
+        strategicContext={strategicComposerContext}
         onOpenStrategicContext={conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined}
         onOpenCommandPalette={conversationMode ? onOpenCommandPalette : undefined}
       />

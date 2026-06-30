@@ -17,11 +17,12 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 from unittest.mock import AsyncMock, call, patch
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 import app.drift_detection  # noqa: F401 — registers DirectionDriftSnapshot in SQLModel.metadata for create_all
 import app.shared_state as _shared_state
 from app.models import (
+    LocalRunner,
     Project,
     Task,
     TaskStatus,
@@ -30,6 +31,7 @@ from app.models import (
     RECOMMENDED_MODE_META_KEY,
 )
 from app.strategic_trigger import ORIGIN_OPERATOR, ORIGIN_QUALIFICATION
+from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
 from app.autonomous_research import _spawn_research_task
 from app.strategic_spawning import (
     _spawn_design_doc_update,
@@ -46,7 +48,9 @@ from app.strategic_spawning import (
     _design_doc_index,
     _summarize_design_doc_index,
     _DESIGN_DOC_INDEX_SUMMARY_CHARS,
+    _OPERATOR_CONTEXT_REFS_KEEP,
 )
+from app.task_completion import _phase_runner_affinity
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.capability_demand import collect_missing_capability_demand
 from app.max_plan_pool import _max_plan_pools, _account_by_id
@@ -111,6 +115,34 @@ def _make_project(**kwargs) -> Project:
     }
     defaults.update(kwargs)
     return Project(**defaults)
+
+
+def _local_continuation_marker(**overrides) -> dict:
+    marker = {
+        "version": 1,
+        "active": True,
+        "operator_user_id": "test-user-123",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+    }
+    marker.update(overrides)
+    return marker
+
+
+def _make_local_runner(project_id: uuid.UUID, **overrides) -> LocalRunner:
+    defaults = {
+        "project_id": project_id,
+        "token_hash": uuid.uuid4().hex + uuid.uuid4().hex,
+        "status": "active",
+        "capabilities": {
+            "task_types": "all",
+            "has_gpu": False,
+            "max_concurrent": 2,
+        },
+        "last_seen_at": datetime.now(timezone.utc).replace(tzinfo=None),
+    }
+    defaults.update(overrides)
+    return LocalRunner(**defaults)
 
 
 async def _seed_legacy_cycles(session, project: Project) -> None:
@@ -2744,6 +2776,206 @@ async def test_spawn_strategic_review_records_preferred_runner_without_pin(
     assert task.context.get("preferred_runner_target_id") == preferred_runner_id
     assert "runner_target_id" not in task.context
     assert not (task.vm_instance_id or "").startswith("runner:")
+
+
+@pytest.mark.asyncio
+async def test_design_doc_update_uses_live_local_continuation_runner_affinity(
+    db_session, mocker
+):
+    """Continuous local Strategic mode gives Phase 1 an advisory live-runner hint."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    runner = _make_local_runner(
+        project.id,
+        capabilities={
+            "task_types": ["design_doc_update"],
+            "has_gpu": False,
+            "max_concurrent": 2,
+        },
+    )
+    db_session.add(runner)
+    await db_session.commit()
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert task.payloads[0]["type"] == "design_doc_update"
+    assert task.context.get("preferred_runner_target_id") == str(runner.id)
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
+    assert "runner_target_id" not in task.context
+    assert not (task.vm_instance_id or "").startswith("runner:")
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_uses_live_local_continuation_runner_affinity(
+    db_session, mocker
+):
+    """Strategy-only Strategic reviews also receive the advisory local preference."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    stale_runner = _make_local_runner(
+        project.id,
+        capabilities={
+            "task_types": ["strategic_review"],
+            "has_gpu": False,
+            "max_concurrent": 2,
+        },
+        last_seen_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1),
+    )
+    live_runner = _make_local_runner(
+        project.id,
+        capabilities={
+            "task_types": ["strategic_review"],
+            "has_gpu": False,
+            "max_concurrent": 2,
+        },
+    )
+    db_session.add(stale_runner)
+    db_session.add(live_runner)
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert task.payloads[0]["type"] == "strategic_review"
+    assert task.context.get("preferred_runner_target_id") == str(live_runner.id)
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
+    assert "runner_target_id" not in task.context
+    assert not (task.vm_instance_id or "").startswith("runner:")
+
+
+@pytest.mark.asyncio
+async def test_local_continuation_affinity_omitted_when_stale_or_incapable(
+    db_session, mocker
+):
+    """Stale continuation markers and incompatible runners do not bias dispatch."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    stale_at = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(
+                updated_at=stale_at,
+                last_seen_at=stale_at,
+            ),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        _make_local_runner(
+            project.id,
+            capabilities={
+                "task_types": ["compute_experiment"],
+                "has_gpu": True,
+                "max_concurrent": 1,
+            },
+        )
+    )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert task.payloads[0]["type"] == "strategic_review"
+    assert "preferred_runner_target_id" not in task.context
+    assert "runner_target_id" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_local_continuation_affinity_reads_current_db_marker(
+    db_session, mocker
+):
+    """A stale in-memory Project marker must not bias strategy-only dispatch."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    runner = _make_local_runner(
+        project.id,
+        capabilities={
+            "task_types": ["strategic_review"],
+            "has_gpu": False,
+            "max_concurrent": 2,
+        },
+    )
+    db_session.add(runner)
+    await db_session.commit()
+
+    await db_session.execute(
+        update(Project)
+        .where(Project.id == project.id)
+        .values(vision={"purpose": "test purpose"})
+        .execution_options(synchronize_session=False)
+    )
+    await db_session.commit()
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY in (project.vision or {})
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert "preferred_runner_target_id" not in task.context
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
+
+
+def test_phase_runner_affinity_falls_back_to_preferred_runner_target_id():
+    runner_id = str(uuid.uuid4())
+    task = Task(
+        project_id=uuid.uuid4(),
+        title="Architecture review",
+        description="phase one",
+        payloads=[{"type": "design_doc_update"}],
+        context={"preferred_runner_target_id": runner_id},
+    )
+
+    assert _phase_runner_affinity(task) == runner_id
 
 
 # ── previous_decision_outcomes in _spawn_strategic_review payload ────────────
@@ -11914,6 +12146,177 @@ async def test_seeded_goal_reaches_design_doc_update_payload(db_session):
     assert payload["problem_model"]["intent"]["purpose"] == _ONBOARD_GOAL
     open_contents = [m["content"] for m in payload["open_messages"]]
     assert _ONBOARD_GOAL in open_contents
+
+
+@pytest.mark.asyncio
+async def test_operator_context_refs_promoted_to_strategic_review_payload(db_session):
+    """Selected Strategic workbench refs become first-class pointer context."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    msg = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.FEEDBACK,
+        content="Please review the release blocker with the linked memo.",
+        created_at=datetime(2026, 6, 3, 1, 0, 0),
+        context={
+            "strategic_session": {
+                "version": 1,
+                "interaction_mode": "continuous",
+                "active_surface": "pipeline",
+                "session_started_at": "2026-06-29T12:00:00Z",
+                "captured_at": "2026-06-29T12:05:00Z",
+                "context_package_id": "strategic-context:test",
+                "selected_refs": [
+                    {"kind": "task", "id": "task-1", "label": "Release blocker"},
+                    {"kind": "task", "id": "task-1", "label": "Duplicate"},
+                    {
+                        "kind": "knowledge_document",
+                        "id": "knowledge:doc-1",
+                        "label": "Prior memo",
+                    },
+                ],
+                "selected_ref_descriptors": [
+                    {
+                        "kind": "task",
+                        "id": "task-1",
+                        "label": "Release blocker task",
+                        "summary": "Small task descriptor",
+                        "status": "blocked",
+                        "target": {
+                            "surface": "task",
+                            "task_id": "task-1",
+                            "logs": "must not be copied",
+                        },
+                    }
+                ],
+                "canvas_body": "must not be copied",
+            }
+        },
+    )
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(msg)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    entries = payload["operator_context_refs"]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["source_message_id"] == str(msg.id)
+    assert entry["context_package_id"] == "strategic-context:test"
+    assert entry["session_started_at"] == "2026-06-29T12:00:00Z"
+    assert entry["captured_at"] == "2026-06-29T12:05:00Z"
+
+    selected_refs = entry["selected_refs"]
+    assert selected_refs[:2] == [
+        {
+            "kind": "task",
+            "id": "task-1",
+            "label": "Release blocker",
+            "descriptor": {
+                "kind": "task",
+                "id": "task-1",
+                "label": "Release blocker task",
+                "summary": "Small task descriptor",
+                "status": "blocked",
+                "target": {"surface": "task", "task_id": "task-1"},
+            },
+        },
+        {
+            "kind": "knowledge_document",
+            "id": "knowledge:doc-1",
+            "label": "Prior memo",
+        },
+    ]
+    serialized = json.dumps(entries)
+    assert "canvas_body" not in serialized
+    assert "must not be copied" not in serialized
+    assert "logs" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_operator_context_refs_ignore_malformed_and_cap(db_session):
+    """Malformed snapshots are skipped and promoted refs stay tightly bounded."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="agent",
+            message_type=MessageType.NOTE,
+            content="Agent-selected context should not be treated as operator context.",
+            created_at=datetime(2026, 6, 3, 3, 0, 0),
+            context={
+                "strategic_session": {
+                    "context_package_id": "strategic-context:agent",
+                    "selected_refs": [{"kind": "task", "id": "agent-only"}],
+                }
+            },
+        )
+    )
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="user",
+            message_type=MessageType.NOTE,
+            content="Malformed context is ignored.",
+            created_at=datetime(2026, 6, 3, 2, 0, 0),
+            context={"strategic_session": "not-a-snapshot"},
+        )
+    )
+    refs = [
+        {"kind": "task", "id": "task-with-large-label", "label": "L" * 2000},
+        {"kind": "task", "id": "x" * 1000, "label": "oversized id"},
+        {"kind": "", "id": "missing-kind"},
+        "not-a-ref",
+        *[
+            {"kind": "task", "id": f"task-{i}", "label": f"Task {i}"}
+            for i in range(_OPERATOR_CONTEXT_REFS_KEEP + 3)
+        ],
+    ]
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="user",
+            message_type=MessageType.FEEDBACK,
+            content="Use the selected bounded context.",
+            created_at=datetime(2026, 6, 3, 1, 0, 0),
+            context={
+                "strategic_session": {
+                    "context_package_id": "strategic-context:bounded",
+                    "selected_refs": refs,
+                }
+            },
+        )
+    )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+    entries = payload["operator_context_refs"]
+
+    assert len(entries) == 1
+    selected_refs = entries[0]["selected_refs"]
+    assert len(selected_refs) == _OPERATOR_CONTEXT_REFS_KEEP
+    assert selected_refs[0] == {"kind": "task", "id": "task-with-large-label"}
+    ref_ids = [ref["id"] for ref in selected_refs]
+    assert "agent-only" not in ref_ids
+    assert "x" * 1000 not in ref_ids
+    assert ref_ids[-1] == f"task-{_OPERATOR_CONTEXT_REFS_KEEP - 2}"
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,8 +21,10 @@ from app.messages_noise_prefs_store import (
 from app.models import _utcnow
 
 WORKBENCH_STATE_KEY = "_strategic_workbench"
+STRATEGIC_LOCAL_CONTINUATION_KEY = "_strategic_local_continuation"
 WORKBENCH_STATE_MAX_BYTES = 50_000
 SESSION_IDLE_TTL_SECONDS = 14_400  # 4 hours
+STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS = SESSION_IDLE_TTL_SECONDS
 
 _ALLOWED_INTERACTION_MODES = frozenset(
     {"chat", "check_in", "monitor", "continuous"}
@@ -238,6 +240,98 @@ def _workbench_session_expired(state: dict[str, Any]) -> bool:
         return False
     elapsed = (_utcnow() - last_active).total_seconds()
     return elapsed > SESSION_IDLE_TTL_SECONDS
+
+
+def _parse_naive_utc_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
+def apply_strategic_local_continuation_marker(
+    vision: dict[str, Any],
+    workbench_state: dict[str, Any],
+    *,
+    operator_user_id: str,
+    preferred_runner_id: str | None = None,
+) -> None:
+    """Update the compact project-level marker for local Strategic continuation."""
+
+    operator_id = _string(str(operator_user_id), max_chars=160)
+    if workbench_state.get("interaction_mode") != "continuous":
+        marker = vision.get(STRATEGIC_LOCAL_CONTINUATION_KEY)
+        marker_operator_id = (
+            marker.get("operator_user_id") if isinstance(marker, dict) else None
+        )
+        if not isinstance(marker, dict) or marker_operator_id in (None, operator_id):
+            vision.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
+        return
+
+    now = _utcnow().isoformat()
+    last_seen_at = (
+        _string(workbench_state.get("last_interaction_at"), max_chars=80) or now
+    )
+    marker: dict[str, Any] = {
+        "version": 1,
+        "active": True,
+        "operator_user_id": operator_id,
+        "updated_at": now,
+        "last_seen_at": last_seen_at,
+    }
+    runner_id = (
+        _string(str(preferred_runner_id), max_chars=80)
+        if preferred_runner_id
+        else None
+    )
+    if runner_id:
+        marker["preferred_runner_id"] = runner_id
+    vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = marker
+
+
+def strategic_local_continuation_status_from_vision(
+    vision: dict[str, Any] | None,
+) -> dict[str, Any]:
+    marker = (vision or {}).get(STRATEGIC_LOCAL_CONTINUATION_KEY)
+    if not isinstance(marker, dict) or marker.get("active") is False:
+        return {
+            "enabled": False,
+            "fresh": False,
+            "preferred_runner_id": None,
+            "reason": "not_enabled",
+            "updated_at": None,
+            "last_seen_at": None,
+            "ttl_seconds": STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
+        }
+
+    updated_at = _string(marker.get("updated_at"), max_chars=80)
+    last_seen_at = _string(marker.get("last_seen_at"), max_chars=80)
+    freshness_ts = _parse_naive_utc_timestamp(last_seen_at or updated_at)
+    if freshness_ts is None:
+        fresh = False
+        reason = "missing_timestamp"
+    else:
+        elapsed = (_utcnow() - freshness_ts).total_seconds()
+        fresh = elapsed <= STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS
+        reason = "armed" if fresh else "stale"
+
+    return {
+        "enabled": True,
+        "fresh": fresh,
+        "preferred_runner_id": _string(
+            marker.get("preferred_runner_id"),
+            max_chars=80,
+        ),
+        "reason": reason,
+        "updated_at": updated_at,
+        "last_seen_at": last_seen_at,
+        "ttl_seconds": STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
+    }
 
 
 def workbench_state_from_prefs(prefs: dict[str, Any] | None) -> dict[str, Any]:

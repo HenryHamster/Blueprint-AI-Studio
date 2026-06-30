@@ -715,11 +715,13 @@ describe('MessagesPanel chrome modes', () => {
     expect(strip?.textContent).not.toContain('3 running / 5 queued');
   });
 
-  test('minimal chat composer does not duplicate the current-session sideboard opener', async () => {
+  test('minimal chat composer shows live Strategic context and opens the sideboard', async () => {
     const sessionStartedAt = new Date(Date.now() - 30 * 60_000).toISOString();
     const lastInteractionAt = new Date(Date.now() - 5 * 60_000).toISOString();
+    const onOpenStrategicContextWorkspace = vi.fn();
     const el = await renderPanel({
       filterChrome: 'minimal',
+      onOpenStrategicContextWorkspace,
       strategicState: makeStrategicState({
         context_package: {
           id: 'strategic-context:proj-1',
@@ -773,8 +775,57 @@ describe('MessagesPanel chrome modes', () => {
       },
     });
 
-    const descriptor = el.querySelector('[data-testid="strategic-context-descriptor"]');
-    expect(descriptor).toBeNull();
+    const descriptor = el.querySelector('[data-testid="strategic-context-descriptor"]') as HTMLButtonElement | null;
+    expect(descriptor).not.toBeNull();
+    expect(descriptor?.textContent).toContain('Workbench context');
+    expect(descriptor?.textContent).toContain('Workday');
+    expect(descriptor?.textContent).toContain('Context ready');
+    expect(descriptor?.textContent).toContain('Latest context report');
+    expect(descriptor?.textContent).toContain('8 nodes / 7 links');
+    expect(descriptor?.textContent).toContain('18 items');
+
+    await act(async () => {
+      descriptor?.click();
+    });
+    expect(onOpenStrategicContextWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  test('minimal chat composer hides stale Strategic workbench context', async () => {
+    const staleNaive = new Date(Date.now() - 5 * 3600_000).toISOString().replace('Z', '');
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      strategicState: makeStrategicState({
+        context_package: null,
+        work_session: {
+          version: 1,
+          id: 'strategic-session:proj-1',
+          mode: 'continuous',
+          active_surface: 'pipeline',
+          session_started_at: staleNaive,
+          last_interaction_at: null,
+          context_package_id: null,
+          attention_level: 'clear',
+          selected_refs: [
+            { kind: 'artifact', id: 'artifact:stale', label: 'Stale ref' },
+          ],
+          selected_ref_descriptors: [],
+          curated_metrics: [],
+        },
+      }),
+      strategicWorkbenchState: {
+        version: 1,
+        interaction_mode: 'continuous',
+        active_surface: 'pipeline',
+        selected_refs: [
+          { kind: 'artifact', id: 'artifact:stale', label: 'Stale ref' },
+        ],
+        session_started_at: staleNaive,
+        last_interaction_at: null,
+      },
+    });
+
+    expect(el.querySelector('[data-testid="strategic-context-descriptor"]')).toBeNull();
+    expect(el.textContent).not.toContain('Stale ref');
   });
 
   test('minimal chat context receipts open Strategic context workspace', async () => {

@@ -39,7 +39,7 @@ from app.models import (
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app import strategic_cycle
-from app.task_locking import lock_project_or_429
+from app.task_locking import lock_project_or_429, with_vision_locked
 from app.build_config_lint import build_config_lint_warnings
 from app.ci_resolution import (
     compute_merge_verification_verdict,
@@ -67,6 +67,7 @@ from app.strategic_context_package import (
 from app.strategic_runtime_work import build_strategic_runtime_summary
 from app.work_session_actions import build_work_session_actions
 from app.workbench_state import (
+    apply_strategic_local_continuation_marker,
     WORKBENCH_STATE_MAX_BYTES,
     get_strategic_workbench_state,
     upsert_strategic_workbench_state_with_previous,
@@ -1614,6 +1615,7 @@ async def get_project_strategic_state(
         session,
         project.id,
         active_task=active_task,
+        project_vision=project.vision or {},
     )
     workbench_state = await get_strategic_workbench_state(
         session,
@@ -1797,6 +1799,20 @@ async def upsert_project_strategic_session(
         project_id,
         workbench,
     )
+
+    def _update_local_continuation_marker(vision: dict) -> None:
+        apply_strategic_local_continuation_marker(
+            vision,
+            state,
+            operator_user_id=current_user["user_id"],
+        )
+
+    await with_vision_locked(
+        session,
+        project_id,
+        _update_local_continuation_marker,
+        skip_locked=False,
+    )
     arming = ARMING_PASSIVE_NOTE
     should_arm = workbench_mode_should_arm_strategic_refresh(previous_state, state)
     await session.commit()
@@ -1856,6 +1872,7 @@ async def create_project_strategic_session_message(
         workbench_context=payload.workbench_context,
         idempotency_key=payload.idempotency_key,
         persist_empty_workbench_context=True,
+        sync_local_continuation_marker=True,
     )
     message_preview = await _message_preview_for_session_response(
         request,

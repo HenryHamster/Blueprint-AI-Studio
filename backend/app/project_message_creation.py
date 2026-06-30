@@ -15,7 +15,9 @@ from sqlmodel import select
 from app.models import MESSAGE_CONTENT_MAX, MessageType, Project, ProjectMessage
 from app.project_message_projection import message_event_payload
 from app.strategic_trigger import ARMING_STEERING, maybe_arm_operator_refresh
+from app.task_locking import with_vision_locked
 from app.workbench_state import (
+    apply_strategic_local_continuation_marker,
     build_message_strategic_session_snapshot,
     upsert_strategic_workbench_state_with_previous,
     workbench_state_exceeds_max_bytes,
@@ -92,6 +94,7 @@ async def create_operator_project_message(
     persist_empty_workbench_context: bool = False,
     compact_context_size: bool = True,
     enforce_raw_content_max: bool = False,
+    sync_local_continuation_marker: bool = False,
 ) -> OperatorMessageCreateResult:
     """Create or idempotently return an operator-authored ProjectMessage."""
 
@@ -160,6 +163,20 @@ async def create_operator_project_message(
                 **stored_workbench,
                 "context_package_id": workbench_context.get("context_package_id"),
             }
+        if sync_local_continuation_marker:
+            def _update_local_continuation_marker(vision: dict) -> None:
+                apply_strategic_local_continuation_marker(
+                    vision,
+                    stored_workbench,
+                    operator_user_id=user_id,
+                )
+
+            await with_vision_locked(
+                session,
+                project_id,
+                _update_local_continuation_marker,
+                skip_locked=False,
+            )
 
     strategic_session = await build_message_strategic_session_snapshot(
         session,

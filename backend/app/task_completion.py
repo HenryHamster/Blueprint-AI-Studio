@@ -460,6 +460,9 @@ def _phase_runner_affinity(task: Task) -> str | None:
     if isinstance(vm_instance_id, str) and vm_instance_id.startswith("runner:"):
         runner_id = vm_instance_id.removeprefix("runner:").strip()
         return runner_id or None
+    preferred_runner_target_id = ctx.get("preferred_runner_target_id")
+    if isinstance(preferred_runner_target_id, str) and preferred_runner_target_id.strip():
+        return preferred_runner_target_id.strip()
     return None
 
 

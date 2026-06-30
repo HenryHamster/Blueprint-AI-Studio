@@ -332,6 +332,30 @@ describe('StrategicContextWorkspace', () => {
     expect(host.textContent).toContain('running update 1');
   });
 
+  test('renders parallel map edges in the fallback list without duplicate key warnings', () => {
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const state = {
+      ...STATE,
+      context_package: {
+        ...STATE.context_package,
+        canvas: {
+          ...STATE.context_package.canvas,
+          edge_count: 2,
+          edges: [
+            { source: 'project', target: 'problem-model', label: 'defines' },
+            { source: 'project', target: 'problem-model', label: 'defines' },
+          ],
+        },
+      },
+    } as StrategicStateResponse;
+
+    const { host } = mount({ state });
+
+    expect(host.querySelector('[data-testid="strategic-context-workspace-edges"]')?.textContent).toContain('defines');
+    expect(consoleError).not.toHaveBeenCalledWith(expect.stringContaining('Encountered two children with the same key'));
+    consoleError.mockRestore();
+  });
+
   test('keeps and removes Strategic session references through the shared updater', () => {
     const onUpdateSessionRefs = vi.fn();
     const { host } = mount({ onUpdateSessionRefs });

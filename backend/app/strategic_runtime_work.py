@@ -24,6 +24,7 @@ from app.models import (
 from app.routers.admin_runners import _RUNNER_LIVENESS_SECONDS, _runner_health
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.time_utils import _utcnow
+from app.workbench_state import strategic_local_continuation_status_from_vision
 
 _ACTIVE_COMPUTE_JOB_STATUSES = (
     ComputeJobStatus.QUEUED,
@@ -356,6 +357,7 @@ async def build_strategic_runtime_summary(
     project_id: uuid.UUID,
     *,
     active_task: Task | None,
+    project_vision: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """Project local-runner readiness plus passive background-work state."""
 
@@ -478,6 +480,29 @@ async def build_strategic_runtime_summary(
         mode = "pending_local"
         fallback_reason = "runner_unavailable"
     operator_status = _local_operator_status(mode, fallback_reason, active_task)
+    continuation_status = strategic_local_continuation_status_from_vision(
+        project_vision
+    )
+    if continuation_status["enabled"] and continuation_status["fresh"]:
+        preferred_runner_id = continuation_status.get("preferred_runner_id")
+        if preferred_runner_id:
+            preferred_health = health_by_runner.get(preferred_runner_id)
+            if preferred_health is None:
+                continuation_status["reason"] = "preferred_runner_missing"
+            elif preferred_health.get("is_live"):
+                continuation_status["reason"] = "preferred_runner_live"
+            else:
+                continuation_status["reason"] = (
+                    preferred_health.get("stale_reason") or "preferred_runner_offline"
+                )
+        elif eligible_live_count > 0:
+            continuation_status["reason"] = "local_runner_ready"
+        elif live_runner_count > 0:
+            continuation_status["reason"] = "local_runner_live"
+        elif strategic_runners:
+            continuation_status["reason"] = "runner_offline"
+        else:
+            continuation_status["reason"] = "no_runner"
 
     return {
         "local_runner": {
@@ -496,6 +521,7 @@ async def build_strategic_runtime_summary(
             "active_task_runtime": active_task_runtime,
             "fallback_reason": fallback_reason,
             "liveness_window_seconds": _RUNNER_LIVENESS_SECONDS,
+            "continuation": continuation_status,
         },
         "work": await build_runtime_work_summary(session, project_id),
     }

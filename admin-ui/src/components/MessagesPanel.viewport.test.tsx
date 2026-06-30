@@ -319,12 +319,17 @@ describe('MessagesPanel — viewport regression', () => {
     if (!conversationColumn || !composerBox) {
       throw new Error('Expected conversation column and composer box to be rendered');
     }
-    expect(contextDescriptor).toBeNull();
+    if (!contextDescriptor) {
+      throw new Error('Expected live Strategic context descriptor to render above the composer');
+    }
 
     const columnRect = conversationColumn.getBoundingClientRect();
     const composerRect = composerBox.getBoundingClientRect();
+    const descriptorRect = contextDescriptor.getBoundingClientRect();
     expect(Math.abs(columnRect.left - composerRect.left)).toBeLessThanOrEqual(1);
     expect(Math.abs(columnRect.right - composerRect.right)).toBeLessThanOrEqual(1);
+    expect(descriptorRect.left).toBeGreaterThanOrEqual(columnRect.left - 1);
+    expect(descriptorRect.right).toBeLessThanOrEqual(columnRect.right + 1);
     expect(composerRect.width).toBeLessThanOrEqual(942);
   });
 

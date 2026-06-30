@@ -100,6 +100,10 @@ from app.time_utils import _utcnow, _coerce_naive_utc
 from app.vision_merge import REJECTED_EDITS_KEY
 from app.landed_signal import LANDED_ON_INTEGRATION_KEY, mark_stranded_non_landing
 from app.project_message_projection import agent_thread_message_dict
+from app.workbench_state import (
+    STRATEGIC_LOCAL_CONTINUATION_KEY,
+    strategic_local_continuation_status_from_vision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +172,78 @@ async def _load_local_runner_status(
         "active_total": active_total,
         "active_gpu": active_gpu,
     }
+
+
+def _agent_visible_vision(vision: dict[str, Any] | None) -> dict[str, Any]:
+    """Return project vision without backend-only operator session metadata."""
+
+    visible = dict(vision or {})
+    visible.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
+    return visible
+
+
+def _local_runner_handles_task_type(runner: LocalRunner, task_type: str) -> bool:
+    task_types = (runner.capabilities or {}).get("task_types", "all")
+    if task_types == "all":
+        return True
+    if isinstance(task_types, (list, tuple, set)):
+        return task_type in task_types
+    return False
+
+
+def _local_runner_is_live(runner: LocalRunner) -> bool:
+    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    return (
+        runner.status == "active"
+        and runner.last_seen_at is not None
+        and runner.last_seen_at > cutoff
+    )
+
+
+async def _resolve_local_continuation_runner_affinity(
+    session: AsyncSession,
+    project: Project,
+    task_type: str,
+) -> str | None:
+    """Return advisory runner affinity for fresh continuous local Strategic mode."""
+
+    current_vision = (
+        await session.execute(select(Project.vision).where(Project.id == project.id))
+    ).scalar_one_or_none()
+    status = strategic_local_continuation_status_from_vision(current_vision or {})
+    if not status.get("enabled") or not status.get("fresh"):
+        return None
+
+    rows = (
+        await session.execute(
+            select(LocalRunner)
+            .where(
+                LocalRunner.project_id == project.id,
+                LocalRunner.status != "deleted",
+            )
+            .order_by(
+                LocalRunner.last_seen_at.desc(),
+                LocalRunner.created_at.desc(),
+            )
+        )
+    ).scalars().all()
+    live_capable = [
+        runner
+        for runner in rows
+        if _local_runner_is_live(runner)
+        and _local_runner_handles_task_type(runner, task_type)
+    ]
+    if not live_capable:
+        return None
+
+    preferred_runner_id = status.get("preferred_runner_id")
+    if isinstance(preferred_runner_id, str) and preferred_runner_id.strip():
+        preferred_runner_id = preferred_runner_id.strip()
+        for runner in live_capable:
+            if str(runner.id) == preferred_runner_id:
+                return preferred_runner_id
+
+    return str(live_capable[0].id)
 
 
 def _empty_finding_challenge_summary() -> dict[str, Any]:
@@ -2190,6 +2266,22 @@ _CRITICAL_OPEN_MESSAGE_TYPES = (
     MessageType.BUG_REPORT.value,
     MessageType.BLOCKER.value,
 )
+_OPERATOR_CONTEXT_MESSAGE_FETCH_LIMIT = 30
+_OPERATOR_CONTEXT_REQUESTS_KEEP = 6
+_OPERATOR_CONTEXT_REFS_KEEP = 12
+_OPERATOR_CONTEXT_REF_SCAN_LIMIT = 24
+_OPERATOR_CONTEXT_DESCRIPTOR_SCAN_LIMIT = 24
+_OPERATOR_CONTEXT_FROM_TYPES = ("user", "operator")
+_OPERATOR_CONTEXT_TARGET_KEYS = (
+    "surface",
+    "section",
+    "task_id",
+    "message_id",
+    "direction_id",
+    "document_id",
+    "artifact_id",
+    "cycle_id",
+)
 
 
 def _open_message_survival_key(msg: dict) -> tuple:
@@ -2255,6 +2347,247 @@ def _summarize_open_messages(messages: list) -> list:
     critical inbox items survive budget pressure instead of vanishing.
     """
     return _bound_open_messages(messages, _OPEN_MESSAGES_KEEP_WHEN_TRIMMED)
+
+
+def _operator_context_text(
+    value: Any,
+    *,
+    max_chars: int,
+    raw_max_chars: int | None = None,
+) -> str | None:
+    if not isinstance(value, str):
+        return None
+    raw_max = raw_max_chars if raw_max_chars is not None else max_chars * 4
+    if len(value) > raw_max:
+        return None
+    text = " ".join(value.strip().split())
+    if not text:
+        return None
+    return text[:max_chars]
+
+
+def _operator_context_ref(raw: Any) -> dict[str, str] | None:
+    if not isinstance(raw, dict):
+        return None
+    kind = _operator_context_text(raw.get("kind"), max_chars=40, raw_max_chars=160)
+    ref_id = _operator_context_text(raw.get("id"), max_chars=160, raw_max_chars=640)
+    if not kind or not ref_id:
+        return None
+    ref: dict[str, str] = {"kind": kind, "id": ref_id}
+    label = _operator_context_text(
+        raw.get("label"), max_chars=180, raw_max_chars=720
+    )
+    if label:
+        ref["label"] = label
+    return ref
+
+
+def _operator_context_target(raw: Any) -> dict[str, str] | None:
+    if not isinstance(raw, dict):
+        return None
+    target: dict[str, str] = {}
+    for key in _OPERATOR_CONTEXT_TARGET_KEYS:
+        value = _operator_context_text(
+            raw.get(key), max_chars=180, raw_max_chars=720
+        )
+        if value:
+            target[key] = value
+    return target or None
+
+
+def _operator_context_descriptor(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    kind = _operator_context_text(raw.get("kind"), max_chars=40, raw_max_chars=160)
+    ref_id = _operator_context_text(raw.get("id"), max_chars=160, raw_max_chars=640)
+    if not kind or not ref_id:
+        return None
+
+    descriptor: dict[str, Any] = {"kind": kind, "id": ref_id}
+    label = _operator_context_text(
+        raw.get("label"), max_chars=180, raw_max_chars=720
+    )
+    if label:
+        descriptor["label"] = label
+    summary = _operator_context_text(
+        raw.get("summary"), max_chars=220, raw_max_chars=880
+    )
+    if summary:
+        descriptor["summary"] = summary
+    status = _operator_context_text(
+        raw.get("status"), max_chars=80, raw_max_chars=320
+    )
+    if status:
+        descriptor["status"] = status
+    target = _operator_context_target(raw.get("target"))
+    if target:
+        descriptor["target"] = target
+    return descriptor
+
+
+def _operator_context_descriptor_map(
+    snapshot: dict[str, Any],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    raw_descriptors = snapshot.get("selected_ref_descriptors")
+    if not isinstance(raw_descriptors, list):
+        return {}
+    descriptors: dict[tuple[str, str], dict[str, Any]] = {}
+    for raw in raw_descriptors[:_OPERATOR_CONTEXT_DESCRIPTOR_SCAN_LIMIT]:
+        descriptor = _operator_context_descriptor(raw)
+        if not descriptor:
+            continue
+        key = (descriptor["kind"], descriptor["id"])
+        if key not in descriptors:
+            descriptors[key] = descriptor
+    return descriptors
+
+
+def _operator_context_package_descriptor(raw: Any) -> dict[str, Any] | None:
+    descriptor = _operator_context_descriptor(raw)
+    if descriptor:
+        return descriptor
+    if not isinstance(raw, dict):
+        return None
+    package_id = _operator_context_text(
+        raw.get("id") or raw.get("context_package_id"),
+        max_chars=180,
+        raw_max_chars=720,
+    )
+    if not package_id:
+        return None
+    result: dict[str, Any] = {"id": package_id}
+    label = _operator_context_text(
+        raw.get("label") or raw.get("title"),
+        max_chars=180,
+        raw_max_chars=720,
+    )
+    if label:
+        result["label"] = label
+    summary = _operator_context_text(
+        raw.get("summary"), max_chars=220, raw_max_chars=880
+    )
+    if summary:
+        result["summary"] = summary
+    status = _operator_context_text(
+        raw.get("status"), max_chars=80, raw_max_chars=320
+    )
+    if status:
+        result["status"] = status
+    return result
+
+
+def _operator_context_created_sort_value(message: ProjectMessage) -> tuple:
+    created_at = message.created_at or datetime.min
+    return (created_at, str(message.id))
+
+
+def _build_operator_context_refs_from_messages(
+    messages: list[ProjectMessage],
+) -> list[dict[str, Any]]:
+    """Promote recent operator-selected Strategic context into pointer entries.
+
+    The source snapshots were already sanitized when ProjectMessage rows were
+    created. This bridge still treats the JSON defensively because rows may be
+    legacy or manually inserted: it copies only pointer-shaped fields, caps all
+    strings/counts, dedupes repeated refs globally, and never includes bodies,
+    logs, or arbitrary nested context.
+    """
+    requests: list[dict[str, Any]] = []
+    seen_refs: set[tuple[str, str]] = set()
+    seen_packages: set[str] = set()
+    total_refs = 0
+
+    for message in sorted(
+        (
+            m
+            for m in messages
+            if getattr(m, "from_type", None) in _OPERATOR_CONTEXT_FROM_TYPES
+        ),
+        key=_operator_context_created_sort_value,
+        reverse=True,
+    ):
+        context = message.context if isinstance(message.context, dict) else {}
+        snapshot = context.get("strategic_session")
+        if not isinstance(snapshot, dict):
+            continue
+
+        descriptors = _operator_context_descriptor_map(snapshot)
+        selected_refs: list[dict[str, Any]] = []
+        raw_refs = snapshot.get("selected_refs")
+        if isinstance(raw_refs, list):
+            for raw_ref in raw_refs[:_OPERATOR_CONTEXT_REF_SCAN_LIMIT]:
+                if total_refs >= _OPERATOR_CONTEXT_REFS_KEEP:
+                    break
+                ref = _operator_context_ref(raw_ref)
+                if not ref:
+                    continue
+                key = (ref["kind"], ref["id"])
+                if key in seen_refs:
+                    continue
+                seen_refs.add(key)
+                descriptor = descriptors.get(key)
+                if descriptor:
+                    ref = {**ref, "descriptor": descriptor}
+                selected_refs.append(ref)
+                total_refs += 1
+
+        entry: dict[str, Any] = {
+            "source_message_id": str(message.id),
+            "created_at": message.created_at.isoformat()
+            if message.created_at
+            else None,
+            "selected_refs": selected_refs,
+        }
+        for source_key, output_key, max_chars in (
+            ("context_package_id", "context_package_id", 180),
+            ("session_id", "session_id", 180),
+            ("id", "session_id", 180),
+            ("session_started_at", "session_started_at", 80),
+            ("captured_at", "captured_at", 80),
+        ):
+            if output_key in entry:
+                continue
+            value = _operator_context_text(
+                snapshot.get(source_key),
+                max_chars=max_chars,
+                raw_max_chars=max_chars * 4,
+            )
+            if value:
+                entry[output_key] = value
+
+        package_descriptor = _operator_context_package_descriptor(
+            snapshot.get("context_package_descriptor") or snapshot.get("context_package")
+        )
+        if package_descriptor:
+            entry["context_package_descriptor"] = package_descriptor
+
+        package_id = entry.get("context_package_id")
+        has_new_package = isinstance(package_id, str) and package_id not in seen_packages
+        if isinstance(package_id, str):
+            seen_packages.add(package_id)
+
+        if selected_refs or has_new_package or package_descriptor:
+            requests.append(entry)
+        if len(requests) >= _OPERATOR_CONTEXT_REQUESTS_KEEP:
+            break
+
+    return requests
+
+
+async def _fetch_operator_context_refs(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[dict[str, Any]]:
+    result = await session.execute(
+        select(ProjectMessage)
+        .where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.from_type.in_(_OPERATOR_CONTEXT_FROM_TYPES),
+        )
+        .order_by(ProjectMessage.created_at.desc(), ProjectMessage.id.desc())
+        .limit(_OPERATOR_CONTEXT_MESSAGE_FETCH_LIMIT)
+    )
+    return _build_operator_context_refs_from_messages(result.scalars().all())
 
 
 def _open_message_citation_summary(context: Any) -> dict:
@@ -2396,6 +2729,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # operator-wins reconciliation loop so the agent reconciles instead of
     # re-proposing overridden values.
     "operator_overrides": {"priority": "medium"},
+    # Recent operator-selected Strategic workbench pointers promoted out of
+    # ProjectMessage.context.strategic_session so selected refs survive when the
+    # conversation thread is trimmed. Already capped and pointer-only.
+    "operator_context_refs": {"priority": "high"},
     # Computed cycle-start reconciliation of the four strategic surfaces
     # (capabilities vs grounding, gaps vs directions, per-direction research
     # pipeline). Conflict-focused and bounded at build time, so it ships whole
@@ -2553,6 +2890,8 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "effort": {"priority": "critical"},
     "vision": {"priority": "critical"},
     "open_messages": {"priority": "high", "summarize": _summarize_open_messages},
+    # See _STRATEGIC_REVIEW_SCHEMA: compact pointer-only operator context.
+    "operator_context_refs": {"priority": "high"},
     # Compact, bounded navigation index over the grounded agent-view design doc
     # — see _STRATEGIC_REVIEW_SCHEMA["design_doc"] and _design_doc_index. Full
     # per-section content is fetched on demand via POST /api/agent/design-doc.
@@ -3958,6 +4297,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # feed (status-filtered query, size-bounded, BUG_REPORT/BLOCKER-prioritized)
     # so this path and the strategic_review path stay unified.
     open_msgs = await _fetch_open_messages(session, project.id)
+    operator_context_refs = await _fetch_operator_context_refs(session, project.id)
 
     # Build shipped_changes_manifest: tasks merged since the last arch review
     shipped_changes_manifest = await _build_shipped_changes_manifest(project, session)
@@ -4005,7 +4345,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
             **({"compute_experiment_sweeps": _dd_compute_sweep_groups} if _dd_compute_sweep_groups else {}),
             "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
-            "vision": project.vision or {},
+            "vision": _agent_visible_vision(project.vision),
             **(
                 {"missing_capability_demand": _missing_demand}
                 if _missing_demand_present
@@ -4030,6 +4370,11 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
                 else {}
             ),
             "open_messages": open_msgs,
+            **(
+                {"operator_context_refs": operator_context_refs}
+                if operator_context_refs
+                else {}
+            ),
             "shipped_changes_manifest": shipped_changes_manifest,
             "base_branch": get_project_integration_branch(project),
             **({"model": doc_model} if doc_model else {}),
@@ -4052,7 +4397,14 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # flag on the task context so the Phase 2 chain can re-surface the operator
     # steering directive rather than silently dropping it on architecture cycles.
     operator_steered = strategic_refresh_origin(project.vision) == ORIGIN_OPERATOR
+    preferred_runner_target_id = await _resolve_local_continuation_runner_affinity(
+        session,
+        project,
+        "design_doc_update",
+    )
     task_context: dict = {"strategic_cycle_id": cycle_id}
+    if preferred_runner_target_id:
+        task_context["preferred_runner_target_id"] = preferred_runner_target_id
     if operator_steered:
         task_context["operator_steered"] = True
         # Persist the operator steering excerpt alongside the flag: the marker is
@@ -4809,6 +5161,7 @@ async def _spawn_strategic_review(
     # the 15 newest messages aged out of the strategist's view and could never
     # be resolved. _fetch_open_messages keeps them visible until fixed/resolved.
     open_msgs = await _fetch_open_messages(session, project.id)
+    operator_context_refs = await _fetch_operator_context_refs(session, project.id)
 
     # When did the user last engage? Last ProjectMessage from_type='user'.
     # The strategic agent uses this to frame its running_update "since last
@@ -6299,7 +6652,7 @@ async def _spawn_strategic_review(
                     _agent_view_design_doc(project.design_doc), **verification_kwargs
                 )
             ),
-            "vision": project.vision or {},
+            "vision": _agent_visible_vision(project.vision),
             "problem_model": _verified_problem_model,
             **(
                 {"cycle_start_reconciliation": _cycle_start_reconciliation}
@@ -6397,6 +6750,11 @@ async def _spawn_strategic_review(
             ),
             "project_name": project.name,
             "open_messages": open_msgs,
+            **(
+                {"operator_context_refs": operator_context_refs}
+                if operator_context_refs
+                else {}
+            ),
             "conversation_thread": conversation_thread,
             **(
                 {"operator_overrides": _operator_overrides}
@@ -6517,9 +6875,18 @@ async def _spawn_strategic_review(
         )
         return False
 
+    effective_preferred_runner_target_id = (
+        str(preferred_runner_target_id)
+        if preferred_runner_target_id
+        else await _resolve_local_continuation_runner_affinity(
+            session,
+            project,
+            "strategic_review",
+        )
+    )
     task_context: dict[str, Any] = {"strategic_cycle_id": cycle_id}
-    if preferred_runner_target_id:
-        task_context["preferred_runner_target_id"] = str(preferred_runner_target_id)
+    if effective_preferred_runner_target_id:
+        task_context["preferred_runner_target_id"] = effective_preferred_runner_target_id
 
     new_task = Task(
         project_id=_project_id,
