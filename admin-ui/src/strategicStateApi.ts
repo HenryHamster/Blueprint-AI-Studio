@@ -541,10 +541,14 @@ export async function updateStrategicWorkbenchState(
 
 export async function fetchStrategicSession(
   projectId: string,
+  includeMessageId?: string | null,
   signal?: AbortSignal,
 ): Promise<StrategicSessionResponse> {
+  const params = new URLSearchParams();
+  if (includeMessageId) params.set('include_message_id', includeMessageId);
+  const query = params.toString();
   const res = await apiFetch(
-    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-session`,
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-session${query ? `?${query}` : ''}`,
     undefined,
     2,
     30000,

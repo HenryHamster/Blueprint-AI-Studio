@@ -566,6 +566,7 @@ async def _recent_session_conversation(
     project_id: uuid.UUID,
     *,
     context_package: Dict[str, Any] | None,
+    include_message_id: uuid.UUID | None = None,
 ) -> Dict[str, Any]:
     rows = (
         await session.execute(
@@ -579,7 +580,26 @@ async def _recent_session_conversation(
         )
     ).scalars().all()
     visible_rows = list(rows[:_SESSION_CONVERSATION_LIMIT])
-    visible_rows.reverse()
+    visible_ids = {message.id for message in visible_rows}
+    if include_message_id is not None and include_message_id not in visible_ids:
+        included_message = (
+            await session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.id == include_message_id,
+                    ProjectMessage.project_id == project_id,
+                    _session_conversation_predicate(),
+                )
+            )
+        ).scalars().first()
+        if included_message is not None:
+            visible_rows.append(included_message)
+    visible_rows.sort(
+        key=lambda message: (
+            message.created_at is None,
+            message.created_at or _utcnow(),
+            str(message.id),
+        )
+    )
     return {
         "limit": _SESSION_CONVERSATION_LIMIT,
         "has_more": len(rows) > _SESSION_CONVERSATION_LIMIT,
@@ -629,6 +649,8 @@ async def _build_strategic_session_response(
     session: AsyncSession,
     project_id: uuid.UUID,
     state: Dict[str, Any],
+    *,
+    include_message_id: uuid.UUID | None = None,
 ) -> Dict[str, Any]:
     context_package = (
         state.get("context_package")
@@ -639,6 +661,7 @@ async def _build_strategic_session_response(
         session,
         project_id,
         context_package=context_package,
+        include_message_id=include_message_id,
     )
     latest_cycle = (
         (state.get("strategic") or {}).get("latest_cycle")
@@ -1422,6 +1445,7 @@ async def get_project_strategic_state(
 async def get_project_strategic_session(
     request: Request,
     project_id: uuid.UUID,
+    include_message_id: uuid.UUID | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -1433,7 +1457,12 @@ async def get_project_strategic_session(
         session=session,
         current_user=current_user,
     )
-    return await _build_strategic_session_response(session, project_id, state)
+    return await _build_strategic_session_response(
+        session,
+        project_id,
+        state,
+        include_message_id=include_message_id,
+    )
 
 
 @router.post("/projects/{project_id}/strategic-session")

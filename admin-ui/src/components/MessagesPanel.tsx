@@ -348,6 +348,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   }, [onStrategicInteraction]);
   const selectedProjectIdRef = useRef(selectedProjectId);
   selectedProjectIdRef.current = selectedProjectId;
+  const targetMessageId = targetMessage?.messageId ?? null;
+  const targetMessageIdRef = useRef<string | null>(targetMessageId);
+  targetMessageIdRef.current = targetMessageId;
+  const strategicSessionPinnedTargetRef = useRef<{ projectId: string; messageId: string } | null>(null);
   const usesStrategicReadModelRef = useRef(usesStrategicReadModel);
   usesStrategicReadModelRef.current = usesStrategicReadModel;
   const attentionNeeds = strategicAttention?.counts.needs_operator ?? 0;
@@ -406,6 +410,13 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showScrollDown, setShowScrollDown] = useState(false);
   const prevMessageCountRef = useRef(0);
+  const lastStrategicSessionTargetFetchRef = useRef<string | null>(null);
+  const getStrategicSessionIncludeMessageId = useCallback((projectId: string | null, currentTargetMessageId: string | null): string | null => {
+    if (!projectId) return null;
+    if (currentTargetMessageId) return currentTargetMessageId;
+    const pinnedTarget = strategicSessionPinnedTargetRef.current;
+    return pinnedTarget?.projectId === projectId ? pinnedTarget.messageId : null;
+  }, []);
 
   // Collapsed resolved
   const [showResolved, setShowResolved] = useState(() => loadMessagesPanelPrefs(auth.currentUser?.email).showResolved);
@@ -727,22 +738,39 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const mutedCount = Object.values(eventPrefs).filter(v => v === 'mute').length;
 
   useEffect(() => {
-    if (!targetMessage?.messageId) return;
+    if (!selectedProjectId) {
+      strategicSessionPinnedTargetRef.current = null;
+      lastStrategicSessionTargetFetchRef.current = null;
+      return;
+    }
+    if (strategicSessionPinnedTargetRef.current?.projectId !== selectedProjectId) {
+      strategicSessionPinnedTargetRef.current = null;
+    }
+    if (targetMessageId) {
+      strategicSessionPinnedTargetRef.current = { projectId: selectedProjectId, messageId: targetMessageId };
+    }
+    lastStrategicSessionTargetFetchRef.current = null;
+  }, [selectedProjectId, targetMessageId]);
+
+  useEffect(() => {
+    if (!targetMessageId) return;
     if (!conversationMode) {
       onTargetMessageHandled?.();
       return;
     }
-    const target = conversationMessages.find(msg => msg.id === targetMessage.messageId)
-      ?? messages.find(msg => msg.id === targetMessage.messageId)
+    const target = conversationMessages.find(msg => msg.id === targetMessageId)
+      ?? messages.find(msg => msg.id === targetMessageId)
       ?? null;
     if (!target) {
-      if (!loading) onTargetMessageHandled?.();
+      if (!loading && lastStrategicSessionTargetFetchRef.current === targetMessageId) {
+        onTargetMessageHandled?.();
+      }
       return;
     }
     setHighlightedMessageId(target.id);
     const node = scrollRef.current?.querySelector(`[data-message-id="${target.id}"]`);
     node?.scrollIntoView({ block: 'center', behavior: 'smooth' });
-    if (targetMessage.action === 'reply' && target.message_type === 'QUESTION' && target.status === 'open') {
+    if (targetMessage?.action === 'reply' && target.message_type === 'QUESTION' && target.status === 'open') {
       setReplyTo({
         id: target.id,
         content: target.content,
@@ -760,7 +788,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     messages,
     onTargetMessageHandled,
     targetMessage?.action,
-    targetMessage?.messageId,
+    targetMessageId,
   ]);
 
   useEffect(() => {
@@ -970,7 +998,19 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     if (!selectedProjectId) { setLoading(false); return; }
     try {
       if (conversationMode) {
-        const session = await fetchStrategicSession(selectedProjectId);
+        const includeMessageId = getStrategicSessionIncludeMessageId(selectedProjectId, targetMessageId);
+        const session = await fetchStrategicSession(selectedProjectId, includeMessageId);
+        const currentIncludeMessageId = getStrategicSessionIncludeMessageId(
+          selectedProjectIdRef.current,
+          targetMessageIdRef.current,
+        );
+        if (
+          selectedProjectIdRef.current !== selectedProjectId
+          || currentIncludeMessageId !== includeMessageId
+        ) {
+          return;
+        }
+        lastStrategicSessionTargetFetchRef.current = includeMessageId;
         const sessionMessages = session.conversation?.items ?? [];
         sessionMessages.forEach(m => seenMessageIdsRef.current.add(m.id));
         hasInitiallyLoadedRef.current = true;
@@ -1081,7 +1121,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     } finally {
       setLoading(false);
     }
-  }, [conversationMode, selectedProjectId, onMessageCountChange, searchQuery, usesStrategicReadModel]);
+  }, [conversationMode, getStrategicSessionIncludeMessageId, selectedProjectId, onMessageCountChange, searchQuery, targetMessageId, usesStrategicReadModel]);
 
   usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
 
@@ -1091,7 +1131,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     const el = scrollRef.current;
     if (!el) return;
     const currentCount = conversationMode ? conversationMessages.length : highSignalOpen.length + routineOpen.length + visibleResolved.length;
-    if (conversationMode && targetMessage?.messageId) {
+    if (conversationMode && targetMessageId) {
       prevMessageCountRef.current = currentCount;
       return;
     }
@@ -1108,7 +1148,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }
     // Don't scroll at all on polling refresh with same count — preserves position
     prevMessageCountRef.current = currentCount;
-  }, [conversationMode, conversationMessages.length, highSignalOpen, routineOpen, targetMessage?.messageId, visibleResolved]);
+  }, [conversationMode, conversationMessages.length, highSignalOpen, routineOpen, targetMessageId, visibleResolved]);
 
   // Update parent with the high-signal count for the tab-title badge. highSignalCount is
   // countHighSignalMessages(messages), identical to the fetch callback and the closed-panel

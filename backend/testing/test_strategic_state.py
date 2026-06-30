@@ -1161,6 +1161,70 @@ async def test_strategic_session_conversation_marks_more_history(
 
 
 @pytest.mark.asyncio
+async def test_strategic_session_includes_requested_older_message_once(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    other_project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(hours=2)
+    target = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="strategic",
+        content="older targeted question",
+        status="open",
+        created_at=base_time,
+    )
+    newer_messages = [
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user" if index % 2 == 0 else "strategic",
+            content=f"newer session row {index:02d}",
+            created_at=base_time + timedelta(minutes=index + 1),
+        )
+        for index in range(20)
+    ]
+    other_message = ProjectMessage(
+        project_id=other_project.id,
+        message_type=MessageType.QUESTION,
+        from_type="strategic",
+        content="other project question",
+        status="open",
+        created_at=base_time,
+    )
+    db_session.add_all([target, *newer_messages, other_message])
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-session"
+        f"?include_message_id={target.id}"
+    )
+
+    assert resp.status_code == 200, resp.text
+    conversation = resp.json()["conversation"]
+    ids = [item["id"] for item in conversation["items"]]
+    assert conversation["limit"] == 20
+    assert conversation["has_more"] is True
+    assert conversation["order"] == "oldest_first"
+    assert ids.count(str(target.id)) == 1
+    assert ids[0] == str(target.id)
+    assert [item["content"] for item in conversation["items"][1:]] == [
+        f"newer session row {index:02d}" for index in range(20)
+    ]
+
+    cross_project_resp = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-session"
+        f"?include_message_id={other_message.id}"
+    )
+    assert cross_project_resp.status_code == 200, cross_project_resp.text
+    cross_project_ids = [
+        item["id"] for item in cross_project_resp.json()["conversation"]["items"]
+    ]
+    assert str(other_message.id) not in cross_project_ids
+
+
+@pytest.mark.asyncio
 async def test_strategic_session_conversation_filters_routine_before_limit(
     client: AsyncClient, db_session
 ):

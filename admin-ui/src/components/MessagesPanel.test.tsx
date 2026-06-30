@@ -67,7 +67,7 @@ function _setupApiFetchMock(opts: {
     if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
       return new Response(JSON.stringify({ last_seen_at: lastSeenAt }), { status: 200 });
     }
-    if (/\/api\/admin\/projects\/[^/]+\/strategic-session$/.test(urlStr) && method === 'GET') {
+    if (/\/api\/admin\/projects\/[^/]+\/strategic-session(?:\?|$)/.test(urlStr) && method === 'GET') {
       const msgs = queue
         ? queue[Math.min(qIdx, queue.length - 1)]
         : defaultMessages;
@@ -132,7 +132,7 @@ function _strategicSessionGetCalls(): unknown[][] {
   return vi.mocked(apiFetch).mock.calls.filter((c) => {
     const url = String(c[0]);
     const init = c[1] as RequestInit | undefined;
-    return /\/api\/admin\/projects\/[^/]+\/strategic-session$/.test(url) && (!init?.method || init.method === 'GET');
+    return /\/api\/admin\/projects\/[^/]+\/strategic-session(?:\?|$)/.test(url) && (!init?.method || init.method === 'GET');
   });
 }
 function _strategicSessionMessagePostCalls(): unknown[][] {
@@ -942,6 +942,25 @@ describe('MessagesPanel chrome modes', () => {
       expect(scrollTo).not.toHaveBeenCalled();
       expect(el.textContent).toContain('Replying to Agent');
       expect(el.textContent).toContain('Should I keep the local runner online?');
+      const sessionCallUrl = String(_strategicSessionGetCalls()[0]?.[0] ?? '');
+      expect(sessionCallUrl).toContain('include_message_id=question-target');
+
+      const mountedRoot = root;
+      if (!mountedRoot) throw new Error('panel root not mounted');
+      await act(async () => {
+        mountedRoot.render(
+          <MessagesPanel
+            selectedProjectId="proj-1"
+            addToast={() => {}}
+            onMessageCountChange={() => {}}
+            filterChrome="minimal"
+            onTargetMessageHandled={onTargetMessageHandled}
+          />,
+        );
+      });
+      await waitFor(() => expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(2));
+      const followUpSessionCallUrl = String(_strategicSessionGetCalls().at(-1)?.[0] ?? '');
+      expect(followUpSessionCallUrl).toContain('include_message_id=question-target');
     } finally {
       Element.prototype.scrollIntoView = originalScrollIntoView;
       HTMLElement.prototype.scrollTo = originalScrollTo;
