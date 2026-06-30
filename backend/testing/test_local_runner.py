@@ -230,12 +230,22 @@ class TestAdminRunnerEndpoints:
             last_seen_at=_utcnow() - timedelta(minutes=9),
             capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
         )
+        offline_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            hostname="offline",
+            status="inactive",
+            last_seen_at=_utcnow() - timedelta(seconds=30),
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
 
         resp = await client.get(f"/api/admin/projects/{project.id}/runners")
         assert resp.status_code == 200
         by_id = {row["id"]: row for row in resp.json()}
 
         live_health = by_id[str(live_runner.id)]["health"]
+        assert live_health["device_status"] == "connected"
+        assert live_health["device_status_reason"] is None
         assert live_health["is_live"] is True
         assert live_health["active_task_count"] == 1
         assert live_health["max_concurrent"] == 3
@@ -243,9 +253,17 @@ class TestAdminRunnerEndpoints:
         assert live_health["stale_reason"] is None
 
         stale_health = by_id[str(stale_runner.id)]["health"]
+        assert stale_health["device_status"] == "stale"
+        assert stale_health["device_status_reason"] == "heartbeat_stale"
         assert stale_health["is_live"] is False
         assert stale_health["stale_reason"] == "heartbeat_stale"
         assert stale_health["liveness_window_seconds"] == 300
+
+        offline_health = by_id[str(offline_runner.id)]["health"]
+        assert offline_health["device_status"] == "offline"
+        assert offline_health["device_status_reason"] == "inactive"
+        assert offline_health["is_live"] is False
+        assert offline_health["stale_reason"] == "inactive"
 
     @pytest.mark.asyncio
     async def test_delete_marks_deleted(self, client: AsyncClient, db_session):

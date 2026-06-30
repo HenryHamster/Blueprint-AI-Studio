@@ -178,7 +178,18 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         stale_reason = "never_seen"
     elif seconds_since_last_seen >= _RUNNER_LIVENESS_SECONDS:
         stale_reason = "heartbeat_stale"
+    if is_live:
+        device_status = "connected"
+        device_status_reason = None
+    elif runner.status != "active":
+        device_status = "offline"
+        device_status_reason = stale_reason
+    else:
+        device_status = "stale"
+        device_status_reason = stale_reason
     return {
+        "device_status": device_status,
+        "device_status_reason": device_status_reason,
         "is_live": is_live,
         "seconds_since_last_seen": seconds_since_last_seen,
         "active_task_count": active_task_count,

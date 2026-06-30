@@ -192,6 +192,32 @@ export interface AccountUpdatePayload {
   auto_disable_after_rate_limits?: number | null;
 }
 
+export interface AccountUsageSummary {
+  active_tasks: number;
+  total_tasks: number;
+  daily_task_count: number;
+  daily_task_cap: number | null;
+  daily_task_remaining: number | null;
+  daily_task_usage_fraction: number | null;
+  max_concurrent_tasks: number | null;
+  concurrent_task_remaining: number | null;
+  concurrent_task_usage_fraction: number | null;
+  at_daily_cap: boolean;
+  at_concurrent_cap: boolean;
+  at_any_cap: boolean;
+}
+
+export interface AccountUsageSnapshot {
+  known: boolean;
+  five_hour_utilization: number | null;
+  seven_day_utilization: number | null;
+  resets_at: Record<string, string | null>;
+  probed_at: string | null;
+  stale: boolean;
+}
+
+export type AccountStatus = 'ready' | 'degraded' | 'at_cap' | 'unavailable' | 'unconfigured' | 'disabled' | string;
+
 export interface MaxPlanAccount {
   id: string;
   name: string;
@@ -210,6 +236,13 @@ export interface MaxPlanAccount {
   daily_task_count?: number;
   daily_task_count_reset_at?: string | null;
   disabled_reason?: string | null;
+  disabled_at?: string | null;
+  credential_configured?: boolean;
+  runtime_ready?: boolean;
+  account_status?: AccountStatus;
+  status_reasons?: string[];
+  usage?: AccountUsageSummary;
+  usage_snapshot?: AccountUsageSnapshot;
 }
 
 export interface ProviderHealthSnapshot {

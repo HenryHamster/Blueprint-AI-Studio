@@ -4197,6 +4197,8 @@ export interface FleetRunner {
     [key: string]: unknown;
   };
   health?: {
+    device_status?: 'connected' | 'stale' | 'offline' | string;
+    device_status_reason?: string | null;
     is_live: boolean;
     seconds_since_last_seen: number | null;
     active_task_count: number;
