@@ -23,9 +23,17 @@ function fallbackLivenessLabel(lastSeenAt: string | null): { label: string; cls:
   return { label: 'offline', cls: 'text-neutral-500' };
 }
 
+function deviceStatusLabel(status: string): { label: string; cls: string } {
+  if (status === 'connected') return { label: 'connected', cls: 'text-emerald-400' };
+  if (status === 'stale') return { label: 'stale', cls: 'text-amber-400' };
+  if (status === 'offline') return { label: 'offline', cls: 'text-neutral-500' };
+  return { label: status.replace(/_/g, ' '), cls: 'text-neutral-500' };
+}
+
 function livenessLabel(runner: FleetRunner): { label: string; cls: string } {
-  if (runner.status !== 'active') return { label: 'offline', cls: 'text-neutral-500' };
   const health = runner.health;
+  if (health?.device_status) return deviceStatusLabel(health.device_status);
+  if (runner.status !== 'active') return { label: 'offline', cls: 'text-neutral-500' };
   if (!health) return fallbackLivenessLabel(runner.last_seen_at);
   if (health.is_live) return { label: 'live', cls: 'text-emerald-400' };
   if (health.stale_reason === 'heartbeat_stale') return { label: 'stale', cls: 'text-amber-400' };
@@ -34,6 +42,7 @@ function livenessLabel(runner: FleetRunner): { label: string; cls: string } {
 }
 
 function isRunnerLive(runner: FleetRunner): boolean {
+  if (runner.health?.device_status) return runner.health.device_status === 'connected';
   if (runner.status !== 'active') return false;
   if (runner.health) return runner.health.is_live;
   return fallbackLivenessLabel(runner.last_seen_at).label === 'live';
@@ -336,7 +345,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
       {!loading && runners.length > 0 && (
         <div className="grid grid-cols-2 gap-2 text-xs lg:grid-cols-4">
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
-            <div className="text-ui-md uppercase tracking-wide text-neutral-500">live</div>
+            <div className="text-ui-md uppercase tracking-wide text-neutral-500">connected</div>
             <div className="mt-0.5 font-mono text-neutral-100">{liveRunners.length}/{runners.length}</div>
           </div>
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
@@ -352,7 +361,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
             <div className="text-ui-md uppercase tracking-wide text-neutral-500">strategic</div>
             <div className={`mt-0.5 font-mono ${liveStrategicRunners.length > 0 ? 'text-emerald-300' : 'text-neutral-500'}`} data-testid="fleet-runner-strategic-readiness">
-              {liveStrategicRunners.length > 0 ? `${liveStrategicRunners.length} live` : 'none live'}
+              {liveStrategicRunners.length > 0 ? `${liveStrategicRunners.length} connected` : 'none connected'}
             </div>
           </div>
         </div>
@@ -360,7 +369,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
 
       {requireLocalRunner && !loading && liveComputeRunners.length === 0 && (
         <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-          Local-only compute is enabled for this project. Compute experiments will wait until a live compute-capable runner connects.
+          Local-only compute is enabled for this project. Compute experiments will wait until a connected compute-capable runner is available.
         </div>
       )}
 

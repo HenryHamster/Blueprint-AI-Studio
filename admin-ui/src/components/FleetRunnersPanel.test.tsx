@@ -293,7 +293,7 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.textContent).toContain('GPU');
   });
 
-  test('backend health renders live state and available slot count', async () => {
+  test('backend health renders connected state and available slot count', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([
       {
         ...SAMPLE_RUNNERS[0],
@@ -305,6 +305,8 @@ describe('FleetRunnersPanel — behavioral', () => {
           workload: 'strategic',
         },
         health: {
+          device_status: 'connected',
+          device_status_reason: null,
           is_live: true,
           seconds_since_last_seen: 12,
           active_task_count: 0,
@@ -319,19 +321,127 @@ describe('FleetRunnersPanel — behavioral', () => {
       },
     ]);
     const el = await mount();
-    expect(el.textContent).toContain('live');
+    expect(el.textContent).toContain('connected');
     expect(el.textContent).toContain('Strategic capable');
-    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('1 live');
+    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('1 connected');
     expect(el.textContent).toContain('1 slots free');
     expect(el.textContent).toContain('design_doc_update, strategic_review');
   });
 
-  test('live all-capability runner counts as strategic-capable', async () => {
+  test('backend device status renders connected, stale, and offline row labels', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        id: 'runner-connected',
+        hostname: 'connected-host',
+        capabilities: { task_types: ['compute_experiment'], has_gpu: false, max_concurrent: 2 },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          seconds_since_last_seen: 12,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 2,
+          available_slots: 2,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+        },
+      },
+      {
+        ...SAMPLE_RUNNERS[0],
+        id: 'runner-stale',
+        hostname: 'stale-host',
+        capabilities: { task_types: ['compute_experiment'], has_gpu: false, max_concurrent: 2 },
+        health: {
+          device_status: 'stale',
+          device_status_reason: 'heartbeat_stale',
+          is_live: false,
+          seconds_since_last_seen: 480,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 2,
+          available_slots: 2,
+          stale_reason: 'heartbeat_stale',
+          agent_available: true,
+          liveness_window_seconds: 300,
+        },
+      },
+      {
+        ...SAMPLE_RUNNERS[0],
+        id: 'runner-offline',
+        hostname: 'offline-host',
+        status: 'inactive',
+        capabilities: { task_types: ['compute_experiment'], has_gpu: false, max_concurrent: 2 },
+        health: {
+          device_status: 'offline',
+          device_status_reason: 'inactive',
+          is_live: false,
+          seconds_since_last_seen: 30,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 2,
+          available_slots: 2,
+          stale_reason: 'inactive',
+          agent_available: true,
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+    const rows = [...el.querySelectorAll('[data-testid="fleet-runner-row"]')];
+
+    expect(rows).toHaveLength(3);
+    expect(el.textContent).toContain('connected');
+    expect(el.textContent).toContain('1/3');
+    expect(rows[0].textContent).toContain('connected');
+    expect(rows[1].textContent).toContain('stale');
+    expect(rows[2].textContent).toContain('offline');
+    expect(rows[2].textContent).toContain('offline (deactivated)');
+  });
+
+  test('backend device status wins over legacy is_live fallback', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        id: 'runner-stale-live',
+        hostname: 'stale-live-host',
+        capabilities: { task_types: ['compute_experiment'], has_gpu: false, max_concurrent: 2 },
+        health: {
+          device_status: 'stale',
+          device_status_reason: 'heartbeat_stale',
+          is_live: true,
+          seconds_since_last_seen: 480,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 2,
+          available_slots: 2,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    expect(el.textContent).toContain('stale');
+    expect(el.textContent).toContain('0/1');
+    expect(el.querySelector('[data-testid="fleet-runner-work-capacity"]')?.textContent).toBe('0/-');
+  });
+
+  test('connected all-capability runner counts as strategic-capable', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([
       {
         ...SAMPLE_RUNNERS[0],
         capabilities: { task_types: 'all', has_gpu: false, max_concurrent: 2 },
         health: {
+          device_status: 'connected',
+          device_status_reason: null,
           is_live: true,
           seconds_since_last_seen: 12,
           active_task_count: 0,
@@ -347,7 +457,7 @@ describe('FleetRunnersPanel — behavioral', () => {
     ]);
     const el = await mount();
 
-    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('1 live');
+    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('1 connected');
     expect(el.textContent).toContain('Strategic capable');
   });
 
@@ -380,13 +490,13 @@ describe('FleetRunnersPanel — behavioral', () => {
     const el = await mount();
 
     expect(el.querySelector('[data-testid="fleet-runner-work-capacity"]')?.textContent).toBe('0/-');
-    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('none live');
+    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('none connected');
     expect(el.textContent).toContain('offline (deactivated)');
     expect(el.textContent).not.toContain('1 active');
     expect(el.textContent).not.toContain('2 slots free');
   });
 
-  test('local-only compute warning appears when no live compute runner exists', async () => {
+  test('local-only compute warning appears when no connected compute runner exists', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([
       {
         ...SAMPLE_RUNNERS[0],
@@ -421,7 +531,7 @@ describe('FleetRunnersPanel — behavioral', () => {
     await act(async () => {});
 
     expect(host.textContent).toContain('Local-only compute is enabled');
-    expect(host.textContent).toContain('wait until a live compute-capable runner connects');
+    expect(host.textContent).toContain('wait until a connected compute-capable runner is available');
   });
 
   test('empty state renders when no runners enrolled', async () => {
