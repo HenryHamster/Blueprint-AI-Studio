@@ -37,9 +37,27 @@ function makeMsg(overrides: Partial<ProjectMessage> = {}): ProjectMessage {
 
 async function renderPanel(root: Root, messages: ProjectMessage[], props: Partial<MessagesPanelProps> = {}) {
   const { apiFetch } = await import('../api');
-  (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-    new Response(JSON.stringify({ messages }), { status: 200 }),
-  );
+  if (props.filterChrome === 'minimal') {
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (/\/api\/admin\/projects\/[^/]+\/strategic-session$/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({
+          conversation: { limit: 20, has_more: false, order: 'oldest_first', items: messages },
+          recent_outputs: [],
+          session: {},
+          status: 'unavailable',
+          location: 'unavailable',
+          status_reason: 'no_runner',
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+  } else {
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify({ messages }), { status: 200 }),
+    );
+  }
   await act(async () => {
     root.render(
       <MessagesPanel

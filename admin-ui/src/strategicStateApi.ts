@@ -323,6 +323,61 @@ export interface StrategicWorkSession {
   context_sources?: StrategicContextPackageSource[];
 }
 
+export interface StrategicSessionConversation {
+  limit: number;
+  has_more?: boolean;
+  order?: 'oldest_first' | 'newest_first' | string;
+  items: StrategicStateMessage[];
+}
+
+export interface StrategicSessionOutput {
+  kind: 'message' | 'cycle' | string;
+  id: string | null;
+  message_type: string;
+  from_type: string;
+  from_task_id?: string | null;
+  content: string;
+  status: string | null;
+  created_at?: string | null;
+  context?: Record<string, unknown>;
+}
+
+export interface StrategicSessionResponse {
+  project_id: string;
+  status: string;
+  location: string;
+  status_reason?: string | null;
+  session: StrategicWorkSession & {
+    status?: string;
+    location?: string;
+    status_reason?: string | null;
+    conversation?: StrategicSessionConversation;
+    recent_outputs?: StrategicSessionOutput[];
+  };
+  workbench?: StrategicWorkbenchState | null;
+  strategic?: StrategicStateResponse['strategic'];
+  runtime?: StrategicStateResponse['runtime'];
+  context_package?: StrategicContextPackageDescriptor | null;
+  conversation: StrategicSessionConversation;
+  recent_outputs: StrategicSessionOutput[];
+  arming?: string | null;
+}
+
+export interface StrategicSessionMessageCreate {
+  content: string;
+  message_type?: string;
+  context?: Record<string, unknown>;
+  workbench_context?: Record<string, unknown>;
+  idempotency_key?: string;
+}
+
+export interface StrategicSessionMessageResponse {
+  id: string;
+  status: 'created' | 'duplicate' | string;
+  arming?: string | null;
+  message?: StrategicStateMessage;
+}
+
 export interface StrategicStateResponse {
   project_id: string;
   strategic: {
@@ -476,4 +531,32 @@ export async function updateStrategicWorkbenchState(
   if (!res.ok) throw new Error(`Failed to update Strategic workbench state: ${res.status}`);
   const data = await res.json() as { workbench: StrategicWorkbenchState };
   return data.workbench;
+}
+
+export async function fetchStrategicSession(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<StrategicSessionResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-session`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch Strategic session: ${res.status}`);
+  return res.json() as Promise<StrategicSessionResponse>;
+}
+
+export async function createStrategicSessionMessage(
+  projectId: string,
+  payload: StrategicSessionMessageCreate,
+): Promise<StrategicSessionMessageResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/strategic-session/messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Failed to create Strategic session message: ${res.status}`);
+  return res.json() as Promise<StrategicSessionMessageResponse>;
 }

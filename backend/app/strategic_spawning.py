@@ -4121,7 +4121,7 @@ def _build_freshness_shas_block(currency: dict) -> dict:
     is_stale = not currency["current"]
     return {
         "verdict": "stale" if is_stale else "fresh",
-        "checked_at": datetime.utcnow().isoformat(),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
         "payload_sha": currency["candidate_sha"],
         "payload_compiled_sha": currency["candidate_sha"],
         "active_candidate_sha": currency["candidate_sha"],
@@ -4143,7 +4143,7 @@ def _build_unknown_freshness_block() -> dict:
 
     return {
         "verdict": "unknown",
-        "checked_at": datetime.utcnow().isoformat(),
+        "checked_at": datetime.now(timezone.utc).isoformat(),
     }
 
 

@@ -67,6 +67,25 @@ function _setupApiFetchMock(opts: {
     if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
       return new Response(JSON.stringify({ last_seen_at: lastSeenAt }), { status: 200 });
     }
+    if (/\/api\/admin\/projects\/[^/]+\/strategic-session$/.test(urlStr) && method === 'GET') {
+      const msgs = queue
+        ? queue[Math.min(qIdx, queue.length - 1)]
+        : defaultMessages;
+      if (queue) qIdx += 1;
+      return new Response(JSON.stringify({
+        conversation: {
+          limit: 20,
+          has_more: false,
+          order: 'oldest_first',
+          items: msgs,
+        },
+        recent_outputs: [],
+        session: {},
+        status: 'unavailable',
+        location: 'unavailable',
+        status_reason: 'no_runner',
+      }), { status: 200 });
+    }
     if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
       const msgs = queue
         ? queue[Math.min(qIdx, queue.length - 1)]
@@ -107,6 +126,20 @@ function _messagesGetCalls(): unknown[][] {
     const url = String(c[0]);
     const init = c[1] as RequestInit | undefined;
     return /\/api\/admin\/messages(\?|$)/.test(url) && (!init?.method || init.method === 'GET');
+  });
+}
+function _strategicSessionGetCalls(): unknown[][] {
+  return vi.mocked(apiFetch).mock.calls.filter((c) => {
+    const url = String(c[0]);
+    const init = c[1] as RequestInit | undefined;
+    return /\/api\/admin\/projects\/[^/]+\/strategic-session$/.test(url) && (!init?.method || init.method === 'GET');
+  });
+}
+function _strategicSessionMessagePostCalls(): unknown[][] {
+  return vi.mocked(apiFetch).mock.calls.filter((c) => {
+    const url = String(c[0]);
+    const init = c[1] as RequestInit | undefined;
+    return /\/api\/admin\/projects\/[^/]+\/strategic-session\/messages$/.test(url) && init?.method === 'POST';
   });
 }
 
@@ -616,6 +649,31 @@ describe('MessagesPanel chrome modes', () => {
     expect(filterToggle(el)?.getAttribute('aria-expanded')).toBe('false');
   });
 
+  test('minimal chat loads conversation from the Strategic session facade', async () => {
+    const strategic = makeMsg({
+      id: 'strategic-session-message',
+      from_type: 'strategic',
+      message_type: 'NOTE',
+      content: 'Session-backed Strategic reply',
+      created_at: '2026-06-01T10:00:00Z',
+    });
+
+    const el = await renderPanel({ filterChrome: 'minimal' }, [strategic]);
+
+    expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(1);
+    expect(_messagesGetCalls()).toHaveLength(0);
+    expect(el.textContent).toContain('Session-backed Strategic reply');
+  });
+
+  test('full message chrome still loads from the generic messages endpoint', async () => {
+    await renderPanel({}, [
+      makeMsg({ id: 'generic-message', content: 'Generic triage message' }),
+    ]);
+
+    expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1);
+    expect(_strategicSessionGetCalls()).toHaveLength(0);
+  });
+
   test('minimal chat chrome shows the compact Strategic context package strip', async () => {
     const el = await renderPanel({
       filterChrome: 'minimal',
@@ -828,6 +886,45 @@ describe('MessagesPanel chrome modes', () => {
       Element.prototype.scrollIntoView = originalScrollIntoView;
       HTMLElement.prototype.scrollTo = originalScrollTo;
     }
+  });
+
+  test('minimal chat question replies still resolve through the generic message patch', async () => {
+    const question = makeMsg({
+      id: 'question-target',
+      from_type: 'agent',
+      message_type: 'QUESTION',
+      content: 'Should I keep the local runner online?',
+      status: 'open',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      targetMessage: { messageId: 'question-target', action: 'reply' },
+    }, [question]);
+
+    await waitFor(() => expect(el.textContent).toContain('Replying to Agent'));
+    const textarea = el.querySelector('textarea') as HTMLTextAreaElement;
+    const sendButton = [...el.querySelectorAll('button')]
+      .find(button => button.getAttribute('aria-label') === 'Send message') as HTMLButtonElement | undefined;
+    if (!sendButton) throw new Error('Expected send button');
+
+    const { fireEvent } = await import('@testing-library/react');
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: 'Keep it online.' } });
+    });
+    await act(async () => {
+      sendButton.click();
+    });
+
+    await waitFor(() => {
+      const patchCall = vi.mocked(apiFetch).mock.calls.find(call => {
+        const url = String(call[0]);
+        const init = call[1] as RequestInit | undefined;
+        return url.includes('/api/admin/messages/question-target') && init?.method === 'PATCH';
+      });
+      expect(patchCall).toBeTruthy();
+    });
+    expect(_strategicSessionMessagePostCalls()).toHaveLength(0);
   });
 
   test('minimal chat chrome keeps queued and working state in the compact strip only', async () => {
@@ -5009,9 +5106,19 @@ describe('MessagesPanel composer draft persistence', () => {
       const urlStr = String(url);
       const initObj = init as RequestInit | undefined;
       const method = initObj?.method ?? 'GET';
-      if (method === 'POST' && urlStr.includes('/api/admin/messages')) {
+      if (method === 'POST' && /\/api\/admin\/projects\/[^/]+\/strategic-session\/messages$/.test(urlStr)) {
         postedBodies.push(JSON.parse(String(initObj?.body ?? '{}')));
         return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
+      }
+      if (method === 'GET' && /\/api\/admin\/projects\/[^/]+\/strategic-session$/.test(urlStr)) {
+        return new Response(JSON.stringify({
+          conversation: { limit: 20, has_more: false, order: 'oldest_first', items: [] },
+          recent_outputs: [],
+          session: {},
+          status: 'unavailable',
+          location: 'unavailable',
+          status_reason: 'no_runner',
+        }), { status: 200 });
       }
       if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
         return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
@@ -5067,7 +5174,7 @@ describe('MessagesPanel composer draft persistence', () => {
         }}
       />,
     );
-    await waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1));
+    await waitFor(() => expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(1));
 
     const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
     expect(textarea.value).toBe('use the clean chat path');
@@ -5082,8 +5189,8 @@ describe('MessagesPanel composer draft persistence', () => {
     });
 
     await waitFor(() => expect(postedBodies).toHaveLength(1));
+    expect(_strategicSessionMessagePostCalls()).toHaveLength(1);
     expect(postedBodies[0]).toMatchObject({
-      project_id: 'proj-draft',
       message_type: 'FEEDBACK',
       content: 'use the clean chat path',
       workbench_context: {
@@ -5097,6 +5204,7 @@ describe('MessagesPanel composer draft persistence', () => {
         context_package_id: 'strategic-context:proj-draft',
       },
     });
+    expect(postedBodies[0]).not.toHaveProperty('project_id');
   });
 
   test('stale Strategic workbench state does not keep routing workbench_context', async () => {
@@ -5107,9 +5215,19 @@ describe('MessagesPanel composer draft persistence', () => {
       const urlStr = String(url);
       const initObj = init as RequestInit | undefined;
       const method = initObj?.method ?? 'GET';
-      if (method === 'POST' && urlStr.includes('/api/admin/messages')) {
+      if (method === 'POST' && /\/api\/admin\/projects\/[^/]+\/strategic-session\/messages$/.test(urlStr)) {
         postedBodies.push(JSON.parse(String(initObj?.body ?? '{}')));
         return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
+      }
+      if (method === 'GET' && /\/api\/admin\/projects\/[^/]+\/strategic-session$/.test(urlStr)) {
+        return new Response(JSON.stringify({
+          conversation: { limit: 20, has_more: false, order: 'oldest_first', items: [] },
+          recent_outputs: [],
+          session: {},
+          status: 'unavailable',
+          location: 'unavailable',
+          status_reason: 'no_runner',
+        }), { status: 200 });
       }
       if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
         return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
@@ -5121,7 +5239,7 @@ describe('MessagesPanel composer draft persistence', () => {
     });
 
     _suppressSinceLastVisit('test-user@example.com', 'proj-draft');
-    const { container, getByText } = render(
+    const { container } = render(
       <MessagesPanel
         selectedProjectId="proj-draft"
         variant="page"
@@ -5159,7 +5277,7 @@ describe('MessagesPanel composer draft persistence', () => {
         }}
       />,
     );
-    await waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1));
+    await waitFor(() => expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(1));
 
     const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
     expect(textarea.value).toBe('');
@@ -5169,12 +5287,16 @@ describe('MessagesPanel composer draft persistence', () => {
       fireEvent.change(textarea, { target: { value: 'stale workbench should not route' } });
     });
 
+    const sendButton = container.querySelector('button[aria-label="Send message"]') as HTMLButtonElement | null;
+    if (!sendButton) throw new Error('Expected send button');
     await act(async () => {
-      getByText('Send').click();
+      sendButton.click();
     });
 
     await waitFor(() => expect(postedBodies).toHaveLength(1));
+    expect(_strategicSessionMessagePostCalls()).toHaveLength(1);
     expect(postedBodies[0]).not.toHaveProperty('workbench_context');
+    expect(postedBodies[0]).not.toHaveProperty('project_id');
   });
 
   test('draft is scoped per project — switching projects loads the new project draft', async () => {

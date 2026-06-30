@@ -23,7 +23,14 @@ import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { DirectionsAddForm } from './DirectionsAddForm';
-import type { StrategicContextPackageDescriptor, StrategicMessageTarget, StrategicStateResponse, StrategicWorkbenchState } from '../strategicStateApi';
+import {
+  createStrategicSessionMessage,
+  fetchStrategicSession,
+  type StrategicContextPackageDescriptor,
+  type StrategicMessageTarget,
+  type StrategicStateResponse,
+  type StrategicWorkbenchState,
+} from '../strategicStateApi';
 import { buildStrategicContextDescriptor, SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
 
 const DEFAULT_VIEW_ID = '__default__';
@@ -556,7 +563,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     setTempMutes(loadTemporaryMutes(auth.currentUser?.email, selectedProjectId));
     setWebhookStats(null);
     optimisticStrategicRefreshRef.current = null;
-    if (!usesStrategicReadModel) setStrategicRefresh(null);
+    if (!usesStrategicReadModelRef.current) setStrategicRefresh(null);
     setMuteWindow(loadMuteWindow(auth.currentUser?.email, selectedProjectId));
     const lastSeen = loadLastSeen(auth.currentUser?.email, selectedProjectId);
     setDividerTime(lastSeen);
@@ -947,11 +954,25 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       setTempMutes(cleaned);
       saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, cleaned);
     }
-  }, [selectedProjectId]);
+  }, [selectedProjectId, tempMutes]);
 
   const fetchMessages = useCallback(async () => {
     if (!selectedProjectId) { setLoading(false); return; }
     try {
+      if (conversationMode) {
+        const session = await fetchStrategicSession(selectedProjectId);
+        const sessionMessages = session.conversation?.items ?? [];
+        sessionMessages.forEach(m => seenMessageIdsRef.current.add(m.id));
+        hasInitiallyLoadedRef.current = true;
+        setMessages(prev => {
+          if (prev.length === sessionMessages.length && prev.every((m, i) => m.id === sessionMessages[i].id && m.status === sessionMessages[i].status)) return prev;
+          return sessionMessages;
+        });
+        if (!usesStrategicReadModelRef.current) {
+          onMessageCountChange?.(countHighSignalMessages(sessionMessages, eventPrefsRef.current, tempMutesRef.current));
+        }
+        return;
+      }
       const params = new URLSearchParams({ project_id: selectedProjectId, status: 'all', limit: searchQuery.trim() ? '200' : '100' });
       if (searchQuery.trim()) params.set('q', searchQuery.trim());
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`);
@@ -1050,7 +1071,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     } finally {
       setLoading(false);
     }
-  }, [selectedProjectId, onMessageCountChange, eventPrefs, searchQuery, usesStrategicReadModel]);
+  }, [conversationMode, selectedProjectId, onMessageCountChange, searchQuery, usesStrategicReadModel]);
 
   usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
 
@@ -1083,8 +1104,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // countHighSignalMessages(messages), identical to the fetch callback and the closed-panel
   // App.tsx path, so the badge stays stable across open/closed transitions.
   useEffect(() => {
+    if (conversationMode && usesStrategicReadModel) return;
     onMessageCountChange?.(highSignalCount);
-  }, [highSignalCount, onMessageCountChange]);
+  }, [conversationMode, highSignalCount, onMessageCountChange, usesStrategicReadModel]);
 
   // Track scroll position for "scroll to bottom" button
   useEffect(() => {
@@ -1169,6 +1191,45 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         idempotencyKeyRef.current = generateIdempotencyKey();
       }
       const submittedContent = newContent.trim();
+      if (conversationMode && !replyTo) {
+        const data = await createStrategicSessionMessage(selectedProjectId, {
+          message_type: effectiveNewType,
+          content: submittedContent,
+          idempotency_key: idempotencyKeyRef.current,
+          ...(Object.keys(context).length > 0 ? { context } : {}),
+          ...(workbenchContext ? { workbench_context: workbenchContext } : {}),
+        });
+        const arming = parseArmingOutcome(data?.arming);
+        idempotencyKeyRef.current = null;
+        setNewContent('');
+        clearComposerDraft(auth.currentUser?.email, selectedProjectId);
+        setReplyTo(null);
+        setLastArming(arming);
+        if (textareaRef.current) textareaRef.current.style.height = 'auto';
+        addToast(armingToastCopy(arming), arming === 'not_armed' ? 'info' : 'success');
+        let didRefreshStrategicState = false;
+        if (arming === 'steering') {
+          const optimisticRefresh = {
+            requested_at: new Date().toISOString(),
+            origin: 'operator',
+            reason: 'operator_message',
+            count: 1,
+            operator_count: 1,
+            excerpt: submittedContent,
+          };
+          optimisticStrategicRefreshRef.current = optimisticRefresh;
+          setStrategicRefresh(optimisticRefresh);
+          void refreshStrategicState?.();
+          didRefreshStrategicState = true;
+        } else if (arming === 'duplicate') {
+          void refreshStrategicState?.();
+          didRefreshStrategicState = true;
+        }
+        await fetchMessages();
+        if (!didRefreshStrategicState) void refreshStrategicState?.();
+        recordStrategicInteraction();
+        return;
+      }
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

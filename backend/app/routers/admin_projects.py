@@ -14,12 +14,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, delete
-from sqlalchemy import update
+from sqlalchemy import and_, func, or_, update
 from sqlalchemy.exc import IntegrityError
 from typing import Dict, Any, List
 import uuid
 from datetime import timedelta
-from sqlalchemy import func
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -51,6 +50,7 @@ from app.ci_resolution import (
 )
 from app.capability_proof import enrich_problem_model_capability_proofs
 from app.message_convergence import LINKED_STATUS, OPEN_STATUS
+from app.notification_dispatch import HIGH_SIGNAL_NOTE_EVENT_TYPES
 from app.operator_attention import build_operator_attention
 from app.project_message_projection import message_event_payload, message_preview_dict
 from app.problem_model import compute_model_size_signal, ProblemModel
@@ -366,6 +366,29 @@ class StrategicSessionMessageCreate(BaseModel):
 
 _SESSION_CONVERSATION_LIMIT = 20
 _SESSION_OUTPUT_LIMIT = 8
+_SESSION_CONVERSATION_FROM_TYPES = ("user", "operator", "strategic", "strategist")
+_SESSION_CONVERSATION_MESSAGE_TYPES = (
+    MessageType.QUESTION,
+    MessageType.BLOCKER,
+    MessageType.BUG_REPORT,
+    MessageType.FEEDBACK,
+)
+_SESSION_CONVERSATION_EVENT_TYPES = frozenset(
+    {"question_answer", "feedback_acknowledgment", *HIGH_SIGNAL_NOTE_EVENT_TYPES}
+)
+
+
+def _session_conversation_predicate():
+    return or_(
+        ProjectMessage.from_type.in_(_SESSION_CONVERSATION_FROM_TYPES),
+        ProjectMessage.message_type.in_(_SESSION_CONVERSATION_MESSAGE_TYPES),
+        and_(
+            ProjectMessage.message_type == MessageType.NOTE,
+            ProjectMessage.context["event_type"]
+            .as_string()
+            .in_(list(_SESSION_CONVERSATION_EVENT_TYPES)),
+        ),
+    )
 
 
 def _is_live_strategic_task(task: Task | None) -> bool:
@@ -376,8 +399,9 @@ def _message_preview(
     message: ProjectMessage,
     *,
     context_package: Dict[str, Any] | None = None,
+    content_max_chars: int | None = 280,
 ) -> Dict[str, Any]:
-    preview = message_preview_dict(message)
+    preview = message_preview_dict(message, content_max_chars=content_max_chars)
     context = preview.get("context")
     strategic_session = (
         context.get("strategic_session")
@@ -491,19 +515,33 @@ async def _recent_session_conversation(
     project_id: uuid.UUID,
     *,
     context_package: Dict[str, Any] | None,
-) -> list[Dict[str, Any]]:
+) -> Dict[str, Any]:
     rows = (
         await session.execute(
             select(ProjectMessage)
-            .where(ProjectMessage.project_id == project_id)
+            .where(
+                ProjectMessage.project_id == project_id,
+                _session_conversation_predicate(),
+            )
             .order_by(ProjectMessage.created_at.desc())
-            .limit(_SESSION_CONVERSATION_LIMIT)
+            .limit(_SESSION_CONVERSATION_LIMIT + 1)
         )
     ).scalars().all()
-    return [
-        _message_preview(message, context_package=context_package)
-        for message in rows
-    ]
+    visible_rows = list(rows[:_SESSION_CONVERSATION_LIMIT])
+    visible_rows.reverse()
+    return {
+        "limit": _SESSION_CONVERSATION_LIMIT,
+        "has_more": len(rows) > _SESSION_CONVERSATION_LIMIT,
+        "order": "oldest_first",
+        "items": [
+            _message_preview(
+                message,
+                context_package=context_package,
+                content_max_chars=None,
+            )
+            for message in visible_rows
+        ],
+    }
 
 
 async def _recent_session_outputs(
@@ -574,10 +612,7 @@ async def _build_strategic_session_response(
             "location": status["location"],
             "status_reason": status["reason"],
             "runtime": local_runner,
-            "conversation": {
-                "limit": _SESSION_CONVERSATION_LIMIT,
-                "items": conversation,
-            },
+            "conversation": conversation,
             "recent_outputs": recent_outputs,
         }
     )
@@ -594,6 +629,31 @@ async def _build_strategic_session_response(
         "conversation": work_session["conversation"],
         "recent_outputs": recent_outputs,
     }
+
+
+async def _message_preview_for_session_response(
+    request: Request,
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    current_user: dict,
+    message: ProjectMessage,
+) -> Dict[str, Any]:
+    state_response = await get_project_strategic_state(
+        request,
+        project_id,
+        session=session,
+        current_user=current_user,
+    )
+    context_package = (
+        state_response.get("context_package")
+        if isinstance(state_response.get("context_package"), dict)
+        else None
+    )
+    return _message_preview(
+        message,
+        context_package=context_package,
+        content_max_chars=None,
+    )
 
 
 def _task_summary(task: Task | None) -> Dict[str, Any] | None:
@@ -1423,11 +1483,18 @@ async def create_project_strategic_session_message(
             )
         ).scalar_one_or_none()
         if existing is not None:
+            message_preview = await _message_preview_for_session_response(
+                request,
+                session,
+                project_id,
+                current_user,
+                existing,
+            )
             return {
                 "id": str(existing.id),
                 "status": "duplicate",
                 "arming": "duplicate",
-                "message": _message_preview(existing),
+                "message": message_preview,
             }
 
     ctx = dict(payload.context or {})
@@ -1444,11 +1511,17 @@ async def create_project_strategic_session_message(
         if warning:
             ctx = {**ctx, "_provenance_warnings": warning}
 
+    await upsert_strategic_workbench_state_with_previous(
+        session,
+        current_user["user_id"],
+        project_id,
+        payload.workbench_context or {},
+    )
     strategic_session = await build_message_strategic_session_snapshot(
         session,
         current_user["user_id"],
         project_id,
-        payload.workbench_context,
+        None,
     )
     if strategic_session:
         ctx = {**ctx, "strategic_session": strategic_session}
@@ -1478,16 +1551,22 @@ async def create_project_strategic_session_message(
                 )
             ).scalar_one_or_none()
             if existing is not None:
+                message_preview = await _message_preview_for_session_response(
+                    request,
+                    session,
+                    project_id,
+                    current_user,
+                    existing,
+                )
                 return {
                     "id": str(existing.id),
                     "status": "duplicate",
                     "arming": "duplicate",
-                    "message": _message_preview(existing),
+                    "message": message_preview,
                 }
         raise
     await session.refresh(msg)
     message_id = str(msg.id)
-    message_preview = _message_preview(msg)
     message_event = message_event_payload(msg)
 
     arming = await maybe_arm_operator_refresh(
@@ -1498,6 +1577,16 @@ async def create_project_strategic_session_message(
     )
     if arming == ARMING_STEERING:
         await session.commit()
+    msg = await session.get(ProjectMessage, uuid.UUID(message_id))
+    if msg is None:
+        raise HTTPException(status_code=500, detail="Created message could not be reloaded")
+    message_preview = await _message_preview_for_session_response(
+        request,
+        session,
+        project_id,
+        current_user,
+        msg,
+    )
     await broadcast_to_project(str(project_id), "message_created", message_event)
     return {
         "id": message_id,

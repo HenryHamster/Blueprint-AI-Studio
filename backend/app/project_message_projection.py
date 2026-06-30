@@ -132,7 +132,7 @@ def message_preview_dict(
     message: ProjectMessage,
     *,
     context_keys: Iterable[str] = DEFAULT_MESSAGE_CONTEXT_PREVIEW_KEYS,
-    content_max_chars: int = 280,
+    content_max_chars: int | None = 280,
     context_max_chars: int = 120,
 ) -> dict[str, Any]:
     base = project_message_base(message)
@@ -150,6 +150,10 @@ def message_preview_dict(
             context_preview["strategic_session"] = strategic_session
     return {
         **base,
-        "content": compact_text(base["content"], max_chars=content_max_chars) or "",
+        "content": (
+            base["content"]
+            if content_max_chars is None
+            else compact_text(base["content"], max_chars=content_max_chars) or ""
+        ),
         "context": context_preview,
     }

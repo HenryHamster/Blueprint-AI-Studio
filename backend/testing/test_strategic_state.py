@@ -1,5 +1,5 @@
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -903,6 +903,7 @@ async def test_strategic_session_endpoint_resumes_persisted_state_and_outputs(
 ):
     project = await _make_project(db_session)
     last_interaction_at = _utcnow().isoformat()
+    long_operator_content = "What should I watch next? " + ("x" * 500)
     db_session.add(
         MessagesNoisePrefs(
             user_id=TEST_USER_ID,
@@ -929,7 +930,7 @@ async def test_strategic_session_endpoint_resumes_persisted_state_and_outputs(
         project_id=project.id,
         message_type=MessageType.QUESTION,
         from_type="user",
-        content="What should I watch next?",
+        content=long_operator_content,
         status="resolved",
     )
     strategic_message = ProjectMessage(
@@ -973,13 +974,95 @@ async def test_strategic_session_endpoint_resumes_persisted_state_and_outputs(
         }
     ]
     assert data["session"]["id"] == repeat["session"]["id"]
+    assert data["conversation"]["limit"] == 20
+    assert data["conversation"]["has_more"] is False
+    assert data["conversation"]["order"] == "oldest_first"
     conversation_ids = {item["id"] for item in data["conversation"]["items"]}
     assert str(user_message.id) in conversation_ids
     assert str(strategic_message.id) in conversation_ids
+    conversation_by_id = {item["id"]: item for item in data["conversation"]["items"]}
+    assert conversation_by_id[str(user_message.id)]["content"] == long_operator_content
     output_contents = [item["content"] for item in data["recent_outputs"]]
     assert "Strategic refreshed the local operator session." in output_contents
     assert "Watch the local Strategic runner registration path." in output_contents
     assert "What should I watch next?" not in output_contents
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_conversation_marks_more_history(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(minutes=30)
+    messages = [
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user" if index % 2 == 0 else "strategic",
+            content=f"session row {index:02d}",
+            created_at=base_time + timedelta(minutes=index),
+        )
+        for index in range(21)
+    ]
+    db_session.add_all(messages)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-session")
+
+    assert resp.status_code == 200, resp.text
+    conversation = resp.json()["conversation"]
+    assert conversation["limit"] == 20
+    assert conversation["has_more"] is True
+    assert conversation["order"] == "oldest_first"
+    contents = [item["content"] for item in conversation["items"]]
+    assert contents == [f"session row {index:02d}" for index in range(1, 21)]
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_conversation_filters_routine_before_limit(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(hours=2)
+    chat_messages = [
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content="operator asks about the workday",
+            created_at=base_time,
+        ),
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="strategic",
+            content="strategic replies with the current plan",
+            created_at=base_time + timedelta(minutes=1),
+        ),
+    ]
+    routine_messages = [
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content=f"routine status row {index:02d}",
+            context={"event_type": "pr_merged"},
+            created_at=base_time + timedelta(hours=1, minutes=index),
+        )
+        for index in range(25)
+    ]
+    db_session.add_all([*chat_messages, *routine_messages])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-session")
+
+    assert resp.status_code == 200, resp.text
+    conversation = resp.json()["conversation"]
+    assert conversation["has_more"] is False
+    assert [item["content"] for item in conversation["items"]] == [
+        "operator asks about the workday",
+        "strategic replies with the current plan",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1107,6 +1190,87 @@ async def test_strategic_session_message_records_operator_message_and_snapshot(
 
 
 @pytest.mark.asyncio
+async def test_strategic_session_message_response_enriches_selected_refs(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    long_content = "Use the canvas context when replying. " + ("y" * 500)
+
+    body = {
+        "message_type": "FEEDBACK",
+        "content": long_content,
+        "idempotency_key": "strategic-session-full-receipt",
+        "workbench_context": {
+            "interaction_mode": "continuous",
+            "active_surface": "project",
+            "selected_refs": [
+                {"kind": "canvas", "id": f"strategic-canvas:{project.id}"}
+            ],
+        },
+    }
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json=body,
+    )
+    duplicate = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json=body,
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert duplicate.status_code == 200, duplicate.text
+    message = resp.json()["message"]
+    duplicate_message = duplicate.json()["message"]
+    assert message["content"] == long_content
+    assert duplicate.json()["status"] == "duplicate"
+    assert duplicate_message["content"] == long_content
+    strategic_session = message["context"]["strategic_session"]
+    duplicate_session = duplicate_message["context"]["strategic_session"]
+    descriptors = strategic_session["selected_ref_descriptors"]
+    duplicate_descriptors = duplicate_session["selected_ref_descriptors"]
+    assert len(descriptors) == 1
+    assert descriptors[0]["kind"] == "canvas"
+    assert descriptors[0]["id"] == f"strategic-canvas:{project.id}"
+    assert descriptors[0]["label"] == "Strategic context map"
+    assert descriptors[0]["summary"]
+    assert descriptors[0]["target"] == {
+        "surface": "project",
+        "section": "problem-model",
+    }
+    assert duplicate_descriptors == descriptors
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_message_response_survives_arming_rollback(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+
+    async def _rollback_and_decline(session, *_args, **_kwargs):
+        await session.rollback()
+        return "not_armed"
+
+    with patch(
+        "app.routers.admin_projects.maybe_arm_operator_refresh",
+        side_effect=_rollback_and_decline,
+    ):
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/strategic-session/messages",
+            json={
+                "message_type": "FEEDBACK",
+                "content": "This should still return a durable message receipt.",
+            },
+        )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["status"] == "created"
+    assert data["arming"] == "not_armed"
+    assert data["message"]["id"] == data["id"]
+    assert data["message"]["content"] == "This should still return a durable message receipt."
+
+
+@pytest.mark.asyncio
 async def test_strategic_session_note_message_is_passive(
     client: AsyncClient, db_session
 ):
@@ -1127,6 +1291,59 @@ async def test_strategic_session_note_message_is_passive(
     assert msg.from_type == "user"
     assert msg.message_type == MessageType.NOTE
     assert msg.content == "Keep this note with the persistent Strategic session."
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_message_touches_workbench_freshness(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    old_interaction_at = (_utcnow() - timedelta(hours=1)).isoformat()
+    db_session.add(
+        MessagesNoisePrefs(
+            user_id=TEST_USER_ID,
+            project_id=project.id,
+            prefs={
+                "_strategic_workbench": {
+                    "version": 1,
+                    "interaction_mode": "monitor",
+                    "active_surface": "pipeline",
+                    "selected_refs": [
+                        {"kind": "task", "id": "task-9", "label": "Watch task"}
+                    ],
+                    "session_started_at": old_interaction_at,
+                    "last_interaction_at": old_interaction_at,
+                }
+            },
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "message_type": "NOTE",
+            "content": "Keep the persistent Strategic session alive.",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["arming"] == "passive_note"
+    stored = (
+        await db_session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.user_id == TEST_USER_ID,
+                MessagesNoisePrefs.project_id == project.id,
+            )
+        )
+    ).scalar_one()
+    workbench = stored.prefs["_strategic_workbench"]
+    assert workbench["interaction_mode"] == "monitor"
+    assert workbench["active_surface"] == "pipeline"
+    assert workbench["selected_refs"] == [
+        {"kind": "task", "id": "task-9", "label": "Watch task"}
+    ]
+    assert datetime.fromisoformat(workbench["last_interaction_at"]) > datetime.fromisoformat(old_interaction_at)
 
 
 @pytest.mark.asyncio
