@@ -275,6 +275,61 @@ describe('MessagesPanel — viewport regression', () => {
     expect(strip!.textContent).not.toContain('canvas nodes');
   });
 
+  test('minimal chat composer aligns to the conversation column at desktop widths', async () => {
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderPanel(r, [
+        makeMsg({ id: 'conversation-alignment', message_type: 'FEEDBACK', from_type: 'operator', content: 'Align this message column with the composer.' }),
+      ], {
+        variant: 'page',
+        filterChrome: 'minimal',
+        showCloseButton: false,
+        strategicState: {
+          project_id: 'project-123',
+          strategic: {
+            active_cycle: null,
+            active_task: null,
+            active_phase: null,
+            latest_cycle: null,
+            refresh: { pending: null, last_fired_at: null, last_fired_origin: null },
+          },
+          context_package: {
+            id: 'strategic-context:project-123',
+            title: 'Strategic context',
+            status: 'ready',
+            item_count: 4,
+            token_count: null,
+            canvas: null,
+            sources: [],
+            drilldowns: [],
+          },
+        } as StrategicStateResponse,
+        onOpenCommandPalette: vi.fn(),
+      });
+    });
+
+    if (!host) throw new Error('Expected host to be mounted');
+    const conversationColumn = host.querySelector<HTMLElement>('[data-testid="strategic-conversation-column"]');
+    const composerBox = host.querySelector<HTMLElement>('[data-testid="strategic-composer-box"]');
+    const contextDescriptor = host.querySelector<HTMLElement>('[data-testid="strategic-context-descriptor"]');
+    if (!conversationColumn || !composerBox || !contextDescriptor) {
+      throw new Error('Expected conversation column, context descriptor, and composer box to be rendered');
+    }
+
+    const columnRect = conversationColumn.getBoundingClientRect();
+    const descriptorRect = contextDescriptor.getBoundingClientRect();
+    const composerRect = composerBox.getBoundingClientRect();
+    expect(Math.abs(columnRect.left - descriptorRect.left)).toBeLessThanOrEqual(1);
+    expect(Math.abs(columnRect.right - descriptorRect.right)).toBeLessThanOrEqual(1);
+    expect(Math.abs(columnRect.left - composerRect.left)).toBeLessThanOrEqual(1);
+    expect(Math.abs(columnRect.right - composerRect.right)).toBeLessThanOrEqual(1);
+    expect(composerRect.width).toBeLessThanOrEqual(942);
+  });
+
   test('stale citation warning chip does not overflow at 375px', async () => {
     const msgs = [
       makeMsg({

@@ -64,6 +64,7 @@ export function MessagesComposer({
   // and, when the strategist is mid-cycle, flagging that a steer is queued rather
   // than acting immediately.
   const minimal = chrome === 'minimal';
+  const minimalColumnClass = 'mx-auto w-full max-w-[940px] lg:mx-0';
   const hintArming = minimal && strategistBusy && lastArming !== 'not_armed' ? null : lastArming;
   const hintText = composerHintCopy(newType, hintArming, strategistBusy);
   const showHint = !minimal || Boolean(strategistBusy) || lastArming === 'not_armed';
@@ -78,7 +79,7 @@ export function MessagesComposer({
       )}
       {/* Reply quote bar */}
       {replyTo && (
-        <div className={`${minimal ? 'mx-auto max-w-4xl' : ''} mb-2 flex items-center gap-2 rounded-r-lg border-l-2 border-blue-500/50 bg-neutral-800/60 px-3 py-1.5`}>
+        <div className={`${minimal ? minimalColumnClass : ''} mb-2 flex items-center gap-2 rounded-r-lg border-l-2 border-blue-500/50 bg-neutral-800/60 px-3 py-1.5`}>
           <Reply className="w-3 h-3 text-blue-400 shrink-0" />
           <span className="text-xs text-neutral-400 truncate flex-1">
             Replying to <span className="text-neutral-300">{replyTo.from}</span>: {replyTo.content.slice(0, 80)}{replyTo.content.length > 80 ? '...' : ''}
@@ -88,8 +89,10 @@ export function MessagesComposer({
           </button>
         </div>
       )}
-      <div className={minimal
-        ? 'mx-auto flex w-full max-w-4xl items-end gap-1.5 rounded-md border border-neutral-800 bg-[#10151c] p-1.5 shadow-inner shadow-black/20'
+      <div
+        data-testid={minimal ? 'strategic-composer-box' : undefined}
+        className={minimal
+        ? `${minimalColumnClass} flex items-end gap-1.5 rounded-md border border-neutral-800 bg-[#10151c] p-1.5 shadow-inner shadow-black/20`
         : 'flex gap-2 items-end'
       }>
         {!minimal && (
@@ -142,7 +145,7 @@ export function MessagesComposer({
       {/* Steering hint: grounded in the last send's real outcome when available,
           otherwise predicted from the selected type. */}
       {showHint && (
-        <div className={minimal ? 'mx-auto mt-1.5 w-full max-w-4xl px-1' : ''}>
+        <div className={minimal ? `${minimalColumnClass} mt-1.5 px-1` : ''}>
           <p className={`${minimal ? 'text-ui-md text-neutral-600' : 'text-ui-md text-neutral-500'} leading-snug ${minimal ? '' : 'mt-1.5 px-0.5'}`}>
             {hintText}
           </p>

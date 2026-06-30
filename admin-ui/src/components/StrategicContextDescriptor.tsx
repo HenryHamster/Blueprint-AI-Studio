@@ -36,7 +36,7 @@ export function StrategicContextDescriptor({
       : undefined;
   const className = compact
     ? 'flex max-w-full flex-wrap items-center gap-x-1.5 gap-y-1 text-ui-md leading-snug text-neutral-500'
-    : 'mx-auto mb-2 flex w-full max-w-4xl flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-neutral-800/70 bg-neutral-950/45 px-2 py-1.5 text-ui-md leading-snug text-neutral-500';
+    : 'mx-auto mb-2 flex w-full max-w-[940px] flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-neutral-800/70 bg-neutral-950/45 px-2 py-1.5 text-ui-md leading-snug text-neutral-500 lg:mx-0';
   const testId = compact ? 'strategic-context-receipt' : 'strategic-context-descriptor';
   const content = (
     <>
