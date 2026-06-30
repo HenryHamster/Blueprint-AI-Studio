@@ -31,7 +31,7 @@ from app.models import (
 from app.auth import get_current_user
 from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
-from app.task_locking import lock_project_or_429
+from app.task_locking import lock_project_or_429, with_vision_locked
 from app.message_convergence import LINKED_STATUS
 from app.project_message_creation import (
     create_operator_project_message,
@@ -49,6 +49,7 @@ from app.messages_last_seen import (
 )
 from app.workbench_state import (
     WORKBENCH_STATE_KEY, WORKBENCH_STATE_MAX_BYTES,
+    apply_strategic_local_continuation_marker,
     build_message_strategic_session_snapshot, get_strategic_workbench_state,
     upsert_strategic_workbench_state_with_previous,
     workbench_mode_refresh_excerpt,
@@ -977,6 +978,20 @@ async def put_messages_workbench_state(
         current_user["user_id"],
         pid,
         payload.workbench,
+    )
+
+    def _update_local_continuation_marker(vision: Dict[str, Any]) -> None:
+        apply_strategic_local_continuation_marker(
+            vision,
+            state,
+            operator_user_id=current_user["user_id"],
+        )
+
+    await with_vision_locked(
+        session,
+        pid,
+        _update_local_continuation_marker,
+        skip_locked=False,
     )
     arming = ARMING_PASSIVE_NOTE
     should_arm = workbench_mode_should_arm_strategic_refresh(previous_state, state)
