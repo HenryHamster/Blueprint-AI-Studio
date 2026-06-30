@@ -134,6 +134,7 @@ describe('StrategicContextMap', () => {
       edges: [],
     });
 
-    expect(host.textContent).toContain('No map nodes are available.');
+    expect(host.textContent).toContain('No map nodes are available yet.');
+    expect(host.textContent).toContain('Resources and evidence below can still carry the discussion context.');
   });
 });

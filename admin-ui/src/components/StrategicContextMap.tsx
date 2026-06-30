@@ -53,7 +53,7 @@ function formatUnitCount(value: number, singular: string): string {
 }
 
 function contextKindLabel(kind?: string | null): string {
-  if (kind === 'canvas') return 'map';
+  if (kind === 'canvas') return 'context map';
   if (kind === 'knowledge_document') return 'knowledge';
   if (kind === 'project_section') return 'project';
   return (kind || 'context').replace(/_/g, ' ');
@@ -291,7 +291,7 @@ export function StrategicContextMap({ canvas, onOpenTarget }: StrategicContextMa
     return (
       <section aria-label="Strategic context map overview" data-testid="strategic-context-map">
         <div className="rounded-md border border-dashed border-neutral-800 bg-neutral-950/40 px-3 py-4 text-sm text-neutral-500">
-          No map nodes are available.
+          No map nodes are available yet. Resources and evidence below can still carry the discussion context.
         </div>
       </section>
     );

@@ -2,6 +2,7 @@ import { useEffect, type ReactNode } from 'react';
 import { Activity, ArrowUpRight, CircleAlert, Cpu, GitBranch, Link2, Network, Plus, Server, X } from 'lucide-react';
 import type {
   StrategicContextArtifactEvidence,
+  StrategicContextPackageDescriptor,
   StrategicContextCanvasNode,
   StrategicContextPackageDrilldown,
   StrategicContextResourceRef,
@@ -24,6 +25,7 @@ import {
 import { StrategicContextMap } from './StrategicContextMap';
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
+type StrategicContextCanvas = NonNullable<StrategicContextPackageDescriptor['canvas']>;
 
 interface StrategicContextWorkspaceProps {
   open: boolean;
@@ -58,7 +60,7 @@ function contextStatusTone(status?: string | null): { dot: string; text: string;
 }
 
 function contextKindLabel(kind?: string | null): string {
-  if (kind === 'canvas') return 'map';
+  if (kind === 'canvas') return 'context map';
   if (kind === 'knowledge_document') return 'knowledge';
   if (kind === 'artifact') return 'artifact';
   if (kind === 'task') return 'task';
@@ -74,6 +76,15 @@ function selectedRefFromResource(resource: StrategicContextResourceRef): Strateg
     kind: resource.kind,
     id: resource.id,
     label: resource.label,
+  };
+}
+
+function selectedRefFromCanvas(canvas: StrategicContextCanvas): StrategicSelectedRef | null {
+  if (!canvas.id) return null;
+  return {
+    kind: 'canvas',
+    id: canvas.id,
+    label: canvas.title ?? 'Strategic context map',
   };
 }
 
@@ -131,6 +142,16 @@ function shortId(value?: string | null): string | null {
 function compactDetail(...parts: Array<string | null | undefined>): string | null {
   const detailParts = parts.map(part => part?.trim()).filter((part): part is string => Boolean(part));
   return detailParts.length > 0 ? detailParts.join(' / ') : null;
+}
+
+function canvasSummaryDetail(
+  canvas: StrategicContextCanvas | null,
+  nodeCount: number,
+  edgeCount: number,
+): string {
+  const nodes = canvas?.node_count ?? nodeCount;
+  const edges = canvas?.edge_count ?? edgeCount;
+  return `${formatCompactNumber(nodes)} nodes / ${formatCompactNumber(edges)} links. Keep this map to carry the whole discussion frame into the session.`;
 }
 
 function sessionModeLabel(mode?: string | null): string {
@@ -333,25 +354,36 @@ function ContextRow({
   onRemove?: () => void;
 }) {
   const canOpen = Boolean(target);
+  const bodyClassName = 'min-h-11 min-w-0 flex-1 text-left';
+  const content = (
+    <>
+      <span className="flex min-w-0 items-center gap-2">
+        <span className="truncate text-sm font-semibold text-neutral-100">{label}</span>
+        {badge}
+      </span>
+      <span className="mt-0.5 block truncate text-ui-sm font-semibold uppercase text-neutral-500">
+        {contextKindLabel(kind)}
+        {targetLabel(target) ? ` / ${targetLabel(target)}` : ''}
+      </span>
+      {detail && <span className="mt-0.5 block line-clamp-2 text-xs leading-relaxed text-neutral-500">{detail}</span>}
+    </>
+  );
   return (
     <div className="flex min-w-0 items-center gap-2 border-t border-neutral-800/70 py-2 first:border-t-0">
-      <button
-        type="button"
-        disabled={!canOpen}
-        onClick={() => onOpenTarget(target)}
-        className="min-h-11 min-w-0 flex-1 text-left disabled:cursor-default"
-        title={canOpen ? `Open ${label}` : label}
-      >
-        <span className="flex min-w-0 items-center gap-2">
-          <span className="truncate text-sm font-semibold text-neutral-100">{label}</span>
-          {badge}
-        </span>
-        <span className="mt-0.5 block truncate text-ui-sm font-semibold uppercase text-neutral-500">
-          {contextKindLabel(kind)}
-          {targetLabel(target) ? ` / ${targetLabel(target)}` : ''}
-        </span>
-        {detail && <span className="mt-0.5 block line-clamp-2 text-xs leading-relaxed text-neutral-500">{detail}</span>}
-      </button>
+      {canOpen ? (
+        <button
+          type="button"
+          onClick={() => onOpenTarget(target)}
+          className={bodyClassName}
+          title={`Open ${label}`}
+        >
+          {content}
+        </button>
+      ) : (
+        <div className={bodyClassName} title={label}>
+          {content}
+        </div>
+      )}
       {canOpen && <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
       <SessionRefAction
         selected={Boolean(selected)}
@@ -556,6 +588,19 @@ export function StrategicContextWorkspace({
   const resources = contextPackage?.resources ?? [];
   const nodes = canvas?.nodes ?? [];
   const edges = canvas?.edges ?? [];
+  const canvasResources = resources.filter(resource => resource.kind === 'canvas');
+  const listedResources = resources.filter(resource => resource.kind !== 'canvas');
+  const syntheticCanvasRef = canvas ? selectedRefFromCanvas(canvas) : null;
+  const canvasResourceRows = canvasResources.length > 0
+    ? canvasResources
+    : syntheticCanvasRef
+      ? [{
+          kind: syntheticCanvasRef.kind,
+          id: syntheticCanvasRef.id,
+          label: syntheticCanvasRef.label ?? 'Strategic context map',
+          summary: canvasSummaryDetail(canvas, nodes.length, edges.length),
+        } satisfies StrategicContextResourceRef]
+      : [];
   const drilldowns = [...(contextPackage?.drilldowns ?? []), ...(canvas?.drilldowns ?? [])];
   const knowledgeEvidence = contextPackage?.evidence?.knowledge?.items ?? [];
   const artifactEvidence = contextPackage?.evidence?.artifacts?.items ?? [];
@@ -811,6 +856,18 @@ export function StrategicContextWorkspace({
               testId="strategic-context-workspace-map"
             >
               <StrategicContextMap canvas={canvas} onOpenTarget={handleOpenTarget} />
+              {canvasResourceRows.length > 0 && (
+                <div className="mt-3 rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5" data-testid="strategic-context-workspace-map-resource">
+                  {canvasResourceRows.map(resource => renderKeepableRow({
+                    key: `${resource.kind}:${resource.id}`,
+                    label: resource.label,
+                    kind: resource.kind,
+                    detail: resource.summary ?? canvasSummaryDetail(canvas, nodes.length, edges.length),
+                    target: resource.target,
+                    ref: selectedRefFromResource(resource),
+                  }))}
+                </div>
+              )}
               {nodes.length > 0 && (
                 <div className="mt-3 rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5">
                   {nodes.map(node => renderKeepableRow({
@@ -847,10 +904,10 @@ export function StrategicContextWorkspace({
               )}
             </Section>
 
-            <Section title="Resources" meta={`${resources.length}`} testId="strategic-context-workspace-resources">
-              {resources.length > 0 ? (
+            <Section title="Resources" meta={`${listedResources.length}`} testId="strategic-context-workspace-resources">
+              {listedResources.length > 0 ? (
                 <div className="rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5">
-                  {resources.map(resource => renderKeepableRow({
+                  {listedResources.map(resource => renderKeepableRow({
                     key: `${resource.kind}:${resource.id}`,
                     label: resource.label,
                     kind: resource.kind,
@@ -860,7 +917,11 @@ export function StrategicContextWorkspace({
                   }))}
                 </div>
               ) : (
-                <EmptyState>No resources are attached to this package.</EmptyState>
+                <EmptyState>
+                  {canvasResourceRows.length > 0
+                    ? 'No additional resources are attached beyond the context map.'
+                    : 'No resources are attached to this package.'}
+                </EmptyState>
               )}
             </Section>
 

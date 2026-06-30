@@ -332,6 +332,45 @@ describe('StrategicContextWorkspace', () => {
     expect(host.textContent).toContain('running update 1');
   });
 
+  test('keeps canvas resources with the rendered map instead of duplicating them in resources', () => {
+    const onUpdateSessionRefs = vi.fn();
+    const state = {
+      ...STATE,
+      context_package: {
+        ...STATE.context_package,
+        resources: [
+          {
+            kind: 'canvas',
+            id: 'canvas:proj-1',
+            label: 'Strategic map resource',
+            summary: 'The map is the shared frame for this discussion.',
+          },
+          ...STATE.context_package.resources,
+        ],
+      },
+    } as StrategicStateResponse;
+
+    const { host } = mount({ state, onUpdateSessionRefs });
+    const mapSection = host.querySelector('[data-testid="strategic-context-workspace-map"]');
+    const mapResource = host.querySelector('[data-testid="strategic-context-workspace-map-resource"]');
+    const resourcesSection = host.querySelector('[data-testid="strategic-context-workspace-resources"]');
+
+    expect(mapSection?.textContent).toContain('Strategic map resource');
+    expect(mapResource?.textContent).toContain('The map is the shared frame for this discussion.');
+    expect(resourcesSection?.textContent).not.toContain('Strategic map resource');
+    expect(Array.from(mapResource?.querySelectorAll('button') ?? []).some(button => button.disabled)).toBe(false);
+
+    Array.from(mapResource?.querySelectorAll('button') ?? [])
+      .find(button => button.title === 'Keep Strategic map resource in session context')
+      ?.click();
+
+    expect(onUpdateSessionRefs).toHaveBeenCalledWith(expect.any(Function));
+    const updater = onUpdateSessionRefs.mock.calls.at(-1)?.[0] as (refs: SessionRefs) => SessionRefs;
+    expect(updater([])).toEqual([
+      { kind: 'canvas', id: 'canvas:proj-1', label: 'Strategic map resource' },
+    ]);
+  });
+
   test('renders parallel map edges in the fallback list without duplicate key warnings', () => {
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
     const state = {
