@@ -24,18 +24,24 @@ function dispatchShortcut(target: EventTarget, init: KeyboardEventInit = {}) {
 function Harness({
   blockingModalOpen,
   commandPaletteOpen = false,
+  commands = COMMANDS,
+  showSettings = false,
   setCommandPaletteOpen,
+  toggleSettings = vi.fn(),
 }: {
   blockingModalOpen: boolean;
   commandPaletteOpen?: boolean;
+  commands?: WorkbenchCommand[];
+  showSettings?: boolean;
   setCommandPaletteOpen: (open: boolean) => void;
+  toggleSettings?: () => void;
 }) {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   useOperatorKeyboardShortcuts({
     activeTab: 'chat',
     blockingModalOpen,
     commandPaletteOpen,
-    commands: COMMANDS,
+    commands,
     searchInputRef,
     searchShortcutBlocked: false,
     selectedTaskCount: 0,
@@ -48,8 +54,8 @@ function Harness({
     setShowAlertsPopover: vi.fn(),
     setShowKnowledgeBrowser: vi.fn(),
     setShowResearchBrowser: vi.fn(),
-    showSettings: false,
-    toggleSettings: vi.fn(),
+    showSettings,
+    toggleSettings,
   });
 
   return (
@@ -76,7 +82,15 @@ describe('useOperatorKeyboardShortcuts', () => {
     host = null;
   });
 
-  function mount(blockingModalOpen = false, commandPaletteOpen = false) {
+  function mount(
+    blockingModalOpen = false,
+    commandPaletteOpen = false,
+    options: {
+      commands?: WorkbenchCommand[];
+      showSettings?: boolean;
+      toggleSettings?: () => void;
+    } = {},
+  ) {
     const setCommandPaletteOpen = vi.fn();
     host = document.createElement('div');
     document.body.appendChild(host);
@@ -87,7 +101,10 @@ describe('useOperatorKeyboardShortcuts', () => {
         <Harness
           blockingModalOpen={blockingModalOpen}
           commandPaletteOpen={commandPaletteOpen}
+          commands={options.commands}
+          showSettings={options.showSettings}
           setCommandPaletteOpen={setCommandPaletteOpen}
+          toggleSettings={options.toggleSettings}
         />,
       );
     });
@@ -123,5 +140,24 @@ describe('useOperatorKeyboardShortcuts', () => {
 
     expect(searchInput).not.toHaveFocus();
     expect(event.defaultPrevented).toBe(false);
+  });
+
+  test('closes Settings with S without running the open Settings command underneath', () => {
+    const toggleSettings = vi.fn();
+    const openSettings = vi.fn();
+    mount(false, false, {
+      commands: [
+        ...COMMANDS,
+        { id: 'settings.general', label: 'Settings', run: openSettings },
+      ],
+      showSettings: true,
+      toggleSettings,
+    });
+
+    const event = dispatchShortcut(document, { key: 's', ctrlKey: false });
+
+    expect(toggleSettings).toHaveBeenCalledOnce();
+    expect(openSettings).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(true);
   });
 });

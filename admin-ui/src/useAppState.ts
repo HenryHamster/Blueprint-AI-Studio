@@ -419,13 +419,9 @@ export function useAppState({ refreshStrategicReadModelRef }: UseAppStateOptions
       if (isEditableShortcutEvent(e)) return;
 
       switch (e.key) {
-        case 'n':
-          if (!showNewTaskModal && !logTask && !showResearchBrowser && !showSettings) {
-            openNewTaskModal();
-          }
-          break;
         case 'r':
           if (selectionMode && selectedTaskIds.size > 0) {
+            e.preventDefault();
             const failed = tasks.filter(t => selectedTaskIds.has(t.id) && t.status === 'FAILED');
             if (failed.length > 0) {
               setConfirmDialog({
@@ -439,12 +435,11 @@ export function useAppState({ refreshStrategicReadModelRef }: UseAppStateOptions
                 },
               });
             }
-          } else if (!showNewTaskModal && !logTask && !showResearchBrowser && !showSettings) {
-            fetchTasks();
           }
           break;
         case 'Delete':
           if (selectionMode && selectedTaskIds.size > 0) {
+            e.preventDefault();
             const cancellable = tasks.filter(t => selectedTaskIds.has(t.id) && ['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING'].includes(t.status));
             if (cancellable.length > 0) {
               setConfirmDialog({
@@ -458,40 +453,11 @@ export function useAppState({ refreshStrategicReadModelRef }: UseAppStateOptions
           break;
         case 'Enter':
           if (selectionMode && selectedTaskIds.size > 0) {
+            e.preventDefault();
             const ids = Array.from(selectedTaskIds);
             const taskId = ids[ids.length - 1];
             const task = tasks.find(t => t.id === taskId);
             if (task) { handleViewLogs(task); }
-          }
-          break;
-        case '1':
-          setShowMessages(false);
-          setShowArchive(false);
-          setActiveTab('chat');
-          break;
-        case '2':
-          setViewMode('pipeline');
-          setShowMessages(false);
-          setShowArchive(false);
-          setActiveTab('pipeline');
-          break;
-        case '3':
-          setShowMessages(false);
-          setShowArchive(false);
-          setActiveTab('project');
-          break;
-        case '4':
-          setShowMessages(false);
-          setShowArchive(false);
-          setActiveTab('runtime');
-          break;
-        case 's':
-          setShowSettings(prev => !prev);
-          break;
-        case 'a':
-        case 'A':
-          if (!showNewTaskModal && !logTask && !showResearchBrowser && activeTab === 'pipeline' && !showSettings) {
-            setShowArchive(!showArchive);
           }
           break;
       }
@@ -499,7 +465,7 @@ export function useAppState({ refreshStrategicReadModelRef }: UseAppStateOptions
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showMessages, activeTab, showSettings, showArchive, selectionMode, selectedTaskIds, tasks]);
+  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showMessages, showArchive, showSettings, selectionMode, selectedTaskIds, tasks]);
 
   // ── Cross-domain glue handlers ────────────────────────────────────────────
 

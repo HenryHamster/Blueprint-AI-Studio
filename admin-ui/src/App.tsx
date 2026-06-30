@@ -503,6 +503,7 @@ export default function App() {
     const baseRefs = (strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench)?.selected_refs ?? [];
     persistStrategicWorkbench({ selected_refs: updateRefs(baseRefs) });
   }, [persistStrategicWorkbench, strategicReadModelWorkbench]);
+  const taskContextSessionProps = { sessionRefs: strategicWorkbenchState?.selected_refs, savingSessionRefs: savingStrategicWorkbench, onUpdateSessionRefs: updateStrategicSessionRefs };
   const pipelineAttentionCount = useMemo(() => {
     const counts = strategicReadModel.data?.attention?.counts;
     if (!counts) return s.needsAttentionCount;
@@ -1478,9 +1479,7 @@ export default function App() {
                   attentionTasks={backendAttentionTasks}
                   localFallbackTasks={localAttentionTasks}
                   trackedTaskIds={s.trackedTaskIds}
-                  sessionRefs={strategicWorkbenchState?.selected_refs}
-                  savingSessionRefs={savingStrategicWorkbench}
-                  onUpdateSessionRefs={updateStrategicSessionRefs}
+                  {...taskContextSessionProps}
                   onOpenTask={s.handleViewLogs}
                   onOpenPipeline={() => handleTabChange('pipeline')}
                   onTrackTask={s.trackTask}
@@ -1678,6 +1677,7 @@ export default function App() {
                     attentionTasks={backendAttentionTasks}
                     localFallbackTasks={localAttentionTasks}
                     trackedTaskIds={s.trackedTaskIds}
+                    {...taskContextSessionProps}
                     onOpenTask={s.handleViewLogs}
                     onOpenPipeline={() => handleTabChange('pipeline')}
                     onTrackTask={s.trackTask}
