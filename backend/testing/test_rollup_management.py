@@ -3217,3 +3217,121 @@ async def test_rollup_post_merge_housekeeping_no_evidence_when_verdict_not_prove
     assert coverage == "uncovered", (
         f"Expected criterion coverage 'uncovered' for unproven verdict, got {coverage!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_multi_child_rollup_criterion_evidence_satisfies_release_scoring_gate(
+    cleanup_db,
+):
+    """Multi-child rollup: per-child proven evidence aggregates to full version coverage.
+
+    Two rollup children each cover a distinct version acceptance criterion via a
+    proven merge-test verdict.  After _record_completed_children_merge_evidence
+    runs on both, get_version_coverage_summary must report all criteria covered
+    and compute_composite must NOT fire the criterion_coverage_incomplete gate.
+    """
+    from app.models import ReleaseVersion, Task as _Task
+    from app.acceptance_criteria import (
+        create_criterion,
+        get_version_coverage_summary,
+        compute_criterion_coverage,
+        get_evidence_for_criterion,
+    )
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.rollup_management import _record_completed_children_merge_evidence
+    from app.release_scoring import compute_composite
+
+    project = await _make_project(cleanup_db)
+    version = ReleaseVersion(project_id=project.id, version_number=1)
+    cleanup_db.add(version)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(version)
+
+    # Two distinct acceptance criteria — one per rollup child.
+    criterion_a = await create_criterion(
+        cleanup_db,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Feature A tests pass under merge-test",
+        created_by="test",
+    )
+    criterion_b = await create_criterion(
+        cleanup_db,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Feature B integration verified",
+        created_by="test",
+    )
+
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+
+    proven_verdict = {
+        "satisfied": True,
+        "proven": True,
+        "kind": "named_test",
+        "reason": "merge-test ran green",
+    }
+
+    child_a = _Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature A"}],
+        status=TaskStatus.COMPLETED,
+        context={CODE_ACCEPTANCE_VERDICT_KEY: proven_verdict},
+        criterion_ids=[criterion_a.criterion_key],
+    )
+    child_b = _Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature B"}],
+        status=TaskStatus.COMPLETED,
+        context={CODE_ACCEPTANCE_VERDICT_KEY: proven_verdict},
+        criterion_ids=[criterion_b.criterion_key],
+    )
+    cleanup_db.add(child_a)
+    cleanup_db.add(child_b)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(child_a)
+    await cleanup_db.refresh(child_b)
+
+    # Record evidence for both children — the production path exercised during
+    # rollup post-merge housekeeping.
+    await _record_completed_children_merge_evidence([child_a, child_b], cleanup_db)
+
+    # Both criteria must now be covered.
+    ev_a = await get_evidence_for_criterion(cleanup_db, criterion_a.id)
+    ev_b = await get_evidence_for_criterion(cleanup_db, criterion_b.id)
+    assert compute_criterion_coverage(ev_a) == "covered", (
+        f"criterion_a must be covered after child_a merge evidence; got {ev_a!r}"
+    )
+    assert compute_criterion_coverage(ev_b) == "covered", (
+        f"criterion_b must be covered after child_b merge evidence; got {ev_b!r}"
+    )
+
+    # Version-level summary must reflect full coverage.
+    summary = await get_version_coverage_summary(cleanup_db, version.id)
+    assert summary["total"] == 2
+    assert summary["covered"] == 2
+    assert summary["uncovered"] == 0, (
+        f"Expected 0 uncovered criteria, got {summary['uncovered']}: {summary}"
+    )
+
+    # The release-scoring gate must not fire criterion_coverage_incomplete.
+    result = compute_composite(
+        ci_green=True,
+        audit_score=1.0,
+        test_erosion=1.0,
+        smoketest_score=None,
+        policy={"weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30}, "threshold": 0.90},
+        smoketest_enabled=False,
+        ci_state="no_checks",
+        ci_required=False,
+        criterion_coverage=summary,
+    )
+    assert result["blocker"] != "criterion_coverage_incomplete", (
+        f"Fully-covered version must not trigger criterion_coverage_incomplete; "
+        f"got blocker={result['blocker']!r}, summary={summary}"
+    )
+    assert result["blocker"] is None, (
+        f"No blocker expected for a fully-covered version; got {result['blocker']!r}"
+    )
