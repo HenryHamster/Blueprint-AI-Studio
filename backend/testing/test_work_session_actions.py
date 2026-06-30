@@ -1,4 +1,37 @@
-from app.work_session_actions import build_work_session_actions
+from app.work_session_actions import _compact_action_target, build_work_session_actions
+
+
+def test_work_session_action_target_preserves_canonical_context_fields():
+    target = _compact_action_target(
+        {
+            "surface": " task ",
+            "project_id": " project-1 ",
+            "section": " artifacts ",
+            "task_id": "task-1",
+            "message_id": "message-1",
+            "direction_id": "direction-1",
+            "alert_id": "alert-1",
+            "action": "open " + ("x" * 200),
+            "document_id": "document-1",
+            "artifact_id": "artifact-1",
+            "cycle_id": "cycle-1",
+            "secret": "drop-me",
+        }
+    )
+
+    assert target == {
+        "surface": "task",
+        "project_id": "project-1",
+        "section": "artifacts",
+        "task_id": "task-1",
+        "message_id": "message-1",
+        "direction_id": "direction-1",
+        "alert_id": "alert-1",
+        "action": "open " + ("x" * 152) + "...",
+        "document_id": "document-1",
+        "artifact_id": "artifact-1",
+        "cycle_id": "cycle-1",
+    }
 
 
 def test_work_session_action_task_linked_alert_targets_task():

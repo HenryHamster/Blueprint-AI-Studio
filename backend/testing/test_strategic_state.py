@@ -33,8 +33,50 @@ from app.models import (
     WakeDeliveryState,
     _utcnow,
 )
+from app.workbench_state import sanitize_strategic_session_snapshot
 
 TEST_USER_ID = "test-user-123"
+
+
+def test_strategic_session_snapshot_preserves_canonical_context_target_fields():
+    snapshot = sanitize_strategic_session_snapshot(
+        {
+            "selected_ref_descriptors": [
+                {
+                    "kind": "knowledge_document",
+                    "id": "knowledge:document-1",
+                    "target": {
+                        "surface": " knowledge ",
+                        "project_id": " project-1 ",
+                        "section": " notes ",
+                        "task_id": "task-1",
+                        "message_id": "message-1",
+                        "direction_id": "direction-1",
+                        "alert_id": "alert-1",
+                        "action": "open " + ("x" * 220),
+                        "document_id": "document-1",
+                        "artifact_id": "artifact-1",
+                        "cycle_id": "cycle-1",
+                        "secret": "drop-me",
+                    },
+                }
+            ]
+        }
+    )
+
+    assert snapshot["selected_ref_descriptors"][0]["target"] == {
+        "surface": "knowledge",
+        "project_id": "project-1",
+        "section": "notes",
+        "task_id": "task-1",
+        "message_id": "message-1",
+        "direction_id": "direction-1",
+        "alert_id": "alert-1",
+        "action": "open " + ("x" * 175),
+        "document_id": "document-1",
+        "artifact_id": "artifact-1",
+        "cycle_id": "cycle-1",
+    }
 
 
 def _assert_generated_at_iso_utc(payload: dict) -> None:
@@ -2053,15 +2095,19 @@ async def test_strategic_session_message_records_operator_message_and_snapshot(
     assert second.status_code == 200
     assert second.json()["status"] == "duplicate"
     assert second.json()["id"] == first.json()["id"]
-    broadcast.assert_awaited_once_with(
-        str(project.id),
-        "message_created",
-        {
-            "message_id": first.json()["id"],
-            "type": "FEEDBACK",
-            "from": "user",
-        },
-    )
+    broadcast.assert_awaited_once()
+    assert broadcast.await_args.args[:2] == (str(project.id), "message_created")
+    event_payload = broadcast.await_args.args[2]
+    assert event_payload["schema_version"] == 1
+    assert event_payload["project_id"] == str(project.id)
+    assert event_payload["resource"] == "project_message"
+    assert event_payload["action"] == "created"
+    assert event_payload["refetch"] == {"surfaces": ["messages", "strategic_session"]}
+    assert event_payload["message_id"] == first.json()["id"]
+    assert event_payload["type"] == "FEEDBACK"
+    assert event_payload["from"] == "user"
+    assert event_payload["message"]["id"] == first.json()["id"]
+    assert event_payload["message"]["status"] == "open"
 
     msg = await db_session.get(ProjectMessage, uuid.UUID(first.json()["id"]))
     assert msg.from_type == "user"
@@ -2255,7 +2301,7 @@ async def test_strategic_session_message_response_survives_arming_rollback(
         return "not_armed"
 
     with patch(
-        "app.routers.admin_projects.maybe_arm_operator_refresh",
+        "app.project_message_creation.maybe_arm_operator_refresh",
         side_effect=_rollback_and_decline,
     ):
         resp = await client.post(

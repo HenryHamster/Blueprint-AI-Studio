@@ -15,11 +15,10 @@ from sqlmodel import select
 from app.models import MESSAGE_CONTENT_MAX, MessageType, Project, ProjectMessage
 from app.project_message_projection import message_event_payload
 from app.strategic_trigger import ARMING_STEERING, maybe_arm_operator_refresh
-from app.task_locking import with_vision_locked
 from app.workbench_state import (
-    apply_strategic_local_continuation_marker,
     build_message_strategic_session_snapshot,
-    upsert_strategic_workbench_state_with_previous,
+    persist_strategic_workbench_update,
+    workbench_context_for_strategic_session_snapshot,
     workbench_state_exceeds_max_bytes,
 )
 
@@ -148,41 +147,23 @@ async def create_operator_project_message(
         workbench_context is not None or persist_empty_workbench_context
     )
     if should_persist_workbench:
-        (
-            _previous_workbench,
-            stored_workbench,
-        ) = await upsert_strategic_workbench_state_with_previous(
+        workbench_write = await persist_strategic_workbench_update(
             session,
             user_id,
             project_id,
             workbench_context or {},
+            sync_local_continuation_marker=sync_local_continuation_marker,
+            arm_interaction_mode=False,
+            commit=False,
         )
+        stored_workbench = workbench_write.state
         workbench_context_for_snapshot = None
         if workbench_context is not None:
-            workbench_context_for_snapshot = {
-                **stored_workbench,
-                "context_package_id": workbench_context.get("context_package_id"),
-                "selected_ref_descriptors": workbench_context.get(
-                    "selected_ref_descriptors"
-                ),
-                "context_package_descriptor": (
-                    workbench_context.get("context_package_descriptor")
-                    or workbench_context.get("context_package")
-                ),
-            }
-        if sync_local_continuation_marker:
-            def _update_local_continuation_marker(vision: dict) -> None:
-                apply_strategic_local_continuation_marker(
-                    vision,
+            workbench_context_for_snapshot = (
+                workbench_context_for_strategic_session_snapshot(
                     stored_workbench,
-                    operator_user_id=user_id,
+                    workbench_context,
                 )
-
-            await with_vision_locked(
-                session,
-                project_id,
-                _update_local_continuation_marker,
-                skip_locked=False,
             )
 
     strategic_session = await build_message_strategic_session_snapshot(

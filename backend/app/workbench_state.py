@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,6 +20,14 @@ from app.messages_noise_prefs_store import (
     mutate_messages_noise_prefs,
 )
 from app.models import _utcnow
+from app.strategic_trigger import (
+    ARMING_NOT_ARMED,
+    ARMING_PASSIVE_NOTE,
+    ARMING_STEERING,
+    ORIGIN_OPERATOR,
+    request_strategic_refresh,
+)
+from app.task_locking import with_vision_locked
 
 WORKBENCH_STATE_KEY = "_strategic_workbench"
 STRATEGIC_LOCAL_CONTINUATION_KEY = "_strategic_local_continuation"
@@ -36,13 +45,23 @@ _STRATEGIC_ARMING_INTERACTION_MODES = frozenset({"check_in", "continuous"})
 _OPERATOR_CONTEXT_TARGET_KEYS = (
     "surface",
     "section",
+    "project_id",
     "task_id",
     "message_id",
     "direction_id",
+    "alert_id",
+    "action",
     "document_id",
     "artifact_id",
     "cycle_id",
 )
+
+
+@dataclass(frozen=True)
+class StrategicWorkbenchWriteResult:
+    previous_state: dict[str, Any]
+    state: dict[str, Any]
+    arming: str = ARMING_PASSIVE_NOTE
 
 
 def workbench_state_size_bytes(raw: Any) -> int:
@@ -602,3 +621,92 @@ async def upsert_strategic_workbench_state_with_previous(
 
     await mutate_messages_noise_prefs(session, user_id, project_id, merge)
     return state_holder["previous"], state_holder["state"]
+
+
+def workbench_context_for_strategic_session_snapshot(
+    stored_workbench: dict[str, Any],
+    raw_workbench_context: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Merge persisted workbench state with transient snapshot-only descriptors."""
+
+    if raw_workbench_context is None:
+        return None
+    snapshot_context: dict[str, Any] = {
+        **stored_workbench,
+        "context_package_id": raw_workbench_context.get("context_package_id"),
+    }
+    selected_ref_descriptors = raw_workbench_context.get("selected_ref_descriptors")
+    if selected_ref_descriptors is not None:
+        snapshot_context["selected_ref_descriptors"] = selected_ref_descriptors
+    context_package_descriptor = (
+        raw_workbench_context.get("context_package_descriptor")
+        or raw_workbench_context.get("context_package")
+    )
+    if context_package_descriptor is not None:
+        snapshot_context["context_package_descriptor"] = context_package_descriptor
+    return snapshot_context
+
+
+async def persist_strategic_workbench_update(
+    session: AsyncSession,
+    user_id: str,
+    project_id: uuid.UUID,
+    raw_state: dict[str, Any],
+    *,
+    sync_local_continuation_marker: bool = True,
+    arm_interaction_mode: bool = True,
+    commit: bool = True,
+) -> StrategicWorkbenchWriteResult:
+    """Persist operator workbench state and run canonical side effects."""
+
+    previous_state, state = await upsert_strategic_workbench_state_with_previous(
+        session,
+        user_id,
+        project_id,
+        raw_state,
+    )
+    if sync_local_continuation_marker:
+        def _update_local_continuation_marker(vision: dict[str, Any]) -> None:
+            apply_strategic_local_continuation_marker(
+                vision,
+                state,
+                operator_user_id=user_id,
+            )
+
+        await with_vision_locked(
+            session,
+            project_id,
+            _update_local_continuation_marker,
+            skip_locked=False,
+        )
+
+    arming = ARMING_PASSIVE_NOTE
+    should_arm = (
+        arm_interaction_mode
+        and workbench_mode_should_arm_strategic_refresh(previous_state, state)
+    )
+    if commit:
+        await session.commit()
+    if should_arm:
+        if not commit:
+            return StrategicWorkbenchWriteResult(
+                previous_state=previous_state,
+                state=state,
+                arming=ARMING_NOT_ARMED,
+            )
+        armed = await request_strategic_refresh(
+            session,
+            project_id,
+            "workbench_interaction_mode",
+            origin=ORIGIN_OPERATOR,
+            steering_excerpt=workbench_mode_refresh_excerpt(state),
+            skip_locked=False,
+        )
+        arming = ARMING_STEERING if armed else ARMING_NOT_ARMED
+        if armed:
+            await session.commit()
+    return StrategicWorkbenchWriteResult(
+        previous_state=previous_state,
+        state=state,
+        arming=arming,
+    )

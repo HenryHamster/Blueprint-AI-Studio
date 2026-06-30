@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -239,22 +240,39 @@ async def test_legacy_project_message_create_snapshots_strategic_session(
 ):
     project = await _make_project(db_session)
 
-    resp = await client.post(
-        f"/api/admin/projects/{project.id}/messages",
-        json={
-            "message_type": "NOTE",
-            "content": "Keep this canvas around.",
-            "workbench_context": {
-                "interaction_mode": "check_in",
-                "active_surface": "project",
-                "selected_refs": [
-                    {"kind": "canvas", "id": "strategic-canvas:proj-1", "label": "Context map"}
-                ],
+    with patch(
+        "app.routers.directions.broadcast_to_project",
+        new_callable=AsyncMock,
+    ) as broadcast:
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/messages",
+            json={
+                "message_type": "NOTE",
+                "content": "Keep this canvas around.",
+                "workbench_context": {
+                    "interaction_mode": "check_in",
+                    "active_surface": "project",
+                    "selected_refs": [
+                        {"kind": "canvas", "id": "strategic-canvas:proj-1", "label": "Context map"}
+                    ],
+                },
             },
-        },
-    )
+        )
 
     assert resp.status_code == 200, resp.text
+    broadcast.assert_awaited_once()
+    assert broadcast.await_args.args[:2] == (str(project.id), "message_created")
+    event_payload = broadcast.await_args.args[2]
+    assert event_payload["schema_version"] == 1
+    assert event_payload["project_id"] == str(project.id)
+    assert event_payload["resource"] == "project_message"
+    assert event_payload["action"] == "created"
+    assert event_payload["refetch"] == {"surfaces": ["messages", "strategic_session"]}
+    assert event_payload["message_id"] == resp.json()["id"]
+    assert event_payload["type"] == "NOTE"
+    assert event_payload["from"] == "user"
+    assert event_payload["message"]["id"] == resp.json()["id"]
+    assert event_payload["message"]["status"] == "open"
     msg = (
         await db_session.execute(
             select(ProjectMessage).where(ProjectMessage.id == uuid.UUID(resp.json()["id"]))

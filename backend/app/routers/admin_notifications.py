@@ -31,7 +31,7 @@ from app.models import (
 from app.auth import get_current_user
 from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
-from app.task_locking import lock_project_or_429, with_vision_locked
+from app.task_locking import lock_project_or_429
 from app.message_convergence import LINKED_STATUS
 from app.project_message_creation import (
     create_operator_project_message,
@@ -49,20 +49,14 @@ from app.messages_last_seen import (
 )
 from app.workbench_state import (
     WORKBENCH_STATE_KEY, WORKBENCH_STATE_MAX_BYTES,
-    apply_strategic_local_continuation_marker,
     build_message_strategic_session_snapshot, get_strategic_workbench_state,
-    upsert_strategic_workbench_state_with_previous,
-    workbench_mode_refresh_excerpt,
-    workbench_mode_should_arm_strategic_refresh,
+    persist_strategic_workbench_update,
+    workbench_context_for_strategic_session_snapshot,
     workbench_state_exceeds_max_bytes, workbench_state_size_bytes,
 )
 from app.strategic_trigger import (
-    ARMING_NOT_ARMED,
-    ARMING_PASSIVE_NOTE,
     ARMING_STEERING,
-    ORIGIN_OPERATOR,
     maybe_arm_operator_refresh,
-    request_strategic_refresh,
 )
 from app import notification_dispatch as _nd
 from app.playbook_storage import (
@@ -662,16 +656,18 @@ async def resolve_message(
         raise HTTPException(status_code=400, detail=f"workbench_context exceeds {WORKBENCH_STATE_MAX_BYTES} byte limit")
     workbench_context_for_snapshot = payload.workbench_context
     if payload.workbench_context is not None:
-        _previous_workbench, stored_workbench = await upsert_strategic_workbench_state_with_previous(
+        workbench_write = await persist_strategic_workbench_update(
             session,
             current_user["user_id"],
             message_project_uuid,
             payload.workbench_context,
+            arm_interaction_mode=False,
+            commit=False,
         )
-        workbench_context_for_snapshot = {
-            **stored_workbench,
-            "context_package_id": payload.workbench_context.get("context_package_id"),
-        }
+        workbench_context_for_snapshot = workbench_context_for_strategic_session_snapshot(
+            workbench_write.state,
+            payload.workbench_context,
+        )
     if was_resolved:
         await session.commit()
         return {"id": message_id_str, "status": "already_resolved", "message": base_message_response}
@@ -973,42 +969,13 @@ async def put_messages_workbench_state(
             detail="Workbench state too large (max 50KB)",
         )
 
-    previous_state, state = await upsert_strategic_workbench_state_with_previous(
+    result = await persist_strategic_workbench_update(
         session,
         current_user["user_id"],
         pid,
         payload.workbench,
     )
-
-    def _update_local_continuation_marker(vision: Dict[str, Any]) -> None:
-        apply_strategic_local_continuation_marker(
-            vision,
-            state,
-            operator_user_id=current_user["user_id"],
-        )
-
-    await with_vision_locked(
-        session,
-        pid,
-        _update_local_continuation_marker,
-        skip_locked=False,
-    )
-    arming = ARMING_PASSIVE_NOTE
-    should_arm = workbench_mode_should_arm_strategic_refresh(previous_state, state)
-    await session.commit()
-    if should_arm:
-        armed = await request_strategic_refresh(
-            session,
-            pid,
-            "workbench_interaction_mode",
-            origin=ORIGIN_OPERATOR,
-            steering_excerpt=workbench_mode_refresh_excerpt(state),
-            skip_locked=False,
-        )
-        arming = ARMING_STEERING if armed else ARMING_NOT_ARMED
-        if armed:
-            await session.commit()
-    return {"status": "ok", "workbench": state, "arming": arming}
+    return {"status": "ok", "workbench": result.state, "arming": result.arming}
 
 
 # ── Messages Saved-Views Endpoints ──────────────────────────────────────────

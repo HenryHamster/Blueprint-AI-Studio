@@ -5298,6 +5298,7 @@ class TestMessages:
         a question_answer NOTE linked back to it so the strategist sees it answered.
         """
         from sqlmodel import select
+        from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
 
         project = await _make_project(db_session)
         question = ProjectMessage(
@@ -5330,8 +5331,30 @@ class TestMessages:
                                 "label": "Operator notes",
                             },
                         ],
+                        "selected_ref_descriptors": [
+                            {
+                                "kind": "knowledge_document",
+                                "id": "knowledge:kdoc-1",
+                                "label": "Operator notes",
+                                "summary": "Decision notes from the current review.",
+                                "target": {
+                                    "surface": "project",
+                                    "section": "problem-model",
+                                    "document_id": "kdoc-1",
+                                },
+                            },
+                        ],
                         "session_started_at": "2026-06-29T01:00:00Z",
                         "context_package_id": "strategic-context:test",
+                        "context_package_descriptor": {
+                            "kind": "context_package",
+                            "id": "strategic-context:test",
+                            "label": "Current session context",
+                            "target": {
+                                "surface": "project",
+                                "section": "problem-model",
+                            },
+                        },
                     },
                 },
             )
@@ -5364,6 +5387,28 @@ class TestMessages:
         session = note.context.get("strategic_session")
         assert session["interaction_mode"] == "continuous"
         assert session["context_package_id"] == "strategic-context:test"
+        assert session["selected_ref_descriptors"] == [
+            {
+                "kind": "knowledge_document",
+                "id": "knowledge:kdoc-1",
+                "label": "Operator notes",
+                "summary": "Decision notes from the current review.",
+                "target": {
+                    "surface": "project",
+                    "section": "problem-model",
+                    "document_id": "kdoc-1",
+                },
+            }
+        ]
+        assert session["context_package_descriptor"] == {
+            "kind": "context_package",
+            "id": "strategic-context:test",
+            "label": "Current session context",
+            "target": {
+                "surface": "project",
+                "section": "problem-model",
+            },
+        }
         assert session["selected_refs"] == [
             {
                 "kind": "knowledge_document",
@@ -5400,6 +5445,10 @@ class TestMessages:
             }
         ]
         assert "context_package_id" not in stored_workbench
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["operator_user_id"] == TEST_USER_ID
+        assert marker["active"] is True
         assert broadcast.await_count == 2
         events = [
             (call.args[1], call.args[2])
@@ -6709,7 +6758,7 @@ class TestMessagesWorkbenchState:
             return False
 
         with patch(
-            "app.routers.admin_notifications.request_strategic_refresh",
+            "app.workbench_state.request_strategic_refresh",
             new=AsyncMock(side_effect=_rollback_then_fail),
         ):
             resp = await client.put(

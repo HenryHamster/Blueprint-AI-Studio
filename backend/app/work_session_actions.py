@@ -30,12 +30,15 @@ def _compact_action_target(target: dict[str, Any] | None) -> dict[str, Any] | No
     for key in (
         "surface",
         "project_id",
+        "section",
         "task_id",
         "message_id",
         "direction_id",
         "alert_id",
-        "section",
         "action",
+        "document_id",
+        "artifact_id",
+        "cycle_id",
     ):
         value = _compact_text(target.get(key), max_chars=160)
         if value:

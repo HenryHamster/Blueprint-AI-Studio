@@ -39,7 +39,7 @@ from app.models import (
 from app.auth import get_current_user
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app import strategic_cycle
-from app.task_locking import lock_project_or_429, with_vision_locked
+from app.task_locking import lock_project_or_429
 from app.build_config_lint import build_config_lint_warnings
 from app.ci_resolution import (
     compute_merge_verification_verdict,
@@ -67,21 +67,11 @@ from app.strategic_context_package import (
 from app.strategic_runtime_work import build_strategic_runtime_summary
 from app.work_session_actions import build_work_session_actions
 from app.workbench_state import (
-    apply_strategic_local_continuation_marker,
     WORKBENCH_STATE_MAX_BYTES,
     get_strategic_workbench_state,
+    persist_strategic_workbench_update,
     sanitize_strategic_session_snapshot,
-    upsert_strategic_workbench_state_with_previous,
-    workbench_mode_refresh_excerpt,
-    workbench_mode_should_arm_strategic_refresh,
     workbench_state_size_bytes,
-)
-from app.strategic_trigger import (
-    ARMING_NOT_ARMED,
-    ARMING_PASSIVE_NOTE,
-    ARMING_STEERING,
-    ORIGIN_OPERATOR,
-    request_strategic_refresh,
 )
 
 router = APIRouter(
@@ -1888,41 +1878,12 @@ async def upsert_project_strategic_session(
             detail="Workbench state too large (max 50KB)",
         )
 
-    previous_state, state = await upsert_strategic_workbench_state_with_previous(
+    workbench_write = await persist_strategic_workbench_update(
         session,
         current_user["user_id"],
         project_id,
         workbench,
     )
-
-    def _update_local_continuation_marker(vision: dict) -> None:
-        apply_strategic_local_continuation_marker(
-            vision,
-            state,
-            operator_user_id=current_user["user_id"],
-        )
-
-    await with_vision_locked(
-        session,
-        project_id,
-        _update_local_continuation_marker,
-        skip_locked=False,
-    )
-    arming = ARMING_PASSIVE_NOTE
-    should_arm = workbench_mode_should_arm_strategic_refresh(previous_state, state)
-    await session.commit()
-    if should_arm:
-        armed = await request_strategic_refresh(
-            session,
-            project_id,
-            "workbench_interaction_mode",
-            origin=ORIGIN_OPERATOR,
-            steering_excerpt=workbench_mode_refresh_excerpt(state),
-            skip_locked=False,
-        )
-        arming = ARMING_STEERING if armed else ARMING_NOT_ARMED
-        if armed:
-            await session.commit()
 
     state_response = await get_project_strategic_state(
         request,
@@ -1935,7 +1896,7 @@ async def upsert_project_strategic_session(
         project_id,
         state_response,
     )
-    response["arming"] = arming
+    response["arming"] = workbench_write.arming
     return response
 
 

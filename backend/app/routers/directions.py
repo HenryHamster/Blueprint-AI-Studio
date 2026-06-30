@@ -14,6 +14,7 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.database import get_session
+from app.broadcast import broadcast_to_project
 from app.models import (
     Task,
     TaskStatus,
@@ -1422,6 +1423,12 @@ async def create_message(
         idempotency_key=payload.idempotency_key,
         enforce_raw_content_max=True,
     )
+    if result.message_event is not None:
+        await broadcast_to_project(
+            str(project.id),
+            "message_created",
+            result.message_event,
+        )
 
     return {"id": result.message_id, "status": result.status, "arming": result.arming}
 
