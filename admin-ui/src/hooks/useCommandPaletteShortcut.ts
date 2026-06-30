@@ -1,5 +1,4 @@
 import { useEffect } from 'react';
-import { isEditableShortcutEvent } from './keyboardTargets';
 
 export function useCommandPaletteShortcut(onOpen: () => void, enabled = true) {
   useEffect(() => {
@@ -7,7 +6,6 @@ export function useCommandPaletteShortcut(onOpen: () => void, enabled = true) {
     const handleCommandShortcut = (event: KeyboardEvent) => {
       if (event.defaultPrevented) return;
       if (event.altKey || !(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'k') return;
-      if (isEditableShortcutEvent(event)) return;
       event.preventDefault();
       onOpen();
     };

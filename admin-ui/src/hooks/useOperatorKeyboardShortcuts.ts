@@ -74,12 +74,13 @@ export function useOperatorKeyboardShortcuts({
     setCommandPaletteOpen(true);
   }, [closeTransientTargets, setCommandPaletteOpen]);
 
-  useCommandPaletteShortcut(openCommandPalette, !commandPaletteOpen);
+  useCommandPaletteShortcut(openCommandPalette, !commandPaletteOpen && !blockingModalOpen);
 
   useEffect(() => {
     function handleSearchShortcut(event: KeyboardEvent) {
       if (event.key !== '/') return;
       if (isEditableShortcutEvent(event)) return;
+      if (blockingModalOpen) return;
       if (searchShortcutBlocked) return;
       event.preventDefault();
       searchInputRef.current?.focus();
@@ -87,7 +88,7 @@ export function useOperatorKeyboardShortcuts({
 
     document.addEventListener('keydown', handleSearchShortcut);
     return () => document.removeEventListener('keydown', handleSearchShortcut);
-  }, [searchInputRef, searchShortcutBlocked]);
+  }, [blockingModalOpen, searchInputRef, searchShortcutBlocked]);
 
   const shouldHandleWorkbenchShortcut = useCallback((commandId: string) => {
     if (blockingModalOpen) return false;

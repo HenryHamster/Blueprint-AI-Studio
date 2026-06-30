@@ -5017,7 +5017,7 @@ describe('MessagesPanel composer draft persistence', () => {
     });
 
     _suppressSinceLastVisit('test-user@example.com', 'proj-draft');
-    const { container, getByText } = render(
+    const { container, getAllByRole } = render(
       <MessagesPanel
         selectedProjectId="proj-draft"
         variant="page"
@@ -5065,11 +5065,14 @@ describe('MessagesPanel composer draft persistence', () => {
 
     const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
     expect(textarea.value).toBe('use the clean chat path');
-    expect(container.textContent).toContain('Send');
+    const sendButton = getAllByRole('button', { name: 'Send message' })
+      .find((button): button is HTMLButtonElement => button instanceof HTMLButtonElement && !button.disabled);
+    if (!sendButton) throw new Error('Expected enabled Strategic send button');
+    expect(sendButton).toHaveAttribute('type', 'button');
     expect(container.textContent).not.toContain('Blocker');
 
     await act(async () => {
-      getByText('Send').click();
+      sendButton?.click();
     });
 
     await waitFor(() => expect(postedBodies).toHaveLength(1));

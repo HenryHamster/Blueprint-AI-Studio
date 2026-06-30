@@ -122,7 +122,7 @@ describe('MessagesComposer — steering hint viewport regression', () => {
       root = r;
       await renderComposer(r, 'FEEDBACK', null, false, 'minimal');
     });
-    expect(host!.textContent).toContain('Send');
+    expect(host!.querySelector('button[aria-label="Send message"]')).not.toBeNull();
     expect(host!.textContent).not.toContain('Strategic');
     expect(host!.textContent).not.toContain('reaches the strategist soon');
     expect(host!.textContent).not.toContain('won’t wake the strategist');
@@ -139,7 +139,7 @@ describe('MessagesComposer — steering hint viewport regression', () => {
       root = r;
       await renderComposer(r, 'FEEDBACK', null, true, 'minimal');
     });
-    expect(host!.textContent).toContain('Send');
+    expect(host!.querySelector('button[aria-label="Send message"]')).not.toBeNull();
     expect(host!.textContent).toContain('queues for the next cycle');
     expect(host!.textContent).not.toContain('Strategic');
     await expectNoTextTruncationAt(375, async () => {});
@@ -155,7 +155,7 @@ describe('MessagesComposer — steering hint viewport regression', () => {
       root = r;
       await renderComposer(r, 'FEEDBACK', 'routine_event', false, 'minimal');
     });
-    expect(host!.textContent).toContain('Send');
+    expect(host!.querySelector('button[aria-label="Send message"]')).not.toBeNull();
     expect(host!.textContent).not.toContain('Routine event');
     expect(host!.textContent).not.toContain('won’t wake the strategist');
     await expectNoTextTruncationAt(375, async () => {});

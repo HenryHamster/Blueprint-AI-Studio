@@ -55,6 +55,7 @@ export function CommandPalette({
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const clearButtonRef = useRef<HTMLButtonElement>(null);
   const activeCommandRef = useRef<HTMLButtonElement | null>(null);
+  const focusActiveCommandRef = useRef(false);
   const restoreFocusRef = useRef<HTMLElement | null>(null);
   const searchQuery = query ?? internalQuery;
 
@@ -93,6 +94,10 @@ export function CommandPalette({
   useEffect(() => {
     if (!open) return;
     activeCommandRef.current?.scrollIntoView?.({ block: 'nearest' });
+    if (focusActiveCommandRef.current) {
+      activeCommandRef.current?.focus();
+      focusActiveCommandRef.current = false;
+    }
   }, [open, resolvedActiveIndex]);
 
   if (!open) return null;
@@ -124,9 +129,26 @@ export function CommandPalette({
     });
   }
 
+  function moveToBoundary(boundary: 'first' | 'last', { focusCommand = false }: { focusCommand?: boolean } = {}) {
+    const enabledCommands = filteredCommands
+      .map((command, index) => ({ command, index }))
+      .filter(({ command }) => !command.disabled);
+    const next = boundary === 'first' ? enabledCommands[0] : enabledCommands.at(-1);
+    if (!next) return;
+    if (focusCommand) focusActiveCommandRef.current = true;
+    setActiveIndex(next.index);
+    if (focusCommand && next.index === resolvedActiveIndex) {
+      window.setTimeout(() => activeCommandRef.current?.focus(), 0);
+    }
+  }
+
   function handleKeyDown(event: KeyboardEvent<HTMLDivElement>) {
     event.stopPropagation();
     event.nativeEvent.stopImmediatePropagation?.();
+    const target = event.target;
+    const textEntryTarget = target instanceof HTMLInputElement ||
+      target instanceof HTMLTextAreaElement ||
+      (target instanceof HTMLElement && target.isContentEditable);
 
     if (event.key === 'Escape') {
       event.preventDefault();
@@ -160,6 +182,20 @@ export function CommandPalette({
     if (event.key === 'ArrowUp') {
       event.preventDefault();
       moveActive(-1);
+      return;
+    }
+
+    if (event.key === 'Home') {
+      if (textEntryTarget) return;
+      event.preventDefault();
+      moveToBoundary('first', { focusCommand: true });
+      return;
+    }
+
+    if (event.key === 'End') {
+      if (textEntryTarget) return;
+      event.preventDefault();
+      moveToBoundary('last', { focusCommand: true });
       return;
     }
 

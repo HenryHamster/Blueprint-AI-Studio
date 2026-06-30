@@ -157,6 +157,60 @@ describe('CommandPalette', () => {
     expect(commands[1].run).toHaveBeenCalledTimes(1);
   });
 
+  test('Home and End move to first and last enabled commands', async () => {
+    const user = userEvent.setup();
+    const commands = makeCommands([
+      { disabled: true },
+    ]);
+    render(
+      <CommandPalette
+        open
+        commands={commands}
+        onClose={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(screen.getByLabelText('Search commands')).toHaveFocus());
+    await user.tab();
+    expect(screen.getByRole('button', { name: /Sync fleet/i })).toHaveFocus();
+
+    await user.keyboard('{End}');
+    expect(screen.getByRole('button', { name: /Switch Strategic to Workday/i })).toHaveFocus();
+    await user.keyboard('{Enter}');
+
+    await user.keyboard('{Home}');
+    expect(screen.getByRole('button', { name: /Sync fleet/i })).toHaveFocus();
+    await user.keyboard('{Enter}');
+
+    expect(commands[0].run).not.toHaveBeenCalled();
+    expect(commands[1].run).toHaveBeenCalledTimes(1);
+    expect(commands[3].run).toHaveBeenCalledTimes(1);
+  });
+
+  test('Home and End preserve native search input editing', async () => {
+    const user = userEvent.setup();
+    render(
+      <CommandPalette
+        open
+        commands={makeCommands()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const input = screen.getByLabelText('Search commands');
+    await waitFor(() => expect(input).toHaveFocus());
+    await user.type(input, 'runner');
+
+    const endEvent = new KeyboardEvent('keydown', { key: 'End', bubbles: true, cancelable: true });
+    const homeEvent = new KeyboardEvent('keydown', { key: 'Home', bubbles: true, cancelable: true });
+    input.dispatchEvent(endEvent);
+    input.dispatchEvent(homeEvent);
+
+    expect(endEvent.defaultPrevented).toBe(false);
+    expect(homeEvent.defaultPrevented).toBe(false);
+    expect(input).toHaveValue('runner');
+  });
+
   test('does not run disabled commands from keyboard or mouse', async () => {
     const user = userEvent.setup();
     const commands = makeCommands([

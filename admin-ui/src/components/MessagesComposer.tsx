@@ -110,14 +110,17 @@ export function MessagesComposer({
           />
         </div>
         <button
+          type="button"
           onClick={onSubmit}
           disabled={submitting || !newContent.trim()}
+          aria-label="Send message"
+          title="Send message"
           className={minimal
-            ? 'flex min-h-[44px] shrink-0 items-center justify-center rounded-md bg-emerald-600 px-3 text-xs font-semibold text-white transition-colors hover:bg-emerald-500 disabled:opacity-40'
+            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md bg-emerald-600 text-white transition-colors hover:bg-emerald-500 disabled:opacity-40'
             : 'bg-blue-600 hover:bg-blue-500 text-white p-2.5 rounded-xl text-xs font-medium transition-colors disabled:opacity-40 shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center'
           }
         >
-          {minimal ? 'Send' : <Send className="w-4 h-4" />}
+          <Send className="w-4 h-4" />
         </button>
       </div>
       {/* Steering hint: grounded in the last send's real outcome when available,

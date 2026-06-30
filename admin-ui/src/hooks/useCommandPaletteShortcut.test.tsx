@@ -73,7 +73,7 @@ describe('useCommandPaletteShortcut', () => {
     expect(event.defaultPrevented).toBe(true);
   });
 
-  test('ignores command shortcuts from editable fields', () => {
+  test('opens command shortcuts from editable fields', () => {
     const onOpen = mount();
     const editableTargets = [
       host?.querySelector('input'),
@@ -89,13 +89,13 @@ describe('useCommandPaletteShortcut', () => {
         cancelable: true,
       });
       target?.dispatchEvent(event);
-      expect(event.defaultPrevented).toBe(false);
+      expect(event.defaultPrevented).toBe(true);
     }
 
-    expect(onOpen).not.toHaveBeenCalled();
+    expect(onOpen).toHaveBeenCalledTimes(3);
   });
 
-  test('does not capture Ctrl+K while a text input is focused', () => {
+  test('captures Ctrl+K while a text input is focused', () => {
     const onOpen = mount();
     host?.querySelector('input')?.focus();
     const event = new KeyboardEvent('keydown', {
@@ -107,11 +107,11 @@ describe('useCommandPaletteShortcut', () => {
 
     document.dispatchEvent(event);
 
-    expect(onOpen).not.toHaveBeenCalled();
-    expect(event.defaultPrevented).toBe(false);
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(event.defaultPrevented).toBe(true);
   });
 
-  test('does not capture Ctrl+K inside editable regions', () => {
+  test('captures Ctrl+K inside editable regions', () => {
     const onOpen = mount();
     const editor = host?.querySelector<HTMLElement>('[aria-label="rich composer"]');
     editor?.focus();
@@ -124,8 +124,8 @@ describe('useCommandPaletteShortcut', () => {
 
     editor?.dispatchEvent(event);
 
-    expect(onOpen).not.toHaveBeenCalled();
-    expect(event.defaultPrevented).toBe(false);
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(event.defaultPrevented).toBe(true);
   });
 
   test('does not capture Ctrl+K while disabled', () => {
