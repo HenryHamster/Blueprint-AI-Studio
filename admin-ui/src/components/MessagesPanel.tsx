@@ -1584,7 +1584,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   }
 
   const bubbleProps = {
-    actionMode: conversationMode ? 'none' as const : 'full' as const,
+    actionMode: conversationMode ? 'reply-only' as const : 'full' as const,
     resolvingId,
     resolveInput,
     deletingIds,

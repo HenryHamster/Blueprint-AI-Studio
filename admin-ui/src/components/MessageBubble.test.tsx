@@ -228,6 +228,21 @@ describe('MessageBubble', () => {
     expect(screen.queryByTitle('Reply')).toBeNull();
   });
 
+  test('chat reply-only mode keeps system messages passive', () => {
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      actionMode: 'reply-only',
+      msg: makeMsg({
+        from_type: 'system',
+        message_type: 'NOTE',
+        content: 'Pipeline heartbeat.',
+      }),
+    })} />);
+
+    expect(screen.getByText('Pipeline heartbeat.')).toBeTruthy();
+    expect(screen.queryByTitle('Reply')).toBeNull();
+  });
+
   test('chat presentation shows operator Strategic context receipt when captured', () => {
     const onOpenStrategicContext = vi.fn();
     render(<MessageBubble {...makeProps({

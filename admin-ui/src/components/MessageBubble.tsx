@@ -256,7 +256,9 @@ export function MessageBubble({
   const userMsg = isUserMessage(msg);
   const chatMode = presentation === 'chat';
   const showOpsChrome = !chatMode;
-  const canChatReply = chatMode && !userMsg && !faded && !readOnly && msg.status === 'open' && actionMode !== 'none';
+  const fromType = (msg.from_type || '').toLowerCase();
+  const replyableChatAuthor = fromType === 'agent' || fromType === 'strategic' || fromType === 'strategist';
+  const canChatReply = chatMode && replyableChatAuthor && !faded && !readOnly && msg.status === 'open' && actionMode !== 'none';
   const isResolving = resolvingId === msg.id;
   const taskId = msg.from_task_id;
   const strategicContextReceipt = chatMode && userMsg

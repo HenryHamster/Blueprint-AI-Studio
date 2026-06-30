@@ -892,6 +892,8 @@ describe('MessagesPanel chrome modes', () => {
     expect(el.querySelector('[data-testid="saved-views-tab-strip"]')).toBeNull();
     expect(filterToggle(el)).toBeUndefined();
     expect(el.querySelector('button[title="Copy message ref"]')).toBeNull();
+    expect(el.querySelector('[data-message-id="strategic"] button[title="Reply"]')).not.toBeNull();
+    expect(el.querySelector('[data-message-id="question"] button[title="Reply"]')).not.toBeNull();
     expect(el.querySelector('button[title="Resolve"]')).toBeNull();
     expect(el.querySelector('button[title="Delete"]')).toBeNull();
     expect(el.querySelector('button[title="Create Direction"]')).toBeNull();
@@ -1082,18 +1084,23 @@ describe('MessagesPanel chrome modes', () => {
       status: 'open',
       created_at: '2026-06-01T10:01:00Z',
     });
-    const el = await renderPanel({
-      filterChrome: 'minimal',
-      targetMessage: { messageId: 'question-target', action: 'reply' },
-    }, [question]);
+    const el = await renderPanel({ filterChrome: 'minimal' }, [question]);
 
+    const { fireEvent } = await import('@testing-library/react');
+    const replyButton = await waitFor(() => {
+      const button = el.querySelector('[data-message-id="question-target"] button[title="Reply"]') as HTMLButtonElement | null;
+      expect(button).not.toBeNull();
+      return button;
+    });
+    await act(async () => {
+      fireEvent.click(replyButton);
+    });
     await waitFor(() => expect(el.textContent).toContain('Replying to Agent'));
     const textarea = el.querySelector('textarea') as HTMLTextAreaElement;
     const sendButton = [...el.querySelectorAll('button')]
       .find(button => button.getAttribute('aria-label') === 'Send message') as HTMLButtonElement | undefined;
     if (!sendButton) throw new Error('Expected send button');
 
-    const { fireEvent } = await import('@testing-library/react');
     await act(async () => {
       fireEvent.change(textarea, { target: { value: 'Keep it online.' } });
     });

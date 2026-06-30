@@ -13,10 +13,10 @@ import type {
   StrategicStateResponse,
   StrategicStateAttentionItem,
   StrategicWorkbenchState,
-  StrategicWorkSessionMetric,
   StrategicWorkSessionAction,
   StrategicWorkSessionRefDescriptor,
 } from '../strategicStateApi';
+import { formatStrategicMetricValue, rankStrategicWorkSessionMetrics } from '../utils/strategicWorkSessionMetrics';
 import { removeStrategicSelectedRef, upsertStrategicSelectedRef, type StrategicSelectedRef } from '../utils/strategicWorkbenchSession';
 import type { PrimaryTab } from './useUIState';
 import type { ViewMode } from './useViewPreferences';
@@ -137,28 +137,6 @@ function attentionItemLabel(item: StrategicStateAttentionItem): string {
   if (item.kind === 'direction') return `Open direction: ${label}`;
   if (item.kind === 'alert') return `Open alert: ${label}`;
   return `Open attention: ${label}`;
-}
-
-function metricValueDetail(metric: StrategicWorkSessionMetric): string {
-  const raw = metric.value;
-  const value = typeof raw === 'number'
-    ? (Number.isInteger(raw) ? String(raw) : raw.toFixed(2))
-    : String(raw ?? '');
-  const unit = metric.unit?.trim();
-  return unit ? `${value} ${unit}` : value;
-}
-
-function metricIsActionable(metric: StrategicWorkSessionMetric): boolean {
-  return Boolean(metric.target) && (Number(metric.value) > 0 || (metric.tone != null && metric.tone !== 'neutral'));
-}
-
-function metricPriority(metric: StrategicWorkSessionMetric): number {
-  if (metric.tone === 'critical') return 50;
-  if (metric.tone === 'warning') return 40;
-  if (metric.tone === 'active') return 30;
-  if (metric.tone === 'watch') return 20;
-  if (Number(metric.value) > 0) return 10;
-  return 0;
 }
 
 function workSessionActionLabel(action: StrategicWorkSessionAction): string {
@@ -552,15 +530,15 @@ export function useWorkbenchCommands({
         disabled: projectDisabled,
         run: () => openAttentionItem(item),
       }));
-    const sessionMetricCommands = (strategicState?.work_session?.curated_metrics ?? [])
-      .filter(metricIsActionable)
-      .sort((a, b) => metricPriority(b) - metricPriority(a) || Number(b.value) - Number(a.value))
-      .slice(0, 10)
+    const sessionMetricCommands = rankStrategicWorkSessionMetrics(
+      strategicState?.work_session?.curated_metrics ?? [],
+      10,
+    )
       .map((metric): WorkbenchCommand => ({
         id: `strategic.session.metric.${metric.id}`,
         label: `Open ${metric.label}`,
         section: 'Session',
-        detail: compactContextDetail(metricValueDetail(metric), metric.tone === 'neutral' ? null : metric.tone) ?? undefined,
+        detail: compactContextDetail(formatStrategicMetricValue(metric), metric.tone === 'neutral' ? null : metric.tone) ?? undefined,
         keywords: ['strategic', 'session', 'metric', metric.id, metric.label, metric.tone ?? '', metric.unit ?? ''],
         disabled: projectDisabled || !openStrategicContextTarget,
         run: () => openContextTarget(metric.target),

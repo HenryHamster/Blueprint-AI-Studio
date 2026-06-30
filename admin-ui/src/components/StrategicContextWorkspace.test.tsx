@@ -149,6 +149,13 @@ const STATE = {
     ],
     curated_metrics: [
       {
+        id: 'messages.open',
+        label: 'open messages',
+        value: 0,
+        tone: 'neutral',
+        target: { surface: 'messages' },
+      },
+      {
         id: 'runtime.compute_failed',
         label: 'failed compute',
         value: 2,
@@ -308,6 +315,7 @@ describe('StrategicContextWorkspace', () => {
     expect(host.textContent).toContain('needs check');
     expect(host.textContent).toContain('One operator decision is waiting.');
     expect(host.textContent).toContain('failed compute');
+    expect(host.textContent).not.toContain('open messages');
     expect(host.textContent).toContain('Reply to operator question');
     expect(host.textContent).toContain('Workbench context package');
     expect(host.textContent).toContain('Operator notes');

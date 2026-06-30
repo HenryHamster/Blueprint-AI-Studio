@@ -14,6 +14,7 @@ import type {
   StrategicWorkSessionMetric,
   StrategicWorkSessionRefDescriptor,
 } from '../strategicStateApi';
+import { formatStrategicMetricValue, rankStrategicWorkSessionMetrics } from '../utils/strategicWorkSessionMetrics';
 import {
   MAX_STRATEGIC_SELECTED_REFS,
   removeStrategicSelectedRef,
@@ -197,15 +198,6 @@ function runtimeWorkDetail(work: StrategicRuntimeWorkState): string {
   if (parts.length > 0) return parts.join(' / ');
   const terminal = work.compute_jobs?.counts.terminal_recent ?? 0;
   return terminal > 0 ? pluralize(terminal, 'recent compute result') : 'No active background work';
-}
-
-function metricValueDetail(metric: StrategicWorkSessionMetric): string {
-  const raw = metric.value;
-  const value = typeof raw === 'number'
-    ? (Number.isInteger(raw) ? String(raw) : raw.toFixed(2))
-    : String(raw ?? '');
-  const unit = metric.unit?.trim();
-  return unit ? `${value} ${unit}` : value;
 }
 
 function metricToneClass(tone?: string | null): string {
@@ -460,7 +452,7 @@ function MetricButton({
   const content = (
     <>
       <span className={`block truncate text-sm font-semibold ${metricToneClass(metric.tone)}`}>
-        {metricValueDetail(metric)}
+        {formatStrategicMetricValue(metric)}
       </span>
       <span className="mt-0.5 block truncate text-ui-sm font-semibold uppercase text-neutral-500">
         {metric.label}
@@ -579,7 +571,7 @@ export function StrategicContextWorkspace({
   const localRunnerStatus = localRunner ? localRunnerTone(localRunner) : null;
   const runtimeWorkStatus = runtimeWork ? runtimeWorkTone(runtimeWork) : null;
   const workSessionActions = (workSession?.actions ?? []).slice(0, 4);
-  const workSessionMetrics = (workSession?.curated_metrics ?? []).slice(0, 6);
+  const workSessionMetrics = rankStrategicWorkSessionMetrics(workSession?.curated_metrics ?? [], 6);
   const attentionCounts = state?.attention?.counts ?? null;
   const attentionPills = attentionCounts ? [
     { label: 'needs', value: attentionCounts.needs_operator },
