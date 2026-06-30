@@ -154,6 +154,7 @@ from app.ci_resolution import (
     _CI_RED,
     _classify_check_runs,
     proceed_on_no_checks,
+    requires_ci_checks,
 )
 from app.release_scoring import (
     # Re-exports — release_qualifier is the canonical import + test-patch
@@ -785,26 +786,26 @@ async def _resolve_candidate_ci(
     # Prefer merged PRs; fall back to every associated PR when none carry merged_at.
     merged_prs = [pr for pr in prs if isinstance(pr, dict) and pr.get("merged_at")]
     use_prs = merged_prs or [pr for pr in prs if isinstance(pr, dict)]
-    head_shas: list[str] = []
+    all_head_shas: list[str] = []
     for pr in use_prs:
         head = pr.get("head")
         head_sha = head.get("sha") if isinstance(head, dict) else None
-        if head_sha and head_sha != candidate_sha and head_sha not in head_shas:
-            head_shas.append(head_sha)
-            # Cap the sweep to avoid exhausting API quota on repos with many PRs.
-            if len(head_shas) >= _PR_HEAD_SWEEP_MAX:
-                break
+        if head_sha and head_sha != candidate_sha and head_sha not in all_head_shas:
+            all_head_shas.append(head_sha)
+
+    # Cap the sweep to avoid exhausting API quota on repos with many PRs.
+    head_shas = all_head_shas[:_PR_HEAD_SWEEP_MAX]
+    truncated = len(all_head_shas) > len(head_shas)
 
     # Log a warning if we had to truncate the PR head sweep.
-    if len(use_prs) > len(head_shas):
-        total_prs = len(use_prs)
+    if truncated:
         logger.warning(
             "[RELEASE_QUALIFIER] CI resolution: commit %s@%s/%s is associated with "
-            "%d PRs; checking at most %d PR heads (truncated)",
+            "%d PR heads; checking at most %d PR heads (truncated)",
             candidate_sha[:8],
             owner,
             repo,
-            total_prs,
+            len(all_head_shas),
             _PR_HEAD_SWEEP_MAX,
         )
 
@@ -868,7 +869,14 @@ async def _resolve_candidate_ci(
             "resolved_sha": first_green_sha,
             "detail": "PR head check-runs passed",
         }
-    if saw_pending or saw_error:
+    if saw_error and not saw_pending:
+        return {
+            "state": _CI_PENDING,
+            "ci_green": False,
+            "resolved_sha": None,
+            "detail": "PR head check-runs fetch failed",
+        }
+    if saw_pending:
         return {
             "state": _CI_PENDING,
             "ci_green": False,
@@ -881,6 +889,94 @@ async def _resolve_candidate_ci(
         "resolved_sha": None,
         "detail": "no check-runs on candidate or associated PR heads",
     }
+
+
+async def _annotate_absent_ci_integration_topology(
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    project: Project,
+    candidate_sha: str,
+    ci_resolution: dict[str, Any],
+) -> dict[str, Any]:
+    """Add finalize-time topology provenance for a definitive no-checks result.
+
+    The scorer still receives a plain ``ci_required`` boolean.  This provenance
+    lets the finalizer relax that boolean only when the absent candidate-level
+    CI belongs to the configured integration branch; comparison failures are
+    recorded as indeterminate and remain strict.
+    """
+    if ci_resolution.get("state") != _CI_NO_CHECKS:
+        return ci_resolution
+
+    integration_branch, promotion_target = _lts_branch_names(project)
+    topology: dict[str, Any] = {
+        "integration_branch": integration_branch,
+        "promotion_target": promotion_target,
+        "candidate_reachable_from_integration": None,
+    }
+    if integration_branch == promotion_target:
+        topology["detail"] = "integration branch equals promotion target"
+        return {**ci_resolution, "integration_branch_topology": topology}
+    if requires_ci_checks(project):
+        topology["detail"] = "project requires candidate CI checks"
+        return {**ci_resolution, "integration_branch_topology": topology}
+
+    try:
+        reachable = await github.is_ancestor_of(
+            token,
+            owner,
+            repo,
+            candidate_sha,
+            integration_branch,
+            project_id=str(project.id),
+        )
+    except Exception as exc:  # noqa: BLE001 — topology-unavailable stays strict
+        logger.warning(
+            "[RELEASE_QUALIFIER] finalize CI topology check failed for %s/%s@%s "
+            "against %s: %s",
+            owner,
+            repo,
+            candidate_sha[:8],
+            integration_branch,
+            exc,
+        )
+        topology["detail"] = f"integration topology check failed: {exc}"
+        return {**ci_resolution, "integration_branch_topology": topology}
+
+    topology["candidate_reachable_from_integration"] = reachable
+    if reachable is True:
+        topology["detail"] = "candidate is reachable from integration branch"
+    elif reachable is False:
+        topology["detail"] = "candidate is not reachable from integration branch"
+    else:
+        topology["detail"] = "integration topology check was indeterminate"
+    return {**ci_resolution, "integration_branch_topology": topology}
+
+
+def _ci_required_for_finalize(
+    project: Project | None,
+    ci_resolution: dict[str, Any],
+) -> bool:
+    """Return whether the finalize scorer must hard-block unresolved CI."""
+    if project is None:
+        return True
+    if ci_resolution.get("state") != _CI_NO_CHECKS:
+        return True
+    if requires_ci_checks(project):
+        return True
+
+    integration_branch, promotion_target = _lts_branch_names(project)
+    if integration_branch == promotion_target:
+        return True
+
+    topology = ci_resolution.get("integration_branch_topology")
+    if not isinstance(topology, dict):
+        return True
+    if topology.get("candidate_reachable_from_integration") is not True:
+        return True
+    return not proceed_on_no_checks(project, integration_branch)
 
 
 async def _resolve_ci_at_finalize(
@@ -935,6 +1031,14 @@ async def _resolve_ci_at_finalize(
         ci_resolution = await _resolve_candidate_ci(
             token, owner, repo, candidate_sha, project_id=str(version.project_id)
         )
+        ci_resolution = await _annotate_absent_ci_integration_topology(
+            token=token,
+            owner=owner,
+            repo=repo,
+            project=project,
+            candidate_sha=candidate_sha,
+            ci_resolution=ci_resolution,
+        )
         logger.info(
             "[RELEASE_QUALIFIER] finalize CI re-resolution for v%d candidate "
             "%s: state=%s ci_green=%s (%s)",
@@ -950,6 +1054,10 @@ async def _resolve_ci_at_finalize(
             "resolved_sha": ci_resolution.get("resolved_sha"),
             "detail": ci_resolution.get("detail"),
         }
+        if "integration_branch_topology" in ci_resolution:
+            resolution_provenance["integration_branch_topology"] = ci_resolution[
+                "integration_branch_topology"
+            ]
         return bool(ci_resolution["ci_green"]), resolution_provenance
     except Exception as exc:  # noqa: BLE001 — finalize CI failure → not-green
         logger.warning(
@@ -960,52 +1068,6 @@ async def _resolve_ci_at_finalize(
         )
         return False, degenerate_resolution
 
-
-async def _resolve_finalize_ci_required(
-    session: AsyncSession,
-    version: release_version.ReleaseVersion,
-    candidate_sha: str | None,
-) -> bool:
-    """Return whether finalize must still treat ``no_checks`` as blocking.
-
-    Only a definitive ``no_checks`` on an integration-branch candidate can
-    relax CI, and only when ``proceed_on_no_checks`` permits that branch.
-    Any indeterminate topology or GitHub failure stays strict.
-    """
-    if not candidate_sha:
-        return True
-    try:
-        project = await session.get(Project, version.project_id)
-        if project is None:
-            return True
-        integration_branch = get_project_integration_branch(project)
-        if not integration_branch:
-            return True
-        resolved = await _resolve_github_with_session(session, project)
-        if resolved is None:
-            return True
-        token, owner, repo = resolved
-        candidate_reachable = await github.is_ancestor_of(
-            token,
-            owner,
-            repo,
-            candidate_sha,
-            integration_branch,
-            project_id=str(version.project_id),
-        )
-        return not (
-            candidate_reachable is True
-            and proceed_on_no_checks(project, integration_branch)
-        )
-    except Exception as exc:  # noqa: BLE001 — uncertain topology stays strict
-        logger.warning(
-            "[RELEASE_QUALIFIER] finalize CI topology check failed for v%d "
-            "candidate %s: %s",
-            version.version_number,
-            str(candidate_sha)[:8],
-            exc,
-        )
-        return True
 
 
 # ---------------------------------------------------------------------------
@@ -3332,7 +3394,8 @@ async def _finalize_qualification(
     if _pre_gates is not None and "ci_required" in _pre_gates:
         ci_required = bool(_pre_gates["ci_required"])
     elif ci_state == _CI_NO_CHECKS:
-        ci_required = await _resolve_finalize_ci_required(session, version, candidate_sha)
+        _proj_for_ci_gate = await session.get(Project, version.project_id)
+        ci_required = _ci_required_for_finalize(_proj_for_ci_gate, ci_resolution)
     criterion_coverage = await get_version_coverage_summary(session, version.id)
     composite = compute_composite(
         ci_green=ci_green,
@@ -4119,8 +4182,9 @@ async def _finalize_locked_version(
             "apply_detail": pre_apply_detail,
         }
         if pre_ci_resolution.get("state") == _CI_NO_CHECKS:
-            _pre_gates["ci_required"] = await _resolve_finalize_ci_required(
-                session, peek, peek_candidate_sha
+            _pre_proj_for_ci_gate = await session.get(Project, peek.project_id)
+            _pre_gates["ci_required"] = _ci_required_for_finalize(
+                _pre_proj_for_ci_gate, pre_ci_resolution
             )
 
     # Expire the peek instance so the FOR UPDATE select below forces a fresh
