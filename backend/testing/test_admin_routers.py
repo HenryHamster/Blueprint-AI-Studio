@@ -6520,6 +6520,135 @@ class TestMessagesWorkbenchState:
         assert STRATEGIC_LOCAL_CONTINUATION_KEY not in (project.vision or {})
 
     @pytest.mark.asyncio
+    async def test_non_continuous_update_clears_stale_foreign_continuation_marker(
+        self, client: AsyncClient, db_session
+    ):
+        from app.workbench_state import (
+            STRATEGIC_LOCAL_CONTINUATION_KEY,
+            STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
+        )
+
+        project = await _make_project(db_session)
+        stale_at = (
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(seconds=STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS + 60)
+        ).isoformat()
+        project.vision = {
+            **(project.vision or {}),
+            STRATEGIC_LOCAL_CONTINUATION_KEY: {
+                "version": 1,
+                "active": True,
+                "operator_user_id": "other-operator",
+                "updated_at": stale_at,
+                "last_seen_at": stale_at,
+            },
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "monitor",
+                    "active_surface": "runtime",
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        assert resp.json()["workbench"]["interaction_mode"] == "monitor"
+        await db_session.refresh(project)
+        assert STRATEGIC_LOCAL_CONTINUATION_KEY not in (project.vision or {})
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "marker_overrides",
+        [
+            {"active": "false"},
+            {"active": None},
+            {"operator_user_id": ""},
+            {"operator_user_id": 123},
+            {"version": "1"},
+        ],
+    )
+    async def test_non_continuous_update_clears_malformed_foreign_continuation_marker(
+        self, client: AsyncClient, db_session, marker_overrides: dict[str, object]
+    ):
+        from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+
+        project = await _make_project(db_session)
+        fresh_at = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        project.vision = {
+            **(project.vision or {}),
+            STRATEGIC_LOCAL_CONTINUATION_KEY: {
+                "version": 1,
+                "active": True,
+                "operator_user_id": "other-operator",
+                "updated_at": fresh_at,
+                "last_seen_at": fresh_at,
+                **marker_overrides,
+            },
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "monitor",
+                    "active_surface": "runtime",
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        assert STRATEGIC_LOCAL_CONTINUATION_KEY not in (project.vision or {})
+
+    @pytest.mark.asyncio
+    async def test_non_continuous_update_preserves_fresh_foreign_continuation_marker(
+        self, client: AsyncClient, db_session
+    ):
+        from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+
+        project = await _make_project(db_session)
+        fresh_at = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
+        project.vision = {
+            **(project.vision or {}),
+            STRATEGIC_LOCAL_CONTINUATION_KEY: {
+                "version": 1,
+                "active": True,
+                "operator_user_id": "other-operator",
+                "updated_at": fresh_at,
+                "last_seen_at": fresh_at,
+                "preferred_runner_id": str(uuid.uuid4()),
+            },
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "monitor",
+                    "active_surface": "runtime",
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["operator_user_id"] == "other-operator"
+        assert marker["last_seen_at"] == fresh_at
+
+    @pytest.mark.asyncio
     async def test_arm_rollback_does_not_discard_workbench_state(
         self, client: AsyncClient, db_session
     ):

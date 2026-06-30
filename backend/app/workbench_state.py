@@ -393,6 +393,37 @@ def _parse_naive_utc_timestamp(value: Any) -> datetime | None:
     return parsed
 
 
+def _strategic_local_continuation_marker_is_fresh(marker: dict[str, Any]) -> bool:
+    freshness_ts = _parse_naive_utc_timestamp(
+        marker.get("last_seen_at") or marker.get("updated_at")
+    )
+    if freshness_ts is None:
+        return False
+    elapsed = (_utcnow() - freshness_ts).total_seconds()
+    return elapsed <= STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS
+
+
+def _strategic_local_continuation_marker_owner_id(
+    marker: dict[str, Any],
+) -> str | None:
+    return _string(marker.get("operator_user_id"), max_chars=160)
+
+
+def _strategic_local_continuation_marker_is_protected_foreign(
+    marker: dict[str, Any],
+    *,
+    operator_id: str | None,
+) -> bool:
+    marker_operator_id = _strategic_local_continuation_marker_owner_id(marker)
+    return (
+        marker.get("version") == 1
+        and marker.get("active") is True
+        and marker_operator_id is not None
+        and marker_operator_id != operator_id
+        and _strategic_local_continuation_marker_is_fresh(marker)
+    )
+
+
 def apply_strategic_local_continuation_marker(
     vision: dict[str, Any],
     workbench_state: dict[str, Any],
@@ -405,10 +436,13 @@ def apply_strategic_local_continuation_marker(
     operator_id = _string(str(operator_user_id), max_chars=160)
     if workbench_state.get("interaction_mode") != "continuous":
         marker = vision.get(STRATEGIC_LOCAL_CONTINUATION_KEY)
-        marker_operator_id = (
-            marker.get("operator_user_id") if isinstance(marker, dict) else None
-        )
-        if not isinstance(marker, dict) or marker_operator_id in (None, operator_id):
+        if (
+            not isinstance(marker, dict)
+            or not _strategic_local_continuation_marker_is_protected_foreign(
+                marker,
+                operator_id=operator_id,
+            )
+        ):
             vision.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
         return
 
