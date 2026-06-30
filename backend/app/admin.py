@@ -78,6 +78,7 @@ from app.schemas import (
 )
 from app.project_message_projection import compact_text, message_preview_dict
 from app.task_outcomes import build_task_evaluation_summary
+from app.task_direction_refs import first_task_direction_id, task_related_direction_ids
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
     _ROLE_LEVEL,
@@ -210,6 +211,7 @@ TERMINAL_STATUSES = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELL
 # up to ~100KB of research_findings plus unbounded status_log, so 500 rows
 # x large-tail payload stays safely under Cloud Run's 32 MB response limit.
 ADMIN_TASKS_MAX_LIMIT = 500
+ADMIN_TASKS_DIRECTION_SCAN_BATCH = 500
 
 
 @router.get("/tasks")
@@ -264,8 +266,6 @@ async def get_all_tasks(
         if created_after.tzinfo is not None:
             created_after = created_after.astimezone(timezone.utc).replace(tzinfo=None)
         filters.append(Task.created_at >= created_after)
-    if direction_id:
-        filters.append(Task.context["direction_id"].as_string() == direction_id)
     if task_type:
         filters.append(Task.payloads[0]["type"].as_string() == task_type)
     if spawned_by:
@@ -276,17 +276,69 @@ async def get_all_tasks(
         # triage filter. Omitted (None) -> no change to existing behavior.
         filters.append(Task.requires_approval == approval_needed)
 
-    count_query = select(func.count()).select_from(Task)
-    for f in filters:
-        count_query = count_query.where(f)
-    total = (await session.execute(count_query)).scalar() or 0
+    if direction_id:
+        matching_task_ids: list[uuid.UUID] = []
+        last_seen_created_at: datetime | None = None
+        last_seen_id: uuid.UUID | None = None
+        while True:
+            scan_query = (
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.created_at,
+                        Task.context,
+                        Task.payloads,
+                        Task.plan_output,
+                        raiseload=True,
+                    )
+                )
+                .order_by(Task.created_at.desc(), Task.id.desc())
+                .limit(ADMIN_TASKS_DIRECTION_SCAN_BATCH)
+            )
+            for f in filters:
+                scan_query = scan_query.where(f)
+            if last_seen_created_at is not None and last_seen_id is not None:
+                scan_query = scan_query.where(
+                    (Task.created_at < last_seen_created_at)
+                    | (
+                        (Task.created_at == last_seen_created_at)
+                        & (Task.id < last_seen_id)
+                    )
+                )
+            batch = (await session.execute(scan_query)).scalars().all()
+            if not batch:
+                break
+            for task in batch:
+                if direction_id in task_related_direction_ids(task):
+                    matching_task_ids.append(task.id)
+            last_seen = batch[-1]
+            last_seen_created_at = last_seen.created_at
+            last_seen_id = last_seen.id
+            if len(batch) < ADMIN_TASKS_DIRECTION_SCAN_BATCH:
+                break
 
-    query = select(Task).order_by(Task.created_at.desc()).offset(offset).limit(limit)
-    for f in filters:
-        query = query.where(f)
+        total = len(matching_task_ids)
+        page_task_ids = matching_task_ids[offset : offset + limit]
+        if page_task_ids:
+            page_order = {task_id: index for index, task_id in enumerate(page_task_ids)}
+            page_query = select(Task).where(Task.id.in_(page_task_ids))
+            result = await session.execute(page_query)
+            tasks = sorted(result.scalars().all(), key=lambda task: page_order[task.id])
+        else:
+            tasks = []
+    else:
+        count_query = select(func.count()).select_from(Task)
+        for f in filters:
+            count_query = count_query.where(f)
+        total = (await session.execute(count_query)).scalar() or 0
 
-    result = await session.execute(query)
-    tasks = result.scalars().all()
+        query = select(Task).order_by(Task.created_at.desc()).offset(offset).limit(limit)
+        for f in filters:
+            query = query.where(f)
+
+        result = await session.execute(query)
+        tasks = result.scalars().all()
 
     # Join artifacts to include all artifacts per task
     task_ids = [t.id for t in tasks]
@@ -1154,10 +1206,7 @@ def _status_values(statuses: tuple[TaskStatus, ...]) -> list[str]:
 
 
 def _task_direction_id(task: Task) -> str | None:
-    ctx = task.context if isinstance(task.context, dict) else {}
-    payload = task.first_payload if isinstance(task.first_payload, dict) else {}
-    value = ctx.get("direction_id") or payload.get("direction_id")
-    return str(value) if value else None
+    return first_task_direction_id(task)
 
 
 def _find_task_direction_ref(task: Task, project: Project | None) -> dict[str, Any] | None:

@@ -56,6 +56,7 @@ from app.operator_attention import build_operator_attention
 from app.project_message_projection import message_event_payload, message_preview_dict
 from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
+from app.task_direction_refs import task_primary_direction_ids
 from app.onboarding_proof import build_onboarding_proof_block
 from app.strategic_context_package import (
     build_strategic_context_package_summary,
@@ -2658,6 +2659,7 @@ async def get_direction_task_counts(
                 Task.status,
                 Task.payloads,
                 Task.context,
+                Task.plan_output,
                 Task.title,
                 Task.latest_status_message,
                 raiseload=True,
@@ -2672,22 +2674,7 @@ async def get_direction_task_counts(
     active_tasks: Dict[str, list[dict]] = {}
     for task in tasks:
         payload = task.first_payload
-        # Primary: context.direction_id (matches admin_digest.py behavior).
-        # Fallback: payload.current_direction_id, then payload.directions[].id
-        # (for older tasks without context).
-        dir_ids: list[str] = []
-        ctx_did = (task.context or {}).get("direction_id")
-        if ctx_did:
-            dir_ids.append(ctx_did)
-        else:
-            current_did = payload.get("current_direction_id")
-            if current_did:
-                dir_ids.append(current_did)
-            else:
-                for direction in payload.get("directions", []):
-                    d_id = direction.get("id")
-                    if d_id:
-                        dir_ids.append(d_id)
+        dir_ids = task_primary_direction_ids(task)
         if not dir_ids:
             continue
         task_type = payload.get("type") or "unknown"

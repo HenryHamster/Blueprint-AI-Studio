@@ -3181,6 +3181,153 @@ class TestAutonomousMode:
         assert body["counts_by_type"][direction_id]["research"] == 1
 
     @pytest.mark.asyncio
+    async def test_admin_tasks_direction_filter_matches_canonical_shapes(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        other_project = await _make_project(db_session)
+        direction_id = "d-canonical"
+        expected_tasks = [
+            Task(
+                project_id=project.id,
+                title="context direction",
+                context={"direction_id": direction_id},
+                payloads=[{"type": "create"}],
+                status=TaskStatus.QUEUED,
+            ),
+            Task(
+                project_id=project.id,
+                title="payload direction",
+                payloads=[{"type": "research", "direction_id": direction_id}],
+                status=TaskStatus.IN_PROGRESS,
+            ),
+            Task(
+                project_id=project.id,
+                title="current direction",
+                payloads=[{"type": "research", "current_direction_id": direction_id}],
+                status=TaskStatus.IN_PROGRESS,
+            ),
+            Task(
+                project_id=project.id,
+                title="directions array",
+                payloads=[{"type": "plan", "directions": [{"id": direction_id}]}],
+                status=TaskStatus.QUEUED,
+            ),
+            Task(
+                project_id=project.id,
+                title="plan output source",
+                payloads=[{"type": "plan"}],
+                plan_output={"source_direction_id": direction_id},
+                status=TaskStatus.QUEUED,
+            ),
+            Task(
+                project_id=project.id,
+                title="nested finding",
+                payloads=[{"type": "research"}],
+                plan_output={"findings": [{"direction_id": direction_id}]},
+                status=TaskStatus.QUEUED,
+            ),
+        ]
+        excluded_tasks = [
+            Task(
+                project_id=project.id,
+                title="other direction",
+                context={"direction_id": "d-other"},
+                payloads=[{"type": "create"}],
+                status=TaskStatus.QUEUED,
+            ),
+            Task(
+                project_id=other_project.id,
+                title="cross project direction",
+                context={"direction_id": direction_id},
+                payloads=[{"type": "create"}],
+                status=TaskStatus.QUEUED,
+            ),
+        ]
+        db_session.add_all([*expected_tasks, *excluded_tasks])
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/tasks?project_id={project.id}&direction_id={direction_id}&limit=50"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        returned_ids = {row["id"] for row in body["tasks"]}
+        assert returned_ids == {str(task.id) for task in expected_tasks}
+        assert body["total"] == len(expected_tasks)
+
+    @pytest.mark.asyncio
+    async def test_get_direction_task_counts_matches_canonical_shapes(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        other_project = await _make_project(db_session)
+        direction_id = "d-counts"
+        db_session.add_all(
+            [
+                Task(
+                    project_id=project.id,
+                    context={"direction_id": direction_id},
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.QUEUED,
+                ),
+                Task(
+                    project_id=project.id,
+                    payloads=[{"type": "research", "direction_id": direction_id}],
+                    status=TaskStatus.IN_PROGRESS,
+                ),
+                Task(
+                    project_id=project.id,
+                    payloads=[
+                        {
+                            "type": "research",
+                            "current_direction_id": direction_id,
+                            "directions": [{"id": "d-not-current"}],
+                        }
+                    ],
+                    status=TaskStatus.IN_PROGRESS,
+                ),
+                Task(
+                    project_id=project.id,
+                    payloads=[{"type": "plan", "directions": [{"id": direction_id}]}],
+                    status=TaskStatus.QUEUED,
+                ),
+                Task(
+                    project_id=project.id,
+                    payloads=[{"type": "plan"}],
+                    plan_output={"research_findings": [{"source_direction_id": direction_id}]},
+                    status=TaskStatus.QUEUED,
+                ),
+                Task(
+                    project_id=project.id,
+                    context={"direction_id": direction_id},
+                    payloads=[{"type": "failed"}],
+                    status=TaskStatus.FAILED,
+                ),
+                Task(
+                    project_id=other_project.id,
+                    context={"direction_id": direction_id},
+                    payloads=[{"type": "create"}],
+                    status=TaskStatus.QUEUED,
+                ),
+            ]
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/directions/task-counts"
+        )
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["counts"][direction_id] == 5
+        assert "d-not-current" not in body["counts"]
+        assert body["counts_by_type"][direction_id]["create"] == 1
+        assert body["counts_by_type"][direction_id]["research"] == 2
+        assert body["counts_by_type"][direction_id]["plan"] == 2
+
+    @pytest.mark.asyncio
     async def test_directions_lite_mode_omits_heavy_fields(
         self, client: AsyncClient, db_session
     ):
