@@ -8,6 +8,7 @@ import { useWorkbenchShortcutRouter } from './useWorkbenchShortcutRouter';
 interface UseOperatorKeyboardShortcutsOptions {
   activeTab: PrimaryTab;
   blockingModalOpen: boolean;
+  commandPaletteShortcutBlocked?: boolean;
   commandPaletteOpen: boolean;
   commands: WorkbenchCommand[];
   searchInputRef: RefObject<HTMLInputElement | null>;
@@ -29,6 +30,7 @@ interface UseOperatorKeyboardShortcutsOptions {
 export function useOperatorKeyboardShortcuts({
   activeTab,
   blockingModalOpen,
+  commandPaletteShortcutBlocked = blockingModalOpen,
   commandPaletteOpen,
   commands,
   searchInputRef,
@@ -74,7 +76,7 @@ export function useOperatorKeyboardShortcuts({
     setCommandPaletteOpen(true);
   }, [closeTransientTargets, setCommandPaletteOpen]);
 
-  useCommandPaletteShortcut(openCommandPalette, !commandPaletteOpen && !blockingModalOpen);
+  useCommandPaletteShortcut(openCommandPalette, !commandPaletteOpen && !commandPaletteShortcutBlocked);
 
   useEffect(() => {
     function handleSearchShortcut(event: KeyboardEvent) {

@@ -19,8 +19,18 @@ function Harness({
   return (
     <>
       <input aria-label="task title" />
+      <textarea aria-label="strategic composer" />
+      <select aria-label="status filter">
+        <option>Queued</option>
+      </select>
+      <div role="textbox" aria-label="role editor" tabIndex={0}>
+        Role editor
+      </div>
       <div aria-label="rich editor" contentEditable suppressContentEditableWarning tabIndex={0}>
-        Editable draft
+        <span>Editable draft</span>
+      </div>
+      <div data-shortcut-scope="editor" aria-label="embedded editor" tabIndex={0}>
+        Embedded editor
       </div>
     </>
   );
@@ -50,13 +60,17 @@ function makeCommands(overrides: Partial<WorkbenchCommand>[] = []): WorkbenchCom
 }
 
 function dispatchShortcut(key: string, init: KeyboardEventInit = {}) {
+  return dispatchShortcutTo(document, key, init);
+}
+
+function dispatchShortcutTo(target: EventTarget, key: string, init: KeyboardEventInit = {}) {
   const event = new KeyboardEvent('keydown', {
     key,
     bubbles: true,
     cancelable: true,
     ...init,
   });
-  document.dispatchEvent(event);
+  target.dispatchEvent(event);
   return event;
 }
 
@@ -159,13 +173,32 @@ describe('useWorkbenchShortcutRouter', () => {
     host?.querySelector<HTMLInputElement>('input')?.focus();
     const inputEvent = dispatchShortcut('n');
 
-    host?.querySelector<HTMLElement>('[aria-label="rich editor"]')?.focus();
-    const editorEvent = dispatchShortcut('r');
+    host?.querySelector<HTMLTextAreaElement>('textarea')?.focus();
+    const textareaEvent = dispatchShortcut('r');
+
+    host?.querySelector<HTMLSelectElement>('select')?.focus();
+    const selectEvent = dispatchShortcut('s');
+
+    host?.querySelector<HTMLElement>('[aria-label="role editor"]')?.focus();
+    const roleEvent = dispatchShortcut('a');
+
+    const richEditorChild = host?.querySelector<HTMLElement>('[aria-label="rich editor"] span');
+    if (!richEditorChild) throw new Error('Expected nested rich editor child');
+    const editorEvent = dispatchShortcutTo(richEditorChild, 'r');
+
+    host?.querySelector<HTMLElement>('[aria-label="embedded editor"]')?.focus();
+    const embeddedEditorEvent = dispatchShortcut('n');
 
     expect(commands.find(command => command.id === 'task.new')?.run).not.toHaveBeenCalled();
     expect(commands.find(command => command.id === 'workbench.refresh')?.run).not.toHaveBeenCalled();
+    expect(commands.find(command => command.id === 'settings.general')?.run).not.toHaveBeenCalled();
+    expect(commands.find(command => command.id === 'pipeline.archive')?.run).not.toHaveBeenCalled();
     expect(inputEvent.defaultPrevented).toBe(false);
+    expect(textareaEvent.defaultPrevented).toBe(false);
+    expect(selectEvent.defaultPrevented).toBe(false);
+    expect(roleEvent.defaultPrevented).toBe(false);
     expect(editorEvent.defaultPrevented).toBe(false);
+    expect(embeddedEditorEvent.defaultPrevented).toBe(false);
   });
 
   test('ignores modified browser chords', () => {

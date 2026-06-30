@@ -10,7 +10,6 @@ import { usePoller, DEFAULT_POLL_MS } from './hooks/usePoller';
 import TaskStreamPanel from './components/TaskStreamPanel';
 import { ResearchBrowser } from './components/ResearchBrowser';
 import { KnowledgeBrowser } from './components/KnowledgeBrowser';
-import { PipelineView } from './components/PipelineView';
 import type { StrategicCockpitDirection } from './components/StrategicCockpit';
 import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask, apiFetch, API_BASE_URL } from './api';
@@ -30,7 +29,6 @@ import type { SettingsSectionRouterProps } from './components/SettingsSectionRou
 import type { PrimaryTab } from './hooks/useUIState';
 import { defaultComputeExperimentForm } from './hooks/useTaskModal';
 import { BulkActionBar } from './components/BulkActionBar';
-import { KanbanBoard } from './components/KanbanBoard';
 import type { SortBy } from './components/KanbanBoard';
 import { ACTIVE_PIPELINE_STATUSES, CANCELLABLE_STATUSES, COLUMNS, SORT_KEY, TERMINAL_STATUSES } from './appWorkbenchConstants';
 import { downloadTaskCsv, orderTasksForKanbanExport } from './utils/taskCsv';
@@ -53,7 +51,8 @@ import type { Task } from './components/TaskCard';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
 import { ProjectWorkspace, RuntimeWorkspace, type ProjectManageSection, type ProjectSection, type RuntimeSection, type RuntimeSettingsSection } from './components/OperatorWorkspaces';
-import { WorkbenchFrame, WorkbenchMetric, WorkbenchPanel, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
+import { PipelineWorkspace } from './components/PipelineWorkspace';
+import { WorkbenchFrame, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
 import { useStrategicReadModel } from './hooks/useStrategicReadModel';
 import { useOperatorKeyboardShortcuts } from './hooks/useOperatorKeyboardShortcuts';
 import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
@@ -939,10 +938,26 @@ export default function App() {
     openProjectManagement: () => setShowProjectManagement(true),
     openProjectMembers: () => setShowProjectMembers(true),
   });
+  const modalShortcutBlocked = Boolean(
+    s.showNewTaskModal ||
+    s.showComposeDrawer ||
+    s.confirmDialog ||
+    showNewProjectModal ||
+    setupProjectId ||
+    showProjectManagement ||
+    showProjectMembers,
+  );
+  const operatorShortcutBlocked = Boolean(
+    modalShortcutBlocked ||
+    s.logTask ||
+    s.showFleetDetail ||
+    strategicContextWorkspaceOpen,
+  );
 
   const { openCommandPalette } = useOperatorKeyboardShortcuts({
     activeTab,
-    blockingModalOpen: Boolean(s.showNewTaskModal || s.logTask || s.showComposeDrawer || s.showFleetDetail || s.confirmDialog || showNewProjectModal || setupProjectId || showProjectManagement || showProjectMembers || strategicContextWorkspaceOpen),
+    blockingModalOpen: operatorShortcutBlocked,
+    commandPaletteShortcutBlocked: modalShortcutBlocked,
     commandPaletteOpen, commands: workbenchCommands, searchInputRef,
     searchShortcutBlocked: Boolean(s.showNewTaskModal || s.logTask || s.showResearchBrowser || s.showSettings),
     selectedTaskCount: s.selectedTaskIds.size, selectionMode: s.selectionMode, setCommandPaletteOpen,
@@ -1576,163 +1591,118 @@ export default function App() {
           />
         </ErrorBoundary>
       ) : (
-        <WorkbenchSurface
-          title="Pipeline"
-          tabs={[
-            { id: 'flow', label: 'Flow' },
-            { id: 'board', label: 'Board' },
-            { id: 'archive', label: 'Archive' },
-          ]}
-          activeTab={pipelineSection}
-          onTabChange={(id) => {
-            setPipelineSection(id);
-            s.setShowArchive(id === 'archive');
-            if (id === 'flow') s.setViewMode('pipeline');
-            if (id === 'board') s.setViewMode('kanban');
+        <PipelineWorkspace
+          surface={{
+            pipelineSection,
+            onPipelineSectionChange: setPipelineSection,
+            showArchive: s.showArchive,
+            setShowArchive: s.setShowArchive,
+            viewMode: s.viewMode,
+            setViewMode: s.setViewMode,
           }}
-          actions={pipelineSurfaceActions}
-          tabLayout="stacked"
-          flush
-        >
-          {pipelineSection === 'archive' && s.showArchive ? (
-            <ArchiveView
-              archiveTasks={s.archiveTasks}
-              archiveLoading={s.archiveLoading}
-              archivePage={s.archivePage}
-              archivePageSize={s.archivePageSize}
-              archiveStatusFilter={s.archiveStatusFilter}
-              archiveSearchQuery={s.archiveSearchQuery}
-              archiveDateRange={s.archiveDateRange}
-              archiveTotalTasks={s.archiveTotalTasks}
-              setShowArchive={(show) => {
-                s.setShowArchive(show);
-                if (!show) {
-                  setPipelineSection('flow');
-                  s.setViewMode('pipeline');
-                }
-              }}
-              setArchivePage={s.setArchivePage}
-              setArchivePageSize={s.setArchivePageSize}
-              setArchiveStatusFilter={s.setArchiveStatusFilter}
-              setArchiveSearchQuery={s.setArchiveSearchQuery}
-              setArchiveDateRange={s.setArchiveDateRange}
-              handleViewLogs={s.handleViewLogs}
-              onRetryTask={s.handleRetry}
-              onUnarchiveTask={s.handleUnarchiveTask}
-              archiveSortOrder={s.archiveSortOrder}
-              setArchiveSortOrder={s.setArchiveSortOrder}
-              onPurgeArchive={s.handlePurgeArchive}
-            />
-          ) : s.viewMode === 'pipeline' ? (
-            <WorkbenchSplit
-              main={(
-                <div className="flex h-full min-h-0 flex-col">
-                  {pipelineFilterStrip}
-                  <ErrorBoundary level="panel">
-                    <main className="flex min-h-0 flex-1 flex-col overflow-hidden px-3 py-3 md:px-4">
-                      <PipelineView
-                        tasks={filteredTasks}
-                        hasActiveFilters={hasActiveFilters}
-                        onViewLogs={s.handleViewLogs}
-                        onNavigateToParent={(parentTaskId) => {
-                          navigator.clipboard.writeText(parentTaskId).then(() => {
-                            s.addToast('Parent task ID copied — use search to find it', 'info');
-                          }).catch(() => {
-                            s.addToast(`Could not copy to clipboard — parent task ID: ${parentTaskId}`, 'error');
-                          });
-                        }}
-                        onClearWaveDeps={s.selectedProjectId ? (() => { const pid = s.selectedProjectId; return pid ? () => s.handleClearWaveDeps(pid) : undefined; })() : undefined}
-                        onArchiveGroup={(taskIds) => {
-                          s.setConfirmDialog({
-                            title: 'Archive this group?',
-                            message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} (parent + children). They can be viewed and unarchived from the Archive view.`,
-                            confirmLabel: 'Archive group',
-                            onConfirm: () => s.handleBulkArchiveColumn(taskIds),
-                          });
-                        }}
-                        onUnarchiveTask={s.handleUnarchiveTask}
-                      />
-                    </main>
-                  </ErrorBoundary>
-                  {pipelinePagination}
-                </div>
-              )}
-              rail={(
-                <div className="space-y-3">
-                  <WorkbenchPanel title="Pipeline" meta={hasActiveFilters ? 'filtered' : 'live'}>
-                    <div className="grid grid-cols-2 gap-2">
-                      <WorkbenchMetric label="active" value={visibleActiveTasks.length} tone="good" />
-                      <WorkbenchMetric label="queued" value={visibleQueuedTasks.length} tone="neutral" />
-                      <WorkbenchMetric label="blocked" value={visibleBlockedTasks.length} tone={visibleBlockedTasks.length > 0 ? 'warn' : 'neutral'} />
-                      <WorkbenchMetric label="failed" value={visibleFailedTasks.length} tone={visibleFailedTasks.length > 0 ? 'bad' : 'neutral'} />
-                    </div>
-                    <div className="mt-3 flex items-center justify-between rounded-md border border-neutral-800 bg-neutral-900/40 px-3 py-2 text-xs">
-                      <span className="text-neutral-500">terminal</span>
-                      <span className="font-medium text-neutral-200">{visibleTerminalTasks.length}</span>
-                    </div>
-                  </WorkbenchPanel>
-
-                  <TaskContextRail
-                    currentTask={openPipelineTask}
-                    attentionTasks={backendAttentionTasks}
-                    localFallbackTasks={localAttentionTasks}
-                    trackedTaskIds={s.trackedTaskIds}
-                    {...taskContextSessionProps}
-                    onOpenTask={s.handleViewLogs}
-                    onOpenPipeline={() => handleTabChange('pipeline')}
-                    onTrackTask={s.trackTask}
-                  />
-                </div>
-              )}
-            />
-          ) : (
-            <div className="flex h-full min-h-0 flex-col">
-              {pipelineFilterStrip}
-              <ErrorBoundary level="panel">
-                <div className="min-h-0 flex-1 overflow-hidden px-3 py-3 md:px-4">
-                  <KanbanBoard
-                    tasks={filteredTasks}
-                    columns={visibleColumns}
-                    loading={s.initialLoading}
-                    maxRetries={s.maxRetries}
-                    actionLoadingMap={s.actionLoadingMap}
-                    compact={s.compactMode}
-                    sortBy={sortBy}
-                    selectionMode={s.selectionMode}
-                    selectedTaskIds={s.selectedTaskIds}
-                    onToggleTaskSelection={s.toggleTaskSelection}
-                    onCtrlClick={(taskId) => { if (!s.selectionMode) s.setSelectionMode(true); s.toggleTaskSelection(taskId); }}
-                    onBulkToggle={s.bulkColumnToggle}
-                    onShiftSelect={s.shiftSelectRange}
-                    hasActiveFilters={hasActiveFilters}
-                    onArchiveColumn={(taskIds, columnLabel) => {
-                      s.setConfirmDialog({
-                        title: `Archive all ${columnLabel} tasks?`,
-                        message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} in the ${columnLabel} column. They can be viewed and unarchived from the Archive view.`,
-                        confirmLabel: `Archive ${columnLabel}`,
-                        onConfirm: () => s.handleBulkArchiveColumn(taskIds),
-                      });
-                    }}
-                    onApprove={s.handleApprove}
-                    onRequestChanges={s.handleRequestChanges}
-                    onCancel={s.handleCancel}
-                    onRetry={s.handleRetry}
-                    onEditPrompt={s.handleEditPrompt}
-                    onDismiss={s.handleDismiss}
-                    onArchive={s.handleArchiveTask}
-                    onViewLogs={s.handleViewLogs}
-                    onTrack={s.trackTask}
-                    trackedTaskIds={s.trackedTaskIds}
-                    onDuplicate={s.openDuplicateTaskModal}
-                    searchQuery={s.searchQuery}
-                    onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
-                  />
-                </div>
-              </ErrorBoundary>
-              {pipelinePagination}
-            </div>
-          )}
-        </WorkbenchSurface>
+          chrome={{
+            actions: pipelineSurfaceActions,
+            filterStrip: pipelineFilterStrip,
+            pagination: pipelinePagination,
+          }}
+          archive={{
+            archiveTasks: s.archiveTasks,
+            archiveLoading: s.archiveLoading,
+            archivePage: s.archivePage,
+            archivePageSize: s.archivePageSize,
+            archiveStatusFilter: s.archiveStatusFilter,
+            archiveSearchQuery: s.archiveSearchQuery,
+            archiveDateRange: s.archiveDateRange,
+            archiveTotalTasks: s.archiveTotalTasks,
+            setArchivePage: s.setArchivePage,
+            setArchivePageSize: s.setArchivePageSize,
+            setArchiveStatusFilter: s.setArchiveStatusFilter,
+            setArchiveSearchQuery: s.setArchiveSearchQuery,
+            setArchiveDateRange: s.setArchiveDateRange,
+            handleViewLogs: s.handleViewLogs,
+            onRetryTask: s.handleRetry,
+            onUnarchiveTask: s.handleUnarchiveTask,
+            archiveSortOrder: s.archiveSortOrder,
+            setArchiveSortOrder: s.setArchiveSortOrder,
+            onPurgeArchive: s.handlePurgeArchive,
+          }}
+          flow={{
+            tasks: filteredTasks,
+            hasActiveFilters,
+            onViewLogs: s.handleViewLogs,
+            onNavigateToParent: (parentTaskId) => {
+              navigator.clipboard.writeText(parentTaskId).then(() => {
+                s.addToast('Parent task ID copied — use search to find it', 'info');
+              }).catch(() => {
+                s.addToast(`Could not copy to clipboard — parent task ID: ${parentTaskId}`, 'error');
+              });
+            },
+            onClearWaveDeps: s.selectedProjectId ? (() => { const pid = s.selectedProjectId; return pid ? () => s.handleClearWaveDeps(pid) : undefined; })() : undefined,
+            onArchiveGroup: (taskIds) => {
+              s.setConfirmDialog({
+                title: 'Archive this group?',
+                message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} (parent + children). They can be viewed and unarchived from the Archive view.`,
+                confirmLabel: 'Archive group',
+                onConfirm: () => s.handleBulkArchiveColumn(taskIds),
+              });
+            },
+            onUnarchiveTask: s.handleUnarchiveTask,
+          }}
+          rail={{
+            currentTask: openPipelineTask,
+            attentionTasks: backendAttentionTasks,
+            localFallbackTasks: localAttentionTasks,
+            trackedTaskIds: s.trackedTaskIds,
+            taskContextSessionProps,
+            onOpenTask: s.handleViewLogs,
+            onOpenPipeline: () => handleTabChange('pipeline'),
+            onTrackTask: s.trackTask,
+          }}
+          board={{
+            tasks: filteredTasks,
+            columns: visibleColumns,
+            loading: s.initialLoading,
+            maxRetries: s.maxRetries,
+            actionLoadingMap: s.actionLoadingMap,
+            compact: s.compactMode,
+            sortBy,
+            selectionMode: s.selectionMode,
+            selectedTaskIds: s.selectedTaskIds,
+            onToggleTaskSelection: s.toggleTaskSelection,
+            onCtrlClick: (taskId) => { if (!s.selectionMode) s.setSelectionMode(true); s.toggleTaskSelection(taskId); },
+            onBulkToggle: s.bulkColumnToggle,
+            onShiftSelect: s.shiftSelectRange,
+            hasActiveFilters,
+            onArchiveColumn: (taskIds, columnLabel) => {
+              s.setConfirmDialog({
+                title: `Archive all ${columnLabel} tasks?`,
+                message: `This will archive ${taskIds.length} task${taskIds.length !== 1 ? 's' : ''} in the ${columnLabel} column. They can be viewed and unarchived from the Archive view.`,
+                confirmLabel: `Archive ${columnLabel}`,
+                onConfirm: () => s.handleBulkArchiveColumn(taskIds),
+              });
+            },
+            onApprove: s.handleApprove,
+            onRequestChanges: s.handleRequestChanges,
+            onCancel: s.handleCancel,
+            onRetry: s.handleRetry,
+            onEditPrompt: s.handleEditPrompt,
+            onDismiss: s.handleDismiss,
+            onArchive: s.handleArchiveTask,
+            onViewLogs: s.handleViewLogs,
+            onTrack: s.trackTask,
+            trackedTaskIds: s.trackedTaskIds,
+            onDuplicate: s.openDuplicateTaskModal,
+            searchQuery: s.searchQuery,
+            onDirectionClick: (dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); },
+          }}
+          metrics={{
+            activeTasks: visibleActiveTasks,
+            queuedTasks: visibleQueuedTasks,
+            blockedTasks: visibleBlockedTasks,
+            failedTasks: visibleFailedTasks,
+            terminalTasks: visibleTerminalTasks,
+          }}
+        />
       )}
       </WorkbenchFrame>
 

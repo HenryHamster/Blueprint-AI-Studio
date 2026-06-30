@@ -25,6 +25,7 @@ function Harness({
   blockingModalOpen,
   commandPaletteOpen = false,
   commands = COMMANDS,
+  commandPaletteShortcutBlocked,
   showSettings = false,
   setCommandPaletteOpen,
   toggleSettings = vi.fn(),
@@ -32,6 +33,7 @@ function Harness({
   blockingModalOpen: boolean;
   commandPaletteOpen?: boolean;
   commands?: WorkbenchCommand[];
+  commandPaletteShortcutBlocked?: boolean;
   showSettings?: boolean;
   setCommandPaletteOpen: (open: boolean) => void;
   toggleSettings?: () => void;
@@ -40,6 +42,7 @@ function Harness({
   useOperatorKeyboardShortcuts({
     activeTab: 'chat',
     blockingModalOpen,
+    commandPaletteShortcutBlocked,
     commandPaletteOpen,
     commands,
     searchInputRef,
@@ -87,6 +90,7 @@ describe('useOperatorKeyboardShortcuts', () => {
     commandPaletteOpen = false,
     options: {
       commands?: WorkbenchCommand[];
+      commandPaletteShortcutBlocked?: boolean;
       showSettings?: boolean;
       toggleSettings?: () => void;
     } = {},
@@ -102,6 +106,7 @@ describe('useOperatorKeyboardShortcuts', () => {
           blockingModalOpen={blockingModalOpen}
           commandPaletteOpen={commandPaletteOpen}
           commands={options.commands}
+          commandPaletteShortcutBlocked={options.commandPaletteShortcutBlocked}
           showSettings={options.showSettings}
           setCommandPaletteOpen={setCommandPaletteOpen}
           toggleSettings={options.toggleSettings}
@@ -129,6 +134,49 @@ describe('useOperatorKeyboardShortcuts', () => {
 
     expect(setCommandPaletteOpen).not.toHaveBeenCalled();
     expect(event.defaultPrevented).toBe(false);
+  });
+
+  test('does not reopen the command palette while it is already open', () => {
+    const setCommandPaletteOpen = mount(false, true);
+
+    const event = dispatchShortcut(document);
+
+    expect(setCommandPaletteOpen).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  test('does not run single-key workbench shortcuts over a blocking modal', () => {
+    const openPipeline = vi.fn();
+    mount(true, false, {
+      commands: [
+        ...COMMANDS,
+        { id: 'pipeline.flow', label: 'Pipeline', run: openPipeline },
+      ],
+    });
+
+    const event = dispatchShortcut(document, { key: '2', ctrlKey: false });
+
+    expect(openPipeline).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  test('can open the command palette when workbench shortcuts are blocked by an inspection drawer', () => {
+    const openPipeline = vi.fn();
+    const setCommandPaletteOpen = mount(true, false, {
+      commandPaletteShortcutBlocked: false,
+      commands: [
+        ...COMMANDS,
+        { id: 'pipeline.flow', label: 'Pipeline', run: openPipeline },
+      ],
+    });
+
+    const paletteEvent = dispatchShortcut(document);
+    const routeEvent = dispatchShortcut(document, { key: '2', ctrlKey: false });
+
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(true);
+    expect(paletteEvent.defaultPrevented).toBe(true);
+    expect(openPipeline).not.toHaveBeenCalled();
+    expect(routeEvent.defaultPrevented).toBe(false);
   });
 
   test('does not focus search over a blocking modal', () => {
