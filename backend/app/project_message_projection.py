@@ -67,6 +67,21 @@ def admin_message_dict(message: ProjectMessage) -> dict[str, Any]:
     return project_message_base(message)
 
 
+def message_event_payload(
+    message: ProjectMessage,
+    *,
+    status: str | None = None,
+) -> dict[str, str]:
+    payload = {
+        "message_id": str(message.id),
+        "type": enum_value(message.message_type),
+        "from": str(message.from_type),
+    }
+    if status is not None:
+        payload["status"] = status
+    return payload
+
+
 def legacy_direction_message_dict(message: ProjectMessage) -> dict[str, Any]:
     base = project_message_base(message)
     return {

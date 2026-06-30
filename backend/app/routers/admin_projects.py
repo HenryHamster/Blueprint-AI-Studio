@@ -24,6 +24,7 @@ from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session, resolve_dialect_name
+from app.broadcast import broadcast_to_project
 from app.shared_state import limiter
 from app.models import (
     ProjectMessage,
@@ -51,7 +52,7 @@ from app.ci_resolution import (
 from app.capability_proof import enrich_problem_model_capability_proofs
 from app.message_convergence import LINKED_STATUS, OPEN_STATUS
 from app.operator_attention import build_operator_attention
-from app.project_message_projection import message_preview_dict
+from app.project_message_projection import message_event_payload, message_preview_dict
 from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
 from app.onboarding_proof import build_onboarding_proof_block
@@ -1484,6 +1485,7 @@ async def create_project_strategic_session_message(
     await session.refresh(msg)
     message_id = str(msg.id)
     message_preview = _message_preview(msg)
+    message_event = message_event_payload(msg)
 
     arming = await maybe_arm_operator_refresh(
         session,
@@ -1493,6 +1495,7 @@ async def create_project_strategic_session_message(
     )
     if arming == ARMING_STEERING:
         await session.commit()
+    await broadcast_to_project(str(project_id), "message_created", message_event)
     return {
         "id": message_id,
         "status": "created",

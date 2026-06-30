@@ -16,6 +16,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
+from app.broadcast import broadcast_to_project
 from app.models import (
     Alert,
     Project,
@@ -32,7 +33,7 @@ from app.shared_state import limiter
 from app.admin import _get_user_project, _get_user_project_with_role, _user_project_ids
 from app.task_locking import lock_project_or_429
 from app.message_convergence import LINKED_STATUS
-from app.project_message_projection import admin_message_dict
+from app.project_message_projection import admin_message_dict, message_event_payload
 from app.messages_noise_prefs_store import (
     get_messages_noise_prefs_row,
     mutate_messages_noise_prefs,
@@ -648,6 +649,7 @@ async def create_message(
     # (MissingGreenlet) and 500 a request whose message already durably
     # committed. The captured scalar is immune to that expire.
     message_id = str(msg.id)
+    message_event = message_event_payload(msg)
 
     # Wake the strategist on genuine operator steering. This is the live-chat
     # surface the admin MessagesPanel composer hits, and it must steer exactly
@@ -673,6 +675,7 @@ async def create_message(
     )
     if arming == ARMING_STEERING:
         await session.commit()
+    await broadcast_to_project(str(project_id), "message_created", message_event)
     return {"id": message_id, "status": "created", "arming": arming}
 
 
@@ -692,6 +695,10 @@ async def resolve_message(
 
     if msg.status == "resolved":
         return {"id": str(msg.id), "status": "already_resolved"}
+    message_event = message_event_payload(msg, status="resolved")
+    message_project_uuid = msg.project_id
+    message_type = msg.message_type
+    message_id_str = str(msg.id)
     resolution = (payload.resolution or "").strip()
     if len(resolution) > MESSAGE_CONTENT_MAX:
         raise HTTPException(
@@ -715,7 +722,7 @@ async def resolve_message(
     )
     await session.commit()
     if result.rowcount > 0:
-        if resolution and msg.message_type in (
+        if resolution and message_type in (
             MessageType.QUESTION,
             MessageType.FEEDBACK,
         ):
@@ -728,22 +735,22 @@ async def resolve_message(
                 strategic_session = await build_message_strategic_session_snapshot(
                     session,
                     current_user["user_id"],
-                    msg.project_id,
+                    message_project_uuid,
                     payload.workbench_context,
                 )
-                if msg.message_type == MessageType.QUESTION:
+                if message_type == MessageType.QUESTION:
                     reply_msg = await _post_qa(
                         session,
-                        msg.project_id,
-                        msg.id,
+                        message_project_uuid,
+                        message_id,
                         resolution,
                         from_type="user",
                     )
                 else:
                     reply_msg = await _post_feedback_ack(
                         session,
-                        msg.project_id,
-                        msg.id,
+                        message_project_uuid,
+                        message_id,
                         resolution,
                     )
                 if strategic_session:
@@ -755,13 +762,14 @@ async def resolve_message(
             except Exception:
                 logging.getLogger(__name__).warning(
                     "post resolution reply failed for message %s",
-                    msg.id,
+                    message_id_str,
                     exc_info=True,
                 )
-        return {"id": str(msg.id), "status": "resolved"}
+        await broadcast_to_project(str(message_project_uuid), "message_updated", message_event)
+        return {"id": message_id_str, "status": "resolved"}
     else:
         # Message was already resolved by a concurrent request
-        return {"id": str(msg.id), "status": "already_resolved"}
+        return {"id": message_id_str, "status": "already_resolved"}
 
 
 @router.delete("/messages/{message_id}")

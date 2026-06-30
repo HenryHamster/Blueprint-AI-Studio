@@ -3770,6 +3770,41 @@ class TestMessages:
         assert "id" in data
 
     @pytest.mark.asyncio
+    async def test_create_message_broadcasts_created_once_for_idempotent_send(
+        self, client: AsyncClient, db_session
+    ):
+        """A durable operator message wakes open workbenches exactly once."""
+        project = await _make_project(db_session)
+        body = {
+            "project_id": str(project.id),
+            "message_type": "NOTE",
+            "content": "Keep this visible in the Strategic workbench.",
+            "idempotency_key": "message-broadcast-idempotent-1",
+        }
+
+        with patch(
+            "app.routers.admin_notifications.broadcast_to_project",
+            new_callable=AsyncMock,
+        ) as broadcast:
+            first = await client.post("/api/admin/messages", json=body)
+            second = await client.post("/api/admin/messages", json=body)
+
+        assert first.status_code == 200, first.text
+        assert first.json()["status"] == "created"
+        assert second.status_code == 200, second.text
+        assert second.json()["status"] == "duplicate"
+        assert second.json()["id"] == first.json()["id"]
+        broadcast.assert_awaited_once_with(
+            str(project.id),
+            "message_created",
+            {
+                "message_id": first.json()["id"],
+                "type": "NOTE",
+                "from": "user",
+            },
+        )
+
+    @pytest.mark.asyncio
     async def test_create_message_idempotency_key_dedupes(
         self, client: AsyncClient, db_session
     ):
@@ -4649,6 +4684,45 @@ class TestMessages:
         )
         assert resp.status_code == 200
         assert resp.json()["status"] == "resolved"
+
+    @pytest.mark.asyncio
+    async def test_resolve_message_broadcasts_updated_event(
+        self, client: AsyncClient, db_session
+    ):
+        """Resolving a message refreshes other open workbenches."""
+        project = await _make_project(db_session)
+        msg = ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user",
+            content="Close me everywhere.",
+            status="open",
+        )
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+
+        with patch(
+            "app.routers.admin_notifications.broadcast_to_project",
+            new_callable=AsyncMock,
+        ) as broadcast:
+            resp = await client.patch(
+                f"/api/admin/messages/{msg.id}",
+                json={"resolution": "Done."},
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["status"] == "resolved"
+        broadcast.assert_awaited_once_with(
+            str(project.id),
+            "message_updated",
+            {
+                "message_id": str(msg.id),
+                "type": "NOTE",
+                "from": "user",
+                "status": "resolved",
+            },
+        )
 
     @pytest.mark.asyncio
     async def test_resolve_linked_message(self, client: AsyncClient, db_session):

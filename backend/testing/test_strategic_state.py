@@ -1,6 +1,6 @@
 import uuid
 from datetime import timedelta
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -824,6 +824,7 @@ async def test_strategic_state_includes_operator_workbench_state(
     client: AsyncClient, db_session
 ):
     project = await _make_project(db_session)
+    last_interaction_at = _utcnow().isoformat()
     db_session.add(
         MessagesNoisePrefs(
             user_id=TEST_USER_ID,
@@ -849,8 +850,8 @@ async def test_strategic_state_includes_operator_workbench_state(
                             "label": "Duplicate canvas",
                         },
                     ],
-                    "session_started_at": "2026-06-29T12:00:00",
-                    "last_interaction_at": "2026-06-29T12:03:00",
+                    "session_started_at": last_interaction_at,
+                    "last_interaction_at": last_interaction_at,
                 },
                 "cycle_summary": "routine",
             },
@@ -901,6 +902,7 @@ async def test_strategic_session_endpoint_resumes_persisted_state_and_outputs(
     client: AsyncClient, db_session
 ):
     project = await _make_project(db_session)
+    last_interaction_at = _utcnow().isoformat()
     db_session.add(
         MessagesNoisePrefs(
             user_id=TEST_USER_ID,
@@ -917,8 +919,8 @@ async def test_strategic_session_endpoint_resumes_persisted_state_and_outputs(
                             "label": "Context map",
                         }
                     ],
-                    "session_started_at": "2026-06-29T12:00:00",
-                    "last_interaction_at": "2026-06-29T12:05:00",
+                    "session_started_at": last_interaction_at,
+                    "last_interaction_at": last_interaction_at,
                 }
             },
         )
@@ -1056,14 +1058,18 @@ async def test_strategic_session_message_records_operator_message_and_snapshot(
         "content": "Keep this session pinned to the local Strategic runner.",
         "idempotency_key": "strategic-session-message-1",
     }
-    first = await client.post(
-        f"/api/admin/projects/{project.id}/strategic-session/messages",
-        json=body,
-    )
-    second = await client.post(
-        f"/api/admin/projects/{project.id}/strategic-session/messages",
-        json=body,
-    )
+    with patch(
+        "app.routers.admin_projects.broadcast_to_project",
+        new_callable=AsyncMock,
+    ) as broadcast:
+        first = await client.post(
+            f"/api/admin/projects/{project.id}/strategic-session/messages",
+            json=body,
+        )
+        second = await client.post(
+            f"/api/admin/projects/{project.id}/strategic-session/messages",
+            json=body,
+        )
 
     assert first.status_code == 200, first.text
     assert first.json()["status"] == "created"
@@ -1071,6 +1077,15 @@ async def test_strategic_session_message_records_operator_message_and_snapshot(
     assert second.status_code == 200
     assert second.json()["status"] == "duplicate"
     assert second.json()["id"] == first.json()["id"]
+    broadcast.assert_awaited_once_with(
+        str(project.id),
+        "message_created",
+        {
+            "message_id": first.json()["id"],
+            "type": "FEEDBACK",
+            "from": "user",
+        },
+    )
 
     msg = await db_session.get(ProjectMessage, uuid.UUID(first.json()["id"]))
     assert msg.from_type == "user"
