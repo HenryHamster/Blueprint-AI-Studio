@@ -3,11 +3,25 @@ import {
   MAX_STRATEGIC_SELECTED_REFS,
   buildOptimisticStrategicWorkbench,
   normalizeStrategicSelectedRefs,
+  tabForWorkbenchSurface,
   removeStrategicSelectedRef,
   upsertStrategicSelectedRef,
+  workbenchSurfaceForTab,
 } from './strategicWorkbenchSession';
 
 describe('strategicWorkbenchSession selected refs', () => {
+  test('maps only canonical workbench tabs to persisted surfaces', () => {
+    expect(workbenchSurfaceForTab('chat')).toBe('strategic');
+    expect(workbenchSurfaceForTab('pipeline')).toBe('pipeline');
+    expect(workbenchSurfaceForTab('project')).toBe('project');
+    expect(workbenchSurfaceForTab('runtime')).toBe('runtime');
+    expect(tabForWorkbenchSurface('strategic')).toBe('chat');
+    expect(tabForWorkbenchSurface('pipeline')).toBe('pipeline');
+    expect(tabForWorkbenchSurface('project')).toBe('project');
+    expect(tabForWorkbenchSurface('runtime')).toBe('runtime');
+    expect(tabForWorkbenchSurface('unknown')).toBeNull();
+  });
+
   test('normalizes selected refs with dedupe and cap', () => {
     const refs = normalizeStrategicSelectedRefs([
       { kind: ' task ', id: 'abc', label: '  Active   task  ' },

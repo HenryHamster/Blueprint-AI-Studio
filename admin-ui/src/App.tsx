@@ -26,7 +26,7 @@ import { HeaderBar } from './components/HeaderBar';
 import type { SectionId } from './components/SettingsDropdown';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import type { SettingsSectionRouterProps } from './components/SettingsSectionRouter';
-import type { PrimaryTab } from './hooks/useUIState';
+import { normalizePrimaryTab, resolvePrimaryTabTarget, type PrimaryTab } from './hooks/useUIState';
 import { defaultComputeExperimentForm } from './hooks/useTaskModal';
 import { BulkActionBar } from './components/BulkActionBar';
 import type { SortBy } from './components/KanbanBoard';
@@ -155,7 +155,8 @@ export default function App() {
   const selectedProjectId = s.selectedProjectId;
   const selectedProjectIdRef = useRef(selectedProjectId);
   selectedProjectIdRef.current = selectedProjectId;
-  const activeTab: PrimaryTab = s.activeTab;
+  const rawActiveTab = s.activeTab;
+  const activeTab: PrimaryTab = normalizePrimaryTab(rawActiveTab);
   const messagesPanelOpen = activeTab === 'chat';
   const [directions, setDirections] = useState<StrategicCockpitDirection[]>([]);
   useEffect(() => {
@@ -634,7 +635,7 @@ export default function App() {
   const [projectManageSection, setProjectManageSection] = useState<ProjectManageSection>('overview');
   const [runtimeSection, setRuntimeSection] = useState<RuntimeSection>('health');
   const [runtimeConfigSection, setRuntimeConfigSection] = useState<RuntimeSettingsSection>('orchestrator');
-  const { setActiveTab: setPrimaryTab, setViewMode: setTaskViewMode } = s;
+  const { setActiveTab: setPrimaryTab, setShowArchive: setArchiveVisible, setViewMode: setTaskViewMode } = s;
   useEffect(() => {
     if (!selectedProjectId || !strategicWorkbenchState?.active_surface) return;
     if (strategicWorkbenchOperatorSurfaceTouchedRef.current) return;
@@ -655,32 +656,14 @@ export default function App() {
     setPipelineSection(s.viewMode === 'kanban' ? 'board' : 'flow');
   }, [activeTab, s.showArchive, s.viewMode]);
   useEffect(() => {
-    if (activeTab === 'cockpit') {
-      setProjectSection('running-update');
-      setPrimaryTab('project');
-      return;
-    }
-    if (activeTab === 'directions') {
-      setProjectSection('directions');
-      setPrimaryTab('project');
-      return;
-    }
-    if (activeTab === 'home') {
-      setRuntimeSection('health');
-      setPrimaryTab('runtime');
-      return;
-    }
-    if (activeTab === 'compute') {
-      setRuntimeSection('compute');
-      setPrimaryTab('runtime');
-      return;
-    }
-    if (activeTab === 'board') {
-      setPipelineSection('board');
-      setTaskViewMode('kanban');
-      setPrimaryTab('pipeline');
-    }
-  }, [activeTab, setPrimaryTab, setTaskViewMode]);
+    const target = resolvePrimaryTabTarget(rawActiveTab);
+    if (target.projectSection) setProjectSection(target.projectSection);
+    if (target.runtimeSection) setRuntimeSection(target.runtimeSection);
+    if (target.pipelineSection) setPipelineSection(target.pipelineSection);
+    if (target.viewMode) setTaskViewMode(target.viewMode);
+    if (target.showArchive !== undefined) setArchiveVisible(target.showArchive);
+    if (target.tab !== rawActiveTab) setPrimaryTab(target.tab);
+  }, [rawActiveTab, setArchiveVisible, setPrimaryTab, setTaskViewMode]);
   const allModelOptions = useMemo(() => {
     const models = new Set<string>();
     Object.values(s.providerTierModelMap).forEach(tiers => {
