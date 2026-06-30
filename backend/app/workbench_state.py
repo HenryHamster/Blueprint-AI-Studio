@@ -31,7 +31,18 @@ _ALLOWED_INTERACTION_MODES = frozenset(
 )
 _ALLOWED_ACTIVE_SURFACES = frozenset({"strategic", "pipeline", "project", "runtime"})
 _MAX_SELECTED_REFS = 12
+_MAX_SELECTED_REF_DESCRIPTORS = 24
 _STRATEGIC_ARMING_INTERACTION_MODES = frozenset({"check_in", "continuous"})
+_OPERATOR_CONTEXT_TARGET_KEYS = (
+    "surface",
+    "section",
+    "task_id",
+    "message_id",
+    "direction_id",
+    "document_id",
+    "artifact_id",
+    "cycle_id",
+)
 
 
 def workbench_state_size_bytes(raw: Any) -> int:
@@ -88,6 +99,107 @@ def _sanitize_selected_refs(raw: Any) -> list[dict[str, str]]:
     return selected_refs
 
 
+def _sanitize_context_target(raw: Any) -> dict[str, str] | None:
+    if not isinstance(raw, dict):
+        return None
+    target: dict[str, str] = {}
+    for key in _OPERATOR_CONTEXT_TARGET_KEYS:
+        value = _string(raw.get(key), max_chars=180)
+        if value:
+            target[key] = value
+    return target or None
+
+
+def _message_ref_target(ref_id: str) -> dict[str, str]:
+    message_id = ref_id.removeprefix("message:")
+    return {"surface": "messages", "message_id": message_id}
+
+
+def _sanitize_ref_descriptor(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    kind = _string(raw.get("kind"), max_chars=40)
+    ref_id = _string(raw.get("id"), max_chars=160)
+    if not kind or not ref_id:
+        return None
+    canonical_kind = kind.lower()
+
+    descriptor: dict[str, Any] = {"kind": kind, "id": ref_id}
+    # Client-supplied labels for message refs can contain copied message bodies.
+    # Durable snapshots keep the pointer and let read projections resolve labels.
+    label = (
+        None if canonical_kind == "message" else _string(raw.get("label"), max_chars=180)
+    )
+    if label:
+        descriptor["label"] = label
+    # Message descriptor summaries are usually compacted message bodies. Keep
+    # message refs navigable, but do not make body text durable hidden context.
+    summary = (
+        None
+        if canonical_kind == "message"
+        else _string(raw.get("summary"), max_chars=220)
+    )
+    if summary:
+        descriptor["summary"] = summary
+    status = (
+        None if canonical_kind == "message" else _string(raw.get("status"), max_chars=80)
+    )
+    if status:
+        descriptor["status"] = status
+    target = (
+        _message_ref_target(ref_id)
+        if canonical_kind == "message"
+        else _sanitize_context_target(raw.get("target"))
+    )
+    if target:
+        descriptor["target"] = target
+    return descriptor
+
+
+def _sanitize_ref_descriptors(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    descriptors: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for entry in raw:
+        descriptor = _sanitize_ref_descriptor(entry)
+        if not descriptor:
+            continue
+        key = (descriptor["kind"], descriptor["id"])
+        if key in seen:
+            continue
+        seen.add(key)
+        descriptors.append(descriptor)
+        if len(descriptors) >= _MAX_SELECTED_REF_DESCRIPTORS:
+            break
+    return descriptors
+
+
+def _sanitize_context_package_descriptor(raw: Any) -> dict[str, Any] | None:
+    descriptor = _sanitize_ref_descriptor(raw)
+    if descriptor:
+        return descriptor
+    if not isinstance(raw, dict):
+        return None
+    package_id = _string(
+        raw.get("id") or raw.get("context_package_id"),
+        max_chars=180,
+    )
+    if not package_id:
+        return None
+    result: dict[str, Any] = {"id": package_id}
+    label = _string(raw.get("label") or raw.get("title"), max_chars=180)
+    if label:
+        result["label"] = label
+    summary = _string(raw.get("summary"), max_chars=220)
+    if summary:
+        result["summary"] = summary
+    status = _string(raw.get("status"), max_chars=80)
+    if status:
+        result["status"] = status
+    return result
+
+
 def sanitize_strategic_session_snapshot(
     raw: Any,
     *,
@@ -129,6 +241,22 @@ def sanitize_strategic_session_snapshot(
             data.get("selected_refs", previous.get("selected_refs"))
         ),
     }
+    selected_ref_descriptors = _sanitize_ref_descriptors(
+        data.get(
+            "selected_ref_descriptors",
+            previous.get("selected_ref_descriptors"),
+        )
+    )
+    if selected_ref_descriptors:
+        snapshot["selected_ref_descriptors"] = selected_ref_descriptors
+    context_package_descriptor = _sanitize_context_package_descriptor(
+        data.get("context_package_descriptor")
+        or data.get("context_package")
+        or previous.get("context_package_descriptor")
+        or previous.get("context_package")
+    )
+    if context_package_descriptor:
+        snapshot["context_package_descriptor"] = context_package_descriptor
     stored_captured_at = _string(data.get("captured_at"), max_chars=80)
     effective_captured_at = captured_at or stored_captured_at
     if effective_captured_at:
@@ -143,6 +271,8 @@ def strategic_session_snapshot_has_signal(snapshot: dict[str, Any]) -> bool:
         or snapshot.get("active_surface") not in (None, "strategic")
         or snapshot.get("session_started_at")
         or snapshot.get("context_package_id")
+        or snapshot.get("selected_ref_descriptors")
+        or snapshot.get("context_package_descriptor")
     )
 
 
@@ -207,7 +337,7 @@ def sanitize_workbench_state(
     if touch:
         last_interaction_at = now
 
-    return {
+    state: dict[str, Any] = {
         "version": 1,
         "interaction_mode": interaction_mode,
         "active_surface": active_surface,
@@ -217,6 +347,15 @@ def sanitize_workbench_state(
         "session_started_at": session_started_at,
         "last_interaction_at": last_interaction_at,
     }
+    preferred_runner_raw = (
+        data["preferred_runner_id"]
+        if "preferred_runner_id" in data
+        else previous.get("preferred_runner_id")
+    )
+    preferred_runner_id = _string(preferred_runner_raw, max_chars=80)
+    if preferred_runner_id:
+        state["preferred_runner_id"] = preferred_runner_id
+    return state
 
 
 def _effective_last_active(state: dict[str, Any]) -> str | None:
@@ -284,11 +423,12 @@ def apply_strategic_local_continuation_marker(
         "updated_at": now,
         "last_seen_at": last_seen_at,
     }
-    runner_id = (
-        _string(str(preferred_runner_id), max_chars=80)
-        if preferred_runner_id
-        else None
+    runner_source = (
+        preferred_runner_id
+        if preferred_runner_id is not None
+        else workbench_state.get("preferred_runner_id")
     )
+    runner_id = _string(str(runner_source), max_chars=80) if runner_source else None
     if runner_id:
         marker["preferred_runner_id"] = runner_id
     vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = marker

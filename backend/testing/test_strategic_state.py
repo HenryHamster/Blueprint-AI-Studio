@@ -1300,9 +1300,7 @@ async def test_strategic_state_resolves_selected_refs_absent_from_context_packag
     }
     message_descriptor = descriptors[("message", f"message:{selected_message.id}")]
     assert message_descriptor["label"] == "BLOCKER from user"
-    assert message_descriptor["summary"].startswith(
-        "This old blocker should stay navigable."
-    )
+    assert "summary" not in message_descriptor
     assert message_descriptor["status"] == "linked"
     assert message_descriptor["target"] == {
         "surface": "messages",
@@ -1743,6 +1741,18 @@ async def test_strategic_session_continuous_writes_local_continuation_marker(
     assert data["session"]["runtime"]["continuation"] == continuation
     assert data["status"] == "unavailable"
     assert data["status_reason"] == "no_runner"
+    metrics = {entry["id"]: entry for entry in data["session"]["curated_metrics"]}
+    assert metrics["runtime.local_strategic_ready"]["value"] == 0
+    assert metrics["runtime.local_strategic_ready"]["tone"] == "warning"
+    actions = {entry["id"]: entry for entry in data["session"]["actions"]}
+    runner_action = actions["runtime.local_strategic.continuation_runner"]
+    assert runner_action["label"] == "Check Workday runner"
+    assert runner_action["priority"] == "high"
+    assert runner_action["target"] == {
+        "surface": "runtime",
+        "section": "devices",
+    }
+    assert runner_action["blocked_reason"] == "no_runner"
 
     await db_session.refresh(project)
     marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
@@ -1750,6 +1760,78 @@ async def test_strategic_session_continuous_writes_local_continuation_marker(
     assert marker["operator_user_id"] == TEST_USER_ID
     assert marker["last_seen_at"]
     assert marker["updated_at"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_continuous_preserves_preferred_runner_marker(
+    client: AsyncClient, db_session
+):
+    from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+
+    project = await _make_project(db_session)
+    preferred_runner_id = str(uuid.uuid4())
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session",
+        json={
+            "workbench": {
+                "interaction_mode": "continuous",
+                "active_surface": "runtime",
+                "preferred_runner_id": preferred_runner_id,
+            }
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["workbench"]["preferred_runner_id"] == preferred_runner_id
+    continuation = data["runtime"]["local_runner"]["continuation"]
+    assert continuation["preferred_runner_id"] == preferred_runner_id
+    assert continuation["reason"] == "preferred_runner_missing"
+
+    await db_session.refresh(project)
+    marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert marker["preferred_runner_id"] == preferred_runner_id
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_continuous_omits_runner_action_when_ready(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    db_session.add(
+        LocalRunner(
+            project_id=project.id,
+            token_hash="r" * 64,
+            hostname="ready-desk",
+            status="active",
+            last_seen_at=_utcnow(),
+            capabilities={
+                "task_types": ["design_doc_update", "strategic_review"],
+                "has_gpu": False,
+                "max_concurrent": 1,
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+                "active_task_ids": [],
+            },
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session",
+        json={"workbench": {"interaction_mode": "continuous"}},
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["runtime"]["local_runner"]["mode"] == "local_ready"
+    metrics = {entry["id"]: entry for entry in data["session"]["curated_metrics"]}
+    assert metrics["runtime.local_strategic_ready"]["value"] == 1
+    assert metrics["runtime.local_strategic_ready"]["tone"] == "active"
+    actions = {entry["id"]: entry for entry in data["session"]["actions"]}
+    assert "runtime.local_strategic.continuation_runner" not in actions
 
 
 @pytest.mark.asyncio
@@ -1863,10 +1945,15 @@ async def test_strategic_session_message_refreshes_local_continuation_marker(
 
     assert resp.status_code == 200, resp.text
     assert state_resp.status_code == 200, state_resp.text
-    continuation = state_resp.json()["runtime"]["local_runner"]["continuation"]
+    data = resp.json()
+    assert data["status"] == "created"
+    assert data["session_status"] == "unavailable"
+    continuation = data["runtime"]["local_runner"]["continuation"]
     assert continuation["enabled"] is True
     assert continuation["fresh"] is True
     assert continuation["last_seen_at"] != stale_at
+    assert data["session"]["runtime"]["continuation"] == continuation
+    assert state_resp.json()["runtime"]["local_runner"]["continuation"] == continuation
 
     await db_session.refresh(project)
     marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
@@ -1997,12 +2084,17 @@ async def test_strategic_session_message_response_enriches_selected_refs(
         "section": "problem-model",
     }
     assert duplicate_descriptors == descriptors
+    assert resp.json()["session"]["mode"] == "continuous"
+    assert resp.json()["session_status"] == "unavailable"
+    assert any(
+        item["id"] == resp.json()["id"]
+        for item in resp.json()["conversation"]["items"]
+    )
     stored = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
     assert stored is not None
-    assert (
-        (stored.context or {})["strategic_session"]["context_package_id"]
-        == f"strategic-context:{project.id}"
-    )
+    stored_session = (stored.context or {})["strategic_session"]
+    assert stored_session["context_package_id"] == f"strategic-context:{project.id}"
+    assert stored_session["selected_ref_descriptors"] == descriptors
     prefs = (
         await db_session.execute(
             select(MessagesNoisePrefs).where(
@@ -2013,6 +2105,93 @@ async def test_strategic_session_message_response_enriches_selected_refs(
     ).scalar_one()
     stored_workbench = (prefs.prefs or {}).get("_strategic_workbench") or {}
     assert "context_package_id" not in stored_workbench
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_message_does_not_persist_selected_message_body(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    selected_message = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BLOCKER,
+        from_type="user",
+        content="SECRET MESSAGE BODY should not become hidden Strategic context.",
+        status="open",
+    )
+    db_session.add(selected_message)
+    await db_session.commit()
+    await db_session.refresh(selected_message)
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/messages",
+        json={
+            "message_type": "FEEDBACK",
+            "content": "Use the selected message only as a navigable pointer.",
+            "workbench_context": {
+                "interaction_mode": "continuous",
+                "active_surface": "messages",
+                "selected_refs": [
+                    {
+                        "kind": "message",
+                        "id": f"message:{selected_message.id}",
+                    },
+                ],
+                "selected_ref_descriptors": [
+                    {
+                        "kind": "MESSAGE",
+                        "id": f"message:{selected_message.id}",
+                        "label": "Hostile descriptor",
+                        "summary": "SECRET MESSAGE BODY from supplied context",
+                        "status": "SECRET STATUS BODY",
+                        "body": "SECRET BODY FIELD",
+                        "logs": "SECRET LOG FIELD",
+                        "target": {
+                            "surface": "SECRET TARGET SURFACE",
+                            "section": "SECRET TARGET SECTION",
+                            "message_id": str(selected_message.id),
+                            "logs": "SECRET TARGET LOG",
+                        },
+                    },
+                ],
+            },
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    descriptor = resp.json()["message"]["context"]["strategic_session"][
+        "selected_ref_descriptors"
+    ][0]
+    assert descriptor["kind"] == "message"
+    assert descriptor["label"] == "BLOCKER from user"
+    assert "summary" not in descriptor
+    assert descriptor["target"] == {
+        "surface": "messages",
+        "message_id": str(selected_message.id),
+    }
+
+    stored = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
+    assert stored is not None
+    serialized = str((stored.context or {})["strategic_session"])
+    assert "SECRET MESSAGE BODY" not in serialized
+    assert "Hostile descriptor" not in serialized
+    assert "SECRET STATUS BODY" not in serialized
+    assert "SECRET BODY FIELD" not in serialized
+    assert "SECRET LOG FIELD" not in serialized
+    assert "SECRET TARGET SURFACE" not in serialized
+    assert "SECRET TARGET SECTION" not in serialized
+    assert "SECRET TARGET LOG" not in serialized
+    stored_descriptor = (stored.context or {})["strategic_session"][
+        "selected_ref_descriptors"
+    ][0]
+    assert stored_descriptor == {
+        "kind": "MESSAGE",
+        "id": f"message:{selected_message.id}",
+        "target": {
+            "surface": "messages",
+            "message_id": str(selected_message.id),
+        },
+    }
 
 
 @pytest.mark.asyncio

@@ -5383,6 +5383,24 @@ describe('MessagesPanel composer draft persistence', () => {
         onMessageCountChange={() => {}}
         strategicState={makeStrategicState({
           project_id: 'proj-draft',
+          context_package: {
+            id: 'strategic-context:proj-draft',
+            title: 'Draft workbench context',
+            status: 'ready',
+            summary: 'Pointer-safe package summary.',
+            item_count: 3,
+            token_count: null,
+            sources: [],
+            drilldowns: [],
+            resources: [],
+            canvas: {
+              id: 'strategic-canvas:proj-draft',
+              node_count: 2,
+              edge_count: 1,
+              nodes: [{ id: 'node-1', kind: 'task', label: 'Heavy canvas node' }],
+              edges: [],
+            },
+          },
           work_session: {
             version: 1,
             id: 'strategic-session:proj-draft:2026-06-29T01:00:00Z',
@@ -5397,9 +5415,11 @@ describe('MessagesPanel composer draft persistence', () => {
             ],
             selected_ref_descriptors: [
               {
-                kind: 'knowledge_document',
-                id: 'knowledge:kdoc-1',
-                label: 'Operator notes',
+                kind: 'artifact',
+                id: 'artifact:latest-context',
+                label: 'Latest context report',
+                summary: 'Short pointer summary.',
+                status: 'active',
               },
             ],
             curated_metrics: [],
@@ -5409,6 +5429,7 @@ describe('MessagesPanel composer draft persistence', () => {
           version: 1,
           interaction_mode: 'continuous',
           active_surface: 'strategic',
+          preferred_runner_id: null,
           selected_refs: [
             { kind: 'artifact', id: 'artifact:latest-context', label: 'Latest context report' },
           ],
@@ -5440,13 +5461,30 @@ describe('MessagesPanel composer draft persistence', () => {
         version: 1,
         interaction_mode: 'continuous',
         active_surface: 'strategic',
+        preferred_runner_id: null,
         selected_refs: [
           { kind: 'artifact', id: 'artifact:latest-context', label: 'Latest context report' },
         ],
+        selected_ref_descriptors: [
+          {
+            kind: 'artifact',
+            id: 'artifact:latest-context',
+            label: 'Latest context report',
+            summary: 'Short pointer summary.',
+            status: 'active',
+          },
+        ],
         session_started_at: sessionStartedAt,
         context_package_id: 'strategic-context:proj-draft',
+        context_package_descriptor: {
+          id: 'strategic-context:proj-draft',
+          title: 'Draft workbench context',
+          status: 'ready',
+          summary: 'Pointer-safe package summary.',
+        },
       },
     });
+    expect(JSON.stringify(postedBodies[0])).not.toContain('Heavy canvas node');
     expect(postedBodies[0]).not.toHaveProperty('project_id');
   });
 

@@ -304,7 +304,6 @@ async def resolve_selected_ref_descriptors(
                 .options(
                     load_only(
                         ProjectMessage.id,
-                        ProjectMessage.content,
                         ProjectMessage.message_type,
                         ProjectMessage.from_type,
                         ProjectMessage.status,
@@ -330,7 +329,6 @@ async def resolve_selected_ref_descriptors(
                     kind="message",
                     ref_id=ref_id,
                     label=f"{message_type or 'message'} from {message.from_type}",
-                    summary=message.content,
                     status=message.status,
                     target={"surface": "messages", "message_id": str(message.id)},
                 ),

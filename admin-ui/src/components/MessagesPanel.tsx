@@ -34,6 +34,7 @@ import {
 import { buildStrategicContextDescriptor, SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
 
 const DEFAULT_VIEW_ID = '__default__';
+const MESSAGE_CONTEXT_SELECTED_REF_DESCRIPTOR_LIMIT = 8;
 
 // Receipt shown for at most 2 hours after a steer fires, preventing stale "picked up"
 // messages that grow without bound, and blocking stale receipts from resurfacing after
@@ -161,13 +162,44 @@ function buildMessageWorkbenchContext(
   if (!sessionIsFresh) {
     return contextPackageId ? { version: 1, context_package_id: contextPackageId } : null;
   }
+  const selectedRefKeys = new Set(
+    selectedRefs
+      .map(ref => `${ref.kind}:${ref.id}`)
+      .filter(key => key.length > 1),
+  );
+  const selectedRefDescriptors = (session?.selected_ref_descriptors ?? [])
+    .filter(ref => selectedRefKeys.has(`${ref.kind}:${ref.id}`))
+    .slice(0, MESSAGE_CONTEXT_SELECTED_REF_DESCRIPTOR_LIMIT)
+    .map(ref => ({
+      kind: ref.kind,
+      id: ref.id,
+      label: ref.label,
+      ...(ref.summary ? { summary: ref.summary } : {}),
+      ...(ref.status ? { status: ref.status } : {}),
+      ...(ref.target ? { target: ref.target } : {}),
+    }));
+  const contextPackage = state?.context_package ?? null;
+  const contextPackageDescriptor = contextPackage
+    ? {
+        id: contextPackage.id,
+        title: contextPackage.title,
+        ...(contextPackage.label ? { label: contextPackage.label } : {}),
+        ...(contextPackage.status ? { status: contextPackage.status } : {}),
+        ...(contextPackage.summary ? { summary: contextPackage.summary } : {}),
+      }
+    : null;
   return {
     version: 1,
     interaction_mode: interactionMode,
     active_surface: activeSurface,
+    ...(workbench && Object.prototype.hasOwnProperty.call(workbench, 'preferred_runner_id')
+      ? { preferred_runner_id: workbench.preferred_runner_id ?? null }
+      : {}),
     selected_refs: selectedRefs,
+    ...(selectedRefDescriptors.length ? { selected_ref_descriptors: selectedRefDescriptors } : {}),
     session_started_at: sessionStartedAt,
     context_package_id: contextPackageId,
+    ...(contextPackageDescriptor ? { context_package_descriptor: contextPackageDescriptor } : {}),
   };
 }
 

@@ -272,6 +272,53 @@ def _runtime_actions(
     return actions
 
 
+def _local_runner_actions(
+    local_runner: dict[str, Any] | None,
+    *,
+    has_local_runner_attention: bool,
+) -> list[dict[str, Any]]:
+    if has_local_runner_attention:
+        return []
+    if not isinstance(local_runner, dict):
+        return []
+    continuation = local_runner.get("continuation")
+    if not isinstance(continuation, dict):
+        return []
+    if not (continuation.get("enabled") and continuation.get("fresh")):
+        return []
+    if str(local_runner.get("mode") or "") == "local":
+        return []
+    if str(local_runner.get("status") or "") == "working" and (
+        local_runner.get("location") == "locally"
+    ):
+        return []
+    try:
+        eligible_live_count = int(local_runner.get("eligible_live_count") or 0)
+    except (TypeError, ValueError):
+        eligible_live_count = 0
+    if eligible_live_count > 0:
+        return []
+
+    reason = _compact_text(
+        continuation.get("reason")
+        or local_runner.get("status_reason")
+        or local_runner.get("fallback_reason")
+        or "runner_unavailable",
+        max_chars=80,
+    )
+    action = _action(
+        "runtime.local_strategic.continuation_runner",
+        "inspect",
+        "Check Workday runner",
+        "Workday mode is active but no eligible local Strategic runner is ready",
+        priority="high",
+        source="runtime",
+        target={"surface": "runtime", "section": "devices"},
+        blocked_reason=reason,
+    )
+    return [action] if action else []
+
+
 def _priority_rank(priority: Any) -> int:
     return {
         "critical": 0,
@@ -286,6 +333,7 @@ def build_work_session_actions(
     attention: dict[str, Any] | None,
     runtime_work: dict[str, Any] | None,
     context_status: str | None,
+    local_runner: dict[str, Any] | None = None,
     limit: int = 10,
 ) -> list[dict[str, Any]]:
     attention_actions = _attention_actions(attention)
@@ -301,6 +349,10 @@ def build_work_session_actions(
         *attention_actions,
         *_runtime_actions(
             runtime_work,
+            has_local_runner_attention=has_local_runner_attention,
+        ),
+        *_local_runner_actions(
+            local_runner,
             has_local_runner_attention=has_local_runner_attention,
         ),
     ]

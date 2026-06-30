@@ -147,6 +147,8 @@ export interface StrategicContextEvidenceCollection<T> {
 export interface StrategicContextPackageDescriptor {
   id: string;
   title: string;
+  label?: string | null;
+  summary?: string | null;
   status?: 'ready' | 'building' | 'stale' | string;
   updated_at?: string | null;
   token_count?: number | null;
@@ -178,7 +180,21 @@ export interface StrategicLocalRunnerRuntime {
   runner_target_id?: string | null;
 }
 
+export interface StrategicLocalRunnerContinuation {
+  enabled: boolean;
+  fresh: boolean;
+  preferred_runner_id?: string | null;
+  reason?: string | null;
+  updated_at?: string | null;
+  last_seen_at?: string | null;
+  ttl_seconds?: number | null;
+}
+
 export interface StrategicLocalRunnerState {
+  status?: string | null;
+  location?: string | null;
+  status_reason?: string | null;
+  continuation?: StrategicLocalRunnerContinuation | null;
   mode: 'local' | 'local_ready' | 'cloud' | 'pending_local' | 'unknown' | string;
   strategic_runner_count: number;
   live_runner_count: number;
@@ -298,6 +314,7 @@ export interface StrategicWorkbenchState {
   version: 1;
   interaction_mode: 'chat' | 'check_in' | 'monitor' | 'continuous' | string;
   active_surface: 'strategic' | 'pipeline' | 'project' | 'runtime' | string;
+  preferred_runner_id?: string | null;
   selected_refs: Array<{
     kind: string;
     id: string;
@@ -404,6 +421,17 @@ export interface StrategicSessionMessageCreate {
 export interface StrategicSessionMessageResponse {
   id: string;
   status: 'created' | 'duplicate' | string;
+  project_id?: string;
+  session_status?: string;
+  location?: string;
+  status_reason?: string | null;
+  session?: StrategicSessionResponse['session'];
+  workbench?: StrategicWorkbenchState | null;
+  strategic?: StrategicStateResponse['strategic'];
+  runtime?: StrategicStateResponse['runtime'];
+  context_package?: StrategicContextPackageDescriptor | null;
+  conversation?: StrategicSessionConversation;
+  recent_outputs?: StrategicSessionOutput[];
   arming?: string | null;
   message?: StrategicStateMessage;
 }

@@ -162,6 +162,13 @@ async def create_operator_project_message(
             workbench_context_for_snapshot = {
                 **stored_workbench,
                 "context_package_id": workbench_context.get("context_package_id"),
+                "selected_ref_descriptors": workbench_context.get(
+                    "selected_ref_descriptors"
+                ),
+                "context_package_descriptor": (
+                    workbench_context.get("context_package_descriptor")
+                    or workbench_context.get("context_package")
+                ),
             }
         if sync_local_continuation_marker:
             def _update_local_continuation_marker(vision: dict) -> None:

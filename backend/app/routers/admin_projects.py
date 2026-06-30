@@ -70,6 +70,7 @@ from app.workbench_state import (
     apply_strategic_local_continuation_marker,
     WORKBENCH_STATE_MAX_BYTES,
     get_strategic_workbench_state,
+    sanitize_strategic_session_snapshot,
     upsert_strategic_workbench_state_with_previous,
     workbench_mode_refresh_excerpt,
     workbench_mode_should_arm_strategic_refresh,
@@ -246,6 +247,11 @@ def _build_work_session_summary(
     runtime_work = (
         runtime_summary.get("work", {}) if isinstance(runtime_summary, dict) else {}
     )
+    local_runner = (
+        runtime_summary.get("local_runner", {})
+        if isinstance(runtime_summary, dict)
+        else {}
+    )
     compute_jobs = (
         runtime_work.get("compute_jobs", {}) if isinstance(runtime_work, dict) else {}
     )
@@ -280,6 +286,23 @@ def _build_work_session_summary(
         int(local_runner_holds.get("count") or 0)
         if isinstance(local_runner_holds, dict)
         else 0
+    )
+    eligible_live_runner_count = (
+        int(local_runner.get("eligible_live_count") or 0)
+        if isinstance(local_runner, dict)
+        else 0
+    )
+    local_continuation = (
+        local_runner.get("continuation", {})
+        if isinstance(local_runner, dict)
+        else {}
+    )
+    continuation_needs_runner = bool(
+        isinstance(local_continuation, dict)
+        and local_continuation.get("enabled")
+        and local_continuation.get("fresh")
+        and eligible_live_runner_count == 0
+        and local_runner.get("mode") != "local"
     )
 
     session_started_at = workbench_state.get("session_started_at")
@@ -365,6 +388,19 @@ def _build_work_session_summary(
             target={"surface": "pipeline"},
         ),
         _work_session_metric(
+            "runtime.local_strategic_ready",
+            "local Strategic ready",
+            eligible_live_runner_count,
+            tone=(
+                "active"
+                if eligible_live_runner_count > 0
+                else "warning"
+                if continuation_needs_runner
+                else "neutral"
+            ),
+            target={"surface": "runtime", "section": "devices"},
+        ),
+        _work_session_metric(
             "runtime.local_runner_holds",
             "local runner holds",
             local_runner_hold_count,
@@ -413,6 +449,7 @@ def _build_work_session_summary(
         attention=attention,
         runtime_work=runtime_work,
         context_status=context_status,
+        local_runner=local_runner if isinstance(local_runner, dict) else None,
     )
     return {
         "version": 1,
@@ -793,6 +830,20 @@ async def _message_preview_for_session_response(
         session=session,
         current_user=current_user,
     )
+    return await _message_preview_for_session_state(
+        session,
+        project_id,
+        state_response,
+        message,
+    )
+
+
+async def _message_preview_for_session_state(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    state_response: Dict[str, Any],
+    message: ProjectMessage,
+) -> Dict[str, Any]:
     context_package = (
         state_response.get("context_package")
         if isinstance(state_response.get("context_package"), dict)
@@ -810,6 +861,50 @@ async def _message_preview_for_session_response(
         selected_ref_descriptors=selected_ref_descriptors,
         content_max_chars=None,
     )
+
+
+async def _persist_message_preview_strategic_session_descriptors(
+    session: AsyncSession,
+    message: ProjectMessage,
+    message_preview: Dict[str, Any],
+) -> None:
+    preview_context = (
+        message_preview.get("context")
+        if isinstance(message_preview.get("context"), dict)
+        else {}
+    )
+    preview_snapshot = (
+        preview_context.get("strategic_session")
+        if isinstance(preview_context, dict)
+        else None
+    )
+    if not isinstance(preview_snapshot, dict):
+        return
+    preview_descriptors = preview_snapshot.get("selected_ref_descriptors")
+    if not isinstance(preview_descriptors, list) or not preview_descriptors:
+        return
+
+    context = message.context if isinstance(message.context, dict) else {}
+    stored_snapshot = context.get("strategic_session")
+    if not isinstance(stored_snapshot, dict):
+        return
+    if isinstance(stored_snapshot.get("selected_ref_descriptors"), list):
+        return
+
+    updated_snapshot = sanitize_strategic_session_snapshot(
+        {
+            **stored_snapshot,
+            "selected_ref_descriptors": preview_descriptors,
+        }
+    )
+    message.context = {
+        **context,
+        "strategic_session": updated_snapshot,
+    }
+    flag_modified(message, "context")
+    session.add(message)
+    await session.commit()
+    await session.refresh(message)
 
 
 def _task_summary(task: Task | None) -> Dict[str, Any] | None:
@@ -1874,18 +1969,45 @@ async def create_project_strategic_session_message(
         persist_empty_workbench_context=True,
         sync_local_continuation_marker=True,
     )
-    message_preview = await _message_preview_for_session_response(
+    state_response = await get_project_strategic_state(
         request,
+        project_id,
+        session=session,
+        current_user=current_user,
+    )
+    message_preview = await _message_preview_for_session_state(
         session,
         project_id,
-        current_user,
+        state_response,
         result.message,
+    )
+    await _persist_message_preview_strategic_session_descriptors(
+        session,
+        result.message,
+        message_preview,
+    )
+    session_read_model = await _build_strategic_session_response(
+        session,
+        project_id,
+        state_response,
+        include_message_id=result.message.id,
     )
     response = {
         "id": result.message_id,
         "status": result.status,
         "arming": result.arming,
         "message": message_preview,
+        "project_id": session_read_model["project_id"],
+        "session_status": session_read_model["status"],
+        "location": session_read_model["location"],
+        "status_reason": session_read_model["status_reason"],
+        "session": session_read_model["session"],
+        "workbench": session_read_model["workbench"],
+        "strategic": session_read_model["strategic"],
+        "runtime": session_read_model["runtime"],
+        "context_package": session_read_model["context_package"],
+        "conversation": session_read_model["conversation"],
+        "recent_outputs": session_read_model["recent_outputs"],
     }
     if result.message_event is not None:
         await broadcast_to_project(
