@@ -19,7 +19,7 @@ export function StrategicContextDescriptor({
   const visibleRefs = model.refs.slice(0, 2);
   const hiddenRefCount = Math.max(0, model.refCount - visibleRefs.length);
   const compact = variant === 'receipt';
-  const title = onOpen ? 'Open Strategic context commands' : model.capturedAt ? `Captured ${model.capturedAt}` : undefined;
+  const title = onOpen ? 'Open Strategic context' : model.capturedAt ? `Captured ${model.capturedAt}` : undefined;
   const className = compact
     ? 'flex max-w-full flex-wrap items-center gap-x-1.5 gap-y-1 text-ui-md leading-snug text-neutral-500'
     : 'mx-auto mb-2 flex w-full max-w-4xl flex-wrap items-center gap-x-2 gap-y-1 text-ui-md leading-snug text-neutral-500';

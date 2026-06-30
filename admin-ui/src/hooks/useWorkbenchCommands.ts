@@ -39,6 +39,7 @@ interface UseWorkbenchCommandsOptions {
   switchStrategicInteractionMode: (mode: StrategicInteractionMode) => void;
   focusStrategicComposer: () => void;
   openStrategicContextTarget?: (target?: StrategicContextTarget | null) => void;
+  openStrategicContextWorkspace?: () => void;
   updateStrategicSessionRefs?: (
     updateRefs: (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs']
   ) => void;
@@ -114,6 +115,11 @@ function fallbackSelectedRefLabel(ref: StrategicSelectedRef): string {
   return ref.label?.trim() || `${contextKindLabel(ref.kind)} ${ref.id.slice(0, 8)}`;
 }
 
+function compactContextDetail(...parts: Array<string | null | undefined>): string | null {
+  const detailParts = parts.map(part => part?.trim()).filter((part): part is string => Boolean(part));
+  return detailParts.length > 0 ? detailParts.join(' / ') : null;
+}
+
 export function useWorkbenchCommands({
   selectedProjectId,
   selectedProjectRepoLabel,
@@ -133,6 +139,7 @@ export function useWorkbenchCommands({
   switchStrategicInteractionMode,
   focusStrategicComposer,
   openStrategicContextTarget,
+  openStrategicContextWorkspace,
   updateStrategicSessionRefs,
   handleTabChange,
   setCommandPaletteOpen,
@@ -213,7 +220,7 @@ export function useWorkbenchCommands({
     }) => {
       const key = contextRefKey(source.ref);
       const selected = selectedKeys.has(key);
-      const detail = [contextKindLabel(source.ref.kind), source.detail].filter(Boolean).join(' / ');
+      const detail = compactContextDetail(contextKindLabel(source.ref.kind), source.detail) ?? contextKindLabel(source.ref.kind);
       if (source.target && openStrategicContextTarget && !seenContextOpenRefs.has(key)) {
         seenContextOpenRefs.add(key);
         addContextCommand({
@@ -308,7 +315,7 @@ export function useWorkbenchCommands({
         addRefCommands({
           ref: selectedRefFromNode(node),
           label: node.label,
-          detail: node.summary ?? node.status ?? null,
+          detail: compactContextDetail(node.summary, node.status),
           target: node.target,
           origin: 'map',
         });
@@ -388,6 +395,17 @@ export function useWorkbenchCommands({
         disabled: projectDisabled || savingStrategicWorkbench || command.mode === strategicInteractionMode,
         run: command.mode === strategicInteractionMode ? closePalette : () => setStrategicModeAndOpenChat(command.mode),
       })),
+      {
+        id: 'strategic.context.workspace',
+        label: 'Strategic context',
+        section: 'Context',
+        detail: contextPackage
+          ? `${selectedRefs.length} kept, ${contextPackage.resources?.length ?? 0} resources, ${contextPackage.canvas?.node_count ?? contextPackage.canvas?.nodes?.length ?? 0} nodes`
+          : `${selectedRefs.length} kept`,
+        keywords: ['strategic', 'context', 'workspace', 'drawer', 'canvas', 'evidence', 'kept'],
+        disabled: projectDisabled || !openStrategicContextWorkspace,
+        run: openStrategicContextWorkspace ? () => runAndClose(openStrategicContextWorkspace) : focusStrategicComposer,
+      },
       ...contextCommandEntries,
       {
         id: 'workbench.refresh',
@@ -600,6 +618,7 @@ export function useWorkbenchCommands({
     handleTabChange,
     hasDesignDoc,
     maxPlanAccountCount,
+    openStrategicContextWorkspace,
     openStrategicContextTarget,
     openGlobalSettings,
     openNewTaskModal,

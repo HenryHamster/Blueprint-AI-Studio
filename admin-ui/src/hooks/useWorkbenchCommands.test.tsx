@@ -128,6 +128,7 @@ describe('useWorkbenchCommands', () => {
   test('exposes dynamic Strategic context commands for open, keep, and remove actions', () => {
     const target = { surface: 'task', task_id: 'task-context-1' } as const;
     const openStrategicContextTarget = vi.fn();
+    const openStrategicContextWorkspace = vi.fn();
     const updateStrategicSessionRefs = vi.fn();
     const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
     const strategicState = {
@@ -176,6 +177,8 @@ describe('useWorkbenchCommands', () => {
               id: 'task-context-1',
               kind: 'task',
               label: 'Investigate failed runner',
+              summary: 'Runner queue is stalled',
+              status: 'blocked',
               target,
             },
           ],
@@ -229,13 +232,18 @@ describe('useWorkbenchCommands', () => {
       strategicState,
       strategicWorkbenchState,
       openStrategicContextTarget,
+      openStrategicContextWorkspace,
       updateStrategicSessionRefs,
       setCommandPaletteOpen,
     });
 
+    captured.find(command => command.id === 'strategic.context.workspace')?.run();
+    expect(openStrategicContextWorkspace).toHaveBeenCalledTimes(1);
+
     expect(captured.filter(command => command.label.includes('Latest report'))).toHaveLength(2);
     expect(captured.filter(command => command.id === 'strategic.context.remove.artifact:artifact:latest')).toHaveLength(1);
     expect(captured.filter(command => command.id === 'strategic.context.open.kept.artifact:artifact:latest')).toHaveLength(1);
+    expect(captured.find(command => command.id === 'strategic.context.keep.task:task-context-1')?.detail).toBe('task / Runner queue is stalled / blocked');
 
     captured.find(command => command.id === 'strategic.context.map')?.run();
     expect(openStrategicContextTarget).toHaveBeenCalledWith({ surface: 'project', section: 'problem-model' });
@@ -301,6 +309,7 @@ describe('useWorkbenchCommands', () => {
 
     expect(captured.find(command => command.id === 'strategic.focus')?.disabled).toBe(true);
     expect(captured.filter(command => command.id.startsWith('strategic.mode.')).every(command => command.disabled)).toBe(true);
+    expect(captured.find(command => command.id === 'strategic.context.workspace')?.disabled).toBe(true);
     expect(captured.find(command => command.id === 'pipeline.flow')?.disabled).toBeFalsy();
     expect(captured.find(command => command.id === 'runtime.health')?.disabled).toBeFalsy();
   });

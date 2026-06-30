@@ -41,6 +41,7 @@ import { ProjectMembers } from './components/ProjectMembers';
 import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
 import { StrategicContextRail } from './components/StrategicContextRail';
+import { StrategicContextWorkspace } from './components/StrategicContextWorkspace';
 import { StrategicSessionControl, type StrategicInteractionMode } from './components/StrategicSessionControl';
 import { TaskContextRail } from './components/TaskContextRail';
 import { CommandPaletteHost } from './components/CommandPaletteHost';
@@ -64,7 +65,6 @@ import { matchesStatusFilter } from './utils/statusFilter';
 import { buildOptimisticStrategicWorkbench, normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSurfaceForTab } from './utils/strategicWorkbenchSession';
 
 type StrategicSessionRefs = StrategicWorkbenchState['selected_refs'];
-
 export default function App() {
   const refreshStrategicReadModelRef = useRef<() => void>(() => {});
   const s = useAppState({ refreshStrategicReadModelRef });
@@ -83,6 +83,7 @@ export default function App() {
   const [openMessageCount, setOpenMessageCount] = useState(0);
   const [newSinceLastVisit, setNewSinceLastVisit] = useState(0);
   const handleMessageCountChange = useCallback((count: number) => setOpenMessageCount(count), []);
+
   // Noise prefs for the closed-panel badge — loaded from localStorage on project change and
   // re-read when the panel closes so changes made inside the panel are reflected immediately.
   const closedPanelNoisePrefsRef = useRef<Record<string, EventPref>>({});
@@ -110,7 +111,6 @@ export default function App() {
     window.addEventListener('blueprint:failure-class-filter', onFailureClassFilter);
     return () => window.removeEventListener('blueprint:failure-class-filter', onFailureClassFilter);
   }, [setFailureClassFilter]);
-
   useEffect(() => {
     localStorage.setItem(SORT_KEY, sortBy);
   }, [sortBy]);
@@ -119,7 +119,6 @@ export default function App() {
     [s.taskCapabilityContract],
   );
   const filterTaskTypeIds = resolvedTaskCapabilities.filterIds;
-
   // Snapshot of the full task-board filter combination + sort, fed to the saved-views
   // switcher so it can detect "modified" state and capture new views.
   const boardFilterSnapshot: BoardFilterSnapshot = {
@@ -134,7 +133,6 @@ export default function App() {
     failureClassFilter: s.failureClassFilter,
     sortBy,
   };
-
   const applyBoardView = useCallback((snap: BoardFilterSnapshot) => {
     setSearchQuery(snap.query);
     setTaskTypeFilter(snap.taskTypeFilter);
@@ -147,7 +145,6 @@ export default function App() {
     setFailureClassFilter(snap.failureClassFilter);
     setSortBy(snap.sortBy);
   }, [setSearchQuery, setTaskTypeFilter, setStatusFilter, setDateRange, setBlockedFilter, setRequiresApproval, setStuckFilter, setStuckMinSeconds, setFailureClassFilter]);
-
   // Update browser tab title with unread message count
   useEffect(() => {
     if (openMessageCount > 0) {
@@ -156,12 +153,10 @@ export default function App() {
       document.title = 'Blueprint AI Studio';
     }
   }, [openMessageCount]);
-
   // Fetch open message count periodically (when panel is closed the callback won't fire)
   const selectedProjectId = s.selectedProjectId;
   const activeTab: PrimaryTab = s.activeTab;
   const messagesPanelOpen = activeTab === 'chat';
-
   const [directions, setDirections] = useState<StrategicCockpitDirection[]>([]);
   useEffect(() => {
     setDirections([]);
@@ -207,7 +202,6 @@ export default function App() {
     enabled: activeTab === 'pipeline' || activeTab === 'chat',
     deps: [selectedProjectId, activeTab],
   });
-
   // Clear message count when panel opens
   useEffect(() => {
     if (messagesPanelOpen) {
@@ -215,7 +209,6 @@ export default function App() {
       setNewSinceLastVisit(0);
     }
   }, [messagesPanelOpen]);
-
   // Load noise prefs from localStorage when the project changes; refresh from server async.
   useEffect(() => {
     if (!selectedProjectId) {
@@ -271,7 +264,6 @@ export default function App() {
     enabled: !!selectedProjectId && !messagesPanelOpen,
     deps: [selectedProjectId, messagesPanelOpen, s.user?.email],
   });
-
   // New project modal
   const [showNewProjectModal, setShowNewProjectModal] = useState(false);
   const [showProjectManagement, setShowProjectManagement] = useState(false);
@@ -282,9 +274,7 @@ export default function App() {
     if (!p) return undefined;
     return { id: p.id, owner: p.github_owner, repo: p.github_repo };
   }, [setupProjectId, s.projects]);
-
   const [showActivityFeed, setShowActivityFeed] = useState(false);
-
   // Project members panel
   const [showProjectMembers, setShowProjectMembers] = useState(false);
   const selectedProject = useMemo(
@@ -294,7 +284,6 @@ export default function App() {
   const selectedProjectRepoLabel = selectedProject
     ? `${selectedProject.github_owner}/${selectedProject.github_repo}`
     : null;
-
   // Fetch project members when panel opens or project changes
   const { fetchProjectMembers } = s;
   useEffect(() => {
@@ -302,7 +291,6 @@ export default function App() {
       fetchProjectMembers(selectedProjectId);
     }
   }, [showProjectMembers, selectedProjectId, fetchProjectMembers]);
-
   const handleViewTask = (taskId: string) => {
     const task = s.tasks.find(t => t.id === taskId);
     if (task) s.handleViewLogs(task);
@@ -314,7 +302,6 @@ export default function App() {
   const [knowledgeBrowserDirectionId, setKnowledgeBrowserDirectionId] = useState<string | null>(null);
   const [knowledgeBrowserInitialDocId, setKnowledgeBrowserInitialDocId] = useState<string | null>(null);
   const [researchFeed, setResearchFeed] = useState<Task[]>([]);
-
   // Fetch project tasks when the Findings Journal opens so findings and implementation child
   // outcomes are independent of the main paginated table state.
   useEffect(() => {
@@ -333,8 +320,6 @@ export default function App() {
       .catch(() => {});
     return () => { cancelled = true; };
   }, [s.showResearchBrowser, selectedProjectId]);
-
-
   // Open operator-spawned SR investigations, keyed by category — used to dedup spawning.
   const [srInvestigationTaskIds, setSrInvestigationTaskIds] = useState<Record<string, string>>({});
   useEffect(() => {
@@ -524,9 +509,12 @@ export default function App() {
       (counts.parked_tasks ?? 0)
     );
   }, [s.needsAttentionCount, strategicReadModel.data?.attention?.counts]);
-  const { open: commandPaletteOpen, query: commandPaletteQuery, setOpen: setCommandPaletteOpen, setQuery: setCommandPaletteQuery, openWithQuery: openCommandPaletteWithQuery } = useCommandPaletteState();
+  const { open: commandPaletteOpen, query: commandPaletteQuery, setOpen: setCommandPaletteOpen, setQuery: setCommandPaletteQuery } = useCommandPaletteState();
+  const [strategicContextWorkspaceOpen, setStrategicContextWorkspaceOpen] = useState(false);
   const [strategicComposerFocusSignal, setStrategicComposerFocusSignal] = useState(0);
-
+  useEffect(() => {
+    setStrategicContextWorkspaceOpen(false);
+  }, [selectedProjectId]);
   const selectedTasks = useMemo(() => s.tasks.filter(t => s.selectedTaskIds.has(t.id)), [s.tasks, s.selectedTaskIds]);
   const cancellableTasks = useMemo(() => selectedTasks.filter(t => CANCELLABLE_STATUSES.has(t.status)), [selectedTasks]);
   const failedTasks = useMemo(() => selectedTasks.filter(t => t.status === 'FAILED'), [selectedTasks]);
@@ -883,6 +871,15 @@ export default function App() {
     setPipelineSection, setProjectSection, setRuntimeSection,
     setShowArchive: s.setShowArchive, setShowKnowledgeBrowser: s.setShowKnowledgeBrowser, setViewMode: s.setViewMode,
   });
+  const openStrategicContextWorkspace = useCallback(() => {
+    setCommandPaletteOpen(false);
+    setStrategicContextWorkspaceOpen(true);
+  }, [setCommandPaletteOpen]);
+  const closeStrategicContextWorkspace = useCallback(() => setStrategicContextWorkspaceOpen(false), []);
+  const openStrategicContextWorkspaceTarget = useCallback((target: Parameters<typeof openStrategicContextTarget>[0]) => {
+    setStrategicContextWorkspaceOpen(false);
+    openStrategicContextTarget(target);
+  }, [openStrategicContextTarget]);
   const currentStrategicInteractionMode = normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode);
   const setStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
     void persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' });
@@ -918,7 +915,7 @@ export default function App() {
     savingStrategicWorkbench,
     switchStrategicInteractionMode,
     focusStrategicComposer,
-    openStrategicContextTarget, updateStrategicSessionRefs,
+    openStrategicContextTarget, openStrategicContextWorkspace, updateStrategicSessionRefs,
     handleTabChange,
     setCommandPaletteOpen,
     setPipelineSection,
@@ -942,7 +939,7 @@ export default function App() {
 
   const { openCommandPalette } = useOperatorKeyboardShortcuts({
     activeTab,
-    blockingModalOpen: Boolean(s.showNewTaskModal || s.logTask || s.showComposeDrawer || s.showFleetDetail || s.confirmDialog || showNewProjectModal || setupProjectId || showProjectManagement || showProjectMembers),
+    blockingModalOpen: Boolean(s.showNewTaskModal || s.logTask || s.showComposeDrawer || s.showFleetDetail || s.confirmDialog || showNewProjectModal || setupProjectId || showProjectManagement || showProjectMembers || strategicContextWorkspaceOpen),
     commandPaletteOpen, commands: workbenchCommands, searchInputRef,
     searchShortcutBlocked: Boolean(s.showNewTaskModal || s.logTask || s.showResearchBrowser || s.showSettings),
     selectedTaskCount: s.selectedTaskIds.size, selectionMode: s.selectionMode, setCommandPaletteOpen,
@@ -1342,9 +1339,16 @@ export default function App() {
         pipelineThrottle={s.pipelineThrottle}
         costSectionAvailable={activeTab === 'runtime' && runtimeSection === 'analytics'}
       />
-
       <CommandPaletteHost open={commandPaletteOpen} commands={workbenchCommands} query={commandPaletteQuery} onQueryChange={setCommandPaletteQuery} setOpen={setCommandPaletteOpen} />
-
+      <StrategicContextWorkspace
+        open={strategicContextWorkspaceOpen}
+        state={strategicReadModel.data ?? null}
+        workbenchState={strategicWorkbenchState}
+        savingSessionRefs={savingStrategicWorkbench}
+        onClose={closeStrategicContextWorkspace}
+        onOpenTarget={openStrategicContextWorkspaceTarget}
+        onUpdateSessionRefs={updateStrategicSessionRefs}
+      />
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {
         const projectId = s.selectedProjectId;
         return (
@@ -1358,12 +1362,8 @@ export default function App() {
         />
         );
       })()}
-
       <VersionMismatchBanner />
-
       {s.userRole === 'admin' && <NullBranchDiagnosticsPanel onConfigure={handleConfigureBranchProject} />}
-
-
       {s.error && (
         <div className="mb-3 md:mb-6 bg-red-950/50 text-red-400 px-4 py-3 rounded-lg text-sm border border-red-900/50 flex items-center gap-2 shrink-0">
           <AlertCircle className="w-4 h-4" />
@@ -1431,7 +1431,7 @@ export default function App() {
                 strategicState={strategicReadModel.data ?? null} strategicWorkbenchState={strategicWorkbenchState}
                 onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
                 onStrategicInteraction={() => { void persistStrategicWorkbench({ active_surface: 'strategic' }); }}
-                onOpenStrategicContextCommands={() => openCommandPaletteWithQuery('context')}
+                onOpenStrategicContextWorkspace={openStrategicContextWorkspace}
               />
             )}
             rail={(

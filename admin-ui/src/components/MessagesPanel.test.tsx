@@ -768,8 +768,8 @@ describe('MessagesPanel chrome modes', () => {
     expect(descriptor?.textContent).not.toContain('Operator notes');
   });
 
-  test('minimal chat context descriptor opens Strategic context commands', async () => {
-    const onOpenStrategicContextCommands = vi.fn();
+  test('minimal chat context descriptor opens Strategic context workspace', async () => {
+    const onOpenStrategicContextWorkspace = vi.fn();
     const el = await renderPanel({
       filterChrome: 'minimal',
       strategicState: makeStrategicState({
@@ -789,7 +789,7 @@ describe('MessagesPanel chrome modes', () => {
           curated_metrics: [],
         },
       }),
-      onOpenStrategicContextCommands,
+      onOpenStrategicContextWorkspace,
     });
 
     const descriptor = el.querySelector('[data-testid="strategic-context-descriptor"]') as HTMLButtonElement | null;
@@ -797,7 +797,7 @@ describe('MessagesPanel chrome modes', () => {
     await act(async () => {
       descriptor?.click();
     });
-    expect(onOpenStrategicContextCommands).toHaveBeenCalledTimes(1);
+    expect(onOpenStrategicContextWorkspace).toHaveBeenCalledTimes(1);
   });
 
   test('minimal chat chrome shows conversation messages chronologically without routine alerts', async () => {
