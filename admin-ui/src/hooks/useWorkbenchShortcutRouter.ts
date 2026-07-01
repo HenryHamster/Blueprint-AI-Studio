@@ -11,6 +11,9 @@ export const WORKBENCH_SHORTCUT_COMMAND_ID_BY_KEY: Readonly<Record<string, strin
   n: 'task.new',
   r: 'workbench.refresh',
   s: 'runtime.settings.general',
+  '[': 'workbench.subtab.previous',
+  ']': 'workbench.subtab.next',
+  '?': 'workbench.shortcuts.open',
 };
 
 interface UseWorkbenchShortcutRouterOptions {

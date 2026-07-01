@@ -10,34 +10,36 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote
 
-from app.workbench_targets import (
-    REFETCH_SURFACE_MESSAGES as _MESSAGES_SURFACE,
-    REFETCH_SURFACE_RUNTIME as _RUNTIME_SURFACE,
-    REFETCH_SURFACE_STRATEGIC_SESSION as _STRATEGIC_SESSION_SURFACE,
-    bounded_workbench_refetch_surfaces,
-    compact_workbench_target,
+from app.workbench_contracts import (
+    ALERT_DISMISS_COMMAND_PREFIX,
+    DEFAULT_REFETCH_SURFACES,
+    RUNNER_PREFER_COMMAND_PREFIX,
+    SURFACE_MESSAGES,
+    SURFACE_RUNTIME,
+    SURFACE_STRATEGIC_SESSION,
+    alert_dismiss_endpoint,
+    compact_text,
+    messages_last_seen_endpoint,
+    normalize_command_descriptor,
+    normalize_refetch_surfaces,
+    normalize_target,
+    strategic_session_endpoint,
 )
 
 MAX_WORK_SESSION_COMMANDS = 24
 
 
 def _compact_text(value: Any, *, max_chars: int = 180) -> str | None:
-    if value is None:
-        return None
-    text = " ".join(str(value).strip().split())
-    if not text:
-        return None
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 3:
-        return text[:max_chars]
-    return f"{text[: max_chars - 3]}..."
+    return compact_text(value, max_chars=max_chars)
 
 
 def _compact_target(target: dict[str, Any] | None) -> dict[str, Any] | None:
-    return compact_workbench_target(target)
+    return normalize_target(target)
+
+
+def _bounded_surfaces(values: list[str] | tuple[str, ...] | None) -> list[str]:
+    return normalize_refetch_surfaces(values, default=())
 
 
 def _mutation(
@@ -76,25 +78,24 @@ def _command(
         "priority": _compact_text(priority, max_chars=40) or "normal",
         "enabled": bool(enabled),
         "target": compact_target,
-        "refetch_surfaces": bounded_workbench_refetch_surfaces(refetch_surfaces),
+        "refetch_surfaces": _bounded_surfaces(refetch_surfaces),
+        "executable": bool(mutation),
     }
     if mutation:
         command["mutation"] = mutation
-    return command
+    return normalize_command_descriptor(command, project_id=compact_target.get("project_id"))
 
 
 def _strategic_session_endpoint(project_id: Any) -> str:
-    encoded_project_id = quote(str(project_id), safe="")
-    return f"/api/admin/projects/{encoded_project_id}/strategic-session"
+    return strategic_session_endpoint(project_id)
 
 
 def _messages_last_seen_endpoint() -> str:
-    return "/api/admin/messages/last-seen"
+    return messages_last_seen_endpoint()
 
 
 def _alert_dismiss_endpoint(alert_id: Any) -> str:
-    encoded_alert_id = quote(str(alert_id), safe="")
-    return f"/api/admin/alerts/{encoded_alert_id}/dismiss"
+    return alert_dismiss_endpoint(alert_id)
 
 
 def _now_epoch_ms() -> int:
@@ -121,7 +122,7 @@ def _mode_command(
     current_mode: str,
     mode: str,
     label: str,
-    refetch_surfaces: tuple[str, ...] = (_STRATEGIC_SESSION_SURFACE,),
+    refetch_surfaces: tuple[str, ...] = DEFAULT_REFETCH_SURFACES,
 ) -> dict[str, Any] | None:
     return _command(
         f"session.mode.{mode}",
@@ -130,7 +131,7 @@ def _mode_command(
         priority="normal",
         enabled=current_mode != mode,
         target={
-            "surface": "messages",
+            "surface": SURFACE_MESSAGES,
             "project_id": project_id,
             "action": f"set_{mode}_mode",
         },
@@ -193,24 +194,24 @@ def _fixed_session_commands(
 
     candidates = [
         _command(
-            "session.check_in",
+        "session.check_in",
             "Check in",
             group="session",
             priority="normal",
             enabled=True,
             target={
-                "surface": "messages",
+                "surface": SURFACE_MESSAGES,
                 "project_id": project_id,
                 "action": "check_in",
             },
-            refetch_surfaces=(_STRATEGIC_SESSION_SURFACE,),
+            refetch_surfaces=DEFAULT_REFETCH_SURFACES,
         ),
         _mode_command(
             project_id=project_id,
             current_mode=current_mode,
             mode="continuous",
             label="Workday mode",
-            refetch_surfaces=(_STRATEGIC_SESSION_SURFACE, _RUNTIME_SURFACE),
+            refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
         ),
         _mode_command(
             project_id=project_id,
@@ -236,7 +237,7 @@ def _fixed_session_commands(
                 "section": "selected_refs",
                 "action": "clear",
             },
-            refetch_surfaces=(_STRATEGIC_SESSION_SURFACE,),
+            refetch_surfaces=DEFAULT_REFETCH_SURFACES,
             mutation=_mutation(
                 method="POST",
                 path=_strategic_session_endpoint(project_id),
@@ -283,21 +284,21 @@ def _runner_preference_commands(
                 continue
             commands.append(
                 _command(
-                    f"session.runner.prefer.{runner_id}",
+                    f"{RUNNER_PREFER_COMMAND_PREFIX}{runner_id}",
                     _runner_label(candidate, runner_id),
                     group="runtime",
                     priority="normal",
                     enabled=runner_id != preferred_runner_id,
                     target={
-                        "surface": "runtime",
+                        "surface": SURFACE_RUNTIME,
                         "project_id": project_id,
                         "section": "devices",
                         "action": "prefer_runner",
                         "runner_id": runner_id,
                     },
                     refetch_surfaces=(
-                        _STRATEGIC_SESSION_SURFACE,
-                        _RUNTIME_SURFACE,
+                        SURFACE_STRATEGIC_SESSION,
+                        SURFACE_RUNTIME,
                     ),
                     mutation=_mutation(
                         method="POST",
@@ -318,15 +319,15 @@ def _runner_preference_commands(
                 priority="normal",
                 enabled=True,
                 target={
-                    "surface": "runtime",
+                    "surface": SURFACE_RUNTIME,
                     "project_id": project_id,
                     "section": "devices",
                     "action": "clear_preferred_runner",
                     "runner_id": preferred_runner_id,
                 },
                 refetch_surfaces=(
-                    _STRATEGIC_SESSION_SURFACE,
-                    _RUNTIME_SURFACE,
+                    SURFACE_STRATEGIC_SESSION,
+                    SURFACE_RUNTIME,
                 ),
                 mutation=_mutation(
                     method="POST",
@@ -358,11 +359,11 @@ def _attention_commands(
                 priority="normal",
                 enabled=True,
                 target={
-                    "surface": "messages",
+                    "surface": SURFACE_MESSAGES,
                     "project_id": project_id,
                     "action": "mark_seen",
                 },
-                refetch_surfaces=(_MESSAGES_SURFACE, _STRATEGIC_SESSION_SURFACE),
+                refetch_surfaces=(SURFACE_MESSAGES, SURFACE_STRATEGIC_SESSION),
                 mutation=_mutation(
                     method="PUT",
                     path=_messages_last_seen_endpoint(),
@@ -388,19 +389,19 @@ def _attention_commands(
                 continue
             commands.append(
                 _command(
-                    f"attention.alert.dismiss:{alert_id}",
+                    f"{ALERT_DISMISS_COMMAND_PREFIX}{alert_id}",
                     _alert_dismiss_label(item, alert_id),
                     group="attention",
                     priority="normal",
                     enabled=True,
                     target={
-                        "surface": "runtime",
+                        "surface": SURFACE_RUNTIME,
                         "project_id": project_id,
                         "section": "health",
                         "alert_id": alert_id,
                         "action": "dismiss_alert",
                     },
-                    refetch_surfaces=(_RUNTIME_SURFACE, _STRATEGIC_SESSION_SURFACE),
+                    refetch_surfaces=(SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION),
                     mutation=_mutation(
                         method="POST",
                         path=_alert_dismiss_endpoint(alert_id),

@@ -42,6 +42,7 @@ from app.strategic_runtime_work import (
 )
 from app.task_movement import build_task_movement_explanation
 from app.time_utils import _utcnow
+from app.workbench_contracts import compact_text, normalize_target
 
 
 _HIGH_SIGNAL_MESSAGE_TYPES = (
@@ -70,10 +71,11 @@ def _enum_value(value: Any) -> str:
 
 
 def _compact_text(value: Any, *, max_chars: int = 180) -> str:
-    text = " ".join(str(value or "").strip().split())
-    if len(text) <= max_chars:
-        return text
-    return f"{text[: max_chars - 1]}…"
+    return compact_text(value, max_chars=max_chars)
+
+
+def _attention_target(target: dict[str, Any]) -> dict[str, Any]:
+    return normalize_target(target) or {}
 
 
 def _direction_manual_intervention(direction: Any) -> bool:
@@ -122,12 +124,12 @@ def _message_attention_item(message: ProjectMessage, *, unread: bool) -> dict[st
             "id": str(message.id),
             "project_id": str(message.project_id),
         },
-        "target": {
+        "target": _attention_target({
             "surface": "messages",
             "project_id": str(message.project_id),
             "message_id": str(message.id),
             "action": "reply" if message.message_type == MessageType.QUESTION else "highlight",
-        },
+        }),
     }
 
 
@@ -173,7 +175,7 @@ def _task_attention_item(task: Task, *, reason: str, severity: str) -> dict[str,
             "id": str(task.id),
             "project_id": str(task.project_id),
         },
-        "target": target,
+        "target": _attention_target(target),
     }
 
 
@@ -197,12 +199,12 @@ def _local_runner_hold_attention_item(task: Task) -> dict[str, Any]:
     )
     item["detail"] = _compact_text(hold_detail, max_chars=180)
     item["awaiting_since"] = awaiting_since
-    item["target"] = {
+    item["target"] = _attention_target({
         "surface": "runtime",
         "project_id": str(task.project_id),
         "section": "devices",
         "task_id": str(task.id),
-    }
+    })
     return item
 
 
@@ -247,12 +249,12 @@ def _stale_runner_pin_attention_item(
     )
     item["detail"] = _compact_text(detail, max_chars=180)
     item["runner_id"] = runner_id
-    item["target"] = {
+    item["target"] = _attention_target({
         "surface": "runtime",
         "project_id": str(task.project_id),
         "section": "devices",
         "task_id": str(task.id),
-    }
+    })
     if runner_id:
         item["target"]["runner_id"] = runner_id
     return item
@@ -300,13 +302,13 @@ def _alert_attention_item(alert: Alert) -> dict[str, Any]:
         "task_id": str(alert.task_id) if alert.task_id else None,
         "domain": alert.domain,
         "event_type": alert.event_type,
-        "target": {
+        "target": _attention_target({
             "surface": "task" if alert.task_id else "runtime",
             "project_id": str(alert.project_id),
             **({"task_id": str(alert.task_id)} if alert.task_id else {}),
             **({} if alert.task_id else {"section": target_section}),
             "alert_id": str(alert.id),
-        },
+        }),
     }
 
 
@@ -328,12 +330,12 @@ def _direction_attention_item(
             "id": direction_id,
             "project_id": str(project_id),
         },
-        "target": {
+        "target": _attention_target({
             "surface": "project",
             "project_id": str(project_id),
             "section": "directions",
             "direction_id": direction_id,
-        },
+        }),
     }
 
 

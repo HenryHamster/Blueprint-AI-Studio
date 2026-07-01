@@ -495,6 +495,7 @@ export interface StrategicWorkSessionCommand {
   enabled: boolean;
   target?: StrategicContextPackageDrilldown['target'] | null;
   refetch_surfaces?: string[];
+  executable?: boolean;
   mutation?: StrategicWorkSessionCommandMutation;
 }
 

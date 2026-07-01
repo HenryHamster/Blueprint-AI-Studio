@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   fetchFleetUtilization,
   listFleetRunners,
@@ -18,6 +21,29 @@ import type { WorkbenchEventEnvelopeV1 } from './types/workbenchEvents';
 vi.mock('./firebase', () => ({
   getIdToken: vi.fn(async () => 'test-token'),
 }));
+
+const OPERATOR_WORKBENCH_FIXTURE_RELATIVE_PATH = 'backend/testing/__fixtures__/operator_workbench_contracts.json';
+
+function operatorWorkbenchFixturePath(): string {
+  const candidates = [
+    import.meta.url.startsWith('file:')
+      ? resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', OPERATOR_WORKBENCH_FIXTURE_RELATIVE_PATH)
+      : null,
+    resolve(process.cwd(), '..', OPERATOR_WORKBENCH_FIXTURE_RELATIVE_PATH),
+    resolve(process.cwd(), OPERATOR_WORKBENCH_FIXTURE_RELATIVE_PATH),
+  ].filter((path): path is string => Boolean(path));
+  const fixturePath = candidates.find(candidate => existsSync(candidate));
+  if (!fixturePath) throw new Error(`Missing operator workbench contract fixture. Checked: ${candidates.join(', ')}`);
+  return fixturePath;
+}
+
+const operatorWorkbenchContractFixture = JSON.parse(
+  readFileSync(operatorWorkbenchFixturePath(), 'utf-8'),
+) as {
+  strategic_state_response: StrategicStateResponse;
+  strategic_session_response: StrategicSessionResponse;
+  workbench_event_payload: WorkbenchEventEnvelopeV1;
+};
 
 function jsonResponse(body: unknown, status = 200) {
   return new Response(JSON.stringify(body), { status });
@@ -208,7 +234,7 @@ const strategicStateFixture = {
           kind: 'local_runner',
           label: 'operator-desk',
           status: 'connected',
-          target: { surface: 'runtime', section: 'runners', runner_id: 'runner-1' },
+          target: { surface: 'runtime', section: 'devices', runner_id: 'runner-1' },
         },
       ],
       edges: [],
@@ -284,7 +310,7 @@ const strategicStateFixture = {
         label: 'Local ready',
         value: 1,
         tone: 'active',
-        target: { surface: 'runtime', section: 'runners' },
+        target: { surface: 'runtime', section: 'devices' },
         provenance: {
           surface: 'runtime',
           path: 'runtime.local_runner.eligible_live_count',
@@ -325,7 +351,7 @@ const strategicStateFixture = {
           summary: 'operator-desk connected',
           tone: 'active',
           ref: { kind: 'runner', id: 'runner-1' },
-          target: { surface: 'runtime', section: 'runners', runner_id: 'runner-1' },
+          target: { surface: 'runtime', section: 'devices', runner_id: 'runner-1' },
           data: { device_status: 'connected' },
         },
       ],
@@ -414,6 +440,35 @@ const fleetFixture = {
 describe('operator workbench contract fixtures', () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it('consumes the backend-owned operator workbench fixture', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse(operatorWorkbenchContractFixture.strategic_state_response))
+      .mockResolvedValueOnce(jsonResponse(operatorWorkbenchContractFixture.strategic_session_response));
+
+    const state = await fetchStrategicState('proj-1');
+    expect(state.work_session?.commands?.[0]).toMatchObject({
+      id: 'session.mode.continuous',
+      executable: true,
+      target: { surface: 'messages', project_id: 'proj-1' },
+    });
+    expect(state.work_session?.curated_metrics[0].target).toMatchObject({
+      surface: 'runtime',
+      section: 'devices',
+      runner_id: 'runner-1',
+    });
+    expect(state.work_session?.events?.items[0]).toMatchObject(operatorWorkbenchContractFixture.workbench_event_payload);
+
+    const session = await fetchStrategicSession('proj-1', 'msg-1');
+    expect(session.session.commands?.[0].refetch_surfaces).toEqual(['strategic_session', 'runtime']);
+    expect(session.session.runtime?.runners?.[0].health?.device_status).toBe('connected');
+    expect(session.conversation.items).toEqual(session.session.conversation?.items);
+
+    expect(String(fetchMock.mock.calls[0][0])).toContain('/api/admin/projects/proj-1/strategic-state');
+    expect(String(fetchMock.mock.calls[1][0])).toContain(
+      '/api/admin/projects/proj-1/strategic-session?include_message_id=msg-1',
+    );
   });
 
   it('preserves Strategic state and session payload fields the workbench composes', async () => {

@@ -18,9 +18,18 @@ from app.models import (
     _utcnow,
 )
 from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.workbench_contracts import (
+    WEBSOCKET_EMITTER_INVENTORY,
+    build_operator_workbench_contract_fixture,
+    normalize_target,
+    validate_executable_command_descriptor,
+)
 
 TEST_USER_ID = "test-user-123"
 FIXTURE_DIR = Path(__file__).parent / "__fixtures__"
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = BACKEND_ROOT.parent
+OPERATOR_WORKBENCH_FIXTURE_PATH = FIXTURE_DIR / "operator_workbench_contracts.json"
 
 
 async def _make_project(session) -> Project:
@@ -70,6 +79,10 @@ def _assert_has_keys(payload: dict[str, Any], keys: set[str]) -> None:
 
 def _fixture(name: str) -> dict:
     return json.loads((FIXTURE_DIR / name).read_text(encoding="utf-8"))
+
+
+def _operator_workbench_fixture() -> dict:
+    return json.loads(OPERATOR_WORKBENCH_FIXTURE_PATH.read_text(encoding="utf-8"))
 
 
 @pytest.mark.asyncio
@@ -414,3 +427,74 @@ def test_task_sideboard_context_v1_fixture_covers_pipeline_and_task_contract():
     assert "problem_model" not in serialized
     assert "design_doc" not in serialized
     assert "huge" not in serialized
+
+
+def test_operator_workbench_contract_fixture_is_current():
+    assert _operator_workbench_fixture() == build_operator_workbench_contract_fixture()
+
+
+def test_operator_workbench_fixture_validates_core_contracts():
+    fixture = _operator_workbench_fixture()
+
+    assert fixture["context_targets"]["runtime_runner_alias_normalized"] == {
+        "surface": "runtime",
+        "section": "devices",
+        "runner_id": "runner-1",
+    }
+    assert normalize_target({"surface": "runtime", "section": "runners"}) == {
+        "surface": "runtime",
+        "section": "devices",
+    }
+    assert normalize_target({"surface": "runtime", "section": "unknown"}) is None
+
+    command = fixture["command_descriptor"]
+    assert command["executable"] is True
+    assert validate_executable_command_descriptor(command, project_id="proj-1") is None
+
+    event_payload = fixture["workbench_event_payload"]
+    assert event_payload["schema_version"] == 1
+    assert event_payload["refetch"]["surfaces"] == ["runtime", "strategic_session"]
+
+    assert fixture["message_arming_outcomes"] == [
+        "steering",
+        "passive_note",
+        "routine_event",
+        "not_armed",
+        "duplicate",
+    ]
+    assert fixture["task_detail_sideboard_context"]["links"][0]["target"] == {
+        "surface": "task",
+        "task_id": "task-1",
+    }
+
+
+def test_websocket_emitter_inventory_covers_current_emitters():
+    discovered_emitters = set()
+    discovered_v1_producers = set()
+    for path in (BACKEND_ROOT / "app").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        rel_path = path.relative_to(REPO_ROOT).as_posix()
+        if "broadcast_to_project" in text or "send_json(" in text:
+            discovered_emitters.add(rel_path)
+        if rel_path != "backend/app/workbench_events.py" and (
+            "emit_workbench_refetch(" in text
+            or "workbench_event_envelope(" in text
+        ):
+            discovered_v1_producers.add(rel_path)
+
+    inventoried = {
+        path
+        for category in ("workbench_v1", "transport", "legacy_compatibility")
+        for path in WEBSOCKET_EMITTER_INVENTORY[category]
+    }
+    inventoried_v1_producers = {
+        path
+        for paths in (WEBSOCKET_EMITTER_INVENTORY["workbench_v1_producers"],)
+        for path in paths
+    }
+
+    assert discovered_emitters == inventoried
+    assert discovered_v1_producers == inventoried_v1_producers
+    assert WEBSOCKET_EMITTER_INVENTORY["workbench_v1"] == (
+        "backend/app/workbench_events.py",
+    )

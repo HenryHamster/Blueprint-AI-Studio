@@ -188,6 +188,42 @@ async def test_malformed_or_non_allowlisted_commands_do_not_persist_receipts(
             unsupported_target_alert,
             "unsupported-alert-target",
         ),
+        (
+            {
+                "id": "session.mode.monitor",
+                "label": "Monitor mode",
+                "enabled": True,
+                "target": {
+                    "surface": "messages",
+                    "project_id": str(project.id),
+                    "action": "set_monitor_mode",
+                },
+                "mutation": {
+                    "method": "POST",
+                    "path": f"/api/admin/projects/{project.id}/strategic-session",
+                    "body": {"workbench": {"interaction_mode": "continuous"}},
+                },
+            },
+            "mismatched-session-mode",
+        ),
+        (
+            {
+                "id": "session.mode.monitor",
+                "label": "Monitor mode",
+                "enabled": True,
+                "target": {
+                    "surface": "runtime",
+                    "project_id": str(project.id),
+                    "section": "health",
+                },
+                "mutation": {
+                    "method": "POST",
+                    "path": f"/api/admin/projects/{project.id}/strategic-session",
+                    "body": {"workbench": {"interaction_mode": "monitor"}},
+                },
+            },
+            "mismatched-session-target",
+        ),
     ]
 
     for command, idem_key in commands:

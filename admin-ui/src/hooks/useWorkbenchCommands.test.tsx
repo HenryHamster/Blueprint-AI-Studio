@@ -25,6 +25,9 @@ const REQUIRED_OPERATOR_ROUTE_COMMANDS = [
   { id: 'strategic.context.workspace', section: 'Context' },
   { id: 'strategic.messages.open', section: 'Messages' },
   { id: 'workbench.refresh', section: 'Workbench', shortcut: 'R' },
+  { id: 'workbench.subtab.previous', section: 'Workbench', shortcut: '[' },
+  { id: 'workbench.subtab.next', section: 'Workbench', shortcut: ']' },
+  { id: 'workbench.shortcuts.open', section: 'Workbench', shortcut: '?' },
   { id: 'pipeline.flow', section: 'Pipeline', shortcut: '2' },
   { id: 'pipeline.board', section: 'Pipeline' },
   { id: 'pipeline.archive', section: 'Pipeline', shortcut: 'A' },
@@ -414,6 +417,48 @@ describe('useWorkbenchCommands', () => {
     expect(updater([{ kind: 'task', id: 'task-1', label: 'Task 1' }])).toEqual([]);
     expect(apiFetchMock).not.toHaveBeenCalled();
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
+  test('normalizes backend descriptor runtime target aliases before routing', () => {
+    const openStrategicContextTarget = vi.fn();
+    const commands: StrategicWorkSessionCommand[] = [
+      {
+        id: 'runtime.runners',
+        label: 'Inspect local runners',
+        group: 'runtime',
+        priority: 'normal',
+        enabled: true,
+        target: { surface: 'runtime', section: 'runners', runner_id: 'runner-1' },
+      },
+      {
+        id: 'runtime.bad-section',
+        label: 'Bad runtime section',
+        group: 'runtime',
+        priority: 'normal',
+        enabled: true,
+        target: { surface: 'runtime', section: 'mystery' },
+      },
+    ];
+
+    mount({
+      strategicState: { work_session: { commands } } as StrategicStateResponse,
+      openStrategicContextTarget,
+    });
+
+    const command = captured.find(item => item.id === 'runtime.runners');
+    expect(command).toMatchObject({
+      section: 'Runtime',
+      detail: 'Runtime devices',
+    });
+    expect(captured.find(item => item.id === 'runtime.bad-section')).toBeUndefined();
+
+    command?.run();
+
+    expect(openStrategicContextTarget).toHaveBeenCalledWith({
+      surface: 'runtime',
+      section: 'devices',
+      runner_id: 'runner-1',
+    });
   });
 
   test('executes backend mutation descriptors for Strategic mode changes and refreshes workbench', async () => {
@@ -1145,6 +1190,11 @@ describe('useWorkbenchCommands', () => {
             label: 'Runtime',
             target: { surface: 'runtime', section: 'compute' },
           },
+          {
+            id: 'provider-settings',
+            label: 'Provider settings',
+            target: { surface: 'runtime', section: 'provider-settings' },
+          },
         ],
         evidence: {
           knowledge: {
@@ -1218,6 +1268,9 @@ describe('useWorkbenchCommands', () => {
 
     captured.find(command => command.id === 'strategic.context.open.drilldown.runtime')?.run();
     expect(openStrategicContextTarget).toHaveBeenCalledWith({ surface: 'runtime', section: 'compute' });
+
+    captured.find(command => command.id === 'strategic.context.open.drilldown.provider-settings')?.run();
+    expect(openStrategicContextTarget).toHaveBeenCalledWith({ surface: 'runtime', section: 'provider-settings' });
 
     captured.find(command => command.id === 'strategic.context.open.kept.artifact:artifact:latest')?.run();
     expect(openStrategicContextTarget).toHaveBeenCalledWith(target);
@@ -1962,7 +2015,26 @@ describe('useWorkbenchCommands', () => {
     expect(captured.find(command => command.id === 'runtime.health')?.shortcut).toBe('4');
     expect(captured.find(command => command.id === 'task.new')?.shortcut).toBe('N');
     expect(captured.find(command => command.id === 'workbench.refresh')?.shortcut).toBe('R');
+    expect(captured.find(command => command.id === 'workbench.subtab.previous')?.shortcut).toBe('[');
+    expect(captured.find(command => command.id === 'workbench.subtab.next')?.shortcut).toBe(']');
+    expect(captured.find(command => command.id === 'workbench.shortcuts.open')?.shortcut).toBe('?');
     expect(captured.find(command => command.id === 'runtime.settings.general')?.shortcut).toBe('S');
+  });
+
+  test('routes subtab and shortcut help commands through supplied callbacks', () => {
+    const openPreviousWorkbenchSubtab = vi.fn();
+    const openNextWorkbenchSubtab = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    mount({ openPreviousWorkbenchSubtab, openNextWorkbenchSubtab, setCommandPaletteOpen });
+
+    captured.find(command => command.id === 'workbench.subtab.previous')?.run();
+    captured.find(command => command.id === 'workbench.subtab.next')?.run();
+    captured.find(command => command.id === 'workbench.shortcuts.open')?.run();
+
+    expect(openPreviousWorkbenchSubtab).toHaveBeenCalledTimes(1);
+    expect(openNextWorkbenchSubtab).toHaveBeenCalledTimes(1);
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(true);
   });
 
   test('builds palette without throwing on non-numeric metric value', () => {

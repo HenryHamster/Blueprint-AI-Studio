@@ -74,7 +74,6 @@ function cycleSection<T extends string>(sections: readonly T[], current: T, dire
   const nextIndex = (currentIndex + direction + sections.length) % sections.length;
   return sections[nextIndex] ?? current;
 }
-
 export default function App() {
   const refreshStrategicReadModelRef = useRef<() => void>(() => {});
   const refreshMessagesRef = useRef<() => void>(() => {});
@@ -998,6 +997,12 @@ export default function App() {
     setStrategicContextWorkspaceOpen(false);
     strategicMessageTarget.open(target);
   }, [strategicMessageTarget.open]);
+  const openPreviousWorkbenchSubtab = useCallback(() => {
+    cycleCurrentWorkbenchSection(-1);
+  }, [cycleCurrentWorkbenchSection]);
+  const openNextWorkbenchSubtab = useCallback(() => {
+    cycleCurrentWorkbenchSection(1);
+  }, [cycleCurrentWorkbenchSection]);
   const currentStrategicInteractionMode = normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode);
   const strategicAccountSpend = useMemo<StrategicAccountSpendStatus>(() => {
     const accounts = s.maxPlanAccounts ?? [];
@@ -1079,6 +1084,8 @@ export default function App() {
     },
     openProjectManagement: () => setShowProjectManagement(true),
     openProjectMembers: () => setShowProjectMembers(true),
+    openPreviousWorkbenchSubtab,
+    openNextWorkbenchSubtab,
   });
   const modalShortcutBlocked = Boolean(
     s.showNewTaskModal ||

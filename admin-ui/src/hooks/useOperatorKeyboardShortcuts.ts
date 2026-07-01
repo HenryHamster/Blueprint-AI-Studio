@@ -156,6 +156,12 @@ export function useOperatorKeyboardShortcuts({
 
   const shouldHandleWorkbenchShortcut = useCallback((commandId: string) => {
     if (blockingModalOpen) return false;
+    if (
+      commandId === 'workbench.subtab.previous'
+      || commandId === 'workbench.subtab.next'
+    ) {
+      return activeTab === 'pipeline' || activeTab === 'project' || activeTab === 'runtime';
+    }
     if (commandId === 'workbench.refresh') {
       if (selectionMode && selectedTaskCount > 0) return false;
       return true;

@@ -33,7 +33,8 @@ export function workbenchRefetchSurfacesFromData(
     return new Set();
   }
   const refetch = isObject(data.refetch) ? data.refetch : null;
-  return new Set(normalizeWorkbenchRefetchSurfaces(refetch?.surfaces));
+  const surfaces = Array.isArray(refetch?.surfaces) ? refetch.surfaces : [];
+  return new Set(normalizeWorkbenchRefetchSurfaces(surfaces));
 }
 
 export function workbenchRefetchSurfacesFromMessage(

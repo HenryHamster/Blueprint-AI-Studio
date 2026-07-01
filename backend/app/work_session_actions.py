@@ -9,24 +9,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.workbench_targets import compact_workbench_target
+from app.workbench_contracts import compact_text, normalize_target
 
 
 def _compact_text(value: Any, *, max_chars: int = 180) -> str | None:
-    if value is None:
-        return None
-    text = " ".join(str(value).strip().split())
-    if not text:
-        return None
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 3:
-        return text[:max_chars]
-    return f"{text[: max_chars - 3]}..."
+    return compact_text(value, max_chars=max_chars)
 
 
 def _compact_action_target(target: dict[str, Any] | None) -> dict[str, Any] | None:
-    return compact_workbench_target(target)
+    return normalize_target(target)
 
 
 def _action(

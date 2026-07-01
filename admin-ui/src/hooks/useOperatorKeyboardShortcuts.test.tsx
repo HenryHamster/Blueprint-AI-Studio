@@ -24,9 +24,9 @@ function dispatchShortcut(target: EventTarget, init: KeyboardEventInit = {}) {
 
 function Harness({
   blockingModalOpen,
+  activeTab = 'chat',
   commandPaletteOpen = false,
   cycleCurrentSection,
-  activeTab = 'chat',
   commands = COMMANDS,
   commandPaletteShortcutBlocked,
   searchShortcutBlocked = false,
@@ -342,6 +342,22 @@ describe('useOperatorKeyboardShortcuts', () => {
     expect(setShowKnowledgeBrowser).toHaveBeenCalledWith(false);
     expect(setShowResearchBrowser).toHaveBeenCalledWith(false);
     expect(event.defaultPrevented).toBe(true);
+  });
+
+  test('does not swallow subtab shortcuts on chat', () => {
+    const previousSubtab = vi.fn();
+    mount(false, false, {
+      activeTab: 'chat',
+      commands: [
+        ...COMMANDS,
+        { id: 'workbench.subtab.previous', label: 'Previous subtab', run: previousSubtab },
+      ],
+    });
+
+    const event = dispatchShortcut(document, { key: '[', ctrlKey: false });
+
+    expect(previousSubtab).not.toHaveBeenCalled();
+    expect(event.defaultPrevented).toBe(false);
   });
 
 });

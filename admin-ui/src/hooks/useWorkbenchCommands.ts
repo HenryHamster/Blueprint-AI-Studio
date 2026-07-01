@@ -5,7 +5,6 @@ import { SETTINGS_SECTION_HOMES } from '../components/OperatorWorkspaceSections'
 import type { SectionId } from '../components/settingsSections';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import { executeStrategicWorkSessionCommand } from '../strategicStateApi';
-import { normalizeWorkbenchTarget } from '../types/workbenchTargets';
 import type {
   StrategicContextArtifactEvidence,
   StrategicContextCanvasNode,
@@ -25,6 +24,7 @@ import type {
 } from '../strategicStateApi';
 import { formatStrategicMetricValue, rankStrategicWorkSessionMetrics } from '../utils/strategicWorkSessionMetrics';
 import { removeStrategicSelectedRef, upsertStrategicSelectedRef, type StrategicSelectedRef } from '../utils/strategicWorkbenchSession';
+import { normalizeWorkbenchRefetchSurfaces, normalizeWorkbenchTarget } from '../types/workbenchTargets';
 import type { PrimaryTab } from './useUIState';
 import type { ViewMode } from './useViewPreferences';
 
@@ -36,10 +36,6 @@ const MESSAGE_COMMAND_LIMIT = 6;
 const TASK_FOCUS_COMMAND_LIMIT = 6;
 const STRATEGIC_INTERACTION_MODES: readonly StrategicInteractionMode[] = ['chat', 'check_in', 'monitor', 'continuous'];
 const WORK_SESSION_MUTATION_METHODS = new Set(['PATCH', 'POST', 'PUT']);
-
-function normalizeStrategicContextTarget(target?: StrategicContextTarget | null): StrategicContextTarget | null {
-  return normalizeWorkbenchTarget(target) as StrategicContextTarget | null;
-}
 
 type WorkSessionCommandRunStatus = {
   state: 'pending' | 'success' | 'error';
@@ -90,6 +86,8 @@ interface UseWorkbenchCommandsOptions {
   refreshWorkbench: () => void;
   openProjectManagement: () => void;
   openProjectMembers: () => void;
+  openPreviousWorkbenchSubtab?: () => void;
+  openNextWorkbenchSubtab?: () => void;
 }
 
 function contextKindLabel(kind?: string | null): string {
@@ -296,6 +294,34 @@ function workSessionActionContextTarget(action: StrategicWorkSessionAction): Str
   return null;
 }
 
+function isSettingsSection(value?: string | null): value is SectionId {
+  return typeof value === 'string' && value in SETTINGS_SECTION_HOMES;
+}
+
+function normalizeSettingsContextTarget(target?: StrategicContextTarget | null): StrategicContextTarget | null {
+  if (!target) return null;
+  const surface = target.surface === 'project' || target.surface === 'runtime' ? target.surface : null;
+  if (!surface || !isSettingsSection(target.section)) return null;
+  const home = SETTINGS_SECTION_HOMES[target.section];
+  if (home.surface !== surface) return null;
+  return { ...target, surface, section: target.section };
+}
+
+function normalizeStrategicContextTarget(target?: StrategicContextTarget | null): StrategicContextTarget | null {
+  return (normalizeWorkbenchTarget(target) as StrategicContextTarget | null) ?? normalizeSettingsContextTarget(target);
+}
+
+function normalizeWorkSessionCommandDescriptor(command: StrategicWorkSessionCommand): StrategicWorkSessionCommand | null {
+  const target = normalizeStrategicContextTarget(command.target ?? null);
+  if (!target) return null;
+  return {
+    ...command,
+    target,
+    refetch_surfaces: normalizeWorkbenchRefetchSurfaces(command.refetch_surfaces),
+    executable: command.executable === false ? false : Boolean(command.mutation),
+  };
+}
+
 function isStrategicInteractionMode(value: string | null | undefined): value is StrategicInteractionMode {
   return Boolean(value && (STRATEGIC_INTERACTION_MODES as readonly string[]).includes(value));
 }
@@ -361,6 +387,7 @@ function hasAllowedWorkSessionMutation(command: StrategicWorkSessionCommand, pro
   if (!projectId || !mutation || !method || !WORK_SESSION_MUTATION_METHODS.has(method) || !path) {
     return false;
   }
+  if (command.executable === false) return false;
   if (!isAllowedWorkSessionMutationCommandId(command.id)) return false;
   if (isMessagesLastSeenMutation(command, method, path, projectId)) return true;
   if (isAlertDismissMutation(command, method, path, projectId)) return true;
@@ -493,6 +520,8 @@ export function useWorkbenchCommands({
   refreshWorkbench,
   openProjectManagement,
   openProjectMembers,
+  openPreviousWorkbenchSubtab,
+  openNextWorkbenchSubtab,
 }: UseWorkbenchCommandsOptions): WorkbenchCommand[] {
   const [workSessionCommandStatuses, setWorkSessionCommandStatuses] = useState<Record<string, WorkSessionCommandRunStatus>>({});
 
@@ -580,7 +609,7 @@ export function useWorkbenchCommands({
       contextCommandEntries.push(command);
     };
     const openContextTarget = (target?: StrategicContextTarget | null) => {
-      openStrategicContextTarget?.(target);
+      openStrategicContextTarget?.(normalizeStrategicContextTarget(target));
       closePalette();
     };
     const openAttentionItem = (item: StrategicStateAttentionItem) => {
@@ -621,17 +650,15 @@ export function useWorkbenchCommands({
       runAndClose(focusStrategicComposer);
     };
     const seenWorkSessionCommandIds = new Set<string>();
-    const workSessionCommandDescriptors = (strategicState?.work_session?.commands ?? [])
-      .map(command => ({
-        ...command,
-        target: normalizeStrategicContextTarget(command.target),
-      }))
-      .filter(command => {
-        const id = command.id?.trim();
-        if (!id || seenWorkSessionCommandIds.has(id)) return false;
-        seenWorkSessionCommandIds.add(id);
-        return true;
-      });
+    const workSessionCommandDescriptors = (strategicState?.work_session?.commands ?? []).reduce<StrategicWorkSessionCommand[]>((acc, command) => {
+      const id = command.id?.trim();
+      if (!id || seenWorkSessionCommandIds.has(id)) return acc;
+      const normalizedCommand = normalizeWorkSessionCommandDescriptor(command);
+      if (!normalizedCommand) return acc;
+      seenWorkSessionCommandIds.add(id);
+      acc.push(normalizedCommand);
+      return acc;
+    }, []);
     const workSessionCommandIds = seenWorkSessionCommandIds;
     const workSessionCommandModes = new Set<StrategicInteractionMode>();
     const workSessionCommandMessageIds = new Set<string>();
@@ -1214,6 +1241,35 @@ export function useWorkbenchCommands({
         run: () => runAndClose(refreshWorkbench),
       },
       {
+        id: 'workbench.subtab.previous',
+        label: 'Previous subtab',
+        section: 'Workbench',
+        detail: 'Current workspace section',
+        keywords: ['previous', 'subtab', 'section', 'workspace'],
+        shortcut: '[',
+        disabled: !openPreviousWorkbenchSubtab,
+        run: openPreviousWorkbenchSubtab ? () => runAndClose(openPreviousWorkbenchSubtab) : closePalette,
+      },
+      {
+        id: 'workbench.subtab.next',
+        label: 'Next subtab',
+        section: 'Workbench',
+        detail: 'Current workspace section',
+        keywords: ['next', 'subtab', 'section', 'workspace'],
+        shortcut: ']',
+        disabled: !openNextWorkbenchSubtab,
+        run: openNextWorkbenchSubtab ? () => runAndClose(openNextWorkbenchSubtab) : closePalette,
+      },
+      {
+        id: 'workbench.shortcuts.open',
+        label: 'Keyboard shortcuts',
+        section: 'Workbench',
+        detail: 'Command palette',
+        keywords: ['keyboard', 'shortcuts', 'commands', 'help'],
+        shortcut: '?',
+        run: () => setCommandPaletteOpen(true),
+      },
+      {
         id: 'pipeline.flow',
         label: 'Pipeline tasks',
         section: 'Pipeline',
@@ -1540,6 +1596,8 @@ export function useWorkbenchCommands({
     openNewTaskModal,
     openProjectManagement,
     openProjectMembers,
+    openPreviousWorkbenchSubtab,
+    openNextWorkbenchSubtab,
     problemModelRevision,
     refreshSettings,
     refreshWorkbench,

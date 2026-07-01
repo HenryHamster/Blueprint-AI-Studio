@@ -24,6 +24,7 @@ from app.models import (
     StrategicCycle,
     Task,
 )
+from app.workbench_contracts import normalize_target
 
 
 def _compact_text(value: Any, *, max_chars: int = 360) -> str | None:
@@ -72,8 +73,9 @@ def _canvas_node(
         node["status"] = _compact_text(status, max_chars=60)
     if count is not None:
         node["count"] = int(count)
-    if target:
-        node["target"] = target
+    normalized_target = normalize_target(target)
+    if normalized_target:
+        node["target"] = normalized_target
     return node
 
 
@@ -147,6 +149,17 @@ def _fallback_ref_target(kind: str, ref_id: str) -> Dict[str, Any] | None:
     return None
 
 
+def _with_target(payload: Dict[str, Any], target: Dict[str, Any] | None) -> Dict[str, Any]:
+    normalized_target = normalize_target(target)
+    if normalized_target:
+        payload["target"] = normalized_target
+    return payload
+
+
+def _drilldown(drilldown_id: str, label: str, target: Dict[str, Any]) -> Dict[str, Any]:
+    return _with_target({"id": drilldown_id, "label": label}, target)
+
+
 def _candidate_descriptor(
     *,
     kind: str,
@@ -172,8 +185,9 @@ def _candidate_descriptor(
     compact_status = _compact_text(status, max_chars=80)
     if compact_status:
         descriptor["status"] = compact_status
-    if isinstance(target, dict):
-        descriptor["target"] = target
+    normalized_target = normalize_target(target)
+    if normalized_target:
+        descriptor["target"] = normalized_target
     return descriptor
 
 
@@ -219,8 +233,8 @@ def _merge_descriptor_fields(
     summary = _compact_text(source.get("summary"), max_chars=220)
     if summary and not descriptor.get("summary"):
         descriptor["summary"] = summary
-    target = source.get("target")
-    if isinstance(target, dict) and not descriptor.get("target"):
+    target = normalize_target(source.get("target"))
+    if target and not descriptor.get("target"):
         descriptor["target"] = target
     status = _compact_text(source.get("status"), max_chars=80)
     if status and not descriptor.get("status"):
@@ -603,7 +617,9 @@ def selected_ref_descriptor(
         overwrite_label=not matched,
     )
     if fallback_target and not descriptor.get("target"):
-        descriptor["target"] = fallback_target
+        normalized_target = normalize_target(fallback_target)
+        if normalized_target:
+            descriptor["target"] = normalized_target
     return descriptor
 
 
@@ -693,27 +709,36 @@ async def load_strategic_context_evidence(
         )
     ).all()
 
-    knowledge_items = [
-        {
-            "id": str(doc.id),
-            "kind": "knowledge_document",
-            "label": _compact_text(doc.title, max_chars=100),
-            "summary": _compact_text(doc.summary, max_chars=180),
-            "source_kind": _compact_text(doc.source_kind, max_chars=60),
-            "topic": _compact_text(doc.topic, max_chars=80),
-            "direction_id": _compact_text(doc.direction_id, max_chars=80),
-            "source_task_id": str(doc.source_task_id) if doc.source_task_id else None,
-            "target": {
-                "surface": "knowledge",
-                "document_id": str(doc.id),
-                "direction_id": _compact_text(doc.direction_id, max_chars=80),
-                "task_id": str(doc.source_task_id) if doc.source_task_id else None,
-            },
-            "created_at": doc.created_at.isoformat() if doc.created_at else None,
-            "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
-        }
-        for doc in knowledge_rows
-    ]
+    knowledge_items = []
+    for doc in knowledge_rows:
+        knowledge_items.append(
+            _with_target(
+                {
+                    "id": str(doc.id),
+                    "kind": "knowledge_document",
+                    "label": _compact_text(doc.title, max_chars=100),
+                    "summary": _compact_text(doc.summary, max_chars=180),
+                    "source_kind": _compact_text(doc.source_kind, max_chars=60),
+                    "topic": _compact_text(doc.topic, max_chars=80),
+                    "direction_id": _compact_text(doc.direction_id, max_chars=80),
+                    "source_task_id": (
+                        str(doc.source_task_id) if doc.source_task_id else None
+                    ),
+                    "created_at": doc.created_at.isoformat()
+                    if doc.created_at
+                    else None,
+                    "updated_at": doc.updated_at.isoformat()
+                    if doc.updated_at
+                    else None,
+                },
+                {
+                    "surface": "knowledge",
+                    "document_id": str(doc.id),
+                    "direction_id": _compact_text(doc.direction_id, max_chars=80),
+                    "task_id": str(doc.source_task_id) if doc.source_task_id else None,
+                },
+            )
+        )
     artifact_items = []
     for artifact, task_id, task_title, task_status, has_logs in artifact_rows:
         artifact_type = getattr(
@@ -726,24 +751,27 @@ async def load_strategic_context_evidence(
             or "Artifact"
         )
         artifact_items.append(
-            {
-                "id": str(artifact.id),
-                "kind": context_kind,
-                "label": _compact_text(label, max_chars=100),
-                "artifact_type": _compact_text(artifact_type, max_chars=80),
-                "task_id": str(task_id) if task_id else None,
-                "task_title": _compact_text(task_title, max_chars=120),
-                "task_status": getattr(task_status, "value", task_status),
-                "logical_key": _compact_text(artifact.logical_key, max_chars=160),
-                "target": {
+            _with_target(
+                {
+                    "id": str(artifact.id),
+                    "kind": context_kind,
+                    "label": _compact_text(label, max_chars=100),
+                    "artifact_type": _compact_text(artifact_type, max_chars=80),
+                    "has_logs": bool(has_logs),
+                    "task_id": str(task_id) if task_id else None,
+                    "task_title": _compact_text(task_title, max_chars=120),
+                    "task_status": getattr(task_status, "value", task_status),
+                    "logical_key": _compact_text(artifact.logical_key, max_chars=160),
+                    "created_at": artifact.created_at.isoformat()
+                    if artifact.created_at
+                    else None,
+                },
+                {
                     "surface": "task",
                     "task_id": str(task_id) if task_id else None,
                     "artifact_id": str(artifact.id),
                 },
-                "created_at": (
-                    artifact.created_at.isoformat() if artifact.created_at else None
-                ),
-            }
+            )
         )
 
     return {
@@ -1292,39 +1320,23 @@ def build_strategic_context_package_summary(
         or _isoformat_source_time(project.created_at)
     )
     drilldowns = [
-        {
-            "id": "running_update",
-            "label": "Update",
-            "target": {"surface": "project", "section": "running-update"},
-        },
-        {
-            "id": "problem_model",
-            "label": "Model",
-            "target": {"surface": "project", "section": "problem-model"},
-        },
-        {
-            "id": "directions",
-            "label": "Directions",
-            "target": {"surface": "project", "section": "directions"},
-        },
-        {
-            "id": "pipeline",
-            "label": "Pipeline",
-            "target": {"surface": "pipeline"},
-        },
-        {
-            "id": "runtime",
-            "label": "Runtime",
-            "target": {"surface": "runtime", "section": "health"},
-        },
+        _drilldown(
+            "running_update",
+            "Update",
+            {"surface": "project", "section": "running-update"},
+        ),
+        _drilldown(
+            "problem_model",
+            "Model",
+            {"surface": "project", "section": "problem-model"},
+        ),
+        _drilldown("directions", "Directions", {"surface": "project", "section": "directions"}),
+        _drilldown("pipeline", "Pipeline", {"surface": "pipeline"}),
+        _drilldown("runtime", "Runtime", {"surface": "runtime", "section": "health"}),
     ]
     if project.design_doc:
         drilldowns.append(
-            {
-                "id": "design",
-                "label": "Design",
-                "target": {"surface": "project", "section": "design-doc"},
-            }
+            _drilldown("design", "Design", {"surface": "project", "section": "design-doc"})
         )
 
     canvas = _strategic_context_canvas(
@@ -1342,26 +1354,32 @@ def build_strategic_context_package_summary(
         drilldowns=drilldowns,
     )
     knowledge_resources = [
-        {
-            "id": f"knowledge:{doc.get('id')}",
-            "kind": "knowledge_document",
-            "label": doc.get("label") or "Knowledge document",
-            "summary": doc.get("summary"),
-            "target": doc.get("target"),
-            "created_at": doc.get("created_at"),
-            "updated_at": doc.get("updated_at"),
-        }
+        _with_target(
+            {
+                "id": f"knowledge:{doc.get('id')}",
+                "kind": "knowledge_document",
+                "label": doc.get("label") or "Knowledge document",
+                "summary": doc.get("summary"),
+                "created_at": doc.get("created_at"),
+                "updated_at": doc.get("updated_at"),
+            },
+            doc.get("target"),
+        )
         for doc in (evidence.get("knowledge") or {}).get("items", [])[:3]
     ]
     artifact_resources = [
-        {
-            "id": f"artifact:{artifact.get('id')}",
-            "kind": "artifact",
-            "label": artifact.get("label") or artifact.get("artifact_type") or "Artifact",
-            "summary": artifact.get("task_title"),
-            "target": artifact.get("target"),
-            "created_at": artifact.get("created_at"),
-        }
+        _with_target(
+            {
+                "id": f"artifact:{artifact.get('id')}",
+                "kind": "artifact",
+                "label": artifact.get("label")
+                or artifact.get("artifact_type")
+                or "Artifact",
+                "summary": artifact.get("task_title"),
+                "created_at": artifact.get("created_at"),
+            },
+            artifact.get("target"),
+        )
         for artifact in (evidence.get("artifacts") or {}).get("items", [])[:3]
     ]
     mixed_resources: list[Dict[str, Any]] = []
@@ -1371,13 +1389,15 @@ def build_strategic_context_package_summary(
         if index < len(artifact_resources):
             mixed_resources.append(artifact_resources[index])
     resources = [
-        {
-            "id": canvas["id"],
-            "kind": "canvas",
-            "label": canvas["title"],
-            "summary": f"{canvas['node_count']} nodes / {canvas['edge_count']} links",
-            "target": {"surface": "project", "section": "problem-model"},
-        },
+        _with_target(
+            {
+                "id": canvas["id"],
+                "kind": "canvas",
+                "label": canvas["title"],
+                "summary": f"{canvas['node_count']} nodes / {canvas['edge_count']} links",
+            },
+            {"surface": "project", "section": "problem-model"},
+        ),
         *mixed_resources,
     ][:7]
     descriptors = _strategic_context_descriptors(

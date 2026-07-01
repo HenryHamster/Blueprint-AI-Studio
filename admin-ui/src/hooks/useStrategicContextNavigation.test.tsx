@@ -235,4 +235,19 @@ describe('useStrategicContextNavigation', () => {
     expect(openTask).toHaveBeenCalledWith('task-drawer-1');
     expect(handleTabChange).not.toHaveBeenCalledWith('pipeline');
   });
+
+  test('normalizes runtime runner aliases and rejects unknown sections', () => {
+    const handleTabChange = vi.fn();
+    const setRuntimeSection = vi.fn();
+    const open = mount({ handleTabChange, setRuntimeSection });
+
+    act(() => {
+      open({ surface: 'runtime', section: 'runners' } as Target);
+      open({ surface: 'runtime', section: 'mystery' } as Target);
+    });
+
+    expect(setRuntimeSection).toHaveBeenCalledWith('devices');
+    expect(handleTabChange).toHaveBeenCalledWith('runtime');
+    expect(handleTabChange).toHaveBeenCalledWith('chat');
+  });
 });

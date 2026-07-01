@@ -15,7 +15,7 @@ export const WORKBENCH_REFETCH_SURFACES = [
   'runtime',
 ] as const;
 
-export const PROJECT_TARGET_SECTIONS = [
+export const WORKBENCH_PROJECT_SECTIONS = [
   'running-update',
   'directions',
   'problem-model',
@@ -33,9 +33,9 @@ export const PROJECT_TARGET_SECTIONS = [
   'access',
 ] as const;
 
-export const PIPELINE_TARGET_SECTIONS = ['flow', 'board', 'archive'] as const;
+export const WORKBENCH_PIPELINE_SECTIONS = ['flow', 'board', 'archive'] as const;
 
-export const RUNTIME_TARGET_SECTIONS = [
+export const WORKBENCH_RUNTIME_SECTIONS = [
   'health',
   'devices',
   'compute',
@@ -51,25 +51,24 @@ export const RUNTIME_TARGET_SECTIONS = [
   'advanced',
 ] as const;
 
-export type WorkbenchTargetSurface = typeof WORKBENCH_TARGET_SURFACES[number];
-export type WorkbenchRefetchSurface = typeof WORKBENCH_REFETCH_SURFACES[number];
+export const PROJECT_TARGET_SECTIONS = WORKBENCH_PROJECT_SECTIONS;
+export const PIPELINE_TARGET_SECTIONS = WORKBENCH_PIPELINE_SECTIONS;
+export const RUNTIME_TARGET_SECTIONS = WORKBENCH_RUNTIME_SECTIONS;
 
-export interface NormalizedWorkbenchTarget {
-  surface: WorkbenchTargetSurface;
-  project_id?: string | null;
-  section?: string | null;
-  task_id?: string | null;
-  message_id?: string | null;
-  direction_id?: string | null;
-  alert_id?: string | null;
-  action?: string | null;
-  document_id?: string | null;
-  artifact_id?: string | null;
-  cycle_id?: string | null;
-  runner_id?: string | null;
-}
+const WORKBENCH_SURFACE_ALIASES = {
+  chat: 'messages',
+  message: 'messages',
+} as const;
 
-const TARGET_KEYS = [
+const WORKBENCH_RUNTIME_SECTION_ALIASES = {
+  runner: 'devices',
+  runners: 'devices',
+  local_runner: 'devices',
+  'local-runners': 'devices',
+  fleet: 'devices',
+} as const;
+
+const WORKBENCH_TARGET_KEYS = [
   'project_id',
   'section',
   'task_id',
@@ -83,63 +82,116 @@ const TARGET_KEYS = [
   'runner_id',
 ] as const;
 
-const TARGET_SURFACE_SET = new Set<string>(WORKBENCH_TARGET_SURFACES);
-const REFETCH_SURFACE_SET = new Set<string>(WORKBENCH_REFETCH_SURFACES);
-const TARGET_SECTIONS_BY_SURFACE: Partial<Record<WorkbenchTargetSurface, Set<string>>> = {
-  project: new Set(PROJECT_TARGET_SECTIONS),
-  pipeline: new Set(PIPELINE_TARGET_SECTIONS),
-  runtime: new Set(RUNTIME_TARGET_SECTIONS),
-};
-const TARGET_SECTION_ALIASES_BY_SURFACE: Partial<Record<WorkbenchTargetSurface, Record<string, string>>> = {
-  runtime: {
-    runners: 'devices',
-  },
+export type WorkbenchTargetSurface = typeof WORKBENCH_TARGET_SURFACES[number];
+export type WorkbenchRefetchSurface = typeof WORKBENCH_REFETCH_SURFACES[number];
+export type WorkbenchProjectSection = typeof WORKBENCH_PROJECT_SECTIONS[number];
+export type WorkbenchPipelineSection = typeof WORKBENCH_PIPELINE_SECTIONS[number];
+export type WorkbenchRuntimeSection = typeof WORKBENCH_RUNTIME_SECTIONS[number];
+
+export type WorkbenchTargetInput = {
+  surface?: string | null;
+  project_id?: string | null;
+  section?: string | null;
+  task_id?: string | null;
+  message_id?: string | null;
+  direction_id?: string | null;
+  alert_id?: string | null;
+  action?: string | null;
+  document_id?: string | null;
+  artifact_id?: string | null;
+  cycle_id?: string | null;
+  runner_id?: string | null;
 };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
+export type NormalizedWorkbenchTarget = {
+  surface: WorkbenchTargetSurface;
+} & Partial<Record<typeof WORKBENCH_TARGET_KEYS[number], string>>;
 
-function compactString(value: unknown): string | null {
+function compactText(value: unknown): string | null {
   if (value == null) return null;
   const text = String(value).trim().replace(/\s+/g, ' ');
   return text || null;
 }
 
+function isOneOf<const T extends readonly string[]>(values: T, value: string | null): value is T[number] {
+  return Boolean(value && (values as readonly string[]).includes(value));
+}
+
 export function isWorkbenchTargetSurface(value: unknown): value is WorkbenchTargetSurface {
-  return typeof value === 'string' && TARGET_SURFACE_SET.has(value);
+  return isOneOf(WORKBENCH_TARGET_SURFACES, compactText(value));
 }
 
 export function isWorkbenchRefetchSurface(value: unknown): value is WorkbenchRefetchSurface {
-  return typeof value === 'string' && REFETCH_SURFACE_SET.has(value);
+  return isOneOf(WORKBENCH_REFETCH_SURFACES, compactText(value));
 }
 
-export function normalizeWorkbenchTarget(target: unknown): NormalizedWorkbenchTarget | null {
-  if (!isRecord(target)) return null;
-  const surface = compactString(target.surface);
-  if (!isWorkbenchTargetSurface(surface)) return null;
+export function isWorkbenchProjectSection(value?: string | null): value is WorkbenchProjectSection {
+  return isOneOf(WORKBENCH_PROJECT_SECTIONS, compactText(value));
+}
+
+export function isWorkbenchPipelineSection(value?: string | null): value is WorkbenchPipelineSection {
+  return isOneOf(WORKBENCH_PIPELINE_SECTIONS, compactText(value));
+}
+
+export function isWorkbenchRuntimeSection(value?: string | null): value is WorkbenchRuntimeSection {
+  return isOneOf(WORKBENCH_RUNTIME_SECTIONS, compactText(value));
+}
+
+export function normalizeWorkbenchRuntimeSection(value?: string | null): WorkbenchRuntimeSection | null {
+  const section = compactText(value);
+  if (!section) return null;
+  const aliased = WORKBENCH_RUNTIME_SECTION_ALIASES[section as keyof typeof WORKBENCH_RUNTIME_SECTION_ALIASES] ?? section;
+  return isWorkbenchRuntimeSection(aliased) ? aliased : null;
+}
+
+function normalizeWorkbenchSurface(value: unknown): WorkbenchTargetSurface | null {
+  const surface = compactText(value);
+  if (!surface) return null;
+  const aliased = WORKBENCH_SURFACE_ALIASES[surface as keyof typeof WORKBENCH_SURFACE_ALIASES] ?? surface;
+  return isWorkbenchTargetSurface(aliased) ? aliased : null;
+}
+
+function normalizeWorkbenchSection(surface: WorkbenchTargetSurface, value: unknown): string | null {
+  const section = compactText(value);
+  if (!section) return null;
+  if (surface === 'project') return isWorkbenchProjectSection(section) ? section : null;
+  if (surface === 'pipeline') return isWorkbenchPipelineSection(section) ? section : null;
+  if (surface === 'runtime') return normalizeWorkbenchRuntimeSection(section);
+  return section;
+}
+
+export function normalizeWorkbenchTarget(target?: WorkbenchTargetInput | null): NormalizedWorkbenchTarget | null {
+  if (!target || typeof target !== 'object') return null;
+  const surface = normalizeWorkbenchSurface(target.surface);
+  if (!surface) return null;
 
   const normalized: NormalizedWorkbenchTarget = { surface };
-  const validSections = TARGET_SECTIONS_BY_SURFACE[surface] ?? null;
-  const sectionAliases = TARGET_SECTION_ALIASES_BY_SURFACE[surface] ?? {};
-  TARGET_KEYS.forEach(key => {
-    let value = compactString(target[key]);
-    if (!value) return;
-    if (key === 'section') value = sectionAliases[value] ?? value;
-    if (key === 'section' && validSections && !validSections.has(value)) return;
-    (normalized as unknown as Record<string, string | null>)[key] = value;
-  });
+  for (const key of WORKBENCH_TARGET_KEYS) {
+    if (key === 'section') {
+      const section = normalizeWorkbenchSection(surface, target.section);
+      if (target.section != null && !section) {
+        if (surface === 'runtime' && compactText(target.runner_id)) continue;
+        return null;
+      }
+      if (section) normalized.section = section;
+      continue;
+    }
+    const value = compactText(target[key]);
+    if (value) normalized[key] = value;
+  }
+
+  if (surface === 'task' && !normalized.task_id) return null;
   return normalized;
 }
 
-export function normalizeWorkbenchRefetchSurfaces(surfaces: unknown): WorkbenchRefetchSurface[] {
-  if (!Array.isArray(surfaces)) return [];
-  const seen = new Set<WorkbenchRefetchSurface>();
-  const normalized: WorkbenchRefetchSurface[] = [];
-  surfaces.forEach(surface => {
-    if (!isWorkbenchRefetchSurface(surface) || seen.has(surface)) return;
+export function normalizeWorkbenchRefetchSurfaces(values?: readonly unknown[] | null): WorkbenchRefetchSurface[] {
+  const surfaces: WorkbenchRefetchSurface[] = [];
+  const seen = new Set<string>();
+  for (const value of values ?? []) {
+    const surface = compactText(value);
+    if (!isOneOf(WORKBENCH_REFETCH_SURFACES, surface) || seen.has(surface)) continue;
+    surfaces.push(surface);
     seen.add(surface);
-    normalized.push(surface);
-  });
-  return normalized;
+  }
+  return surfaces;
 }

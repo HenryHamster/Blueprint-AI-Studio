@@ -24,6 +24,18 @@ from app.strategic_trigger import (
     ORIGIN_OPERATOR,
     request_strategic_refresh,
 )
+from app.workbench_contracts import (
+    ALERT_DISMISS_COMMAND_PREFIX,
+    RUNNER_PREFER_COMMAND_PREFIX,
+    SURFACE_STRATEGIC_SESSION,
+    alert_id_from_command_id,
+    compact_text,
+    normalize_refetch_surfaces,
+    normalize_target,
+    runner_id_from_command_id,
+    validate_executable_command_descriptor,
+    work_session_command_kind,
+)
 from app.workbench_state import (
     WORKBENCH_STATE_MAX_BYTES,
     persist_strategic_workbench_update,
@@ -31,31 +43,14 @@ from app.workbench_state import (
     workbench_mode_should_arm_strategic_refresh,
     workbench_state_size_bytes,
 )
-from app.workbench_targets import (
-    DEFAULT_WORKBENCH_REFETCH_SURFACES,
-    bounded_workbench_refetch_surfaces,
-    compact_workbench_target,
-)
 
 
 OPERATOR_COMMAND_EVENT_TYPE = "operator_command"
 WORK_SESSION_COMMAND_JOB_LIMIT = 8
-_EXECUTABLE_SESSION_MODES = frozenset(("chat", "continuous", "monitor"))
-_RUNNER_PREFER_PREFIX = "session.runner.prefer."
-_ALERT_DISMISS_PREFIX = "attention.alert.dismiss:"
 
 
 def _compact_text(value: Any, *, max_chars: int = 240) -> str | None:
-    if value is None:
-        return None
-    text = " ".join(str(value).strip().split())
-    if not text:
-        return None
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 3:
-        return text[:max_chars]
-    return f"{text[: max_chars - 3]}..."
+    return compact_text(value, max_chars=max_chars)
 
 
 def _bounded_mapping(value: Any, *, max_items: int = 16) -> dict[str, Any] | None:
@@ -87,18 +82,15 @@ def _command_id(command: dict[str, Any]) -> str:
 
 def _safe_command_target(command: dict[str, Any]) -> dict[str, Any] | None:
     target = command.get("target") if isinstance(command.get("target"), dict) else None
-    return compact_workbench_target(target)
+    return normalize_target(target)
 
 
 def _command_refetch_surfaces(command: dict[str, Any]) -> list[str]:
-    values = (
+    return normalize_refetch_surfaces(
         command.get("refetch_surfaces")
         if isinstance(command.get("refetch_surfaces"), list)
-        else None
-    )
-    return bounded_workbench_refetch_surfaces(
-        values,
-        default=DEFAULT_WORKBENCH_REFETCH_SURFACES,
+        else None,
+        default=(SURFACE_STRATEGIC_SESSION,),
     )
 
 
@@ -123,14 +115,14 @@ def _receipt_from_message(message: ProjectMessage) -> dict[str, Any]:
             if message.created_at
             else None
         ),
-        "target": compact_workbench_target(
+        "target": normalize_target(
             receipt.get("target") if isinstance(receipt.get("target"), dict) else None
         ),
-        "refetch_surfaces": bounded_workbench_refetch_surfaces(
+        "refetch_surfaces": normalize_refetch_surfaces(
             receipt.get("refetch_surfaces")
             if isinstance(receipt.get("refetch_surfaces"), list)
             else None,
-            default=DEFAULT_WORKBENCH_REFETCH_SURFACES,
+            default=(SURFACE_STRATEGIC_SESSION,),
         ),
         "result": receipt.get("result") if isinstance(receipt.get("result"), dict) else None,
     }
@@ -193,37 +185,15 @@ def _mutation_body(command: dict[str, Any]) -> dict[str, Any]:
 
 
 def _alert_id_from_command_id(command_id: str) -> str | None:
-    alert_id = command_id.removeprefix(_ALERT_DISMISS_PREFIX)
-    try:
-        return str(uuid.UUID(alert_id))
-    except (TypeError, ValueError, AttributeError):
-        return None
+    return alert_id_from_command_id(command_id)
 
 
 def _runner_id_from_command_id(command_id: str) -> str | None:
-    if not command_id.startswith(_RUNNER_PREFER_PREFIX):
-        return None
-    return _compact_text(
-        command_id.removeprefix(_RUNNER_PREFER_PREFIX),
-        max_chars=160,
-    )
+    return runner_id_from_command_id(command_id)
 
 
 def _allowed_command_kind(command_id: str) -> str | None:
-    if command_id.startswith("session.mode."):
-        mode = command_id.removeprefix("session.mode.")
-        return "strategic_workbench" if mode in _EXECUTABLE_SESSION_MODES else None
-    if command_id == "session.clear_selected_refs":
-        return "strategic_workbench"
-    if command_id.startswith(_RUNNER_PREFER_PREFIX):
-        return "strategic_workbench" if _runner_id_from_command_id(command_id) else None
-    if command_id == "session.runner.clear_preferred":
-        return "strategic_workbench"
-    if command_id == "attention.messages.mark_seen":
-        return "messages_last_seen"
-    if command_id.startswith(_ALERT_DISMISS_PREFIX):
-        return "alert_dismiss" if _alert_id_from_command_id(command_id) else None
-    return None
+    return work_session_command_kind(command_id)
 
 
 def _is_strategic_workbench_command(command_id: str) -> bool:
@@ -239,10 +209,10 @@ def _can_persist_failed_receipt(command: dict[str, Any]) -> bool:
         return False
     if command_id == "attention.messages.mark_seen":
         return isinstance(_mutation_body(command).get("timestamp"), int)
-    if command_id.startswith(_RUNNER_PREFER_PREFIX):
+    if command_id.startswith(RUNNER_PREFER_COMMAND_PREFIX):
         target = _safe_command_target(command) or {}
         return target.get("runner_id") == _runner_id_from_command_id(command_id)
-    if command_id.startswith(_ALERT_DISMISS_PREFIX):
+    if command_id.startswith(ALERT_DISMISS_COMMAND_PREFIX):
         alert_id = _alert_id_from_command_id(command_id)
         target = _safe_command_target(command) or {}
         return alert_id is not None and target.get("alert_id") == alert_id
@@ -282,7 +252,7 @@ async def _execute_strategic_workbench_command(
         workbench = {"interaction_mode": mode}
     elif command_id == "session.clear_selected_refs":
         workbench = {"selected_refs": []}
-    elif command_id.startswith("session.runner.prefer."):
+    elif command_id.startswith(RUNNER_PREFER_COMMAND_PREFIX):
         runner_id = _runner_id_from_command_id(command_id)
         target_runner_id = _compact_text(target.get("runner_id"), max_chars=160)
         if not runner_id or target_runner_id != runner_id:
@@ -352,7 +322,7 @@ async def _execute_alert_dismiss(
     project_id: uuid.UUID,
     command_id: str,
 ) -> dict[str, Any]:
-    alert_id = command_id.removeprefix("attention.alert.dismiss:")
+    alert_id = command_id.removeprefix(ALERT_DISMISS_COMMAND_PREFIX)
     try:
         alert_uuid = uuid.UUID(alert_id)
     except (TypeError, ValueError, AttributeError) as exc:
@@ -394,7 +364,7 @@ async def _apply_command(
             command=command,
             observed_at_ms=observed_at_ms,
         )
-    if command_id.startswith("attention.alert.dismiss:"):
+    if command_id.startswith(ALERT_DISMISS_COMMAND_PREFIX):
         return await _execute_alert_dismiss(
             session,
             project_id=project_id,
@@ -559,6 +529,12 @@ async def execute_work_session_command(
         raise HTTPException(status_code=409, detail="Command is not executable")
     if _allowed_command_kind(command_id) is None:
         raise HTTPException(status_code=409, detail="Command is not executable")
+    validation_error = validate_executable_command_descriptor(
+        command,
+        project_id=project_id,
+    )
+    if validation_error:
+        raise HTTPException(status_code=409, detail="Command is no longer executable")
 
     try:
         result = await _apply_command(

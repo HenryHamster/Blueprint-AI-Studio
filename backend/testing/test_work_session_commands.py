@@ -50,6 +50,7 @@ def test_work_session_commands_convert_actions_to_navigation_descriptors():
             "action": "reply",
         },
         "refetch_surfaces": [],
+        "executable": False,
     }
     assert "mutation" not in command
 
@@ -242,6 +243,7 @@ def test_work_session_commands_include_runner_preference_mutations():
             "runner_id": "runner-1",
         },
         "refetch_surfaces": ["strategic_session", "runtime"],
+        "executable": True,
         "mutation": {
             "method": "POST",
             "path": "/api/admin/projects/project-1/strategic-session",
@@ -290,6 +292,7 @@ def test_work_session_commands_include_clear_preferred_runner_mutation():
             "runner_id": "runner-1",
         },
         "refetch_surfaces": ["strategic_session", "runtime"],
+        "executable": True,
         "mutation": {
             "method": "POST",
             "path": "/api/admin/projects/project-1/strategic-session",
@@ -353,6 +356,7 @@ def test_work_session_commands_include_attention_mutations():
             "action": "dismiss_alert",
         },
         "refetch_surfaces": ["runtime", "strategic_session"],
+        "executable": True,
         "mutation": {
             "method": "POST",
             "path": f"/api/admin/alerts/{alert_id}/dismiss",
@@ -621,3 +625,36 @@ def test_work_session_commands_do_not_expose_raw_secret_payload_or_context():
     assert "raw-secret-context" not in serialized
     assert "run-with-secret-token" not in serialized
     assert "payload" not in serialized
+
+
+def test_work_session_commands_normalize_or_reject_target_sections():
+    commands = build_work_session_commands(
+        project_id="project-1",
+        workbench_state={"interaction_mode": "chat", "selected_refs": []},
+        context_package=None,
+        actions=[
+            {
+                "id": "runtime.runners",
+                "label": "Open local runners",
+                "priority": "normal",
+                "source": "runtime",
+                "target": {"surface": "runtime", "section": "runners"},
+                "enabled": True,
+            },
+            {
+                "id": "runtime.unknown",
+                "label": "Open unknown runtime",
+                "priority": "normal",
+                "source": "runtime",
+                "target": {"surface": "runtime", "section": "mystery"},
+                "enabled": True,
+            },
+        ],
+    )
+
+    by_id = _commands_by_id(commands)
+    assert by_id["runtime.runners"]["target"] == {
+        "surface": "runtime",
+        "section": "devices",
+    }
+    assert "runtime.unknown" not in by_id

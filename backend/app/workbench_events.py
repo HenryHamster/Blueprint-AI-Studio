@@ -18,35 +18,28 @@ from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
 from app.models import Alert, MessageType, ProjectMessage, StrategicCycle, Task
-from app.workbench_targets import (
-    REFETCH_SURFACE_DIRECTIONS as SURFACE_DIRECTIONS,
-    REFETCH_SURFACE_MESSAGES as SURFACE_MESSAGES,
-    REFETCH_SURFACE_PIPELINE as SURFACE_PIPELINE,
-    REFETCH_SURFACE_RUNTIME as SURFACE_RUNTIME,
-    REFETCH_SURFACE_STRATEGIC_SESSION as SURFACE_STRATEGIC_SESSION,
-    bounded_workbench_refetch_surfaces,
-    compact_workbench_target,
+from app.workbench_contracts import (
+    DEFAULT_REFETCH_SURFACES as CONTRACT_DEFAULT_REFETCH_SURFACES,
+    SURFACE_DIRECTIONS,
+    SURFACE_MESSAGES,
+    SURFACE_PIPELINE,
+    SURFACE_RUNTIME,
+    SURFACE_STRATEGIC_SESSION,
+    compact_text,
+    normalize_refetch_surfaces,
+    normalize_target,
 )
 
 WORKBENCH_EVENT_SCHEMA_VERSION = 1
 
-DEFAULT_WORKBENCH_REFETCH_SURFACES = (SURFACE_STRATEGIC_SESSION,)
+DEFAULT_WORKBENCH_REFETCH_SURFACES = CONTRACT_DEFAULT_REFETCH_SURFACES
 DEFAULT_WORKBENCH_EVENT_FEED_LIMIT = 24
 _SOURCE_QUERY_LIMIT = 12
 _OPERATOR_COMMAND_EVENT_TYPE = "operator_command"
 
 
 def _compact_str(value: Any, *, max_chars: int = 160) -> str | None:
-    if value is None:
-        return None
-    text = " ".join(str(value).strip().split())
-    if not text:
-        return None
-    if len(text) <= max_chars:
-        return text
-    if max_chars <= 3:
-        return text[:max_chars]
-    return f"{text[: max_chars - 3]}..."
+    return compact_text(value, max_chars=max_chars)
 
 
 def _bounded_int(value: Any) -> int:
@@ -99,6 +92,13 @@ def _event_tone(*, resource: str, action: str, severity: str | None = None) -> s
     return "neutral"
 
 
+def _bounded_surfaces(values: Sequence[str] | None) -> list[str]:
+    return normalize_refetch_surfaces(
+        values,
+        default=DEFAULT_WORKBENCH_REFETCH_SURFACES,
+    )
+
+
 def _bounded_mapping(value: Any, *, max_items: int = 16) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         return None
@@ -133,10 +133,7 @@ def workbench_event_envelope(
         "resource": _compact_str(resource, max_chars=80) or "workbench",
         "action": _compact_str(action, max_chars=80) or "updated",
         "refetch": {
-            "surfaces": bounded_workbench_refetch_surfaces(
-                refetch_surfaces,
-                default=DEFAULT_WORKBENCH_REFETCH_SURFACES,
-            )
+            "surfaces": _bounded_surfaces(refetch_surfaces)
         },
     }
 
@@ -207,9 +204,9 @@ def _feed_item(
         payload["tone"] = tone
     if ref:
         payload["ref"] = dict(ref)
-    compact_target = compact_workbench_target(target)
-    if compact_target:
-        payload["target"] = compact_target
+    normalized_target = normalize_target(target)
+    if normalized_target:
+        payload["target"] = normalized_target
     if data:
         payload["data"] = dict(data)
     return payload
