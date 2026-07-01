@@ -410,12 +410,20 @@ describe('PipelineWorkspace task stream', () => {
     });
 
     const sideboard = screen.getByTestId('pipeline-sideboard');
-    expect(within(sideboard).getByText('Task health')).toBeInTheDocument();
-    expect(within(sideboard).getByText('filtered')).toBeInTheDocument();
-    expect(within(sideboard).getByText('Running')).toBeInTheDocument();
-    expect(within(sideboard).getByText('Queued')).toBeInTheDocument();
-    expect(within(sideboard).getByText('Finished')).toBeInTheDocument();
-    expect(within(sideboard).getByText('clear')).toBeInTheDocument();
+    const nowPanel = within(sideboard).getByTestId('pipeline-now-panel');
+    expect(nowPanel).toBeInTheDocument();
+    expect(within(nowPanel).getByText('Now')).toBeInTheDocument();
+    expect(within(nowPanel).getByText('1 running')).toBeInTheDocument();
+    expect(within(nowPanel).getByText('1 tracked')).toBeInTheDocument();
+    expect(within(screen.getByTestId('pipeline-now-row-task-stream-1')).getByText('Selected')).toBeInTheDocument();
+    const healthPanel = within(sideboard).getByTestId('pipeline-health-panel');
+    expect(within(healthPanel).getByText('Task health')).toBeInTheDocument();
+    expect(within(healthPanel).getByText('filtered')).toBeInTheDocument();
+    expect(within(healthPanel).getByText('Running')).toBeInTheDocument();
+    expect(within(healthPanel).getByText('Queued')).toBeInTheDocument();
+    expect(within(healthPanel).getByText('Parked')).toBeInTheDocument();
+    expect(within(healthPanel).getByText('Finished')).toBeInTheDocument();
+    expect(within(healthPanel).getByText('clear')).toBeInTheDocument();
     expect(within(sideboard).getByTestId('task-stream-panel')).toHaveAttribute('data-variant', 'embedded');
     expect(within(sideboard).getByTestId('task-context-rail')).toBeInTheDocument();
 
@@ -423,6 +431,110 @@ describe('PipelineWorkspace task stream', () => {
     expect(sideboardShell).toHaveClass('max-h-[34vh]');
     expect(sideboardShell).toHaveClass('lg:col-start-2');
     expect(sideboardShell).toHaveClass('lg:border-l');
+  });
+
+  test('routes Now panel task open and track actions', () => {
+    const onOpenTask = vi.fn();
+    const onTrackTask = vi.fn();
+    const activeTask = makeTask({ id: 'task-now-active', title: 'Active implementation task', status: 'IN_PROGRESS' });
+    const blockedTask = makeTask({ id: 'task-now-blocked', title: 'Blocked integration task', status: 'BLOCKED' });
+    const parkedTask = makeTask({ id: 'task-now-parked', title: 'Parked follow-up task', status: 'PARKED' });
+    const queuedTask = makeTask({ id: 'task-now-queued', title: 'Queued review task', status: 'QUEUED' });
+
+    renderWorkspace({
+      flow: {
+        tasks: [activeTask, blockedTask, parkedTask, queuedTask],
+        hasActiveFilters: false,
+        onViewLogs: vi.fn(),
+        onNavigateToParent: vi.fn(),
+        onArchiveGroup: vi.fn(),
+        onUnarchiveTask: vi.fn(),
+      },
+      metrics: {
+        activeTasks: [activeTask],
+        queuedTasks: [queuedTask],
+        blockedTasks: [blockedTask],
+        failedTasks: [],
+        terminalTasks: [],
+      },
+      rail: {
+        currentTask: null,
+        attentionTasks: [blockedTask],
+        localFallbackTasks: [queuedTask],
+        trackedTaskIds: new Set([activeTask.id]),
+        taskContextSessionProps: {},
+        onOpenTask,
+        onOpenPipeline: vi.fn(),
+        onTrackTask,
+      },
+    });
+
+    const nowPanel = screen.getByTestId('pipeline-now-panel');
+    expect(within(nowPanel).getByText('Now')).toBeInTheDocument();
+    expect(within(nowPanel).getByText('1 running')).toBeInTheDocument();
+    expect(within(nowPanel).getByText('1 tracked')).toBeInTheDocument();
+    expect(within(screen.getByTestId('pipeline-now-row-task-now-active')).getByText('Running')).toBeInTheDocument();
+    expect(within(screen.getByTestId('pipeline-now-row-task-now-blocked')).getByText('Blocked')).toBeInTheDocument();
+    expect(within(screen.getByTestId('pipeline-now-row-task-now-parked')).getByText('Parked')).toBeInTheDocument();
+    expect(within(screen.getByTestId('pipeline-now-row-task-now-queued')).getByText('Queued')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Track Active implementation task')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByLabelText('Open Active implementation task'));
+    expect(onOpenTask).toHaveBeenCalledWith(activeTask);
+
+    fireEvent.click(screen.getByLabelText('Track Blocked integration task'));
+    expect(onTrackTask).toHaveBeenCalledWith(blockedTask);
+  });
+
+  test('shows a quiet Now panel empty state when no active work is visible', () => {
+    renderWorkspace({
+      flow: {
+        tasks: [],
+        hasActiveFilters: false,
+        onViewLogs: vi.fn(),
+        onNavigateToParent: vi.fn(),
+        onArchiveGroup: vi.fn(),
+        onUnarchiveTask: vi.fn(),
+      },
+      metrics: {
+        activeTasks: [],
+        queuedTasks: [],
+        blockedTasks: [],
+        failedTasks: [],
+        terminalTasks: [],
+      },
+    });
+
+    const nowPanel = screen.getByTestId('pipeline-now-panel');
+    expect(within(nowPanel).getByText('No active pipeline work in view.')).toBeInTheDocument();
+  });
+
+  test('counts parked-only tasks as attention in task health', () => {
+    const parkedTask = makeTask({ id: 'task-health-parked', title: 'Parked task', status: 'PARKED' });
+
+    renderWorkspace({
+      flow: {
+        tasks: [parkedTask],
+        hasActiveFilters: false,
+        onViewLogs: vi.fn(),
+        onNavigateToParent: vi.fn(),
+        onArchiveGroup: vi.fn(),
+        onUnarchiveTask: vi.fn(),
+      },
+      metrics: {
+        activeTasks: [],
+        queuedTasks: [],
+        blockedTasks: [],
+        failedTasks: [],
+        terminalTasks: [],
+      },
+    });
+
+    const healthPanel = screen.getByTestId('pipeline-health-panel');
+    expect(within(healthPanel).getByText('1 need attention')).toBeInTheDocument();
+    expect(within(healthPanel).getByText('Parked')).toBeInTheDocument();
+    expect(within(healthPanel).getByText('1')).toBeInTheDocument();
+    expect(screen.queryByText('clear')).not.toBeInTheDocument();
   });
 
   test('does not render embedded stream when no tasks are tracked', () => {

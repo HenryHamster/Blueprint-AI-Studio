@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { X, Radio, ChevronDown, ChevronUp, Trash2 } from 'lucide-react';
 import type { Task, TrackLogEntry, TrackLogType } from '../types/task';
-import { formatTimeOnly } from '../utils/time';
+import { formatTimeOnly, timeAgo } from '../utils/time';
 
 export type TaskStreamPanelVariant = 'floating' | 'embedded';
 
@@ -38,6 +38,14 @@ function statusDotColor(status?: string): string {
   }
 }
 
+function streamFreshnessLabel(task: Task | undefined, entries: TrackLogEntry[]): string {
+  const lastEntry = entries.at(-1);
+  if (lastEntry) return `last event ${timeAgo(lastEntry.t)}`;
+  if (task && ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'].includes(task.status)) return 'active, no events yet';
+  if (task?.status === 'QUEUED') return 'queued, no events yet';
+  return 'no events yet';
+}
+
 export default function TaskStreamPanel({
   trackedTaskIds,
   trackedLogs,
@@ -55,6 +63,7 @@ export default function TaskStreamPanel({
   const [autoScroll, setAutoScroll] = useState(true);
   const embedded = variant === 'embedded';
   const isCollapsed = !embedded && collapsed;
+  const [, setFreshnessTick] = useState(() => Date.now());
 
   // Derive active tab: use selectedTab if still tracked, otherwise fall back to first
   const activeTab = trackedTaskIds.has(selectedTab) ? selectedTab : (ids[0] || '');
@@ -67,6 +76,12 @@ export default function TaskStreamPanel({
       el.scrollTop = el.scrollHeight;
     }
   }, [activeEntries.length, activeTab, autoScroll]);
+
+  useEffect(() => {
+    if (isCollapsed) return undefined;
+    const id = window.setInterval(() => setFreshnessTick(Date.now()), 30_000);
+    return () => window.clearInterval(id);
+  }, [isCollapsed]);
 
   const handleScroll = () => {
     const el = scrollRef.current;
@@ -183,7 +198,10 @@ export default function TaskStreamPanel({
 
           {/* Footer */}
           <div className={footerClassName}>
-            <span>{activeEntries.length} entries</span>
+            <div className="flex min-w-0 items-center gap-2">
+              <span className="shrink-0">{activeEntries.length} entries</span>
+              <span className="min-w-0 truncate">{streamFreshnessLabel(activeTask, activeEntries)}</span>
+            </div>
             {!autoScroll && (
               <button type="button" onClick={() => { setAutoScroll(true); scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: 'smooth' }); }}
                 className="text-blue-500 transition-colors hover:text-blue-400">

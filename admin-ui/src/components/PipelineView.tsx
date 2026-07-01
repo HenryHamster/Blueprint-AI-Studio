@@ -8,20 +8,28 @@ import { buildForest, type TreeNode } from './PipelineView.utils';
 import { taskStatusDotColor } from '../utils/taskStatus';
 
 const ACTIVE_STATUSES = ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'];
+const WAITING_STATUSES = ['BLOCKED', 'PARKED'];
 const TERMINAL_STATUSES = ['COMPLETED', 'FAILED', 'CANCELLED'];
 
-type FilterType = 'All' | 'Active' | 'Blocked' | 'Failed';
+type FilterType = 'All' | 'Active' | 'Waiting' | 'Blocked' | 'Failed';
 
 const FILTER_CHIPS: { label: FilterType }[] = [
   { label: 'All' },
   { label: 'Active' },
+  { label: 'Waiting' },
   { label: 'Blocked' },
   { label: 'Failed' },
 ];
 
+function taskIsWaiting(task: Task): boolean {
+  return WAITING_STATUSES.includes(task.status)
+    || (task.status === 'QUEUED' && !!task.depends_on && task.depends_on.length > 0);
+}
+
 function taskMatchesFilter(task: Task, filter: FilterType): boolean {
   if (filter === 'All') return true;
   if (filter === 'Active') return ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'].includes(task.status);
+  if (filter === 'Waiting') return taskIsWaiting(task);
   // First-class BLOCKED status, with the legacy QUEUED+depends_on inference
   // kept as a fallback for payloads predating the status.
   if (filter === 'Blocked') return task.status === 'BLOCKED' || (task.status === 'QUEUED' && !!task.depends_on && task.depends_on.length > 0);
@@ -680,7 +688,8 @@ export function PipelineView({ tasks, onViewLogs, hasActiveFilters, onNavigateTo
     Object.fromEntries(
       visibleForest.map(r => [
         r.task.id,
-        countByStatuses(r, ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING', 'FAILED']) > 0,
+        countByStatuses(r, ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING', 'FAILED', 'BLOCKED', 'PARKED']) > 0
+          || countQueuedBehindDependencies(r) > 0,
       ])
     ),
     [visibleForest]
@@ -835,4 +844,11 @@ function countByStatuses(node: TreeNode, statuses: string[]): number {
   return self
     + node.children.reduce((sum, c) => sum + countByStatuses(c, statuses), 0)
     + node.sidecars.reduce((sum, c) => sum + countByStatuses(c, statuses), 0);
+}
+
+function countQueuedBehindDependencies(node: TreeNode): number {
+  const self = node.task.status === 'QUEUED' && (node.task.depends_on?.length ?? 0) > 0 ? 1 : 0;
+  return self
+    + node.children.reduce((sum, c) => sum + countQueuedBehindDependencies(c), 0)
+    + node.sidecars.reduce((sum, c) => sum + countQueuedBehindDependencies(c), 0);
 }

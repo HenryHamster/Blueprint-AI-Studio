@@ -93,6 +93,43 @@ describe('PipelineView Blocked filter', () => {
     const title = nodeFor('plain-running').getAttribute('title') ?? '';
     expect(title).not.toContain('stale reason that should not render');
   });
+
+  it('keeps blocked, parked, and dependency-waiting tasks lit under Waiting', async () => {
+    const user = userEvent.setup();
+    const tasks = [
+      makeTask({ id: 'blocked-status', title: 'Blocked by status', status: 'BLOCKED' }),
+      makeTask({ id: 'parked-status', title: 'Parked by status', status: 'PARKED' }),
+      makeTask({ id: 'legacy-waiting', title: 'Waiting on dependency', status: 'QUEUED', depends_on: ['blocked-status'] }),
+      makeTask({ id: 'plain-queued', title: 'Plain queued', status: 'QUEUED' }),
+      makeTask({ id: 'running-task', title: 'Running task', status: 'IN_PROGRESS' }),
+    ];
+    render(<PipelineView tasks={tasks} onViewLogs={vi.fn()} />);
+
+    await user.click(screen.getByRole('button', { name: 'Expand all' }));
+    await user.click(screen.getByRole('button', { name: 'Waiting' }));
+
+    expect(nodeFor('blocked-status').className).not.toMatch(/opacity-40/);
+    expect(nodeFor('parked-status').className).not.toMatch(/opacity-40/);
+    expect(nodeFor('legacy-waiting').className).not.toMatch(/opacity-40/);
+    expect(nodeFor('plain-queued').className).toMatch(/opacity-40/);
+    expect(nodeFor('running-task').className).toMatch(/opacity-40/);
+  });
+
+  it('expands groups with waiting children by default', () => {
+    const tasks = [
+      makeTask({ id: 'root-waiting', title: 'Root waiting group', status: 'QUEUED' }),
+      makeTask({
+        id: 'blocked-child',
+        title: 'Blocked child should be visible',
+        status: 'BLOCKED',
+        parent_task_id: 'root-waiting',
+      }),
+      makeTask({ id: 'sibling-root', title: 'Sibling root', status: 'QUEUED' }),
+    ];
+    render(<PipelineView tasks={tasks} onViewLogs={vi.fn()} />);
+
+    expect(nodeFor('blocked-child')).toBeInTheDocument();
+  });
 });
 
 function findNode(roots: TreeNode[], id: string): TreeNode | null {

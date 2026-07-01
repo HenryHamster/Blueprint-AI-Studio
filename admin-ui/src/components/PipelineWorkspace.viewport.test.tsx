@@ -183,6 +183,21 @@ describe('PipelineWorkspace viewport regression', () => {
     if (!sideboard || !aside || !main) {
       throw new Error('Expected Pipeline flow sideboard and main region to render');
     }
+    const nowPanel = sideboard.querySelector<HTMLElement>('[data-testid="pipeline-now-panel"]');
+    if (!nowPanel) {
+      throw new Error('Expected Pipeline Now panel to render');
+    }
+    expect(nowPanel.textContent).toContain('Now');
+    expect(nowPanel.textContent).toContain('tracked');
+    const nowButtons = Array.from(nowPanel.querySelectorAll<HTMLButtonElement>('button[aria-label^="Open "], button[aria-label^="Track "]'));
+    if (nowButtons.length === 0) {
+      throw new Error('Expected Pipeline Now action buttons to render');
+    }
+    for (const button of nowButtons) {
+      const rect = button.getBoundingClientRect();
+      expect(rect.width).toBeGreaterThanOrEqual(44);
+      expect(rect.height).toBeGreaterThanOrEqual(44);
+    }
     expect(Boolean(aside.compareDocumentPosition(main) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
     expect(aside.getBoundingClientRect().right).toBeLessThanOrEqual(376);
     expect(aside.getBoundingClientRect().bottom).toBeLessThanOrEqual(main.getBoundingClientRect().top + 1);
@@ -205,6 +220,9 @@ describe('PipelineWorkspace viewport regression', () => {
       throw new Error('Expected Pipeline desktop sideboard and main region to render');
     }
     expect(stream?.dataset.variant).toBe('embedded');
+    expect(sideboard.textContent).toContain('Now');
+    expect(sideboard.textContent).toContain('Task health');
+    expect(sideboard.textContent).toContain('Task context');
     expect(aside.getBoundingClientRect().left).toBeGreaterThanOrEqual(main.getBoundingClientRect().right - 1);
   });
 });

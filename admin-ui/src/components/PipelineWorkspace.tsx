@@ -1,5 +1,5 @@
 import { useEffect, useState, type ComponentProps, type ReactNode } from 'react';
-import { ChevronDown, ChevronRight } from 'lucide-react';
+import { ArrowUpRight, ChevronDown, ChevronRight, Star } from 'lucide-react';
 import ArchiveView from './ArchiveView';
 import { ErrorBoundary } from './ErrorBoundary';
 import { KanbanBoard } from './KanbanBoard';
@@ -98,6 +98,14 @@ interface PipelineSideboardProps {
   rail: PipelineRailProps;
   metrics: PipelineMetricsProps;
   stream?: PipelineStreamProps;
+}
+
+type PipelineNowTone = 'active' | 'attention' | 'queued' | 'selected' | 'waiting';
+
+interface PipelineNowItem {
+  task: Task;
+  label: string;
+  tone: PipelineNowTone;
 }
 
 export interface PipelineWorkspaceStatus {
@@ -344,14 +352,148 @@ function PipelineHealthRow({
   );
 }
 
+function pipelineNowToneClass(tone: PipelineNowTone): string {
+  return {
+    active: 'border-emerald-500/20 bg-emerald-500/5 text-emerald-200',
+    attention: 'border-red-500/25 bg-red-500/5 text-red-200',
+    queued: 'border-neutral-800 bg-neutral-950/35 text-neutral-300',
+    selected: 'border-cyan-500/20 bg-cyan-500/5 text-cyan-200',
+    waiting: 'border-violet-500/25 bg-violet-500/5 text-violet-200',
+  }[tone];
+}
+
+function pipelineNowItems(rail: PipelineRailProps, metrics: PipelineMetricsProps, tasks: Task[]): PipelineNowItem[] {
+  const items: PipelineNowItem[] = [];
+  const seen = new Set<string>();
+  const push = (task: Task | null | undefined, label: string, tone: PipelineNowTone) => {
+    if (!task || seen.has(task.id)) return;
+    seen.add(task.id);
+    items.push({ task, label, tone });
+  };
+
+  push(rail.currentTask, 'Selected', 'selected');
+  metrics.failedTasks.slice(0, 2).forEach(task => push(task, 'Failed', 'attention'));
+  metrics.blockedTasks.slice(0, 2).forEach(task => push(task, 'Blocked', 'attention'));
+  tasks.filter(task => task.status === 'PARKED').slice(0, 2).forEach(task => push(task, 'Parked', 'waiting'));
+  metrics.activeTasks.slice(0, 3).forEach(task => push(task, 'Running', 'active'));
+  metrics.queuedTasks.slice(0, 2).forEach(task => push(task, 'Queued', 'queued'));
+  return items.slice(0, 6);
+}
+
+function PipelineNowRow({
+  item,
+  tracked,
+  onOpenTask,
+  onTrackTask,
+}: {
+  item: PipelineNowItem;
+  tracked: boolean;
+  onOpenTask: (task: Task) => void;
+  onTrackTask?: (task: Task) => void;
+}) {
+  const statusDetail = item.task.latest_status_message
+    || (item.task.started_at ? `started ${timeAgo(item.task.started_at)}` : `created ${timeAgo(item.task.created_at)}`);
+
+  return (
+    <div
+      data-testid={`pipeline-now-row-${item.task.id}`}
+      className={`grid min-w-0 grid-cols-[minmax(0,1fr)_auto] gap-2 rounded border px-2.5 py-2 ${pipelineNowToneClass(item.tone)}`}
+    >
+      <button
+        type="button"
+        onClick={() => onOpenTask(item.task)}
+        className="min-w-0 text-left"
+        title={item.task.title || item.task.id}
+      >
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="shrink-0 rounded border border-current/20 px-1.5 py-0.5 font-mono text-ui-sm uppercase">
+            {item.label}
+          </span>
+          <span className="min-w-0 truncate text-xs font-semibold text-neutral-100">{item.task.title || item.task.id}</span>
+        </div>
+        <div className="mt-1 min-w-0 truncate text-ui-sm text-neutral-500">{statusDetail}</div>
+      </button>
+      <div className="flex shrink-0 items-center gap-1">
+        {onTrackTask && !tracked && (
+          <button
+            type="button"
+            onClick={() => onTrackTask(item.task)}
+            className="inline-flex min-h-11 min-w-11 items-center justify-center rounded border border-neutral-800 bg-neutral-950/55 text-neutral-500 transition-colors hover:border-neutral-700 hover:text-neutral-200"
+            title={`Track ${item.task.title || item.task.id}`}
+            aria-label={`Track ${item.task.title || item.task.id}`}
+          >
+            <Star className="h-3.5 w-3.5" aria-hidden="true" />
+          </button>
+        )}
+        <button
+          type="button"
+          onClick={() => onOpenTask(item.task)}
+          className="inline-flex min-h-11 min-w-11 items-center justify-center rounded border border-neutral-800 bg-neutral-950/55 text-neutral-500 transition-colors hover:border-neutral-700 hover:text-neutral-200"
+          title={`Open ${item.task.title || item.task.id}`}
+          aria-label={`Open ${item.task.title || item.task.id}`}
+        >
+          <ArrowUpRight className="h-3.5 w-3.5" aria-hidden="true" />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PipelineNowPanel({ rail, metrics, tasks }: { rail: PipelineRailProps; metrics: PipelineMetricsProps; tasks: Task[] }) {
+  const items = pipelineNowItems(rail, metrics, tasks);
+  const trackedCount = rail.trackedTaskIds.size;
+  const activeCount = metrics.activeTasks.length;
+
+  return (
+    <section
+      data-testid="pipeline-now-panel"
+      className="min-w-0 overflow-hidden rounded border border-neutral-800/80 bg-[#0b1118]/90"
+    >
+      <div className="flex min-w-0 items-center justify-between gap-3 border-b border-neutral-800/80 px-2.5 py-2">
+        <h2 className="truncate text-sm font-semibold text-neutral-100">Now</h2>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {activeCount > 0 && (
+            <span className="rounded border border-emerald-500/20 bg-emerald-500/10 px-1.5 py-0.5 font-mono text-ui-sm text-emerald-300">
+              {activeCount} running
+            </span>
+          )}
+          {trackedCount > 0 && (
+            <span className="rounded border border-cyan-500/20 bg-cyan-500/10 px-1.5 py-0.5 font-mono text-ui-sm text-cyan-300">
+              {trackedCount} tracked
+            </span>
+          )}
+        </div>
+      </div>
+      {items.length > 0 ? (
+        <div className="grid gap-1.5 p-1.5">
+          {items.map(item => (
+            <PipelineNowRow
+              key={`${item.label}:${item.task.id}`}
+              item={item}
+              tracked={rail.trackedTaskIds.has(item.task.id)}
+              onOpenTask={rail.onOpenTask}
+              onTrackTask={rail.onTrackTask}
+            />
+          ))}
+        </div>
+      ) : (
+        <div className="px-2.5 py-3 text-xs text-neutral-600">No active pipeline work in view.</div>
+      )}
+    </section>
+  );
+}
+
 function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardProps) {
-  const attentionCount = metrics.blockedTasks.length + metrics.failedTasks.length;
+  const parkedTasks = flow.tasks.filter(task => task.status === 'PARKED');
+  const attentionCount = metrics.blockedTasks.length + metrics.failedTasks.length + parkedTasks.length;
   const attentionLabel = attentionCount > 0
     ? `${attentionCount} need attention`
     : 'clear';
 
   return (
     <div data-testid="pipeline-sideboard" className="grid min-w-0 gap-1.5">
+      <PipelineNowPanel rail={rail} metrics={metrics} tasks={flow.tasks} />
+
       <section
         data-testid="pipeline-health-panel"
         className="min-w-0 overflow-hidden rounded border border-neutral-800/80 bg-[#0b1118]/90"
@@ -375,6 +517,7 @@ function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardPro
           <PipelineHealthRow label="Running" value={metrics.activeTasks.length} tone="good" />
           <PipelineHealthRow label="Queued" value={metrics.queuedTasks.length} />
           <PipelineHealthRow label="Blocked" value={metrics.blockedTasks.length} tone={metrics.blockedTasks.length > 0 ? 'warn' : 'neutral'} />
+          <PipelineHealthRow label="Parked" value={parkedTasks.length} tone={parkedTasks.length > 0 ? 'warn' : 'neutral'} />
           <PipelineHealthRow label="Failed" value={metrics.failedTasks.length} tone={metrics.failedTasks.length > 0 ? 'bad' : 'neutral'} />
           <PipelineHealthRow label="Finished" value={metrics.terminalTasks.length} tone="info" />
         </dl>
