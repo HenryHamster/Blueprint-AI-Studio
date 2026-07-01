@@ -3989,6 +3989,29 @@ async def test_strategic_state_includes_operator_attention(
     assert all(len(entry["label"]) <= 96 for entry in actions)
     assert all(len(entry["reason"]) <= 180 for entry in actions)
 
+    commands = {entry["id"]: entry for entry in data["work_session"]["commands"]}
+    mark_seen = commands["attention.messages.mark_seen"]
+    assert mark_seen["mutation"]["method"] == "PUT"
+    assert mark_seen["mutation"]["path"] == "/api/admin/messages/last-seen"
+    assert mark_seen["mutation"]["body"]["project_id"] == str(project.id)
+    assert isinstance(mark_seen["mutation"]["body"]["timestamp"], int)
+    dismiss_alert = commands[f"attention.alert.dismiss:{active_alert.id}"]
+    assert dismiss_alert["label"] == (
+        f"Dismiss alert: {active_alert.title} ({str(active_alert.id)[:8]})"
+    )
+    assert dismiss_alert["mutation"] == {
+        "method": "POST",
+        "path": f"/api/admin/alerts/{active_alert.id}/dismiss",
+        "body": {},
+    }
+    assert dismiss_alert["target"] == {
+        "surface": "runtime",
+        "project_id": str(project.id),
+        "section": "health",
+        "alert_id": str(active_alert.id),
+        "action": "dismiss_alert",
+    }
+
 
 @pytest.mark.asyncio
 async def test_operator_attention_endpoint_reuses_projection(

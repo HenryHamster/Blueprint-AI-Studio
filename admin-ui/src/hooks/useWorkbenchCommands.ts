@@ -292,7 +292,7 @@ function strategicModeFromCommandId(commandId: string): StrategicInteractionMode
   return isStrategicInteractionMode(mode) ? mode : null;
 }
 
-function isAllowedWorkSessionMutationCommandId(commandId: string): boolean {
+function isStrategicSessionMutationCommandId(commandId: string): boolean {
   return (
     Boolean(strategicModeFromCommandId(commandId))
     || commandId === 'session.clear_selected_refs'
@@ -301,23 +301,58 @@ function isAllowedWorkSessionMutationCommandId(commandId: string): boolean {
   );
 }
 
+function isAllowedWorkSessionMutationCommandId(commandId: string): boolean {
+  return (
+    isStrategicSessionMutationCommandId(commandId)
+    || commandId === 'attention.messages.mark_seen'
+    || commandId.startsWith('attention.alert.dismiss:')
+  );
+}
+
 function isStrategicSessionMutationPath(path: string, projectId: string): boolean {
   const prefix = `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-session`;
   return path === prefix || path.startsWith(`${prefix}?`);
+}
+
+function isMessagesLastSeenMutation(command: StrategicWorkSessionCommand, method: string, path: string, projectId: string): boolean {
+  return (
+    command.id === 'attention.messages.mark_seen'
+    && method === 'PUT'
+    && path === '/api/admin/messages/last-seen'
+    && command.target?.surface === 'messages'
+    && command.target?.project_id === projectId
+    && command.target?.action === 'mark_seen'
+    && command.mutation?.body?.project_id === projectId
+  );
+}
+
+function isAlertDismissMutation(command: StrategicWorkSessionCommand, method: string, path: string, projectId: string): boolean {
+  if (!command.id.startsWith('attention.alert.dismiss:') || method !== 'POST') return false;
+  const alertId = command.id.slice('attention.alert.dismiss:'.length);
+  return Boolean(
+    alertId
+      && command.target?.project_id === projectId
+      && command.target?.surface === 'runtime'
+      && command.target?.section === 'health'
+      && command.target?.action === 'dismiss_alert'
+      && command.target?.alert_id === alertId
+      && path === `/api/admin/alerts/${encodeURIComponent(alertId)}/dismiss`,
+  );
 }
 
 function hasAllowedWorkSessionMutation(command: StrategicWorkSessionCommand, projectId: string | null): boolean {
   const mutation = command.mutation;
   const method = mutation?.method?.trim().toUpperCase();
   const path = mutation?.path?.trim();
-  return Boolean(
-    projectId
-      && mutation
-      && method
-      && WORK_SESSION_MUTATION_METHODS.has(method)
-      && path
-      && isAllowedWorkSessionMutationCommandId(command.id)
-      && isStrategicSessionMutationPath(path, projectId),
+  if (!projectId || !mutation || !method || !WORK_SESSION_MUTATION_METHODS.has(method) || !path) {
+    return false;
+  }
+  if (!isAllowedWorkSessionMutationCommandId(command.id)) return false;
+  if (isMessagesLastSeenMutation(command, method, path, projectId)) return true;
+  if (isAlertDismissMutation(command, method, path, projectId)) return true;
+  return (
+    isStrategicSessionMutationCommandId(command.id)
+    && isStrategicSessionMutationPath(path, projectId)
   );
 }
 
@@ -339,6 +374,10 @@ function workSessionCommandTargetDetail(target?: StrategicContextTarget | null):
   const section = humanizeCommandToken(target.section);
   if (target.surface === 'messages') return target.message_id ? 'Message' : 'Messages';
   if (target.surface === 'task') return 'Task';
+  if (target.surface === 'runtime' && target.action === 'dismiss_alert' && target.alert_id) {
+    const alertRef = target.alert_id.slice(0, 8);
+    return section ? `Runtime ${section} / alert ${alertRef}` : `Runtime alert ${alertRef}`;
+  }
   if (target.surface === 'runtime') return section ? `Runtime ${section}` : 'Runtime';
   if (target.surface === 'pipeline') return section ? `Pipeline ${section}` : 'Pipeline';
   if (target.surface === 'project') return section ? `Project ${section}` : 'Project';

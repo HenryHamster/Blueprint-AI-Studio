@@ -555,6 +555,7 @@ def _build_work_session_summary(
         workbench_state=workbench_state,
         context_package=context_package,
         local_runner=local_runner if isinstance(local_runner, dict) else None,
+        attention=attention,
     )
     return {
         "version": 1,

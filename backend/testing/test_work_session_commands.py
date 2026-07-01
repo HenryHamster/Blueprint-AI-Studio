@@ -1,4 +1,5 @@
 import json
+import uuid
 
 from app.work_session_commands import (
     MAX_WORK_SESSION_COMMANDS,
@@ -234,6 +235,183 @@ def test_work_session_commands_include_clear_preferred_runner_mutation():
             "body": {"workbench": {"preferred_runner_id": None}},
         },
     }
+
+
+def test_work_session_commands_include_attention_mutations():
+    alert_id = str(uuid.uuid4())
+    commands = build_work_session_commands(
+        project_id="project-1",
+        workbench_state={"interaction_mode": "chat", "selected_refs": []},
+        context_package=None,
+        actions=[],
+        attention={
+            "counts": {"unread": 2},
+            "items": [
+                {
+                    "id": "alert:alert/one",
+                    "kind": "alert",
+                    "label": "Runner offline",
+                    "detail": "secret-token must not leak",
+                    "ref": {
+                        "kind": "alert",
+                        "id": alert_id,
+                        "project_id": "project-1",
+                    },
+                }
+            ],
+        },
+    )
+
+    by_id = _commands_by_id(commands)
+    mark_seen = by_id["attention.messages.mark_seen"]
+    assert mark_seen["label"] == "Mark messages seen"
+    assert mark_seen["group"] == "attention"
+    assert mark_seen["target"] == {
+        "surface": "messages",
+        "project_id": "project-1",
+        "action": "mark_seen",
+    }
+    assert mark_seen["refetch_surfaces"] == ["messages", "strategic_session"]
+    assert mark_seen["mutation"]["method"] == "PUT"
+    assert mark_seen["mutation"]["path"] == "/api/admin/messages/last-seen"
+    assert mark_seen["mutation"]["body"]["project_id"] == "project-1"
+    assert isinstance(mark_seen["mutation"]["body"]["timestamp"], int)
+
+    dismiss = by_id[f"attention.alert.dismiss:{alert_id}"]
+    assert dismiss == {
+        "id": f"attention.alert.dismiss:{alert_id}",
+        "label": f"Dismiss alert: Runner offline ({alert_id[:8]})",
+        "group": "attention",
+        "priority": "normal",
+        "enabled": True,
+        "target": {
+            "surface": "runtime",
+            "project_id": "project-1",
+            "section": "health",
+            "alert_id": alert_id,
+            "action": "dismiss_alert",
+        },
+        "refetch_surfaces": ["runtime", "strategic_session"],
+        "mutation": {
+            "method": "POST",
+            "path": f"/api/admin/alerts/{alert_id}/dismiss",
+            "body": {},
+        },
+    }
+    assert "secret-token" not in json.dumps(commands, sort_keys=True)
+
+
+def test_work_session_commands_skip_attention_mutations_when_not_useful():
+    commands = build_work_session_commands(
+        project_id="project-1",
+        workbench_state={"interaction_mode": "chat", "selected_refs": []},
+        context_package=None,
+        actions=[],
+        attention={"counts": {"unread": 0}, "items": []},
+    )
+
+    ids = {command["id"] for command in commands}
+    assert "attention.messages.mark_seen" not in ids
+    assert not any(command_id.startswith("attention.alert.dismiss:") for command_id in ids)
+
+
+def test_work_session_commands_distinguish_duplicate_attention_alert_labels():
+    first_alert_id = str(uuid.uuid4())
+    second_alert_id = str(uuid.uuid4())
+    commands = build_work_session_commands(
+        project_id="project-1",
+        workbench_state={"interaction_mode": "chat", "selected_refs": []},
+        context_package=None,
+        actions=[],
+        attention={
+            "counts": {"unread": 0},
+            "items": [
+                {
+                    "kind": "alert",
+                    "label": "Runner offline",
+                    "ref": {
+                        "kind": "alert",
+                        "id": first_alert_id,
+                        "project_id": "project-1",
+                    },
+                },
+                {
+                    "kind": "alert",
+                    "label": "Runner offline",
+                    "ref": {
+                        "kind": "alert",
+                        "id": second_alert_id,
+                        "project_id": "project-1",
+                    },
+                },
+            ],
+        },
+    )
+
+    labels = [
+        command["label"]
+        for command in commands
+        if command["id"].startswith("attention.alert.dismiss:")
+    ]
+    assert labels == [
+        f"Dismiss alert: Runner offline ({first_alert_id[:8]})",
+        f"Dismiss alert: Runner offline ({second_alert_id[:8]})",
+    ]
+    assert labels[0] != labels[1]
+
+
+def test_work_session_commands_skip_unscoped_attention_alert_mutations():
+    valid_alert_id = str(uuid.uuid4())
+    wrong_project_alert_id = str(uuid.uuid4())
+    malformed_alert_id = str(uuid.uuid4())
+    commands = build_work_session_commands(
+        project_id="project-1",
+        workbench_state={"interaction_mode": "chat", "selected_refs": []},
+        context_package=None,
+        actions=[],
+        attention={
+            "counts": {"unread": 0},
+            "items": [
+                {
+                    "kind": "alert",
+                    "label": "Missing project",
+                    "ref": {"kind": "alert", "id": valid_alert_id},
+                },
+                {
+                    "kind": "alert",
+                    "label": "Wrong project",
+                    "ref": {
+                        "kind": "alert",
+                        "id": wrong_project_alert_id,
+                        "project_id": "other-project",
+                    },
+                },
+                {
+                    "kind": "alert",
+                    "label": "Wrong kind",
+                    "ref": {
+                        "kind": "task",
+                        "id": malformed_alert_id,
+                        "project_id": "project-1",
+                    },
+                },
+                {
+                    "kind": "alert",
+                    "label": "Malformed id",
+                    "ref": {
+                        "kind": "alert",
+                        "id": "alert-not-a-uuid",
+                        "project_id": "project-1",
+                    },
+                },
+            ],
+        },
+    )
+
+    assert not any(
+        command["id"].startswith("attention.alert.dismiss:")
+        for command in commands
+    )
 
 
 def test_work_session_commands_limit_runner_preferences_after_eligibility_filter():

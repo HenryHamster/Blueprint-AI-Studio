@@ -531,6 +531,112 @@ describe('useWorkbenchCommands', () => {
     });
   });
 
+  test('executes backend mutation descriptors for attention housekeeping', async () => {
+    const refreshWorkbench = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const alertId = '11111111-1111-1111-1111-111111111111';
+    const secondAlertId = '22222222-2222-2222-2222-222222222222';
+    const commands: StrategicWorkSessionCommand[] = [
+      {
+        id: 'attention.messages.mark_seen',
+        label: 'Mark messages seen',
+        group: 'attention',
+        priority: 'normal',
+        enabled: true,
+        target: {
+          surface: 'messages',
+          project_id: 'project-1',
+          action: 'mark_seen',
+        },
+        mutation: {
+          method: 'PUT',
+          path: '/api/admin/messages/last-seen',
+          body: { project_id: 'project-1', timestamp: 1_782_912_000_000 },
+        },
+      },
+      {
+        id: `attention.alert.dismiss:${alertId}`,
+        label: 'Dismiss alert: Runner offline (11111111)',
+        group: 'attention',
+        priority: 'normal',
+        enabled: true,
+        target: {
+          surface: 'runtime',
+          project_id: 'project-1',
+          section: 'health',
+          alert_id: alertId,
+          action: 'dismiss_alert',
+        },
+        mutation: {
+          method: 'POST',
+          path: `/api/admin/alerts/${alertId}/dismiss`,
+          body: {},
+        },
+      },
+      {
+        id: `attention.alert.dismiss:${secondAlertId}`,
+        label: 'Dismiss alert: Account quota (22222222)',
+        group: 'attention',
+        priority: 'normal',
+        enabled: true,
+        target: {
+          surface: 'runtime',
+          project_id: 'project-1',
+          section: 'health',
+          alert_id: secondAlertId,
+          action: 'dismiss_alert',
+        },
+        mutation: {
+          method: 'POST',
+          path: `/api/admin/alerts/${secondAlertId}/dismiss`,
+          body: {},
+        },
+      },
+    ];
+
+    mount({
+      strategicState: { work_session: { commands } } as StrategicStateResponse,
+      refreshWorkbench,
+      setCommandPaletteOpen,
+    });
+
+    expect(captured.find(item => item.id === 'attention.messages.mark_seen')).toMatchObject({
+      section: 'Messages',
+      detail: 'Messages',
+      disabled: false,
+    });
+    expect(captured.find(item => item.id === `attention.alert.dismiss:${alertId}`)).toMatchObject({
+      label: 'Dismiss alert: Runner offline (11111111)',
+      section: 'Attention',
+      detail: 'Runtime health / alert 11111111',
+      disabled: false,
+    });
+    expect(captured.find(item => item.id === `attention.alert.dismiss:${secondAlertId}`)).toMatchObject({
+      label: 'Dismiss alert: Account quota (22222222)',
+      section: 'Attention',
+      detail: 'Runtime health / alert 22222222',
+      disabled: false,
+    });
+
+    captured.find(item => item.id === 'attention.messages.mark_seen')?.run();
+    captured.find(item => item.id === `attention.alert.dismiss:${alertId}`)?.run();
+
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+    expect(apiFetchMock).toHaveBeenNthCalledWith(1, '/api/admin/messages/last-seen', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project_id: 'project-1', timestamp: 1_782_912_000_000 }),
+    });
+    expect(apiFetchMock).toHaveBeenNthCalledWith(2, `/api/admin/alerts/${alertId}/dismiss`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    await vi.waitFor(() => {
+      expect(refreshWorkbench).toHaveBeenCalledTimes(2);
+    });
+  });
+
   test.each([
     ['subpath', { method: 'PATCH', path: '/api/admin/projects/project-1/strategic-session/messages' }],
     ['wrong project', { method: 'PATCH', path: '/api/admin/projects/other-project/strategic-session' }],
@@ -606,6 +712,67 @@ describe('useWorkbenchCommands', () => {
     expect(apiFetchMock).not.toHaveBeenCalled();
     expect(refreshWorkbench).not.toHaveBeenCalled();
     expect(openStrategicContextTarget).toHaveBeenCalledWith(target);
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
+  test('does not execute unsafe attention housekeeping mutation descriptors', () => {
+    const refreshWorkbench = vi.fn();
+    const openStrategicContextTarget = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const alertId = '11111111-1111-1111-1111-111111111111';
+    const alertTarget = {
+      surface: 'runtime',
+      project_id: 'project-1',
+      section: 'health',
+      alert_id: '22222222-2222-2222-2222-222222222222',
+      action: 'dismiss_alert',
+    } as const;
+    const commands: StrategicWorkSessionCommand[] = [
+      {
+        id: 'attention.messages.mark_seen',
+        label: 'Mark messages seen',
+        group: 'attention',
+        priority: 'normal',
+        enabled: true,
+        target: {
+          surface: 'messages',
+          project_id: 'project-1',
+          action: 'mark_seen',
+        },
+        mutation: {
+          method: 'PUT',
+          path: '/api/admin/messages/last-seen',
+          body: { project_id: 'other-project', timestamp: 1_782_912_000_000 },
+        },
+      },
+      {
+        id: `attention.alert.dismiss:${alertId}`,
+        label: 'Dismiss alert: Runner offline (11111111)',
+        group: 'attention',
+        priority: 'normal',
+        enabled: true,
+        target: alertTarget,
+        mutation: {
+          method: 'POST',
+          path: `/api/admin/alerts/${alertId}/dismiss`,
+          body: {},
+        },
+      },
+    ];
+
+    mount({
+      strategicState: { work_session: { commands } } as StrategicStateResponse,
+      refreshWorkbench,
+      openStrategicContextTarget,
+      setCommandPaletteOpen,
+    });
+
+    captured.find(item => item.id === 'attention.messages.mark_seen')?.run();
+    captured.find(item => item.id === `attention.alert.dismiss:${alertId}`)?.run();
+
+    expect(apiFetchMock).not.toHaveBeenCalled();
+    expect(refreshWorkbench).not.toHaveBeenCalled();
+    expect(openStrategicContextTarget).toHaveBeenCalledWith(alertTarget);
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 

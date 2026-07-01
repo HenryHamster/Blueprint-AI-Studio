@@ -50,7 +50,7 @@ from app.models import (
 )
 from app.auth import get_current_user, require_admin
 from app.schemas import AgentStatusPayload
-from app.workbench_events import SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION
+from app.workbench_events import SURFACE_MESSAGES, SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -3825,9 +3825,20 @@ class TestAlerts:
         await db_session.commit()
         await db_session.refresh(alert)
 
-        resp = await client.post(f"/api/admin/alerts/{alert.id}/dismiss")
+        with patch("app.workbench_events.broadcast_to_project", new=AsyncMock()) as bcast:
+            resp = await client.post(f"/api/admin/alerts/{alert.id}/dismiss")
         assert resp.status_code == 200
         assert resp.json()["status"] == "dismissed"
+        bcast.assert_awaited_once()
+        assert bcast.await_args.args[:2] == (str(project.id), "workbench_refetch")
+        event_payload = bcast.await_args.args[2]
+        assert event_payload["resource"] == "alert"
+        assert event_payload["action"] == "dismissed"
+        assert event_payload["refetch"] == {
+            "surfaces": [SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION, SURFACE_MESSAGES],
+        }
+        assert event_payload["alert_id"] == str(alert.id)
+        assert event_payload["alert"]["alert_id"] == str(alert.id)
 
     @pytest.mark.asyncio
     async def test_dismiss_alert_not_found_returns_404(self, client: AsyncClient):

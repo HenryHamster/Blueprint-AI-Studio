@@ -55,6 +55,7 @@ from app.workbench_state import (
     workbench_state_exceeds_max_bytes, workbench_state_size_bytes,
 )
 from app.workbench_events import (
+    SURFACE_MESSAGES,
     SURFACE_RUNTIME,
     SURFACE_STRATEGIC_SESSION,
     emit_workbench_refetch,
@@ -442,6 +443,19 @@ async def dismiss_alert(
     alert.dismissed_at = _utcnow()
     session.add(alert)
     await session.commit()
+    await emit_workbench_refetch(
+        alert.project_id,
+        resource="alert",
+        action="dismissed",
+        refetch_surfaces=(SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION, SURFACE_MESSAGES),
+        summary_key="alert",
+        summary={
+            "alert_id": str(alert.id),
+            "severity": getattr(alert.severity, "value", alert.severity),
+            "title": alert.title,
+        },
+        alert_id=str(alert.id),
+    )
     return {"status": "dismissed"}
 
 

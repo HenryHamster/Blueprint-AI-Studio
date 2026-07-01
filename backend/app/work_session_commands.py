@@ -7,11 +7,14 @@ endpoints.
 
 from __future__ import annotations
 
+import uuid
+from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
 
 MAX_WORK_SESSION_COMMANDS = 24
+_MESSAGES_SURFACE = "messages"
 _STRATEGIC_SESSION_SURFACE = "strategic_session"
 _RUNTIME_SURFACE = "runtime"
 _COMMAND_TARGET_KEYS = (
@@ -114,6 +117,33 @@ def _command(
 def _strategic_session_endpoint(project_id: Any) -> str:
     encoded_project_id = quote(str(project_id), safe="")
     return f"/api/admin/projects/{encoded_project_id}/strategic-session"
+
+
+def _messages_last_seen_endpoint() -> str:
+    return "/api/admin/messages/last-seen"
+
+
+def _alert_dismiss_endpoint(alert_id: Any) -> str:
+    encoded_alert_id = quote(str(alert_id), safe="")
+    return f"/api/admin/alerts/{encoded_alert_id}/dismiss"
+
+
+def _now_epoch_ms() -> int:
+    return int(datetime.now(timezone.utc).timestamp() * 1000)
+
+
+def _uuid_text(value: Any) -> str | None:
+    try:
+        return str(uuid.UUID(str(value)))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _alert_dismiss_label(item: dict[str, Any], alert_id: str) -> str:
+    title = _compact_text(item.get("label"), max_chars=64)
+    if title:
+        return f"Dismiss alert: {title} ({alert_id[:8]})"
+    return f"Dismiss alert: {alert_id[:8]}"
 
 
 def _mode_command(
@@ -339,6 +369,82 @@ def _runner_preference_commands(
     return [command for command in commands if command]
 
 
+def _attention_commands(
+    *,
+    project_id: str,
+    attention: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not isinstance(attention, dict):
+        return []
+    counts = attention.get("counts") if isinstance(attention.get("counts"), dict) else {}
+    commands: list[dict[str, Any] | None] = []
+
+    unread_count = int(counts.get("unread") or 0)
+    if unread_count > 0:
+        commands.append(
+            _command(
+                "attention.messages.mark_seen",
+                "Mark messages seen",
+                group="attention",
+                priority="normal",
+                enabled=True,
+                target={
+                    "surface": "messages",
+                    "project_id": project_id,
+                    "action": "mark_seen",
+                },
+                refetch_surfaces=(_MESSAGES_SURFACE, _STRATEGIC_SESSION_SURFACE),
+                mutation=_mutation(
+                    method="PUT",
+                    path=_messages_last_seen_endpoint(),
+                    body={
+                        "project_id": project_id,
+                        "timestamp": _now_epoch_ms(),
+                    },
+                ),
+            )
+        )
+
+    items = attention.get("items")
+    emitted_alerts = 0
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict) or item.get("kind") != "alert":
+                continue
+            ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+            ref_kind = _compact_text(ref.get("kind"), max_chars=40)
+            ref_project_id = _compact_text(ref.get("project_id"), max_chars=160)
+            alert_id = _uuid_text(ref.get("id"))
+            if ref_kind != "alert" or ref_project_id != project_id or not alert_id:
+                continue
+            commands.append(
+                _command(
+                    f"attention.alert.dismiss:{alert_id}",
+                    _alert_dismiss_label(item, alert_id),
+                    group="attention",
+                    priority="normal",
+                    enabled=True,
+                    target={
+                        "surface": "runtime",
+                        "project_id": project_id,
+                        "section": "health",
+                        "alert_id": alert_id,
+                        "action": "dismiss_alert",
+                    },
+                    refetch_surfaces=(_RUNTIME_SURFACE, _STRATEGIC_SESSION_SURFACE),
+                    mutation=_mutation(
+                        method="POST",
+                        path=_alert_dismiss_endpoint(alert_id),
+                    ),
+                )
+            )
+            emitted_alerts += 1
+            if emitted_alerts >= 4:
+                break
+
+    return [command for command in commands if command]
+
+
 def _action_command(action: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(action, dict):
         return None
@@ -364,6 +470,7 @@ def build_work_session_commands(
     workbench_state: dict[str, Any] | None,
     context_package: dict[str, Any] | None,
     local_runner: dict[str, Any] | None = None,
+    attention: dict[str, Any] | None = None,
     limit: int = MAX_WORK_SESSION_COMMANDS,
 ) -> list[dict[str, Any]]:
     """Build bounded work-session command descriptors from read-model inputs."""
@@ -386,6 +493,10 @@ def build_work_session_commands(
             project_id=project_id_text,
             workbench_state=workbench_state,
             local_runner=local_runner,
+        ),
+        *_attention_commands(
+            project_id=project_id_text,
+            attention=attention,
         ),
         *[
             command
