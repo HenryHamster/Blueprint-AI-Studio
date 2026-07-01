@@ -696,6 +696,8 @@ function taskFocusBucket(focus: StrategicStateTaskFocus | null | undefined, key:
 
 function taskFocusDetail(item: StrategicStateTaskFocusItem): string {
   const reasons = item.reasons ?? [];
+  const movementExplanation = item.movement_explanation?.trim();
+  if (movementExplanation) return movementExplanation;
   if (item.detail) return item.detail;
   if (item.latest_status_message) return item.latest_status_message;
   if (reasons.length > 0) return reasons.join(', ');

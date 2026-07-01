@@ -67,6 +67,7 @@ from app.project_message_projection import (
 from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
 from app.task_direction_refs import task_primary_direction_ids
+from app.task_movement import build_task_movement_explanation
 from app.onboarding_proof import build_onboarding_proof_block
 from app.strategic_context_package import (
     build_strategic_context_package_summary,
@@ -1464,6 +1465,7 @@ def _task_focus_item(
         or task.park_reason
         or task.latest_status_message
     )
+    movement_explanation = build_task_movement_explanation(task)
     return {
         "id": str(task.id),
         "bucket": bucket,
@@ -1472,6 +1474,7 @@ def _task_focus_item(
         "task_type": _compact_text(task_type, max_chars=80),
         "latest_status_message": _compact_text(task.latest_status_message, max_chars=180),
         "detail": _compact_text(detail, max_chars=220),
+        "movement_explanation": _compact_text(movement_explanation, max_chars=220),
         "requires_approval": bool(task.requires_approval),
         "reasons": _task_focus_reasons(task),
         "direction_id": direction_id,
@@ -1531,6 +1534,7 @@ async def _task_focus_bucket(
                     Task.created_at,
                     Task.started_at,
                     Task.completed_at,
+                    Task.depends_on,
                     Task.blocker_kind,
                     Task.blocked_reason,
                     Task.blocked_at,
@@ -2263,7 +2267,11 @@ async def get_project_strategic_state(
     }
     work_session = {
         **work_session,
-        "events": await build_workbench_event_feed(session, project.id),
+        "events": await build_workbench_event_feed(
+            session,
+            project.id,
+            runtime_summary=runtime_summary,
+        ),
         "jobs": await build_work_session_command_jobs(
             session,
             project.id,

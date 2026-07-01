@@ -79,6 +79,7 @@ from app.schemas import (
 from app.project_message_projection import compact_text, message_preview_dict
 from app.task_outcomes import build_task_evaluation_summary
 from app.task_direction_refs import first_task_direction_id, task_related_direction_ids
+from app.task_movement import build_task_movement_explanation
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
     _ROLE_LEVEL,
@@ -1297,10 +1298,12 @@ def _task_sideboard_context(
         max_chars=220,
     )
     dependency_count = len(task.depends_on or [])
+    movement_explanation = build_task_movement_explanation(task)
     pipeline = {
         "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
         "child_count": child_count,
         "dependency_count": dependency_count,
+        "movement_explanation": compact_text(movement_explanation, max_chars=220),
         "blocked_reason": compact_text(
             task.blocked_reason or task.park_reason,
             max_chars=220,
@@ -1653,6 +1656,7 @@ async def get_task(
     )
 
     task_type = (task.first_payload).get("type", "create")
+    movement_explanation = build_task_movement_explanation(task)
     return {
         "id": str(task.id),
         "project_id": str(task.project_id),
@@ -1686,6 +1690,7 @@ async def get_task(
         # non-BLOCKED or pre-migration task; the admin UI guards on presence.
         "blocker_kind": task.blocker_kind,
         "blocked_reason": task.blocked_reason,
+        "movement_explanation": movement_explanation,
         "blocked_at": task.blocked_at.isoformat() if task.blocked_at else None,
         "recheck_after": task.recheck_after.isoformat() if task.recheck_after else None,
         # Durable PARKED-state metadata (alembic 0199). Nullable for any

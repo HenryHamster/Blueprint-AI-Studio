@@ -28,6 +28,7 @@ from app.strategic_runtime_work import (
     local_runner_hold_task_filters,
     task_awaiting_local_runner_since,
 )
+from app.task_movement import build_task_movement_explanation
 
 
 _HIGH_SIGNAL_MESSAGE_TYPES = (
@@ -124,6 +125,7 @@ def _task_attention_item(task: Task, *, reason: str, severity: str) -> dict[str,
         or task.park_reason
         or task.description
     )
+    movement_explanation = build_task_movement_explanation(task, max_chars=180)
     return {
         "id": f"task:{task.id}:{reason}",
         "kind": "task",
@@ -131,6 +133,7 @@ def _task_attention_item(task: Task, *, reason: str, severity: str) -> dict[str,
         "reason": reason,
         "label": label,
         "detail": _compact_text(detail or task.title, max_chars=180),
+        "movement_explanation": movement_explanation,
         "status": status,
         "created_at": task.created_at.isoformat() if task.created_at else None,
         "updated_at": task.updated_at.isoformat() if task.updated_at else None,

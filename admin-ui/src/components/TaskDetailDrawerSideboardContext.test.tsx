@@ -105,4 +105,52 @@ describe('TaskSideboardContextSection', () => {
     await user.click(screen.getByRole('button', { name: 'parent parent-task-abcdef' }));
     expect(onNavigateToTask).toHaveBeenCalledWith('parent-task-abcdef');
   });
+
+  test('prefers pipeline movement_explanation over blocked_reason', () => {
+    const task = makeTask();
+    const context = task.sideboard_context!;
+    render(
+      <TaskSideboardContextSection
+        task={{
+          ...task,
+          sideboard_context: {
+            ...context,
+            pipeline: {
+              ...context.pipeline,
+              blocked_reason: 'Raw pipeline blocker should stay hidden.',
+              movement_explanation: 'Backend normalized pipeline movement.',
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText('Backend normalized pipeline movement.')).toBeInTheDocument();
+    expect(screen.queryByText('Raw pipeline blocker should stay hidden.')).not.toBeInTheDocument();
+  });
+
+  test('includes the pipeline group when movement_explanation is the only pipeline detail', () => {
+    const task = makeTask();
+    const context = task.sideboard_context!;
+    render(
+      <TaskSideboardContextSection
+        task={{
+          ...task,
+          sideboard_context: {
+            ...context,
+            pipeline: {
+              parent_task_id: null,
+              child_count: 0,
+              dependency_count: 0,
+              blocked_reason: null,
+              movement_explanation: 'Only movement detail is present.',
+            },
+          },
+        }}
+      />,
+    );
+
+    expect(screen.getByText('Pipeline')).toBeInTheDocument();
+    expect(screen.getByText('Only movement detail is present.')).toBeInTheDocument();
+  });
 });

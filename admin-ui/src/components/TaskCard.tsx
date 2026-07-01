@@ -637,6 +637,9 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
 
   const durationStats = useDurationStats(task.project_id);
   const taskType = task.task_type ?? ((task.payloads?.[0] as Record<string, unknown>)?.type as string) ?? 'create';
+  const movementExplanation = task.movement_explanation?.trim();
+  const blockedDisplayReason = movementExplanation || task.blocked_reason;
+  const parkDisplayReason = movementExplanation || task.park_reason;
   const etaLabel = (() => {
     if (task.status !== 'IN_PROGRESS' && task.status !== 'PROVISIONING') return null;
     if (!task.started_at) return null;
@@ -1083,8 +1086,8 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
               </span>
             ) : null}
           </div>
-          {task.blocked_reason ? (
-            <p className="text-ui-md text-amber-200/80 break-words">{task.blocked_reason}</p>
+          {blockedDisplayReason ? (
+            <p className="text-ui-md text-amber-200/80 break-words">{blockedDisplayReason}</p>
           ) : (
             <p className="text-ui-md text-amber-200/60 italic">Parked on an unmet precondition</p>
           )}
@@ -1122,8 +1125,8 @@ export const TaskCard = memo(forwardRef<HTMLDivElement, TaskCardProps>(function 
               </span>
             ) : null}
           </div>
-          {task.park_reason ? (
-            <p className="text-ui-md text-violet-200/80 break-words">{task.park_reason}</p>
+          {parkDisplayReason ? (
+            <p className="text-ui-md text-violet-200/80 break-words">{parkDisplayReason}</p>
           ) : null}
           {(() => {
             if (!task.wake_registration?.deadline_at) return null;

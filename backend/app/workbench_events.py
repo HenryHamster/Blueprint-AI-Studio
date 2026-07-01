@@ -44,6 +44,13 @@ def _compact_str(value: Any, *, max_chars: int = 160) -> str | None:
     return f"{text[: max_chars - 1]}..."
 
 
+def _bounded_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _enum_value(value: Any) -> str:
     return value.value if hasattr(value, "value") else str(value)
 
@@ -400,6 +407,7 @@ async def build_workbench_event_feed(
     project_id: Any,
     *,
     limit: int = DEFAULT_WORKBENCH_EVENT_FEED_LIMIT,
+    runtime_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a bounded durable current-state event feed for the work session."""
 
@@ -486,6 +494,7 @@ async def build_workbench_event_feed(
         *[_task_feed_item(row) for row in task_rows],
         *[_alert_feed_item(row) for row in alert_rows],
         *[_cycle_feed_item(row) for row in cycle_rows],
+        *_runtime_feed_items(project_id, runtime_summary),
     ]
     items.sort(key=lambda item: item.get("occurred_at") or "", reverse=True)
     return {
@@ -494,6 +503,285 @@ async def build_workbench_event_feed(
         "has_more": len(items) > bounded_limit,
         "items": items[:bounded_limit],
     }
+
+
+def _runtime_feed_items(
+    project_id: Any,
+    runtime_summary: Mapping[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not isinstance(runtime_summary, Mapping):
+        return []
+    return [
+        *_local_runner_feed_items(project_id, runtime_summary.get("local_runner")),
+        *_compute_job_feed_items(project_id, runtime_summary.get("work")),
+    ]
+
+
+def _parse_runtime_occurred_at(*values: Any) -> datetime | None:
+    for value in values:
+        if isinstance(value, datetime):
+            return value
+        parsed = _parse_iso_datetime(value)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _local_runner_feed_items(
+    project_id: Any,
+    local_runner: Any,
+) -> list[dict[str, Any]]:
+    if not isinstance(local_runner, Mapping):
+        return []
+    items: list[dict[str, Any]] = []
+    runners = local_runner.get("runners")
+    runners = runners if isinstance(runners, list) else []
+    active_runner_id = _compact_str(local_runner.get("active_runner_id"), max_chars=80)
+    continuation = (
+        local_runner.get("continuation")
+        if isinstance(local_runner.get("continuation"), Mapping)
+        else {}
+    )
+    preferred_runner_id = _compact_str(
+        continuation.get("preferred_runner_id"),
+        max_chars=80,
+    )
+
+    for runner in runners:
+        if not isinstance(runner, Mapping):
+            continue
+        runner_id = _compact_str(runner.get("id"), max_chars=80)
+        if not runner_id:
+            continue
+        health = (
+            runner.get("health")
+            if isinstance(runner.get("health"), Mapping)
+            else {}
+        )
+        capabilities = (
+            runner.get("capabilities")
+            if isinstance(runner.get("capabilities"), Mapping)
+            else {}
+        )
+        is_live = health.get("is_live") is True
+        blocked_reason = _compact_str(runner.get("blocked_reason"), max_chars=120)
+        device_status = _compact_str(health.get("device_status"), max_chars=80)
+        action = (
+            "selected"
+            if runner.get("is_active_runner") is True
+            else "preferred"
+            if runner.get("is_preferred") is True
+            else "ready"
+            if runner.get("eligible_for_active_task") is True
+            else "unavailable"
+        )
+        title_status = device_status or ("live" if is_live else "offline")
+        summary_parts = [
+            _compact_str(runner.get("hostname"), max_chars=80) or "Local runner",
+            title_status,
+        ]
+        if blocked_reason:
+            summary_parts.append(blocked_reason)
+        items.append(
+            _feed_item(
+                project_id,
+                item_id=f"local_runner:{runner_id}:{action}",
+                occurred_at=_parse_runtime_occurred_at(
+                    runner.get("last_seen_at"),
+                    runner.get("created_at"),
+                ),
+                source="runtime",
+                resource="local_runner",
+                action=action,
+                title=f"Local runner {action}",
+                summary=" - ".join(summary_parts),
+                tone="active"
+                if action in {"selected", "ready"}
+                else "warning"
+                if action == "unavailable"
+                else "neutral",
+                ref={"kind": "local_runner", "id": runner_id},
+                target={
+                    "surface": "runtime",
+                    "section": "devices",
+                    "runner_id": runner_id,
+                },
+                refetch_surfaces=(SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION),
+                data={
+                    "runner_id": runner_id,
+                    "hostname": _compact_str(runner.get("hostname"), max_chars=160),
+                    "is_active_runner": runner.get("is_active_runner") is True,
+                    "is_preferred": runner.get("is_preferred") is True,
+                    "eligible_for_active_task": runner.get("eligible_for_active_task")
+                    is True,
+                    "blocked_reason": blocked_reason,
+                    "health": {
+                        key: health.get(key)
+                        for key in (
+                            "device_status",
+                            "device_status_reason",
+                            "stale_reason",
+                            "is_live",
+                            "agent_available",
+                            "active_work_count",
+                            "active_compute_job_count",
+                            "available_slots",
+                            "max_concurrent",
+                        )
+                        if key in health
+                    },
+                    "capabilities": {
+                        key: capabilities.get(key)
+                        for key in (
+                            "runner_preset",
+                            "workload",
+                            "has_gpu",
+                            "max_concurrent",
+                            "agent_available",
+                        )
+                        if key in capabilities
+                    },
+                },
+            )
+        )
+
+    if not runners and (
+        _bounded_int(local_runner.get("strategic_runner_count")) > 0
+        or local_runner.get("active_task_pinned") is True
+        or preferred_runner_id
+    ):
+        mode = _compact_str(local_runner.get("mode"), max_chars=80) or "unknown"
+        reason = _compact_str(
+            local_runner.get("fallback_reason") or local_runner.get("status_reason"),
+            max_chars=120,
+        )
+        items.append(
+            _feed_item(
+                project_id,
+                item_id=(
+                    f"local_runner:selection:{mode}:"
+                    f"{active_runner_id or preferred_runner_id or 'none'}"
+                ),
+                occurred_at=None,
+                source="runtime",
+                resource="local_runner",
+                action=mode,
+                title="Local runner selection",
+                summary=reason,
+                tone="warning" if reason else "neutral",
+                target={"surface": "runtime", "section": "devices"},
+                refetch_surfaces=(SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION),
+                data={
+                    "mode": mode,
+                    "status": _compact_str(local_runner.get("status"), max_chars=80),
+                    "location": _compact_str(
+                        local_runner.get("location"),
+                        max_chars=80,
+                    ),
+                    "status_reason": _compact_str(
+                        local_runner.get("status_reason"),
+                        max_chars=120,
+                    ),
+                    "active_runner_id": active_runner_id,
+                    "preferred_runner_id": preferred_runner_id,
+                    "strategic_runner_count": _bounded_int(
+                        local_runner.get("strategic_runner_count")
+                    ),
+                    "live_runner_count": _bounded_int(
+                        local_runner.get("live_runner_count")
+                    ),
+                    "eligible_live_count": _bounded_int(
+                        local_runner.get("eligible_live_count")
+                    ),
+                },
+            )
+        )
+    return items
+
+
+def _compute_job_feed_items(
+    project_id: Any,
+    runtime_work: Any,
+) -> list[dict[str, Any]]:
+    if not isinstance(runtime_work, Mapping):
+        return []
+    compute_jobs = (
+        runtime_work.get("compute_jobs")
+        if isinstance(runtime_work.get("compute_jobs"), Mapping)
+        else {}
+    )
+    job_items = compute_jobs.get("items")
+    if not isinstance(job_items, list):
+        return []
+    items: list[dict[str, Any]] = []
+    for job in job_items:
+        if not isinstance(job, Mapping):
+            continue
+        job_id = _compact_str(job.get("id"), max_chars=80)
+        status = _compact_str(job.get("status"), max_chars=80)
+        if not job_id or not status:
+            continue
+        action = status.lower()
+        task_title = _compact_str(job.get("task_title"), max_chars=120)
+        terminal_reason = _compact_str(job.get("terminal_reason"), max_chars=180)
+        title = f"Compute job {action.replace('_', ' ')}"
+        if task_title:
+            title = f"{title}: {task_title}"
+        data = {
+            "job_id": job_id,
+            "task_id": _compact_str(job.get("task_id"), max_chars=80),
+            "task_type": _compact_str(job.get("task_type"), max_chars=80),
+            "status": status,
+            "backend": _compact_str(job.get("backend"), max_chars=80),
+            "machine_type": _compact_str(job.get("machine_type"), max_chars=120),
+            "accelerator_type": _compact_str(
+                job.get("accelerator_type"),
+                max_chars=80,
+            ),
+            "accelerator_count": job.get("accelerator_count"),
+            "spend_cap_usd": job.get("spend_cap_usd"),
+            "cost_usd": job.get("cost_usd"),
+            "started_at": _compact_str(job.get("started_at"), max_chars=80),
+            "completed_at": _compact_str(job.get("completed_at"), max_chars=80),
+            "last_heartbeat_at": _compact_str(
+                job.get("last_heartbeat_at"),
+                max_chars=80,
+            ),
+            "terminal_reason": terminal_reason,
+        }
+        target = {"surface": "runtime", "section": "compute"}
+        task_id = data["task_id"]
+        if task_id:
+            target["task_id"] = task_id
+        items.append(
+            _feed_item(
+                project_id,
+                item_id=f"compute_job:{job_id}:{action}",
+                occurred_at=_parse_runtime_occurred_at(
+                    job.get("completed_at"),
+                    job.get("updated_at"),
+                    job.get("started_at"),
+                    job.get("created_at"),
+                ),
+                source="runtime",
+                resource="compute_job",
+                action=action,
+                title=title,
+                summary=terminal_reason,
+                tone="critical"
+                if status in {"FAILED", "TIMED_OUT"}
+                else "warning"
+                if status == "CANCELLED"
+                else "active"
+                if status in {"QUEUED", "STARTING", "RUNNING", "POLLING"}
+                else "neutral",
+                ref={"kind": "compute_job", "id": job_id},
+                target=target,
+                refetch_surfaces=(SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION),
+                data={key: value for key, value in data.items() if value is not None},
+            )
+        )
+    return items
 
 
 async def emit_workbench_refetch(

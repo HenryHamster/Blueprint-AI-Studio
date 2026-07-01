@@ -661,6 +661,17 @@ describe('TaskCard BLOCKED status', () => {
     expect(screen.getByText('file_conflict')).toBeInTheDocument();
   });
 
+  it('prefers movement_explanation over the raw blocker reason', () => {
+    const task = makeTask({
+      status: 'BLOCKED',
+      blocked_reason: 'Raw blocker reason should stay hidden',
+      movement_explanation: 'Backend normalized why this task cannot move.',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('Backend normalized why this task cannot move.')).toBeInTheDocument();
+    expect(screen.queryByText('Raw blocker reason should stay hidden')).toBeNull();
+  });
+
   it('renders cleanly for a BLOCKED task with no blocker metadata (backward compat)', () => {
     const task = makeTask({ status: 'BLOCKED' });
     render(<TaskCard task={task} {...baseProps} />);
@@ -707,6 +718,17 @@ describe('TaskCard BLOCKED status', () => {
     render(<TaskCard task={task} {...baseProps} />);
     expect(screen.getByTitle(/Dismiss — marks this failed task cancelled/)).toBeInTheDocument();
     expect(screen.getByTitle(/Archive — moves this task off the board/)).toBeInTheDocument();
+  });
+
+  it('prefers movement_explanation over the raw parked reason', () => {
+    const task = makeTask({
+      status: 'PARKED',
+      park_reason: 'Raw parked reason should stay hidden',
+      movement_explanation: 'Backend normalized why this task is parked.',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('Backend normalized why this task is parked.')).toBeInTheDocument();
+    expect(screen.queryByText('Raw parked reason should stay hidden')).toBeNull();
   });
 });
 

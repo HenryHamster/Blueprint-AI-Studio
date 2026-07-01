@@ -579,6 +579,7 @@ async def test_strategic_state_task_focus_uses_full_project_scope(
     assert approval_row["id"] == str(approval_task.id)
     assert approval_row["direction_id"] == "d-approval"
     assert approval_row["requires_approval"] is True
+    assert approval_row["movement_explanation"] == "Waiting for operator approval."
     assert "approval" in approval_row["reasons"]
 
     friction = focus["buckets"]["friction"]
@@ -587,6 +588,7 @@ async def test_strategic_state_task_focus_uses_full_project_scope(
     assert blocked_row["id"] == str(blocked_task.id)
     assert blocked_row["direction_id"] == "d-blocked"
     assert blocked_row["blocked_reason"] == "Needs local runner registration"
+    assert blocked_row["movement_explanation"] == "Needs local runner registration"
     assert "blocked" in blocked_row["reasons"]
 
     queued = focus["buckets"]["queued"]
@@ -594,6 +596,9 @@ async def test_strategic_state_task_focus_uses_full_project_scope(
     assert queued["has_more"] is True
     assert queued["items"][0]["id"] == str(old_queued_task.id)
     assert queued["items"][0]["direction_id"] == "d-queued-context"
+    assert queued["items"][0]["movement_explanation"] == (
+        "Queued for the next available pipeline slot."
+    )
     assert all(row["id"] != str(approval_task.id) for row in queued["items"])
 
     completed = focus["buckets"]["recent_completed"]
@@ -683,6 +688,20 @@ async def test_strategic_state_reports_active_local_strategic_runner(
     assert local_runner["liveness_window_seconds"] == 300
     assert data["work_session"]["status"] == "working"
     assert data["work_session"]["location"] == "locally"
+    runner_events = [
+        item
+        for item in data["work_session"]["events"]["items"]
+        if item["resource"] == "local_runner"
+    ]
+    assert len(runner_events) == 1
+    assert runner_events[0]["action"] == "selected"
+    assert runner_events[0]["target"] == {
+        "surface": "runtime",
+        "section": "devices",
+        "runner_id": str(runner.id),
+    }
+    assert runner_events[0]["data"]["health"]["is_live"] is True
+    assert "token_hash" not in str(runner_events[0])
 
 
 @pytest.mark.asyncio
@@ -3689,6 +3708,20 @@ async def test_strategic_state_includes_runtime_background_work(
     assert running_item["accelerator_type"] == "L4"
     failed_item = next(item for item in compute["items"] if item["status"] == "FAILED")
     assert len(failed_item["terminal_reason"]) <= 180
+    event_items = data["work_session"]["events"]["items"]
+    compute_events = [
+        item for item in event_items if item["resource"] == "compute_job"
+    ]
+    assert {item["action"] for item in compute_events} == {"running", "failed"}
+    running_event = next(item for item in compute_events if item["action"] == "running")
+    assert running_event["target"] == {
+        "surface": "runtime",
+        "section": "compute",
+        "task_id": str(active_task.id),
+    }
+    assert running_event["data"]["backend"] == "local"
+    assert "next_poll_at" not in running_event["data"]
+    assert "polling_metadata" not in running_event["data"]
 
     assert work["held_approvals"]["count"] == 1
     assert work["held_approvals"]["items"][0]["title"] == "Approve expensive benchmark"
@@ -3857,6 +3890,7 @@ async def test_strategic_state_surfaces_local_runner_holds(
     assert local_attention["severity"] == "needs_operator"
     assert local_attention["awaiting_since"] == awaiting_since
     assert "Waiting for local runner hardware" in local_attention["detail"]
+    assert local_attention["movement_explanation"] == "No eligible local runner is online."
 
     actions = {entry["id"]: entry for entry in data["work_session"]["actions"]}
     hold_action = actions[f"attention.task:{held_for_runner.id}:local_runner_hold"]
@@ -4097,6 +4131,10 @@ async def test_strategic_state_includes_operator_attention(
     assert f"alert:{dismissed_alert.id}" not in item_ids
     assert "direction:d-manual:manual_intervention" in item_ids
     assert all(len(item.get("detail") or "") <= 180 for item in attention["items"])
+    attention_items = {item["id"]: item for item in attention["items"]}
+    assert attention_items[
+        f"task:{approval_task.id}:approval_required"
+    ]["movement_explanation"] == "Waiting for operator approval."
 
     actions = data["work_session"]["actions"]
     assert len(actions) <= 10

@@ -137,6 +137,7 @@ const STATE: StrategicStateResponse = {
               title: 'Review backend focus contract',
               task_type: 'review',
               latest_status_message: 'Strategic needs an operator decision before merging.',
+              movement_explanation: 'Task movement normalized by backend contract.',
               detail: 'Approval requested for the task focus projection.',
               requires_approval: true,
               reasons: ['approval', 'evaluating'],
@@ -624,6 +625,9 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).toContain('Task focus');
     expect(host.textContent).toContain('Needs judgment');
     expect(host.textContent).toContain('Review backend focus contract');
+    expect(host.textContent).toContain('Task movement normalized by backend contract.');
+    expect(host.textContent).not.toContain('Approval requested for the task focus projection.');
+    expect(host.textContent).not.toContain('Strategic needs an operator decision before merging.');
     expect(host.textContent).toContain('Wire focus rows into the Strategic rail');
     expect(host.textContent).toContain('Extract Pipeline workspace');
     expect(host.textContent?.match(/Review backend focus contract/g) ?? []).toHaveLength(1);

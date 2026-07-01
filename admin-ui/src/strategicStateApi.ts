@@ -29,6 +29,7 @@ export interface StrategicStateTask {
   title?: string | null;
   task_type?: string | null;
   latest_status_message?: string | null;
+  movement_explanation?: string | null;
   started_at?: string | null;
   created_at?: string | null;
   updated_at?: string | null;
@@ -44,6 +45,7 @@ export interface StrategicStateAttentionItem {
   reason: string;
   label: string;
   detail?: string | null;
+  movement_explanation?: string | null;
   unread?: boolean;
   status?: string | null;
   created_at?: string | null;
@@ -631,6 +633,7 @@ export interface StrategicStateTaskFocusItem {
   title: string | null;
   task_type?: string | null;
   latest_status_message?: string | null;
+  movement_explanation?: string | null;
   detail?: string | null;
   requires_approval: boolean;
   reasons: string[];

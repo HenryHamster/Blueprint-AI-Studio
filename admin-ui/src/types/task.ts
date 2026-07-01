@@ -117,6 +117,7 @@ export interface TaskSideboardContext {
     child_count: number;
     dependency_count: number;
     blocked_reason?: string | null;
+    movement_explanation?: string | null;
   };
   artifacts: {
     total: number;
@@ -151,6 +152,7 @@ export interface Task {
   task_type?: TaskType;
   vm_instance_id?: string;
   latest_status_message?: string;
+  movement_explanation?: string | null;
   status_log?: { t: string; msg: string }[];
   created_by: string;
   requires_approval: boolean;

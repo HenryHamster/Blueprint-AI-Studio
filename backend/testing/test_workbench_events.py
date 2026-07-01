@@ -359,3 +359,146 @@ async def test_build_workbench_event_feed_uses_task_status_transition_time(db_se
         "project_message",
     ]
     assert feed["items"][0]["occurred_at"] == (now - timedelta(minutes=2)).isoformat()
+
+
+@pytest.mark.asyncio
+async def test_build_workbench_event_feed_adds_runtime_runner_and_compute_items(
+    db_session,
+):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    runner_id = str(uuid.uuid4())
+    job_id = str(uuid.uuid4())
+    runtime_summary = {
+        "local_runner": {
+            "mode": "local",
+            "status": "working",
+            "location": "locally",
+            "status_reason": None,
+            "strategic_runner_count": 1,
+            "live_runner_count": 1,
+            "eligible_live_count": 1,
+            "active_runner_id": runner_id,
+            "continuation": {"preferred_runner_id": runner_id},
+            "runners": [
+                {
+                    "id": runner_id,
+                    "hostname": "workstation-01",
+                    "last_seen_at": now.isoformat(),
+                    "created_at": (now - timedelta(hours=1)).isoformat(),
+                    "capabilities": {
+                        "runner_preset": "strategic_local",
+                        "has_gpu": True,
+                        "max_concurrent": 2,
+                        "secret_token": "must-not-leak",
+                    },
+                    "health": {
+                        "device_status": "ready",
+                        "is_live": True,
+                        "agent_available": True,
+                        "active_compute_job_count": 1,
+                        "available_slots": 1,
+                        "raw_polling_metadata": {"token": "must-not-leak"},
+                    },
+                    "eligible_for_active_task": True,
+                    "is_active_runner": True,
+                    "is_preferred": True,
+                }
+            ],
+        },
+        "work": {
+            "compute_jobs": {
+                "items": [
+                    {
+                        "id": job_id,
+                        "task_id": str(uuid.uuid4()),
+                        "task_title": "Run GPU benchmark",
+                        "task_type": "compute_experiment",
+                        "status": "RUNNING",
+                        "backend": "runner_subprocess",
+                        "machine_type": "gpu-small",
+                        "accelerator_type": "L4",
+                        "accelerator_count": 1,
+                        "spend_cap_usd": 8.0,
+                        "cost_usd": 1.25,
+                        "created_at": (now - timedelta(minutes=30)).isoformat(),
+                        "updated_at": (now - timedelta(minutes=1)).isoformat(),
+                        "started_at": (now - timedelta(minutes=20)).isoformat(),
+                        "last_heartbeat_at": (
+                            now - timedelta(seconds=30)
+                        ).isoformat(),
+                        "next_poll_at": now.isoformat(),
+                        "polling_metadata": {"token": "must-not-leak"},
+                    }
+                ]
+            }
+        },
+    }
+
+    feed = await build_workbench_event_feed(
+        db_session,
+        project.id,
+        limit=5,
+        runtime_summary=runtime_summary,
+    )
+
+    by_resource = {item["resource"]: item for item in feed["items"]}
+    assert set(by_resource) == {"local_runner", "compute_job"}
+
+    runner_item = by_resource["local_runner"]
+    assert runner_item["action"] == "selected"
+    assert runner_item["target"] == {
+        "surface": "runtime",
+        "section": "devices",
+        "runner_id": runner_id,
+    }
+    assert runner_item["data"]["health"]["active_compute_job_count"] == 1
+    assert runner_item["data"]["capabilities"] == {
+        "runner_preset": "strategic_local",
+        "has_gpu": True,
+        "max_concurrent": 2,
+    }
+
+    compute_item = by_resource["compute_job"]
+    assert compute_item["action"] == "running"
+    assert compute_item["title"] == "Compute job running: Run GPU benchmark"
+    assert compute_item["target"]["section"] == "compute"
+    assert compute_item["data"]["backend"] == "runner_subprocess"
+    assert compute_item["data"]["accelerator_type"] == "L4"
+    assert "next_poll_at" not in compute_item["data"]
+    assert "polling_metadata" not in compute_item["data"]
+    assert "must-not-leak" not in str(feed["items"])
+
+
+@pytest.mark.asyncio
+async def test_build_workbench_event_feed_tolerates_malformed_runtime_counts(
+    db_session,
+):
+    project = await _make_project(db_session)
+    runtime_summary = {
+        "local_runner": {
+            "mode": "pending_local",
+            "status": "waiting",
+            "active_task_pinned": True,
+            "strategic_runner_count": "not-a-number",
+            "live_runner_count": object(),
+            "eligible_live_count": None,
+            "continuation": {"preferred_runner_id": "runner-pref"},
+            "status_reason": "No runner heartbeat yet.",
+            "runners": [],
+        }
+    }
+
+    feed = await build_workbench_event_feed(
+        db_session,
+        project.id,
+        runtime_summary=runtime_summary,
+    )
+
+    assert len(feed["items"]) == 1
+    item = feed["items"][0]
+    assert item["resource"] == "local_runner"
+    assert item["action"] == "pending_local"
+    assert item["data"]["strategic_runner_count"] == 0
+    assert item["data"]["live_runner_count"] == 0
+    assert item["data"]["eligible_live_count"] == 0

@@ -22804,6 +22804,8 @@ class TestPostCommitPendingField:
         assert sideboard["pipeline"]["child_count"] == 1
         assert sideboard["pipeline"]["dependency_count"] == 0
         assert sideboard["pipeline"]["blocked_reason"] == "Waiting for reviewer feedback."
+        assert sideboard["pipeline"]["movement_explanation"] == "Waiting for reviewer feedback."
+        assert resp.json()["movement_explanation"] == "Waiting for reviewer feedback."
         assert sideboard["artifacts"]["total"] == 1
         assert sideboard["artifacts"]["by_type"] == {
             "PULL_REQUEST": 1,

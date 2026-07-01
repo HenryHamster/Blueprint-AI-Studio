@@ -125,6 +125,8 @@ export function TaskSideboardContextSection({
   const context = task.sideboard_context;
   if (!context) return null;
   const parentTaskId = context.pipeline.parent_task_id;
+  const pipelineMovementExplanation = context.pipeline.movement_explanation?.trim();
+  const pipelineReason = pipelineMovementExplanation || context.pipeline.blocked_reason;
   const direction = context.strategic.direction;
   const cycle = context.strategic.cycle;
   const recentMessages = context.messages.items.slice(0, 2);
@@ -145,7 +147,7 @@ export function TaskSideboardContextSection({
     parentTaskId ||
     context.pipeline.child_count > 0 ||
     context.pipeline.dependency_count > 0 ||
-    context.pipeline.blocked_reason,
+    pipelineReason,
   );
 
   return (
@@ -234,9 +236,9 @@ export function TaskSideboardContextSection({
                 <ContextStat label="Children" value={context.pipeline.child_count} />
               )}
             </div>
-            {context.pipeline.blocked_reason && (
+            {pipelineReason && (
               <div className="mt-2 break-words rounded border border-rose-500/25 bg-rose-500/5 px-2 py-1.5 text-sm text-rose-300">
-                {context.pipeline.blocked_reason}
+                {pipelineReason}
               </div>
             )}
           </ContextGroup>
