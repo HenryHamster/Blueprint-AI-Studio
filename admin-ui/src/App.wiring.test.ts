@@ -42,4 +42,12 @@ describe('App workbench wiring', () => {
     expect(appSource).toMatch(/<PrimaryTabNav[\s\S]*onTabChange=\{\(tab\) => \{[\s\S]*tab === 'pipeline' && s\.trackedTaskIds\.size > 0[\s\S]*openTrackedTaskStreams\(\);/);
     expect(appSource).toContain('Open tracked task streams in Pipeline');
   });
+
+  test('keeps bracket section cycling wired through the real Pipeline view state', () => {
+    expect(appSource).toContain("const PIPELINE_SECTION_ORDER: readonly PipelineSection[] = ['flow', 'board', 'archive'];");
+    expect(appSource).toMatch(/const applyPipelineSection = useCallback\(\(section: PipelineSection\) => \{[\s\S]*setPipelineSection\(section\);[\s\S]*setArchiveVisible\(section === 'archive'\);[\s\S]*if \(section === 'flow'\) setTaskViewMode\('pipeline'\);[\s\S]*if \(section === 'board'\) setTaskViewMode\('kanban'\);/);
+    expect(appSource).toMatch(/if \(activeTab === 'pipeline'\) \{[\s\S]*applyPipelineSection\(cycleSection\(PIPELINE_SECTION_ORDER, pipelineSection, direction\)\);[\s\S]*return true;/);
+    expect(appSource).toMatch(/searchShortcutBlocked: Boolean\(s\.showNewTaskModal \|\| s\.logTask \|\| transientWorkbenchPanelOpen\)/);
+    expect(appSource).toMatch(/transientPanelOpen: transientWorkbenchPanelOpen/);
+  });
 });

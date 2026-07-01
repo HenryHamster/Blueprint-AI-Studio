@@ -39,6 +39,7 @@ import { StrategicContextRail } from './components/StrategicContextRail';
 import { StrategicContextWorkspace } from './components/StrategicContextWorkspace';
 import { StrategicSessionControl, type StrategicAccountSpendStatus, type StrategicInteractionMode } from './components/StrategicSessionControl';
 import { CommandPaletteHost } from './components/CommandPaletteHost';
+import { KeyboardShortcutsOverlay } from './components/KeyboardShortcutsOverlay';
 import { parseArmingOutcome, workbenchArmingToastCopy } from './components/messageArming';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
 import { BoardSavedViewsBar, type BoardFilterSnapshot } from './components/BoardSavedViewsBar';
@@ -63,6 +64,17 @@ import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
 
 type StrategicSessionRefs = StrategicWorkbenchState['selected_refs'];
 type PipelineDirectionOption = { id: string; text: string };
+const PIPELINE_SECTION_ORDER: readonly PipelineSection[] = ['flow', 'board', 'archive'];
+const PROJECT_SECTION_ORDER: readonly ProjectSection[] = ['running-update', 'directions', 'problem-model', 'design-doc', 'manage'];
+const RUNTIME_SECTION_ORDER: readonly RuntimeSection[] = ['health', 'devices', 'compute', 'accounts', 'settings', 'analytics'];
+
+function cycleSection<T extends string>(sections: readonly T[], current: T, direction: -1 | 1): T {
+  if (sections.length === 0) return current;
+  const currentIndex = Math.max(0, sections.indexOf(current));
+  const nextIndex = (currentIndex + direction + sections.length) % sections.length;
+  return sections[nextIndex] ?? current;
+}
+
 export default function App() {
   const refreshStrategicReadModelRef = useRef<() => void>(() => {});
   const refreshMessagesRef = useRef<() => void>(() => {});
@@ -527,6 +539,7 @@ export default function App() {
     );
   }, [s.needsAttentionCount, strategicReadModel.data?.attention?.counts]);
   const { open: commandPaletteOpen, query: commandPaletteQuery, setOpen: setCommandPaletteOpen, setQuery: setCommandPaletteQuery } = useCommandPaletteState();
+  const [shortcutHelpOpen, setShortcutHelpOpen] = useState(false);
   const [strategicContextWorkspaceOpen, setStrategicContextWorkspaceOpen] = useState(false);
   const [strategicComposerFocusSignal, setStrategicComposerFocusSignal] = useState(0);
   useEffect(() => {
@@ -681,6 +694,27 @@ export default function App() {
   const [runtimeSection, setRuntimeSection] = useState<RuntimeSection>('health');
   const [runtimeConfigSection, setRuntimeConfigSection] = useState<RuntimeSettingsSection>('orchestrator');
   const { setActiveTab: setPrimaryTab, setShowArchive: setArchiveVisible, setViewMode: setTaskViewMode } = s;
+  const applyPipelineSection = useCallback((section: PipelineSection) => {
+    setPipelineSection(section);
+    setArchiveVisible(section === 'archive');
+    if (section === 'flow') setTaskViewMode('pipeline');
+    if (section === 'board') setTaskViewMode('kanban');
+  }, [setArchiveVisible, setTaskViewMode]);
+  const cycleCurrentWorkbenchSection = useCallback((direction: -1 | 1) => {
+    if (activeTab === 'pipeline') {
+      applyPipelineSection(cycleSection(PIPELINE_SECTION_ORDER, pipelineSection, direction));
+      return true;
+    }
+    if (activeTab === 'project') {
+      setProjectSection(cycleSection(PROJECT_SECTION_ORDER, projectSection, direction));
+      return true;
+    }
+    if (activeTab === 'runtime') {
+      setRuntimeSection(cycleSection(RUNTIME_SECTION_ORDER, runtimeSection, direction));
+      return true;
+    }
+    return false;
+  }, [activeTab, applyPipelineSection, pipelineSection, projectSection, runtimeSection]);
   useEffect(() => {
     if (!selectedProjectId || !strategicWorkbenchState?.active_surface) return;
     if (strategicWorkbenchOperatorSurfaceTouchedRef.current) return;
@@ -1060,21 +1094,31 @@ export default function App() {
     s.showFleetDetail ||
     strategicContextWorkspaceOpen,
   );
+  const transientWorkbenchPanelOpen = Boolean(
+    s.showResearchBrowser ||
+    s.showKnowledgeBrowser ||
+    s.showAlertsPopover ||
+    showActivityFeed,
+  );
 
   const { openCommandPalette } = useOperatorKeyboardShortcuts({
     activeTab,
     blockingModalOpen: operatorShortcutBlocked,
+    cycleCurrentSection: cycleCurrentWorkbenchSection,
     commandPaletteShortcutBlocked: modalShortcutBlocked,
     commandPaletteOpen, commands: workbenchCommands, searchInputRef,
-    searchShortcutBlocked: Boolean(s.showNewTaskModal || s.logTask || s.showResearchBrowser),
+    searchShortcutBlocked: Boolean(s.showNewTaskModal || s.logTask || transientWorkbenchPanelOpen),
     selectedTaskCount: s.selectedTaskIds.size, selectionMode: s.selectionMode, setCommandPaletteOpen,
     setKnowledgeBrowserDirectionId,
     setKnowledgeBrowserInitialDocId,
     setResearchBrowserDirectionId,
+    setShortcutHelpOpen,
     setShowActivityFeed,
     setShowAlertsPopover: s.setShowAlertsPopover,
     setShowKnowledgeBrowser: s.setShowKnowledgeBrowser,
     setShowResearchBrowser: s.setShowResearchBrowser,
+    shortcutHelpOpen,
+    transientPanelOpen: transientWorkbenchPanelOpen,
   });
 
   const pipelineSurfaceActions = (
@@ -1307,6 +1351,7 @@ export default function App() {
         costSectionAvailable={activeTab === 'runtime' && runtimeSection === 'analytics'}
       />
       <CommandPaletteHost open={commandPaletteOpen} commands={workbenchCommands} query={commandPaletteQuery} onQueryChange={setCommandPaletteQuery} setOpen={setCommandPaletteOpen} />
+      <KeyboardShortcutsOverlay open={shortcutHelpOpen} onClose={() => setShortcutHelpOpen(false)} />
       <StrategicContextWorkspace
         open={strategicContextWorkspaceOpen}
         state={strategicReadModel.data ?? null}

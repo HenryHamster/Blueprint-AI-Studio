@@ -8,7 +8,7 @@ The rule for this file: after every major batch, update the status ledger, miles
 
 ## Status Ledger
 
-Overall implementation estimate: 86%.
+Overall implementation estimate: 87%.
 
 Legend:
 - Done: implemented, reviewed, tested, and pushed.
@@ -23,7 +23,7 @@ Legend:
 | M1. Roadmap and tracking discipline | In progress | This document. | Keep this file updated after every pushed batch. |
 | M2. Persistent local Strategic workday mode | Done | Workbench state, 12-hour continuation markers, explicit marker ownership/lease diagnostics, duplicate-session protection, Strategic local runner requirement, local runner selection, attention for holds, stale Strategic hold timeout, and clearer Devices UI. | Only revisit explicit takeover or heartbeat fallback renewal if real multi-operator contention appears. |
 | M3. Messages as the active-work interface | Done | Shared `ProjectMessage` creation/projection, bounded workbench message context, minimal Strategic-session Chat, backend/frontend arming fixtures. | Keep regression coverage while M4/M5 add richer command and context surfaces. |
-| M4. Ctrl+K and hotkey operating layer | Partial | Command palette, shortcut hooks, server command descriptors, allowlisted command execution, shared target/refetch vocabulary for command routing. | Finish missing hotkeys and shortcut-help behavior. |
+| M4. Ctrl+K and hotkey operating layer | Partial | Command palette, shortcut hooks, server command descriptors, allowlisted command execution, shared target/refetch vocabulary, current-section bracket cycling, and keyboard shortcuts overlay. | Finish command registry/contract cleanup and remaining command semantics dedupe. |
 | M5. Strategic context and canvas/artifact surface | Done | Context package, selected refs, canvas descriptors, `StrategicContextWorkspace`, map/resource rows, Chat artifact slot, descriptor schema, renderer tests, golden fixtures. | Keep v1 read-only; revisit writable canvas/layout persistence only with a concrete requirement. |
 | M6. Pipeline monitoring and task sideboard | Done | Pipeline workspace, task tree, task rail, stale attention routing, task sideboard context, task-sideboard contract, Chat task-target drawer routing, waiting-vs-blocked health labels. | Further tracked-stream affordance polish can continue without reopening the sideboard contract. |
 | M7. Runtime, devices, accounts, settings, project management | Done | Canonical Project/Runtime settings homes, workspace-hosted settings router semantics, command/context routing to Project Manage and Runtime Settings/Accounts, reachability and viewport tests. | Keep regression coverage while remaining project/runtime policy work lands. |
@@ -195,12 +195,16 @@ Existing:
   - dismiss alert
 - Frontend maps server commands plus local navigation/action commands.
 
-Completed in latest batch:
+Completed in recent batches:
 - Added shared backend target/refetch vocabulary in `backend/app/workbench_targets.py`.
 - Reused that contract from work-session commands, command execution receipts/jobs, action targets, and event-feed target/refetch projection.
 - Added shared frontend target/refetch normalization in `admin-ui/src/types/workbenchTargets.ts`.
 - Routed command descriptors, attention targets, context navigation, and websocket refetch handling through the frontend helper without changing the public command-palette shape.
 - Preserved legacy `runtime/runners` target links by aliasing them to the current Runtime Devices section.
+- Added current-surface bracket cycling: `[` and `]` move between Pipeline, Project, or Runtime subtabs without creating a second navigation layer.
+- Added a compact `?` keyboard shortcuts overlay with dialog semantics, focus restore, Escape/backdrop/close handling, and no command-palette overloading.
+- Hardened `/` so modified slash chords do not steal focus, and disabled command palette/router shortcuts while the shortcuts overlay is open.
+- Added Escape handling for the shortcuts overlay and transient workbench panels without taking over the legacy task selection/log/archive Escape path.
 
 Remaining work:
 - Complete the command registry/contract beyond target/refetch normalization:
@@ -213,12 +217,8 @@ Remaining work:
   - executable vs navigation-only
   - mutation allowlist
 - Continue removing duplicated command semantics between backend and frontend where the command id and mutation allowlists still exist in both places.
-- Add missing hotkeys from the IA target:
-  - `[` and `]` for previous/next subtab within the current mode
-  - `/` to focus current mode search/filter where available
-  - `?` for shortcuts overlay
-  - unified `Esc` behavior for topmost overlay, selection, and mode defaults
-- Ensure hotkeys are disabled inside inputs, textareas, selects, and rich editors.
+- Extend `/` from the current task search to per-mode search/filter refs if Project or Runtime gain local filters.
+- Continue unifying `Esc` only where it reduces conflicts; legacy selection/log/archive behavior still owns its existing path.
 - Add command entries for the hidden message actions moved out of chat chrome.
 - Keep command execution scoped. Do not add arbitrary backend mutation execution without a real permission and validation layer.
 
@@ -228,6 +228,7 @@ Authoritative files:
 - `backend/app/workbench_targets.py`
 - `admin-ui/src/components/CommandPalette.tsx`
 - `admin-ui/src/components/CommandPaletteHost.tsx`
+- `admin-ui/src/components/KeyboardShortcutsOverlay.tsx`
 - `admin-ui/src/hooks/useWorkbenchCommands.ts`
 - `admin-ui/src/hooks/useOperatorKeyboardShortcuts.ts`
 - `admin-ui/src/hooks/useWorkbenchShortcutRouter.ts`
@@ -236,7 +237,7 @@ Authoritative files:
 
 Acceptance gates:
 - Backend tests cover every server command id and malformed/disabled/stale command rejection.
-- Frontend tests cover keyboard routing and all canonical targets.
+- Frontend tests cover keyboard routing, shortcut help, and all canonical targets.
 - Command palette viewport tests pass without overflow.
 - Review confirms every visible command either navigates somewhere real or executes an allowlisted mutation.
 
@@ -597,21 +598,21 @@ Final verification gates:
 
 ## Next Batch Recommendation
 
-Recommended next implementation batches: continue M4/M9 and M5/M6, then run M12 audit loops.
+Recommended next implementation batches: continue M4/M9 and M8, then run M12 audit loops.
 
 Scope:
-1. M4/M9: harden Ctrl+K commands, context targets, and backend/frontend fixtures.
-2. M5/M6: add first-class Chat canvas/artifact rendering and task sideboard fixture coverage.
+1. M4/M9: finish command registry semantics, mutation allowlist documentation, and backend/frontend fixture convergence.
+2. M8: finish lifecycle clearing semantics and performance review for larger event/metric volumes.
 3. Keep M7/M10 token and settings-home regression coverage current while lower-level panels change.
-4. Run M8 lifecycle/performance audit checks while contract fixtures expand.
-5. Start M12 completion audit passes once M5/M6/M9 have their fixture coverage.
+4. Start M12 completion audit passes once M4/M8/M9 have their remaining contract coverage.
 
-Reason: the highest-risk M2 reliability gap is closed, M3 has landed, and M7/M10 cleanup has landed; the next material progress is making command/contracts, canvas/sideboard, and read-model audit hardening move in parallel.
+Reason: the highest-risk M2 reliability gap is closed, M3/M5/M6/M7/M10 have landed, and the remaining material progress is now command/contracts plus read-model/event hardening.
 
 ## Update Log
 
 | Date | Commit | Change |
 | --- | --- | --- |
+| 2026-07-01 | M4 hotkey help | Added current-surface bracket cycling, compact keyboard shortcuts overlay, modified-slash guard, overlay shortcut blocking, transient-panel Escape handling, focused frontend tests, and roadmap update. |
 | 2026-07-01 | M8 read-model metrics | Added registry-backed work-session metric metadata and excluded operator command receipts from check-in delta counts. |
 | 2026-07-01 | M2 local Strategic reliability | Added bounded stale Strategic local runner hold timeout/recovery, frontend Devices/session state clarity, and focused tests. |
 | 2026-07-01 | roadmap creation | Created full usability roadmap and milestone ledger. |
