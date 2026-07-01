@@ -25,6 +25,7 @@ and this endpoint hands those pinned tasks to the polling runner.
 import logging
 import math
 import uuid
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -40,6 +41,7 @@ from app.models import ComputeJob, ComputeJobStatus, LocalRunner, Project, Task,
 from app.task_capabilities import agent_capability_slice
 from app.workbench_events import (
     SURFACE_RUNTIME,
+    SURFACE_STRATEGIC_SESSION,
     emit_workbench_refetch,
 )
 
@@ -51,6 +53,7 @@ _MAX_RUNNER_RESULT_METRICS_KEYS = 256
 _MAX_RUNNER_ARTIFACT_BYTES = 25 * 1024 * 1024  # 25 MiB
 # Allowance for multipart framing/headers when early-rejecting on Content-Length.
 _MULTIPART_BODY_MARGIN = 1 * 1024 * 1024  # 1 MiB
+_RUNNER_LIVENESS_SECONDS = 300
 
 logger = logging.getLogger("blueprint")
 
@@ -90,6 +93,42 @@ def _filter_result_metrics(raw: dict) -> dict:
 def _runner_capability_list(capabilities: Dict[str, Any], key: str) -> List[Any]:
     value = capabilities.get(key)
     return value if isinstance(value, list) else []
+
+
+def _runner_liveness_health(
+    *,
+    status: str | None,
+    last_seen_at: datetime | None,
+    now: datetime,
+) -> dict[str, Any]:
+    if last_seen_at is None:
+        seconds_since_last_seen = None
+    else:
+        seconds_since_last_seen = max(0, int((now - last_seen_at).total_seconds()))
+
+    is_live = (
+        status == "active"
+        and seconds_since_last_seen is not None
+        and seconds_since_last_seen < _RUNNER_LIVENESS_SECONDS
+    )
+    if is_live:
+        device_status = "connected"
+        stale_reason = None
+    elif status != "active":
+        device_status = "offline"
+        stale_reason = "inactive" if status == "inactive" else status
+    elif seconds_since_last_seen is None:
+        device_status = "stale"
+        stale_reason = "never_seen"
+    else:
+        device_status = "stale"
+        stale_reason = "heartbeat_stale"
+
+    return {
+        "device_status": device_status,
+        "is_live": is_live,
+        "stale_reason": stale_reason,
+    }
 
 
 class HeartbeatRequest(BaseModel):
@@ -193,9 +232,16 @@ async def heartbeat(
     previous_status = runner.status
     previous_hostname = runner.hostname
     previous_version = runner.version
+    previous_last_seen_at = runner.last_seen_at
     previous_caps = dict(runner.capabilities or {})
+    now = _utcnow()
+    previous_health = _runner_liveness_health(
+        status=previous_status,
+        last_seen_at=previous_last_seen_at,
+        now=now,
+    )
 
-    runner.last_seen_at = _utcnow()
+    runner.last_seen_at = now
     # Re-arm an inactive runner on every authenticated heartbeat. The stale-runner
     # sweep flips active->inactive after a single missed 300s window (slept/network-
     # dropped host); a successful heartbeat is proof of liveness, so flip it back to
@@ -224,8 +270,18 @@ async def heartbeat(
     runner.capabilities = caps
     session.add(runner)
     await session.commit()
+    current_health = _runner_liveness_health(
+        status=runner.status,
+        last_seen_at=runner.last_seen_at,
+        now=now,
+    )
+    liveness_recovered = (
+        not bool(previous_health.get("is_live"))
+        and bool(current_health.get("is_live"))
+    )
     runtime_state_changed = (
-        previous_status != runner.status
+        liveness_recovered
+        or previous_status != runner.status
         or previous_hostname != runner.hostname
         or previous_version != runner.version
         or _runner_capability_list(previous_caps, "active_task_ids")
@@ -242,7 +298,7 @@ async def heartbeat(
             runner.project_id,
             resource="local_runner",
             action="heartbeat",
-            refetch_surfaces=(SURFACE_RUNTIME,),
+            refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
             summary_key="runner",
             summary={
                 "id": str(runner.id),

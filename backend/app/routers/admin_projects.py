@@ -60,7 +60,10 @@ from app.project_message_creation import (
     create_operator_project_message,
     parse_operator_message_type,
 )
-from app.project_message_projection import message_preview_dict
+from app.project_message_projection import (
+    MESSAGE_EVENT_REFETCH_SURFACES,
+    message_preview_dict,
+)
 from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
 from app.task_direction_refs import task_primary_direction_ids
@@ -83,7 +86,6 @@ from app.workbench_state import (
     workbench_state_size_bytes,
 )
 from app.workbench_events import (
-    SURFACE_STRATEGIC_SESSION,
     build_workbench_event_feed,
     emit_workbench_refetch,
 )
@@ -2395,7 +2397,7 @@ async def create_project_strategic_session_check_in(
             project_id,
             resource="strategic_check_in",
             action="created",
-            refetch_surfaces=(SURFACE_STRATEGIC_SESSION,),
+            refetch_surfaces=MESSAGE_EVENT_REFETCH_SURFACES,
             summary_key="check_in",
             summary={
                 "message_id": str(message.id),

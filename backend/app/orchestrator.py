@@ -125,6 +125,11 @@ from app.time_utils import (
     rate_limit_retry_minutes,
     set_retry_after,
 )
+from app.workbench_events import (
+    SURFACE_RUNTIME,
+    SURFACE_STRATEGIC_SESSION,
+    emit_workbench_refetch,
+)
 
 logger = logging.getLogger("blueprint")
 
@@ -1247,9 +1252,9 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
     from sqlalchemy import or_, update as _sa_update
 
     cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
-    stale_ids = (
+    stale_rows = (
         await session.execute(
-            select(LocalRunner.id).where(
+            select(LocalRunner.id, LocalRunner.project_id).where(
                 LocalRunner.status == "active",
                 or_(
                     LocalRunner.last_seen_at.is_(None),
@@ -1257,9 +1262,15 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
                 ),
             )
         )
-    ).scalars().all()
+    ).all()
+    stale_ids = [runner_id for runner_id, _project_id in stale_rows]
     if not stale_ids:
         return
+    stale_counts_by_project: dict[uuid.UUID, int] = {}
+    for _runner_id, project_id in stale_rows:
+        stale_counts_by_project[project_id] = (
+            stale_counts_by_project.get(project_id, 0) + 1
+        )
 
     await session.execute(
         _sa_update(LocalRunner)
@@ -1281,6 +1292,7 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
             )
         )
     ).scalars().all()
+    released_pins_by_project: dict[uuid.UUID, int] = {}
     for task in pinned:
         task.status = TaskStatus.QUEUED
         task.vm_instance_id = None
@@ -1289,6 +1301,9 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
         new_ctx.pop("runner_target_id", None)
         task.context = new_ctx
         session.add(task)
+        released_pins_by_project[task.project_id] = (
+            released_pins_by_project.get(task.project_id, 0) + 1
+        )
         logger.info(
             "[RUNNERS] Released unpulled pin for task %s from a now-inactive "
             "runner (back to QUEUED for re-dispatch)",
@@ -1296,6 +1311,26 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
         )
 
     await session.commit()
+    for project_id, deactivated_count in stale_counts_by_project.items():
+        try:
+            await emit_workbench_refetch(
+                project_id,
+                resource="local_runner",
+                action="deactivated_stale",
+                refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+                summary_key="runners",
+                summary={
+                    "deactivated_count": deactivated_count,
+                    "released_unpulled_pins": released_pins_by_project.get(
+                        project_id, 0
+                    ),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to emit stale-runner refetch for project %s",
+                project_id,
+            )
 
 
 async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:

@@ -621,7 +621,10 @@ class TestRunnerEndpoints:
         assert emit.await_args.args[0] == runner.project_id
         assert emit.await_args.kwargs["resource"] == "local_runner"
         assert emit.await_args.kwargs["action"] == "heartbeat"
-        assert emit.await_args.kwargs["refetch_surfaces"] == ("runtime",)
+        assert emit.await_args.kwargs["refetch_surfaces"] == (
+            "strategic_session",
+            "runtime",
+        )
         assert emit.await_args.kwargs["summary"] == {
             "id": str(runner.id),
             "status": "active",
@@ -631,13 +634,14 @@ class TestRunnerEndpoints:
         }
 
     @pytest.mark.asyncio
-    async def test_heartbeat_skips_refetch_when_only_liveness_changes(
+    async def test_heartbeat_emits_refetch_when_stale_runner_becomes_live(
         self, client: AsyncClient, db_session
     ):
         project = await _make_project(db_session)
         runner, token = await _make_runner(
             db_session,
             project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=9),
             capabilities={
                 "active_task_ids": ["task-1"],
                 "active_compute_job_ids": ["job-1"],
@@ -660,7 +664,21 @@ class TestRunnerEndpoints:
             )
 
         assert resp.status_code == 200
-        emit.assert_not_awaited()
+        emit.assert_awaited_once()
+        assert emit.await_args.args[0] == runner.project_id
+        assert emit.await_args.kwargs["resource"] == "local_runner"
+        assert emit.await_args.kwargs["action"] == "heartbeat"
+        assert emit.await_args.kwargs["refetch_surfaces"] == (
+            "strategic_session",
+            "runtime",
+        )
+        assert emit.await_args.kwargs["summary"] == {
+            "id": str(runner.id),
+            "status": "active",
+            "active_task_count": 1,
+            "active_compute_job_count": 1,
+            "agent_available": True,
+        }
 
     @pytest.mark.asyncio
     async def test_heartbeat_skips_refetch_for_default_empty_active_work(
@@ -1561,6 +1579,69 @@ class TestOrchestratorRunnerRouting:
         await db_session.refresh(stale)
         assert fresh.status == "active"
         assert stale.status == "inactive"
+
+    @pytest.mark.asyncio
+    async def test_deactivate_stale_runners_emits_grouped_workbench_refetch(
+        self, db_session
+    ):
+        project_a = await _make_project(db_session, name="Runner Project A")
+        project_b = await _make_project(db_session, name="Runner Project B")
+        fresh, _ = await _make_runner(db_session, project_a.id, last_seen_at=_utcnow())
+        stale_a1, _ = await _make_runner(
+            db_session, project_a.id, last_seen_at=_utcnow() - timedelta(minutes=10)
+        )
+        stale_a2, _ = await _make_runner(
+            db_session, project_a.id, last_seen_at=_utcnow() - timedelta(minutes=11)
+        )
+        stale_b, _ = await _make_runner(
+            db_session, project_b.id, last_seen_at=_utcnow() - timedelta(minutes=12)
+        )
+        pinned = Task(
+            project_id=project_a.id,
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{stale_a1.id}",
+            vm_provisioned_at=_utcnow(),
+            context={"runner_target_id": str(stale_a1.id)},
+        )
+        db_session.add(pinned)
+        await db_session.commit()
+
+        with patch(
+            "app.orchestrator.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            await orch._deactivate_stale_runners(db_session)
+
+        await db_session.refresh(fresh)
+        await db_session.refresh(stale_a1)
+        await db_session.refresh(stale_a2)
+        await db_session.refresh(stale_b)
+        assert fresh.status == "active"
+        assert stale_a1.status == "inactive"
+        assert stale_a2.status == "inactive"
+        assert stale_b.status == "inactive"
+
+        assert emit.await_count == 2
+        calls_by_project = {call.args[0]: call for call in emit.await_args_list}
+        assert set(calls_by_project) == {project_a.id, project_b.id}
+        for call in calls_by_project.values():
+            assert call.kwargs["resource"] == "local_runner"
+            assert call.kwargs["action"] == "deactivated_stale"
+            assert call.kwargs["refetch_surfaces"] == (
+                "strategic_session",
+                "runtime",
+            )
+            assert call.kwargs["summary_key"] == "runners"
+
+        assert calls_by_project[project_a.id].kwargs["summary"] == {
+            "deactivated_count": 2,
+            "released_unpulled_pins": 1,
+        }
+        assert calls_by_project[project_b.id].kwargs["summary"] == {
+            "deactivated_count": 1,
+            "released_unpulled_pins": 0,
+        }
 
     @pytest.mark.asyncio
     async def test_deactivate_stale_runners_null_last_seen_at(self, db_session):

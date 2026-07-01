@@ -35,6 +35,7 @@ from app.models import (
     _utcnow,
 )
 from app.workbench_state import sanitize_strategic_session_snapshot
+from app.workbench_events import SURFACE_MESSAGES, SURFACE_STRATEGIC_SESSION
 
 TEST_USER_ID = "test-user-123"
 
@@ -2629,10 +2630,7 @@ async def test_strategic_session_check_in_records_quiet_durable_receipt(
         },
     }
 
-    with patch(
-        "app.routers.admin_projects.emit_workbench_refetch",
-        new_callable=AsyncMock,
-    ) as emit_refetch:
+    with patch("app.workbench_events.broadcast_to_project", new=AsyncMock()) as bcast:
         first = await client.post(
             f"/api/admin/projects/{project.id}/strategic-session/check-in",
             json=body,
@@ -2647,15 +2645,16 @@ async def test_strategic_session_check_in_records_quiet_durable_receipt(
     assert first.json()["check_in"]["status"] == "created"
     assert second.json()["check_in"]["status"] == "duplicate"
     assert second.json()["check_in"]["message_id"] == first.json()["check_in"]["message_id"]
-    emit_refetch.assert_awaited_once()
-    assert emit_refetch.await_args.args[0] == project.id
-    assert emit_refetch.await_args.kwargs["resource"] == "strategic_check_in"
-    assert emit_refetch.await_args.kwargs["action"] == "created"
-    assert emit_refetch.await_args.kwargs["refetch_surfaces"] == (
-        "strategic_session",
-    )
-    assert emit_refetch.await_args.kwargs["message_id"] == first.json()["check_in"]["message_id"]
-    assert emit_refetch.await_args.kwargs["summary"]["message_id"] == first.json()["check_in"]["message_id"]
+    bcast.assert_awaited_once()
+    assert bcast.await_args.args[:2] == (str(project.id), "workbench_refetch")
+    event_payload = bcast.await_args.args[2]
+    assert event_payload["resource"] == "strategic_check_in"
+    assert event_payload["action"] == "created"
+    assert event_payload["refetch"] == {
+        "surfaces": [SURFACE_MESSAGES, SURFACE_STRATEGIC_SESSION],
+    }
+    assert event_payload["message_id"] == first.json()["check_in"]["message_id"]
+    assert event_payload["check_in"]["message_id"] == first.json()["check_in"]["message_id"]
 
     message_id = uuid.UUID(first.json()["check_in"]["message_id"])
     msg = await db_session.get(ProjectMessage, message_id)
