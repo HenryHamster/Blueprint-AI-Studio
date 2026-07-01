@@ -329,6 +329,7 @@ describe('StrategicContextWorkspace', () => {
 
     expect(host.textContent).toContain('Strategic context');
     expect(host.textContent).toContain('Session');
+    expect(host.querySelector('[data-testid="strategic-session-control"]')).not.toBeNull();
     expect(host.textContent).toContain('Workday');
     expect(host.textContent).toContain('Runner');
     expect(host.textContent).toContain('1 runner ready');
@@ -351,6 +352,53 @@ describe('StrategicContextWorkspace', () => {
     expect(host.textContent).toContain('Operator context brief');
     expect(host.textContent).toContain('Latest pull request');
     expect(host.textContent).toContain('running update 1');
+  });
+
+  test('exposes Strategic mode, check-in, and account controls from the drawer', () => {
+    const onClose = vi.fn();
+    const onModeChange = vi.fn();
+    const onCheckIn = vi.fn();
+    const onOpenAccounts = vi.fn();
+    const { host } = mount({
+      onClose,
+      onModeChange,
+      onCheckIn,
+      onOpenAccounts,
+      accountSpend: {
+        totalAccounts: 3,
+        availableAccounts: 2,
+        enabledAccounts: 3,
+        cooldownAccounts: 0,
+        trackedSpendUsd: 12.34,
+      },
+    });
+
+    const control = host.querySelector('[data-testid="strategic-session-control"]');
+    expect(control?.textContent).toContain('Workday');
+    expect(control?.textContent).toContain('Mark checked');
+    expect(control?.textContent).toContain('Accounts');
+
+    const buttons = Array.from(host.querySelectorAll('button'));
+    expect(buttons.filter(button => button.title === 'Open Runner')).toHaveLength(1);
+    expect(buttons.filter(button => button.title === 'Open Compute')).toHaveLength(1);
+    expect(buttons.some(button => button.getAttribute('aria-label')?.startsWith('Open devices: runner'))).toBe(false);
+    expect(buttons.some(button => button.getAttribute('aria-label')?.startsWith('Open compute: runtime work'))).toBe(false);
+
+    buttons
+      .find(button => button.getAttribute('aria-label') === 'Switch Strategic mode to Monitor')
+      ?.click();
+    expect(onModeChange).toHaveBeenCalledWith('monitor');
+
+    buttons
+      .find(button => button.getAttribute('aria-label')?.startsWith('Mark Strategic session checked:'))
+      ?.click();
+    expect(onCheckIn).toHaveBeenCalledTimes(1);
+
+    buttons
+      .find(button => button.getAttribute('aria-label')?.startsWith('Open accounts: accounts'))
+      ?.click();
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(onOpenAccounts).toHaveBeenCalledTimes(1);
   });
 
   test('keeps canvas resources with the rendered map instead of duplicating them in resources', () => {

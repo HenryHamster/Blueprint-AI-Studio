@@ -1440,10 +1440,17 @@ export default function App() {
         open={strategicContextWorkspaceOpen}
         state={strategicReadModel.data ?? null}
         workbenchState={strategicWorkbenchState}
+        savingSession={savingStrategicWorkbench}
         savingSessionRefs={savingStrategicWorkbench}
+        accountSpend={strategicAccountSpend}
+        checkingIn={checkingInStrategicSession}
         onClose={closeStrategicContextWorkspace}
         onOpenTarget={openStrategicContextWorkspaceTarget}
         onOpenMessageTarget={strategicMessageTarget.open}
+        onModeChange={setStrategicInteractionMode}
+        onCheckIn={handleStrategicCheckIn}
+        onOpenAccounts={openRuntimeAccounts}
+        onOpenSpend={openRuntimeAnalytics}
         onUpdateSessionRefs={updateStrategicSessionRefs}
       />
       {showProjectMembers && s.selectedProjectId && selectedProject && (() => {

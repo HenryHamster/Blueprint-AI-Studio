@@ -18,12 +18,18 @@ import type {
 import { formatStrategicMetricValue, rankStrategicWorkSessionMetrics } from '../utils/strategicWorkSessionMetrics';
 import {
   MAX_STRATEGIC_SELECTED_REFS,
+  normalizeStrategicInteractionMode,
   removeStrategicSelectedRef,
   upsertStrategicSelectedRef,
   type StrategicSelectedRef,
 } from '../utils/strategicWorkbenchSession';
 import { StrategicContextMap } from './StrategicContextMap';
 import { StrategicSessionEvents } from './StrategicSessionEvents';
+import {
+  StrategicSessionControl,
+  type StrategicAccountSpendStatus,
+  type StrategicInteractionMode,
+} from './StrategicSessionControl';
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
 type StrategicContextCanvas = NonNullable<StrategicContextPackageDescriptor['canvas']>;
@@ -32,10 +38,17 @@ interface StrategicContextWorkspaceProps {
   open: boolean;
   state: StrategicStateResponse | null;
   workbenchState?: StrategicWorkbenchState | null;
+  savingSession?: boolean;
   savingSessionRefs?: boolean;
+  accountSpend?: StrategicAccountSpendStatus | null;
+  checkingIn?: boolean;
   onClose: () => void;
   onOpenTarget: (target?: StrategicContextTarget | null) => void;
   onOpenMessageTarget?: (target?: StrategicMessageTarget) => void;
+  onModeChange?: (mode: StrategicInteractionMode) => void;
+  onCheckIn?: () => void;
+  onOpenAccounts?: () => void;
+  onOpenSpend?: () => void;
   onUpdateSessionRefs?: (
     updateRefs: (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs']
   ) => void;
@@ -560,10 +573,17 @@ export function StrategicContextWorkspace({
   open,
   state,
   workbenchState,
+  savingSession = false,
   savingSessionRefs = false,
+  accountSpend = null,
+  checkingIn = false,
   onClose,
   onOpenTarget,
   onOpenMessageTarget,
+  onModeChange,
+  onCheckIn,
+  onOpenAccounts,
+  onOpenSpend,
   onUpdateSessionRefs,
 }: StrategicContextWorkspaceProps) {
   useEffect(() => {
@@ -613,6 +633,7 @@ export function StrategicContextWorkspace({
     contextPackage?.updated_at ? `updated ${contextPackage.updated_at}` : null,
   ].filter(Boolean).join(' / ');
   const workSession = state?.work_session ?? null;
+  const sessionMode = normalizeStrategicInteractionMode(workbenchState?.interaction_mode ?? workSession?.mode);
   const localRunner = state?.runtime?.local_runner ?? null;
   const runtimeWork = state?.runtime?.work ?? null;
   const localRunnerStatus = localRunner ? localRunnerTone(localRunner) : null;
@@ -725,10 +746,30 @@ export function StrategicContextWorkspace({
           <div className="grid min-w-0 max-w-full grid-cols-1 gap-3">
             <Section
               title="Session"
-              meta={sessionModeLabel(workbenchState?.interaction_mode ?? workSession?.mode)}
+              meta={sessionModeLabel(sessionMode)}
               testId="strategic-context-workspace-session"
             >
               <div className="space-y-3">
+                <StrategicSessionControl
+                  mode={sessionMode}
+                  saving={savingSession}
+                  accountSpend={accountSpend}
+                  lastCheckIn={workSession?.last_check_in ?? null}
+                  sinceLastCheckIn={workSession?.since_last_check_in ?? null}
+                  checkingIn={checkingIn}
+                  onModeChange={onModeChange}
+                  onCheckIn={onCheckIn}
+                  onOpenAccounts={onOpenAccounts ? () => {
+                    onClose();
+                    onOpenAccounts();
+                  } : undefined}
+                  onOpenSpend={onOpenSpend ? () => {
+                    onClose();
+                    onOpenSpend();
+                  } : undefined}
+                  className="items-stretch sm:items-stretch sm:justify-start"
+                />
+
                 <div className="grid gap-2 md:grid-cols-2">
                   {localRunner && localRunnerStatus && (
                     <SessionSummaryButton
