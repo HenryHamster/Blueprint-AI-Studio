@@ -181,6 +181,114 @@ describe('StrategicSessionControl', () => {
     expect(screen.queryByText('at_capacity')).not.toBeInTheDocument();
   });
 
+  it('renders compact account spend health and opens accounts by default', async () => {
+    const onOpenAccounts = vi.fn();
+    const onOpenSpend = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <StrategicSessionControl
+        currentMode="chat"
+        accountSpend={{
+          totalAccounts: 3,
+          availableAccounts: 2,
+          enabledAccounts: 2,
+          activeAccountTasks: 1,
+          configuredCapAccounts: 1,
+          disabledModelCount: 2,
+          trackedSpendUsd: 12.34,
+          dailyCostCeilingUsd: 25,
+        }}
+        onModeChange={vi.fn()}
+        onOpenAccounts={onOpenAccounts}
+        onOpenSpend={onOpenSpend}
+      />,
+    );
+
+    const accounts = screen.getByRole('button', { name: /open accounts: accounts cooldowns/i });
+    expect(accounts).toHaveTextContent('Accounts');
+    expect(accounts).toHaveTextContent('Cooldowns');
+    expect(accounts).toHaveTextContent(
+      /2\/3 available.*1 active.*1 with caps.*2 disabled models.*tracked \$12\.34.*daily ceiling \$25\.00/i,
+    );
+
+    await user.click(accounts);
+    expect(onOpenAccounts).toHaveBeenCalledTimes(1);
+    expect(onOpenSpend).not.toHaveBeenCalled();
+  });
+
+  it('surfaces no enabled accounts as a blocked account spend state', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        accountSpend={{
+          totalAccounts: 4,
+          availableAccounts: 0,
+          enabledAccounts: 0,
+          cooldownAccounts: 1,
+          configuredCapAccounts: 2,
+          disabledModelCount: 5,
+          trackedSpendUsd: 29,
+          dailyCostCeilingUsd: 30,
+        }}
+        onModeChange={vi.fn()}
+        onOpenAccounts={vi.fn()}
+      />,
+    );
+
+    const accounts = screen.getByRole('button', { name: /open accounts: accounts blocked/i });
+    expect(accounts).toHaveTextContent('Blocked');
+    expect(accounts).toHaveTextContent(
+      /0\/4 available.*1 cooldown.*2 with caps.*5 disabled models.*tracked \$29\.00.*daily ceiling \$30\.00/i,
+    );
+    expect(accounts.className).toContain('border-red-500/30');
+  });
+
+  it('keeps configured account caps as neutral detail when availability is healthy', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="chat"
+        accountSpend={{
+          totalAccounts: 2,
+          availableAccounts: 2,
+          enabledAccounts: 2,
+          configuredCapAccounts: 2,
+          trackedSpendUsd: 0,
+          dailyCostCeilingUsd: 0,
+        }}
+        onModeChange={vi.fn()}
+        onOpenAccounts={vi.fn()}
+      />,
+    );
+
+    const accounts = screen.getByRole('button', { name: /open accounts: accounts 2\/2 available/i });
+    expect(accounts).toHaveTextContent('2/2 available');
+    expect(accounts).toHaveTextContent('2 with caps');
+    expect(accounts.className).not.toContain('border-amber-500/30');
+  });
+
+  it('does not describe an empty account set as ready', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="monitor"
+        accountSpend={{
+          totalAccounts: 0,
+          availableAccounts: 0,
+          enabledAccounts: 0,
+          trackedSpendUsd: 0,
+          dailyCostCeilingUsd: 0,
+        }}
+        onModeChange={vi.fn()}
+        onOpenAccounts={vi.fn()}
+      />,
+    );
+
+    const accounts = screen.getByRole('button', { name: /open accounts: accounts no accounts/i });
+    expect(accounts).toHaveTextContent('No accounts');
+    expect(accounts).not.toHaveTextContent('0/0 ready');
+    expect(accounts).not.toHaveTextContent('$0.00 / $0.00 daily');
+  });
+
   it('renders active runtime work as a compute button', async () => {
     const onOpenCompute = vi.fn();
     const user = userEvent.setup();

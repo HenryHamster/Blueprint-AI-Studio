@@ -410,6 +410,7 @@ describe('WorkbenchComposition viewport regression', () => {
     onOpenCommandPalette?: () => void;
     onOpenDevices?: () => void;
     onOpenCompute?: () => void;
+    onOpenAccounts?: () => void;
     onOpenContext?: () => void;
   } = {}) {
     const onOpenCommandPalette = options.onOpenCommandPalette ?? vi.fn();
@@ -448,9 +449,20 @@ describe('WorkbenchComposition viewport regression', () => {
                     saving={false}
                     localRunner={STATE.runtime.local_runner}
                     runtimeWork={null}
+                    accountSpend={{
+                      totalAccounts: 2,
+                      availableAccounts: 1,
+                      enabledAccounts: 1,
+                      activeAccountTasks: 1,
+                      configuredCapAccounts: 1,
+                      disabledModelCount: 0,
+                      trackedSpendUsd: 12.34,
+                      dailyCostCeilingUsd: 50,
+                    }}
                     onModeChange={vi.fn()}
                     onOpenDevices={options.onOpenDevices ?? vi.fn()}
                     onOpenCompute={options.onOpenCompute ?? vi.fn()}
+                    onOpenAccounts={options.onOpenAccounts ?? vi.fn()}
                   />
                   <button
                     type="button"
@@ -520,10 +532,11 @@ describe('WorkbenchComposition viewport regression', () => {
   test('breakpoint shell keeps monitoring visible with one composer command launcher', async () => {
     const onOpenCommandPalette = vi.fn();
     const onOpenDevices = vi.fn();
+    const onOpenAccounts = vi.fn();
 
     await expectNoOverflowAt(
       1024,
-      () => renderWorkbenchShell({ onOpenCommandPalette, onOpenDevices }),
+      () => renderWorkbenchShell({ onOpenCommandPalette, onOpenDevices, onOpenAccounts }),
       { height: 800, waitMs: 50 },
     );
 
@@ -539,6 +552,8 @@ describe('WorkbenchComposition viewport regression', () => {
     expect(sessionControl).toBeTruthy();
     expect(getComputedStyle(sessionControl as Element).display).not.toBe('none');
     expect(host?.querySelector('button[aria-label^="Open devices: runner"]')).toBeTruthy();
+    const accountsButton = host?.querySelector<HTMLButtonElement>('button[aria-label^="Open accounts:"]');
+    expect(accountsButton).toBeTruthy();
     expect(rail).toBeTruthy();
     expect(getComputedStyle(rail!.closest('aside')!).display).not.toBe('none');
     expect(contextButton).toBeTruthy();
@@ -548,6 +563,8 @@ describe('WorkbenchComposition viewport regression', () => {
     await act(async () => { commandButtons[0].click(); });
     expect(onOpenCommandPalette).toHaveBeenCalledOnce();
     expect(onOpenDevices).not.toHaveBeenCalled();
+    await act(async () => { accountsButton!.click(); });
+    expect(onOpenAccounts).toHaveBeenCalledOnce();
   });
 
   test('mobile shell keeps composer, hides rail, and exposes context button without overflow', async () => {

@@ -2,6 +2,7 @@ import {
   CheckCircle2,
   ChevronRight,
   Clock3,
+  CreditCard,
   Cpu,
   Eye,
   Infinity,
@@ -91,6 +92,20 @@ export interface StrategicRuntimeWorkStatus {
   } | null;
 }
 
+export interface StrategicAccountSpendStatus {
+  totalAccounts?: number | null;
+  availableAccounts?: number | null;
+  enabledAccounts?: number | null;
+  activeAccountTasks?: number | null;
+  cooldownAccounts?: number | null;
+  cappedAccounts?: number | null;
+  configuredCapAccounts?: number | null;
+  disabledModelCount?: number | null;
+  cumulativeCostUsd?: number | null;
+  trackedSpendUsd?: number | null;
+  dailyCostCeilingUsd?: number | null;
+}
+
 export interface StrategicSessionControlProps {
   currentMode?: StrategicInteractionMode;
   mode?: StrategicInteractionMode;
@@ -99,6 +114,7 @@ export interface StrategicSessionControlProps {
   localRunner?: StrategicLocalRunnerStatus | null;
   runtimeWorkStatus?: StrategicRuntimeWorkStatus | null;
   runtimeWork?: StrategicRuntimeWorkStatus | null;
+  accountSpend?: StrategicAccountSpendStatus | null;
   lastCheckIn?: StrategicWorkSessionLastCheckIn | null;
   sinceLastCheckIn?: StrategicWorkSessionSinceLastCheckIn | null;
   checkingIn?: boolean;
@@ -106,6 +122,8 @@ export interface StrategicSessionControlProps {
   onCheckIn?: () => void;
   onOpenDevices?: () => void;
   onOpenCompute?: () => void;
+  onOpenAccounts?: () => void;
+  onOpenSpend?: () => void;
   className?: string;
 }
 
@@ -188,8 +206,22 @@ function firstCount(...values: Array<number | null | undefined>): number | null 
   return null;
 }
 
+function finiteNonNegativeNumber(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
 function pluralize(count: number, singular: string): string {
   return `${count} ${singular}${count === 1 ? '' : 's'}`;
+}
+
+function formatUsd(value: number | null | undefined): string | null {
+  const amount = finiteNonNegativeNumber(value);
+  if (amount == null) return null;
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    maximumFractionDigits: 2,
+  }).format(amount);
 }
 
 function formatRelativeTime(timestamp?: string | null): string | null {
@@ -439,6 +471,69 @@ function runtimeDetail(status: StrategicRuntimeWorkStatus): string | null {
   return null;
 }
 
+function accountSpendTone(status: StrategicAccountSpendStatus): Tone {
+  const available = firstCount(status.availableAccounts);
+  const total = firstCount(status.totalAccounts);
+  if (total === 0) return 'warning';
+  if (available === 0 && (total == null || total > 0)) return 'danger';
+  if (
+    (firstCount(status.cooldownAccounts) ?? 0) > 0
+    || (firstCount(status.disabledModelCount) ?? 0) > 0
+    || (available != null && total != null && available < total)
+  ) {
+    return 'warning';
+  }
+  if (available != null && available > 0) return 'success';
+  if ((finiteNonNegativeNumber(status.trackedSpendUsd ?? status.cumulativeCostUsd) ?? 0) > 0) return 'info';
+  return 'neutral';
+}
+
+function accountSpendLabel(status: StrategicAccountSpendStatus): string {
+  const available = firstCount(status.availableAccounts);
+  const enabled = firstCount(status.enabledAccounts);
+  const total = firstCount(status.totalAccounts);
+  if (total === 0) return 'No accounts';
+  if (available === 0 && (total == null || total > 0)) return 'Blocked';
+  if ((firstCount(status.cooldownAccounts) ?? 0) > 0) return 'Cooldowns';
+  if ((firstCount(status.disabledModelCount) ?? 0) > 0) return 'Cooldowns';
+  if (available != null && total != null && available < total) return 'Partial';
+  if (available != null && total != null) return `${available}/${total} available`;
+  if (available != null) return pluralize(available, 'available account');
+  if (enabled != null && total != null) return `${enabled}/${total} enabled`;
+  if (enabled != null) return pluralize(enabled, 'enabled account');
+  if ((finiteNonNegativeNumber(status.trackedSpendUsd ?? status.cumulativeCostUsd) ?? 0) > 0) return 'Spend tracked';
+  return 'Available';
+}
+
+function accountSpendDetail(status: StrategicAccountSpendStatus): string | null {
+  const available = firstCount(status.availableAccounts);
+  const enabled = firstCount(status.enabledAccounts);
+  const total = firstCount(status.totalAccounts);
+  const active = firstCount(status.activeAccountTasks) ?? 0;
+  const cooldowns = firstCount(status.cooldownAccounts) ?? 0;
+  const configuredCaps = firstCount(status.configuredCapAccounts, status.cappedAccounts) ?? 0;
+  const disabledModels = firstCount(status.disabledModelCount) ?? 0;
+  const costValue = finiteNonNegativeNumber(status.trackedSpendUsd ?? status.cumulativeCostUsd);
+  const ceilingValue = finiteNonNegativeNumber(status.dailyCostCeilingUsd);
+  const hasCeiling = ceilingValue != null && ceilingValue > 0;
+  const shouldShowSpend = costValue != null && costValue > 0;
+  const trackedSpend = shouldShowSpend ? formatUsd(costValue) : null;
+  const ceiling = hasCeiling ? formatUsd(ceilingValue) : null;
+  const parts = [
+    total === 0 ? 'No accounts' : null,
+    available != null && total != null && total > 0 ? `${available}/${total} available` : null,
+    enabled != null && total != null && total > 0 && enabled !== available ? pluralize(enabled, 'enabled account') : null,
+    enabled != null && total == null ? pluralize(enabled, 'enabled account') : null,
+    active > 0 ? `${active} active` : null,
+    cooldowns > 0 ? `${cooldowns} cooldown` : null,
+    configuredCaps > 0 ? `${configuredCaps} with caps` : null,
+    disabledModels > 0 ? pluralize(disabledModels, 'disabled model') : null,
+    trackedSpend ? `tracked ${trackedSpend}` : null,
+    ceiling ? `daily ceiling ${ceiling}` : null,
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(' / ') : null;
+}
+
 function StatusDot({ tone }: { tone: Tone }) {
   return <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${toneClasses[tone].dot}`} aria-hidden="true" />;
 }
@@ -451,6 +546,7 @@ export function StrategicSessionControl({
   localRunner = null,
   runtimeWorkStatus = null,
   runtimeWork = null,
+  accountSpend = null,
   lastCheckIn = null,
   sinceLastCheckIn = null,
   checkingIn = false,
@@ -458,11 +554,15 @@ export function StrategicSessionControl({
   onCheckIn,
   onOpenDevices,
   onOpenCompute,
+  onOpenAccounts,
+  onOpenSpend,
   className = '',
 }: StrategicSessionControlProps) {
   const selectedMode = currentMode ?? mode ?? 'chat';
   const runnerStatus = localRunnerStatus ?? localRunner;
   const workStatus = runtimeWorkStatus ?? runtimeWork;
+  const openAccountSpend = onOpenAccounts ?? onOpenSpend;
+  const accountSpendOpenLabel = onOpenAccounts ? 'Open accounts' : 'Open spend';
   const checkInSummary = checkInDetail(lastCheckIn, sinceLastCheckIn);
   const checkInChanges = checkInChangeCount(sinceLastCheckIn);
 
@@ -484,6 +584,14 @@ export function StrategicSessionControl({
         label: runtimeLabel(workStatus),
         detail: runtimeDetail(workStatus),
         useful: runtimeIsUseful(workStatus),
+      }
+    : null;
+
+  const accountSpendControl = accountSpend
+    ? {
+        tone: accountSpendTone(accountSpend),
+        label: accountSpendLabel(accountSpend),
+        detail: accountSpendDetail(accountSpend),
       }
     : null;
 
@@ -596,6 +704,68 @@ export function StrategicSessionControl({
             <ChevronRight className="h-3.5 w-3.5 shrink-0 text-neutral-600 transition-colors group-hover:text-neutral-300" aria-hidden="true" />
           </button>
         )}
+
+        {accountSpendControl ? (
+          openAccountSpend ? (
+            <button
+              type="button"
+              onClick={openAccountSpend}
+              className={`group inline-grid min-h-11 w-full min-w-0 grid-cols-[auto,minmax(0,1fr),auto] items-center gap-2 rounded border px-2 py-1.5 text-left transition-colors hover:border-neutral-500 hover:bg-neutral-900/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 sm:min-h-8 sm:w-auto sm:max-w-[20rem] ${
+                toneClasses[accountSpendControl.tone].border
+              } ${toneClasses[accountSpendControl.tone].bg}`}
+              aria-label={`${accountSpendOpenLabel}: accounts ${accountSpendControl.label}${
+                accountSpendControl.detail ? `, ${accountSpendControl.detail}` : ''
+              }`}
+              title={accountSpendControl.detail ? `${accountSpendOpenLabel}: ${accountSpendControl.detail}` : accountSpendOpenLabel}
+            >
+              <CreditCard
+                className={`h-3.5 w-3.5 shrink-0 ${toneClasses[accountSpendControl.tone].icon}`}
+                aria-hidden="true"
+              />
+              <span className="min-w-0 flex-1">
+                <span className="flex min-w-0 items-center gap-1.5 leading-tight">
+                  <span className="shrink-0 font-mono text-ui-sm font-semibold uppercase text-neutral-500">Accounts</span>
+                  <StatusDot tone={accountSpendControl.tone} />
+                  <span className={`truncate text-xs font-semibold ${toneClasses[accountSpendControl.tone].text}`}>
+                    {accountSpendControl.label}
+                  </span>
+                </span>
+                <span className="block truncate text-ui-sm text-neutral-400">
+                  {accountSpendControl.detail ?? 'Open account and spend state'}
+                </span>
+              </span>
+              <ChevronRight
+                className="h-3.5 w-3.5 shrink-0 text-neutral-600 transition-colors group-hover:text-neutral-300"
+                aria-hidden="true"
+              />
+            </button>
+          ) : (
+            <span
+              className={`inline-grid min-h-11 w-full min-w-0 grid-cols-[auto,minmax(0,1fr)] items-center gap-2 rounded border px-2 py-1.5 text-left sm:min-h-8 sm:w-auto sm:max-w-[20rem] ${
+                toneClasses[accountSpendControl.tone].border
+              } ${toneClasses[accountSpendControl.tone].bg}`}
+              aria-label={`Accounts ${accountSpendControl.label}${accountSpendControl.detail ? `, ${accountSpendControl.detail}` : ''}`}
+              title="Accounts"
+            >
+              <CreditCard
+                className={`h-3.5 w-3.5 shrink-0 ${toneClasses[accountSpendControl.tone].icon}`}
+                aria-hidden="true"
+              />
+              <span className="min-w-0 flex-1">
+                <span className="flex min-w-0 items-center gap-1.5 leading-tight">
+                  <span className="shrink-0 font-mono text-ui-sm font-semibold uppercase text-neutral-500">Accounts</span>
+                  <StatusDot tone={accountSpendControl.tone} />
+                  <span className={`truncate text-xs font-semibold ${toneClasses[accountSpendControl.tone].text}`}>
+                    {accountSpendControl.label}
+                  </span>
+                </span>
+                <span className="block truncate text-ui-sm text-neutral-400">
+                  {accountSpendControl.detail ?? 'Account and spend state'}
+                </span>
+              </span>
+            </span>
+          )
+        ) : null}
 
         {runtime && runtime.useful && onOpenCompute ? (
           <button

@@ -40,7 +40,7 @@ import ActivityFeed from './components/ActivityFeed';
 import { MessagesPanel } from './components/MessagesPanel';
 import { StrategicContextRail } from './components/StrategicContextRail';
 import { StrategicContextWorkspace } from './components/StrategicContextWorkspace';
-import { StrategicSessionControl, type StrategicInteractionMode } from './components/StrategicSessionControl';
+import { StrategicSessionControl, type StrategicAccountSpendStatus, type StrategicInteractionMode } from './components/StrategicSessionControl';
 import { CommandPaletteHost } from './components/CommandPaletteHost';
 import { parseArmingOutcome, workbenchArmingToastCopy } from './components/messageArming';
 import { QuickFilterPresets } from './components/QuickFilterPresets';
@@ -873,6 +873,16 @@ export default function App() {
     s.setActiveTab(tab);
   }, [s, persistStrategicWorkbench]);
 
+  const openRuntimeAccounts = useCallback(() => {
+    setRuntimeSection('accounts');
+    handleTabChange('runtime');
+  }, [handleTabChange]);
+
+  const openRuntimeAnalytics = useCallback(() => {
+    setRuntimeSection('analytics');
+    handleTabChange('runtime');
+  }, [handleTabChange]);
+
   const openProjectManageWorkspace = useCallback((section: ProjectManageSection, projectId?: string) => {
     if (projectId && projectId !== s.selectedProjectId) s.setSelectedProjectId(projectId);
     if (s.showSettings) s.handleToggleSettings();
@@ -917,6 +927,31 @@ export default function App() {
     strategicMessageTarget.open(target);
   }, [strategicMessageTarget.open]);
   const currentStrategicInteractionMode = normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode);
+  const strategicAccountSpend = useMemo<StrategicAccountSpendStatus>(() => {
+    const accounts = s.maxPlanAccounts ?? [];
+    const cooldownAccounts = accounts.filter(account => Object.keys(account.disabled_models ?? {}).length > 0).length;
+    const unavailableStatuses = new Set(['disabled', 'unconfigured', 'unavailable', 'at_cap']);
+    const availableAccounts = accounts.filter(account => {
+      const status = typeof account.account_status === 'string' ? account.account_status.toLowerCase() : null;
+      return account.enabled
+        && !account.disabled_reason
+        && account.credential_configured !== false
+        && account.runtime_ready !== false
+        && Object.keys(account.disabled_models ?? {}).length === 0
+        && (!status || !unavailableStatuses.has(status));
+    }).length;
+    return {
+      totalAccounts: accounts.length,
+      availableAccounts,
+      enabledAccounts: accounts.filter(account => account.enabled).length,
+      activeAccountTasks: accounts.reduce((sum, account) => sum + (account.active_tasks ?? 0), 0),
+      cooldownAccounts,
+      configuredCapAccounts: accounts.filter(account => account.daily_task_cap != null || account.max_concurrent_tasks != null).length,
+      disabledModelCount: accounts.reduce((sum, account) => sum + Object.keys(account.disabled_models ?? {}).length, 0),
+      trackedSpendUsd: s.cumulativeCost,
+      dailyCostCeilingUsd: s.dailyCostCeilingUsd,
+    };
+  }, [s.cumulativeCost, s.dailyCostCeilingUsd, s.maxPlanAccounts]);
   const setStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
     void persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' });
   }, [persistStrategicWorkbench]);
@@ -1463,6 +1498,7 @@ export default function App() {
                 runtimeWork={strategicReadModel.data?.runtime?.work ?? null}
                 lastCheckIn={strategicReadModel.data?.work_session?.last_check_in ?? null}
                 sinceLastCheckIn={strategicReadModel.data?.work_session?.since_last_check_in ?? null}
+                accountSpend={strategicAccountSpend}
                 checkingIn={checkingInStrategicSession}
                 onModeChange={setStrategicInteractionMode}
                 onCheckIn={handleStrategicCheckIn}
@@ -1474,6 +1510,8 @@ export default function App() {
                   setRuntimeSection('compute');
                   handleTabChange('runtime');
                 }}
+                onOpenAccounts={openRuntimeAccounts}
+                onOpenSpend={openRuntimeAnalytics}
               />
               <button
                 type="button"
