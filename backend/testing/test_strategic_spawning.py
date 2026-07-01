@@ -32,7 +32,9 @@ from app.models import (
 )
 from app.strategic_trigger import ORIGIN_OPERATOR, ORIGIN_QUALIFICATION
 from app.workbench_state import (
+    SESSION_IDLE_TTL_SECONDS,
     STRATEGIC_LOCAL_CONTINUATION_KEY,
+    STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
     STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
     STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
 )
@@ -2896,7 +2898,10 @@ async def test_local_continuation_affinity_omitted_when_stale_or_incapable(
         "app.task_lifecycle._has_active_strategic_task",
         new=AsyncMock(return_value=False),
     )
-    stale_at = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+    stale_at = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS + 60)
+    ).isoformat()
     project = _make_project(
         vision={
             "purpose": "test purpose",
@@ -2980,6 +2985,88 @@ async def test_local_continuation_requires_local_even_without_live_runner(
     assert "preferred_runner_target_id" not in task.context
     assert "runner_target_id" not in task.context
     assert not (task.vm_instance_id or "").startswith("runner:")
+
+
+@pytest.mark.asyncio
+async def test_local_continuation_workday_ttl_outlives_idle_workbench_ttl(
+    db_session, mocker
+):
+    """Workday local intent remains hard local after the UI idle TTL."""
+    assert STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS > SESSION_IDLE_TTL_SECONDS
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    workday_at = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=SESSION_IDLE_TTL_SECONDS + 60)
+    ).isoformat()
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(
+                updated_at=workday_at,
+                last_seen_at=workday_at,
+            ),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert task.payloads[0]["type"] == "strategic_review"
+    assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+    assert (
+        task.context.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+        == "workbench_continuous"
+    )
+    assert "preferred_runner_target_id" not in task.context
+    assert "runner_target_id" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_local_continuation_requires_local_for_fresh_foreign_owner_marker(
+    db_session, mocker
+):
+    """The compact project marker is intentionally project-level at spawn time."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(
+                operator_user_id="other-operator",
+                owner_session_started_at=(
+                    datetime.now(timezone.utc) - timedelta(minutes=10)
+                ).isoformat(),
+            ),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert task.payloads[0]["type"] == "strategic_review"
+    assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+    assert (
+        task.context.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+        == "workbench_continuous"
+    )
+    assert "preferred_runner_target_id" not in task.context
 
 
 @pytest.mark.asyncio

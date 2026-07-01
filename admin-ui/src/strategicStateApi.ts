@@ -270,6 +270,11 @@ export interface StrategicLocalRunnerContinuation {
   reason?: string | null;
   updated_at?: string | null;
   last_seen_at?: string | null;
+  expires_at?: string | null;
+  owner_user_id?: string | null;
+  owner_session_started_at?: string | null;
+  owned_by_current_operator?: boolean | null;
+  ownership?: 'none' | 'unknown' | 'owned' | 'current_operator' | 'other_operator' | string;
   ttl_seconds?: number | null;
 }
 

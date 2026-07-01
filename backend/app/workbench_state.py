@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy.exc import IntegrityError
@@ -39,7 +39,7 @@ STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY = "strategic_local_runner_reason"
 STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY = "awaiting_strategic_local_runner_since"
 WORKBENCH_STATE_MAX_BYTES = 50_000
 SESSION_IDLE_TTL_SECONDS = 14_400  # 4 hours
-STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS = SESSION_IDLE_TTL_SECONDS
+STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS = 43_200  # 12 hours
 STRATEGIC_LOCAL_CONTINUATION_RENEWAL_MIN_SECONDS = 60
 
 _ALLOWED_INTERACTION_MODES = frozenset(
@@ -488,6 +488,12 @@ def _strategic_local_continuation_marker_owner_id(
     return _string(marker.get("operator_user_id"), max_chars=160)
 
 
+def _strategic_local_continuation_marker_session_started_at(
+    marker: dict[str, Any],
+) -> str | None:
+    return _string(marker.get("owner_session_started_at"), max_chars=80)
+
+
 def _strategic_local_continuation_marker_is_protected_foreign(
     marker: dict[str, Any],
     *,
@@ -503,6 +509,34 @@ def _strategic_local_continuation_marker_is_protected_foreign(
     )
 
 
+def _strategic_local_continuation_marker_is_protected_newer_owner_session(
+    marker: dict[str, Any],
+    *,
+    operator_id: str | None,
+    session_started_at: str | None,
+) -> bool:
+    marker_operator_id = _strategic_local_continuation_marker_owner_id(marker)
+    marker_session_started_at = (
+        _strategic_local_continuation_marker_session_started_at(marker)
+    )
+    if (
+        marker.get("version") != 1
+        or marker.get("active") is not True
+        or marker_operator_id is None
+        or marker_operator_id != operator_id
+        or marker_session_started_at is None
+        or session_started_at is None
+        or marker_session_started_at == session_started_at
+        or not _strategic_local_continuation_marker_is_fresh(marker)
+    ):
+        return False
+    marker_started = _parse_naive_utc_timestamp(marker_session_started_at)
+    state_started = _parse_naive_utc_timestamp(session_started_at)
+    if marker_started is None or state_started is None:
+        return False
+    return marker_started > state_started
+
+
 def apply_strategic_local_continuation_marker(
     vision: dict[str, Any],
     workbench_state: dict[str, Any],
@@ -513,16 +547,41 @@ def apply_strategic_local_continuation_marker(
     """Update the compact project-level marker for local Strategic continuation."""
 
     operator_id = _string(str(operator_user_id), max_chars=160)
+    session_started_at = _string(
+        workbench_state.get("session_started_at"),
+        max_chars=80,
+    )
     if workbench_state.get("interaction_mode") != "continuous":
         marker = vision.get(STRATEGIC_LOCAL_CONTINUATION_KEY)
         if (
             not isinstance(marker, dict)
-            or not _strategic_local_continuation_marker_is_protected_foreign(
-                marker,
-                operator_id=operator_id,
+            or not (
+                _strategic_local_continuation_marker_is_protected_foreign(
+                    marker,
+                    operator_id=operator_id,
+                )
+                or _strategic_local_continuation_marker_is_protected_newer_owner_session(
+                    marker,
+                    operator_id=operator_id,
+                    session_started_at=session_started_at,
+                )
             )
         ):
             vision.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
+        return
+
+    marker = vision.get(STRATEGIC_LOCAL_CONTINUATION_KEY)
+    if isinstance(marker, dict) and (
+        _strategic_local_continuation_marker_is_protected_foreign(
+            marker,
+            operator_id=operator_id,
+        )
+        or _strategic_local_continuation_marker_is_protected_newer_owner_session(
+            marker,
+            operator_id=operator_id,
+            session_started_at=session_started_at,
+        )
+    ):
         return
 
     now = _utcnow().isoformat()
@@ -536,6 +595,8 @@ def apply_strategic_local_continuation_marker(
         "updated_at": now,
         "last_seen_at": last_seen_at,
     }
+    if session_started_at:
+        marker["owner_session_started_at"] = session_started_at
     runner_source = (
         preferred_runner_id
         if preferred_runner_id is not None
@@ -549,6 +610,8 @@ def apply_strategic_local_continuation_marker(
 
 def strategic_local_continuation_status_from_vision(
     vision: dict[str, Any] | None,
+    *,
+    operator_user_id: str | None = None,
 ) -> dict[str, Any]:
     marker = (vision or {}).get(STRATEGIC_LOCAL_CONTINUATION_KEY)
     if not isinstance(marker, dict) or marker.get("active") is False:
@@ -559,19 +622,46 @@ def strategic_local_continuation_status_from_vision(
             "reason": "not_enabled",
             "updated_at": None,
             "last_seen_at": None,
+            "expires_at": None,
+            "owner_user_id": None,
+            "owner_session_started_at": None,
+            "owned_by_current_operator": False,
+            "ownership": "none",
             "ttl_seconds": STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
         }
 
     updated_at = _string(marker.get("updated_at"), max_chars=80)
     last_seen_at = _string(marker.get("last_seen_at"), max_chars=80)
+    owner_user_id = _strategic_local_continuation_marker_owner_id(marker)
+    owner_session_started_at = (
+        _strategic_local_continuation_marker_session_started_at(marker)
+    )
+    current_operator_id = (
+        _string(str(operator_user_id), max_chars=160) if operator_user_id else None
+    )
+    owned_by_current_operator = (
+        current_operator_id is not None and owner_user_id == current_operator_id
+    )
+    if owner_user_id is None:
+        ownership = "unknown"
+    elif current_operator_id is None:
+        ownership = "owned"
+    elif owned_by_current_operator:
+        ownership = "current_operator"
+    else:
+        ownership = "other_operator"
     freshness_ts = _parse_naive_utc_timestamp(last_seen_at or updated_at)
     if freshness_ts is None:
         fresh = False
         reason = "missing_timestamp"
+        expires_at = None
     else:
         elapsed = (_utcnow() - freshness_ts).total_seconds()
         fresh = elapsed <= STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS
         reason = "armed" if fresh else "stale"
+        expires_at = (
+            freshness_ts + timedelta(seconds=STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS)
+        ).isoformat()
 
     return {
         "enabled": True,
@@ -583,6 +673,11 @@ def strategic_local_continuation_status_from_vision(
         "reason": reason,
         "updated_at": updated_at,
         "last_seen_at": last_seen_at,
+        "expires_at": expires_at,
+        "owner_user_id": owner_user_id,
+        "owner_session_started_at": owner_session_started_at,
+        "owned_by_current_operator": owned_by_current_operator,
+        "ownership": ownership,
         "ttl_seconds": STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
     }
 

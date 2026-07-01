@@ -32,6 +32,11 @@ export interface StrategicLocalRunnerStatus {
     reason?: string | null;
     updated_at?: string | null;
     last_seen_at?: string | null;
+    expires_at?: string | null;
+    owner_user_id?: string | null;
+    owner_session_started_at?: string | null;
+    owned_by_current_operator?: boolean | null;
+    ownership?: 'none' | 'unknown' | 'owned' | 'current_operator' | 'other_operator' | string;
     ttl_seconds?: number | null;
   } | null;
   deviceCount?: number | null;
@@ -298,13 +303,27 @@ function runnerStatusValue(status: StrategicLocalRunnerStatus): string {
   return normalizedStatus(status.status ?? status.mode);
 }
 
+function continuationOwnedByAnotherOperator(status: StrategicLocalRunnerStatus): boolean {
+  const continuation = status.continuation;
+  return (
+    continuation?.enabled === true
+    && continuation.fresh === true
+    && continuation.owned_by_current_operator === false
+    && (
+      continuation.ownership === 'other_operator'
+      || cleanText(continuation.owner_user_id) != null
+    )
+  );
+}
+
 function runnerTone(status: StrategicLocalRunnerStatus): Tone {
   const value = runnerStatusValue(status);
   const fallbackReason = normalizedStatus(status.fallback_reason);
   const hasStaleContinuation = status.continuation?.enabled === true && status.continuation.fresh === false;
   const hasUnknownContinuation = status.continuation?.enabled === true && status.continuation.fresh == null;
+  const hasForeignContinuation = continuationOwnedByAnotherOperator(status);
   if (value.includes('error') || value.includes('fail')) return 'danger';
-  if (hasStaleContinuation || hasUnknownContinuation || WARNING_FALLBACK_REASONS.has(fallbackReason)) return 'warning';
+  if (hasStaleContinuation || hasUnknownContinuation || hasForeignContinuation || WARNING_FALLBACK_REASONS.has(fallbackReason)) return 'warning';
   if (value.includes('warn')) return 'warning';
   if (status.connected === true || status.active === true) return 'success';
   if ((firstCount(status.eligible_live_count) ?? 0) > 0) return 'success';
@@ -366,6 +385,9 @@ function runnerDetail(status: StrategicLocalRunnerStatus): string | null {
   if (statusReason) return humanizeStatus(statusReason);
   if (busy != null && busy > 0 && (ready == null || ready === 0)) return `${busy} busy`;
   if (status.continuation?.enabled === true) {
+    if (continuationOwnedByAnotherOperator(status)) {
+      return 'Workday owned by another operator';
+    }
     if (status.continuation.fresh === false) {
       return preferredRunner
         ? `Stale continuation, preferred runner ${preferredRunner}`
@@ -411,6 +433,7 @@ function runnerMeta(status: StrategicLocalRunnerStatus, primaryDetail: string | 
     unavailable != null && unavailable > 0 ? `${unavailable} unavailable` : null,
     preferredRunner ? `preferred runner ${preferredRunner}` : null,
     status.active_task_pinned === true ? 'pinned' : null,
+    continuationOwnedByAnotherOperator(status) ? 'owned by another operator' : null,
     continuation?.enabled === true
       ? `${continuation.fresh === true ? 'fresh' : continuation.fresh === false ? 'stale' : 'unknown'} continuation`
       : null,

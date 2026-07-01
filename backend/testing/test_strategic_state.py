@@ -2464,7 +2464,10 @@ async def test_strategic_session_command_failed_receipt_refetches(
 async def test_strategic_session_continuous_writes_local_continuation_marker(
     client: AsyncClient, db_session
 ):
-    from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+    from app.workbench_state import (
+        STRATEGIC_LOCAL_CONTINUATION_KEY,
+        STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
+    )
 
     project = await _make_project(db_session)
 
@@ -2485,6 +2488,15 @@ async def test_strategic_session_continuous_writes_local_continuation_marker(
     assert continuation["fresh"] is True
     assert continuation["preferred_runner_id"] is None
     assert continuation["reason"] == "no_runner"
+    assert continuation["ttl_seconds"] == STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS
+    assert continuation["owner_user_id"] == TEST_USER_ID
+    assert continuation["owned_by_current_operator"] is True
+    assert continuation["ownership"] == "current_operator"
+    assert (
+        continuation["owner_session_started_at"]
+        == data["workbench"]["session_started_at"]
+    )
+    assert continuation["expires_at"]
     assert data["session"]["runtime"]["continuation"] == continuation
     assert data["status"] == "unavailable"
     assert data["status_reason"] == "no_runner"
@@ -2505,6 +2517,10 @@ async def test_strategic_session_continuous_writes_local_continuation_marker(
     marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
     assert marker["active"] is True
     assert marker["operator_user_id"] == TEST_USER_ID
+    assert (
+        marker["owner_session_started_at"]
+        == data["workbench"]["session_started_at"]
+    )
     assert marker["last_seen_at"]
     assert marker["updated_at"]
 
@@ -2716,13 +2732,13 @@ async def test_strategic_state_reads_stale_local_continuation_marker_as_not_fres
     client: AsyncClient, db_session
 ):
     from app.workbench_state import (
-        SESSION_IDLE_TTL_SECONDS,
         STRATEGIC_LOCAL_CONTINUATION_KEY,
+        STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
     )
 
     project = await _make_project(db_session)
     stale_at = (
-        _utcnow() - timedelta(seconds=SESSION_IDLE_TTL_SECONDS + 60)
+        _utcnow() - timedelta(seconds=STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS + 60)
     ).isoformat()
     vision = dict(project.vision or {})
     vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = {
@@ -2748,9 +2764,177 @@ async def test_strategic_state_reads_stale_local_continuation_marker_as_not_fres
     assert continuation["fresh"] is False
     assert continuation["reason"] == "stale"
     assert continuation["last_seen_at"] == stale_at
+    assert continuation["owner_user_id"] == TEST_USER_ID
+    assert continuation["owned_by_current_operator"] is True
+    assert continuation["ownership"] == "current_operator"
+    assert continuation["expires_at"]
     assert (
         session_resp.json()["session"]["runtime"]["continuation"] == continuation
     )
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_preserves_fresh_foreign_local_continuation_marker(
+    client: AsyncClient, db_session
+):
+    from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+
+    project = await _make_project(db_session)
+    other_operator = "other-operator"
+    other_session_started_at = (_utcnow() - timedelta(hours=1)).isoformat()
+    fresh_at = (_utcnow() - timedelta(minutes=20)).isoformat()
+    project.vision = {
+        **(project.vision or {}),
+        STRATEGIC_LOCAL_CONTINUATION_KEY: {
+            "version": 1,
+            "active": True,
+            "operator_user_id": other_operator,
+            "owner_session_started_at": other_session_started_at,
+            "updated_at": fresh_at,
+            "last_seen_at": fresh_at,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    state_resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    leave_resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session",
+        json={"workbench": {"interaction_mode": "check_in"}},
+    )
+    enter_resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session",
+        json={"workbench": {"interaction_mode": "continuous"}},
+    )
+
+    assert state_resp.status_code == 200, state_resp.text
+    continuation = state_resp.json()["runtime"]["local_runner"]["continuation"]
+    assert continuation["enabled"] is True
+    assert continuation["fresh"] is True
+    assert continuation["owner_user_id"] == other_operator
+    assert continuation["owner_session_started_at"] == other_session_started_at
+    assert continuation["owned_by_current_operator"] is False
+    assert continuation["ownership"] == "other_operator"
+    assert continuation["expires_at"]
+
+    assert leave_resp.status_code == 200, leave_resp.text
+    leave_continuation = leave_resp.json()["runtime"]["local_runner"]["continuation"]
+    assert leave_continuation["owner_user_id"] == other_operator
+    assert leave_continuation["ownership"] == "other_operator"
+    assert enter_resp.status_code == 200, enter_resp.text
+    enter_continuation = enter_resp.json()["runtime"]["local_runner"]["continuation"]
+    assert enter_resp.json()["workbench"]["interaction_mode"] == "continuous"
+    assert enter_continuation["owner_user_id"] == other_operator
+    assert enter_continuation["ownership"] == "other_operator"
+    await db_session.refresh(project)
+    marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert marker["operator_user_id"] == other_operator
+    assert marker["owner_session_started_at"] == other_session_started_at
+    assert marker["last_seen_at"] == fresh_at
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_stale_duplicate_cannot_replace_newer_marker(
+    client: AsyncClient, db_session
+):
+    from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+
+    project = await _make_project(db_session)
+    old_session_started_at = (_utcnow() - timedelta(hours=2)).isoformat()
+    newer_session_started_at = (_utcnow() - timedelta(minutes=10)).isoformat()
+    fresh_at = (_utcnow() - timedelta(minutes=5)).isoformat()
+    project.vision = {
+        **(project.vision or {}),
+        STRATEGIC_LOCAL_CONTINUATION_KEY: {
+            "version": 1,
+            "active": True,
+            "operator_user_id": TEST_USER_ID,
+            "owner_session_started_at": newer_session_started_at,
+            "updated_at": fresh_at,
+            "last_seen_at": fresh_at,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    leave_resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session",
+        json={
+            "workbench": {
+                "interaction_mode": "check_in",
+                "session_started_at": old_session_started_at,
+            }
+        },
+    )
+    reenter_resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session",
+        json={
+            "workbench": {
+                "interaction_mode": "continuous",
+                "session_started_at": old_session_started_at,
+            }
+        },
+    )
+
+    assert leave_resp.status_code == 200, leave_resp.text
+    leave_continuation = leave_resp.json()["runtime"]["local_runner"]["continuation"]
+    assert leave_continuation["owner_user_id"] == TEST_USER_ID
+    assert leave_continuation["owner_session_started_at"] == newer_session_started_at
+    assert reenter_resp.status_code == 200, reenter_resp.text
+    reenter_continuation = reenter_resp.json()["runtime"]["local_runner"][
+        "continuation"
+    ]
+    assert reenter_continuation["owner_user_id"] == TEST_USER_ID
+    assert reenter_continuation["owner_session_started_at"] == newer_session_started_at
+
+    await db_session.refresh(project)
+    marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert marker["operator_user_id"] == TEST_USER_ID
+    assert marker["owner_session_started_at"] == newer_session_started_at
+    assert marker["last_seen_at"] == fresh_at
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_malformed_owner_lease_does_not_pin_marker(
+    client: AsyncClient, db_session
+):
+    from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+
+    project = await _make_project(db_session)
+    fresh_at = (_utcnow() - timedelta(minutes=5)).isoformat()
+    project.vision = {
+        **(project.vision or {}),
+        STRATEGIC_LOCAL_CONTINUATION_KEY: {
+            "version": 1,
+            "active": True,
+            "operator_user_id": TEST_USER_ID,
+            "owner_session_started_at": "not-a-timestamp",
+            "updated_at": fresh_at,
+            "last_seen_at": fresh_at,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    session_started_at = (_utcnow() - timedelta(minutes=1)).isoformat()
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session",
+        json={
+            "workbench": {
+                "interaction_mode": "continuous",
+                "session_started_at": session_started_at,
+            }
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    continuation = resp.json()["runtime"]["local_runner"]["continuation"]
+    assert continuation["owner_user_id"] == TEST_USER_ID
+    assert continuation["owner_session_started_at"] == session_started_at
+    await db_session.refresh(project)
+    marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert marker["owner_session_started_at"] == session_started_at
+    assert marker["last_seen_at"] != fresh_at
 
 
 @pytest.mark.asyncio
@@ -2758,13 +2942,13 @@ async def test_strategic_session_message_refreshes_local_continuation_marker(
     client: AsyncClient, db_session
 ):
     from app.workbench_state import (
-        SESSION_IDLE_TTL_SECONDS,
         STRATEGIC_LOCAL_CONTINUATION_KEY,
+        STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
     )
 
     project = await _make_project(db_session)
     stale_at = (
-        _utcnow() - timedelta(seconds=SESSION_IDLE_TTL_SECONDS + 60)
+        _utcnow() - timedelta(seconds=STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS + 60)
     ).isoformat()
     project.vision = {
         **(project.vision or {}),

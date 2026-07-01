@@ -638,6 +638,7 @@ async def build_strategic_runtime_summary(
     *,
     active_task: Task | None,
     project_vision: Dict[str, Any] | None = None,
+    operator_user_id: str | None = None,
 ) -> Dict[str, Any]:
     """Project local-runner readiness plus passive background-work state."""
 
@@ -740,7 +741,8 @@ async def build_strategic_runtime_summary(
         active_task_runtime = {**active_task_runtime, "vm_instance_id": None}
 
     continuation_status = strategic_local_continuation_status_from_vision(
-        project_vision
+        project_vision,
+        operator_user_id=operator_user_id,
     )
     preferred_runner_id = continuation_status.get("preferred_runner_id")
     if not isinstance(preferred_runner_id, str) or not preferred_runner_id.strip():

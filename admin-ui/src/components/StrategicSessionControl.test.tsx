@@ -184,6 +184,34 @@ describe('StrategicSessionControl', () => {
     expect(devices.className).toContain('border-amber-500/30');
   });
 
+  it('surfaces a workday marker owned by another operator without showing the owner id', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        localRunnerStatus={{
+          mode: 'pending_local',
+          continuation: {
+            enabled: true,
+            fresh: true,
+            owner_user_id: 'other-operator',
+            owned_by_current_operator: false,
+            ownership: 'other_operator',
+          },
+        }}
+        onModeChange={vi.fn()}
+        onOpenDevices={vi.fn()}
+      />,
+    );
+
+    const devices = screen.getByRole('button', {
+      name: /open devices: runner waiting, workday owned by another operator, fresh continuation/i,
+    });
+    expect(devices.className).toContain('border-amber-500/30');
+    expect(devices).toHaveTextContent('Workday owned by another operator');
+    expect(devices.getAttribute('aria-label')).not.toContain('other-operator');
+    expect(screen.queryByText('other-operator')).not.toBeInTheDocument();
+  });
+
   it('renders backend runner reason codes as operator-readable detail', () => {
     render(
       <StrategicSessionControl

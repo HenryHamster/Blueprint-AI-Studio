@@ -8,7 +8,7 @@ The rule for this file: after every major batch, update the status ledger, miles
 
 ## Status Ledger
 
-Overall implementation estimate: 78%.
+Overall implementation estimate: 82%.
 
 Legend:
 - Done: implemented, reviewed, tested, and pushed.
@@ -21,7 +21,7 @@ Legend:
 | --- | --- | --- | --- |
 | M0. Workbench IA foundation | Done | Four-mode shell, Chat/Pipeline/Project/Runtime homes, task archive moved under Pipeline, runtime settings/devices/accounts rehosted. | Keep regression coverage while later cleanup lands. |
 | M1. Roadmap and tracking discipline | In progress | This document. | Keep this file updated after every pushed batch. |
-| M2. Persistent local Strategic workday mode | Partial | Workbench state, continuous mode markers, Strategic local runner requirement, local runner selection, attention for holds, stale Strategic hold timeout, clearer Devices UI. | Make continuation persistence/ownership explicit and settle workday TTL semantics. |
+| M2. Persistent local Strategic workday mode | Done | Workbench state, 12-hour continuation markers, explicit marker ownership/lease diagnostics, duplicate-session protection, Strategic local runner requirement, local runner selection, attention for holds, stale Strategic hold timeout, and clearer Devices UI. | Only revisit explicit takeover or heartbeat fallback renewal if real multi-operator contention appears. |
 | M3. Messages as the active-work interface | Done | Shared `ProjectMessage` creation/projection, bounded workbench message context, minimal Strategic-session Chat, backend/frontend arming fixtures. | Keep regression coverage while M4/M5 add richer command and context surfaces. |
 | M4. Ctrl+K and hotkey operating layer | Partial | Command palette, shortcut hooks, server command descriptors, allowlisted command execution. | Finish canonical command/target registry and missing hotkeys. |
 | M5. Strategic context and canvas/artifact surface | Done | Context package, selected refs, canvas descriptors, `StrategicContextWorkspace`, map/resource rows, Chat artifact slot, descriptor schema, renderer tests, golden fixtures. | Keep v1 read-only; revisit writable canvas/layout persistence only with a concrete requirement. |
@@ -107,11 +107,14 @@ Existing:
 - Attention now surfaces Strategic local runner holds.
 - Stale Strategic local runner holds now share the compute local-runner bounded timeout path and terminally fail with an operator alert instead of waiting forever.
 - Runtime Devices and Strategic session controls now distinguish fresh, stale, and unknown continuation state; preferred runners; eligible live Strategic runners; connected runners; and Strategic vs compute local-runner holds.
+- Continuous mode now uses a 12-hour workday continuation TTL instead of the generic 4-hour UI idle TTL.
+- Continuation markers expose explicit owner/lease diagnostics in the backend read model and preserve fresh markers owned by another operator.
+- Newer same-user workday leases are protected from stale duplicate tabs that try to clear or overwrite the marker.
+- The Devices control warns when a fresh Workday marker is owned by another operator without showing raw owner ids.
 
-Remaining work:
-- Make continuation-marker ownership explicit for multi-operator cases. Current project-level marker is intentionally lossy.
-- Decide whether the current 4-hour workbench TTL is enough for a workday or whether continuous mode needs a longer durable marker.
-- Add any remaining tests for duplicate operator sessions and final preferred-runner loss cases not covered by current runner heartbeat/delete tests.
+Future considerations:
+- Keep the marker project-level unless real multi-operator contention proves explicit takeover or per-operator markers are worth the added system surface.
+- Consider heartbeat fallback renewal only if preferred-runner loss causes real workday interruption; current behavior remains conservative.
 
 Authoritative files:
 - `backend/app/workbench_state.py`
@@ -176,7 +179,7 @@ Acceptance gates:
 
 ## M4. Ctrl+K and Hotkey Operating Layer
 
-Status: Done.
+Status: Partial.
 
 Purpose: Let the operator avoid typing polished essays and avoid hunting through UI chrome. Commands should expose real actions, navigation, and context selection.
 
@@ -301,7 +304,7 @@ Acceptance gates:
 
 ## M7. Runtime, Devices, Accounts, Settings, and Project Management
 
-Status: Partial.
+Status: Done.
 
 Purpose: Make cost, accounts, devices, deployment health, and policy settings available when needed without cramming them into Chat or Pipeline.
 
@@ -312,7 +315,7 @@ Existing:
 - Project workspace rehosts project settings and project management.
 - Settings section router exists and many settings forms have tests.
 
-Remaining work:
+Future considerations:
 - Keep Runtime Devices aligned with M2 local-runner follow-up without editing the M2-owned runner panels in this batch.
 - Continue moving any future project policy controls through the canonical Project Manage home.
 
@@ -341,7 +344,7 @@ Acceptance gates:
 
 ## M8. Operator Attention and Work-Session Read Model
 
-Status: Done.
+Status: Partial.
 
 Purpose: Give the operator a reliable "what needs me" and "what is happening now" model without forcing manual task management.
 
@@ -436,7 +439,7 @@ Acceptance gates:
 
 ## M10. Visual System and UI Polish
 
-Status: Partial.
+Status: Done.
 
 Purpose: Make the app feel like a polished developer tool: dark, dense where needed, calm, and visually consistent.
 
@@ -446,7 +449,7 @@ Existing:
 - Pipeline remains denser for monitoring.
 - Many viewport tests exist.
 
-Remaining work:
+Future considerations:
 - Extend token migration deeper into low-level panels when those panels are otherwise touched.
 - Keep screenshot capture review in later completion-audit batches.
 
@@ -571,16 +574,16 @@ Final verification gates:
 
 ## Next Batch Recommendation
 
-Recommended next implementation batches: continue M4/M9 and M5/M6, then return to M2/M8 hardening.
+Recommended next implementation batches: continue M4/M9 and M5/M6, then run M12 audit loops.
 
 Scope:
 1. M4/M9: harden Ctrl+K commands, context targets, and backend/frontend fixtures.
 2. M5/M6: add first-class Chat canvas/artifact rendering and task sideboard fixture coverage.
 3. Keep M7/M10 token and settings-home regression coverage current while lower-level panels change.
-4. Return to M2 for continuation ownership and TTL semantics.
-5. Return to M8 for lifecycle clearing semantics and performance review.
+4. Run M8 lifecycle/performance audit checks while contract fixtures expand.
+5. Start M12 completion audit passes once M5/M6/M9 have their fixture coverage.
 
-Reason: the highest-risk M2 reliability gap is closed, M3 has landed, and M7/M10 cleanup has landed; the next material progress is making command/contracts, canvas/sideboard, and read-model hardening move in parallel.
+Reason: the highest-risk M2 reliability gap is closed, M3 has landed, and M7/M10 cleanup has landed; the next material progress is making command/contracts, canvas/sideboard, and read-model audit hardening move in parallel.
 
 ## Update Log
 
@@ -591,3 +594,4 @@ Reason: the highest-risk M2 reliability gap is closed, M3 has landed, and M7/M10
 | 2026-07-01 | roadmap creation | Created full usability roadmap and milestone ledger. |
 | 2026-07-01 | `33dd23e38` | Pushed stale operator attention paths: stale runner pins, provisioning, queued dependencies, Strategic local runner hold counts, frontend routing/sideboard integration, and regression tests. |
 | 2026-07-01 | M7/M10 runtime and visual polish | Implemented M7/M10 cleanup: canonical settings homes, workspace router host semantics, workbench theme tokens, primary shell token migration, Pipeline duplicate-open cleanup, reachability tests, focused typecheck/unit/viewport/capture evidence. |
+| 2026-07-01 | M2 continuation ownership/TTL | Added 12-hour workday continuation TTL, owner/lease read-model fields, foreign-owner and duplicate-session marker protection, Devices ownership warning, and focused backend/frontend tests. |

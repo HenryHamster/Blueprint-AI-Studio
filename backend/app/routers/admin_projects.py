@@ -2101,6 +2101,7 @@ async def get_project_strategic_state(
         project.id,
         active_task=active_task,
         project_vision=project.vision or {},
+        operator_user_id=current_user["user_id"],
     )
     workbench_state = await get_strategic_workbench_state(
         session,
