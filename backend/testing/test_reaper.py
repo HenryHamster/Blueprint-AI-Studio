@@ -432,13 +432,13 @@ async def test_parked_rate_limit_task_expires_back_to_cold_requeue(reaper_db, mo
         payloads=[{"type": "create"}],
         vm_instance_id=old_vm_id,
         status=TaskStatus.QUEUED,
-        retry_after_until=datetime.utcnow() - timedelta(minutes=1),
+        retry_after_until=_utcnow() - timedelta(minutes=1),
         context={
             "parked_for_retarget": True,
-            "park_deadline": (datetime.utcnow() - timedelta(seconds=5)).isoformat(),
+            "park_deadline": (_utcnow() - timedelta(seconds=5)).isoformat(),
             "warm_target_vm_id": old_vm_id,
             "warm_handoff_deadline": (
-                datetime.utcnow() - timedelta(seconds=5)
+                _utcnow() - timedelta(seconds=5)
             ).isoformat(),
             "warm_target_pr": "4242",
             "blacklisted_accounts": ["acct-failed"],
@@ -452,7 +452,7 @@ async def test_parked_rate_limit_task_expires_back_to_cold_requeue(reaper_db, mo
         "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock, return_value=True
     )
 
-    now = datetime.utcnow()
+    now = _utcnow()
     await run_infra_recovery_and_hold_maintenance(reaper_db, now)
 
     await reaper_db.refresh(task)

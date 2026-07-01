@@ -9593,8 +9593,12 @@ async def test_blocker_lands_blocked_no_retry_no_alert(
     in INFRA_CLASSES but a standalone task still ran through the FAILED->QUEUED
     retry branch, re-dispatching a VM up to max_retries against the same wall.
     """
+    from app.time_utils import _utcnow
+
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
-    mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
+    ensure_vm_deleted = mocker.patch(
+        "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock
+    )
     mocker.patch(
         "app.routers.agent_status.broadcast_to_project", new_callable=AsyncMock
     )
@@ -9612,6 +9616,8 @@ async def test_blocker_lands_blocked_no_retry_no_alert(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "build x"}],
         vm_instance_id="agent-vm-blocked",
+        last_heartbeat=_utcnow() - timedelta(minutes=5),
+        started_at=_utcnow() - timedelta(minutes=7),
         status=TaskStatus.IN_PROGRESS,
     )
     db_session.add(task)
@@ -9638,6 +9644,12 @@ async def test_blocker_lands_blocked_no_retry_no_alert(
     assert task.status != TaskStatus.QUEUED, "BLOCKED must not retry"
     # Retry budget is NOT burned.
     assert task.attempt_count == 0
+    assert task.vm_instance_id is None
+    assert task.last_heartbeat is None
+    assert task.started_at is None
+    ensure_vm_deleted.assert_awaited_once_with(
+        "agent-vm-blocked", reason="blocked_precondition"
+    )
     # BLOCKED_PRECONDITION classification preserved for historical consumers.
     assert (task.context or {}).get("failure_category") == "BLOCKED_PRECONDITION"
     # Durable blocker metadata persisted on the task itself, not only the status
@@ -22048,7 +22060,7 @@ async def test_agent_status_compute_terminal_before_park_callback_finalizes_once
         status=ComputeJobStatus.SUCCEEDED,
         outcome=ComputeJobOutcome.SUCCESS,
         final_cost_usd=0.42,
-        completed_at=datetime.utcnow() - timedelta(seconds=10),
+        completed_at=_utcnow() - timedelta(seconds=10),
     )
     db_session.add(job)
     await db_session.commit()
@@ -22142,6 +22154,7 @@ async def test_agent_status_compute_park_callback_duplicate_parked_is_idempotent
     existing registration.
     """
     from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.time_utils import _utcnow
 
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
 
@@ -22171,7 +22184,7 @@ async def test_agent_status_compute_park_callback_duplicate_parked_is_idempotent
         status=ComputeJobStatus.SUCCEEDED,
         outcome=ComputeJobOutcome.SUCCESS,
         final_cost_usd=0.10,
-        completed_at=datetime.utcnow() - timedelta(seconds=5),
+        completed_at=_utcnow() - timedelta(seconds=5),
     )
     db_session.add(job)
     await db_session.commit()
@@ -22250,6 +22263,7 @@ async def test_agent_status_compute_park_stale_non_parked_after_parking_is_noop(
     leave the task PARKED with the registration count unchanged.
     """
     from app.compute_jobs import COMPUTE_JOB_TERMINAL_WAKE_KIND
+    from app.time_utils import _utcnow
 
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
 
@@ -22279,7 +22293,7 @@ async def test_agent_status_compute_park_stale_non_parked_after_parking_is_noop(
         status=ComputeJobStatus.SUCCEEDED,
         outcome=ComputeJobOutcome.SUCCESS,
         final_cost_usd=0.05,
-        completed_at=datetime.utcnow() - timedelta(seconds=5),
+        completed_at=_utcnow() - timedelta(seconds=5),
     )
     db_session.add(job)
     await db_session.commit()

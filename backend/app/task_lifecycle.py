@@ -36,6 +36,7 @@ from app.models import (
     TaskWakeRegistration,
     WakeAction,
     WakeDeliveryState,
+    TASK_PARKABLE_STATUSES,
 )
 from app.schemas import AgentStatusPayload
 from app.shared_state import (
@@ -49,8 +50,7 @@ from app.task_capabilities import (
     strategic_phase_for,
 )
 from app.json_extract import scan_balanced_json_objects
-from app.task_blocked import strip_fresh_attempt_context
-from app.time_utils import clear_retry_after
+from app.task_blocked import reset_task_for_fresh_attempt
 import app.shared_state as _shared_state
 from app.broadcast import broadcast_to_project, _sanitize_log
 from app.payload_schemas import validate_internal_payload
@@ -6418,14 +6418,7 @@ async def close_orphan_pr_if_any(
 
 # Statuses a live task may transition into PARKED from. Terminal states and
 # BLOCKED are excluded — a parked task is *running* work that chose to wait.
-_PARKABLE_STATUSES = frozenset(
-    {
-        TaskStatus.QUEUED,
-        TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS,
-        TaskStatus.EVALUATING,
-    }
-)
+_PARKABLE_STATUSES = TASK_PARKABLE_STATUSES
 
 # Default age after which a PARKED task with no live (PENDING/FIRED) wake
 # registration is treated as orphaned and failed rather than stranded forever.
@@ -6835,12 +6828,8 @@ async def deliver_wake(
             emit_task_terminated_notify(session, str(task.id))
         registration.result_state = "finalized"
     else:  # RESUME — return the task to the dispatch queue on a fresh VM.
+        reset_task_for_fresh_attempt(task)
         task.status = TaskStatus.QUEUED
-        task.parked_at = None
-        task.park_reason = None
-        task.vm_instance_id = None
-        clear_retry_after(task)
-        task.context = strip_fresh_attempt_context(task.context or {})
         task.latest_status_message = (
             f"Woken by {registration.wake_source_kind}: re-queued for dispatch"
         )[:500]

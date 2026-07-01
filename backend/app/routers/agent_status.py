@@ -31,6 +31,7 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    TASK_AGENT_STATUS_IDEMPOTENT_STATUSES,
     bank_task_current_attempt,
     get_task_total_vm_cost_usd,
     with_task_attempt_banking,
@@ -104,12 +105,7 @@ router = APIRouter()
 
 
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
-_AGENT_STATUS_TERMINAL_STATUSES = (
-    TaskStatus.COMPLETED,
-    TaskStatus.FAILED,
-    TaskStatus.CANCELLED,
-    TaskStatus.BLOCKED,
-)
+_AGENT_STATUS_TERMINAL_STATUSES = TASK_AGENT_STATUS_IDEMPOTENT_STATUSES
 _PARK_AND_RETARGET_DEFAULT_BUDGET_SECONDS = 600
 _PARK_AND_RETARGET_MAX_BUDGET_SECONDS = 1800
 
@@ -1642,6 +1638,7 @@ async def update_agent_status(
                     from app.task_blocked import enter_blocked_state
 
                     _blk_acct_id = get_task_llm_account_id(task)
+                    _blocked_vm_id = task.vm_instance_id
                     if _blk_acct_id and not (task.context or {}).get("_slot_released"):
                         await release_max_plan_account(_blk_acct_id)
                         task.context = {**(task.context or {}), "_slot_released": True}
@@ -1658,10 +1655,10 @@ async def update_agent_status(
                         ),
                     )
                     task.vm_stopped_at = _utcnow()
-                    # Retire any LEASED pool member before the commit. enter_blocked_state
-                    # does not clear vm_instance_id, so the linkage is still intact here.
-                    # The terminal-completion path never fires for BLOCKED tasks, so this
-                    # is the last chance to release the member before it leaks permanently.
+                    # Retire any LEASED pool member before clearing vm_instance_id.
+                    # The terminal-completion path never fires for BLOCKED tasks,
+                    # so this is the last chance to release the member before it
+                    # leaks permanently.
                     try:
                         from app.models import PoolVmState  # noqa: PLC0415
                         from app.warm_pool import (  # noqa: PLC0415
@@ -1680,6 +1677,9 @@ async def update_agent_status(
                             "[AGENT STATUS] pool-member retire failed for BLOCKED task %s",
                             task.id,
                         )
+                    task.vm_instance_id = None
+                    task.last_heartbeat = None
+                    task.started_at = None
                     session.add(task)
                     await session.commit()
                     # Surface one deduplicated, operator-visible precondition
@@ -1706,7 +1706,7 @@ async def update_agent_status(
                         {"task_id": str(task.id), "status": TaskStatus.BLOCKED},
                     )
                     await _ensure_vm_deleted(
-                        task.vm_instance_id, reason="blocked_precondition"
+                        _blocked_vm_id, reason="blocked_precondition"
                     )
                     logger.info(
                         f"[AGENT STATUS] Task {task.id} BLOCKED — precondition not "

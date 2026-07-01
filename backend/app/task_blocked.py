@@ -497,6 +497,23 @@ def clear_blocker_metadata(task: Task) -> None:
     )
 
 
+def reset_task_for_fresh_attempt(task: Task) -> None:
+    """Clear stale runtime state before a task returns to QUEUED.
+
+    Used by BLOCKED/PARKED resume paths that reuse the same task row. It removes
+    the old agent binding and per-attempt liveness markers while preserving
+    retry-guidance history that belongs across attempts.
+    """
+    clear_blocker_metadata(task)
+    task.last_heartbeat = None
+    task.started_at = None
+    task.vm_instance_id = None
+    task.parked_at = None
+    task.park_reason = None
+    clear_retry_after(task)
+    task.context = strip_fresh_attempt_context(task.context or {})
+
+
 def unblock_to_queued(task: Task, *, message: Optional[str] = None) -> None:
     """Out-transition: return a BLOCKED task to QUEUED once its precondition
     resolves.
@@ -506,8 +523,7 @@ def unblock_to_queued(task: Task, *, message: Optional[str] = None) -> None:
     clear any JWT deny-list entry left by the BLOCKED transition. The sweep that
     decides *when* a precondition has resolved is owned by the auto-unblock work.
     """
-    clear_blocker_metadata(task)
-    task.context = strip_fresh_attempt_context(task.context or {})
+    reset_task_for_fresh_attempt(task)
     task.status = TaskStatus.QUEUED
     task.latest_status_message = (
         message or "Unblocked — precondition resolved, requeued"

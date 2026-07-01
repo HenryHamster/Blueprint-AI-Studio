@@ -171,6 +171,45 @@ class TaskStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+TASK_OUTCOME_TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }
+)
+
+# Statuses where the current agent/VM binding is no longer live and any issued
+# agent JWT must be revoked. BLOCKED/PARKED are recoverable, but both release
+# the agent slot immediately.
+TASK_AGENT_RELEASE_STATUSES: frozenset[TaskStatus] = (
+    TASK_OUTCOME_TERMINAL_STATUSES | {TaskStatus.BLOCKED, TaskStatus.PARKED}
+)
+
+# Agent status callbacks should be idempotent after true terminal outcomes and
+# BLOCKED. PARKED has its own stale-callback response because it is non-terminal
+# work owned by the wake-delivery worker.
+TASK_AGENT_STATUS_IDEMPOTENT_STATUSES: frozenset[TaskStatus] = (
+    TASK_OUTCOME_TERMINAL_STATUSES | {TaskStatus.BLOCKED}
+)
+
+TASK_PARKABLE_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+    }
+)
+
+
+def task_status_releases_agent_resources(status: TaskStatus | str | None) -> bool:
+    """True when ``status`` releases the active agent/VM binding."""
+    if status is None:
+        return False
+    return status in TASK_AGENT_RELEASE_STATUSES
+
+
 class WakeAction(str, Enum):
     """What the wake-delivery worker does with a PARKED task when its source fires.
 
@@ -2324,22 +2363,6 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
             emit_task_terminated_notify,
         )
 
-        # BLOCKED is terminal-for-now: entering it releases the VM and must
-        # revoke the agent JWT (emit_task_terminated_notify), and the
-        # BLOCKED->QUEUED unblock must fire the revive branch so peer instances
-        # evict the stale deny-list entry. PARKED is the same shape: entering it
-        # releases the agent VM/JWT/slot immediately (see park_task), so it must
-        # revoke the agent JWT exactly as BLOCKED does; the PARKED->QUEUED resume
-        # wake then fires the revive branch so peer instances evict the stale
-        # deny-list entry. Keep this in lockstep with the terminal set used by
-        # _on_status_set's callbacks below and with _AGENT_WS_TERMINAL_STATUSES.
-        terminal = (
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-            TaskStatus.BLOCKED,
-            TaskStatus.PARKED,
-        )
         for instance in session.dirty:
             if not isinstance(instance, Task):
                 continue
@@ -2347,9 +2370,11 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
             if not history.added:
                 continue
             new_status = history.added[0]
-            if new_status in terminal:
+            if task_status_releases_agent_resources(new_status):
                 emit_task_terminated_notify(session, str(instance.id))
-            elif history.deleted and history.deleted[0] in terminal:
+            elif history.deleted and task_status_releases_agent_resources(
+                history.deleted[0]
+            ):
                 # Real terminal → non-terminal transition (requeue/revive): the
                 # prior status was terminal and the new one is not. Broadcast so
                 # every instance evicts its stale deny-list entry. The guard on
@@ -2420,20 +2445,10 @@ def _on_status_set(target: Task, value, oldvalue, initiator):
                 e,
             )
         task_id = str(target.id)
-        # Notify JWT revocation when task reaches terminal state. BLOCKED is
-        # terminal-for-now: the VM is released and must stop, so revoke its JWT
-        # exactly as for FAILED/CANCELLED. Recovery requeues the task to QUEUED,
-        # which falls into the revive branch below and clears the deny-list entry.
-        # PARKED behaves identically — it releases the agent VM/JWT/slot the moment
-        # it parks, so the released agent's token must be revoked; the resume wake
-        # back to QUEUED hits the revive branch and clears the deny-list entry.
-        if value in (
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-            TaskStatus.BLOCKED,
-            TaskStatus.PARKED,
-        ):
+        # Notify JWT revocation when task reaches a resource-releasing state.
+        # BLOCKED/PARKED are recoverable, but both release the active agent/VM
+        # binding and must revoke the old token until a fresh QUEUED claim revives it.
+        if task_status_releases_agent_resources(value):
             for cb in _on_task_terminal_callbacks:
                 try:
                     cb(task_id)
