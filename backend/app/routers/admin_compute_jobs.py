@@ -322,7 +322,8 @@ async def kill_project_compute_job(
         killed = await session.get(ComputeJob, job_id)
         if killed is None:
             raise HTTPException(status_code=404, detail="Compute job not found")
-    return {"compute_job": serialize_compute_job_response_safe(killed)}
+    built = await _build_compute_job_payload(session, [killed])
+    return {"compute_job": built[0]}
 
 
 @router.get("/projects/{project_id}/compute-jobs/sweep-groups")

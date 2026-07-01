@@ -25,6 +25,7 @@ from app.models import (
     SourceKind,
     Task,
     TaskStatus,
+    _utcnow,
 )
 
 TEST_USER_ID = "test-user-123"
@@ -201,7 +202,13 @@ async def test_list_compute_jobs_non_member_404(client: AsyncClient, db_session)
 async def test_kill_compute_job_member_ok(client: AsyncClient, db_session):
     project = await _make_project(db_session, name="Killable")
     await _add_member(db_session, project.id, "member")
-    _task, job, _artifact = await _make_job(db_session, project)
+    task, job, artifact = await _make_job(
+        db_session,
+        project,
+        title="Killable compute task",
+        with_artifact=True,
+    )
+    assert artifact is not None
 
     resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
     assert resp.status_code == 200
@@ -209,6 +216,15 @@ async def test_kill_compute_job_member_ok(client: AsyncClient, db_session):
     assert body["status"] == ComputeJobStatus.CANCELLED.value
     assert body["outcome"] == ComputeJobOutcome.CANCELLED.value
     assert "operator" in (body["terminal_reason"] or "")
+    assert body["task_title"] == task.title
+    assert body["task_type"] == "compute_experiment"
+    assert body["artifact"] == {
+        "id": str(artifact.id),
+        "artifact_type": ArtifactType.COMPUTE_RESULT.value,
+        "storage_uri": "gs://bucket/jobs/job-1/result.parquet",
+        "logical_key": "compute-result-job-1",
+        "created_at": artifact.created_at.isoformat(),
+    }
 
 
 @pytest.mark.asyncio
@@ -628,7 +644,7 @@ async def test_list_compute_jobs_includes_success_criterion_and_verdict(
         machine_type="e2-standard-2",
         spend_cap_usd=2.0,
         accrued_cost_usd=1.0,
-        completed_at=datetime.utcnow(),
+        completed_at=_utcnow(),
     )
     db_session.add(job)
     await db_session.commit()
@@ -678,7 +694,7 @@ async def test_list_compute_jobs_per_arm_verdicts_exposed(
         machine_type="e2-standard-2",
         spend_cap_usd=2.0,
         accrued_cost_usd=1.20,
-        completed_at=datetime.utcnow(),
+        completed_at=_utcnow(),
     )
     db_session.add(job)
     await db_session.commit()
@@ -741,7 +757,7 @@ async def test_list_compute_jobs_criterion_verdict_recovered_from_job_row(
         spend_cap_usd=2.0,
         accrued_cost_usd=1.0,
         final_cost_usd=1.0,
-        completed_at=datetime.utcnow(),
+        completed_at=_utcnow(),
         polling_metadata={"result_metrics": {"accuracy": 0.95}},
     )
     db_session.add(job)
@@ -792,7 +808,7 @@ async def test_list_compute_jobs_criterion_verdict_recovered_from_stdout(
         spend_cap_usd=2.0,
         accrued_cost_usd=0.5,
         final_cost_usd=0.5,
-        completed_at=datetime.utcnow(),
+        completed_at=_utcnow(),
         polling_metadata={
             "command_log": {"text": 'run complete\n{"f1": 0.88}\n', "truncated": False}
         },
@@ -1193,7 +1209,7 @@ async def test_list_compute_jobs_includes_summary(client: AsyncClient, db_sessio
         spend_cap_usd=5.0,
         accrued_cost_usd=1.0,
         final_cost_usd=1.5,
-        completed_at=datetime.utcnow(),
+        completed_at=_utcnow(),
     )
     db_session.add(job1)
     await db_session.commit()
@@ -1226,7 +1242,7 @@ async def test_list_compute_jobs_includes_summary(client: AsyncClient, db_sessio
         spend_cap_usd=5.0,
         accrued_cost_usd=0.8,
         final_cost_usd=0.8,
-        completed_at=datetime.utcnow(),
+        completed_at=_utcnow(),
     )
     db_session.add(job2)
     await db_session.commit()

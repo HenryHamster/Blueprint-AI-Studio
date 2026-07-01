@@ -6,6 +6,7 @@ from typing import Dict, Any, List
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -49,9 +50,14 @@ async def get_activity(
 
     # --- 1 & 2: Completed and Failed tasks in last 7 days (or since cutoff) ---
     user_project_ids = _user_project_ids(current_user["user_id"])
+    terminal_activity_at = func.coalesce(
+        Task.completed_at,
+        Task.updated_at,
+        Task.created_at,
+    )
     task_filters = [
         Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-        Task.created_at >= cutoff,
+        terminal_activity_at >= cutoff,
         Task.project_id.in_(user_project_ids),
     ]
     if project_id:
@@ -67,15 +73,16 @@ async def get_activity(
                 Task.title,
                 Task.project_id,
                 Task.payloads,
-                Task.status_log,
                 Task.created_at,
                 Task.started_at,
+                Task.completed_at,
+                Task.updated_at,
                 Task.context,
                 Task.latest_status_message,
                 Task.plan_output,
             raiseload=True,)
         )
-        .order_by(Task.created_at.desc())
+        .order_by(terminal_activity_at.desc())
         .limit(limit * 3)
     )
     recent_tasks = tasks_result.scalars().all()
@@ -134,17 +141,9 @@ async def get_activity(
         task_type = (t.first_payload).get("type", "create")
         pr_info = artifact_map.get(tid, {})
 
-        # Determine timestamp: last status_log entry or updated_at fallback
-        completed_at = None
-        if t.status_log:
-            last_entry = t.status_log[-1]
-            try:
-                completed_at = datetime.fromisoformat(last_entry["t"])
-            except (KeyError, ValueError):
-                pass
-        if completed_at is None:
-            # fall back to created_at since Task has no updated_at column
-            completed_at = t.created_at
+        # Match the SQL filter/order expression so recent rows cannot emit
+        # stale event timestamps.
+        completed_at = t.completed_at or t.updated_at or t.created_at
 
         duration_seconds = None
         if completed_at is not None and t.started_at is not None:
