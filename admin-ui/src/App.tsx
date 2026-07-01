@@ -7,7 +7,6 @@ import { ConfirmDialog } from './components/ConfirmDialog';
 import { useAppState } from './useAppState';
 import { matchesTaskTypeFilter, resolveTaskCapabilities, TaskCapabilitiesProvider } from './taskCapabilities';
 import { usePoller, DEFAULT_POLL_MS } from './hooks/usePoller';
-import TaskStreamPanel from './components/TaskStreamPanel';
 import { ResearchBrowser } from './components/ResearchBrowser';
 import { KnowledgeBrowser } from './components/KnowledgeBrowser';
 import { auth, signInWithGoogle, signOut } from './firebase';
@@ -71,7 +70,6 @@ export default function App() {
   refreshMessagesRef.current = () => setMessageRealtimeRefreshSignal(value => value + 1);
   const s = useAppState({ refreshStrategicReadModelRef, refreshMessagesRef });
   const searchInputRef = useRef<HTMLInputElement>(null);
-  const [drawerWidth, setDrawerWidth] = useState(0);
   const [pipelineContextTask, setPipelineContextTask] = useState<Task | null>(null);
   const pipelineContextRequestRef = useRef(0);
   // Dedup guard: track the last lastCycleCompletion object we toasted for so a
@@ -897,6 +895,13 @@ export default function App() {
     s.setActiveTab(tab);
   }, [s, persistStrategicWorkbench]);
 
+  const openTrackedTaskStreams = useCallback(() => {
+    setArchiveVisible(false);
+    setTaskViewMode('pipeline');
+    setPipelineSection('flow');
+    handleTabChange('pipeline');
+  }, [handleTabChange, setArchiveVisible, setTaskViewMode]);
+
   const openRuntimeAccounts = useCallback(() => {
     setRuntimeSection('accounts');
     handleTabChange('runtime');
@@ -1082,14 +1087,14 @@ export default function App() {
       <button
         type="button"
         onClick={() => { void s.fetchTasks(); }}
-        className="inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
+        className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9"
       >
         Refresh
       </button>
       <button
         type="button"
         onClick={s.openNewTaskModal}
-        className="inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
+        className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9"
       >
         New task
       </button>
@@ -1203,8 +1208,6 @@ export default function App() {
   const pipelinePagination = (
     <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />
   );
-  const pipelineFlowOwnsTaskStream = activeTab === 'pipeline' && pipelineSection === 'flow';
-
   if (s.authLoading) {
     return (
       <div className="h-screen flex items-center justify-center bg-neutral-950 text-neutral-400">
@@ -1835,7 +1838,13 @@ export default function App() {
 
       <PrimaryTabNav
         activeTab={activeTab}
-        onTabChange={handleTabChange}
+        onTabChange={(tab) => {
+          if (tab === 'pipeline' && s.trackedTaskIds.size > 0) {
+            openTrackedTaskStreams();
+            return;
+          }
+          handleTabChange(tab);
+        }}
         openMessageCount={openMessageCount}
         newSinceLastVisitCount={newSinceLastVisit}
         needsAttentionCount={pipelineAttentionCount}
@@ -1853,6 +1862,16 @@ export default function App() {
         )}
         right={(
           <>
+            {s.trackedTaskIds.size > 0 && (
+              <button
+                type="button"
+                onClick={openTrackedTaskStreams}
+                className="rounded border border-neutral-800 bg-neutral-950/70 px-1.5 text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-100"
+                title="Open tracked task streams in Pipeline"
+              >
+                tracking {s.trackedTaskIds.size}
+              </button>
+            )}
             <span>{s.globalActiveCount} active</span>
             <span>{s.globalQueuedCount} queued</span>
             <span>${s.cumulativeCost.toFixed(2)}</span>
@@ -1993,23 +2012,11 @@ export default function App() {
               baseBranch: payload.base_branch as string | undefined,
             });
           }}
-          onWidthChange={setDrawerWidth}
           onNavigateToTask={(taskId) => {
             handleViewTaskById(taskId);
           }}
         />
         </ErrorBoundary>
-      )}
-
-      {s.trackedTaskIds.size > 0 && !pipelineFlowOwnsTaskStream && (
-        <TaskStreamPanel
-          trackedTaskIds={s.trackedTaskIds}
-          trackedLogs={s.trackedLogs}
-          tasks={s.tasks}
-          onUntrack={s.untrackTask}
-          onUntrackAll={s.untrackAll}
-          offsetRight={s.logTask ? drawerWidth : 0}
-        />
       )}
 
       {s.selectionMode && s.selectedTaskIds.size > 0 && (

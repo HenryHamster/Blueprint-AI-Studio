@@ -382,6 +382,45 @@ describe('HeaderBar — viewport regression', () => {
     expect(onTabChange).not.toHaveBeenCalled();
   });
 
+  test('mobile menu exposes health panel without a separate monitoring surface', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.minHeight = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} />); });
+    const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
+    await act(async () => { hamburger?.click(); });
+
+    const healthButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.includes('Health panel'));
+    expect(healthButton).toBeTruthy();
+    await act(async () => { healthButton?.click(); });
+
+    expect(host.querySelector('[data-testid="orchestrator-health-bar"]')).not.toBeNull();
+    expect(host.textContent).not.toContain('Task stream');
+  });
+
+  test('mobile menu hides new task while Pipeline owns task creation controls', async () => {
+    const onOpenNewTaskModal = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.minHeight = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenNewTaskModal={onOpenNewTaskModal} activeTab="pipeline" />); });
+    const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
+    await act(async () => { hamburger?.click(); });
+
+    const mobileMenu = hamburger?.nextElementSibling;
+    const mobileNewTaskButton = Array.from(mobileMenu?.querySelectorAll<HTMLButtonElement>('button') ?? [])
+      .find(button => button.textContent?.trim() === 'New task');
+    expect(mobileNewTaskButton).toBeUndefined();
+    expect(onOpenNewTaskModal).not.toHaveBeenCalled();
+  });
+
   test('mobile primary nav switches modes and shows badges', async () => {
     const onTabChange = vi.fn();
     host = document.createElement('div');

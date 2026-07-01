@@ -33,4 +33,13 @@ describe('App workbench wiring', () => {
     expect(appSource).toContain('onOpenTask: handleOpenTaskDetails,');
     expect(appSource).toMatch(/<RuntimeWorkspace[\s\S]*onViewTask=\{handleOpenTaskDetails\}/);
   });
+
+  test('keeps live task streams owned by Pipeline instead of a global floating panel', () => {
+    expect(appSource).not.toContain("import TaskStreamPanel from './components/TaskStreamPanel';");
+    expect(appSource).not.toContain('<TaskStreamPanel');
+    expect(appSource).toMatch(/const openTrackedTaskStreams = useCallback\(\(\) => \{[\s\S]*setArchiveVisible\(false\);[\s\S]*setTaskViewMode\('pipeline'\);[\s\S]*setPipelineSection\('flow'\);[\s\S]*handleTabChange\('pipeline'\);/);
+    expect(appSource).toMatch(/<PipelineWorkspace[\s\S]*stream=\{\{[\s\S]*trackedTaskIds: s\.trackedTaskIds,[\s\S]*trackedLogs: s\.trackedLogs,[\s\S]*onUntrack: s\.untrackTask,[\s\S]*onUntrackAll: s\.untrackAll,/);
+    expect(appSource).toMatch(/<PrimaryTabNav[\s\S]*onTabChange=\{\(tab\) => \{[\s\S]*tab === 'pipeline' && s\.trackedTaskIds\.size > 0[\s\S]*openTrackedTaskStreams\(\);/);
+    expect(appSource).toContain('Open tracked task streams in Pipeline');
+  });
 });

@@ -804,12 +804,27 @@ export function HeaderBar(props: HeaderBarProps) {
                   </button>
                 )}
                 <button
-                  onClick={() => { onOpenNewTaskModal(); setShowMobileMenu(false); }}
-                  className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
+                  onClick={() => {
+                    setHealthExpanded(prev => !prev);
+                    setShowMobileMenu(false);
+                    setShowMobileShortcuts(false);
+                  }}
+                  className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${
+                    healthExpanded ? 'bg-neutral-800/90 text-neutral-100' : 'text-neutral-300 hover:bg-neutral-800'
+                  }`}
                 >
-                  <span className="w-4 h-4 flex items-center justify-center font-mono shrink-0">N</span>
-                  <span>New task</span>
+                  <span className={`h-2 w-2 rounded-full shrink-0 ${healthDotColor}`} />
+                  <span>{healthExpanded ? 'Hide health panel' : 'Health panel'}</span>
                 </button>
+                {props.activeTab !== 'pipeline' && (
+                  <button
+                    onClick={() => { onOpenNewTaskModal(); setShowMobileMenu(false); }}
+                    className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
+                  >
+                    <span className="w-4 h-4 flex items-center justify-center font-mono shrink-0">N</span>
+                    <span>New task</span>
+                  </button>
+                )}
                 <button
                   onClick={() => setShowMobileShortcuts(prev => !prev)}
                   className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
