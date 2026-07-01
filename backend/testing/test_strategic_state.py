@@ -2375,6 +2375,10 @@ async def test_strategic_session_command_executes_attention_housekeeping(
         f"/api/admin/projects/{project.id}/strategic-session/commands/attention.alert.dismiss:{alert.id}/execute",
         json={"idempotency_key": "cmd-dismiss-alert-1"},
     )
+    dismiss_duplicate_resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/commands/attention.alert.dismiss:{alert.id}/execute",
+        json={"idempotency_key": "cmd-dismiss-alert-1"},
+    )
 
     assert seen_resp.status_code == 200, seen_resp.text
     assert seen_resp.json()["command"]["receipt"]["command_id"] == "attention.messages.mark_seen"
@@ -2395,6 +2399,11 @@ async def test_strategic_session_command_executes_attention_housekeeping(
     )
     await db_session.refresh(alert)
     assert alert.dismissed_at is not None
+    assert dismiss_duplicate_resp.status_code == 200, dismiss_duplicate_resp.text
+    duplicate_command = dismiss_duplicate_resp.json()["command"]
+    assert duplicate_command["status"] == "duplicate"
+    assert duplicate_command["applied"] is False
+    assert duplicate_command["receipt"]["id"] == dismiss_resp.json()["command"]["receipt"]["id"]
 
 
 @pytest.mark.asyncio

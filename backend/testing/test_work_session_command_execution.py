@@ -4,7 +4,8 @@ import pytest
 from fastapi import HTTPException
 from sqlmodel import select
 
-from app.models import Project, ProjectMessage
+from app.models import Alert, LocalRunner, Project, ProjectMessage
+from app.messages_noise_prefs_store import get_messages_noise_prefs_row
 from app.work_session_command_execution import (
     build_work_session_command_jobs,
     execute_work_session_command,
@@ -38,7 +39,7 @@ def _dismiss_alert_command(project_id: uuid.UUID, alert_id: uuid.UUID) -> dict:
         "mutation": {
             "method": "POST",
             "path": f"/api/admin/alerts/{alert_id}/dismiss",
-            "body": {"token": "must-not-leak"},
+            "body": {},
         },
     }
 
@@ -122,6 +123,269 @@ async def test_failed_allowlisted_command_persists_bounded_receipt_and_jobs(
         )
     ).scalars().all()
     assert len(receipts) == 1
+
+
+@pytest.mark.asyncio
+async def test_executes_check_in_mode_command_through_shared_contract(db_session):
+    project = await _make_project(db_session)
+    command = {
+        "id": "session.mode.check_in",
+        "label": "Check-in mode",
+        "enabled": True,
+        "target": {
+            "surface": "messages",
+            "project_id": str(project.id),
+            "action": "set_check_in_mode",
+        },
+        "refetch_surfaces": ["strategic_session"],
+        "mutation": {
+            "method": "POST",
+            "path": f"/api/admin/projects/{project.id}/strategic-session",
+            "body": {"workbench": {"interaction_mode": "check_in"}},
+        },
+    }
+
+    result = await execute_work_session_command(
+        db_session,
+        project_id=project.id,
+        user_id=TEST_USER_ID,
+        command=command,
+        idempotency_key="check-in-mode-1",
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["applied"] is True
+    assert result["receipt"]["command_id"] == "session.mode.check_in"
+    prefs = await get_messages_noise_prefs_row(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+    )
+    assert prefs is not None
+    assert prefs.prefs["_strategic_workbench"]["interaction_mode"] == "check_in"
+
+
+@pytest.mark.asyncio
+async def test_drifted_executable_descriptors_do_not_apply_or_persist_receipts(
+    db_session,
+):
+    project = await _make_project(db_session)
+    alert = Alert(
+        project_id=project.id,
+        title="Runner offline",
+        message="Runner stopped heartbeating",
+    )
+    db_session.add(alert)
+    await db_session.commit()
+    await db_session.refresh(alert)
+
+    commands = [
+        (
+            {
+                "id": "session.mode.check_in",
+                "label": "Check-in mode",
+                "enabled": True,
+                "target": {
+                    "surface": "messages",
+                    "project_id": str(project.id),
+                    "action": "set_check_in_mode",
+                },
+                "mutation": {
+                    "method": "POST",
+                    "path": f"/api/admin/projects/{project.id}/strategic-session?unsafe=1",
+                    "body": {"workbench": {"interaction_mode": "check_in"}},
+                },
+            },
+            "drifted-mode-path",
+        ),
+        (
+            {
+                "id": "attention.messages.mark_seen",
+                "label": "Mark messages seen",
+                "enabled": True,
+                "target": {
+                    "surface": "messages",
+                    "project_id": str(project.id),
+                    "action": "mark_seen",
+                },
+                "mutation": {
+                    "method": "PUT",
+                    "path": "/api/admin/messages/last-seen",
+                    "body": {
+                        "project_id": str(uuid.uuid4()),
+                        "timestamp": 123456,
+                    },
+                },
+            },
+            "drifted-mark-seen-project",
+        ),
+        (
+            {
+                "id": f"attention.alert.dismiss:{alert.id}",
+                "label": "Dismiss alert: Runner offline",
+                "enabled": True,
+                "target": {
+                    "surface": "runtime",
+                    "project_id": str(project.id),
+                    "section": "health",
+                    "alert_id": str(uuid.uuid4()),
+                    "action": "dismiss_alert",
+                },
+                "mutation": {
+                    "method": "POST",
+                    "path": f"/api/admin/alerts/{alert.id}/dismiss",
+                    "body": {},
+                },
+            },
+            "drifted-alert-target",
+        ),
+        (
+            {
+                "id": f"attention.alert.dismiss:{alert.id}",
+                "label": "Dismiss alert: Runner offline",
+                "enabled": True,
+                "target": {
+                    "surface": "runtime",
+                    "project_id": str(project.id),
+                    "section": "health",
+                    "alert_id": str(alert.id),
+                    "action": "dismiss_alert",
+                },
+                "mutation": {
+                    "method": "POST",
+                    "path": f"/api/admin/alerts/{alert.id}/dismiss",
+                    "body": {"token": "must-not-leak"},
+                },
+            },
+            "drifted-alert-body",
+        ),
+    ]
+
+    for command, idempotency_key in commands:
+        with pytest.raises(HTTPException) as exc_info:
+            await execute_work_session_command(
+                db_session,
+                project_id=project.id,
+                user_id=TEST_USER_ID,
+                command=command,
+                idempotency_key=idempotency_key,
+            )
+        assert exc_info.value.status_code == 409
+
+    await db_session.refresh(alert)
+    assert alert.dismissed_at is None
+    receipts = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalars().all()
+    assert receipts == []
+
+
+@pytest.mark.asyncio
+async def test_executes_runner_prefer_and_clear_with_stale_clear_guard(db_session):
+    project = await _make_project(db_session)
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="a" * 64,
+        hostname="desk-mini",
+        status="active",
+    )
+    stale_runner = LocalRunner(
+        project_id=project.id,
+        token_hash="b" * 64,
+        hostname="old-desk",
+        status="active",
+    )
+    db_session.add_all([runner, stale_runner])
+    await db_session.commit()
+    await db_session.refresh(runner)
+    await db_session.refresh(stale_runner)
+    runner_id = str(runner.id)
+    stale_runner_id = str(stale_runner.id)
+    prefer_command = {
+        "id": f"session.runner.prefer.{runner_id}",
+        "label": "Prefer runner A",
+        "enabled": True,
+        "target": {
+            "surface": "runtime",
+            "project_id": str(project.id),
+            "section": "devices",
+            "action": "prefer_runner",
+            "runner_id": runner_id,
+        },
+        "refetch_surfaces": ["strategic_session", "runtime"],
+        "mutation": {
+            "method": "POST",
+            "path": f"/api/admin/projects/{project.id}/strategic-session",
+            "body": {"workbench": {"preferred_runner_id": runner_id}},
+        },
+    }
+
+    prefer_result = await execute_work_session_command(
+        db_session,
+        project_id=project.id,
+        user_id=TEST_USER_ID,
+        command=prefer_command,
+        idempotency_key="prefer-runner-a-1",
+    )
+
+    assert prefer_result["status"] == "succeeded"
+    prefs = await get_messages_noise_prefs_row(db_session, TEST_USER_ID, project.id)
+    assert prefs is not None
+    assert prefs.prefs["_strategic_workbench"]["preferred_runner_id"] == runner_id
+
+    stale_clear_command = {
+        "id": "session.runner.clear_preferred",
+        "label": "Clear preferred runner",
+        "enabled": True,
+        "target": {
+            "surface": "runtime",
+            "project_id": str(project.id),
+            "section": "devices",
+            "action": "clear_preferred_runner",
+            "runner_id": stale_runner_id,
+        },
+        "refetch_surfaces": ["strategic_session", "runtime"],
+        "mutation": {
+            "method": "POST",
+            "path": f"/api/admin/projects/{project.id}/strategic-session",
+            "body": {"workbench": {"preferred_runner_id": None}},
+        },
+    }
+    with pytest.raises(HTTPException) as exc_info:
+        await execute_work_session_command(
+            db_session,
+            project_id=project.id,
+            user_id=TEST_USER_ID,
+            command=stale_clear_command,
+            idempotency_key="clear-runner-stale-1",
+        )
+    assert exc_info.value.status_code == 409
+
+    prefs = await get_messages_noise_prefs_row(db_session, TEST_USER_ID, project.id)
+    assert prefs is not None
+    assert prefs.prefs["_strategic_workbench"]["preferred_runner_id"] == runner_id
+
+    clear_command = {
+        **stale_clear_command,
+        "target": {
+            **stale_clear_command["target"],
+            "runner_id": runner_id,
+        },
+    }
+    clear_result = await execute_work_session_command(
+        db_session,
+        project_id=project.id,
+        user_id=TEST_USER_ID,
+        command=clear_command,
+        idempotency_key="clear-runner-a-1",
+    )
+
+    assert clear_result["status"] == "succeeded"
+    prefs = await get_messages_noise_prefs_row(db_session, TEST_USER_ID, project.id)
+    assert prefs is not None
+    assert prefs.prefs["_strategic_workbench"].get("preferred_runner_id") is None
 
 
 @pytest.mark.asyncio

@@ -5,6 +5,16 @@ from app.work_session_commands import (
     MAX_WORK_SESSION_COMMANDS,
     build_work_session_commands,
 )
+from app.workbench_contracts import (
+    COMMAND_ID_ATTENTION_MESSAGES_MARK_SEEN,
+    COMMAND_ID_SESSION_CLEAR_SELECTED_REFS,
+    COMMAND_ID_SESSION_RUNNER_CLEAR_PREFERRED,
+    alert_dismiss_command_id,
+    executable_work_session_command_contract,
+    runner_preference_command_id,
+    session_mode_command_id,
+    work_session_command_kind,
+)
 
 
 def _commands_by_id(commands):
@@ -144,6 +154,7 @@ def test_work_session_commands_include_fixed_session_commands_and_canvas():
     assert {
         "session.check_in",
         "session.mode.continuous",
+        "session.mode.check_in",
         "session.mode.monitor",
         "session.mode.chat",
         "session.clear_selected_refs",
@@ -164,6 +175,17 @@ def test_work_session_commands_include_fixed_session_commands_and_canvas():
     }
     assert workday["target"]["surface"] == "messages"
     assert workday["refetch_surfaces"] == ["strategic_session", "runtime"]
+
+    check_in_mode = by_id["session.mode.check_in"]
+    assert check_in_mode["label"] == "Check-in mode"
+    assert check_in_mode["enabled"] is True
+    assert check_in_mode["mutation"] == {
+        "method": "POST",
+        "path": "/api/admin/projects/project-1/strategic-session",
+        "body": {"workbench": {"interaction_mode": "check_in"}},
+    }
+    assert check_in_mode["target"]["action"] == "set_check_in_mode"
+    assert check_in_mode["refetch_surfaces"] == ["strategic_session"]
 
     assert by_id["session.mode.chat"]["enabled"] is False
     assert by_id["session.clear_selected_refs"]["enabled"] is False
@@ -364,6 +386,81 @@ def test_work_session_commands_include_attention_mutations():
         },
     }
     assert "secret-token" not in json.dumps(commands, sort_keys=True)
+
+
+def test_work_session_command_contract_classifies_emitted_executable_commands():
+    alert_id = str(uuid.uuid4())
+    commands = build_work_session_commands(
+        project_id="project-1",
+        workbench_state={
+            "interaction_mode": "monitor",
+            "selected_refs": [
+                {"kind": "task", "id": "task-1", "label": "Selected task"}
+            ],
+            "preferred_runner_id": "runner-1",
+        },
+        context_package=None,
+        actions=[],
+        local_runner={
+            "runners": [
+                {
+                    "id": "runner-1",
+                    "hostname": "desk-mini",
+                    "eligible_for_active_task": True,
+                },
+                {
+                    "id": "runner-2",
+                    "hostname": "desk-two",
+                    "eligible_for_active_task": True,
+                },
+            ],
+        },
+        attention={
+            "counts": {"unread": 3},
+            "items": [
+                {
+                    "kind": "alert",
+                    "label": "Runner offline",
+                    "ref": {
+                        "kind": "alert",
+                        "id": alert_id,
+                        "project_id": "project-1",
+                    },
+                }
+            ],
+        },
+    )
+
+    executable_command_ids = {
+        command["id"] for command in commands if "mutation" in command
+    }
+
+    assert executable_command_ids == {
+        session_mode_command_id("continuous"),
+        session_mode_command_id("check_in"),
+        session_mode_command_id("monitor"),
+        session_mode_command_id("chat"),
+        COMMAND_ID_SESSION_CLEAR_SELECTED_REFS,
+        runner_preference_command_id("runner-1"),
+        runner_preference_command_id("runner-2"),
+        COMMAND_ID_SESSION_RUNNER_CLEAR_PREFERRED,
+        COMMAND_ID_ATTENTION_MESSAGES_MARK_SEEN,
+        alert_dismiss_command_id(alert_id),
+    }
+    assert {
+        work_session_command_kind(command_id)
+        for command_id in executable_command_ids
+    } == {
+        "strategic_workbench",
+        "messages_last_seen",
+        "alert_dismiss",
+    }
+    assert all(
+        executable_work_session_command_contract(command, project_id="project-1")
+        is not None
+        for command in commands
+        if "mutation" in command
+    )
 
 
 def test_work_session_commands_skip_attention_mutations_when_not_useful():

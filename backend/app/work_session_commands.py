@@ -12,18 +12,23 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.workbench_contracts import (
-    ALERT_DISMISS_COMMAND_PREFIX,
+    COMMAND_ID_ATTENTION_MESSAGES_MARK_SEEN,
+    COMMAND_ID_SESSION_CHECK_IN,
+    COMMAND_ID_SESSION_CLEAR_SELECTED_REFS,
+    COMMAND_ID_SESSION_RUNNER_CLEAR_PREFERRED,
     DEFAULT_REFETCH_SURFACES,
-    RUNNER_PREFER_COMMAND_PREFIX,
     SURFACE_MESSAGES,
     SURFACE_RUNTIME,
     SURFACE_STRATEGIC_SESSION,
+    alert_dismiss_command_id,
     alert_dismiss_endpoint,
     compact_text,
     messages_last_seen_endpoint,
     normalize_command_descriptor,
     normalize_refetch_surfaces,
     normalize_target,
+    runner_preference_command_id,
+    session_mode_command_id,
     strategic_session_endpoint,
 )
 
@@ -125,7 +130,7 @@ def _mode_command(
     refetch_surfaces: tuple[str, ...] = DEFAULT_REFETCH_SURFACES,
 ) -> dict[str, Any] | None:
     return _command(
-        f"session.mode.{mode}",
+        session_mode_command_id(mode),
         label,
         group="mode",
         priority="normal",
@@ -194,7 +199,7 @@ def _fixed_session_commands(
 
     candidates = [
         _command(
-        "session.check_in",
+            COMMAND_ID_SESSION_CHECK_IN,
             "Check in",
             group="session",
             priority="normal",
@@ -216,6 +221,12 @@ def _fixed_session_commands(
         _mode_command(
             project_id=project_id,
             current_mode=current_mode,
+            mode="check_in",
+            label="Check-in mode",
+        ),
+        _mode_command(
+            project_id=project_id,
+            current_mode=current_mode,
             mode="monitor",
             label="Monitor mode",
         ),
@@ -226,7 +237,7 @@ def _fixed_session_commands(
             label="Chat mode",
         ),
         _command(
-            "session.clear_selected_refs",
+            COMMAND_ID_SESSION_CLEAR_SELECTED_REFS,
             "Clear selected refs",
             group="context",
             priority="normal",
@@ -284,7 +295,7 @@ def _runner_preference_commands(
                 continue
             commands.append(
                 _command(
-                    f"{RUNNER_PREFER_COMMAND_PREFIX}{runner_id}",
+                    runner_preference_command_id(runner_id),
                     _runner_label(candidate, runner_id),
                     group="runtime",
                     priority="normal",
@@ -313,7 +324,7 @@ def _runner_preference_commands(
     if preferred_runner_id:
         commands.append(
             _command(
-                "session.runner.clear_preferred",
+                COMMAND_ID_SESSION_RUNNER_CLEAR_PREFERRED,
                 "Clear preferred runner",
                 group="runtime",
                 priority="normal",
@@ -353,7 +364,7 @@ def _attention_commands(
     if unread_count > 0:
         commands.append(
             _command(
-                "attention.messages.mark_seen",
+                COMMAND_ID_ATTENTION_MESSAGES_MARK_SEEN,
                 "Mark messages seen",
                 group="attention",
                 priority="normal",
@@ -389,7 +400,7 @@ def _attention_commands(
                 continue
             commands.append(
                 _command(
-                    f"{ALERT_DISMISS_COMMAND_PREFIX}{alert_id}",
+                    alert_dismiss_command_id(alert_id),
                     _alert_dismiss_label(item, alert_id),
                     group="attention",
                     priority="normal",

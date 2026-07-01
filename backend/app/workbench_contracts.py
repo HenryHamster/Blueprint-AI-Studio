@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Mapping, Sequence
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 from urllib.parse import quote
 
 WORKBENCH_CONTRACT_VERSION = 1
@@ -105,11 +106,16 @@ COMMAND_GROUPS = frozenset(
     )
 )
 COMMAND_PRIORITIES = frozenset(("critical", "high", "normal", "low"))
-EXECUTABLE_SESSION_MODES = frozenset(("chat", "continuous", "monitor"))
+EXECUTABLE_SESSION_MODES = frozenset(("chat", "check_in", "continuous", "monitor"))
 STRATEGIC_INTERACTION_MODES = frozenset(
     ("chat", "check_in", "monitor", "continuous")
 )
 
+COMMAND_ID_SESSION_CHECK_IN = "session.check_in"
+COMMAND_ID_SESSION_CLEAR_SELECTED_REFS = "session.clear_selected_refs"
+COMMAND_ID_SESSION_RUNNER_CLEAR_PREFERRED = "session.runner.clear_preferred"
+COMMAND_ID_ATTENTION_MESSAGES_MARK_SEEN = "attention.messages.mark_seen"
+SESSION_MODE_COMMAND_PREFIX = "session.mode."
 RUNNER_PREFER_COMMAND_PREFIX = "session.runner.prefer."
 ALERT_DISMISS_COMMAND_PREFIX = "attention.alert.dismiss:"
 MUTATION_METHODS = frozenset(("PATCH", "POST", "PUT"))
@@ -208,6 +214,24 @@ WEBSOCKET_EMITTER_INVENTORY = {
         "backend/app/warm_pool_maintainer.py",
     ),
 }
+
+WorkSessionCommandKind = Literal[
+    "strategic_workbench",
+    "messages_last_seen",
+    "alert_dismiss",
+]
+
+
+@dataclass(frozen=True)
+class WorkSessionExecutableCommand:
+    command_id: str
+    kind: WorkSessionCommandKind
+    method: str
+    path: str
+    workbench_patch: dict[str, Any] | None = None
+    messages_seen_timestamp: int | None = None
+    runner_id: str | None = None
+    alert_id: str | None = None
 
 
 def compact_text(value: Any, *, max_chars: int = 180) -> str | None:
@@ -317,6 +341,21 @@ def alert_dismiss_endpoint(alert_id: Any) -> str:
     return f"/api/admin/alerts/{quote(str(alert_id), safe='')}/dismiss"
 
 
+def session_mode_command_id(mode: str) -> str:
+    return f"{SESSION_MODE_COMMAND_PREFIX}{mode}"
+
+
+def session_mode_from_command_id(command_id: str) -> str | None:
+    if not command_id.startswith(SESSION_MODE_COMMAND_PREFIX):
+        return None
+    mode = command_id.removeprefix(SESSION_MODE_COMMAND_PREFIX)
+    return mode if mode in EXECUTABLE_SESSION_MODES else None
+
+
+def runner_preference_command_id(runner_id: str) -> str:
+    return f"{RUNNER_PREFER_COMMAND_PREFIX}{runner_id}"
+
+
 def alert_id_from_command_id(command_id: str) -> str | None:
     if not command_id.startswith(ALERT_DISMISS_COMMAND_PREFIX):
         return None
@@ -335,17 +374,20 @@ def runner_id_from_command_id(command_id: str) -> str | None:
     )
 
 
-def work_session_command_kind(command_id: str) -> str | None:
-    if command_id.startswith("session.mode."):
-        mode = command_id.removeprefix("session.mode.")
-        return "strategic_workbench" if mode in EXECUTABLE_SESSION_MODES else None
-    if command_id == "session.clear_selected_refs":
+def alert_dismiss_command_id(alert_id: str | uuid.UUID) -> str:
+    return f"{ALERT_DISMISS_COMMAND_PREFIX}{alert_id}"
+
+
+def work_session_command_kind(command_id: str) -> WorkSessionCommandKind | None:
+    if session_mode_from_command_id(command_id) is not None:
+        return "strategic_workbench"
+    if command_id == COMMAND_ID_SESSION_CLEAR_SELECTED_REFS:
         return "strategic_workbench"
     if command_id.startswith(RUNNER_PREFER_COMMAND_PREFIX):
         return "strategic_workbench" if runner_id_from_command_id(command_id) else None
-    if command_id == "session.runner.clear_preferred":
+    if command_id == COMMAND_ID_SESSION_RUNNER_CLEAR_PREFERRED:
         return "strategic_workbench"
-    if command_id == "attention.messages.mark_seen":
+    if command_id == COMMAND_ID_ATTENTION_MESSAGES_MARK_SEEN:
         return "messages_last_seen"
     if command_id.startswith(ALERT_DISMISS_COMMAND_PREFIX):
         return "alert_dismiss" if alert_id_from_command_id(command_id) else None
@@ -427,6 +469,186 @@ def _target_project_matches(project_id: Any | None, target: Mapping[str, Any]) -
     return bool(expected and target.get("project_id") == expected)
 
 
+def _method_and_path(command: Mapping[str, Any]) -> tuple[str, str] | None:
+    mutation = _mutation(command)
+    method = compact_text(mutation.get("method"), max_chars=20)
+    path = compact_text(mutation.get("path"), max_chars=500)
+    if not method or not path:
+        return None
+    return method.upper(), path
+
+
+def _body_exact(command: Mapping[str, Any], expected: dict[str, Any]) -> bool:
+    return _mutation_body(command) == expected
+
+
+def _strategic_workbench_command_contract(
+    command: Mapping[str, Any],
+    *,
+    project_id: Any,
+    command_id: str,
+    method: str,
+    path: str,
+    target: Mapping[str, Any],
+) -> WorkSessionExecutableCommand | None:
+    project_text = str(project_id)
+    if method != "POST" or path != strategic_session_endpoint(project_text):
+        return None
+    if not _target_project_matches(project_text, target):
+        return None
+
+    mode = session_mode_from_command_id(command_id)
+    if mode is not None:
+        expected_body = {"workbench": {"interaction_mode": mode}}
+        if (
+            target.get("surface") != SURFACE_MESSAGES
+            or target.get("action") != f"set_{mode}_mode"
+            or not _body_exact(command, expected_body)
+        ):
+            return None
+        return WorkSessionExecutableCommand(
+            command_id=command_id,
+            kind="strategic_workbench",
+            method=method,
+            path=path,
+            workbench_patch={"interaction_mode": mode},
+        )
+
+    if command_id == COMMAND_ID_SESSION_CLEAR_SELECTED_REFS:
+        expected_body = {"workbench": {"selected_refs": []}}
+        if (
+            target.get("surface") != SURFACE_PROJECT
+            or target.get("section") != "selected_refs"
+            or target.get("action") != "clear"
+            or not _body_exact(command, expected_body)
+        ):
+            return None
+        return WorkSessionExecutableCommand(
+            command_id=command_id,
+            kind="strategic_workbench",
+            method=method,
+            path=path,
+            workbench_patch={"selected_refs": []},
+        )
+
+    runner_id = runner_id_from_command_id(command_id)
+    if runner_id is not None:
+        expected_body = {"workbench": {"preferred_runner_id": runner_id}}
+        if (
+            target.get("surface") != SURFACE_RUNTIME
+            or target.get("section") != "devices"
+            or target.get("action") != "prefer_runner"
+            or target.get("runner_id") != runner_id
+            or not _body_exact(command, expected_body)
+        ):
+            return None
+        return WorkSessionExecutableCommand(
+            command_id=command_id,
+            kind="strategic_workbench",
+            method=method,
+            path=path,
+            workbench_patch={"preferred_runner_id": runner_id},
+            runner_id=runner_id,
+        )
+
+    if command_id == COMMAND_ID_SESSION_RUNNER_CLEAR_PREFERRED:
+        runner_id = compact_text(target.get("runner_id"), max_chars=160)
+        expected_body = {"workbench": {"preferred_runner_id": None}}
+        if (
+            target.get("surface") != SURFACE_RUNTIME
+            or target.get("section") != "devices"
+            or target.get("action") != "clear_preferred_runner"
+            or not runner_id
+            or not _body_exact(command, expected_body)
+        ):
+            return None
+        return WorkSessionExecutableCommand(
+            command_id=command_id,
+            kind="strategic_workbench",
+            method=method,
+            path=path,
+            workbench_patch={"preferred_runner_id": None},
+            runner_id=runner_id,
+        )
+
+    return None
+
+
+def executable_work_session_command_contract(
+    command: Mapping[str, Any],
+    *,
+    project_id: Any,
+) -> WorkSessionExecutableCommand | None:
+    """Return the parsed executable contract for a mutation descriptor."""
+
+    command_id = compact_text(command.get("id"), max_chars=180)
+    if not command_id:
+        return None
+    kind = work_session_command_kind(command_id)
+    method_path = _method_and_path(command)
+    target = normalize_target(command.get("target"))
+    if kind is None or method_path is None or not target:
+        return None
+    method, path = method_path
+    if method not in MUTATION_METHODS or not _target_project_matches(project_id, target):
+        return None
+
+    if kind == "strategic_workbench":
+        return _strategic_workbench_command_contract(
+            command,
+            project_id=project_id,
+            command_id=command_id,
+            method=method,
+            path=path,
+            target=target,
+        )
+
+    project_text = str(project_id)
+    if kind == "messages_last_seen":
+        body = _mutation_body(command)
+        timestamp = body.get("timestamp")
+        expected_body = {"project_id": project_text, "timestamp": timestamp}
+        if (
+            method != "PUT"
+            or path != messages_last_seen_endpoint()
+            or target.get("surface") != SURFACE_MESSAGES
+            or target.get("action") != "mark_seen"
+            or not isinstance(timestamp, int)
+            or not _body_exact(command, expected_body)
+        ):
+            return None
+        return WorkSessionExecutableCommand(
+            command_id=command_id,
+            kind="messages_last_seen",
+            method=method,
+            path=path,
+            messages_seen_timestamp=timestamp,
+        )
+
+    if kind == "alert_dismiss":
+        alert_id = alert_id_from_command_id(command_id)
+        if (
+            not alert_id
+            or method != "POST"
+            or path != alert_dismiss_endpoint(alert_id)
+            or target.get("surface") != SURFACE_RUNTIME
+            or target.get("section") != "health"
+            or target.get("action") != "dismiss_alert"
+            or target.get("alert_id") != alert_id
+            or not _body_exact(command, {})
+        ):
+            return None
+        return WorkSessionExecutableCommand(
+            command_id=command_id,
+            kind="alert_dismiss",
+            method=method,
+            path=path,
+            alert_id=alert_id,
+        )
+
+    return None
+
+
 def validate_executable_command_descriptor(
     command: Mapping[str, Any],
     *,
@@ -447,91 +669,18 @@ def validate_executable_command_descriptor(
     if not _target_project_matches(project_id, target):
         return "command target project mismatch"
 
-    mutation = _mutation(command)
-    method = compact_text(mutation.get("method"), max_chars=20)
-    path = compact_text(mutation.get("path"), max_chars=500)
-    if not method or not path:
+    method_path = _method_and_path(command)
+    if method_path is None:
         return "command mutation is missing method or path"
-    method = method.upper()
+    method, _path = method_path
     if method not in MUTATION_METHODS:
         return "command mutation method is not allowlisted"
 
-    project_text = _project_id_text(project_id, target)
-    if kind == "strategic_workbench":
-        if method not in {"PATCH", "POST"}:
-            return "strategic workbench command must use PATCH or POST"
-        if not project_text or path != strategic_session_endpoint(project_text):
-            return "strategic workbench command path mismatch"
-        workbench = _workbench_body(command)
-        if command_id.startswith("session.mode."):
-            mode = command_id.removeprefix("session.mode.")
-            if (
-                target.get("surface") != SURFACE_MESSAGES
-                or target.get("action") != f"set_{mode}_mode"
-            ):
-                return "strategic mode target mismatch"
-            if workbench.get("interaction_mode") != mode:
-                return "strategic mode mutation body mismatch"
-        elif command_id == "session.clear_selected_refs":
-            if (
-                target.get("surface") != SURFACE_PROJECT
-                or target.get("section") != "selected_refs"
-                or target.get("action") != "clear"
-            ):
-                return "clear selected refs target mismatch"
-            if workbench.get("selected_refs") != []:
-                return "clear selected refs mutation body mismatch"
-        elif command_id.startswith(RUNNER_PREFER_COMMAND_PREFIX):
-            runner_id = runner_id_from_command_id(command_id)
-            if (
-                not runner_id
-                or target.get("surface") != SURFACE_RUNTIME
-                or target.get("section") != "devices"
-                or target.get("action") != "prefer_runner"
-                or target.get("runner_id") != runner_id
-            ):
-                return "runner preference target mismatch"
-            if workbench.get("preferred_runner_id") != runner_id:
-                return "runner preference mutation body mismatch"
-        elif command_id == "session.runner.clear_preferred":
-            if (
-                target.get("surface") != SURFACE_RUNTIME
-                or target.get("section") != "devices"
-                or target.get("action") != "clear_preferred_runner"
-            ):
-                return "clear preferred runner target mismatch"
-            if workbench.get("preferred_runner_id", "__missing__") is not None:
-                return "clear preferred runner mutation body mismatch"
-        return None
-
-    if kind == "messages_last_seen":
-        body = _mutation_body(command)
-        if method != "PUT" or path != messages_last_seen_endpoint():
-            return "messages last-seen mutation path mismatch"
-        if target.get("surface") != SURFACE_MESSAGES or target.get("action") != "mark_seen":
-            return "messages last-seen target mismatch"
-        if project_text and body.get("project_id") != project_text:
-            return "messages last-seen body project mismatch"
-        if not isinstance(body.get("timestamp"), int):
-            return "messages last-seen timestamp is required"
-        return None
-
-    if kind == "alert_dismiss":
-        alert_id = alert_id_from_command_id(command_id)
-        if not alert_id:
-            return "alert dismiss command id is invalid"
-        if method != "POST" or path != alert_dismiss_endpoint(alert_id):
-            return "alert dismiss mutation path mismatch"
-        if (
-            target.get("surface") != SURFACE_RUNTIME
-            or target.get("section") != "health"
-            or target.get("action") != "dismiss_alert"
-            or target.get("alert_id") != alert_id
-        ):
-            return "alert dismiss target mismatch"
-        return None
-
-    return "command is not executable"
+    if project_id is None:
+        return "command target project mismatch"
+    if executable_work_session_command_contract(command, project_id=project_id) is None:
+        return "command descriptor mismatch"
+    return None
 
 
 def build_operator_workbench_contract_fixture() -> dict[str, Any]:

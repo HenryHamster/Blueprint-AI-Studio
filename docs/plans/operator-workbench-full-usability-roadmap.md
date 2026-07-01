@@ -8,7 +8,7 @@ The rule for this file: after every major batch, update the status ledger, miles
 
 ## Status Ledger
 
-Overall implementation estimate: 90%.
+Overall implementation estimate: 91%.
 
 Legend:
 - Done: implemented, reviewed, tested, and pushed.
@@ -197,7 +197,11 @@ Existing:
 
 Completed:
 - Canonical backend contract module now owns command groups, priorities, target surfaces/sections, refetch surfaces, mutation endpoints, and executable descriptor validation.
-- Command descriptors include `executable` and invalid/mismatched mutation descriptors are rejected before execution receipts are persisted.
+- Command descriptors include `executable`, and invalid/mismatched mutation descriptors are rejected before side effects or receipts.
+- Backend command execution consumes the parsed executable contract for session mode, selected refs, runner preference, message last-seen, and alert dismissal commands.
+- Check-in mode is emitted as a server-backed session mode descriptor, matching the existing workbench state and frontend mode model.
+- Idempotent one-shot command replays are handled before current descriptor lookup, so dismissed alerts can replay receipts after disappearing from the command list.
+- Runner clear-preferred commands validate the target runner against current stored preference before mutating workbench state.
 - Frontend target vocabulary normalizes `chat/message` to `messages`, runtime `runner/runners/local_runner/fleet` to `devices`, and rejects unknown sections before routing.
 - `[` and `]` cycle subtabs in the active Pipeline/Project/Runtime workspace.
 - `/` continues to focus the current task search/filter where available.
@@ -205,6 +209,11 @@ Completed:
 - Single-key shortcuts remain disabled inside inputs, textareas, selects, role textboxes, contenteditable regions, and explicit editor scopes.
 - Escape closes shortcut help and transient workbench panels without taking over legacy task selection/log/archive behavior.
 - Command execution remains scoped to the existing allowlist; no arbitrary backend mutation execution was added.
+Follow-up polish:
+- Extend `/` from the current task search to per-mode search/filter refs if Project or Runtime gain local filters.
+- Continue unifying `Esc` only where it reduces conflicts; legacy selection/log/archive behavior still owns its existing path.
+- Add command entries for the hidden message actions moved out of chat chrome.
+- Keep command execution scoped. Do not add arbitrary backend mutation execution without a real permission and validation layer.
 
 Authoritative files:
 - `backend/app/work_session_commands.py`
@@ -592,6 +601,7 @@ Reason: the highest-risk M2 reliability gap is closed, M3/M5/M6/M7/M10 have land
 
 | Date | Commit | Change |
 | --- | --- | --- |
+| 2026-07-01 | M4 backend command contract | Added shared backend executable command grammar, routed descriptors/execution through it, server-backed Check-in mode command, drift rejection tests, and roadmap update. |
 | 2026-07-01 | M4 hotkey help | Added current-surface bracket cycling, compact keyboard shortcuts overlay, modified-slash guard, overlay shortcut blocking, transient-panel Escape handling, focused frontend tests, and roadmap update. |
 | 2026-07-01 | M8 read-model metrics | Added registry-backed work-session metric metadata and excluded operator command receipts from check-in delta counts. |
 | 2026-07-01 | M2 local Strategic reliability | Added bounded stale Strategic local runner hold timeout/recovery, frontend Devices/session state clarity, and focused tests. |

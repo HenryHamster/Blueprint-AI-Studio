@@ -80,6 +80,7 @@ from app.work_session_actions import build_work_session_actions
 from app.work_session_command_execution import (
     OPERATOR_COMMAND_EVENT_TYPE,
     build_work_session_command_jobs,
+    existing_work_session_command_result_for_idempotency_key,
     execute_work_session_command,
 )
 from app.work_session_commands import build_work_session_commands
@@ -2352,6 +2353,22 @@ async def execute_project_strategic_session_command(
         session=session,
         current_user=current_user,
     )
+    duplicate_command_result = await existing_work_session_command_result_for_idempotency_key(
+        session,
+        project_id=project_id,
+        user_id=current_user["user_id"],
+        command_id=command_id,
+        idempotency_key=payload.idempotency_key,
+    )
+    if duplicate_command_result is not None:
+        response = await _build_strategic_session_response(
+            session,
+            project_id,
+            state_response,
+        )
+        response["command"] = duplicate_command_result
+        return response
+
     command = _work_session_command_by_id(state_response, command_id)
     if command is None:
         raise HTTPException(status_code=404, detail="Command not found")

@@ -17,6 +17,7 @@ from app.messages_last_seen import (
     timestamp_ms_to_naive_utc,
     upsert_messages_last_seen,
 )
+from app.messages_noise_prefs_store import get_messages_noise_prefs_row
 from app.models import Alert, MESSAGE_CONTENT_MAX, MessageType, ProjectMessage, _utcnow
 from app.strategic_trigger import (
     ARMING_NOT_ARMED,
@@ -26,24 +27,26 @@ from app.strategic_trigger import (
 )
 from app.workbench_contracts import (
     ALERT_DISMISS_COMMAND_PREFIX,
-    RUNNER_PREFER_COMMAND_PREFIX,
+    COMMAND_ID_ATTENTION_MESSAGES_MARK_SEEN,
+    COMMAND_ID_SESSION_RUNNER_CLEAR_PREFERRED,
     SURFACE_STRATEGIC_SESSION,
+    WorkSessionExecutableCommand,
     alert_id_from_command_id,
     compact_text,
+    executable_work_session_command_contract,
     normalize_refetch_surfaces,
     normalize_target,
     runner_id_from_command_id,
-    validate_executable_command_descriptor,
     work_session_command_kind,
 )
 from app.workbench_state import (
+    WORKBENCH_STATE_KEY,
     WORKBENCH_STATE_MAX_BYTES,
     persist_strategic_workbench_update,
     workbench_mode_refresh_excerpt,
     workbench_mode_should_arm_strategic_refresh,
     workbench_state_size_bytes,
 )
-
 
 OPERATOR_COMMAND_EVENT_TYPE = "operator_command"
 WORK_SESSION_COMMAND_JOB_LIMIT = 8
@@ -196,20 +199,18 @@ def _allowed_command_kind(command_id: str) -> str | None:
     return work_session_command_kind(command_id)
 
 
-def _is_strategic_workbench_command(command_id: str) -> bool:
-    return _allowed_command_kind(command_id) == "strategic_workbench"
-
-
-def _can_persist_failed_receipt(command: dict[str, Any]) -> bool:
+def _can_persist_failed_receipt(command: dict[str, Any], exc: HTTPException) -> bool:
+    if exc.status_code == 409 and exc.detail == "Command is no longer executable":
+        return False
     command_id = _command_id(command)
     kind = _allowed_command_kind(command_id)
     if kind is None or _safe_command_target(command) is None:
         return False
     if not bool(command.get("enabled", True)) or not _mutation(command):
         return False
-    if command_id == "attention.messages.mark_seen":
+    if command_id == COMMAND_ID_ATTENTION_MESSAGES_MARK_SEEN:
         return isinstance(_mutation_body(command).get("timestamp"), int)
-    if command_id.startswith(RUNNER_PREFER_COMMAND_PREFIX):
+    if _runner_id_from_command_id(command_id):
         target = _safe_command_target(command) or {}
         return target.get("runner_id") == _runner_id_from_command_id(command_id)
     if command_id.startswith(ALERT_DISMISS_COMMAND_PREFIX):
@@ -241,27 +242,9 @@ async def _execute_strategic_workbench_command(
     *,
     user_id: str,
     project_id: uuid.UUID,
-    command: dict[str, Any],
+    contract: WorkSessionExecutableCommand,
 ) -> dict[str, Any]:
-    command_id = str(command.get("id") or "")
-    target = command.get("target") if isinstance(command.get("target"), dict) else {}
-    body = _mutation_body(command)
-    body_workbench = body.get("workbench") if isinstance(body.get("workbench"), dict) else {}
-    if command_id.startswith("session.mode."):
-        mode = command_id.removeprefix("session.mode.")
-        workbench = {"interaction_mode": mode}
-    elif command_id == "session.clear_selected_refs":
-        workbench = {"selected_refs": []}
-    elif command_id.startswith(RUNNER_PREFER_COMMAND_PREFIX):
-        runner_id = _runner_id_from_command_id(command_id)
-        target_runner_id = _compact_text(target.get("runner_id"), max_chars=160)
-        if not runner_id or target_runner_id != runner_id:
-            raise HTTPException(status_code=409, detail="Command is no longer executable")
-        workbench = {"preferred_runner_id": runner_id}
-    elif command_id == "session.runner.clear_preferred":
-        workbench = {"preferred_runner_id": None}
-    else:
-        workbench = body_workbench
+    workbench = contract.workbench_patch
     if not isinstance(workbench, dict):
         raise HTTPException(status_code=409, detail="Command is no longer executable")
     if workbench_state_size_bytes(workbench) > WORKBENCH_STATE_MAX_BYTES:
@@ -269,6 +252,27 @@ async def _execute_strategic_workbench_command(
             status_code=400,
             detail="Workbench state too large (max 50KB)",
         )
+    if (
+        contract.command_id == COMMAND_ID_SESSION_RUNNER_CLEAR_PREFERRED
+        and contract.runner_id
+    ):
+        prefs_row = await get_messages_noise_prefs_row(
+            session,
+            user_id,
+            project_id,
+        )
+        prefs = (
+            prefs_row.prefs
+            if prefs_row is not None and isinstance(prefs_row.prefs, dict)
+            else {}
+        )
+        current_workbench = (
+            prefs.get(WORKBENCH_STATE_KEY)
+            if isinstance(prefs.get(WORKBENCH_STATE_KEY), dict)
+            else {}
+        )
+        if current_workbench.get("preferred_runner_id") != contract.runner_id:
+            raise HTTPException(status_code=409, detail="Command is no longer executable")
     write = await persist_strategic_workbench_update(
         session,
         user_id,
@@ -294,11 +298,10 @@ async def _execute_mark_messages_seen(
     *,
     user_id: str,
     project_id: uuid.UUID,
-    command: dict[str, Any],
+    contract: WorkSessionExecutableCommand,
     observed_at_ms: int | None,
 ) -> dict[str, Any]:
-    body = _mutation_body(command)
-    raw_timestamp = body.get("timestamp")
+    raw_timestamp = contract.messages_seen_timestamp
     if not isinstance(raw_timestamp, int):
         raise HTTPException(status_code=409, detail="Command is no longer executable")
     effective_timestamp = raw_timestamp
@@ -320,9 +323,9 @@ async def _execute_alert_dismiss(
     session: AsyncSession,
     *,
     project_id: uuid.UUID,
-    command_id: str,
+    contract: WorkSessionExecutableCommand,
 ) -> dict[str, Any]:
-    alert_id = command_id.removeprefix(ALERT_DISMISS_COMMAND_PREFIX)
+    alert_id = contract.alert_id or ""
     try:
         alert_uuid = uuid.UUID(alert_id)
     except (TypeError, ValueError, AttributeError) as exc:
@@ -345,30 +348,29 @@ async def _apply_command(
     *,
     user_id: str,
     project_id: uuid.UUID,
-    command: dict[str, Any],
+    contract: WorkSessionExecutableCommand,
     observed_at_ms: int | None,
 ) -> dict[str, Any]:
-    command_id = str(command.get("id") or "")
-    if _is_strategic_workbench_command(command_id):
+    if contract.kind == "strategic_workbench":
         return await _execute_strategic_workbench_command(
             session,
             user_id=user_id,
             project_id=project_id,
-            command=command,
+            contract=contract,
         )
-    if command_id == "attention.messages.mark_seen":
+    if contract.kind == "messages_last_seen":
         return await _execute_mark_messages_seen(
             session,
             user_id=user_id,
             project_id=project_id,
-            command=command,
+            contract=contract,
             observed_at_ms=observed_at_ms,
         )
-    if command_id.startswith(ALERT_DISMISS_COMMAND_PREFIX):
+    if contract.kind == "alert_dismiss":
         return await _execute_alert_dismiss(
             session,
             project_id=project_id,
-            command_id=command_id,
+            contract=contract,
         )
     raise HTTPException(status_code=409, detail="Command is not executable")
 
@@ -529,11 +531,8 @@ async def execute_work_session_command(
         raise HTTPException(status_code=409, detail="Command is not executable")
     if _allowed_command_kind(command_id) is None:
         raise HTTPException(status_code=409, detail="Command is not executable")
-    validation_error = validate_executable_command_descriptor(
-        command,
-        project_id=project_id,
-    )
-    if validation_error:
+    contract = executable_work_session_command_contract(command, project_id=project_id)
+    if contract is None:
         raise HTTPException(status_code=409, detail="Command is no longer executable")
 
     try:
@@ -541,13 +540,13 @@ async def execute_work_session_command(
             session,
             user_id=user_id,
             project_id=project_id,
-            command=command,
+            contract=contract,
             observed_at_ms=observed_at_ms,
         )
     except HTTPException as exc:
         with contextlib.suppress(Exception):
             await session.rollback()
-        if not _can_persist_failed_receipt(command):
+        if not _can_persist_failed_receipt(command, exc):
             raise
         return await _persist_failed_command_receipt(
             session,
@@ -626,6 +625,35 @@ async def execute_work_session_command(
         "applied": True,
         "command_id": command_id,
         "receipt": _receipt_from_message(receipt),
+    }
+
+
+async def existing_work_session_command_result_for_idempotency_key(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    user_id: str,
+    command_id: str,
+    idempotency_key: str | None,
+) -> dict[str, Any] | None:
+    idem_key = _validate_idempotency_key(idempotency_key)
+    existing = await _receipt_for_idempotency_key(session, project_id, idem_key)
+    if existing is None:
+        return None
+    if not _existing_receipt_matches(
+        existing,
+        user_id=user_id,
+        command_id=command_id,
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="idempotency_key already belongs to another operation",
+        )
+    return {
+        "status": "duplicate",
+        "applied": False,
+        "command_id": command_id,
+        "receipt": _receipt_from_message(existing),
     }
 
 
