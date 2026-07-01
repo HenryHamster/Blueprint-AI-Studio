@@ -104,8 +104,6 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
     showResearchBrowser, setShowResearchBrowser,
     showKnowledgeBrowser, setShowKnowledgeBrowser,
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
-    showMessages, setShowMessages,
-    showComposeDrawer, setShowComposeDrawer,
     showFleetDetail, setShowFleetDetail,
     showAlertsPopover, setShowAlertsPopover,
     showSettings, setShowSettings,
@@ -413,7 +411,6 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
         }
         if (showResearchBrowser) { setShowResearchBrowser(false); return; }
         if (showActivityFeed) { setShowActivityFeed(false); return; }
-        if (showMessages) { setShowMessages(false); return; }
         if (showArchive) { setShowArchive(false); return; }
         if (showSettings) { setShowSettings(false); return; }
         return;
@@ -468,7 +465,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showMessages, showArchive, showSettings, selectionMode, selectedTaskIds, tasks]);
+  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showArchive, showSettings, selectionMode, selectedTaskIds, tasks]);
 
   // ── Cross-domain glue handlers ────────────────────────────────────────────
 
@@ -572,8 +569,6 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
     // Activity feed
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
     // Messages
-    showMessages, setShowMessages,
-    showComposeDrawer, setShowComposeDrawer,
     showFleetDetail, setShowFleetDetail,
     showAlertsPopover, setShowAlertsPopover,
     // New task modal

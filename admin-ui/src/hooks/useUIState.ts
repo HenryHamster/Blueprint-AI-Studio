@@ -81,8 +81,6 @@ export function useUIState() {
     });
   }, []);
 
-  const [showMessages, setShowMessages] = useState(false);
-  const [showComposeDrawer, setShowComposeDrawer] = useState(false);
   const [showFleetDetail, setShowFleetDetail] = useState(false);
   const [showAlertsPopover, setShowAlertsPopover] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -167,8 +165,6 @@ export function useUIState() {
     showResearchBrowser, setShowResearchBrowser,
     showKnowledgeBrowser, setShowKnowledgeBrowser,
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
-    showMessages, setShowMessages,
-    showComposeDrawer, setShowComposeDrawer,
     showFleetDetail, setShowFleetDetail,
     showAlertsPopover, setShowAlertsPopover,
     showSettings, setShowSettings,

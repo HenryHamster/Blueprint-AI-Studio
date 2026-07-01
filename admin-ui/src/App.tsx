@@ -10,7 +10,6 @@ import { usePoller, DEFAULT_POLL_MS } from './hooks/usePoller';
 import TaskStreamPanel from './components/TaskStreamPanel';
 import { ResearchBrowser } from './components/ResearchBrowser';
 import { KnowledgeBrowser } from './components/KnowledgeBrowser';
-import type { StrategicCockpitDirection } from './components/StrategicCockpit';
 import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask, apiFetch, API_BASE_URL } from './api';
 import { countHighSignalMessages, countNewSinceLastVisit, loadLastSeen, fetchBackendLastSeen, resolveLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
@@ -64,6 +63,7 @@ import { matchesStatusFilter } from './utils/statusFilter';
 import { buildOptimisticStrategicWorkbench, normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSurfaceForTab } from './utils/strategicWorkbenchSession';
 
 type StrategicSessionRefs = StrategicWorkbenchState['selected_refs'];
+type PipelineDirectionOption = { id: string; text: string };
 export default function App() {
   const refreshStrategicReadModelRef = useRef<() => void>(() => {});
   const refreshMessagesRef = useRef<() => void>(() => {});
@@ -160,7 +160,7 @@ export default function App() {
   const rawActiveTab = s.activeTab;
   const activeTab: PrimaryTab = normalizePrimaryTab(rawActiveTab);
   const messagesPanelOpen = activeTab === 'chat';
-  const [directions, setDirections] = useState<StrategicCockpitDirection[]>([]);
+  const [directions, setDirections] = useState<PipelineDirectionOption[]>([]);
   useEffect(() => {
     setDirections([]);
   }, [selectedProjectId]);
@@ -180,7 +180,7 @@ export default function App() {
       if (signal.aborted || pid !== selectedProjectId) return;
       const list = Array.isArray(data) ? data : ((data as Record<string, unknown>)?.directions ?? []);
       setDirections((list as Array<Record<string, unknown>>)
-        .map((d): StrategicCockpitDirection | null => {
+        .map((d): PipelineDirectionOption | null => {
           const id = typeof d.id === 'string' ? d.id : '';
           if (!id) return null;
           const text = typeof d.text === 'string'
@@ -188,17 +188,9 @@ export default function App() {
             : typeof d.title === 'string'
               ? d.title
               : id;
-          return {
-            id,
-            text,
-            priority: typeof d.priority === 'string' ? d.priority : null,
-            status: typeof d.status === 'string' ? d.status : null,
-            category: typeof d.category === 'string' ? d.category : null,
-            last_researched_at: typeof d.last_researched_at === 'string' ? d.last_researched_at : null,
-            held: d.held === true,
-          };
+          return { id, text };
         })
-        .filter((d): d is StrategicCockpitDirection => d !== null));
+        .filter((d): d is PipelineDirectionOption => d !== null));
     } catch { /* ignore; the pipeline filter can operate without direction labels */ }
   }, {
     intervalMs: DEFAULT_POLL_MS,
@@ -664,7 +656,6 @@ export default function App() {
     const tab = tabForWorkbenchSurface(strategicWorkbenchState.active_surface);
     if (!tab) return;
     strategicWorkbenchRestoreProjectRef.current = selectedProjectId;
-    if (tab !== 'chat') s.setShowMessages(false);
     if (tab !== 'pipeline') s.setShowArchive(false);
     if (tab !== activeTab) setPrimaryTab(tab);
   }, [activeTab, s, selectedProjectId, setPrimaryTab, strategicWorkbenchState?.active_surface]);
@@ -864,7 +855,6 @@ export default function App() {
   const handleTabChange = useCallback((tab: PrimaryTab) => {
     strategicWorkbenchOperatorSurfaceTouchedRef.current = true;
     strategicWorkbenchRestoreProjectRef.current = s.selectedProjectId;
-    if (tab !== 'chat') s.setShowMessages(false);
     if (tab !== 'pipeline') {
       s.setShowArchive(false);
     }
@@ -1020,7 +1010,6 @@ export default function App() {
   });
   const modalShortcutBlocked = Boolean(
     s.showNewTaskModal ||
-    s.showComposeDrawer ||
     s.confirmDialog ||
     showNewProjectModal ||
     setupProjectId ||
