@@ -22,7 +22,7 @@ import { FleetDetailDrawer } from './components/FleetDetailDrawer';
 import { NewTaskModal } from './components/NewTaskModal';
 import { NewProjectModal } from './components/NewProjectModal';
 import { ProjectManagementModal } from './components/ProjectManagementModal';
-import { HeaderBar } from './components/HeaderBar';
+import { HeaderBar, PrimaryTabNav } from './components/HeaderBar';
 import type { SectionId } from './components/SettingsDropdown';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import type { SettingsSectionRouterProps } from './components/SettingsSectionRouter';
@@ -1513,6 +1513,7 @@ export default function App() {
                 onOpenAccounts={openRuntimeAccounts}
                 onOpenSpend={openRuntimeAnalytics}
                 showMonitoringControls={false}
+                className="hidden md:flex"
               />
               <button
                 type="button"
@@ -1801,6 +1802,16 @@ export default function App() {
         />
       )}
       </WorkbenchFrame>
+
+      <PrimaryTabNav
+        activeTab={activeTab}
+        onTabChange={handleTabChange}
+        openMessageCount={openMessageCount}
+        newSinceLastVisitCount={newSinceLastVisit}
+        needsAttentionCount={pipelineAttentionCount}
+        placement="mobile"
+        className="md:hidden"
+      />
 
       <WorkbenchStatusBar
         left={(

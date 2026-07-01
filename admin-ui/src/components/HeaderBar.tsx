@@ -215,6 +215,76 @@ export interface HeaderBarProps {
   onManageProjects?: () => void;
 }
 
+export interface PrimaryTabNavProps {
+  activeTab: PrimaryTab;
+  onTabChange: (tab: PrimaryTab) => void;
+  openMessageCount?: number;
+  newSinceLastVisitCount?: number;
+  needsAttentionCount?: number;
+  className?: string;
+  placement?: 'header' | 'mobile';
+}
+
+function tabLabel(tab: PrimaryTab): string {
+  return tab === 'chat' ? 'Chat' : tab.charAt(0).toUpperCase() + tab.slice(1);
+}
+
+export function PrimaryTabNav({
+  activeTab,
+  onTabChange,
+  openMessageCount = 0,
+  newSinceLastVisitCount = 0,
+  needsAttentionCount = 0,
+  className = '',
+  placement = 'header',
+}: PrimaryTabNavProps) {
+  const mobile = placement === 'mobile';
+  const navClassName = mobile
+    ? `grid grid-cols-4 gap-1 border-t border-neutral-800/90 bg-[#020407] px-1.5 py-1.5 ${className}`
+    : `hidden min-w-0 flex-1 items-center gap-0.5 overflow-x-auto rounded border border-neutral-800/80 bg-[#070a0f] p-0.5 md:flex md:flex-none ${className}`;
+
+  return (
+    <nav
+      data-viewport-allow-overflow
+      data-viewport-allow-truncation
+      data-testid={mobile ? 'mobile-primary-tab-nav' : 'primary-tab-nav'}
+      className={navClassName}
+      aria-label="Primary workbench sections"
+    >
+      {(['chat', 'pipeline', 'project', 'runtime'] as const).map(tab => {
+        const isActive = activeTab === tab;
+        const chatBadgeCount = tab === 'chat'
+          ? Math.max(openMessageCount, newSinceLastVisitCount)
+          : 0;
+        const pipelineBadgeCount = tab === 'pipeline' ? needsAttentionCount : 0;
+        const badgeCount = Math.max(chatBadgeCount, pipelineBadgeCount);
+        const label = tabLabel(tab);
+        return (
+          <button
+            key={tab}
+            type="button"
+            onClick={() => onTabChange(tab)}
+            className={`inline-flex min-h-[44px] min-w-0 items-center justify-center rounded text-sm font-semibold leading-none transition-colors whitespace-nowrap ${
+              mobile ? 'px-1.5' : 'shrink-0 px-2.5 py-1 md:min-h-6 md:px-2 md:text-xs'
+            } ${
+              isActive
+                ? 'bg-neutral-800/90 text-neutral-100 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]'
+                : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100'
+            }`}
+          >
+            <span className="truncate">{label}</span>
+            {badgeCount > 0 && (
+              <span className="ml-1.5 inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-cyan-400 px-1 text-ui-sm font-bold leading-none text-neutral-950">
+                {badgeCount > 99 ? '99+' : badgeCount}
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
 
 export function HeaderBar(props: HeaderBarProps) {
   const {
@@ -384,10 +454,6 @@ export function HeaderBar(props: HeaderBarProps) {
     if (cycleAge !== null && cycleAge >= 60) return 'bg-amber-400';
     return 'bg-emerald-500';
   }, [apiHealthy, props.health]);
-  const tabLabel = (tab: PrimaryTab) => (
-    tab === 'chat' ? 'Chat' : tab.charAt(0).toUpperCase() + tab.slice(1)
-  );
-
   return (
     <div className="shrink-0">
       {/* Health expanded panel — shows full OrchestratorHealthBar below the top bar on click */}
@@ -437,39 +503,13 @@ export function HeaderBar(props: HeaderBarProps) {
             push the bar wide on narrow viewports; opt the scroll container out
             of the overflow/truncation invariants (its descendants legitimately
             extend past the fold inside the scroll region). */}
-        <nav
-          data-viewport-allow-overflow
-          data-viewport-allow-truncation
-          className="order-3 flex min-w-0 flex-1 basis-full items-center gap-0.5 overflow-x-auto rounded border border-neutral-800/80 bg-[#070a0f] p-0.5 sm:order-none sm:basis-auto md:flex-none"
-        >
-          {(['chat', 'pipeline', 'project', 'runtime'] as const).map(tab => {
-            const isActive = props.activeTab === tab;
-            const chatBadgeCount = tab === 'chat'
-              ? Math.max(openMessageCount ?? 0, newSinceLastVisitCount ?? 0)
-              : 0;
-            const pipelineBadgeCount = tab === 'pipeline' ? props.needsAttentionCount ?? 0 : 0;
-            const badgeCount = Math.max(chatBadgeCount, pipelineBadgeCount);
-            const label = tabLabel(tab);
-            return (
-              <button
-                key={tab}
-                onClick={() => props.onTabChange(tab)}
-                className={`inline-flex min-h-[44px] shrink-0 items-center rounded px-2.5 py-1 text-sm font-semibold leading-none transition-colors whitespace-nowrap md:min-h-6 md:px-2 md:text-xs ${
-                  isActive
-                    ? 'bg-neutral-800/90 text-neutral-100 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]'
-                    : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100'
-                }`}
-              >
-                {label}
-                {badgeCount > 0 && (
-                  <span className="ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full bg-cyan-400 px-1 text-ui-sm font-bold leading-none text-neutral-950">
-                    {badgeCount > 99 ? '99+' : badgeCount}
-                  </span>
-                )}
-              </button>
-            );
-          })}
-        </nav>
+        <PrimaryTabNav
+          activeTab={props.activeTab}
+          onTabChange={props.onTabChange}
+          openMessageCount={openMessageCount}
+          newSinceLastVisitCount={newSinceLastVisitCount}
+          needsAttentionCount={props.needsAttentionCount}
+        />
 
         {/* RIGHT: Icon cluster + SettingsDropdown + mobile controls + Launch Task */}
         <div className="ml-auto flex shrink-0 items-center gap-0.5">
@@ -770,23 +810,6 @@ export function HeaderBar(props: HeaderBarProps) {
                   <span className="w-4 h-4 flex items-center justify-center font-mono shrink-0">N</span>
                   <span>New task</span>
                 </button>
-                {(['chat', 'pipeline', 'project', 'runtime'] as const).map(tab => (
-                  <button
-                    key={tab}
-                    onClick={() => { props.onTabChange(tab); setShowMobileMenu(false); }}
-                    className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${
-                      props.activeTab === tab ? 'bg-neutral-800 text-neutral-100' : 'text-neutral-300 hover:bg-neutral-800'
-                    }`}
-                  >
-                    <Compass className="w-4 h-4 shrink-0" />
-                    <span>{tabLabel(tab)}</span>
-                    {tab === 'chat' && (openMessageCount > 0 || (newSinceLastVisitCount ?? 0) > 0) && (
-                      <span className="ml-auto rounded-full bg-cyan-400 px-1.5 py-0.5 text-ui-xs font-bold leading-none text-neutral-950">
-                        {Math.max(openMessageCount, newSinceLastVisitCount ?? 0)}
-                      </span>
-                    )}
-                  </button>
-                ))}
                 <button
                   onClick={() => setShowMobileShortcuts(prev => !prev)}
                   className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"

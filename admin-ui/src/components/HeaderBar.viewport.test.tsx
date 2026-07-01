@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { HeaderBar } from './HeaderBar';
+import { HeaderBar, PrimaryTabNav } from './HeaderBar';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 
@@ -360,6 +360,55 @@ describe('HeaderBar — viewport regression', () => {
       .find(button => button.textContent?.includes('Command palette'));
     expect(commandButton).toBeUndefined();
     expect(onOpenCommandPalette).not.toHaveBeenCalled();
+  });
+
+  test('mobile menu does not duplicate primary mode navigation', async () => {
+    const onTabChange = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.minHeight = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} onTabChange={onTabChange} />); });
+    const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
+    await act(async () => { hamburger?.click(); });
+
+    const menu = hamburger?.nextElementSibling;
+    const modeButtons = Array.from(menu?.querySelectorAll<HTMLButtonElement>('button') ?? [])
+      .filter(button => ['Chat', 'Pipeline', 'Project', 'Runtime'].includes(button.textContent?.trim() ?? ''));
+
+    expect(modeButtons).toHaveLength(0);
+    expect(onTabChange).not.toHaveBeenCalled();
+  });
+
+  test('mobile primary nav switches modes and shows badges', async () => {
+    const onTabChange = vi.fn();
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <PrimaryTabNav
+          activeTab="chat"
+          onTabChange={onTabChange}
+          openMessageCount={3}
+          needsAttentionCount={5}
+          placement="mobile"
+        />,
+      );
+    });
+
+    const buttons = Array.from(host.querySelectorAll<HTMLButtonElement>('button'));
+    expect(buttons.map(button => button.textContent?.trim())).toEqual([
+      'Chat3',
+      'Pipeline5',
+      'Project',
+      'Runtime',
+    ]);
+    await act(async () => { buttons[1].click(); });
+    expect(onTabChange).toHaveBeenCalledWith('pipeline');
   });
 
   test('pipeline tab shows attention badge from existing count prop', async () => {

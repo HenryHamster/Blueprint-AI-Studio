@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { HeaderBar } from './HeaderBar';
+import { HeaderBar, PrimaryTabNav } from './HeaderBar';
 import { MessagesPanel } from './MessagesPanel';
 import { StrategicContextRail } from './StrategicContextRail';
 import { StrategicSessionControl } from './StrategicSessionControl';
@@ -515,6 +515,7 @@ describe('WorkbenchComposition viewport regression', () => {
                     onOpenCompute={options.onOpenCompute ?? vi.fn()}
                     onOpenAccounts={options.onOpenAccounts ?? vi.fn()}
                     showMonitoringControls={false}
+                    className="hidden md:flex"
                   />
                   <button
                     type="button"
@@ -570,6 +571,14 @@ describe('WorkbenchComposition viewport regression', () => {
               />
             </WorkbenchSurface>
           </WorkbenchFrame>
+          <PrimaryTabNav
+            activeTab="chat"
+            onTabChange={vi.fn()}
+            openMessageCount={1}
+            needsAttentionCount={2}
+            placement="mobile"
+            className="md:hidden"
+          />
         </div>,
       );
     });
@@ -665,11 +674,18 @@ describe('WorkbenchComposition viewport regression', () => {
     const composer = host?.querySelector('[data-testid="strategic-composer-box"]');
     const railAside = host?.querySelector('[data-testid="strategic-context-rail"]')?.closest('aside');
     const contextButton = host?.querySelector<HTMLButtonElement>('button[aria-label="Open Strategic context"]');
+    const mobileNav = host?.querySelector<HTMLElement>('[data-testid="mobile-primary-tab-nav"]');
+    const sessionControl = host?.querySelector('[data-testid="strategic-session-control"]');
 
     expect(composer).toBeTruthy();
+    expect(sessionControl).toBeTruthy();
+    expect(getComputedStyle(sessionControl as Element).display).toBe('none');
     expect(railAside).toBeTruthy();
     expect(getComputedStyle(railAside!).display).toBe('none');
     expect(contextButton).toBeTruthy();
     expect(getComputedStyle(contextButton!).display).not.toBe('none');
+    expect(mobileNav).toBeTruthy();
+    expect(getComputedStyle(mobileNav!).display).toBe('grid');
+    expect(composer!.getBoundingClientRect().bottom).toBeLessThanOrEqual(mobileNav!.getBoundingClientRect().top);
   });
 });
