@@ -40,6 +40,10 @@ from app.task_locking import (
     with_vision_locked,
 )
 from app.time_utils import _utcnow
+from app.workbench_state import (
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+)
 from app.direction_mode import (
     append_prompt_suffix,
     is_pause_mode,
@@ -1242,6 +1246,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 vision.pop("_pending_strategic_review", None)
 
             await with_vision_locked(session, project.id, _drop_pending_sr)
+            await session.commit()
+            await session.refresh(project)
 
             from app.alert_dispatch import _create_strategic_alert  # noqa: PLC0415
 
@@ -1262,12 +1268,28 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     cycle_id=pending_sr.get("cycle_id"),
                     operator_steered=bool(pending_sr.get("operator_steered")),
                     steering_excerpt=pending_sr.get("steering_excerpt"),
+                    preferred_runner_target_id=pending_sr.get(
+                        "preferred_runner_target_id"
+                    )
+                    if isinstance(pending_sr.get("preferred_runner_target_id"), str)
+                    else None,
+                    local_runner_context={
+                        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: str(
+                            pending_sr.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+                            or "workbench_continuous"
+                        ),
+                    }
+                    if pending_sr.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY)
+                    else None,
                 ):
 
                     def _clear_pending_sr(vision: dict) -> None:
                         vision.pop("_pending_strategic_review", None)
 
                     await with_vision_locked(session, project.id, _clear_pending_sr)
+                    await session.commit()
+                    await session.refresh(project)
                     logger.info(
                         f"[STRATEGIC] Retried pending strategic review for project {project.id} (originally failed at {pending_sr.get('failed_at')})"
                     )
@@ -1287,6 +1309,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                             marker["first_attempted_at"] = _now_iso
 
                     await with_vision_locked(session, project.id, _bump_pending_sr_skip)
+                    await session.commit()
+                    await session.refresh(project)
                     # Fall through to tactical research
             except Exception:
                 logger.exception(
@@ -1303,6 +1327,8 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                         marker["first_attempted_at"] = _now_iso
 
                 await with_vision_locked(session, project.id, _bump_pending_sr)
+                await session.commit()
+                await session.refresh(project)
                 # Fall through to tactical research
 
     # Strategic cycle check — runs BEFORE the research blocking guard so it's

@@ -36,7 +36,12 @@ from app.models import (
     _utcnow,
 )
 from app.messages_last_seen import naive_utc_to_epoch_ms
-from app.workbench_state import sanitize_strategic_session_snapshot
+from app.workbench_state import (
+    STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+    sanitize_strategic_session_snapshot,
+)
 from app.workbench_events import SURFACE_MESSAGES, SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION
 
 TEST_USER_ID = "test-user-123"
@@ -1074,6 +1079,108 @@ async def test_strategic_state_does_not_report_queued_cloud_task_as_working(
     assert data["work_session"]["status"] == "unavailable"
     assert data["work_session"]["location"] == "cloud"
     assert data["work_session"]["status_reason"] == "cloud_dispatch_pending"
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_exposes_local_required_cloud_assignment_violation(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    phase2_task = Task(
+        project_id=project.id,
+        title="Strategic review incorrectly on cloud VM",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.IN_PROGRESS,
+        strategic_cycle_id="sc-local-cloud",
+        vm_instance_id="gce-strategic-violation",
+        context={
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+            STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+        },
+    )
+    db_session.add(phase2_task)
+    await db_session.commit()
+    await db_session.refresh(phase2_task)
+
+    active_cycle = StrategicCycle(
+        id="sc-local-cloud",
+        project_id=project.id,
+        outcome="phase2_running",
+        phase1_started_at=_utcnow() - timedelta(minutes=10),
+        phase1_completed_at=_utcnow() - timedelta(minutes=5),
+        phase2_started_at=_utcnow() - timedelta(minutes=5),
+        phase2_task_id=phase2_task.id,
+    )
+    db_session.add(active_cycle)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    local_runner = resp.json()["runtime"]["local_runner"]
+
+    assert local_runner["mode"] == "cloud"
+    assert local_runner["status"] == "working"
+    assert local_runner["location"] == "cloud"
+    assert local_runner["status_reason"] == "local_required_cloud_dispatch"
+    assert local_runner["fallback_reason"] == "local_required_cloud_dispatch"
+    assert (
+        local_runner["active_task_runtime"]["vm_instance_id"]
+        == "gce-strategic-violation"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_reports_queued_local_required_task_as_pending_local(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    awaiting_since = (_utcnow() - timedelta(minutes=3)).isoformat()
+    queued_task = Task(
+        project_id=project.id,
+        title="Strategic review waiting for local runner",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.QUEUED,
+        strategic_cycle_id="sc-local-required",
+        vm_instance_id="agent-vm-pre-dispatch-placeholder",
+        context={
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+            STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+            STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: awaiting_since,
+        },
+    )
+    db_session.add(queued_task)
+    await db_session.commit()
+    await db_session.refresh(queued_task)
+
+    active_cycle = StrategicCycle(
+        id="sc-local-required",
+        project_id=project.id,
+        outcome="phase2_running",
+        phase1_started_at=_utcnow() - timedelta(minutes=10),
+        phase1_completed_at=_utcnow() - timedelta(minutes=5),
+        phase2_started_at=_utcnow() - timedelta(minutes=5),
+        phase2_task_id=queued_task.id,
+    )
+    db_session.add(active_cycle)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+    local_runner = data["runtime"]["local_runner"]
+
+    assert data["strategic"]["active_task"]["id"] == str(queued_task.id)
+    assert local_runner["mode"] == "pending_local"
+    assert local_runner["status"] == "unavailable"
+    assert local_runner["location"] == "locally"
+    assert local_runner["status_reason"] == "no_runner"
+    assert local_runner["fallback_reason"] == "no_runner"
+    assert local_runner["active_task_requires_local"] is True
+    assert local_runner["active_task_awaiting_local_runner_since"] == awaiting_since
+    assert local_runner["active_task_runtime"]["vm_instance_id"] is None
+    assert data["work_session"]["status"] == "unavailable"
+    assert data["work_session"]["location"] == "locally"
+    assert data["work_session"]["status_reason"] == "no_runner"
 
 
 @pytest.mark.asyncio

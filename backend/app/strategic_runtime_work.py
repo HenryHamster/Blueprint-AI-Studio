@@ -26,7 +26,11 @@ from app.models import (
 from app.routers.admin_runners import _RUNNER_LIVENESS_SECONDS, _runner_health
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.time_utils import _utcnow
-from app.workbench_state import strategic_local_continuation_status_from_vision
+from app.workbench_state import (
+    STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+    strategic_local_continuation_status_from_vision,
+)
 
 _ACTIVE_COMPUTE_JOB_STATUSES = (
     ComputeJobStatus.QUEUED,
@@ -117,6 +121,38 @@ def task_awaiting_local_runner_since(task: Task | None) -> str | None:
     if isinstance(raw, str):
         return _string_or_none(raw)
     return str(raw)
+
+
+def task_awaiting_strategic_local_runner_since(task: Task | None) -> str | None:
+    if task is None:
+        return None
+    context = task.context or {}
+    raw = context.get(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        return _string_or_none(raw)
+    return str(raw)
+
+
+def task_requires_strategic_local_runner(task: Task | None) -> bool:
+    if task is None:
+        return False
+    payload = task.first_payload or {}
+    return (
+        payload.get("type") in STRATEGIC_TASK_TYPES
+        and bool((task.context or {}).get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY))
+    )
+
+
+def task_is_strategic_local_runner_hold(task: Task | None) -> bool:
+    if task is None:
+        return False
+    return (
+        task_requires_strategic_local_runner(task)
+        and task.status == TaskStatus.QUEUED
+        and bool((task.context or {}).get(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY))
+    )
 
 
 def task_is_local_runner_hold(task: Task | None) -> bool:
@@ -666,6 +702,22 @@ async def build_strategic_runtime_summary(
         ),
         None,
     )
+    active_task_requires_local = task_requires_strategic_local_runner(active_task)
+    active_task_cloud_violation = (
+        active_task_requires_local
+        and active_task is not None
+        and active_task.status in _CLOUD_STRATEGIC_RUNNING_STATUSES
+        and isinstance(active_task.vm_instance_id, str)
+        and active_task.vm_instance_id
+        and not active_task.vm_instance_id.startswith("runner:")
+    )
+    if (
+        active_task_requires_local
+        and not active_task_pinned
+        and not active_task_cloud_violation
+        and active_task_runtime
+    ):
+        active_task_runtime = {**active_task_runtime, "vm_instance_id": None}
 
     continuation_status = strategic_local_continuation_status_from_vision(
         project_vision
@@ -698,6 +750,23 @@ async def build_strategic_runtime_summary(
             fallback_reason = "runner_claim_pending"
         else:
             mode = "local"
+    elif active_task_cloud_violation:
+        mode = "cloud"
+        fallback_reason = "local_required_cloud_dispatch"
+    elif active_task_requires_local:
+        mode = "pending_local"
+        if not strategic_runners:
+            fallback_reason = "no_runner"
+        elif not readiness_capable_runners:
+            fallback_reason = "capability_mismatch"
+        elif readiness_live_runner_count == 0:
+            fallback_reason = "runner_offline"
+        elif agent_unavailable_count > 0:
+            fallback_reason = "agent_unavailable"
+        elif busy_runner_count > 0:
+            fallback_reason = "at_capacity"
+        else:
+            fallback_reason = "runner_unavailable"
     elif active_task is not None and active_task.vm_instance_id:
         mode = "cloud"
         fallback_reason = (
@@ -782,6 +851,10 @@ async def build_strategic_runtime_summary(
             "agent_unavailable_count": agent_unavailable_count,
             "active_runner_id": active_runner_id,
             "active_task_pinned": active_task_pinned,
+            "active_task_requires_local": active_task_requires_local,
+            "active_task_awaiting_local_runner_since": (
+                task_awaiting_strategic_local_runner_since(active_task)
+            ),
             "active_task_runtime": active_task_runtime,
             "fallback_reason": fallback_reason,
             "liveness_window_seconds": _RUNNER_LIVENESS_SECONDS,

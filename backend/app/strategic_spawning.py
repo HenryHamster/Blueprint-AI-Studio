@@ -102,6 +102,8 @@ from app.landed_signal import LANDED_ON_INTEGRATION_KEY, mark_stranded_non_landi
 from app.project_message_projection import agent_thread_message_dict
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
     strategic_local_continuation_status_from_vision,
 )
 
@@ -200,15 +202,19 @@ def _local_runner_is_live(runner: LocalRunner) -> bool:
     )
 
 
+def _local_runner_agent_available(runner: LocalRunner) -> bool:
+    return (runner.capabilities or {}).get("agent_available") is not False
+
+
 async def _resolve_local_continuation_runner_affinity(
     session: AsyncSession,
-    project: Project,
+    project_id: Any,
     task_type: str,
 ) -> str | None:
     """Return advisory runner affinity for fresh continuous local Strategic mode."""
 
     current_vision = (
-        await session.execute(select(Project.vision).where(Project.id == project.id))
+        await session.execute(select(Project.vision).where(Project.id == project_id))
     ).scalar_one_or_none()
     status = strategic_local_continuation_status_from_vision(current_vision or {})
     if not status.get("enabled") or not status.get("fresh"):
@@ -218,7 +224,7 @@ async def _resolve_local_continuation_runner_affinity(
         await session.execute(
             select(LocalRunner)
             .where(
-                LocalRunner.project_id == project.id,
+                LocalRunner.project_id == project_id,
                 LocalRunner.status != "deleted",
             )
             .order_by(
@@ -232,6 +238,7 @@ async def _resolve_local_continuation_runner_affinity(
         for runner in rows
         if _local_runner_is_live(runner)
         and _local_runner_handles_task_type(runner, task_type)
+        and _local_runner_agent_available(runner)
     ]
     if not live_capable:
         return None
@@ -244,6 +251,39 @@ async def _resolve_local_continuation_runner_affinity(
                 return preferred_runner_id
 
     return str(live_capable[0].id)
+
+
+async def _resolve_local_continuation_runner_intent(
+    session: AsyncSession,
+    project_id: Any,
+    task_type: str,
+) -> dict[str, Any]:
+    """Return dispatch context for fresh continuous local Strategic mode.
+
+    A fresh continuation marker is a hard local intent, even when no runner is
+    live at spawn time. The runner id remains advisory within the local fleet;
+    the explicit required flag is what prevents cloud fallback later.
+    """
+
+    current_vision = (
+        await session.execute(select(Project.vision).where(Project.id == project_id))
+    ).scalar_one_or_none()
+    status = strategic_local_continuation_status_from_vision(current_vision or {})
+    if not status.get("enabled") or not status.get("fresh"):
+        return {}
+
+    context: dict[str, Any] = {
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+    }
+    preferred_runner_target_id = await _resolve_local_continuation_runner_affinity(
+        session,
+        project_id,
+        task_type,
+    )
+    if preferred_runner_target_id:
+        context["preferred_runner_target_id"] = preferred_runner_target_id
+    return context
 
 
 def _empty_finding_challenge_summary() -> dict[str, Any]:
@@ -4397,14 +4437,12 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # flag on the task context so the Phase 2 chain can re-surface the operator
     # steering directive rather than silently dropping it on architecture cycles.
     operator_steered = strategic_refresh_origin(project.vision) == ORIGIN_OPERATOR
-    preferred_runner_target_id = await _resolve_local_continuation_runner_affinity(
+    local_runner_intent = await _resolve_local_continuation_runner_intent(
         session,
-        project,
+        project.id,
         "design_doc_update",
     )
-    task_context: dict = {"strategic_cycle_id": cycle_id}
-    if preferred_runner_target_id:
-        task_context["preferred_runner_target_id"] = preferred_runner_target_id
+    task_context: dict = {"strategic_cycle_id": cycle_id, **local_runner_intent}
     if operator_steered:
         task_context["operator_steered"] = True
         # Persist the operator steering excerpt alongside the flag: the marker is
@@ -4715,6 +4753,7 @@ async def _spawn_strategic_review(
     operator_steered: bool = False,
     steering_excerpt: str | None = None,
     preferred_runner_target_id: str | None = None,
+    local_runner_context: dict[str, Any] | None = None,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
@@ -4742,6 +4781,11 @@ async def _spawn_strategic_review(
     ``preferred_runner_target_id`` is a non-authoritative local-runner affinity
     hint from the preceding architecture phase. Dispatch may honor it only if
     that runner is still live, eligible, agent-available, and has capacity.
+
+    ``local_runner_context`` carries a hard local-only Strategic intent from
+    the Phase 1 task context. It is captured by the caller before any retry or
+    rollback-prone work so this function does not need to re-read mutable
+    project ORM attributes in the post-build finalize path.
     """
     from app.task_lifecycle import _has_active_strategic_task
 
@@ -4805,6 +4849,13 @@ async def _spawn_strategic_review(
         _base_problem_model = dict(project.problem_model or {})
         _base_running_update = (
             project.running_update if isinstance(project.running_update, str) else ""
+        )
+    local_runner_intent = dict(local_runner_context or {})
+    if not local_runner_intent.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY):
+        local_runner_intent = await _resolve_local_continuation_runner_intent(
+            session,
+            _project_id,
+            "strategic_review",
         )
 
     # Build direction stats with rich data. Include `active` + `paused` +
@@ -6878,13 +6929,15 @@ async def _spawn_strategic_review(
     effective_preferred_runner_target_id = (
         str(preferred_runner_target_id)
         if preferred_runner_target_id
-        else await _resolve_local_continuation_runner_affinity(
-            session,
-            project,
-            "strategic_review",
-        )
+        else local_runner_intent.get("preferred_runner_target_id")
     )
     task_context: dict[str, Any] = {"strategic_cycle_id": cycle_id}
+    if local_runner_intent.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY):
+        task_context[STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY] = True
+        task_context[STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY] = local_runner_intent.get(
+            STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+            "workbench_continuous",
+        )
     if effective_preferred_runner_target_id:
         task_context["preferred_runner_target_id"] = effective_preferred_runner_target_id
 

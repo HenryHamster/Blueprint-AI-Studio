@@ -61,7 +61,7 @@ from app.compute_cloud_run import (
     _resolve_machine_type as _cr_resolve_machine_type,
     launch_agent_cloud_run_job,
 )
-from app.task_capabilities import CLOUD_RUN_CANDIDATE_TASK_TYPES
+from app.task_capabilities import CLOUD_RUN_CANDIDATE_TASK_TYPES, STRATEGIC_TASK_TYPES
 from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.depends_on_provenance import remap_structural_depends_on
 from app.models import (
@@ -129,6 +129,11 @@ from app.workbench_events import (
     SURFACE_RUNTIME,
     SURFACE_STRATEGIC_SESSION,
     emit_workbench_refetch,
+)
+from app.workbench_state import (
+    STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
 )
 
 logger = logging.getLogger("blueprint")
@@ -746,6 +751,7 @@ async def _try_runner_dispatch(
     # stale wait stamp — otherwise the bounded-timeout sweep could fail it after
     # it has already been claimed by a runner.
     new_ctx.pop("awaiting_local_runner_since", None)
+    new_ctx.pop(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
     task.context = new_ctx
     task.vm_instance_id = f"runner:{runner.id}"
     task.status = TaskStatus.PROVISIONING
@@ -772,6 +778,94 @@ async def _try_runner_dispatch(
         runner.id,
     )
     return True
+
+
+def _task_requires_strategic_local_runner(task: Task) -> bool:
+    payload = task.first_payload or {}
+    task_type = str(payload.get("type") or "")
+    return (
+        task_type in STRATEGIC_TASK_TYPES
+        and bool((task.context or {}).get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY))
+    )
+
+
+async def _hold_strategic_local_runner_task(
+    session: AsyncSession,
+    task: Task,
+) -> bool:
+    """Keep a local-required Strategic task queued instead of cloud-falling back."""
+
+    if not _task_requires_strategic_local_runner(task):
+        return False
+
+    ctx = dict(task.context or {})
+    changed = ctx.pop("runner_target_id", None) is not None
+    if not ctx.get(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY):
+        ctx[STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
+        changed = True
+    if task.vm_instance_id is not None:
+        task.vm_instance_id = None
+        changed = True
+    if task.vm_provisioned_at is not None:
+        task.vm_provisioned_at = None
+        changed = True
+
+    intent_reason = str(
+        ctx.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY) or "workbench_continuous"
+    )
+    reason = (
+        "Strategic workbench is in continuous local mode; waiting for a live "
+        "Strategic-capable local runner instead of dispatching to cloud."
+    )
+    if task.latest_status_message != reason:
+        task.latest_status_message = reason
+        changed = True
+    if changed:
+        task.context = ctx
+        session.add(task)
+        await session.commit()
+        try:
+            from app.broadcast import broadcast_to_project
+
+            await broadcast_to_project(
+                str(task.project_id),
+                "task_updated",
+                {
+                    "task_id": str(task.id),
+                    "status": task.status,
+                    "message": task.latest_status_message,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] task_updated broadcast failed for held Strategic "
+                "local-runner task %s",
+                task.id,
+            )
+    else:
+        await session.rollback()
+    logger.info(
+        "[RUNNERS] Holding Strategic task %s: continuous local mode requires "
+        "a live Strategic-capable runner (reason=%s)",
+        task.id,
+        intent_reason,
+    )
+    return True
+
+
+async def _try_strategic_local_required_runner_path(
+    session: AsyncSession,
+    task: Task,
+    runners_by_project: dict[uuid.UUID, list[LocalRunner]],
+    pins_this_cycle: dict[uuid.UUID, int],
+) -> bool:
+    """Dispatch or hold local-required Strategic tasks before cloud deferrals."""
+
+    if not _task_requires_strategic_local_runner(task):
+        return False
+    if await _try_runner_dispatch(session, task, runners_by_project, pins_this_cycle):
+        return True
+    return await _hold_strategic_local_runner_task(session, task)
 
 
 def _num_or_none(value) -> float | None:
@@ -2089,6 +2183,9 @@ async def _filter_project_resource_dispatch_eligible(
     for task_id in eligible_ids:
         task = task_by_id.get(task_id)
         if task is None:
+            continue
+        if _task_requires_strategic_local_runner(task):
+            filtered.append(task_id)
             continue
         try:
             defer_msg = await _project_resource_dispatch_defer_message(
@@ -4444,6 +4541,15 @@ async def orchestrator_worker():
                         if task.requires_approval:
                             await session.rollback()
                             continue
+                        if await _try_strategic_local_required_runner_path(
+                            session,
+                            task,
+                            _active_runners_cache,
+                            _runner_pins_this_cycle,
+                        ):
+                            if str(task.vm_instance_id or "").startswith("runner:"):
+                                _cycle_dispatched += 1
+                            continue
                         resource_defer_msg = (
                             await _project_resource_dispatch_defer_message(
                                 session, task, project_active_counts
@@ -4515,6 +4621,9 @@ async def orchestrator_worker():
                             _runner_pins_this_cycle,
                         ):
                             _cycle_dispatched += 1
+                            continue
+
+                        if await _hold_strategic_local_runner_task(session, task):
                             continue
 
                         # Phase 2c: warm-VM continuity skip-provision branch.

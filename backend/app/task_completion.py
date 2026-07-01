@@ -63,6 +63,10 @@ from app.compute_experiment_contract import (
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
 )
 from app.task_capabilities import WRITE_TASK_TYPES
+from app.workbench_state import (
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+)
 from app.task_evaluators import (
     REVIEW_SECOND_OPINION_AWAITING_KEY,
     REVIEW_SECOND_OPINION_PARKED_KEY,
@@ -464,6 +468,21 @@ def _phase_runner_affinity(task: Task) -> str | None:
     if isinstance(preferred_runner_target_id, str) and preferred_runner_target_id.strip():
         return preferred_runner_target_id.strip()
     return None
+
+
+def _phase_local_runner_context(task: Task) -> dict[str, Any]:
+    """Carry hard local Strategic intent from architecture phase to review."""
+
+    ctx = task.context or {}
+    if not ctx.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY):
+        return {}
+    reason = ctx.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+    return {
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: (
+            reason if isinstance(reason, str) and reason else "workbench_continuous"
+        ),
+    }
 
 
 # Cap on the per-direction remediation-outcome history list length.
@@ -4605,6 +4624,7 @@ async def _handle_design_doc_completion(
     # message has aged out of the live conversation-thread snapshot.
     steering_excerpt = (task.context or {}).get("steering_excerpt")
     preferred_runner_target_id = _phase_runner_affinity(task)
+    local_runner_context = _phase_local_runner_context(task)
     spawned = None
     try:
         # Wave F4 H9: removed `await session.refresh(project)`. The caller
@@ -4620,6 +4640,7 @@ async def _handle_design_doc_completion(
             operator_steered=operator_steered,
             steering_excerpt=steering_excerpt,
             preferred_runner_target_id=preferred_runner_target_id,
+            local_runner_context=local_runner_context,
         )
         if spawned:
             phase2_spawned = True
@@ -4643,6 +4664,12 @@ async def _handle_design_doc_completion(
                     "cycle_id": cycle_id,
                     "operator_steered": operator_steered,
                     "steering_excerpt": steering_excerpt,
+                    **(
+                        {"preferred_runner_target_id": preferred_runner_target_id}
+                        if preferred_runner_target_id
+                        else {}
+                    ),
+                    **local_runner_context,
                 },
             }
             flag_modified(project, "vision")
@@ -4673,6 +4700,12 @@ async def _handle_design_doc_completion(
                 "cycle_id": cycle_id,
                 "operator_steered": operator_steered,
                 "steering_excerpt": steering_excerpt,
+                **(
+                    {"preferred_runner_target_id": preferred_runner_target_id}
+                    if preferred_runner_target_id
+                    else {}
+                ),
+                **local_runner_context,
             },
         }
         if cycle_id:

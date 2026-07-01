@@ -38,6 +38,9 @@ from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
     STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
+    STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
     WORKBENCH_STATE_KEY,
 )
 
@@ -2007,6 +2010,150 @@ class TestOrchestratorRunnerRouting:
         await db_session.refresh(task)
         assert task.vm_instance_id == f"runner:{fallback.id}"
         assert task.context["runner_target_id"] == str(fallback.id)
+
+    @pytest.mark.asyncio
+    async def test_strategic_local_required_holds_when_no_runner(
+        self, db_session, mocker
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            vm_instance_id="agent-vm-should-not-launch",
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert (
+            await orch._try_runner_dispatch(db_session, task, {project.id: []}, {})
+            is False
+        )
+        broadcast = mocker.patch(
+            "app.broadcast.broadcast_to_project",
+            new=AsyncMock(),
+        )
+
+        assert await orch._hold_strategic_local_runner_task(db_session, task) is True
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id is None
+        assert task.context[STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY] is True
+        assert task.context[STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY]
+        assert "runner_target_id" not in task.context
+        assert "waiting for a live Strategic-capable local runner" in (
+            task.latest_status_message or ""
+        )
+        broadcast.assert_awaited_once()
+        assert broadcast.await_args.args[0] == str(project.id)
+        assert broadcast.await_args.args[1] == "task_updated"
+        assert broadcast.await_args.args[2]["task_id"] == str(task.id)
+        assert broadcast.await_args.args[2]["message"] == task.latest_status_message
+
+    @pytest.mark.asyncio
+    async def test_strategic_local_required_hold_clears_resource_placeholder(
+        self, db_session, mocker
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            vm_instance_id="agent-vm-pre-dispatch-placeholder",
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
+
+        assert await orch._hold_strategic_local_runner_task(db_session, task) is True
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id is None
+        assert task.context[STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY]
+
+    @pytest.mark.asyncio
+    async def test_strategic_local_required_runner_path_holds_without_resource_deferral(
+        self, db_session, mocker
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            vm_instance_id="agent-vm-pre-dispatch-placeholder",
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
+
+        handled = await orch._try_strategic_local_required_runner_path(
+            db_session,
+            task,
+            {project.id: []},
+            {},
+        )
+
+        await db_session.refresh(task)
+        assert handled is True
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id is None
+        assert task.context[STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY]
+
+    @pytest.mark.asyncio
+    async def test_strategic_local_required_clears_hold_when_runner_available(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "has_gpu": False,
+                "max_concurrent": 2,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+                STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: _utcnow().isoformat(),
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(
+            db_session,
+            task,
+            {project.id: [runner]},
+            {},
+        )
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.PROVISIONING
+        assert task.vm_instance_id == f"runner:{runner.id}"
+        assert task.context["runner_target_id"] == str(runner.id)
+        assert STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY not in task.context
+        assert task.context[STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY] is True
 
     @pytest.mark.asyncio
     async def test_try_runner_dispatch_skips_already_pinned(self, db_session):

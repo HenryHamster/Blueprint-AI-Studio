@@ -103,6 +103,29 @@ function formatTimeOnly(iso: string | null): string {
   return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
 }
 
+function maxUsage(snapshot: UsageSnapshot | undefined): number {
+  if (!snapshot?.known) return 0;
+  return Math.max(snapshot.five_hour_utilization ?? 0, snapshot.seven_day_utilization ?? 0);
+}
+
+function accountNextAction(acct: AccountHealthEntry, totalFailures: number): { label: string; cls: string } {
+  const usage = maxUsage(acct.usage_snapshot);
+  const quotaCooldown = acct.rate_limited_models.some(model => model.cooldown_type === 'quota_exhausted');
+  const regressionCooldown = acct.rate_limited_models.some(model => model.cooldown_type === 'regression');
+  if (acct.state === 'disabled') {
+    return { label: acct.disabled_reason ? `Disabled: ${acct.disabled_reason}` : 'Disabled: enable or rotate credentials', cls: 'text-red-300' };
+  }
+  if (quotaCooldown) return { label: 'Hold traffic: daily quota exhausted', cls: 'text-red-300' };
+  if (regressionCooldown) return { label: 'Route around regression cooldown', cls: 'text-amber-300' };
+  if (acct.state === 'disqualified') return { label: 'Disqualified: wait for probe or inspect failures', cls: 'text-amber-300' };
+  if (usage >= 90) return { label: 'Near quota: move traffic or wait for reset', cls: 'text-red-300' };
+  if (usage >= 70) return { label: 'Usage pressure: keep as backup', cls: 'text-amber-300' };
+  if (acct.rate_limited_models.length > 0) return { label: 'Model cooldown active: route around it', cls: 'text-amber-300' };
+  if (totalFailures > 0 || acct.rl_events_24h > 0) return { label: 'Degraded: watch recent failures', cls: 'text-amber-300' };
+  if (acct.state === 'probing') return { label: 'Probing: wait for health sample', cls: 'text-blue-300' };
+  return { label: 'Ready for dispatch', cls: 'text-emerald-300' };
+}
+
 // ---------- component ----------
 
 // Response is considered visibly stale once the cache fallback is older than
@@ -134,11 +157,7 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
     { healthy: 0, probing: 0, disqualified: 0, disabled: 0 },
   );
   const usageKnown = accounts.filter(account => account.usage_snapshot?.known).length;
-  const usagePressure = accounts.filter(account => {
-    const snapshot = account.usage_snapshot;
-    if (!snapshot?.known) return false;
-    return (snapshot.five_hour_utilization ?? 0) >= 70 || (snapshot.seven_day_utilization ?? 0) >= 70;
-  }).length;
+  const usagePressure = accounts.filter(account => maxUsage(account.usage_snapshot) >= 70).length;
   const cooldownModels = accounts.reduce((sum, account) => sum + account.rate_limited_models.length, 0);
   const regressionModels = accounts.reduce(
     (sum, account) => sum + account.rate_limited_models.filter(model => model.cooldown_type === 'regression').length,
@@ -198,6 +217,7 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
           const sr7d = acct.success_rate_7d;
           const sr7dColor = sr7d == null ? '' : sr7d >= 0.7 ? 'text-emerald-400' : sr7d >= 0.4 ? 'text-amber-400' : 'text-red-400';
           const dimmed = acct.state === 'disabled' || acct.state === 'disqualified';
+          const action = accountNextAction(acct, totalFailures);
           return (
             <div key={acct.account_id} className={`bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5${dimmed ? ' opacity-50' : ''}`}>
               <button
@@ -300,6 +320,9 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
                     </p>
                   );
                 })}
+                <p className={`mt-0.5 text-ui-sm ${action.cls}`} data-testid="account-health-next-action">
+                  Next: {action.label}
+                </p>
               </button>
               {expanded && acct.usage_snapshot && (
                 <div className="mt-2 pt-2 border-t border-neutral-800/50 text-ui-sm text-neutral-400 space-y-0.5" title="Usage headroom detail">

@@ -101,6 +101,49 @@ describe('PoolAccountHealthPanel', () => {
     expect(summary).toHaveTextContent('1/2');
     expect(summary).toHaveTextContent('2 model cooldowns');
     expect(summary).toHaveTextContent('1 regressions');
+    expect(screen.getAllByTestId('account-health-next-action').map(el => el.textContent)).toEqual([
+      'Next: Ready for dispatch',
+      'Next: Disabled: enable or rotate credentials',
+    ]);
+  });
+
+  it('prioritizes quota exhaustion and usage pressure as row next actions', () => {
+    render(
+      <PoolAccountHealthPanel
+        accounts={[
+          makeAccount({
+            account_id: 'quota',
+            rate_limited_models: [
+              { model: 'claude-quota', cooldown_seconds_remaining: 3600, cooldown_type: 'quota_exhausted' },
+            ],
+            usage_snapshot: {
+              known: true,
+              five_hour_utilization: 95,
+              seven_day_utilization: 40,
+              resets_at: {},
+              probed_at: null,
+              stale: false,
+            },
+          }),
+          makeAccount({
+            account_id: 'pressure',
+            usage_snapshot: {
+              known: true,
+              five_hour_utilization: 76,
+              seven_day_utilization: 50,
+              resets_at: {},
+              probed_at: null,
+              stale: false,
+            },
+          }),
+        ]}
+        loading={false}
+      />,
+    );
+
+    const actions = screen.getAllByTestId('account-health-next-action').map(el => el.textContent);
+    expect(actions).toContain('Next: Hold traffic: daily quota exhausted');
+    expect(actions).toContain('Next: Usage pressure: keep as backup');
   });
 
   it('renders regression diagnostic line for regression-quarantined models', () => {

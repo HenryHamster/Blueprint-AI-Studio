@@ -14,6 +14,10 @@ from sqlmodel import select
 from app import strategic_cycle, vision_merge
 from app.models import Project, StrategicCycle, Task, TaskStatus
 from app.time_utils import _utcnow
+from app.workbench_state import (
+    STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+)
 
 
 # --- helpers ---------------------------------------------------------------
@@ -387,6 +391,42 @@ async def test_find_stalled_skips_recently_started(db_session):
     await db_session.commit()
     stalled = await strategic_cycle.find_stalled(db_session)
     assert stalled == []
+
+
+@pytest.mark.asyncio
+async def test_find_stalled_skips_strategic_local_runner_holds(db_session):
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Strategic review waiting for local runner",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.QUEUED,
+        context={
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+            STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: (
+                _utcnow() - timedelta(hours=4)
+            ).isoformat(),
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    cycle = StrategicCycle(
+        id="sc-local-hold",
+        project_id=project.id,
+        outcome=strategic_cycle.OUTCOME_PHASE2_RUNNING,
+        phase1_started_at=_utcnow() - timedelta(hours=5),
+        phase1_completed_at=_utcnow() - timedelta(hours=4),
+        phase2_started_at=_utcnow() - timedelta(hours=4),
+        phase2_task_id=task.id,
+    )
+    db_session.add(cycle)
+    await db_session.commit()
+
+    stalled = await strategic_cycle.find_stalled(db_session)
+
+    assert all(c.id != cycle.id for c in stalled)
 
 
 # --- vision_merge ----------------------------------------------------------

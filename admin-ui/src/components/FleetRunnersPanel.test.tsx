@@ -326,6 +326,67 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('1 connected');
     expect(el.textContent).toContain('1 slots free');
     expect(el.textContent).toContain('design_doc_update, strategic_review');
+    expect(el.querySelector('[data-testid="fleet-next-action"]')?.textContent).toContain('Fleet has dispatch capacity');
+  });
+
+  test('surfaces blocked agent availability as the fleet next action', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: ['compute_experiment'], has_gpu: true, max_concurrent: 2 },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          seconds_since_last_seen: 8,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 2,
+          available_slots: 2,
+          stale_reason: null,
+          agent_available: false,
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    expect(el.querySelector('[data-testid="fleet-next-action"]')?.textContent).toContain('Inspect agent availability');
+    expect(el.textContent).toContain('agent unavailable');
+    expect(el.textContent).toContain('Next: Restart or inspect the local agent');
+    expect(el.textContent).toContain('2 slots free');
+  });
+
+  test('distinguishes unknown runner slots from full capacity', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: ['compute_experiment'], has_gpu: false, max_concurrent: 2 },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          seconds_since_last_seen: 8,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 2,
+          available_slots: null,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    expect(el.querySelector('[data-testid="fleet-next-action"]')?.textContent).toContain('Confirm runner slot telemetry');
+    expect(el.querySelector('[data-testid="fleet-next-action"]')?.textContent).not.toContain('Capacity is full');
+    expect(el.textContent).toContain('slots unknown');
+    expect(el.textContent).toContain('Next: Confirm runner slot telemetry');
+    expect(el.textContent).not.toContain('1/1 ready');
+    expect(el.textContent).toContain('0+ known');
   });
 
   test('backend device status renders connected, stale, and offline row labels', async () => {

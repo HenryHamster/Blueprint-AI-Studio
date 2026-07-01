@@ -34,6 +34,9 @@ from app.task_locking import with_vision_locked
 
 WORKBENCH_STATE_KEY = "_strategic_workbench"
 STRATEGIC_LOCAL_CONTINUATION_KEY = "_strategic_local_continuation"
+STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY = "strategic_local_runner_required"
+STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY = "strategic_local_runner_reason"
+STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY = "awaiting_strategic_local_runner_since"
 WORKBENCH_STATE_MAX_BYTES = 50_000
 SESSION_IDLE_TTL_SECONDS = 14_400  # 4 hours
 STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS = SESSION_IDLE_TTL_SECONDS

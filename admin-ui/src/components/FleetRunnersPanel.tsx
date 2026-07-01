@@ -70,6 +70,11 @@ function availableSlots(runner: FleetRunner): number | null {
   return Math.max(0, max - activeTaskCount(runner));
 }
 
+function maxSlotsForRunner(runner: FleetRunner): number | null {
+  const max = runner.health?.max_concurrent ?? runner.capabilities.max_concurrent;
+  return typeof max === 'number' ? max : null;
+}
+
 function isComputeCapable(runner: FleetRunner): boolean {
   const taskTypes = runner.capabilities.task_types;
   return taskTypes === 'all' || (Array.isArray(taskTypes) && taskTypes.includes('compute_experiment'));
@@ -114,6 +119,53 @@ function runnerReadinessDetail(runner: FleetRunner, runnerLive: boolean, slots: 
   if (!runnerLive) return `${heartbeat}; waiting for next heartbeat`;
   if (slots === 0) return `${heartbeat}; no slots free`;
   return `${heartbeat}; ready`;
+}
+
+type ReadinessTone = 'good' | 'warn' | 'bad' | 'neutral';
+
+interface RunnerReadiness {
+  label: string;
+  detail: string;
+  nextAction: string;
+  tone: ReadinessTone;
+  ready: boolean;
+}
+
+function runnerReadiness(runner: FleetRunner, runnerLive: boolean, slots: number | null): RunnerReadiness {
+  const detail = runnerReadinessDetail(runner, runnerLive, slots);
+  if (runner.status !== 'active') {
+    return { label: 'inactive', detail, nextAction: 'Re-enroll or revoke this runner', tone: 'neutral', ready: false };
+  }
+  if (!runner.last_seen_at && runner.health?.seconds_since_last_seen == null) {
+    return { label: 'not started', detail, nextAction: 'Start the runner process', tone: 'warn', ready: false };
+  }
+  if (!runnerLive) {
+    const reason = runner.health?.device_status_reason ?? runner.health?.stale_reason;
+    return {
+      label: runner.health?.device_status === 'stale' ? 'heartbeat stale' : 'offline',
+      detail: reason ? `${detail}; ${reason.replace(/_/g, ' ')}` : detail,
+      nextAction: 'Check host and runner heartbeat',
+      tone: 'warn',
+      ready: false,
+    };
+  }
+  if (runner.health?.agent_available === false) {
+    return { label: 'agent unavailable', detail, nextAction: 'Restart or inspect the local agent', tone: 'bad', ready: false };
+  }
+  if (slots == null) {
+    return { label: 'slots unknown', detail, nextAction: 'Confirm runner slot telemetry', tone: 'warn', ready: false };
+  }
+  if (slots === 0) {
+    return { label: 'full', detail, nextAction: 'Wait for a slot or add capacity', tone: 'warn', ready: false };
+  }
+  return { label: 'ready', detail, nextAction: 'No action needed', tone: 'good', ready: true };
+}
+
+function readinessClasses(tone: ReadinessTone): string {
+  if (tone === 'good') return 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300';
+  if (tone === 'warn') return 'border-amber-500/30 bg-amber-500/10 text-amber-300';
+  if (tone === 'bad') return 'border-red-500/30 bg-red-500/10 text-red-300';
+  return 'border-neutral-700 bg-neutral-950/40 text-neutral-400';
 }
 
 interface TokenDialogProps {
@@ -297,11 +349,34 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
   const liveComputeRunners = liveRunners.filter(isComputeCapable);
   const liveGpuRunners = liveRunners.filter(runner => runner.capabilities.has_gpu);
   const liveStrategicRunners = liveRunners.filter(isStrategicRunner);
+  const liveRunnerReadiness = liveRunners.map(runner => runnerReadiness(runner, true, availableSlots(runner)));
+  const readyRunners = liveRunnerReadiness.filter(readiness => readiness.ready).length;
+  const agentUnavailable = liveRunners.filter(runner => runner.health?.agent_available === false).length;
   const busyWork = liveRunners.reduce((sum, runner) => sum + activeWorkCount(runner), 0);
-  const maxSlots = liveRunners.reduce((sum, runner) => {
-    const max = runner.health?.max_concurrent ?? runner.capabilities.max_concurrent;
-    return sum + (typeof max === 'number' ? max : 0);
-  }, 0);
+  const maxSlots = liveRunners.reduce((sum, runner) => sum + (maxSlotsForRunner(runner) ?? 0), 0);
+  const slotValues = liveRunners.map(availableSlots);
+  const knownFreeSlots = slotValues.reduce<number>((sum, slots) => sum + (slots ?? 0), 0);
+  const hasUnknownSlots = slotValues.some(slots => slots == null);
+  const freeSlotsLabel = hasUnknownSlots ? `${knownFreeSlots}+ known` : `${knownFreeSlots} free`;
+  const gpuSlotValues = liveGpuRunners.map(availableSlots);
+  const knownGpuSlots = gpuSlotValues.reduce<number>((sum, slots) => sum + (slots ?? 0), 0);
+  const hasUnknownGpuSlots = gpuSlotValues.some(slots => slots == null);
+  const gpuCapacityLabel = liveGpuRunners.length === 0
+    ? 'offline'
+    : hasUnknownGpuSlots
+      ? `${liveGpuRunners.length} connected`
+      : `${knownGpuSlots} slots free`;
+  const localOnlyBlocked = requireLocalRunner && !loading && liveComputeRunners.length === 0;
+  const nextAction = (() => {
+    if (loading) return null;
+    if (runners.length === 0) return 'Enroll a runner, then start it to send the first heartbeat.';
+    if (localOnlyBlocked) return 'Start or enroll a connected compute-capable local runner.';
+    if (agentUnavailable > 0) return 'Inspect agent availability on the affected runner host.';
+    if (liveRunners.length === 0) return 'Check runner hosts; no active runner is connected.';
+    if (!hasUnknownSlots && knownFreeSlots === 0) return 'Capacity is full; wait for work to finish or enroll another runner.';
+    if (hasUnknownSlots && knownFreeSlots === 0) return 'Confirm runner slot telemetry; connected capacity is not reporting slots.';
+    return 'Fleet has dispatch capacity.';
+  })();
 
   return (
     <div className="space-y-3">
@@ -345,29 +420,50 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
       {!loading && runners.length > 0 && (
         <div className="grid grid-cols-2 gap-2 text-xs lg:grid-cols-4">
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
-            <div className="text-ui-md uppercase tracking-wide text-neutral-500">connected</div>
-            <div className="mt-0.5 font-mono text-neutral-100">{liveRunners.length}/{runners.length}</div>
+            <div className="text-ui-md uppercase tracking-wide text-neutral-500">readiness</div>
+            <div className={`mt-0.5 font-mono ${readyRunners > 0 ? 'text-emerald-300' : 'text-amber-300'}`}>
+              {readyRunners}/{runners.length} ready
+            </div>
+            <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{liveRunners.length} connected</div>
           </div>
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
-            <div className="text-ui-md uppercase tracking-wide text-neutral-500">work</div>
+            <div className="text-ui-md uppercase tracking-wide text-neutral-500">slots</div>
             <div className="mt-0.5 font-mono text-neutral-100" data-testid="fleet-runner-work-capacity">{busyWork}/{maxSlots || '-'}</div>
+            <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{freeSlotsLabel}</div>
           </div>
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
             <div className="text-ui-md uppercase tracking-wide text-neutral-500">gpu</div>
             <div className={`mt-0.5 font-mono ${liveGpuRunners.length > 0 ? 'text-purple-300' : 'text-neutral-500'}`}>
-              {liveGpuRunners.length > 0 ? `${liveGpuRunners.length} online` : 'offline'}
+              {gpuCapacityLabel}
             </div>
+            <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{liveGpuRunners.length} connected</div>
           </div>
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
             <div className="text-ui-md uppercase tracking-wide text-neutral-500">strategic</div>
             <div className={`mt-0.5 font-mono ${liveStrategicRunners.length > 0 ? 'text-emerald-300' : 'text-neutral-500'}`} data-testid="fleet-runner-strategic-readiness">
               {liveStrategicRunners.length > 0 ? `${liveStrategicRunners.length} connected` : 'none connected'}
             </div>
+            <div className={`mt-0.5 truncate text-ui-sm ${agentUnavailable > 0 ? 'text-red-300' : 'text-neutral-600'}`}>
+              {agentUnavailable > 0 ? `${agentUnavailable} agent blocked` : 'agents ok'}
+            </div>
           </div>
         </div>
       )}
 
-      {requireLocalRunner && !loading && liveComputeRunners.length === 0 && (
+      {nextAction && runners.length > 0 && (
+        <div
+          className={`rounded-md border px-3 py-2 text-xs ${
+            nextAction === 'Fleet has dispatch capacity.'
+              ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-200'
+              : 'border-amber-500/20 bg-amber-500/10 text-amber-200'
+          }`}
+          data-testid="fleet-next-action"
+        >
+          <span className="font-semibold">Next action:</span> {nextAction}
+        </div>
+      )}
+
+      {localOnlyBlocked && (
         <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
           Local-only compute is enabled for this project. Compute experiments will wait until a connected compute-capable runner is available.
         </div>
@@ -390,7 +486,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
             const activeCount = activeTaskCount(runner);
             const slots = runnerLive ? availableSlots(runner) : null;
             const strategicRunner = isStrategicRunner(runner);
-            const readinessDetail = runnerReadinessDetail(runner, runnerLive, slots);
+            const readiness = runnerReadiness(runner, runnerLive, slots);
             return (
               <div
                 key={runner.id}
@@ -435,9 +531,15 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
                     {runner.capabilities.has_gpu && (
                       <span className="rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">GPU</span>
                     )}
+                    <span className={`rounded border px-1.5 py-0.5 text-xs font-medium ${readinessClasses(readiness.tone)}`}>
+                      {readiness.label}
+                    </span>
                   </div>
                   <div className="mt-1 text-xs text-neutral-500">{capsSummary(runner.capabilities)}</div>
-                  <div className="mt-0.5 text-ui-md text-neutral-600">{readinessDetail}</div>
+                  <div className="mt-0.5 text-ui-md text-neutral-600">{readiness.detail}</div>
+                  <div className={`mt-0.5 text-ui-md ${readiness.ready ? 'text-emerald-400/80' : 'text-amber-300/90'}`}>
+                    Next: {readiness.nextAction}
+                  </div>
                 </div>
                 <button
                   onClick={() => handleRevoke(runner)}

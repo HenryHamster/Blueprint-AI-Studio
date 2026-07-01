@@ -405,6 +405,7 @@ async def sweep_stalled_strategic_cycles(
     from app import strategic_cycle
     from app.models import Alert, AlertSeverity
     from app.broadcast import broadcast_to_project as _bcast
+    from app.strategic_runtime_work import task_is_strategic_local_runner_hold
 
     stalled = await strategic_cycle.find_stalled(session)
     _step7_now = _utcnow()
@@ -424,6 +425,13 @@ async def sweep_stalled_strategic_cycles(
 
         if linked_task_id is not None:
             linked_task = await session.get(Task, linked_task_id)
+            if task_is_strategic_local_runner_hold(linked_task):
+                logger.info(
+                    f"[REAPER] Cycle {c.id} in {stalled_phase} >3h "
+                    f"but linked task {linked_task_id} is intentionally "
+                    f"waiting for a local Strategic runner — skipping stall declaration"
+                )
+                continue
             if linked_task is not None and linked_task.status in (
                 TaskStatus.QUEUED,
                 TaskStatus.PROVISIONING,

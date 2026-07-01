@@ -54,6 +54,9 @@ function settingsProps() {
         daily_task_cap: 20,
         max_concurrent_tasks: null,
         disabled_models: {},
+        credential_configured: true,
+        runtime_ready: true,
+        account_status: 'ready',
       },
       {
         id: 'acct-2',
@@ -67,6 +70,9 @@ function settingsProps() {
         disabled_models: {
           'gpt-test': { hits: 3, at: '2026-06-30T10:00:00Z' },
         },
+        credential_configured: false,
+        runtime_ready: false,
+        account_status: 'disabled',
       },
     ],
   } as never;
@@ -80,6 +86,7 @@ describe('RuntimeAccountsPanel', () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     __pollerInternals.reset();
   });
 
@@ -140,10 +147,26 @@ describe('RuntimeAccountsPanel', () => {
     const monitor = screen.getByRole('region', { name: 'Runtime account monitor' });
     expect(monitor).toHaveTextContent('1/2');
     expect(monitor).toHaveTextContent('2 providers');
+    expect(screen.getByTestId('runtime-accounts-next-action')).toHaveTextContent('Inspect 1 non-healthy account');
     expect(screen.getByTestId('provider-model-panel')).toBeInTheDocument();
     expect(screen.getByTestId('provider-cost-panel')).toHaveTextContent('cost window 24');
     expect(modelPanelProps.at(-1)?.accounts).toHaveLength(2);
     expect(costPanelProps.at(-1)).toMatchObject({ selectedProjectId: 'proj-1', windowHours: 24 });
+  });
+
+  it('prioritizes local cap holds in the account monitor next action', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({ accounts: [] }));
+    const props = settingsProps() as {
+      maxPlanAccounts: Array<{ usage?: { at_any_cap: boolean }; account_status?: string }>;
+    };
+    props.maxPlanAccounts[0].usage = { at_any_cap: true };
+    props.maxPlanAccounts[0].account_status = 'at_cap';
+
+    render(<RuntimeAccountsPanel selectedProjectId="proj-1" settingsRouterProps={props as never} />);
+    await act(async () => {});
+
+    expect(screen.getByTestId('runtime-accounts-next-action')).toHaveTextContent('Raise caps or wait for reset on 1 held account');
+    expect(screen.getByText('Active').parentElement).toHaveTextContent('1 cap holds');
   });
 
   it('surfaces account-health poll failures while keeping cost/model monitors mounted', async () => {
@@ -156,6 +179,34 @@ describe('RuntimeAccountsPanel', () => {
     expect(screen.getByTestId('provider-model-panel')).toBeInTheDocument();
     expect(screen.getByTestId('provider-cost-panel')).toBeInTheDocument();
     expect(modelPanelProps.at(-1)?.accounts).toBeNull();
+  });
+
+  it('does not report accounts ready while initial health is loading', () => {
+    apiFetchMock.mockResolvedValue(new Promise(() => {}));
+
+    render(<RuntimeAccountsPanel selectedProjectId="proj-1" settingsRouterProps={settingsProps()} />);
+
+    expect(screen.getByTestId('runtime-accounts-next-action')).toHaveTextContent('Loading account health before dispatch');
+    const monitor = screen.getByRole('region', { name: 'Runtime account monitor' });
+    expect(monitor).toHaveTextContent('polling');
+  });
+
+  it('does not report cached health as ready after polling fails', async () => {
+    apiFetchMock
+      .mockResolvedValueOnce(jsonResponse({ accounts: [], served_stale: false }))
+      .mockRejectedValueOnce(new Error('network down'));
+    vi.useFakeTimers();
+
+    render(<RuntimeAccountsPanel selectedProjectId="proj-1" settingsRouterProps={settingsProps()} />);
+    await act(async () => {});
+    expect(screen.getByTestId('runtime-accounts-next-action')).toHaveTextContent('Accounts are ready for dispatch');
+
+    await act(async () => {
+      vi.advanceTimersByTime(30_000);
+    });
+    await act(async () => {});
+
+    expect(screen.getByTestId('runtime-accounts-next-action')).toHaveTextContent('Account health polling failed; using last-known rows');
   });
 
   it('updates provider cost window from the account monitor selector', async () => {

@@ -19,6 +19,10 @@ from app.orchestrator import (
     _filter_project_resource_dispatch_eligible,
     _project_resource_dispatch_defer_message,
 )
+from app.workbench_state import (
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+)
 from testing.factories import make_membership, make_project, make_task
 
 
@@ -317,6 +321,55 @@ async def test_dispatch_defers_task_at_spend_ceiling(db_session, mocker):
     assert msg is not None
     assert "spend budget" in msg
     assert "$10.00/$10.00" in msg
+
+
+@pytest.mark.asyncio
+async def test_dispatch_filter_keeps_local_required_strategic_at_spend_ceiling(
+    db_session, mocker
+):
+    """Local-required Strategic work is handled by runner pin/hold, not cloud spend deferral."""
+    project = make_project(
+        build_config={
+            "resource_envelope": {
+                "spend_ceiling_usd": 10.0,
+                "spend_window_days": 7,
+            }
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        context={
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+            STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    spend_mock = mocker.patch(
+        "app.orchestrator.get_project_recent_spend_usd",
+        new=AsyncMock(
+            return_value={"total": 10.0, "compute": 10.0, "agent_vm": 0.0, "idle": 0.0}
+        ),
+    )
+    broadcast = AsyncMock()
+
+    result = await _filter_project_resource_dispatch_eligible(
+        db_session,
+        [task.id],
+        [task],
+        {},
+        broadcast,
+    )
+
+    assert result == [task.id]
+    spend_mock.assert_not_called()
+    broadcast.assert_not_called()
 
 
 @pytest.mark.asyncio

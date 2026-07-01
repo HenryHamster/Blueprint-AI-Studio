@@ -6,6 +6,7 @@ import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHe
 import { ProviderModelBreakdownPanel } from './ProviderModelBreakdownPanel';
 import { ProviderCostPanel } from './ProviderCostPanel';
 import type { RuntimeSettingsSection } from './OperatorWorkspaceSections';
+import type { MaxPlanAccount } from '../types/settings';
 
 const WINDOW_OPTIONS = [
   { label: '6h', value: 6 },
@@ -44,6 +45,30 @@ function StatCell({
       <div className={`mt-0.5 truncate font-mono text-sm font-semibold ${valueClass}`}>{value}</div>
       {sub && <div className="mt-0.5 truncate text-ui-md text-neutral-600">{sub}</div>}
     </div>
+  );
+}
+
+function highUsage(account: AccountHealthEntry): number {
+  const snapshot = account.usage_snapshot;
+  if (!snapshot?.known) return 0;
+  return Math.max(snapshot.five_hour_utilization ?? 0, snapshot.seven_day_utilization ?? 0);
+}
+
+function plural(count: number, singular: string, pluralLabel = `${singular}s`): string {
+  return `${count} ${count === 1 ? singular : pluralLabel}`;
+}
+
+function accountIsDispatchReady(account: MaxPlanAccount): boolean {
+  const status = typeof account.account_status === 'string' ? account.account_status.toLowerCase() : null;
+  return (
+    account.enabled
+    && account.runtime_ready === true
+    && account.credential_configured !== false
+    && !account.disabled_reason
+    && status !== 'at_cap'
+    && status !== 'disabled'
+    && status !== 'unavailable'
+    && status !== 'unconfigured'
   );
 }
 
@@ -89,25 +114,50 @@ export function RuntimeAccountsPanel({
   const configuredAccounts = settingsRouterProps.maxPlanAccounts ?? [];
   const providerCount = new Set(configuredAccounts.map(account => account.provider)).size;
   const enabledAccounts = configuredAccounts.filter(account => account.enabled).length;
+  const runtimeReadyAccounts = configuredAccounts.filter(accountIsDispatchReady).length;
   const activeTasks = configuredAccounts.reduce((sum, account) => sum + (account.active_tasks ?? 0), 0);
   const cappedAccounts = configuredAccounts.filter(
     account => account.daily_task_cap != null || account.max_concurrent_tasks != null,
   ).length;
-  const cooldowns = configuredAccounts.reduce(
+  const capHeldAccounts = configuredAccounts.filter(account => account.usage?.at_any_cap || account.account_status === 'at_cap').length;
+  const cooldowns = configuredAccounts.filter(account => account.enabled).reduce(
     (sum, account) => sum + Object.keys(account.disabled_models ?? {}).length,
     0,
   );
   const healthRows = accountHealth ?? [];
+  const actionableHealthRows = healthRows.filter(account => account.state !== 'disabled');
   const nonHealthyRows = healthRows.filter(account => account.state !== 'healthy').length;
-  const usagePressureRows = healthRows.filter(account => {
-    const snapshot = account.usage_snapshot;
-    if (!snapshot?.known) return false;
-    return (snapshot.five_hour_utilization ?? 0) >= 70 || (snapshot.seven_day_utilization ?? 0) >= 70;
-  }).length;
-  const rateLimitedModels = healthRows.reduce(
+  const usagePressureRows = actionableHealthRows.filter(account => highUsage(account) >= 70).length;
+  const quotaPressureRows = actionableHealthRows.filter(account => highUsage(account) >= 90).length;
+  const rateLimitedModels = actionableHealthRows.reduce(
     (sum, account) => sum + account.rate_limited_models.length,
     0,
   );
+  const totalCooldowns = cooldowns + rateLimitedModels;
+  const nextAccountAction = (() => {
+    if (!settingsRouterProps.githubAccount) return 'Connect GitHub identity before dispatching account-backed work.';
+    if (configuredAccounts.length === 0) return 'Add a provider account to make the runtime schedulable.';
+    if (enabledAccounts === 0) return 'Enable at least one provider account.';
+    if (loadingHealth && accountHealth === null) return 'Loading account health before dispatch.';
+    if (pollError && accountHealth === null) return 'Restore account health polling; runtime health is unknown.';
+    if (pollError) return 'Account health polling failed; using last-known rows.';
+    if (servedStale) return 'Account health is stale; verify polling before dispatch.';
+    if (capHeldAccounts > 0) return `Raise caps or wait for reset on ${plural(capHeldAccounts, 'held account')}.`;
+    if (runtimeReadyAccounts === 0) return 'Fix account credentials or status before dispatch.';
+    if (quotaPressureRows > 0) return `Move traffic off ${plural(quotaPressureRows, 'near-quota account')}.`;
+    if (totalCooldowns > 0) return `Let cooldowns expire or route around ${plural(totalCooldowns, 'suppressed model')}.`;
+    if (nonHealthyRows > 0) return `Inspect ${plural(nonHealthyRows, 'non-healthy account')}.`;
+    if (usagePressureRows > 0) return `Watch spend and quota pressure on ${plural(usagePressureRows, 'account')}.`;
+    return 'Accounts are ready for dispatch.';
+  })();
+  const nextAccountActionGood = nextAccountAction === 'Accounts are ready for dispatch.';
+  const healthTone = loadingHealth && accountHealth === null
+    ? 'neutral'
+    : pollError
+      ? 'bad'
+      : nonHealthyRows > 0
+        ? 'warn'
+        : 'good';
   const availableSettings = new Set(availableSettingsSections);
   const shortcutOptions: Array<{ section: RuntimeSettingsSection; label: string; title: string }> = [
     { section: 'provider-settings', label: 'Providers', title: 'Open provider model defaults' },
@@ -153,6 +203,16 @@ export function RuntimeAccountsPanel({
             </label>
           </div>
         </div>
+        <div
+          className={`border-b px-3 py-2 text-xs ${
+            nextAccountActionGood
+              ? 'border-emerald-500/20 bg-emerald-500/10 text-emerald-200'
+              : 'border-amber-500/20 bg-amber-500/10 text-amber-200'
+          }`}
+          data-testid="runtime-accounts-next-action"
+        >
+          <span className="font-semibold">Next action:</span> {nextAccountAction}
+        </div>
         <div className="grid grid-cols-2 overflow-hidden sm:grid-cols-4 lg:grid-cols-6">
           <StatCell
             label="GitHub"
@@ -163,32 +223,32 @@ export function RuntimeAccountsPanel({
           <StatCell
             label="LLM"
             value={`${enabledAccounts}/${configuredAccounts.length}`}
-            sub={`${providerCount} provider${providerCount === 1 ? '' : 's'}`}
+            sub={`${runtimeReadyAccounts} ready, ${providerCount} provider${providerCount === 1 ? '' : 's'}`}
             tone={enabledAccounts > 0 ? 'good' : 'warn'}
           />
           <StatCell
             label="Active"
             value={activeTasks}
-            sub={`${cappedAccounts} capped`}
-            tone={activeTasks > 0 ? 'info' : 'neutral'}
+            sub={capHeldAccounts > 0 ? `${capHeldAccounts} cap holds` : `${cappedAccounts} capped`}
+            tone={capHeldAccounts > 0 ? 'warn' : activeTasks > 0 ? 'info' : 'neutral'}
           />
           <StatCell
             label="Cooldowns"
-            value={cooldowns + rateLimitedModels}
+            value={totalCooldowns}
             sub={`${cooldowns} configured, ${rateLimitedModels} health`}
-            tone={cooldowns + rateLimitedModels > 0 ? 'warn' : 'neutral'}
+            tone={totalCooldowns > 0 ? 'warn' : 'neutral'}
           />
           <StatCell
             label="Health"
             value={loadingHealth && accountHealth === null ? 'loading' : nonHealthyRows}
-            sub={pollError ? 'poll failed' : `${healthRows.length} observed`}
-            tone={pollError ? 'bad' : nonHealthyRows > 0 ? 'warn' : 'good'}
+            sub={pollError ? 'poll failed' : loadingHealth && accountHealth === null ? 'polling' : `${healthRows.length} observed`}
+            tone={healthTone}
           />
           <StatCell
             label="Usage"
             value={loadingHealth && accountHealth === null ? 'loading' : usagePressureRows}
-            sub=">=70% window"
-            tone={usagePressureRows > 0 ? 'warn' : 'neutral'}
+            sub={quotaPressureRows > 0 ? `${quotaPressureRows} near quota` : '>=70% window'}
+            tone={quotaPressureRows > 0 ? 'bad' : usagePressureRows > 0 ? 'warn' : 'neutral'}
           />
         </div>
         {pollError && (

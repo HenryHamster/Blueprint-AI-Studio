@@ -71,6 +71,10 @@ from app.shared_state import runtime_config as _runtime_config
 import app.reaper_sweeps as _rs
 from app.reaper_sweeps import event_driven_unblock_on_knowledge
 from app.time_utils import _utcnow
+from app.workbench_state import (
+    STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+)
 
 
 def test_heartbeat_stale_cutoff_respects_runtime_config_override():
@@ -6018,6 +6022,50 @@ async def test_step7_stalled_cycle_does_not_broadcast_on_commit_failure(
         )
 
     broadcast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_skips_strategic_local_runner_hold(reaper_db):
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-local-hold",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.QUEUED,
+        context={
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+            STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: (
+                _utcnow() - timedelta(hours=4)
+            ).isoformat(),
+        },
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase1_started_at=_utcnow() - timedelta(hours=5),
+        phase1_completed_at=_utcnow() - timedelta(hours=4),
+        phase2_started_at=_utcnow() - timedelta(hours=4),
+        phase2_task_id=task.id,
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    stalled = await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert stalled == 0
+    assert task.status == TaskStatus.QUEUED
+    assert cycle.outcome == "phase2_running"
 
 
 # ── Orphan reap crash isolation & quarantine ─────────────────────────────

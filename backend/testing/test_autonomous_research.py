@@ -38,6 +38,10 @@ from app.capability_demand import collect_missing_capability_demand
 from app.payload_schemas import validate_internal_payload
 from app.task_evaluators import ADVERSARIAL_GATE_VERDICT_KEY
 from app.auth import create_agent_token
+from app.workbench_state import (
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+)
 
 USE_POSTGRES = os.getenv("USE_TEST_POSTGRES", "").lower() == "true" and os.getenv(
     "DATABASE_URL", ""
@@ -16137,7 +16141,15 @@ async def test_pending_sr_success_clears_marker_and_returns_early(db_session, mo
         new=AsyncMock(return_value=True),
     )
 
-    project = _make_pending_sr_project(db_session)
+    preferred_runner_id = str(uuid.uuid4())
+    project = _make_pending_sr_project(
+        db_session,
+        preferred_runner_target_id=preferred_runner_id,
+        **{
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+            STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+        },
+    )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
@@ -16147,6 +16159,14 @@ async def test_pending_sr_success_clears_marker_and_returns_early(db_session, mo
     assert spawn_sr_mock.called, (
         "_spawn_strategic_review must be called on a fresh pending marker"
     )
+    assert (
+        spawn_sr_mock.await_args.kwargs["preferred_runner_target_id"]
+        == preferred_runner_id
+    )
+    assert spawn_sr_mock.await_args.kwargs["local_runner_context"] == {
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+    }
 
     await db_session.refresh(project)
     assert (project.vision or {}).get("_pending_strategic_review") is None, (

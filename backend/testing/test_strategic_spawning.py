@@ -31,7 +31,11 @@ from app.models import (
     RECOMMENDED_MODE_META_KEY,
 )
 from app.strategic_trigger import ORIGIN_OPERATOR, ORIGIN_QUALIFICATION
-from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+from app.workbench_state import (
+    STRATEGIC_LOCAL_CONTINUATION_KEY,
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+)
 from app.autonomous_research import _spawn_research_task
 from app.strategic_spawning import (
     _spawn_design_doc_update,
@@ -2782,7 +2786,7 @@ async def test_spawn_strategic_review_records_preferred_runner_without_pin(
 async def test_design_doc_update_uses_live_local_continuation_runner_affinity(
     db_session, mocker
 ):
-    """Continuous local Strategic mode gives Phase 1 an advisory live-runner hint."""
+    """Continuous local Strategic mode makes Phase 1 local-required."""
     _patch_spawning_deps(mocker)
     mocker.patch(
         "app.task_lifecycle._has_active_strategic_task",
@@ -2814,6 +2818,11 @@ async def test_design_doc_update_uses_live_local_continuation_runner_affinity(
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     task = result.scalars().one()
     assert task.payloads[0]["type"] == "design_doc_update"
+    assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+    assert (
+        task.context.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+        == "workbench_continuous"
+    )
     assert task.context.get("preferred_runner_target_id") == str(runner.id)
     assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
     assert "runner_target_id" not in task.context
@@ -2824,7 +2833,7 @@ async def test_design_doc_update_uses_live_local_continuation_runner_affinity(
 async def test_strategic_review_uses_live_local_continuation_runner_affinity(
     db_session, mocker
 ):
-    """Strategy-only Strategic reviews also receive the advisory local preference."""
+    """Strategy-only Strategic reviews also become local-required."""
     _patch_spawning_deps(mocker)
     mocker.patch(
         "app.task_lifecycle._has_active_strategic_task",
@@ -2866,6 +2875,11 @@ async def test_strategic_review_uses_live_local_continuation_runner_affinity(
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     task = result.scalars().one()
     assert task.payloads[0]["type"] == "strategic_review"
+    assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+    assert (
+        task.context.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+        == "workbench_continuous"
+    )
     assert task.context.get("preferred_runner_target_id") == str(live_runner.id)
     assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
     assert "runner_target_id" not in task.context
@@ -2913,8 +2927,59 @@ async def test_local_continuation_affinity_omitted_when_stale_or_incapable(
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     task = result.scalars().one()
     assert task.payloads[0]["type"] == "strategic_review"
+    assert STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in task.context
     assert "preferred_runner_target_id" not in task.context
     assert "runner_target_id" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_local_continuation_requires_local_even_without_live_runner(
+    db_session, mocker
+):
+    """Fresh continuous local mode must not lose hard local intent while offline."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        _make_local_runner(
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "has_gpu": False,
+                "max_concurrent": 2,
+            },
+            status="inactive",
+            last_seen_at=datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(hours=1),
+        )
+    )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert task.payloads[0]["type"] == "strategic_review"
+    assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+    assert (
+        task.context.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+        == "workbench_continuous"
+    )
+    assert "preferred_runner_target_id" not in task.context
+    assert "runner_target_id" not in task.context
+    assert not (task.vm_instance_id or "").startswith("runner:")
 
 
 @pytest.mark.asyncio
@@ -2961,6 +3026,7 @@ async def test_local_continuation_affinity_reads_current_db_marker(
     assert spawned is True
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     task = result.scalars().one()
+    assert STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in task.context
     assert "preferred_runner_target_id" not in task.context
     assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
 
@@ -13339,6 +13405,8 @@ async def test_architecture_cycle_operator_wake_reaches_phase2_after_marker_clea
     design_doc_task.context = {
         **(design_doc_task.context or {}),
         "runner_target_id": preferred_runner_id,
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
     }
     design_doc_task.vm_instance_id = f"runner:{preferred_runner_id}"
     project.vision = {
@@ -13378,6 +13446,14 @@ async def test_architecture_cycle_operator_wake_reaches_phase2_after_marker_clea
     assert (
         (review.context or {}).get("preferred_runner_target_id")
         == preferred_runner_id
+    )
+    assert (
+        (review.context or {}).get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY)
+        is True
+    )
+    assert (
+        (review.context or {}).get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+        == "workbench_continuous"
     )
     assert "runner_target_id" not in (review.context or {})
     assert not (review.vm_instance_id or "").startswith("runner:")
