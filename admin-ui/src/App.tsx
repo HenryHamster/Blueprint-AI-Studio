@@ -72,10 +72,17 @@ export default function App() {
   const s = useAppState({ refreshStrategicReadModelRef, refreshMessagesRef });
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [drawerWidth, setDrawerWidth] = useState(0);
+  const [pipelineContextTask, setPipelineContextTask] = useState<Task | null>(null);
+  const pipelineContextRequestRef = useRef(0);
   // Dedup guard: track the last lastCycleCompletion object we toasted for so a
   // WS reconnect that re-emits the same event doesn't fire a second toast.
   const lastCycleCompletionToastRef = useRef<typeof s.lastCycleCompletion>(null);
-  const { lastCycleCompletion: cycleCompletion, addToast } = s;
+  const { lastCycleCompletion: cycleCompletion, addToast, handleViewLogs: openTaskDetailDrawer } = s;
+  const handleOpenTaskDetails = useCallback((task: Task) => {
+    pipelineContextRequestRef.current += 1;
+    setPipelineContextTask(task);
+    openTaskDetailDrawer(task);
+  }, [openTaskDetailDrawer]);
   useEffect(() => {
     if (!cycleCompletion) return;
     if (cycleCompletion === lastCycleCompletionToastRef.current) return;
@@ -286,11 +293,11 @@ export default function App() {
       fetchProjectMembers(selectedProjectId);
     }
   }, [showProjectMembers, selectedProjectId, fetchProjectMembers]);
-  const handleViewTask = (taskId: string) => {
+  const handleViewTask = useCallback((taskId: string) => {
     const task = s.tasks.find(t => t.id === taskId);
-    if (task) s.handleViewLogs(task);
-    else fetchTask(taskId).then(s.handleViewLogs).catch(() => {});
-  };
+    if (task) handleOpenTaskDetails(task);
+    else fetchTask(taskId).then(handleOpenTaskDetails).catch(() => {});
+  }, [handleOpenTaskDetails, s.tasks]);
 
   const [dismissedZoneAlertIds, setDismissedZoneAlertIds] = useState<Set<string>>(new Set());
   const [researchBrowserDirectionId, setResearchBrowserDirectionId] = useState<string | null>(null);
@@ -592,21 +599,39 @@ export default function App() {
 
   const {
     addToast: addTaskLookupToast,
-    handleViewLogs: openTaskLogs,
     tasks: taskLookupTasks,
   } = s;
+  const selectPipelineTaskById = useCallback((taskId: string) => {
+    const target = taskLookupTasks.find(t => t.id === taskId);
+    const requestId = pipelineContextRequestRef.current + 1;
+    pipelineContextRequestRef.current = requestId;
+    if (target) {
+      setPipelineContextTask(target);
+      return;
+    }
+    setPipelineContextTask(null);
+    fetchTask(taskId)
+      .then(task => {
+        if (pipelineContextRequestRef.current === requestId) setPipelineContextTask(task);
+      })
+      .catch(() => {
+        if (pipelineContextRequestRef.current === requestId) {
+          addTaskLookupToast('Could not load task context — it may have been deleted', 'error');
+        }
+      });
+  }, [addTaskLookupToast, taskLookupTasks]);
   const handleViewTaskById = useCallback((taskId: string) => {
     const target = taskLookupTasks.find(t => t.id === taskId);
     if (target) {
-      openTaskLogs(target);
+      handleOpenTaskDetails(target);
       return;
     }
     fetchTask(taskId)
-      .then(openTaskLogs)
+      .then(handleOpenTaskDetails)
       .catch(() => {
         addTaskLookupToast('Could not load task — it may have been deleted', 'error');
       });
-  }, [addTaskLookupToast, openTaskLogs, taskLookupTasks]);
+  }, [addTaskLookupToast, handleOpenTaskDetails, taskLookupTasks]);
 
   const hasActiveFilters = s.tasks.length > 0 && (filteredTasks.length < s.tasks.length || s.failureClassFilter.length > 0);
   const visibleActiveTasks = useMemo(() => filteredTasks.filter(t => ACTIVE_PIPELINE_STATUSES.has(t.status)), [filteredTasks]);
@@ -637,11 +662,20 @@ export default function App() {
       .filter(t => t.status === 'FAILED' || t.status === 'BLOCKED' || stuckTaskIds.has(t.id) || ACTIVE_PIPELINE_STATUSES.has(t.status))
       .sort((a, b) => priority(b) - priority(a) || parseTimestamp(b.created_at).getTime() - parseTimestamp(a.created_at).getTime());
   }, [filteredTasks, stuckTaskIds]);
+  const selectedPipelineContextTask = useMemo(() => {
+    if (!pipelineContextTask) return null;
+    const refreshedTask = taskLookupTasks.find(t => t.id === pipelineContextTask.id);
+    const task = refreshedTask ?? pipelineContextTask;
+    if (s.selectedProjectId && task.project_id !== s.selectedProjectId) return null;
+    return task;
+  }, [pipelineContextTask, s.selectedProjectId, taskLookupTasks]);
   const openPipelineTask = useMemo(() => {
+    if (selectedPipelineContextTask && s.logTask?.id === selectedPipelineContextTask.id) return s.logTask;
+    if (selectedPipelineContextTask) return selectedPipelineContextTask;
     if (!s.logTask) return null;
     if (s.selectedProjectId && s.logTask.project_id !== s.selectedProjectId) return null;
     return s.logTask;
-  }, [s.logTask, s.selectedProjectId]);
+  }, [s.logTask, s.selectedProjectId, selectedPipelineContextTask]);
 
   const [pipelineSection, setPipelineSection] = useState<PipelineSection>('flow');
   const [projectSection, setProjectSection] = useState<ProjectSection>('running-update');
@@ -898,7 +932,7 @@ export default function App() {
   }, [handleTabChange, setCommandPaletteOpen]);
   const strategicMessageTarget = useStrategicMessageTarget(() => handleTabChange('chat'), selectedProjectId);
   const openStrategicContextTarget = useStrategicContextNavigation({
-    handleTabChange, handleViewTaskById, openMessages: strategicMessageTarget.open,
+    handleTabChange, openMessages: strategicMessageTarget.open, selectPipelineTaskById,
     setKnowledgeBrowserDirectionId, setKnowledgeBrowserInitialDocId,
     setPipelineSection, setProjectSection, setRuntimeSection,
     setShowArchive: s.setShowArchive, setShowKnowledgeBrowser: s.setShowKnowledgeBrowser, setViewMode: s.setViewMode,
@@ -1595,7 +1629,7 @@ export default function App() {
           setArchiveStatusFilter={s.setArchiveStatusFilter}
           setArchiveSearchQuery={s.setArchiveSearchQuery}
           setArchiveDateRange={s.setArchiveDateRange}
-          handleViewLogs={s.handleViewLogs}
+          handleViewLogs={handleOpenTaskDetails}
           onRetryTask={s.handleRetry}
           onUnarchiveTask={s.handleUnarchiveTask}
           archiveSortOrder={s.archiveSortOrder}
@@ -1645,7 +1679,7 @@ export default function App() {
             apiHealthy={s.apiHealthy}
             wsConnected={s.wsConnected}
             settingsRouterProps={settingsRouterProps}
-            onViewTask={s.handleViewLogs}
+            onViewTask={handleOpenTaskDetails}
             onViewTaskById={handleViewTaskById}
             onOpenFleet={() => {
               s.setActiveTab('runtime');
@@ -1695,7 +1729,7 @@ export default function App() {
             setArchiveStatusFilter: s.setArchiveStatusFilter,
             setArchiveSearchQuery: s.setArchiveSearchQuery,
             setArchiveDateRange: s.setArchiveDateRange,
-            handleViewLogs: s.handleViewLogs,
+            handleViewLogs: handleOpenTaskDetails,
             onRetryTask: s.handleRetry,
             onUnarchiveTask: s.handleUnarchiveTask,
             archiveSortOrder: s.archiveSortOrder,
@@ -1705,7 +1739,7 @@ export default function App() {
           flow={{
             tasks: filteredTasks,
             hasActiveFilters,
-            onViewLogs: s.handleViewLogs,
+            onViewLogs: handleOpenTaskDetails,
             onNavigateToParent: (parentTaskId) => {
               navigator.clipboard.writeText(parentTaskId).then(() => {
                 s.addToast('Parent task ID copied — use search to find it', 'info');
@@ -1730,7 +1764,7 @@ export default function App() {
             localFallbackTasks: localAttentionTasks,
             trackedTaskIds: s.trackedTaskIds,
             taskContextSessionProps,
-            onOpenTask: s.handleViewLogs,
+            onOpenTask: handleOpenTaskDetails,
             onOpenPipeline: () => handleTabChange('pipeline'),
             onTrackTask: s.trackTask,
           }}
@@ -1764,7 +1798,7 @@ export default function App() {
             onEditPrompt: s.handleEditPrompt,
             onDismiss: s.handleDismiss,
             onArchive: s.handleArchiveTask,
-            onViewLogs: s.handleViewLogs,
+            onViewLogs: handleOpenTaskDetails,
             onTrack: s.trackTask,
             trackedTaskIds: s.trackedTaskIds,
             onDuplicate: s.openDuplicateTaskModal,
@@ -1907,14 +1941,7 @@ export default function App() {
           onNavigateToTask={(taskId) => {
             s.setShowResearchBrowser(false);
             setResearchBrowserDirectionId(null);
-            const target = s.tasks.find(t => t.id === taskId);
-            if (target) {
-              s.handleViewLogs(target);
-            } else {
-              fetchTask(taskId).then(s.handleViewLogs).catch(() => {
-                s.addToast('Could not load task — it may have been deleted', 'error');
-              });
-            }
+            handleViewTaskById(taskId);
           }}
         />
       )}
@@ -1928,14 +1955,7 @@ export default function App() {
           initialDocumentId={knowledgeBrowserInitialDocId ?? undefined}
           onNavigateToTask={(taskId) => {
             s.setShowKnowledgeBrowser(false);
-            const target = s.tasks.find(t => t.id === taskId);
-            if (target) {
-              s.handleViewLogs(target);
-            } else {
-              fetchTask(taskId).then(s.handleViewLogs).catch(() => {
-                s.addToast('Could not load task — it may have been deleted', 'error');
-              });
-            }
+            handleViewTaskById(taskId);
           }}
         />
       )}
@@ -1975,14 +1995,7 @@ export default function App() {
           }}
           onWidthChange={setDrawerWidth}
           onNavigateToTask={(taskId) => {
-            const target = s.tasks.find(t => t.id === taskId);
-            if (target) {
-              s.handleViewLogs(target);
-            } else {
-              fetchTask(taskId).then(s.handleViewLogs).catch(() => {
-                s.addToast('Could not load task — it may have been deleted', 'error');
-              });
-            }
+            handleViewTaskById(taskId);
           }}
         />
         </ErrorBoundary>

@@ -23,4 +23,14 @@ describe('App workbench wiring', () => {
     expect(appSource).toMatch(/const openStrategicMessageTargetFromCommandPalette = useCallback\([\s\S]*setStrategicContextWorkspaceOpen\(false\);[\s\S]*strategicMessageTarget\.open\(target\);[\s\S]*\[strategicMessageTarget\.open\]/);
     expect(appSource).toMatch(/checkingInStrategicSession,[\s\S]*markStrategicChecked: handleStrategicCheckIn,[\s\S]*openStrategicContextTarget: openStrategicContextWorkspaceTarget,[\s\S]*openStrategicMessageTarget: openStrategicMessageTargetFromCommandPalette,/);
   });
+
+  test('keeps Pipeline context selection separate from the task details drawer', () => {
+    expect(appSource).toContain('const [pipelineContextTask, setPipelineContextTask] = useState<Task | null>(null);');
+    expect(appSource).toContain('const pipelineContextRequestRef = useRef(0);');
+    expect(appSource).toMatch(/const selectPipelineTaskById = useCallback\([\s\S]*const requestId = pipelineContextRequestRef\.current \+ 1;[\s\S]*setPipelineContextTask\(target\);[\s\S]*fetchTask\(taskId\)[\s\S]*pipelineContextRequestRef\.current === requestId[\s\S]*setPipelineContextTask\(task\)/);
+    expect(appSource).toMatch(/useStrategicContextNavigation\(\{[\s\S]*selectPipelineTaskById/);
+    expect(appSource).toMatch(/const openPipelineTask = useMemo\(\(\) => \{[\s\S]*if \(selectedPipelineContextTask && s\.logTask\?\.id === selectedPipelineContextTask\.id\) return s\.logTask;[\s\S]*if \(selectedPipelineContextTask\) return selectedPipelineContextTask;[\s\S]*if \(!s\.logTask\) return null;/);
+    expect(appSource).toContain('onOpenTask: handleOpenTaskDetails,');
+    expect(appSource).toMatch(/<RuntimeWorkspace[\s\S]*onViewTask=\{handleOpenTaskDetails\}/);
+  });
 });

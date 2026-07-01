@@ -13,8 +13,8 @@ let openTarget: OpenTarget | null = null;
 function Harness(overrides: Partial<Parameters<typeof useStrategicContextNavigation>[0]> = {}) {
   const callback = useStrategicContextNavigation({
     handleTabChange: vi.fn(),
-    handleViewTaskById: vi.fn(),
     openMessages: vi.fn(),
+    selectPipelineTaskById: vi.fn(),
     setKnowledgeBrowserDirectionId: vi.fn(),
     setKnowledgeBrowserInitialDocId: vi.fn(),
     setPipelineSection: vi.fn(),
@@ -87,18 +87,24 @@ describe('useStrategicContextNavigation', () => {
 
   test('routes messages, tasks, and knowledge targets through their owning surfaces', () => {
     const handleTabChange = vi.fn();
-    const handleViewTaskById = vi.fn();
     const openMessages = vi.fn();
+    const selectPipelineTaskById = vi.fn();
     const setKnowledgeBrowserDirectionId = vi.fn();
     const setKnowledgeBrowserInitialDocId = vi.fn();
+    const setPipelineSection = vi.fn();
+    const setShowArchive = vi.fn();
     const setShowKnowledgeBrowser = vi.fn();
+    const setViewMode = vi.fn();
     const open = mount({
       handleTabChange,
-      handleViewTaskById,
       openMessages,
+      selectPipelineTaskById,
       setKnowledgeBrowserDirectionId,
       setKnowledgeBrowserInitialDocId,
+      setPipelineSection,
+      setShowArchive,
       setShowKnowledgeBrowser,
+      setViewMode,
     });
 
     act(() => {
@@ -108,10 +114,14 @@ describe('useStrategicContextNavigation', () => {
     });
 
     expect(openMessages).toHaveBeenCalledWith({ messageId: 'msg-1', action: 'reply' });
-    expect(handleViewTaskById).toHaveBeenCalledWith('task-1');
+    expect(selectPipelineTaskById).toHaveBeenCalledWith('task-1');
+    expect(setPipelineSection).toHaveBeenCalledWith('flow');
+    expect(setViewMode).toHaveBeenCalledWith('pipeline');
+    expect(setShowArchive).toHaveBeenCalledWith(false);
+    expect(handleTabChange).toHaveBeenCalledWith('pipeline');
     expect(setKnowledgeBrowserInitialDocId).toHaveBeenCalledWith('doc-1');
     expect(setKnowledgeBrowserDirectionId).toHaveBeenCalledWith('dir-1');
     expect(setShowKnowledgeBrowser).toHaveBeenCalledWith(true);
-    expect(handleTabChange).not.toHaveBeenCalled();
+    expect(handleTabChange).toHaveBeenCalledTimes(1);
   });
 });

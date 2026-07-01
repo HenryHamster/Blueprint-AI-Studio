@@ -9,8 +9,8 @@ type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
 
 interface UseStrategicContextNavigationOptions {
   handleTabChange: (tab: PrimaryTab) => void;
-  handleViewTaskById: (taskId: string) => void;
   openMessages: (target?: StrategicMessageTarget) => void;
+  selectPipelineTaskById: (taskId: string) => void;
   setKnowledgeBrowserDirectionId: (directionId: string | null) => void;
   setKnowledgeBrowserInitialDocId: (documentId: string | null) => void;
   setPipelineSection: (section: PipelineSection) => void;
@@ -52,8 +52,8 @@ function messageTargetFromContextTarget(target: StrategicContextTarget): Strateg
 
 export function useStrategicContextNavigation({
   handleTabChange,
-  handleViewTaskById,
   openMessages,
+  selectPipelineTaskById,
   setKnowledgeBrowserDirectionId,
   setKnowledgeBrowserInitialDocId,
   setPipelineSection,
@@ -92,8 +92,11 @@ export function useStrategicContextNavigation({
       return;
     }
     if (target.surface === 'task') {
-      if (target.task_id) handleViewTaskById(target.task_id);
-      else handleTabChange('pipeline');
+      setPipelineSection('flow');
+      setViewMode('pipeline');
+      setShowArchive(false);
+      if (target.task_id) selectPipelineTaskById(target.task_id);
+      handleTabChange('pipeline');
       return;
     }
     if (target.surface === 'knowledge') {
@@ -103,8 +106,8 @@ export function useStrategicContextNavigation({
     }
   }, [
     handleTabChange,
-    handleViewTaskById,
     openMessages,
+    selectPipelineTaskById,
     setKnowledgeBrowserDirectionId,
     setKnowledgeBrowserInitialDocId,
     setPipelineSection,
