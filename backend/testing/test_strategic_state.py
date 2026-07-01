@@ -39,6 +39,64 @@ from app.workbench_events import SURFACE_MESSAGES, SURFACE_RUNTIME, SURFACE_STRA
 
 TEST_USER_ID = "test-user-123"
 
+EXPECTED_CURATED_METRIC_PROVENANCE = {
+    "attention.needs_operator": ("attention", "attention.counts.needs_operator"),
+    "attention.watch": ("attention", "attention.counts.watch"),
+    "messages.open": ("messages", "messages.counts.open"),
+    "messages.linked": ("messages", "messages.counts.linked"),
+    "tasks.running": ("tasks", "tasks.counts.running"),
+    "tasks.blocked": ("tasks", "tasks.counts.blocked"),
+    "tasks.parked": ("tasks", "tasks.counts.parked"),
+    "tasks.failed": ("tasks", "tasks.counts.failed"),
+    "runtime.compute_active": (
+        "runtime",
+        "runtime.work.compute_jobs.counts.active",
+    ),
+    "runtime.compute_failed": (
+        "runtime",
+        "runtime.work.compute_jobs.counts.failed_recent",
+    ),
+    "runtime.held_approvals": (
+        "runtime",
+        "runtime.work.held_approvals.count",
+    ),
+    "runtime.local_strategic_ready": (
+        "runtime",
+        "runtime.local_runner.eligible_live_count",
+    ),
+    "runtime.local_runner_holds": (
+        "runtime",
+        "runtime.work.local_runner_holds.count",
+    ),
+    "runtime.parked_wakes": (
+        "runtime",
+        "runtime.work.parked_wakes.counts.active",
+    ),
+    "runtime.wake_problems": (
+        "runtime",
+        "runtime.work.parked_wakes.counts.problem",
+    ),
+    "runtime.compute_spend": (
+        "runtime",
+        "runtime.work.compute_jobs.spend.window_total_usd",
+    ),
+    "context.stale": ("context", "context_package.status"),
+    "context.items": ("context", "context_package.item_count"),
+}
+
+
+def _assert_curated_metric_provenance(metrics: dict[str, dict]) -> None:
+    assert set(EXPECTED_CURATED_METRIC_PROVENANCE).issubset(metrics)
+    for metric_id, metric in metrics.items():
+        provenance = metric.get("provenance")
+        assert isinstance(provenance, dict), metric_id
+        assert isinstance(provenance.get("surface"), str), metric_id
+        assert isinstance(provenance.get("path"), str), metric_id
+    for metric_id, (surface, path) in EXPECTED_CURATED_METRIC_PROVENANCE.items():
+        provenance = metrics[metric_id]["provenance"]
+        assert provenance["surface"] == surface
+        assert provenance["path"] == path
+
 
 def test_strategic_session_snapshot_preserves_canonical_context_target_fields():
     snapshot = sanitize_strategic_session_snapshot(
@@ -1038,6 +1096,9 @@ async def test_strategic_state_marks_active_cycle_with_cancelled_task_as_stale(
         "surface": "project",
         "section": "problem-model",
     }
+    _assert_curated_metric_provenance(metrics)
+    assert metrics["context.stale"]["provenance"]["status"] == "stale"
+    assert metrics["context.stale"]["provenance"]["transform"] == "equals:stale"
 
 
 @pytest.mark.asyncio
@@ -1441,6 +1502,10 @@ async def test_strategic_state_includes_operator_workbench_state(
     assert metrics["messages.open"]["label"] == "open messages"
     assert metrics["tasks.running"]["target"] == {"surface": "pipeline"}
     assert metrics["context.items"]["value"] == resp.json()["context_package"]["item_count"]
+    _assert_curated_metric_provenance(metrics)
+    assert metrics["context.items"]["provenance"]["status"] == resp.json()[
+        "context_package"
+    ]["status"]
 
 
 @pytest.mark.asyncio
@@ -2757,6 +2822,9 @@ async def test_strategic_state_marks_check_in_unavailable_without_prior_receipt(
     assert session_work_session["last_check_in"] is None
     assert session_work_session["since_last_check_in"]["available"] is False
     assert session_work_session["commands"] == state_work_session["commands"]
+    assert session_work_session["curated_metrics"] == state_work_session["curated_metrics"]
+    metrics = {entry["id"]: entry for entry in state_work_session["curated_metrics"]}
+    _assert_curated_metric_provenance(metrics)
 
 
 @pytest.mark.asyncio
@@ -3251,22 +3319,35 @@ async def test_strategic_state_includes_runtime_background_work(
     session_metrics = {
         entry["id"]: entry for entry in data["work_session"]["curated_metrics"]
     }
+    _assert_curated_metric_provenance(session_metrics)
     assert session_metrics["tasks.parked"]["value"] == 1
     assert session_metrics["runtime.compute_active"]["value"] == 1
     assert session_metrics["runtime.compute_active"]["target"] == {
         "surface": "runtime",
         "section": "compute",
     }
+    assert "window_minutes" not in session_metrics["runtime.compute_active"][
+        "provenance"
+    ]
     assert session_metrics["runtime.compute_failed"]["value"] == 1
     assert session_metrics["runtime.compute_failed"]["tone"] == "critical"
+    assert session_metrics["runtime.compute_failed"]["provenance"][
+        "window_minutes"
+    ] == 360
     assert session_metrics["runtime.held_approvals"]["value"] == 1
     assert session_metrics["runtime.held_approvals"]["target"] == {
         "surface": "pipeline",
     }
+    assert "window_minutes" not in session_metrics["runtime.held_approvals"][
+        "provenance"
+    ]
     assert session_metrics["runtime.parked_wakes"]["value"] == 1
     assert session_metrics["runtime.wake_problems"]["value"] == 1
     assert session_metrics["runtime.compute_spend"]["unit"] == "USD"
     assert session_metrics["runtime.compute_spend"]["value"] == pytest.approx(3.75)
+    assert session_metrics["runtime.compute_spend"]["provenance"][
+        "window_minutes"
+    ] == 360
     session_actions = {
         entry["id"]: entry for entry in data["work_session"]["actions"]
     }

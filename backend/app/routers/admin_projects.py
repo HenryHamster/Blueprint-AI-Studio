@@ -163,6 +163,7 @@ def _work_session_metric(
     tone: str = "neutral",
     target: Dict[str, Any] | None = None,
     unit: str | None = None,
+    provenance: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     metric: Dict[str, Any] = {
         "id": metric_id,
@@ -174,7 +175,23 @@ def _work_session_metric(
         metric["unit"] = unit
     if target:
         metric["target"] = target
+    if provenance:
+        metric["provenance"] = {
+            key: value for key, value in provenance.items() if value is not None
+        }
     return metric
+
+
+def _metric_provenance(
+    surface: str,
+    path: str,
+    **extras: Any,
+) -> Dict[str, Any]:
+    return {
+        "surface": surface,
+        "path": path,
+        **{key: value for key, value in extras.items() if value is not None},
+    }
 
 
 def _dedupe_workbench_refs(refs: Any, *, limit: int = 12) -> list[Dict[str, Any]]:
@@ -254,6 +271,11 @@ def _build_work_session_summary(
         if isinstance(context_package, dict)
         else None
     )
+    context_updated_at = (
+        _compact_text(context_package.get("updated_at"), max_chars=80)
+        if isinstance(context_package, dict)
+        else None
+    )
     runtime_work = (
         runtime_summary.get("work", {}) if isinstance(runtime_summary, dict) else {}
     )
@@ -270,6 +292,13 @@ def _build_work_session_summary(
     )
     compute_spend = (
         compute_jobs.get("spend", {}) if isinstance(compute_jobs, dict) else {}
+    )
+    compute_window_minutes = (
+        int(compute_jobs.get("window_minutes"))
+        if isinstance(compute_jobs, dict)
+        and isinstance(compute_jobs.get("window_minutes"), (int, float))
+        and compute_jobs.get("window_minutes") > 0
+        else None
     )
     held_approvals = (
         runtime_work.get("held_approvals", {})
@@ -326,6 +355,10 @@ def _build_work_session_summary(
             if int(attention_counts.get("needs_operator") or 0) > 0
             else "neutral",
             target={"surface": "messages"},
+            provenance=_metric_provenance(
+                "attention",
+                "attention.counts.needs_operator",
+            ),
         ),
         _work_session_metric(
             "attention.watch",
@@ -333,18 +366,21 @@ def _build_work_session_summary(
             int(attention_counts.get("watch") or 0),
             tone="watch" if int(attention_counts.get("watch") or 0) > 0 else "neutral",
             target={"surface": "messages"},
+            provenance=_metric_provenance("attention", "attention.counts.watch"),
         ),
         _work_session_metric(
             "messages.open",
             "open messages",
             int(message_counts.get("open") or 0),
             target={"surface": "messages"},
+            provenance=_metric_provenance("messages", "messages.counts.open"),
         ),
         _work_session_metric(
             "messages.linked",
             "linked messages",
             int(message_counts.get("linked") or 0),
             target={"surface": "messages"},
+            provenance=_metric_provenance("messages", "messages.counts.linked"),
         ),
         _work_session_metric(
             "tasks.running",
@@ -352,6 +388,7 @@ def _build_work_session_summary(
             int(task_counts.get("running") or 0),
             tone="active" if int(task_counts.get("running") or 0) > 0 else "neutral",
             target={"surface": "pipeline"},
+            provenance=_metric_provenance("tasks", "tasks.counts.running"),
         ),
         _work_session_metric(
             "tasks.blocked",
@@ -359,6 +396,7 @@ def _build_work_session_summary(
             int(task_counts.get("blocked") or 0),
             tone="warning" if int(task_counts.get("blocked") or 0) > 0 else "neutral",
             target={"surface": "pipeline"},
+            provenance=_metric_provenance("tasks", "tasks.counts.blocked"),
         ),
         _work_session_metric(
             "tasks.parked",
@@ -366,6 +404,7 @@ def _build_work_session_summary(
             int(task_counts.get("parked") or 0),
             tone="watch" if int(task_counts.get("parked") or 0) > 0 else "neutral",
             target={"surface": "pipeline"},
+            provenance=_metric_provenance("tasks", "tasks.counts.parked"),
         ),
         _work_session_metric(
             "tasks.failed",
@@ -373,6 +412,7 @@ def _build_work_session_summary(
             int(task_counts.get("failed") or 0),
             tone="critical" if int(task_counts.get("failed") or 0) > 0 else "neutral",
             target={"surface": "pipeline"},
+            provenance=_metric_provenance("tasks", "tasks.counts.failed"),
         ),
         _work_session_metric(
             "runtime.compute_active",
@@ -380,6 +420,10 @@ def _build_work_session_summary(
             int(compute_counts.get("active") or 0),
             tone="active" if int(compute_counts.get("active") or 0) > 0 else "neutral",
             target={"surface": "runtime", "section": "compute"},
+            provenance=_metric_provenance(
+                "runtime",
+                "runtime.work.compute_jobs.counts.active",
+            ),
         ),
         _work_session_metric(
             "runtime.compute_failed",
@@ -389,6 +433,11 @@ def _build_work_session_summary(
             if int(compute_counts.get("failed_recent") or 0) > 0
             else "neutral",
             target={"surface": "runtime", "section": "compute"},
+            provenance=_metric_provenance(
+                "runtime",
+                "runtime.work.compute_jobs.counts.failed_recent",
+                window_minutes=compute_window_minutes,
+            ),
         ),
         _work_session_metric(
             "runtime.held_approvals",
@@ -396,6 +445,10 @@ def _build_work_session_summary(
             held_approval_count,
             tone="warning" if held_approval_count > 0 else "neutral",
             target={"surface": "pipeline"},
+            provenance=_metric_provenance(
+                "runtime",
+                "runtime.work.held_approvals.count",
+            ),
         ),
         _work_session_metric(
             "runtime.local_strategic_ready",
@@ -409,6 +462,10 @@ def _build_work_session_summary(
                 else "neutral"
             ),
             target={"surface": "runtime", "section": "devices"},
+            provenance=_metric_provenance(
+                "runtime",
+                "runtime.local_runner.eligible_live_count",
+            ),
         ),
         _work_session_metric(
             "runtime.local_runner_holds",
@@ -416,6 +473,10 @@ def _build_work_session_summary(
             local_runner_hold_count,
             tone="warning" if local_runner_hold_count > 0 else "neutral",
             target={"surface": "runtime", "section": "devices"},
+            provenance=_metric_provenance(
+                "runtime",
+                "runtime.work.local_runner_holds.count",
+            ),
         ),
         _work_session_metric(
             "runtime.parked_wakes",
@@ -423,6 +484,10 @@ def _build_work_session_summary(
             int(wake_counts.get("active") or 0),
             tone="watch" if int(wake_counts.get("active") or 0) > 0 else "neutral",
             target={"surface": "runtime", "section": "compute"},
+            provenance=_metric_provenance(
+                "runtime",
+                "runtime.work.parked_wakes.counts.active",
+            ),
         ),
         _work_session_metric(
             "runtime.wake_problems",
@@ -430,6 +495,10 @@ def _build_work_session_summary(
             int(wake_counts.get("problem") or 0),
             tone="critical" if int(wake_counts.get("problem") or 0) > 0 else "neutral",
             target={"surface": "runtime", "section": "compute"},
+            provenance=_metric_provenance(
+                "runtime",
+                "runtime.work.parked_wakes.counts.problem",
+            ),
         ),
         _work_session_metric(
             "runtime.compute_spend",
@@ -440,6 +509,11 @@ def _build_work_session_summary(
             else "neutral",
             target={"surface": "runtime", "section": "compute"},
             unit="USD",
+            provenance=_metric_provenance(
+                "runtime",
+                "runtime.work.compute_jobs.spend.window_total_usd",
+                window_minutes=compute_window_minutes,
+            ),
         ),
         _work_session_metric(
             "context.stale",
@@ -447,12 +521,25 @@ def _build_work_session_summary(
             1 if context_status == "stale" else 0,
             tone="warning" if context_status == "stale" else "neutral",
             target={"surface": "project", "section": "problem-model"},
+            provenance=_metric_provenance(
+                "context",
+                "context_package.status",
+                transform="equals:stale",
+                status=context_status,
+                updated_at=context_updated_at,
+            ),
         ),
         _work_session_metric(
             "context.items",
             "context items",
             context_item_count,
             target={"surface": "project", "section": "problem-model"},
+            provenance=_metric_provenance(
+                "context",
+                "context_package.item_count",
+                status=context_status,
+                updated_at=context_updated_at,
+            ),
         ),
     ]
     actions = build_work_session_actions(
@@ -2377,7 +2464,7 @@ async def create_project_strategic_session_check_in(
                             detail=(
                                 "idempotency_key already belongs to another message"
                             ),
-                        )
+                        ) from None
                     status = "duplicate"
                 else:
                     raise
