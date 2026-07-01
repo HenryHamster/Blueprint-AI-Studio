@@ -13,13 +13,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import flag_modified
+from sqlmodel import select
 
 from app.messages_noise_prefs_store import (
     get_messages_noise_prefs_row,
-    mutate_messages_noise_prefs,
 )
-from app.models import _utcnow
+from app.models import LocalRunner, MessagesNoisePrefs, _utcnow
 from app.strategic_trigger import (
     ARMING_NOT_ARMED,
     ARMING_PASSIVE_NOTE,
@@ -27,6 +29,7 @@ from app.strategic_trigger import (
     ORIGIN_OPERATOR,
     request_strategic_refresh,
 )
+from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.task_locking import with_vision_locked
 
 WORKBENCH_STATE_KEY = "_strategic_workbench"
@@ -128,6 +131,19 @@ def _sanitize_context_target(raw: Any) -> dict[str, str] | None:
         if value:
             target[key] = value
     return target or None
+
+
+def _runner_handles_any_strategic_work(capabilities: Any) -> bool:
+    caps = capabilities if isinstance(capabilities, dict) else {}
+    task_types = caps.get("task_types", "all")
+    if task_types == "all":
+        return True
+    if not isinstance(task_types, list):
+        return False
+    return any(
+        isinstance(task_type, str) and task_type in STRATEGIC_TASK_TYPES
+        for task_type in task_types
+    )
 
 
 def _message_ref_target(ref_id: str) -> dict[str, str]:
@@ -324,6 +340,7 @@ def sanitize_workbench_state(
     *,
     existing: dict[str, Any] | None = None,
     touch: bool = True,
+    valid_preferred_runner_ids: set[str] | None = None,
 ) -> dict[str, Any]:
     data = raw if isinstance(raw, dict) else {}
     previous = existing if isinstance(existing, dict) else {}
@@ -373,6 +390,12 @@ def sanitize_workbench_state(
         else previous.get("preferred_runner_id")
     )
     preferred_runner_id = _string(preferred_runner_raw, max_chars=80)
+    if (
+        preferred_runner_id
+        and valid_preferred_runner_ids is not None
+        and preferred_runner_id not in valid_preferred_runner_ids
+    ):
+        preferred_runner_id = None
     if preferred_runner_id:
         state["preferred_runner_id"] = preferred_runner_id
     return state
@@ -585,6 +608,95 @@ async def get_strategic_workbench_state(
     return workbench_state_from_prefs(row.prefs if row else None)
 
 
+async def _valid_preferred_runner_ids(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> set[str]:
+    runners = (
+        await session.execute(
+            select(LocalRunner)
+            .where(
+                LocalRunner.project_id == project_id,
+                LocalRunner.status != "deleted",
+            )
+            .with_for_update()
+        )
+    ).scalars().all()
+    return {
+        str(runner.id)
+        for runner in runners
+        if _runner_handles_any_strategic_work(runner.capabilities)
+    }
+
+
+async def clear_preferred_runner_references(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID | str,
+) -> dict[str, Any]:
+    """Remove a runner preference from saved workbench state after revocation."""
+
+    runner_id_text = _string(str(runner_id), max_chars=80)
+    if not runner_id_text:
+        return {"workbench_states": 0, "continuation_marker": False}
+
+    rows = (
+        await session.execute(
+            select(MessagesNoisePrefs)
+            .where(MessagesNoisePrefs.project_id == project_id)
+            .with_for_update()
+        )
+    ).scalars().all()
+    cleared_workbench_states = 0
+    for row in rows:
+        prefs = dict(row.prefs or {})
+        workbench = prefs.get(WORKBENCH_STATE_KEY)
+        if not isinstance(workbench, dict):
+            continue
+        preferred_runner_id = _string(
+            workbench.get("preferred_runner_id"),
+            max_chars=80,
+        )
+        if preferred_runner_id != runner_id_text:
+            continue
+        next_workbench = dict(workbench)
+        next_workbench.pop("preferred_runner_id", None)
+        prefs[WORKBENCH_STATE_KEY] = next_workbench
+        row.prefs = prefs
+        flag_modified(row, "prefs")
+        session.add(row)
+        cleared_workbench_states += 1
+
+    cleared_marker = False
+
+    def _clear_continuation_marker(vision: dict[str, Any]) -> None:
+        nonlocal cleared_marker
+        marker = vision.get(STRATEGIC_LOCAL_CONTINUATION_KEY)
+        if not isinstance(marker, dict):
+            return
+        preferred_runner_id = _string(
+            marker.get("preferred_runner_id"),
+            max_chars=80,
+        )
+        if preferred_runner_id != runner_id_text:
+            return
+        next_marker = dict(marker)
+        next_marker.pop("preferred_runner_id", None)
+        vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = next_marker
+        cleared_marker = True
+
+    await with_vision_locked(
+        session,
+        project_id,
+        _clear_continuation_marker,
+        skip_locked=False,
+    )
+    return {
+        "workbench_states": cleared_workbench_states,
+        "continuation_marker": cleared_marker,
+    }
+
+
 async def upsert_strategic_workbench_state(
     session: AsyncSession,
     user_id: str,
@@ -606,22 +718,45 @@ async def upsert_strategic_workbench_state_with_previous(
     project_id: uuid.UUID,
     raw_state: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    state_holder: dict[str, dict[str, Any]] = {}
-
-    def merge(existing_prefs: dict[str, Any]) -> dict[str, Any]:
+    for attempt in range(2):
+        valid_runner_ids = await _valid_preferred_runner_ids(session, project_id)
+        row = await get_messages_noise_prefs_row(
+            session,
+            user_id,
+            project_id,
+            for_update=True,
+        )
+        existing_prefs = dict(row.prefs or {}) if row is not None else {}
         previous = workbench_state_from_prefs(existing_prefs)
         state = sanitize_workbench_state(
             raw_state,
             existing=previous,
+            valid_preferred_runner_ids=valid_runner_ids,
         )
-        state_holder["previous"] = previous
-        state_holder["state"] = state
-        prefs = dict(existing_prefs)
-        prefs[WORKBENCH_STATE_KEY] = state
-        return prefs
+        next_prefs = dict(existing_prefs)
+        next_prefs[WORKBENCH_STATE_KEY] = state
 
-    await mutate_messages_noise_prefs(session, user_id, project_id, merge)
-    return state_holder["previous"], state_holder["state"]
+        if row is None:
+            row = MessagesNoisePrefs(
+                user_id=user_id,
+                project_id=project_id,
+                prefs=next_prefs,
+            )
+        else:
+            row.prefs = next_prefs
+            flag_modified(row, "prefs")
+        session.add(row)
+
+        try:
+            await session.flush()
+            return previous, state
+        except IntegrityError:
+            await session.rollback()
+            if attempt == 0:
+                continue
+            raise
+
+    raise RuntimeError("Failed to update strategic workbench state")
 
 
 def workbench_context_for_strategic_session_snapshot(

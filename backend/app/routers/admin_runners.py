@@ -26,6 +26,7 @@ from app.workbench_events import (
     SURFACE_STRATEGIC_SESSION,
     emit_workbench_refetch,
 )
+from app.workbench_state import clear_preferred_runner_references
 
 logger = logging.getLogger("blueprint")
 
@@ -337,10 +338,12 @@ async def delete_runner(
         project_id, current_user["user_id"], session, "owner"
     )
     result = await session.execute(
-        select(LocalRunner).where(
+        select(LocalRunner)
+        .where(
             LocalRunner.id == runner_id,
             LocalRunner.project_id == project_id,
         )
+        .with_for_update()
     )
     runner = result.scalars().first()
     if runner is None or runner.status == "deleted":
@@ -348,13 +351,19 @@ async def delete_runner(
 
     runner.status = "deleted"
     session.add(runner)
+    cleared_runner_references = await clear_preferred_runner_references(
+        session,
+        project_id,
+        runner_id,
+    )
     released_pins = await _release_unpulled_runner_pins(session, runner_id)
     await session.commit()
     logger.info(
-        "[RUNNERS] Deleted runner %s for project %s (released_unpulled_pins=%s)",
+        "[RUNNERS] Deleted runner %s for project %s (released_unpulled_pins=%s cleared_refs=%s)",
         runner_id,
         project_id,
         released_pins,
+        cleared_runner_references,
     )
     await emit_workbench_refetch(
         project_id,

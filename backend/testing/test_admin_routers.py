@@ -28,6 +28,7 @@ from app.models import (
     Project,
     ProjectMember,
     ProjectStatus,
+    LocalRunner,
     PoolVm,
     PoolVmState,
     ReleaseVersion,
@@ -45,6 +46,7 @@ from app.models import (
     SystemMaturity,
     WakeDeliveryState,
     _on_task_terminal_callbacks,
+    _utcnow,
 )
 from app.auth import get_current_user, require_admin
 from app.schemas import AgentStatusPayload
@@ -6574,7 +6576,17 @@ class TestMessagesWorkbenchState:
         from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
 
         project = await _make_project(db_session)
-        preferred_runner_id = str(uuid.uuid4())
+        runner = LocalRunner(
+            project_id=project.id,
+            token_hash="m" * 64,
+            hostname="desk-mini",
+            status="active",
+            last_seen_at=_utcnow(),
+        )
+        db_session.add(runner)
+        await db_session.commit()
+        await db_session.refresh(runner)
+        preferred_runner_id = str(runner.id)
         resp = await client.put(
             "/api/admin/messages/workbench-state",
             json={
@@ -6596,6 +6608,32 @@ class TestMessagesWorkbenchState:
         assert marker["preferred_runner_id"] == preferred_runner_id
         assert marker["last_seen_at"]
         assert marker["updated_at"]
+
+    @pytest.mark.asyncio
+    async def test_continuous_mode_drops_unknown_preferred_runner_id(
+        self, client: AsyncClient, db_session
+    ):
+        from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+
+        project = await _make_project(db_session)
+        resp = await client.put(
+            "/api/admin/messages/workbench-state",
+            json={
+                "project_id": str(project.id),
+                "workbench": {
+                    "interaction_mode": "continuous",
+                    "active_surface": "runtime",
+                    "preferred_runner_id": str(uuid.uuid4()),
+                },
+            },
+        )
+
+        assert resp.status_code == 200
+        assert "preferred_runner_id" not in resp.json()["workbench"]
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["active"] is True
+        assert "preferred_runner_id" not in marker
 
     @pytest.mark.asyncio
     async def test_leaving_continuous_mode_clears_local_continuation_marker(

@@ -141,6 +141,132 @@ def test_work_session_commands_clear_selected_refs_uses_existing_session_endpoin
     assert clear_refs["refetch_surfaces"] == ["strategic_session"]
 
 
+def test_work_session_commands_include_runner_preference_mutations():
+    commands = build_work_session_commands(
+        project_id="project-1",
+        workbench_state={"interaction_mode": "continuous", "selected_refs": []},
+        context_package=None,
+        actions=[],
+        local_runner={
+            "runners": [
+                {
+                    "id": "runner-1",
+                    "hostname": "desk-mini",
+                    "eligible_for_active_task": True,
+                    "secret": "drop-me",
+                },
+                {
+                    "id": "runner-2",
+                    "hostname": "busy-desk",
+                    "eligible_for_active_task": False,
+                },
+            ],
+        },
+    )
+
+    by_id = _commands_by_id(commands)
+    prefer = by_id["session.runner.prefer.runner-1"]
+    assert prefer == {
+        "id": "session.runner.prefer.runner-1",
+        "label": "Prefer desk-mini",
+        "group": "runtime",
+        "priority": "normal",
+        "enabled": True,
+        "target": {
+            "surface": "runtime",
+            "project_id": "project-1",
+            "section": "devices",
+            "action": "prefer_runner",
+            "runner_id": "runner-1",
+        },
+        "refetch_surfaces": ["strategic_session", "runtime"],
+        "mutation": {
+            "method": "POST",
+            "path": "/api/admin/projects/project-1/strategic-session",
+            "body": {"workbench": {"preferred_runner_id": "runner-1"}},
+        },
+    }
+    assert "session.runner.prefer.runner-2" not in by_id
+    assert "drop-me" not in json.dumps(commands, sort_keys=True)
+
+
+def test_work_session_commands_include_clear_preferred_runner_mutation():
+    commands = build_work_session_commands(
+        project_id="project-1",
+        workbench_state={
+            "interaction_mode": "continuous",
+            "selected_refs": [],
+            "preferred_runner_id": "runner-1",
+        },
+        context_package=None,
+        actions=[],
+        local_runner={
+            "runners": [
+                {
+                    "id": "runner-1",
+                    "hostname": "desk-mini",
+                    "eligible_for_active_task": True,
+                },
+            ],
+        },
+    )
+
+    by_id = _commands_by_id(commands)
+    assert by_id["session.runner.prefer.runner-1"]["enabled"] is False
+    clear = by_id["session.runner.clear_preferred"]
+    assert clear == {
+        "id": "session.runner.clear_preferred",
+        "label": "Clear preferred runner",
+        "group": "runtime",
+        "priority": "normal",
+        "enabled": True,
+        "target": {
+            "surface": "runtime",
+            "project_id": "project-1",
+            "section": "devices",
+            "action": "clear_preferred_runner",
+            "runner_id": "runner-1",
+        },
+        "refetch_surfaces": ["strategic_session", "runtime"],
+        "mutation": {
+            "method": "POST",
+            "path": "/api/admin/projects/project-1/strategic-session",
+            "body": {"workbench": {"preferred_runner_id": None}},
+        },
+    }
+
+
+def test_work_session_commands_limit_runner_preferences_after_eligibility_filter():
+    runners = [
+        {
+            "id": f"blocked-{index}",
+            "hostname": f"blocked-{index}",
+            "eligible_for_active_task": False,
+        }
+        for index in range(9)
+    ] + [
+        {
+            "id": f"runner-{index}",
+            "hostname": f"runner-{index}",
+            "eligible_for_active_task": True,
+        }
+        for index in range(10)
+    ]
+    commands = build_work_session_commands(
+        project_id="project-1",
+        workbench_state={"interaction_mode": "continuous", "selected_refs": []},
+        context_package=None,
+        actions=[],
+        local_runner={"runners": runners},
+    )
+
+    ids = {command["id"] for command in commands}
+    assert "session.runner.prefer.runner-0" in ids
+    assert "session.runner.prefer.runner-7" in ids
+    assert "session.runner.prefer.runner-8" not in ids
+    assert "session.runner.prefer.blocked-0" not in ids
+
+
 def test_work_session_command_mutations_url_encode_project_id_path_segment():
     commands = build_work_session_commands(
         project_id="owner/repo project",

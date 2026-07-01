@@ -741,6 +741,25 @@ async def test_strategic_state_reports_strategic_runner_candidates(
     assert docs_only["eligible_for_active_task"] is False
     assert docs_only["blocked_reason"] == "capability_mismatch"
 
+    commands = {entry["id"]: entry for entry in resp.json()["work_session"]["commands"]}
+    eligible_runner_id = str(runners[0].id)
+    prefer_command = commands[f"session.runner.prefer.{eligible_runner_id}"]
+    assert prefer_command["target"] == {
+        "surface": "runtime",
+        "project_id": str(project.id),
+        "section": "devices",
+        "action": "prefer_runner",
+        "runner_id": eligible_runner_id,
+    }
+    assert prefer_command["mutation"] == {
+        "method": "POST",
+        "path": f"/api/admin/projects/{project.id}/strategic-session",
+        "body": {"workbench": {"preferred_runner_id": eligible_runner_id}},
+    }
+    assert f"session.runner.prefer.{runners[1].id}" not in commands
+    assert f"session.runner.prefer.{runners[2].id}" not in commands
+    assert f"session.runner.prefer.{runners[3].id}" not in commands
+
 
 @pytest.mark.asyncio
 async def test_strategic_state_counts_assigned_compute_jobs_in_runner_capacity(
@@ -2058,7 +2077,22 @@ async def test_strategic_session_continuous_preserves_preferred_runner_marker(
     from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
 
     project = await _make_project(db_session)
-    preferred_runner_id = str(uuid.uuid4())
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="p" * 64,
+        hostname="preferred-offline",
+        status="active",
+        capabilities={
+            "task_types": ["design_doc_update", "strategic_review"],
+            "runner_preset": "strategic_local",
+            "workload": "strategic",
+            "agent_available": True,
+        },
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+    preferred_runner_id = str(runner.id)
 
     resp = await client.post(
         f"/api/admin/projects/{project.id}/strategic-session",
@@ -2076,11 +2110,86 @@ async def test_strategic_session_continuous_preserves_preferred_runner_marker(
     assert data["workbench"]["preferred_runner_id"] == preferred_runner_id
     continuation = data["runtime"]["local_runner"]["continuation"]
     assert continuation["preferred_runner_id"] == preferred_runner_id
-    assert continuation["reason"] == "preferred_runner_missing"
+    assert continuation["reason"] == "never_seen"
 
     await db_session.refresh(project)
     marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
     assert marker["preferred_runner_id"] == preferred_runner_id
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_continuous_drops_unknown_preferred_runner(
+    client: AsyncClient, db_session
+):
+    from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+
+    project = await _make_project(db_session)
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session",
+        json={
+            "workbench": {
+                "interaction_mode": "continuous",
+                "active_surface": "runtime",
+                "preferred_runner_id": str(uuid.uuid4()),
+            }
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert "preferred_runner_id" not in data["workbench"]
+    continuation = data["runtime"]["local_runner"]["continuation"]
+    assert continuation["preferred_runner_id"] is None
+
+    await db_session.refresh(project)
+    marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert "preferred_runner_id" not in marker
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_continuous_drops_non_strategic_preferred_runner(
+    client: AsyncClient, db_session
+):
+    from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+
+    project = await _make_project(db_session)
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="n" * 64,
+        hostname="docs-only",
+        status="active",
+        last_seen_at=_utcnow(),
+        capabilities={
+            "task_types": ["docs"],
+            "max_concurrent": 1,
+            "agent_available": True,
+        },
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session",
+        json={
+            "workbench": {
+                "interaction_mode": "continuous",
+                "active_surface": "runtime",
+                "preferred_runner_id": str(runner.id),
+            }
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert "preferred_runner_id" not in data["workbench"]
+    continuation = data["runtime"]["local_runner"]["continuation"]
+    assert continuation["preferred_runner_id"] is None
+
+    await db_session.refresh(project)
+    marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert "preferred_runner_id" not in marker
 
 
 @pytest.mark.asyncio

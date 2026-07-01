@@ -252,6 +252,93 @@ def _fixed_session_commands(
     return [command for command in candidates if command]
 
 
+def _runner_label(candidate: dict[str, Any], runner_id: str) -> str:
+    hostname = _compact_text(candidate.get("hostname"), max_chars=48)
+    if hostname:
+        return f"Prefer {hostname}"
+    return f"Prefer runner {runner_id[:8]}"
+
+
+def _runner_preference_commands(
+    *,
+    project_id: str,
+    workbench_state: dict[str, Any] | None,
+    local_runner: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    if not isinstance(local_runner, dict):
+        return []
+    state = workbench_state if isinstance(workbench_state, dict) else {}
+    preferred_runner_id = _compact_text(
+        state.get("preferred_runner_id"),
+        max_chars=80,
+    )
+    commands: list[dict[str, Any] | None] = []
+    runners = local_runner.get("runners")
+    if isinstance(runners, list):
+        emitted_runner_commands = 0
+        for candidate in runners:
+            if not isinstance(candidate, dict):
+                continue
+            runner_id = _compact_text(candidate.get("id"), max_chars=80)
+            if not runner_id or not bool(candidate.get("eligible_for_active_task")):
+                continue
+            commands.append(
+                _command(
+                    f"session.runner.prefer.{runner_id}",
+                    _runner_label(candidate, runner_id),
+                    group="runtime",
+                    priority="normal",
+                    enabled=runner_id != preferred_runner_id,
+                    target={
+                        "surface": "runtime",
+                        "project_id": project_id,
+                        "section": "devices",
+                        "action": "prefer_runner",
+                        "runner_id": runner_id,
+                    },
+                    refetch_surfaces=(
+                        _STRATEGIC_SESSION_SURFACE,
+                        _RUNTIME_SURFACE,
+                    ),
+                    mutation=_mutation(
+                        method="POST",
+                        path=_strategic_session_endpoint(project_id),
+                        body={"workbench": {"preferred_runner_id": runner_id}},
+                    ),
+                )
+            )
+            emitted_runner_commands += 1
+            if emitted_runner_commands >= 8:
+                break
+    if preferred_runner_id:
+        commands.append(
+            _command(
+                "session.runner.clear_preferred",
+                "Clear preferred runner",
+                group="runtime",
+                priority="normal",
+                enabled=True,
+                target={
+                    "surface": "runtime",
+                    "project_id": project_id,
+                    "section": "devices",
+                    "action": "clear_preferred_runner",
+                    "runner_id": preferred_runner_id,
+                },
+                refetch_surfaces=(
+                    _STRATEGIC_SESSION_SURFACE,
+                    _RUNTIME_SURFACE,
+                ),
+                mutation=_mutation(
+                    method="POST",
+                    path=_strategic_session_endpoint(project_id),
+                    body={"workbench": {"preferred_runner_id": None}},
+                ),
+            )
+        )
+    return [command for command in commands if command]
+
+
 def _action_command(action: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(action, dict):
         return None
@@ -276,6 +363,7 @@ def build_work_session_commands(
     actions: list[dict[str, Any]] | None,
     workbench_state: dict[str, Any] | None,
     context_package: dict[str, Any] | None,
+    local_runner: dict[str, Any] | None = None,
     limit: int = MAX_WORK_SESSION_COMMANDS,
 ) -> list[dict[str, Any]]:
     """Build bounded work-session command descriptors from read-model inputs."""
@@ -293,6 +381,11 @@ def build_work_session_commands(
             project_id=project_id_text,
             workbench_state=workbench_state,
             context_package=context_package,
+        ),
+        *_runner_preference_commands(
+            project_id=project_id_text,
+            workbench_state=workbench_state,
+            local_runner=local_runner,
         ),
         *[
             command

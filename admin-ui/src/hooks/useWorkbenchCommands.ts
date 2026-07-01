@@ -293,7 +293,12 @@ function strategicModeFromCommandId(commandId: string): StrategicInteractionMode
 }
 
 function isAllowedWorkSessionMutationCommandId(commandId: string): boolean {
-  return Boolean(strategicModeFromCommandId(commandId)) || commandId === 'session.clear_selected_refs';
+  return (
+    Boolean(strategicModeFromCommandId(commandId))
+    || commandId === 'session.clear_selected_refs'
+    || commandId.startsWith('session.runner.prefer.')
+    || commandId === 'session.runner.clear_preferred'
+  );
 }
 
 function isStrategicSessionMutationPath(path: string, projectId: string): boolean {

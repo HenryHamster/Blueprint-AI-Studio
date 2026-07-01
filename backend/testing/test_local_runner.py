@@ -24,6 +24,7 @@ from app.models import (
     ComputeJobOutcome,
     ComputeJobStatus,
     LocalRunner,
+    MessagesNoisePrefs,
     Project,
     ProjectMember,
     Task,
@@ -306,6 +307,69 @@ class TestAdminRunnerEndpoints:
             f"/api/admin/projects/{project.id}/runners/{runner.id}"
         )
         assert resp2.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_delete_clears_preferred_runner_workbench_state(
+        self, client: AsyncClient, db_session
+    ):
+        from app.workbench_state import (
+            STRATEGIC_LOCAL_CONTINUATION_KEY,
+            WORKBENCH_STATE_KEY,
+        )
+
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+        now = _utcnow().isoformat()
+        db_session.add(
+            MessagesNoisePrefs(
+                user_id=TEST_USER_ID,
+                project_id=project.id,
+                prefs={
+                    WORKBENCH_STATE_KEY: {
+                        "version": 1,
+                        "interaction_mode": "continuous",
+                        "active_surface": "runtime",
+                        "selected_refs": [],
+                        "preferred_runner_id": str(runner.id),
+                    }
+                },
+            )
+        )
+        project.vision = {
+            **(project.vision or {}),
+            STRATEGIC_LOCAL_CONTINUATION_KEY: {
+                "version": 1,
+                "active": True,
+                "operator_user_id": TEST_USER_ID,
+                "updated_at": now,
+                "last_seen_at": now,
+                "preferred_runner_id": str(runner.id),
+            },
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.delete(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}"
+        )
+
+        assert resp.status_code == 200
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                    MessagesNoisePrefs.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        assert (
+            "preferred_runner_id"
+            not in prefs_row.prefs[WORKBENCH_STATE_KEY]
+        )
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["active"] is True
+        assert "preferred_runner_id" not in marker
 
     @pytest.mark.asyncio
     async def test_delete_releases_unpulled_runner_pins(

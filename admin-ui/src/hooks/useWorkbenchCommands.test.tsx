@@ -408,6 +408,86 @@ describe('useWorkbenchCommands', () => {
     });
   });
 
+  test('executes backend mutation descriptors for runner preference changes', async () => {
+    const refreshWorkbench = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const preferBody = { workbench: { preferred_runner_id: 'runner-1' } };
+    const clearBody = { workbench: { preferred_runner_id: null } };
+    const commands: StrategicWorkSessionCommand[] = [
+      {
+        id: 'session.runner.prefer.runner-1',
+        label: 'Prefer desk-mini',
+        group: 'runtime',
+        priority: 'normal',
+        enabled: true,
+        target: {
+          surface: 'runtime',
+          section: 'devices',
+          action: 'prefer_runner',
+          runner_id: 'runner-1',
+        },
+        mutation: {
+          method: 'POST',
+          path: '/api/admin/projects/project-1/strategic-session',
+          body: preferBody,
+        },
+      },
+      {
+        id: 'session.runner.clear_preferred',
+        label: 'Clear preferred runner',
+        group: 'runtime',
+        priority: 'normal',
+        enabled: true,
+        target: {
+          surface: 'runtime',
+          section: 'devices',
+          action: 'clear_preferred_runner',
+          runner_id: 'runner-1',
+        },
+        mutation: {
+          method: 'POST',
+          path: '/api/admin/projects/project-1/strategic-session',
+          body: clearBody,
+        },
+      },
+    ];
+
+    mount({
+      strategicState: { work_session: { commands } } as StrategicStateResponse,
+      refreshWorkbench,
+      setCommandPaletteOpen,
+    });
+
+    expect(captured.find(item => item.id === 'session.runner.prefer.runner-1')).toMatchObject({
+      section: 'Runtime',
+      detail: 'Runtime devices',
+      disabled: false,
+    });
+    expect(captured.find(item => item.id === 'session.runner.clear_preferred')).toMatchObject({
+      section: 'Runtime',
+      detail: 'Runtime devices',
+      disabled: false,
+    });
+
+    captured.find(item => item.id === 'session.runner.prefer.runner-1')?.run();
+    captured.find(item => item.id === 'session.runner.clear_preferred')?.run();
+
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+    expect(apiFetchMock).toHaveBeenNthCalledWith(1, '/api/admin/projects/project-1/strategic-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(preferBody),
+    });
+    expect(apiFetchMock).toHaveBeenNthCalledWith(2, '/api/admin/projects/project-1/strategic-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(clearBody),
+    });
+    await vi.waitFor(() => {
+      expect(refreshWorkbench).toHaveBeenCalledTimes(2);
+    });
+  });
+
   test.each([
     ['subpath', { method: 'PATCH', path: '/api/admin/projects/project-1/strategic-session/messages' }],
     ['wrong project', { method: 'PATCH', path: '/api/admin/projects/other-project/strategic-session' }],
@@ -443,6 +523,47 @@ describe('useWorkbenchCommands', () => {
     expect(apiFetchMock).not.toHaveBeenCalled();
     expect(refreshWorkbench).not.toHaveBeenCalled();
     expect(switchStrategicInteractionMode).toHaveBeenCalledWith('monitor');
+  });
+
+  test('does not execute unsafe runner preference mutation descriptors', () => {
+    const refreshWorkbench = vi.fn();
+    const openStrategicContextTarget = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const target = {
+      surface: 'runtime',
+      section: 'devices',
+      action: 'prefer_runner',
+      runner_id: 'runner-1',
+    } as const;
+    const commands: StrategicWorkSessionCommand[] = [
+      {
+        id: 'session.runner.prefer.runner-1',
+        label: 'Prefer desk-mini',
+        group: 'runtime',
+        priority: 'normal',
+        enabled: true,
+        target,
+        mutation: {
+          method: 'POST',
+          path: '/api/admin/projects/other-project/strategic-session',
+          body: { workbench: { preferred_runner_id: 'runner-1' } },
+        },
+      },
+    ];
+
+    mount({
+      strategicState: { work_session: { commands } } as StrategicStateResponse,
+      refreshWorkbench,
+      openStrategicContextTarget,
+      setCommandPaletteOpen,
+    });
+
+    captured.find(item => item.id === 'session.runner.prefer.runner-1')?.run();
+
+    expect(apiFetchMock).not.toHaveBeenCalled();
+    expect(refreshWorkbench).not.toHaveBeenCalled();
+    expect(openStrategicContextTarget).toHaveBeenCalledWith(target);
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
   test('routes message descriptors through context navigation when message opener is unavailable', () => {
