@@ -72,8 +72,8 @@ describe('WorkbenchLayout viewport regression', () => {
     const rail = host?.querySelector('aside');
     const panel = rail?.querySelector('section');
     const panelBody = panel?.lastElementChild;
-    expect(rail ? getComputedStyle(rail).paddingTop : '').toBe('10px');
-    expect(panelBody instanceof HTMLElement ? getComputedStyle(panelBody).paddingTop : '').toBe('10px');
+    expect(rail ? getComputedStyle(rail).paddingTop : '').toBe('8px');
+    expect(panelBody instanceof HTMLElement ? getComputedStyle(panelBody).paddingTop : '').toBe('8px');
   });
 
   test('action-only surface hides the duplicate title while preserving actions', async () => {

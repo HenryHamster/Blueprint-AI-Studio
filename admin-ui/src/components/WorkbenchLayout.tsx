@@ -9,7 +9,7 @@ export interface WorkbenchTab<T extends string> {
 
 export function WorkbenchFrame({ children }: { children: ReactNode }) {
   return (
-    <main className="min-h-0 min-w-0 flex-1 overflow-hidden border-b border-neutral-800 bg-[#05080c]">
+    <main className="min-h-0 min-w-0 flex-1 overflow-hidden border-b border-neutral-800 bg-[#04070b]">
       {children}
     </main>
   );
@@ -75,15 +75,15 @@ export function WorkbenchSurface<T extends string>({
   const bodyClassName = contentClassName ?? (
     flush
       ? 'flex min-h-0 min-w-0 flex-col overflow-hidden'
-      : 'min-h-0 min-w-0 overflow-auto p-3 custom-scrollbar'
+      : 'min-h-0 min-w-0 overflow-auto p-2.5 custom-scrollbar'
   );
 
   const headerClassName = showTitle
-    ? 'min-w-0 border-b border-neutral-800/90 bg-[#030508] px-2 py-1.5 md:px-2.5'
-    : 'min-w-0 border-b border-neutral-800/90 bg-[#030508] px-2 py-1 md:px-2.5';
+    ? 'min-w-0 border-b border-neutral-800/90 bg-[#020407] px-2 py-1.5 md:px-2.5'
+    : 'min-w-0 border-b border-neutral-800/90 bg-[#020407] px-2 py-1 md:px-2.5';
 
   return (
-    <section className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] bg-[#05080c]">
+    <section className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] bg-[#04070b]">
       <header className={headerClassName}>
         <div className="flex min-w-0 items-center gap-2">
           {showTitle && (
@@ -114,10 +114,10 @@ export function WorkbenchSplit({
   railClassName?: string;
 }) {
   return (
-    <div className="grid h-full min-h-0 min-w-0 grid-cols-1 overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(300px,26vw)]">
+    <div className="grid h-full min-h-0 min-w-0 grid-cols-1 overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(320px,28vw)]">
       <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">{main}</div>
       {rail && (
-        <aside className={`hidden min-h-0 min-w-0 overflow-auto border-l border-neutral-800 bg-[#10151c] p-2.5 custom-scrollbar lg:block ${railClassName}`}>
+        <aside className={`hidden min-h-0 min-w-0 overflow-auto border-l border-neutral-800 bg-[#0b1017] p-2 custom-scrollbar lg:block ${railClassName}`}>
           {rail}
         </aside>
       )}
@@ -137,12 +137,12 @@ export function WorkbenchPanel({
   className?: string;
 }) {
   return (
-    <section className={`min-w-0 rounded-md border border-neutral-800 bg-[#10151c] ${className}`}>
-      <div className="flex min-w-0 items-center justify-between gap-3 border-b border-neutral-800 px-3 py-2.5">
+    <section className={`min-w-0 rounded-md border border-neutral-800 bg-[#10161e] ${className}`}>
+      <div className="flex min-w-0 items-center justify-between gap-3 border-b border-neutral-800 px-2.5 py-2">
         <h2 className="truncate text-sm font-semibold text-neutral-100">{title}</h2>
         {meta && <div className="shrink-0 text-xs text-neutral-500">{meta}</div>}
       </div>
-      <div className="min-w-0 p-2.5">{children}</div>
+      <div className="min-w-0 p-2">{children}</div>
     </section>
   );
 }

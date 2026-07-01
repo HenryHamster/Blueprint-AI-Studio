@@ -145,9 +145,9 @@ describe('MessagesComposer — steering hint viewport regression', () => {
     if (!host) throw new Error('Expected composer viewport test host to be mounted');
     const commandButton = host.querySelector<HTMLButtonElement>('button[title="Open command palette (Ctrl+K)"]');
     expect(commandButton).not.toBeNull();
-    expect(commandButton?.className).toContain('border-r');
+    expect(commandButton?.className).toContain('border-neutral-800');
     expect(commandButton?.className).not.toContain('bg-[#080c11]');
-    expect(host.querySelector('[data-testid="strategic-composer-box"]')?.className).toContain('gap-0');
+    expect(host.querySelector('[data-testid="strategic-composer-box"]')?.className).toContain('gap-1');
     await act(async () => { commandButton?.click(); });
     expect(onOpenCommandPalette).toHaveBeenCalledOnce();
     await expectNoTextTruncationAt(375, async () => {});

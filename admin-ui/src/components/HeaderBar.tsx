@@ -384,6 +384,9 @@ export function HeaderBar(props: HeaderBarProps) {
     if (cycleAge !== null && cycleAge >= 60) return 'bg-amber-400';
     return 'bg-emerald-500';
   }, [apiHealthy, props.health]);
+  const tabLabel = (tab: PrimaryTab) => (
+    tab === 'chat' ? 'Chat' : tab.charAt(0).toUpperCase() + tab.slice(1)
+  );
 
   return (
     <div className="shrink-0">
@@ -404,7 +407,7 @@ export function HeaderBar(props: HeaderBarProps) {
       )}
 
       {/* Unified top bar: compact global shell with fixed utility clusters and a scrolling tab strip. */}
-      <header className="flex min-h-10 flex-wrap items-center gap-1 border-b border-neutral-800/90 bg-[#030508] px-1.5 py-0.5 md:min-h-9 md:flex-nowrap md:px-2">
+      <header className="flex min-h-10 flex-wrap items-center gap-1 border-b border-neutral-800/90 bg-[#020407] px-1.5 py-0.5 md:min-h-8 md:flex-nowrap md:px-2">
         {/* LEFT: ProjectSwitcher + Manage projects slot */}
         <div className="flex min-w-0 shrink-0 items-center gap-1">
           <div className="hidden items-center lg:flex" aria-label="Blueprint">
@@ -446,12 +449,12 @@ export function HeaderBar(props: HeaderBarProps) {
               : 0;
             const pipelineBadgeCount = tab === 'pipeline' ? props.needsAttentionCount ?? 0 : 0;
             const badgeCount = Math.max(chatBadgeCount, pipelineBadgeCount);
-            const label = tab === 'chat' ? 'Strategic' : tab.charAt(0).toUpperCase() + tab.slice(1);
+            const label = tabLabel(tab);
             return (
               <button
                 key={tab}
                 onClick={() => props.onTabChange(tab)}
-                className={`inline-flex min-h-[44px] shrink-0 items-center rounded px-2.5 py-1 text-sm font-semibold leading-none transition-colors whitespace-nowrap md:min-h-7 md:px-2 md:text-xs ${
+                className={`inline-flex min-h-[44px] shrink-0 items-center rounded px-2.5 py-1 text-sm font-semibold leading-none transition-colors whitespace-nowrap md:min-h-6 md:px-2 md:text-xs ${
                   isActive
                     ? 'bg-neutral-800/90 text-neutral-100 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]'
                     : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100'
@@ -556,7 +559,7 @@ export function HeaderBar(props: HeaderBarProps) {
           {/* SettingsDropdown — always in DOM so its fixed overlay renders when triggered from mobile menu.
               The trigger button is hidden on mobile via triggerClassName; the fixed panel bypasses parent display:none. */}
           <SettingsDropdown
-            triggerClassName="hidden md:inline-flex h-8 w-8 items-center justify-center rounded border border-neutral-800/80 bg-[#070a0f] hover:bg-neutral-900"
+            triggerClassName="hidden md:inline-flex h-7 w-7 items-center justify-center rounded border border-neutral-800/80 bg-[#070a0f] hover:bg-neutral-900"
           showSettings={showSettings}
           onToggleSettings={onToggleSettings}
           settingsRef={settingsRef}
@@ -776,7 +779,7 @@ export function HeaderBar(props: HeaderBarProps) {
                     }`}
                   >
                     <Compass className="w-4 h-4 shrink-0" />
-                    <span>{tab === 'chat' ? 'Strategic' : tab.charAt(0).toUpperCase() + tab.slice(1)}</span>
+                    <span>{tabLabel(tab)}</span>
                     {tab === 'chat' && (openMessageCount > 0 || (newSinceLastVisitCount ?? 0) > 0) && (
                       <span className="ml-auto rounded-full bg-cyan-400 px-1.5 py-0.5 text-ui-xs font-bold leading-none text-neutral-950">
                         {Math.max(openMessageCount, newSinceLastVisitCount ?? 0)}
@@ -799,7 +802,7 @@ export function HeaderBar(props: HeaderBarProps) {
                         ['Ctrl+K', 'Command palette'],
                         ['N', 'New task'],
                         ['R', 'Refresh'],
-                        ['1', 'Strategic chat'],
+                        ['1', 'Chat'],
                         ['2', 'Pipeline'],
                         ['3', 'Project update'],
                         ['4', 'Runtime'],

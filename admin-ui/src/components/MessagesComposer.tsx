@@ -71,7 +71,7 @@ export function MessagesComposer({
 
   return (
     <div className={minimal
-      ? 'shrink-0 border-t border-neutral-800 bg-[#05080c] px-2 py-1.5 md:px-2.5'
+      ? 'shrink-0 border-t border-neutral-800 bg-[#04070b] px-2 py-2 md:px-2.5'
       : 'px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50'
     }>
       {minimal && strategicContext && (
@@ -92,7 +92,7 @@ export function MessagesComposer({
       <div
         data-testid={minimal ? 'strategic-composer-box' : undefined}
         className={minimal
-        ? `${minimalColumnClass} flex items-end gap-0 rounded-md border border-neutral-800/90 bg-[#080c11] p-0.5 shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]`
+        ? `${minimalColumnClass} flex items-end gap-1 rounded-md border border-neutral-700/80 bg-[#0a0f15] p-1 shadow-[0_12px_40px_rgba(0,0,0,0.24),inset_0_1px_0_rgba(255,255,255,0.04)]`
         : 'flex gap-2 items-end'
       }>
         {!minimal && (
@@ -104,10 +104,10 @@ export function MessagesComposer({
             onClick={onOpenCommandPalette}
             title="Open command palette (Ctrl+K)"
             aria-label="Open command palette (Ctrl+K)"
-            className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-sm border-r border-neutral-800/80 px-2.5 text-xs font-semibold text-neutral-500 transition-colors hover:bg-neutral-900/70 hover:text-neutral-100 md:min-h-9 md:min-w-11"
+            className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded border border-neutral-800/80 bg-neutral-950/40 px-2.5 text-xs font-semibold text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-100 md:min-h-8 md:min-w-10"
           >
             <Command className="h-3.5 w-3.5" />
-            <span className="hidden font-mono text-ui-sm text-neutral-500 sm:inline">Ctrl K</span>
+            <span className="hidden font-mono text-ui-sm text-neutral-500 sm:inline">Ctrl+K</span>
           </button>
         )}
         <div className="relative flex-1">
@@ -121,7 +121,7 @@ export function MessagesComposer({
             placeholder={minimal ? 'Message Strategic' : 'Type a message...'}
             rows={1}
             className={minimal
-              ? 'min-h-[44px] w-full resize-none rounded-sm border-0 bg-transparent px-2.5 py-2 text-sm leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-600 md:min-h-8 md:py-1'
+              ? 'min-h-[44px] w-full resize-none rounded border-0 bg-transparent px-3 py-2 text-sm leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-600 md:min-h-8 md:py-1.5'
               : 'w-full bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600 resize-none min-h-[44px] leading-relaxed'
             }
           />
@@ -133,7 +133,7 @@ export function MessagesComposer({
           aria-label="Send message"
           title="Send message"
           className={minimal
-            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-sm bg-neutral-200 text-neutral-950 transition-colors hover:bg-white disabled:bg-neutral-700 disabled:text-neutral-500 disabled:opacity-100 md:min-h-9 md:min-w-9'
+            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded bg-emerald-500 text-neutral-950 transition-colors hover:bg-emerald-400 disabled:bg-neutral-800 disabled:text-neutral-500 disabled:opacity-100 md:min-h-8 md:min-w-8'
             : 'bg-blue-600 hover:bg-blue-500 text-white p-2.5 rounded-xl text-xs font-medium transition-colors disabled:opacity-40 shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center'
           }
         >

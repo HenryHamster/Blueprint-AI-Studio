@@ -328,6 +328,22 @@ describe('HeaderBar — viewport regression', () => {
     expect(host.querySelector('[aria-label="Blueprint"]')).not.toBeNull();
   });
 
+  test('primary mode label is Chat, not a duplicate Strategic entry point', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} activeTab="chat" />); });
+
+    const chatTab = Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.trim() === 'Chat');
+    expect(chatTab).toBeTruthy();
+    const oldStrategicTab = Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.trim() === 'Strategic');
+    expect(oldStrategicTab).toBeUndefined();
+  });
+
   test('mobile menu does not duplicate the Strategic composer command launcher', async () => {
     const onOpenCommandPalette = vi.fn();
     host = document.createElement('div');
