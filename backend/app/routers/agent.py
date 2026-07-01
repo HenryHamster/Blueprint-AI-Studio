@@ -893,7 +893,7 @@ async def claim_task(
     # Strip internal runtime-routing fields before returning task context to the agent.
     safe_context = {
         k: v
-        for k, v in (task.context or {}).items()
+        for k, v in _claimed_context.items()
         if not k.startswith("max_plan_") and not k.startswith("llm_")
     }
     # Resolve per-project branch metadata once so we can inject it into both
@@ -910,10 +910,20 @@ async def claim_task(
         get_project_integration_branch(project) if project else None
     )
 
+    _claim_runtime_model = _claimed_context.get("llm_model")
+    _claim_runtime_execution_mode = _claimed_context.get("llm_execution_mode")
+
     response_payloads: list = []
     for entry in task.payloads or []:
         if isinstance(entry, dict):
             patched = dict(entry)
+            if isinstance(_claim_runtime_model, str) and _claim_runtime_model.strip():
+                patched["model"] = _claim_runtime_model.strip()
+            if (
+                isinstance(_claim_runtime_execution_mode, str)
+                and _claim_runtime_execution_mode.strip()
+            ):
+                patched["execution_mode"] = _claim_runtime_execution_mode.strip()
             if project_promotion_target and not patched.get("promotion_target"):
                 patched["promotion_target"] = project_promotion_target
             if project_integration_branch and not patched.get("integration_branch"):
