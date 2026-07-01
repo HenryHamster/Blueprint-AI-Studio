@@ -23,6 +23,11 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from app.broadcast import broadcast_to_project
+from app.workbench_events import (
+    SURFACE_DIRECTIONS,
+    SURFACE_STRATEGIC_SESSION,
+    workbench_event_envelope,
+)
 
 # Event-name contract shared with the admin UI.
 STRATEGIC_CYCLE_STARTED = "strategic_cycle_started"
@@ -39,8 +44,7 @@ _STEERING_EXCERPT_MAX_CHARS = 240
 _STATUS_MAX_CHARS = 160
 _ID_LIST_MAX = 25
 _NOTIFY_PAYLOAD_SOFT_LIMIT = 6_000
-_EVENT_SCHEMA_VERSION = 1
-_STRATEGIC_REFETCH_SURFACES = ("strategic_session", "directions")
+_STRATEGIC_REFETCH_SURFACES = (SURFACE_STRATEGIC_SESSION, SURFACE_DIRECTIONS)
 
 _PHASE_LABELS = {
     1: "Architecture review",
@@ -95,13 +99,12 @@ def _event_envelope(
     action: str,
     refetch_surfaces: Sequence[str] = _STRATEGIC_REFETCH_SURFACES,
 ) -> dict[str, Any]:
-    return {
-        "schema_version": _EVENT_SCHEMA_VERSION,
-        "project_id": str(project_id),
-        "resource": resource,
-        "action": action,
-        "refetch": {"surfaces": list(refetch_surfaces)},
-    }
+    return workbench_event_envelope(
+        project_id,
+        resource=resource,
+        action=action,
+        refetch_surfaces=refetch_surfaces,
+    )
 
 
 def _phase_payload(

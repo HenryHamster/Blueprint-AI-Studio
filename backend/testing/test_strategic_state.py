@@ -2629,9 +2629,9 @@ async def test_strategic_session_check_in_records_quiet_durable_receipt(
     }
 
     with patch(
-        "app.routers.admin_projects.broadcast_to_project",
+        "app.routers.admin_projects.emit_workbench_refetch",
         new_callable=AsyncMock,
-    ) as broadcast:
+    ) as emit_refetch:
         first = await client.post(
             f"/api/admin/projects/{project.id}/strategic-session/check-in",
             json=body,
@@ -2646,11 +2646,15 @@ async def test_strategic_session_check_in_records_quiet_durable_receipt(
     assert first.json()["check_in"]["status"] == "created"
     assert second.json()["check_in"]["status"] == "duplicate"
     assert second.json()["check_in"]["message_id"] == first.json()["check_in"]["message_id"]
-    broadcast.assert_awaited_once_with(
-        str(project.id),
-        "workbench_refetch",
-        {"refetch": {"surfaces": ["strategic_session"]}},
+    emit_refetch.assert_awaited_once()
+    assert emit_refetch.await_args.args[0] == project.id
+    assert emit_refetch.await_args.kwargs["resource"] == "strategic_check_in"
+    assert emit_refetch.await_args.kwargs["action"] == "created"
+    assert emit_refetch.await_args.kwargs["refetch_surfaces"] == (
+        "strategic_session",
     )
+    assert emit_refetch.await_args.kwargs["message_id"] == first.json()["check_in"]["message_id"]
+    assert emit_refetch.await_args.kwargs["summary"]["message_id"] == first.json()["check_in"]["message_id"]
 
     message_id = uuid.UUID(first.json()["check_in"]["message_id"])
     msg = await db_session.get(ProjectMessage, message_id)
@@ -2888,6 +2892,73 @@ async def test_strategic_state_counts_changes_since_last_check_in(
     assert session_since["tasks"] == since_state["tasks"]
     assert session_since["alerts"] == since_state["alerts"]
     assert session_since["strategic"] == since_state["strategic"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_and_session_expose_work_session_event_feed(
+    client: AsyncClient,
+    db_session,
+):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    message = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="strategic",
+        content="Confirm the local runner policy.",
+        status="open",
+        created_at=now - timedelta(minutes=3),
+    )
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "review"}],
+        status=TaskStatus.IN_PROGRESS,
+        title="Review runner readiness",
+        latest_status_message="Checking the runner contract.",
+        created_at=now - timedelta(minutes=8),
+        updated_at=now - timedelta(minutes=2),
+    )
+    alert = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.WARNING,
+        title="Runner stale",
+        message="The local runner has not checked in.",
+        domain="runner",
+        created_at=now - timedelta(minutes=1),
+    )
+    db_session.add(message)
+    db_session.add(task)
+    db_session.add(alert)
+    await db_session.commit()
+
+    state_resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    session_resp = await client.get(f"/api/admin/projects/{project.id}/strategic-session")
+
+    assert state_resp.status_code == 200, state_resp.text
+    assert session_resp.status_code == 200, session_resp.text
+    state_events = state_resp.json()["work_session"]["events"]
+    session_events = session_resp.json()["session"]["events"]
+    assert session_events == state_events
+    assert state_events["version"] == 1
+    assert state_events["limit"] == 24
+    assert state_events["has_more"] is False
+    by_resource = {item["resource"]: item for item in state_events["items"]}
+    assert set(by_resource) >= {"alert", "task", "project_message"}
+    assert by_resource["alert"]["action"] == "raised"
+    assert by_resource["alert"]["refetch"]["surfaces"] == [
+        "runtime",
+        "strategic_session",
+    ]
+    assert by_resource["task"]["action"] == "in_progress"
+    assert by_resource["task"]["target"] == {
+        "surface": "task",
+        "task_id": str(task.id),
+    }
+    assert by_resource["project_message"]["target"] == {
+        "surface": "messages",
+        "message_id": str(message.id),
+        "action": "reply",
+    }
 
 
 @pytest.mark.asyncio

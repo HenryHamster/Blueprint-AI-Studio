@@ -1,5 +1,6 @@
 import { apiFetch, type StrategicRefreshMarker } from './api';
 import type { ProjectMessagePreview } from './types/messages';
+import type { WorkbenchEventEnvelopeV1 } from './types/workbenchEvents';
 
 export interface StrategicStateCycle {
   id: string;
@@ -432,6 +433,28 @@ export interface StrategicWorkSessionSinceLastCheckIn {
   };
 }
 
+export interface StrategicWorkSessionEvent extends WorkbenchEventEnvelopeV1 {
+  id: string;
+  occurred_at?: string | null;
+  source: string;
+  title: string;
+  summary?: string | null;
+  tone?: 'neutral' | 'watch' | 'warning' | 'critical' | 'active' | string;
+  ref?: {
+    kind: string;
+    id: string;
+  } | null;
+  target?: StrategicContextPackageDrilldown['target'] | null;
+  data?: Record<string, unknown>;
+}
+
+export interface StrategicWorkSessionEventFeed {
+  version: 1;
+  limit: number;
+  has_more: boolean;
+  items: StrategicWorkSessionEvent[];
+}
+
 export interface StrategicWorkSession {
   version: 1;
   id: string;
@@ -446,6 +469,7 @@ export interface StrategicWorkSession {
   curated_metrics: StrategicWorkSessionMetric[];
   context_sources?: StrategicContextPackageSource[];
   actions?: StrategicWorkSessionAction[];
+  events?: StrategicWorkSessionEventFeed;
   last_check_in?: StrategicWorkSessionLastCheckIn | null;
   since_last_check_in?: StrategicWorkSessionSinceLastCheckIn | null;
 }

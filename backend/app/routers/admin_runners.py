@@ -21,6 +21,11 @@ from app.auth import create_runner_token, hash_runner_token, get_current_user
 from app.database import get_session
 from app.models import LocalRunner, Task, TaskStatus, _utcnow
 from app.task_capabilities import STRATEGIC_TASK_TYPES, TaskType
+from app.workbench_events import (
+    SURFACE_RUNTIME,
+    SURFACE_STRATEGIC_SESSION,
+    emit_workbench_refetch,
+)
 
 logger = logging.getLogger("blueprint")
 
@@ -257,6 +262,19 @@ async def register_runner(
         project_id,
         payload.hostname,
     )
+    await emit_workbench_refetch(
+        project_id,
+        resource="local_runner",
+        action="registered",
+        refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+        summary_key="runner",
+        summary={
+            "id": str(runner.id),
+            "status": runner.status,
+            "hostname": runner.hostname,
+            "preset": (runner.capabilities or {}).get("runner_preset"),
+        },
+    )
     # The token is surfaced ONCE here and never again.
     return {"runner_id": str(runner.id), "token": token}
 
@@ -337,6 +355,18 @@ async def delete_runner(
         runner_id,
         project_id,
         released_pins,
+    )
+    await emit_workbench_refetch(
+        project_id,
+        resource="local_runner",
+        action="deleted",
+        refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+        summary_key="runner",
+        summary={
+            "id": str(runner_id),
+            "status": "deleted",
+            "released_unpulled_pins": released_pins,
+        },
     )
     return {
         "runner_id": str(runner_id),

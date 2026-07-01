@@ -14,6 +14,11 @@ from app.workbench_state import (
     sanitize_strategic_session_snapshot,
     strategic_session_snapshot_has_signal,
 )
+from app.workbench_events import (
+    SURFACE_MESSAGES,
+    SURFACE_STRATEGIC_SESSION,
+    workbench_event_envelope,
+)
 
 
 DEFAULT_MESSAGE_CONTEXT_PREVIEW_KEYS = (
@@ -24,8 +29,7 @@ DEFAULT_MESSAGE_CONTEXT_PREVIEW_KEYS = (
     "dedupe_key",
 )
 
-MESSAGE_EVENT_SCHEMA_VERSION = 1
-MESSAGE_EVENT_REFETCH_SURFACES = ("messages", "strategic_session")
+MESSAGE_EVENT_REFETCH_SURFACES = (SURFACE_MESSAGES, SURFACE_STRATEGIC_SESSION)
 _MESSAGE_EVENT_EXCERPT_MAX_CHARS = 160
 
 
@@ -97,12 +101,13 @@ def message_event_payload(
         "message_id": str(message.id),
         "type": message_type,
         "from": str(message.from_type),
-        "schema_version": MESSAGE_EVENT_SCHEMA_VERSION,
-        "project_id": str(message.project_id),
-        "resource": "project_message",
-        "action": action,
         "message": message_summary,
-        "refetch": {"surfaces": list(MESSAGE_EVENT_REFETCH_SURFACES)},
+        **workbench_event_envelope(
+            message.project_id,
+            resource="project_message",
+            action=action,
+            refetch_surfaces=MESSAGE_EVENT_REFETCH_SURFACES,
+        ),
     }
     if status is not None:
         payload["status"] = status

@@ -632,7 +632,7 @@ describe('useLogViewer strategist events', () => {
   });
 
   it('routes envelope refetch surfaces to messages and Strategic session refreshes', async () => {
-    const { result } = setup();
+    const { result } = setup({ selectedProjectId: 'proj1' });
     const ws = await connect(result);
     const refreshStrategicReadModel = result.current.refreshStrategicReadModelRef.current as ReturnType<typeof vi.fn>;
     const refreshMessages = result.current.refreshMessagesRef.current as ReturnType<typeof vi.fn>;
@@ -643,6 +643,10 @@ describe('useLogViewer strategist events', () => {
       ws.emit({
         event: 'workbench_refetch',
         data: {
+          schema_version: 1,
+          project_id: 'proj1',
+          resource: 'project_message',
+          action: 'created',
           refetch: {
             surfaces: ['messages', 'strategic_session'],
           },
@@ -655,6 +659,88 @@ describe('useLogViewer strategist events', () => {
     act(() => { vi.advanceTimersByTime(500); });
     expect(refreshStrategicReadModel).toHaveBeenCalledTimes(1);
     expect(refreshMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it('ignores v1 envelope refetch surfaces for another project', async () => {
+    const { result } = setup({ selectedProjectId: 'proj1' });
+    const ws = await connect(result);
+    const refreshStrategicReadModel = result.current.refreshStrategicReadModelRef.current as ReturnType<typeof vi.fn>;
+    const refreshMessages = result.current.refreshMessagesRef.current as ReturnType<typeof vi.fn>;
+    refreshStrategicReadModel.mockClear();
+    refreshMessages.mockClear();
+
+    act(() => {
+      ws.emit({
+        event: 'workbench_refetch',
+        data: {
+          schema_version: 1,
+          project_id: 'proj2',
+          resource: 'project_message',
+          action: 'created',
+          refetch: {
+            surfaces: ['messages', 'strategic_session'],
+          },
+        },
+      });
+    });
+
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(refreshStrategicReadModel).not.toHaveBeenCalled();
+    expect(refreshMessages).not.toHaveBeenCalled();
+  });
+
+  it('ignores envelope-bearing legacy project events for another project', async () => {
+    const { result } = setup({ selectedProjectId: 'proj1' });
+    const ws = await connect(result);
+    const fetchDirections = result.current.fetchDirectionsRef.current as ReturnType<typeof vi.fn>;
+    const refreshStrategicReadModel = result.current.refreshStrategicReadModelRef.current as ReturnType<typeof vi.fn>;
+    const refreshMessages = result.current.refreshMessagesRef.current as ReturnType<typeof vi.fn>;
+    fetchDirections.mockClear();
+    refreshStrategicReadModel.mockClear();
+    refreshMessages.mockClear();
+
+    act(() => {
+      ws.emit({
+        event: 'message_created',
+        data: {
+          schema_version: 1,
+          project_id: 'proj2',
+          resource: 'project_message',
+          action: 'created',
+          refetch: {
+            surfaces: ['messages', 'strategic_session'],
+          },
+        },
+      });
+      ws.emit({
+        event: 'strategic_updated',
+        data: {
+          schema_version: 1,
+          project_id: 'proj2',
+          resource: 'strategic',
+          action: 'updated',
+          refetch: {
+            surfaces: ['directions', 'strategic_session'],
+          },
+        },
+      });
+      ws.emit({
+        event: 'strategic_cycle_started',
+        data: {
+          schema_version: 1,
+          project_id: 'proj2',
+          resource: 'strategic_cycle',
+          action: 'started',
+          task_id: 'task-foreign',
+        },
+      });
+    });
+
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(refreshStrategicReadModel).not.toHaveBeenCalled();
+    expect(refreshMessages).not.toHaveBeenCalled();
+    expect(fetchDirections).not.toHaveBeenCalled();
+    expect(result.current.lv.strategistActive).toBe(false);
   });
 
   it('keeps legacy message events refreshing the message list', async () => {

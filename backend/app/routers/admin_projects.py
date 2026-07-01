@@ -81,6 +81,11 @@ from app.workbench_state import (
     sanitize_strategic_session_snapshot,
     workbench_state_size_bytes,
 )
+from app.workbench_events import (
+    SURFACE_STRATEGIC_SESSION,
+    build_workbench_event_feed,
+    emit_workbench_refetch,
+)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -2061,6 +2066,10 @@ async def get_project_strategic_state(
             current_user["user_id"],
         ),
     }
+    work_session = {
+        **work_session,
+        "events": await build_workbench_event_feed(session, project.id),
+    }
 
     # SHA-aware freshness: resolve candidate vs integration HEAD, best-effort.
     # A GitHub API failure must not break the endpoint — verdict degrades to unknown.
@@ -2374,10 +2383,17 @@ async def create_project_strategic_session_check_in(
         "message_id": str(message.id),
     }
     if status == "created":
-        await broadcast_to_project(
-            str(project_id),
-            "workbench_refetch",
-            {"refetch": {"surfaces": ["strategic_session"]}},
+        await emit_workbench_refetch(
+            project_id,
+            resource="strategic_check_in",
+            action="created",
+            refetch_surfaces=(SURFACE_STRATEGIC_SESSION,),
+            summary_key="check_in",
+            summary={
+                "message_id": str(message.id),
+                "status": status,
+            },
+            message_id=str(message.id),
         )
     return session_read_model
 

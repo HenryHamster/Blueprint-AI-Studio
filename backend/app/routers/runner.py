@@ -38,6 +38,10 @@ from app.runner_rate_limiter import check_runner_rate_limit
 from app.database import get_session
 from app.models import ComputeJob, ComputeJobStatus, LocalRunner, Project, Task, TaskStatus, _utcnow
 from app.task_capabilities import agent_capability_slice
+from app.workbench_events import (
+    SURFACE_RUNTIME,
+    emit_workbench_refetch,
+)
 
 _MAX_RUNNER_COMMAND_LOG_BYTES = 65536
 _MAX_RUNNER_RESULT_METRICS_KEYS = 256
@@ -81,6 +85,11 @@ def _filter_result_metrics(raw: dict) -> dict:
             out[key] = numeric
         # strings, None, nested dicts/lists → dropped
     return out
+
+
+def _runner_capability_list(capabilities: Dict[str, Any], key: str) -> List[Any]:
+    value = capabilities.get(key)
+    return value if isinstance(value, list) else []
 
 
 class HeartbeatRequest(BaseModel):
@@ -181,6 +190,11 @@ async def heartbeat(
     if not allowed:
         raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
 
+    previous_status = runner.status
+    previous_hostname = runner.hostname
+    previous_version = runner.version
+    previous_caps = dict(runner.capabilities or {})
+
     runner.last_seen_at = _utcnow()
     # Re-arm an inactive runner on every authenticated heartbeat. The stale-runner
     # sweep flips active->inactive after a single missed 300s window (slept/network-
@@ -210,6 +224,34 @@ async def heartbeat(
     runner.capabilities = caps
     session.add(runner)
     await session.commit()
+    runtime_state_changed = (
+        previous_status != runner.status
+        or previous_hostname != runner.hostname
+        or previous_version != runner.version
+        or _runner_capability_list(previous_caps, "active_task_ids")
+        != _runner_capability_list(caps, "active_task_ids")
+        or _runner_capability_list(previous_caps, "active_compute_job_ids")
+        != _runner_capability_list(caps, "active_compute_job_ids")
+        or previous_caps.get("agent_available") != caps.get("agent_available")
+        or previous_caps.get("has_gpu") != caps.get("has_gpu")
+        or previous_caps.get("gpu_count") != caps.get("gpu_count")
+        or previous_caps.get("gpu_names") != caps.get("gpu_names")
+    )
+    if runtime_state_changed:
+        await emit_workbench_refetch(
+            runner.project_id,
+            resource="local_runner",
+            action="heartbeat",
+            refetch_surfaces=(SURFACE_RUNTIME,),
+            summary_key="runner",
+            summary={
+                "id": str(runner.id),
+                "status": runner.status,
+                "active_task_count": len(caps.get("active_task_ids") or []),
+                "active_compute_job_count": len(caps.get("active_compute_job_ids") or []),
+                "agent_available": caps.get("agent_available"),
+            },
+        )
     return {"ok": True, "last_seen_at": runner.last_seen_at.isoformat()}
 
 

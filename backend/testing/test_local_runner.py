@@ -9,6 +9,7 @@ Covers the four new surfaces:
 
 import uuid
 from datetime import timedelta
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -174,6 +175,30 @@ class TestAdminRunnerEndpoints:
         assert row.capabilities["max_concurrent"] == 1
 
     @pytest.mark.asyncio
+    async def test_register_emits_workbench_runner_refresh(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+
+        with patch(
+            "app.routers.admin_runners.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/runners/register",
+                json={"hostname": "local-strategic", "preset": "strategic_local"},
+            )
+
+        assert resp.status_code == 200
+        emit.assert_awaited_once()
+        assert emit.await_args.kwargs["resource"] == "local_runner"
+        assert emit.await_args.kwargs["action"] == "registered"
+        assert "strategic_session" in emit.await_args.kwargs["refetch_surfaces"]
+        assert "runtime" in emit.await_args.kwargs["refetch_surfaces"]
+        assert emit.await_args.kwargs["summary"]["id"] == resp.json()["runner_id"]
+        assert emit.await_args.kwargs["summary"]["preset"] == "strategic_local"
+
+    @pytest.mark.asyncio
     async def test_register_rejects_malformed_capabilities(
         self, client: AsyncClient, db_session
     ):
@@ -321,6 +346,34 @@ class TestAdminRunnerEndpoints:
         assert "runner_target_id" not in (unpulled.context or {})
         assert pulled.status == TaskStatus.PROVISIONING
         assert pulled.vm_instance_id == f"runner:{runner.id}"
+
+    @pytest.mark.asyncio
+    async def test_delete_emits_workbench_runner_refresh(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+
+        with patch(
+            "app.routers.admin_runners.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            resp = await client.delete(
+                f"/api/admin/projects/{project.id}/runners/{runner.id}"
+            )
+
+        assert resp.status_code == 200
+        emit.assert_awaited_once()
+        assert emit.await_args.args[0] == project.id
+        assert emit.await_args.kwargs["resource"] == "local_runner"
+        assert emit.await_args.kwargs["action"] == "deleted"
+        assert "strategic_session" in emit.await_args.kwargs["refetch_surfaces"]
+        assert "runtime" in emit.await_args.kwargs["refetch_surfaces"]
+        assert emit.await_args.kwargs["summary"] == {
+            "id": str(runner.id),
+            "status": "deleted",
+            "released_unpulled_pins": 0,
+        }
 
 
 # ── Runner polling/heartbeat endpoints ───────────────────────────────────────
@@ -541,6 +594,93 @@ class TestRunnerEndpoints:
         await db_session.refresh(runner)
         assert runner.last_seen_at > old_seen
         assert runner.capabilities["active_task_ids"] == ["abc", "def"]
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_emits_workbench_runner_refresh(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        with patch(
+            "app.routers.runner.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            resp = await client.post(
+                "/api/runner/heartbeat",
+                json={
+                    "active_task_ids": ["task-1"],
+                    "active_compute_job_ids": ["job-1"],
+                    "agent_available": True,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        emit.assert_awaited_once()
+        assert emit.await_args.args[0] == runner.project_id
+        assert emit.await_args.kwargs["resource"] == "local_runner"
+        assert emit.await_args.kwargs["action"] == "heartbeat"
+        assert emit.await_args.kwargs["refetch_surfaces"] == ("runtime",)
+        assert emit.await_args.kwargs["summary"] == {
+            "id": str(runner.id),
+            "status": "active",
+            "active_task_count": 1,
+            "active_compute_job_count": 1,
+            "agent_available": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_skips_refetch_when_only_liveness_changes(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "active_task_ids": ["task-1"],
+                "active_compute_job_ids": ["job-1"],
+                "agent_available": True,
+            },
+        )
+
+        with patch(
+            "app.routers.runner.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            resp = await client.post(
+                "/api/runner/heartbeat",
+                json={
+                    "active_task_ids": ["task-1"],
+                    "active_compute_job_ids": ["job-1"],
+                    "agent_available": True,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        emit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_skips_refetch_for_default_empty_active_work(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        with patch(
+            "app.routers.runner.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            resp = await client.post(
+                "/api/runner/heartbeat",
+                json={},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        emit.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_heartbeat_persists_runner_reported_capabilities(

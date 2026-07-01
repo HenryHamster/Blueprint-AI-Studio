@@ -2,6 +2,10 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Task, TaskStatus, TrackLogEntry } from '../types/task';
 import type { DeployState } from '../types/settings';
 import type { StrategicChallengeSummary } from '../types/digest';
+import {
+  workbenchMessageMatchesProject,
+  workbenchRefetchSurfacesFromMessage,
+} from '../types/workbenchEvents';
 import { API_BASE_URL, authHeaders, fetchTask } from '../api';
 
 interface UseLogViewerDeps {
@@ -85,16 +89,6 @@ const STRATEGIC_READ_MODEL_REFRESH_EVENTS = new Set([
   'strategic_cycle_started',
   'strategic_cycle_completed',
 ]);
-
-function eventRefetchSurfaces(msg: unknown): Set<string> {
-  const data = typeof msg === 'object' && msg !== null && 'data' in msg ? (msg as { data?: unknown }).data : null;
-  const refetch = typeof data === 'object' && data !== null && 'refetch' in data ? (data as { refetch?: unknown }).refetch : null;
-  const surfaces = typeof refetch === 'object' && refetch !== null && 'surfaces' in refetch
-    ? (refetch as { surfaces?: unknown }).surfaces
-    : null;
-  if (!Array.isArray(surfaces)) return new Set();
-  return new Set(surfaces.filter((surface): surface is string => typeof surface === 'string'));
-}
 
 export function useLogViewer({
   fetchTasksRef,
@@ -316,7 +310,9 @@ export function useLogViewer({
   const handleWsMessage = useCallback((event: MessageEvent) => {
     try {
       const msg = JSON.parse(event.data);
-      const refetchSurfaces = eventRefetchSurfaces(msg);
+      const envelopeProjectId = selectedProjectIdRef.current ?? trackingProjectIdRef.current;
+      const refetchSurfaces = workbenchRefetchSurfacesFromMessage(msg, envelopeProjectId);
+      const projectEventApplies = workbenchMessageMatchesProject(msg, envelopeProjectId);
 
       // Pong response — update last-pong timestamp for heartbeat tracking
       if (msg.event === 'pong') {
@@ -372,30 +368,30 @@ export function useLogViewer({
       }
 
       // Global events (deploy state, pipeline throttle, task list refresh)
-      if (msg.event === 'deploy_state') {
+      if (projectEventApplies && msg.event === 'deploy_state') {
         setDeployState(msg.data);
       }
-      if (msg.event === 'pipeline_throttle') {
+      if (projectEventApplies && msg.event === 'pipeline_throttle') {
         setPipelineThrottle(msg.data);
         if (pipelineThrottleTimerRef.current) clearTimeout(pipelineThrottleTimerRef.current);
         const clearMs = (msg.data.recovery_seconds ?? 60) * 1000;
         pipelineThrottleTimerRef.current = setTimeout(() => setPipelineThrottle(null), clearMs);
       }
-      if (msg.event === 'task_updated' || msg.event === 'artifact_created') {
+      if (projectEventApplies && (msg.event === 'task_updated' || msg.event === 'artifact_created')) {
         if (fetchTasksDebounceRef.current) clearTimeout(fetchTasksDebounceRef.current);
         fetchTasksDebounceRef.current = setTimeout(() => { fetchTasksRef.current(); }, 500);
       }
-      if (
+      if (projectEventApplies && (
         STRATEGIC_READ_MODEL_REFRESH_EVENTS.has(msg.event)
         || refetchSurfaces.has('strategic_session')
-      ) {
+      )) {
         refreshStrategicReadModel();
       }
-      if (
+      if (projectEventApplies && (
         msg.event === 'message_created'
         || msg.event === 'message_updated'
         || refetchSurfaces.has('messages')
-      ) {
+      )) {
         refreshMessages();
       }
 
@@ -406,6 +402,9 @@ export function useLogViewer({
         if (fetchDirectionsDebounceRef.current) clearTimeout(fetchDirectionsDebounceRef.current);
         fetchDirectionsDebounceRef.current = setTimeout(() => { fetchDirectionsRef?.current?.(); }, 500);
       };
+      if (!projectEventApplies) {
+        return;
+      }
       if (msg.event === 'strategic_updated' || refetchSurfaces.has('directions')) {
         refetchDirections();
       } else if (msg.event === 'strategic_cycle_started') {
