@@ -15047,6 +15047,49 @@ async def test_agent_claim_injects_direction_narrative(client: AsyncClient, db_s
     }
 
 
+@pytest.mark.asyncio
+async def test_agent_claim_payload_uses_persisted_llm_runtime_without_context_leak(
+    client: AsyncClient, db_session
+):
+    """Claim payload must reflect the selected runtime even though internal
+    llm_* context keys are stripped from the agent-visible context."""
+    project = Project(name="Claim Runtime Payload Test", user_id="test-user-runtime")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Runtime claim consumer",
+        payloads=[{"type": "create", "prompt": "Use selected runtime"}],
+        vm_instance_id="agent-vm-runtime-claim",
+        status=TaskStatus.PROVISIONING,
+        context={
+            "llm_account_id": "acct-runtime",
+            "max_plan_account_id": "acct-runtime",
+            "llm_provider": "openai",
+            "llm_auth_mode": "api_key",
+            "llm_model": "gpt-5.4",
+            "llm_execution_mode": "default",
+            "operator_note": "visible",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-runtime-claim")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+
+    body = resp.json()
+    assert body["payloads"][0]["model"] == "gpt-5.4"
+    assert body["payloads"][0]["execution_mode"] == "default"
+    assert body["context"]["operator_note"] == "visible"
+    assert all(not key.startswith("llm_") for key in body["context"])
+    assert all(not key.startswith("max_plan_") for key in body["context"])
+
+
 # ---------------------------------------------------------------------------
 # OAuth credential rotation (agent → backend)
 # ---------------------------------------------------------------------------
