@@ -321,7 +321,7 @@ export function MessageBubble({
         {/* Bubble */}
         <div className={chatMode
           ? userMsg
-            ? 'rounded-md border border-neutral-700/50 bg-neutral-800/70 px-3 py-2 shadow-[0_1px_0_rgba(255,255,255,0.03)]'
+            ? 'rounded-md border border-neutral-700/60 bg-[#10161f] px-3 py-2 shadow-[0_1px_0_rgba(255,255,255,0.035)]'
             : 'rounded-md border border-transparent bg-transparent px-0.5 py-0.5'
           : `rounded-2xl border px-4 py-3 ${config.bubbleBg} ${
             msg.message_type === 'BLOCKER' ? 'border-amber-600/60 ring-1 ring-amber-500/20' :
@@ -367,11 +367,11 @@ export function MessageBubble({
           )}
           {/* Content */}
           {userMsg ? (
-            <div className={chatMode ? 'text-sm text-neutral-200 leading-normal' : 'text-sm text-neutral-200 leading-relaxed'}>
+            <div className={chatMode ? 'text-sm text-neutral-100 leading-relaxed' : 'text-sm text-neutral-200 leading-relaxed'}>
               <MarkdownContent content={msg.content} />
             </div>
           ) : (
-            <div className={chatMode ? 'text-sm text-neutral-200 leading-normal' : 'text-sm text-neutral-200 leading-relaxed'}>
+            <div className={chatMode ? 'text-sm text-neutral-100 leading-relaxed' : 'text-sm text-neutral-200 leading-relaxed'}>
               <MarkdownContent content={msg.content} />
             </div>
           )}

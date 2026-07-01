@@ -1131,8 +1131,8 @@ describe('MessagesPanel chrome modes', () => {
     expect(el.querySelector('[data-testid="saved-views-tab-strip"]')).toBeNull();
     expect(filterToggle(el)).toBeUndefined();
     expect(el.querySelector('button[title="Copy message ref"]')).toBeNull();
-    expect(el.querySelector('[data-message-id="strategic"] button[title="Reply"]')).not.toBeNull();
-    expect(el.querySelector('[data-message-id="question"] button[title="Reply"]')).not.toBeNull();
+    expect(el.querySelector('[data-message-id="strategic"] button[title="Reply"]')).toBeNull();
+    expect(el.querySelector('[data-message-id="question"] button[title="Reply"]')).toBeNull();
     expect(el.querySelector('button[title="Resolve"]')).toBeNull();
     expect(el.querySelector('button[title="Delete"]')).toBeNull();
     expect(el.querySelector('button[title="Create Direction"]')).toBeNull();
@@ -1414,17 +1414,12 @@ describe('MessagesPanel chrome modes', () => {
       status: 'open',
       created_at: '2026-06-01T10:01:00Z',
     });
-    const el = await renderPanel({ filterChrome: 'minimal' }, [question]);
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      targetMessage: { messageId: 'question-target', action: 'reply' },
+    }, [question]);
 
     const { fireEvent } = await import('@testing-library/react');
-    const replyButton = await waitFor(() => {
-      const button = el.querySelector('[data-message-id="question-target"] button[title="Reply"]') as HTMLButtonElement | null;
-      expect(button).not.toBeNull();
-      return button;
-    });
-    await act(async () => {
-      fireEvent.click(replyButton);
-    });
     await waitFor(() => expect(el.textContent).toContain('Replying to Agent'));
     const textarea = el.querySelector('textarea') as HTMLTextAreaElement;
     const sendButton = [...el.querySelectorAll('button')]
@@ -1458,17 +1453,12 @@ describe('MessagesPanel chrome modes', () => {
       status: 'open',
       created_at: '2026-06-01T10:01:00Z',
     });
-    const el = await renderPanel({ filterChrome: 'minimal' }, [strategic]);
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      targetMessage: { messageId: 'strategic-reply-target', action: 'reply' },
+    }, [strategic]);
 
     const { fireEvent } = await import('@testing-library/react');
-    const replyButton = await waitFor(() => {
-      const button = el.querySelector('[data-message-id="strategic-reply-target"] button[title="Reply"]') as HTMLButtonElement | null;
-      expect(button).not.toBeNull();
-      return button;
-    });
-    await act(async () => {
-      fireEvent.click(replyButton);
-    });
     await waitFor(() => expect(el.textContent).toContain('Replying to Strategic'));
     const textarea = el.querySelector('textarea') as HTMLTextAreaElement;
     const sendButton = [...el.querySelectorAll('button')]

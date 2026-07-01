@@ -411,7 +411,7 @@ describe('PipelineWorkspace task stream', () => {
 
     const sideboard = screen.getByTestId('pipeline-sideboard');
     expect(within(sideboard).getByText('Task health')).toBeInTheDocument();
-    expect(within(sideboard).getByText('Filtered task monitor')).toBeInTheDocument();
+    expect(within(sideboard).getByText('filtered')).toBeInTheDocument();
     expect(within(sideboard).getByText('Running')).toBeInTheDocument();
     expect(within(sideboard).getByText('Queued')).toBeInTheDocument();
     expect(within(sideboard).getByText('Finished')).toBeInTheDocument();

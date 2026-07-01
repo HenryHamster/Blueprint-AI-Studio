@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Compass, Microscope, BookOpen, MoreHorizontal, Settings, Bell, Plus } from 'lucide-react';
+import { Activity, Microscope, BookOpen, MoreHorizontal, Settings, Bell, Plus } from 'lucide-react';
 import { AutonomousStatus } from './AutonomousStatus';
 import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
@@ -241,7 +241,7 @@ export function PrimaryTabNav({
   const mobile = placement === 'mobile';
   const navClassName = mobile
     ? `grid grid-cols-4 gap-1 border-t border-neutral-800/90 bg-[#020407] px-1.5 py-1.5 ${className}`
-    : `hidden min-w-0 flex-1 items-center gap-0.5 overflow-x-auto rounded border border-neutral-800/80 bg-[#070a0f] p-0.5 md:flex md:flex-none ${className}`;
+    : `hidden min-w-0 flex-1 items-center gap-0.5 overflow-x-auto rounded-md border border-neutral-800/80 bg-[#05080d] p-0.5 md:flex md:flex-none ${className}`;
 
   return (
     <nav
@@ -274,7 +274,7 @@ export function PrimaryTabNav({
           >
             <span className="truncate">{label}</span>
             {badgeCount > 0 && (
-              <span className="ml-1.5 inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-cyan-400 px-1 text-ui-sm font-bold leading-none text-neutral-950">
+              <span className="ml-1.5 inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-emerald-400 px-1 text-ui-sm font-bold leading-none text-neutral-950">
                 {badgeCount > 99 ? '99+' : badgeCount}
               </span>
             )}
@@ -477,8 +477,11 @@ export function HeaderBar(props: HeaderBarProps) {
         {/* LEFT: ProjectSwitcher + Manage projects slot */}
         <div className="flex min-w-0 shrink-0 items-center gap-1">
           <div className="hidden items-center lg:flex" aria-label="Blueprint">
-            <span className="flex h-3.5 w-3.5 items-center justify-center rounded border border-neutral-800/70 bg-[#070a0f] text-neutral-600">
-              <Compass className="h-2.5 w-2.5" />
+            <span className="grid h-4 w-4 grid-cols-2 gap-0.5 rounded border border-neutral-800/80 bg-[#05080d] p-0.5" aria-hidden="true">
+              <span className="rounded-[1px] bg-neutral-500/80" />
+              <span className="rounded-[1px] bg-neutral-700" />
+              <span className="rounded-[1px] bg-neutral-700" />
+              <span className="rounded-[1px] bg-emerald-400/80" />
             </span>
           </div>
           <ProjectSwitcherDropdown
@@ -515,7 +518,7 @@ export function HeaderBar(props: HeaderBarProps) {
         <div className="ml-auto flex shrink-0 items-center gap-0.5">
 
           {/* Desktop icon cluster */}
-          <div className="hidden items-center gap-0.5 rounded border border-neutral-800/80 bg-[#070a0f] p-0.5 md:flex">
+          <div className="hidden items-center gap-0.5 rounded-md border border-neutral-800/80 bg-[#05080d] p-0.5 md:flex">
             {/* Alerts — only when active alerts exist */}
             {(props.alertCount ?? 0) > 0 && (
               /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */

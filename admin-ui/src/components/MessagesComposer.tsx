@@ -74,7 +74,7 @@ export function MessagesComposer({
 
   return (
     <div className={minimal
-      ? 'shrink-0 border-t border-neutral-800 bg-[#04070b] px-2 py-2 md:px-2.5'
+      ? 'shrink-0 border-t border-neutral-800 bg-[#03060a] px-2 pb-2 pt-1.5 md:px-2.5'
       : 'px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50'
     }>
       {minimal && strategicContext && (
@@ -95,7 +95,7 @@ export function MessagesComposer({
       <div
         data-testid={minimal ? 'strategic-composer-box' : undefined}
         className={minimal
-        ? `${minimalColumnClass} flex items-end gap-1 rounded-md border border-neutral-700/80 bg-[#0a0f15] p-1 shadow-[0_12px_40px_rgba(0,0,0,0.24),inset_0_1px_0_rgba(255,255,255,0.04)]`
+        ? `${minimalColumnClass} flex items-end gap-1 rounded-md border border-neutral-700/80 bg-[#0a0f15] p-1 shadow-[0_10px_28px_rgba(0,0,0,0.20),inset_0_1px_0_rgba(255,255,255,0.035)]`
         : 'flex gap-2 items-end'
       }>
         {!minimal && (
@@ -107,7 +107,7 @@ export function MessagesComposer({
             onClick={onOpenCommandPalette}
             title="Open command palette (Ctrl+K)"
             aria-label="Open command palette (Ctrl+K)"
-            className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded border border-neutral-800/80 bg-neutral-950/40 px-2.5 text-xs font-semibold text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-100 md:min-h-8 md:min-w-10"
+            className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2.5 text-xs font-semibold text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-100 md:min-h-8 md:min-w-10"
           >
             <Command className="h-3.5 w-3.5" />
             <span className="hidden font-mono text-ui-sm text-neutral-500 sm:inline">Ctrl+K</span>
@@ -137,7 +137,7 @@ export function MessagesComposer({
           aria-label="Send message"
           title="Send message"
           className={minimal
-            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded bg-emerald-500 text-neutral-950 transition-colors hover:bg-emerald-400 disabled:bg-neutral-800 disabled:text-neutral-500 disabled:opacity-100 md:min-h-8 md:min-w-8'
+            ? 'flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md bg-emerald-500 text-neutral-950 transition-colors hover:bg-emerald-400 disabled:bg-neutral-800 disabled:text-neutral-500 disabled:opacity-100 md:min-h-8 md:min-w-8'
             : 'bg-blue-600 hover:bg-blue-500 text-white p-2.5 rounded-xl text-xs font-medium transition-colors disabled:opacity-40 shrink-0 min-h-[44px] min-w-[44px] flex items-center justify-center'
           }
         >
