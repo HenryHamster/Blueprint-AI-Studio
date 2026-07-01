@@ -77,6 +77,11 @@ describe('ProviderCostPanel', () => {
     expect(table.getByText('83%')).toBeInTheDocument();
     expect(table.getByText('$21.50')).toBeInTheDocument();
     expect(table.getByText('$5.38')).toBeInTheDocument();
+    const summary = screen.getByTestId('provider-cost-summary');
+    expect(summary).toHaveTextContent('24h');
+    expect(summary).toHaveTextContent('12');
+    expect(summary).toHaveTextContent('4 merged');
+    expect(summary).toHaveTextContent('$21.50');
     expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/provider-cost-summary?hours=24&project_id=proj-abc', undefined);
   });
 

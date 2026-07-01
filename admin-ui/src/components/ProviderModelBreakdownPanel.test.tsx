@@ -89,6 +89,10 @@ describe('ProviderModelBreakdownPanel', () => {
     expect(inTable().getByText('claude-opus-4-7')).toBeInTheDocument();
     expect(inTable().getByText('anthropic')).toBeInTheDocument();
     expect(screen.getAllByText('85%').length).toBeGreaterThan(0);
+    const summary = screen.getByTestId('provider-model-summary');
+    expect(summary).toHaveTextContent('1');
+    expect(summary).toHaveTextContent('20');
+    expect(summary).toHaveTextContent('0');
   });
 
   it('expanding a row reveals per-account drill-in with below_median badge', async () => {
@@ -267,6 +271,20 @@ describe('ProviderModelBreakdownPanel', () => {
     await user.click(screen.getByText('Hide single-account'));
     expect(inTable().queryByText('model-a')).not.toBeInTheDocument();
     expect(inTable().getByText('model-b')).toBeInTheDocument();
+  });
+
+  it('keeps the panel mounted with an empty state when the single-account filter removes every row', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({ rows: [makeRow({ distinct_accounts: 1 })] }));
+
+    const user = userEvent.setup();
+    render(<ProviderModelBreakdownPanel selectedProjectId={null} />);
+    await act(async () => {});
+
+    await user.click(screen.getByText('Hide single-account'));
+
+    expect(screen.getByTestId('provider-model-empty-filter')).toHaveTextContent('No multi-account provider/model rows');
+    expect(screen.getByTestId('provider-model-summary')).toHaveTextContent('0');
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
   });
 
   it('renders a stale / as-of affordance when the response was served stale', async () => {

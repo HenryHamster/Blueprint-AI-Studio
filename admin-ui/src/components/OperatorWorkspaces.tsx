@@ -9,6 +9,7 @@ import { ComputeJobsPanel } from './ComputeJobsPanel';
 import { DashboardHome } from './DashboardHome';
 import { ConsoleHome } from './ConsoleHome';
 import { FleetRunnersPanel } from './FleetRunnersPanel';
+import { RuntimeAccountsPanel } from './RuntimeAccountsPanel';
 import { SettingsSectionRouter, type SettingsSectionRouterProps } from './SettingsSectionRouter';
 import type { Task } from './TaskCard';
 import { WarmVmPanel } from './WarmVmPanel';
@@ -464,18 +465,37 @@ export function RuntimeWorkspace({
       contentClassName={runtimeSection === 'settings' ? 'min-h-0 min-w-0 overflow-hidden' : 'min-h-0 min-w-0 overflow-auto p-3 custom-scrollbar'}
     >
       {runtimeSection === 'health' ? (
-        <ConsoleHome
-          selectedProjectId={selectedProjectId}
-          scopedActiveCount={scopedActiveCount}
-          scopedQueuedCount={scopedQueuedCount}
-          globalActiveCount={globalActiveCount}
-          globalQueuedCount={globalQueuedCount}
-          tasks={tasks}
-          onViewTask={onViewTask}
-          onShowAnalytics={() => onRuntimeSectionChange('analytics')}
-          onOpenFleet={onOpenFleet}
-          onCreateTask={onCreateTask}
-        />
+        <div className="mx-auto flex max-w-7xl flex-col gap-3">
+          <RuntimeSectionIntro
+            item={activeRuntimeItem}
+            title="Runtime overview"
+          >
+            <RuntimeStatusPill label="API" value={apiHealthy ? 'connected' : 'error'} tone={apiHealthy ? 'good' : 'warn'} />
+            <RuntimeStatusPill label="WS" value={wsConnected ? 'connected' : 'stale'} tone={wsConnected ? 'good' : 'warn'} />
+            <RuntimeStatusPill
+              label="project"
+              value={selectedProjectRepoLabel ?? 'fleet-wide'}
+              tone={selectedProjectId ? 'info' : 'neutral'}
+            />
+            <RuntimeStatusPill
+              label="fleet"
+              value={`${globalActiveCount} active / ${globalQueuedCount} queued`}
+              tone={globalActiveCount > 0 ? 'info' : 'neutral'}
+            />
+          </RuntimeSectionIntro>
+          <ConsoleHome
+            selectedProjectId={selectedProjectId}
+            scopedActiveCount={scopedActiveCount}
+            scopedQueuedCount={scopedQueuedCount}
+            globalActiveCount={globalActiveCount}
+            globalQueuedCount={globalQueuedCount}
+            tasks={tasks}
+            onViewTask={onViewTask}
+            onShowAnalytics={() => onRuntimeSectionChange('analytics')}
+            onOpenFleet={onOpenFleet}
+            onCreateTask={onCreateTask}
+          />
+        </div>
       ) : runtimeSection === 'devices' ? (
         <div className="mx-auto flex max-w-7xl flex-col gap-3">
           <RuntimeSectionIntro
@@ -586,9 +606,7 @@ export function RuntimeWorkspace({
               <RuntimeStatusPill label="cooldowns" value={disabledModelCount} tone="warn" />
             )}
           </RuntimeSectionIntro>
-          <div className="rounded-md border border-neutral-800 bg-[#10151c] p-3">
-            <SettingsSectionRouter {...settingsRouterProps} activeSection="accounts" />
-          </div>
+          <RuntimeAccountsPanel selectedProjectId={selectedProjectId} settingsRouterProps={settingsRouterProps} />
         </div>
       ) : (
         <div className="grid h-full min-h-0 grid-cols-1 overflow-hidden lg:grid-cols-[260px_minmax(0,1fr)]">

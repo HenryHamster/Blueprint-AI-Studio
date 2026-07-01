@@ -2119,27 +2119,40 @@ async def get_lane_pilot_preflight(
 
 @router.post("/improvement-lanes/reclaim-orphaned")
 async def reclaim_orphaned_lane_workspaces(
+    dry_run: bool = Query(False),
+    project_id: uuid.UUID | None = Query(None),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),
 ):
-    """Reset workspace_state to COLD on lanes whose backing pool VM no longer exists.
+    """Reconcile lane workspace state against the warm-pool registry.
 
     On-demand trigger for the startup recovery sweep
-    (``reclaim_orphaned_lane_workspace_states``).  Useful when an operator
-    observes an improvement lane stuck in workspace_state=WARM_RESERVED or
-    LEASED with a missing VM — running this endpoint remediates the orphan
-    immediately without requiring an orchestrator restart.
+    (``reconcile_lane_workspaces``).  Useful when an operator observes an
+    improvement lane stuck in workspace_state=WARM_RESERVED or LEASED with a
+    missing/stale backing VM, stale reservation, or missing terminal owner task.
+    ``dry_run=true`` reports what would change without mutating rows.
 
-    Returns ``reclaimed``: the count of lanes whose workspace state was reset.
+    Returns ``reclaimed`` as a compatibility alias for lanes actually cleared,
+    plus structured reconciliation counts.
     """
-    from app.improvement_lane_ops import reclaim_orphaned_lane_workspace_states  # noqa: PLC0415
+    from app.improvement_lane_ops import reconcile_lane_workspaces
 
-    reclaimed = await reclaim_orphaned_lane_workspace_states(session)
-    await session.commit()
+    result = await reconcile_lane_workspaces(
+        session,
+        dry_run=dry_run,
+        project_id=project_id,
+    )
+    if not dry_run:
+        await session.commit()
 
     logger.info(
-        "[LANE-PILOT] operator reclaim-orphaned: reclaimed=%s",
-        reclaimed,
+        "[LANE-PILOT] operator reclaim-orphaned: %s",
+        result,
     )
 
-    return {"reclaimed": reclaimed}
+    return {
+        **result,
+        "project_id": str(project_id) if project_id is not None else None,
+        "reclaimed": result["lanes_cleared"],
+        "would_reclaim": result["lanes_would_clear"],
+    }

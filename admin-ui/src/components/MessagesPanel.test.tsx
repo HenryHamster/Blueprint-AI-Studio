@@ -638,6 +638,67 @@ describe('MessagesPanel chrome modes', () => {
     expect(filterToggle(el)?.getAttribute('aria-expanded')).toBe('true');
   });
 
+  test('compact message chrome renders one filter command surface without duplicate controls', async () => {
+    const el = await renderPanel({ variant: 'page', filterChrome: 'compact' }, [
+      makeMsg({ id: 'critical', message_type: 'BLOCKER', from_type: 'agent', content: 'Critical blocker' }),
+    ]);
+
+    const collapsedButtons = [...el.querySelectorAll('button')];
+    expect(collapsedButtons.filter(button => button.title === 'Show filters and saved views')).toHaveLength(1);
+    expect(el.querySelectorAll('input[placeholder="Search messages..."]')).toHaveLength(0);
+    expect(el.querySelectorAll('[data-testid="saved-views-tab-strip"]')).toHaveLength(0);
+
+    const toggle = filterToggle(el);
+    if (!toggle) throw new Error('filter toggle not found');
+    await act(async () => { toggle.click(); });
+
+    const expandedButtons = [...el.querySelectorAll('button')];
+    expect(expandedButtons.filter(button => button.title === 'Hide filters and saved views')).toHaveLength(1);
+    expect(el.querySelectorAll('input[placeholder="Search messages..."]')).toHaveLength(1);
+    expect(el.querySelectorAll('[data-testid="saved-views-tab-strip"]')).toHaveLength(1);
+    expect(expandedButtons.filter(button => button.title === 'Toggle sort order')).toHaveLength(1);
+    expect(expandedButtons.filter(button => button.title?.includes('Critical only'))).toHaveLength(1);
+    expect(expandedButtons.filter(button =>
+      button.title?.includes('Only new since') ||
+      button.title?.includes('Show all messages') ||
+      button.title?.includes('No messages to filter')
+    )).toHaveLength(1);
+    expect(expandedButtons.filter(button => button.title?.includes('Save current filters'))).toHaveLength(1);
+    expect(expandedButtons.filter(button => button.title?.includes('Event type visibility'))).toHaveLength(1);
+  });
+
+  test('Ctrl+K focuses the message composer in compact chrome without duplicating command controls', async () => {
+    const onOpenCommandPalette = vi.fn();
+    const el = await renderPanel({ variant: 'page', filterChrome: 'compact', onOpenCommandPalette });
+    const textarea = el.querySelector('textarea') as HTMLTextAreaElement | null;
+    expect(textarea).not.toBeNull();
+    expect(document.activeElement).not.toBe(textarea);
+
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true }));
+    });
+
+    await waitFor(() => expect(document.activeElement).toBe(textarea));
+    expect(onOpenCommandPalette).not.toHaveBeenCalled();
+    expect(el.querySelectorAll('button[title="Open command palette (Ctrl+K)"]')).toHaveLength(0);
+  });
+
+  test('Ctrl+K opens the Strategic command surface and focuses the minimal chat composer', async () => {
+    const onOpenCommandPalette = vi.fn();
+    const el = await renderPanel({ filterChrome: 'minimal', onOpenCommandPalette });
+    const textarea = el.querySelector('textarea') as HTMLTextAreaElement | null;
+    expect(textarea).not.toBeNull();
+    expect(el.querySelectorAll('button[title="Open command palette (Ctrl+K)"]')).toHaveLength(1);
+    expect(el.querySelector('input[placeholder="Search messages..."]')).toBeNull();
+
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true }));
+    });
+
+    await waitFor(() => expect(document.activeElement).toBe(textarea));
+    expect(onOpenCommandPalette).toHaveBeenCalledTimes(1);
+  });
+
   test('legacy onClose usage keeps full controls and close action', async () => {
     const onClose = vi.fn();
     const el = await renderPanel({ onClose });

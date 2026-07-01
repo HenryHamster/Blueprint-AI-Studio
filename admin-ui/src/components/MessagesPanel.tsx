@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo, useLayoutEffect } from 'react';
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker } from '../api';
 import type { StrategicCycleProgress, StrategicCycleCompletion } from '../hooks/useLogViewer';
@@ -437,6 +437,20 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // to a fresh type-based prediction).
   const [lastArming, setLastArming] = useState<ArmingOutcome | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const focusComposerTextarea = useCallback(() => {
+    window.setTimeout(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      if (!el.disabled) {
+        try {
+          el.setSelectionRange(el.value.length, el.value.length);
+        } catch {
+          // Ignore selection failures in non-browser test environments.
+        }
+      }
+    }, 0);
+  }, []);
   const effectiveNewType = conversationMode ? 'FEEDBACK' : newType;
   // Idempotency key for the in-flight draft. Generated once per draft and
   // reused across retries / a rapid double-submit so the backend collapses
@@ -527,6 +541,26 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const [saveDialogError, setSaveDialogError] = useState<string | null>(null);
   const [openKebabId, setOpenKebabId] = useState<string | null>(null);
   const kebabRef = useRef<HTMLDivElement>(null);
+
+  const openMessageCommandSurface = useCallback(() => {
+    focusComposerTextarea();
+    if (conversationMode) onOpenCommandPalette?.();
+  }, [conversationMode, focusComposerTextarea, onOpenCommandPalette]);
+
+  useLayoutEffect(() => {
+    function handleMessageCommandShortcut(event: KeyboardEvent) {
+      if (event.defaultPrevented) return;
+      if (event.altKey || event.shiftKey || !(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'k') return;
+      if (showSaveDialog || pendingConvertMsg) return;
+      event.preventDefault();
+      event.stopPropagation();
+      event.stopImmediatePropagation();
+      openMessageCommandSurface();
+    }
+
+    document.addEventListener('keydown', handleMessageCommandShortcut, true);
+    return () => document.removeEventListener('keydown', handleMessageCommandShortcut, true);
+  }, [openMessageCommandSurface, pendingConvertMsg, showSaveDialog]);
 
   // Last-seen tracking: dividerTime is the threshold; when operator scrolls past or timeout fires, we persist it
   const [dividerTime, setDividerTime] = useState<number | null>(null);
@@ -730,11 +764,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
   useEffect(() => {
     if (!focusComposerSignal) return;
-    const timer = window.setTimeout(() => {
-      textareaRef.current?.focus();
-    }, 0);
-    return () => window.clearTimeout(timer);
-  }, [focusComposerSignal]);
+    focusComposerTextarea();
+  }, [focusComposerSignal, focusComposerTextarea]);
 
   // Memoized message-list derivation: open/resolved split, high-signal vs routine,
   // pinned blockers/questions, auto-promoted failing groups, visible-resolved, and
@@ -2029,7 +2060,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         chrome={conversationMode ? 'minimal' : 'full'}
         strategicContext={strategicComposerContext}
         onOpenStrategicContext={conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined}
-        onOpenCommandPalette={conversationMode ? onOpenCommandPalette : undefined}
+        onOpenCommandPalette={conversationMode ? openMessageCommandSurface : undefined}
       />
     </div>
   );

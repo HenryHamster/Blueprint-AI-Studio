@@ -1587,7 +1587,7 @@ export default function App() {
                 onUpdateSessionRefs={updateStrategicSessionRefs}
               />
             )}
-            railClassName="bg-[#0b1017]"
+            railClassName="bg-[#080d13]"
           />
         </WorkbenchSurface>
       ) : activeTab !== 'pipeline' && s.showArchive ? (

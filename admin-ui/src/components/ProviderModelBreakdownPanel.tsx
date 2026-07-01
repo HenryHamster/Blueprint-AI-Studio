@@ -52,6 +52,44 @@ function fmtDate(iso: string | null) {
   }
 }
 
+function ModelSummary({ rows }: { rows: BreakdownRow[] }) {
+  const totalTasks = rows.reduce((sum, row) => sum + row.total_tasks, 0);
+  const totalAccounts = rows.reduce((sum, row) => sum + row.distinct_accounts, 0);
+  const quarantinedAccounts = rows.reduce(
+    (sum, row) => sum + (row.accounts ?? []).filter(account => account.quarantine_status).length,
+    0,
+  );
+  const belowMedianAccounts = rows.reduce(
+    (sum, row) => sum + (row.accounts ?? []).filter(account => account.below_median).length,
+    0,
+  );
+
+  return (
+    <div
+      data-testid="provider-model-summary"
+      className="mb-2 grid grid-cols-2 overflow-hidden rounded-md border border-neutral-800/60 bg-neutral-950/30 sm:grid-cols-4"
+    >
+      <div className="border-r border-b border-neutral-800/60 px-2.5 py-2 sm:border-b-0">
+        <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Rows</div>
+        <div className="mt-0.5 font-mono text-xs font-semibold text-neutral-200">{rows.length}</div>
+      </div>
+      <div className="border-r-0 border-b border-neutral-800/60 px-2.5 py-2 sm:border-r sm:border-b-0">
+        <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Tasks</div>
+        <div className="mt-0.5 font-mono text-xs font-semibold text-neutral-200">{totalTasks}</div>
+      </div>
+      <div className="border-r border-neutral-800/60 px-2.5 py-2">
+        <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Accounts</div>
+        <div className="mt-0.5 font-mono text-xs font-semibold text-neutral-200">{totalAccounts}</div>
+        <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{belowMedianAccounts} under median</div>
+      </div>
+      <div className="px-2.5 py-2">
+        <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Quarantine</div>
+        <div className="mt-0.5 font-mono text-xs font-semibold text-amber-300">{quarantinedAccounts}</div>
+      </div>
+    </div>
+  );
+}
+
 function QuarantineBadge({
   qs,
   accountId,
@@ -197,7 +235,6 @@ export function ProviderModelBreakdownPanel({
   if (rows.length === 0) return null;
 
   const visible = hideSingleAccount ? rows.filter(r => r.distinct_accounts >= 2) : rows;
-  if (visible.length === 0) return null;
 
   // A response served from the cache fallback, OR a poll that has started
   // failing after a prior success, means the rows below are last-good — not a
@@ -238,6 +275,15 @@ export function ProviderModelBreakdownPanel({
           {hideSingleAccount ? 'Show all' : 'Hide single-account'}
         </button>
       </div>
+      <ModelSummary rows={visible} />
+      {visible.length === 0 ? (
+        <div
+          data-testid="provider-model-empty-filter"
+          className="rounded-lg border border-neutral-800/50 bg-neutral-900/50 px-3 py-4 text-center text-xs text-neutral-500"
+        >
+          No multi-account provider/model rows in this window.
+        </div>
+      ) : (
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {/* Mobile: stacked card layout */}
         <div className="sm:hidden divide-y divide-neutral-800/30">
@@ -380,6 +426,7 @@ export function ProviderModelBreakdownPanel({
           </tbody>
         </table>
       </div>
+      )}
     </section>
   );
 }

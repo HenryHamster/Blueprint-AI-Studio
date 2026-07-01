@@ -64,6 +64,12 @@ export function ProviderCostPanel({
 
   const w24 = efficiency?.window_24h;
   const w7 = efficiency?.window_7d;
+  const totalTasks = data.rows.reduce((sum, row) => sum + row.total_tasks, 0);
+  const successCount = data.rows.reduce((sum, row) => sum + row.success_count, 0);
+  const mergedCount = data.rows.reduce((sum, row) => sum + row.merged_count, 0);
+  const totalSpend = data.rows.reduce((sum, row) => sum + row.total_cost_usd, 0);
+  const aggregateSuccessRate = totalTasks > 0 ? successCount / totalTasks : null;
+  const aggregateCostPerMerged = mergedCount > 0 ? totalSpend / mergedCount : null;
 
   return (
     <section>
@@ -82,6 +88,35 @@ export function ProviderCostPanel({
           <EffMetric label="review cycles" value={fmtEffIter(w7?.review_iter_median)} delta={w7?.vs_prior_review_iter_median_delta} lowerIsBetter />
         </div>
       )}
+      <div
+        data-testid="provider-cost-summary"
+        className="mb-2 grid grid-cols-2 overflow-hidden rounded-md border border-neutral-800/60 bg-neutral-950/30 sm:grid-cols-4"
+      >
+        <div className="border-r border-b border-neutral-800/60 px-2.5 py-2 sm:border-b-0">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Window</div>
+          <div className="mt-0.5 font-mono text-xs font-semibold text-neutral-200">{data.window_hours}h</div>
+          <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{selectedProjectId ? 'project' : 'fleet'} scope</div>
+        </div>
+        <div className="border-r-0 border-b border-neutral-800/60 px-2.5 py-2 sm:border-r sm:border-b-0">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Tasks</div>
+          <div className="mt-0.5 font-mono text-xs font-semibold text-neutral-200">{totalTasks}</div>
+          <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{mergedCount} merged</div>
+        </div>
+        <div className="border-r border-neutral-800/60 px-2.5 py-2">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Success</div>
+          <div className="mt-0.5 font-mono text-xs font-semibold text-emerald-300">
+            {aggregateSuccessRate == null ? '—' : `${Math.round(aggregateSuccessRate * 100)}%`}
+          </div>
+          <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{successCount} succeeded</div>
+        </div>
+        <div className="px-2.5 py-2">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Spend</div>
+          <div className="mt-0.5 font-mono text-xs font-semibold text-neutral-200">${totalSpend.toFixed(2)}</div>
+          <div className="mt-0.5 truncate text-ui-sm text-neutral-600">
+            {aggregateCostPerMerged == null ? 'no merges' : `$${aggregateCostPerMerged.toFixed(2)}/merge`}
+          </div>
+        </div>
+      </div>
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {/* Mobile: stacked card layout */}
         <div className="sm:hidden divide-y divide-neutral-800/30">

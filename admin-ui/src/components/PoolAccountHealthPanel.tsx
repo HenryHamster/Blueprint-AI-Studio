@@ -126,6 +126,24 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
 
   const freshness = snapshotFreshness(generatedAt, null, RESPONSE_STALE_AFTER_SECONDS);
   const showStale = servedStale;
+  const stateCounts = accounts.reduce<Record<AccountHealthState, number>>(
+    (acc, account) => {
+      acc[account.state] += 1;
+      return acc;
+    },
+    { healthy: 0, probing: 0, disqualified: 0, disabled: 0 },
+  );
+  const usageKnown = accounts.filter(account => account.usage_snapshot?.known).length;
+  const usagePressure = accounts.filter(account => {
+    const snapshot = account.usage_snapshot;
+    if (!snapshot?.known) return false;
+    return (snapshot.five_hour_utilization ?? 0) >= 70 || (snapshot.seven_day_utilization ?? 0) >= 70;
+  }).length;
+  const cooldownModels = accounts.reduce((sum, account) => sum + account.rate_limited_models.length, 0);
+  const regressionModels = accounts.reduce(
+    (sum, account) => sum + account.rate_limited_models.filter(model => model.cooldown_type === 'regression').length,
+    0,
+  );
 
   return (
     <section>
@@ -139,6 +157,35 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
             stale{freshness.asOfLabel ? ` · as of ${freshness.asOfLabel}` : ''}
           </span>
         )}
+      </div>
+      <div
+        data-testid="account-health-summary"
+        className="mb-2 grid grid-cols-2 overflow-hidden rounded-md border border-neutral-800/60 bg-neutral-950/30 sm:grid-cols-4"
+      >
+        <div className="border-r border-b border-neutral-800/60 px-2.5 py-2 sm:border-b-0">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Healthy</div>
+          <div className="mt-0.5 font-mono text-xs font-semibold text-emerald-300">
+            {stateCounts.healthy}/{accounts.length}
+          </div>
+        </div>
+        <div className="border-r-0 border-b border-neutral-800/60 px-2.5 py-2 sm:border-r sm:border-b-0">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Probing</div>
+          <div className="mt-0.5 font-mono text-xs font-semibold text-blue-300">{stateCounts.probing}</div>
+        </div>
+        <div className="border-r border-neutral-800/60 px-2.5 py-2">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Suppressed</div>
+          <div className="mt-0.5 font-mono text-xs font-semibold text-amber-300">
+            {stateCounts.disqualified + stateCounts.disabled}
+          </div>
+          <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{cooldownModels} model cooldowns</div>
+        </div>
+        <div className="px-2.5 py-2">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Usage</div>
+          <div className="mt-0.5 font-mono text-xs font-semibold text-neutral-200">
+            {usagePressure}/{usageKnown}
+          </div>
+          <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{regressionModels} regressions</div>
+        </div>
       </div>
       <div className="space-y-1">
         {accounts.map(acct => {

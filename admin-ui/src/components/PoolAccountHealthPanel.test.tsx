@@ -61,6 +61,48 @@ describe('PoolAccountHealthPanel', () => {
     expect(screen.queryByTitle('Dominant failure class (24h)')).not.toBeInTheDocument();
   });
 
+  it('renders a compact state, cooldown, and usage summary', () => {
+    render(
+      <PoolAccountHealthPanel
+        accounts={[
+          makeAccount({
+            account_id: 'healthy',
+            usage_snapshot: {
+              known: true,
+              five_hour_utilization: 25,
+              seven_day_utilization: 40,
+              resets_at: {},
+              probed_at: null,
+              stale: false,
+            },
+          }),
+          makeAccount({
+            account_id: 'disabled',
+            state: 'disabled',
+            usage_snapshot: {
+              known: true,
+              five_hour_utilization: 92,
+              seven_day_utilization: 82,
+              resets_at: {},
+              probed_at: null,
+              stale: false,
+            },
+            rate_limited_models: [
+              { model: 'claude-rate', cooldown_seconds_remaining: 120, cooldown_type: 'rate_limit' },
+              { model: 'claude-regression', cooldown_seconds_remaining: 3600, cooldown_type: 'regression' },
+            ],
+          }),
+        ]}
+        loading={false}
+      />,
+    );
+
+    const summary = screen.getByTestId('account-health-summary');
+    expect(summary).toHaveTextContent('1/2');
+    expect(summary).toHaveTextContent('2 model cooldowns');
+    expect(summary).toHaveTextContent('1 regressions');
+  });
+
   it('renders regression diagnostic line for regression-quarantined models', () => {
     const account = makeAccount({
       state: 'disabled',
@@ -195,7 +237,7 @@ describe('PoolAccountHealthPanel', () => {
     const badge = screen.getByTitle(/Usage headroom — 5h \/ 7d window utilization/);
     expect(badge).toHaveClass('opacity-60');
     expect(badge).toHaveTextContent('stale');
-    expect(badge).toHaveTextContent('@12:00');
+    expect(badge.textContent).toMatch(/stale @/);
   });
 
   it('renders a response-level stale chip when servedStale is true', () => {

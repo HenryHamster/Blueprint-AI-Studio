@@ -36,6 +36,10 @@ vi.mock('./DashboardHome', () => ({
   DashboardHome: () => <div>analytics</div>,
 }));
 
+vi.mock('./RuntimeAccountsPanel', () => ({
+  RuntimeAccountsPanel: () => <div data-testid="runtime-accounts-panel">account monitor</div>,
+}));
+
 vi.mock('./SettingsSectionRouter', () => ({
   SettingsSectionRouter: ({ activeSection }: { activeSection: string }) => (
     <div data-testid="settings-section">{activeSection}</div>
@@ -175,9 +179,28 @@ describe('Operator workspaces', () => {
     expect(screen.getByTestId('settings-section')).toHaveTextContent('alert-domains');
 
     rerender(<RuntimeWorkspace {...runtimeProps({ runtimeSection: 'accounts' })} />);
-    expect(screen.getByTestId('settings-section')).toHaveTextContent('accounts');
+    expect(screen.getByTestId('runtime-accounts-panel')).toHaveTextContent('account monitor');
 
     rerender(<RuntimeWorkspace {...runtimeProps({ runtimeSection: 'settings', runtimeConfigSection: 'provider-settings' })} />);
     expect(screen.getByTestId('settings-section')).toHaveTextContent('provider-settings');
+  });
+
+  test('surfaces API and WebSocket state inside the runtime overview workspace', () => {
+    render(
+      <RuntimeWorkspace
+        {...runtimeProps({ runtimeSection: 'health' })}
+        selectedProjectId={null}
+        selectedProjectRepoLabel={null}
+        apiHealthy={false}
+        wsConnected={false}
+      />,
+    );
+
+    expect(screen.getByText('Runtime overview')).toBeInTheDocument();
+    expect(screen.getByText('API')).toBeInTheDocument();
+    expect(screen.getByText('error')).toBeInTheDocument();
+    expect(screen.getByText('WS')).toBeInTheDocument();
+    expect(screen.getByText('stale')).toBeInTheDocument();
+    expect(screen.getByText('fleet-wide')).toBeInTheDocument();
   });
 });

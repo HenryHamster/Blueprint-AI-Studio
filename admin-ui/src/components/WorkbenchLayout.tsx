@@ -9,7 +9,7 @@ export interface WorkbenchTab<T extends string> {
 
 export function WorkbenchFrame({ children }: { children: ReactNode }) {
   return (
-    <main className="min-h-0 min-w-0 flex-1 overflow-hidden border-b border-neutral-800 bg-[#04070b]">
+    <main className="min-h-0 min-w-0 flex-1 overflow-hidden border-b border-neutral-800 bg-[#03060a]">
       {children}
     </main>
   );
@@ -59,7 +59,7 @@ export function WorkbenchSurface<T extends string>({
             disabled={tab.disabled}
             onClick={() => onTabChange?.(tab.id)}
             aria-pressed={selected}
-            className={`inline-flex min-h-[44px] shrink-0 items-center gap-1.5 rounded border px-2.5 text-sm font-semibold transition-colors md:min-h-0 md:px-2 md:py-1 ${
+            className={`inline-flex min-h-[44px] shrink-0 items-center gap-1.5 rounded border px-2.5 text-sm font-semibold transition-colors md:min-h-6 md:px-2 md:py-0.5 md:text-xs ${
               selected
                 ? 'border-neutral-700/80 bg-neutral-800/90 text-neutral-100 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]'
                 : 'border-transparent text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100'
@@ -75,12 +75,12 @@ export function WorkbenchSurface<T extends string>({
   const bodyClassName = contentClassName ?? (
     flush
       ? 'flex min-h-0 min-w-0 flex-col overflow-hidden'
-      : 'min-h-0 min-w-0 overflow-auto p-2.5 custom-scrollbar'
+      : 'min-h-0 min-w-0 overflow-auto p-2 custom-scrollbar'
   );
 
   const headerClassName = showTitle
-    ? 'min-w-0 border-b border-neutral-800/90 bg-[#020407] px-2 py-1.5 md:px-2.5'
-    : 'min-w-0 border-b border-neutral-800/90 bg-[#020407] px-2 py-1 md:px-2.5';
+    ? 'min-w-0 border-b border-neutral-800/90 bg-[#020407] px-2 py-1 md:px-2'
+    : 'min-w-0 border-b border-neutral-800/90 bg-[#020407] px-2 py-0.5 md:px-2';
 
   return (
     <section className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] bg-[#04070b]">
@@ -114,10 +114,10 @@ export function WorkbenchSplit({
   railClassName?: string;
 }) {
   return (
-    <div className="grid h-full min-h-0 min-w-0 grid-cols-1 overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(320px,28vw)]">
+    <div className="grid h-full min-h-0 min-w-0 grid-cols-1 overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(300px,26vw)]">
       <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">{main}</div>
       {rail && (
-        <aside className={`hidden min-h-0 min-w-0 overflow-auto border-l border-neutral-800 bg-[#0b1017] p-2 custom-scrollbar lg:block ${railClassName}`}>
+        <aside className={`hidden min-h-0 min-w-0 overflow-auto border-l border-neutral-800 bg-[#080d13] p-1.5 custom-scrollbar lg:block ${railClassName}`}>
           {rail}
         </aside>
       )}
@@ -137,12 +137,12 @@ export function WorkbenchPanel({
   className?: string;
 }) {
   return (
-    <section className={`min-w-0 rounded-md border border-neutral-800 bg-[#10161e] ${className}`}>
-      <div className="flex min-w-0 items-center justify-between gap-3 border-b border-neutral-800 px-2.5 py-2">
+    <section className={`min-w-0 rounded-md border border-neutral-800 bg-[#0c1219] ${className}`}>
+      <div className="flex min-w-0 items-center justify-between gap-3 border-b border-neutral-800 px-2 py-1.5">
         <h2 className="truncate text-sm font-semibold text-neutral-100">{title}</h2>
         {meta && <div className="shrink-0 text-xs text-neutral-500">{meta}</div>}
       </div>
-      <div className="min-w-0 p-2">{children}</div>
+      <div className="min-w-0 p-1.5">{children}</div>
     </section>
   );
 }
@@ -164,7 +164,7 @@ export function WorkbenchMetric({
     info: 'text-cyan-300',
   }[tone];
   return (
-    <div className="rounded-md border border-neutral-800 bg-[#151c25] px-3 py-2">
+    <div className="rounded-md border border-neutral-800 bg-[#0f151d] px-2.5 py-1.5">
       <div className="text-ui-md uppercase tracking-wide text-neutral-500">{label}</div>
       <div className={`mt-1 text-lg font-semibold ${toneClass}`}>{value}</div>
     </div>
@@ -179,7 +179,7 @@ export function WorkbenchStatusBar({
   right?: ReactNode;
 }) {
   return (
-    <footer className="hidden h-6 shrink-0 items-center justify-between gap-3 border-t border-neutral-800 bg-[#05070a] px-2 font-mono text-ui-md text-neutral-500 md:flex">
+    <footer className="hidden h-5 shrink-0 items-center justify-between gap-3 border-t border-neutral-800 bg-[#05070a] px-2 font-mono text-ui-md text-neutral-500 md:flex">
       <div className="flex min-w-0 items-center gap-3 truncate">{left}</div>
       {right && <div className="flex shrink-0 items-center gap-3">{right}</div>}
     </footer>
