@@ -1043,6 +1043,11 @@ export function StrategicContextRail({
   const selectedRefDescriptors = selectedRefs.map(ref => descriptorByRef.get(sessionRefKey(ref)) ?? fallbackRefDescriptor(ref));
 
   function attentionItemAction(item: StrategicStateAttentionItem): (() => void) | undefined {
+    if (item.target?.surface === 'task') {
+      const taskId = item.target.task_id ?? item.task_id ?? item.ref?.id;
+      return onOpenTask && taskId ? () => onOpenTask(taskId) : onOpenPipeline;
+    }
+    if (item.target) return () => openContextTarget(item.target);
     if (item.kind === 'task') {
       return onOpenTask && item.ref?.id ? () => onOpenTask(item.ref.id) : onOpenPipeline;
     }

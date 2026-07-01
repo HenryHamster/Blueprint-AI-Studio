@@ -4078,6 +4078,273 @@ async def test_strategic_state_surfaces_local_runner_holds(
 
 
 @pytest.mark.asyncio
+async def test_strategic_state_surfaces_strategic_local_runner_holds(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    awaiting_since = (_utcnow() - timedelta(minutes=20)).isoformat()
+    strategic_hold = Task(
+        project_id=project.id,
+        title="Run Strategic locally",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.QUEUED,
+        latest_status_message="Workday mode is waiting for a local runner.",
+        context={
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+            STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: awaiting_since,
+        },
+        priority=1,
+    )
+    missing_required_marker = Task(
+        project_id=project.id,
+        title="Malformed Strategic local marker",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.QUEUED,
+        context={STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: awaiting_since},
+        priority=2,
+    )
+    wrong_type_marker = Task(
+        project_id=project.id,
+        title="Non-Strategic local marker",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        context={
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+            STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: awaiting_since,
+        },
+        priority=3,
+    )
+    db_session.add_all([strategic_hold, missing_required_marker, wrong_type_marker])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    holds = data["runtime"]["work"]["local_runner_holds"]
+    assert holds["count"] == 1
+    assert holds["compute_count"] == 0
+    assert holds["strategic_count"] == 1
+    assert holds["items"][0]["id"] == str(strategic_hold.id)
+    assert holds["items"][0]["awaiting_since"] == awaiting_since
+
+    attention = data["attention"]
+    assert attention["counts"]["local_runner_holds"] == 1
+    assert attention["counts"]["strategic_local_runner_holds"] == 1
+    assert attention["counts"]["needs_operator"] == 1
+    item = next(
+        item
+        for item in attention["items"]
+        if item["id"] == f"task:{strategic_hold.id}:local_runner_hold"
+    )
+    assert item["awaiting_since"] == awaiting_since
+    assert item["target"] == {
+        "surface": "runtime",
+        "project_id": str(project.id),
+        "section": "devices",
+        "task_id": str(strategic_hold.id),
+    }
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_surfaces_stale_pipeline_intervention_tasks(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    stale_dep = str(uuid.uuid4())
+    healthy_dependency = Task(
+        project_id=project.id,
+        title="Healthy upstream dependency",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_at=now - timedelta(minutes=30),
+    )
+    stale_queued = Task(
+        project_id=project.id,
+        title="Queued behind stale dependency",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[stale_dep],
+        created_at=now - timedelta(minutes=20),
+        latest_status_message="Waiting on upstream foundation.",
+        priority=1,
+    )
+    healthy_waiter = Task(
+        project_id=project.id,
+        title="Queued behind healthy dependency",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[str(healthy_dependency.id)],
+        created_at=now - timedelta(minutes=20),
+        priority=2,
+    )
+    fresh_queued = Task(
+        project_id=project.id,
+        title="Fresh queued dependency",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        depends_on=[str(uuid.uuid4())],
+        created_at=now - timedelta(minutes=2),
+    )
+    old_no_dependency = Task(
+        project_id=project.id,
+        title="Old normal queue",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        created_at=now - timedelta(hours=1),
+    )
+    stale_provisioning = Task(
+        project_id=project.id,
+        title="Provisioning exceeded stale threshold",
+        payloads=[{"type": "create", "scope": "small"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id="vm-stale-provision",
+        vm_provisioned_at=now - timedelta(minutes=20),
+        latest_status_message="VM was dispatched but never claimed.",
+        priority=2,
+    )
+    fresh_provisioning = Task(
+        project_id=project.id,
+        title="Provisioning still within threshold",
+        payloads=[{"type": "create", "scope": "small"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id="vm-fresh-provision",
+        vm_provisioned_at=now - timedelta(minutes=1),
+    )
+    approval_provisioning = Task(
+        project_id=project.id,
+        title="Approval provisioning wins precedence",
+        payloads=[{"type": "create", "scope": "small"}],
+        status=TaskStatus.PROVISIONING,
+        requires_approval=True,
+        vm_instance_id="vm-approval-provision",
+        vm_provisioned_at=now - timedelta(minutes=20),
+    )
+    stale_runner = LocalRunner(
+        project_id=project.id,
+        token_hash="hash-stale-runner",
+        hostname="workstation",
+        status="active",
+        last_seen_at=now - timedelta(minutes=10),
+    )
+    live_runner = LocalRunner(
+        project_id=project.id,
+        token_hash="hash-live-runner",
+        hostname="online-workstation",
+        status="active",
+        last_seen_at=now,
+    )
+    db_session.add_all(
+        [
+            stale_queued,
+            healthy_dependency,
+            healthy_waiter,
+            fresh_queued,
+            old_no_dependency,
+            stale_provisioning,
+            fresh_provisioning,
+            approval_provisioning,
+            stale_runner,
+            live_runner,
+        ]
+    )
+    await db_session.flush()
+    stale_runner_pin = Task(
+        project_id=project.id,
+        title="Pinned to stale runner",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id=f"runner:{stale_runner.id}",
+        vm_provisioned_at=now - timedelta(minutes=20),
+        context={"runner_target_id": str(stale_runner.id)},
+        latest_status_message="Waiting for the runner to pull work.",
+        priority=3,
+    )
+    live_runner_pin = Task(
+        project_id=project.id,
+        title="Pinned to live runner",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.PROVISIONING,
+        vm_instance_id=f"runner:{live_runner.id}",
+        vm_provisioned_at=now - timedelta(minutes=20),
+        context={"runner_target_id": str(live_runner.id)},
+    )
+    db_session.add_all([stale_runner_pin, live_runner_pin])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+    attention = data["attention"]
+
+    assert attention["level"] == "needs_operator"
+    assert attention["counts"]["stale_queued_tasks"] == 1
+    assert attention["counts"]["stale_provisioning_tasks"] == 1
+    assert attention["counts"]["stale_runner_pins"] == 1
+    assert attention["counts"]["approvals"] == 1
+    assert attention["counts"]["needs_operator"] == 4
+    assert attention["counts"]["watch"] == 0
+
+    items = {item["id"]: item for item in attention["items"]}
+    queued_item = items[f"task:{stale_queued.id}:stale_queued_task"]
+    assert queued_item["label"] == "Dependency queue stale"
+    assert queued_item["detail"] == "Waiting on upstream foundation."
+    assert queued_item["target"] == {
+        "surface": "task",
+        "project_id": str(project.id),
+        "task_id": str(stale_queued.id),
+    }
+    assert f"task:{fresh_queued.id}:stale_queued_task" not in items
+    assert f"task:{old_no_dependency.id}:stale_queued_task" not in items
+    assert f"task:{healthy_waiter.id}:stale_queued_task" not in items
+
+    provisioning_item = items[
+        f"task:{stale_provisioning.id}:stale_provisioning_task"
+    ]
+    assert provisioning_item["label"] == "Provisioning stale"
+    assert provisioning_item["detail"] == "VM was dispatched but never claimed."
+    assert f"task:{fresh_provisioning.id}:stale_provisioning_task" not in items
+    assert (
+        f"task:{approval_provisioning.id}:stale_provisioning_task"
+        not in items
+    )
+    assert f"task:{approval_provisioning.id}:approval_required" in items
+
+    runner_item = items[f"task:{stale_runner_pin.id}:stale_runner_pin"]
+    assert runner_item["label"] == "Runner pin stale"
+    assert runner_item["runner_id"] == str(stale_runner.id)
+    assert runner_item["target"] == {
+        "surface": "runtime",
+        "project_id": str(project.id),
+        "section": "devices",
+        "task_id": str(stale_runner_pin.id),
+        "runner_id": str(stale_runner.id),
+    }
+    assert f"task:{live_runner_pin.id}:stale_runner_pin" not in items
+    assert f"task:{stale_runner_pin.id}:stale_provisioning_task" not in items
+
+    actions = {entry["id"]: entry for entry in data["work_session"]["actions"]}
+    queued_action = actions[f"attention.task:{stale_queued.id}:stale_queued_task"]
+    assert queued_action["label"] == "Inspect queued dependency"
+    assert queued_action["kind"] == "review"
+    assert queued_action["target"] == {
+        "surface": "task",
+        "project_id": str(project.id),
+        "task_id": str(stale_queued.id),
+    }
+    runner_action = actions[f"attention.task:{stale_runner_pin.id}:stale_runner_pin"]
+    assert runner_action["label"] == "Check pinned runner"
+    assert runner_action["target"] == {
+        "surface": "runtime",
+        "project_id": str(project.id),
+        "section": "devices",
+        "task_id": str(stale_runner_pin.id),
+        "runner_id": str(stale_runner.id),
+    }
+
+
+@pytest.mark.asyncio
 async def test_strategic_state_does_not_return_terminal_task_as_active(
     client: AsyncClient, db_session
 ):
@@ -4334,6 +4601,13 @@ async def test_strategic_state_includes_operator_attention(
     failed_action = actions_by_id[f"attention.task:{failed_task.id}:failed_task"]
     assert failed_action["kind"] == "review"
     assert failed_action["target"]["task_id"] == str(failed_task.id)
+    alert_action = actions_by_id[f"attention.alert:{active_alert.id}"]
+    assert alert_action["target"] == {
+        "surface": "runtime",
+        "project_id": str(project.id),
+        "section": "devices",
+        "alert_id": str(active_alert.id),
+    }
     assert all(entry["enabled"] is True for entry in actions)
     assert all(len(entry["label"]) <= 96 for entry in actions)
     assert all(len(entry["reason"]) <= 180 for entry in actions)

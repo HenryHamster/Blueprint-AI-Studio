@@ -179,6 +179,23 @@ def local_runner_hold_task_filters(project_id: uuid.UUID) -> tuple[ColumnElement
     )
 
 
+def strategic_local_runner_hold_task_filters(
+    project_id: uuid.UUID,
+) -> tuple[ColumnElement[bool], ...]:
+    awaiting_since = Task.context[STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY].as_string()
+    required = Task.context[STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY].as_boolean()
+    return (
+        Task.project_id == project_id,
+        Task.archived.is_(False),
+        Task.status == TaskStatus.QUEUED,
+        Task.requires_approval.is_not(True),
+        Task.payloads[0]["type"].as_string().in_(list(STRATEGIC_TASK_TYPES)),
+        required.is_(True),
+        awaiting_since.is_not(None),
+        awaiting_since != "",
+    )
+
+
 def _runner_target_id(task: Task | None) -> str | None:
     if task is None:
         return None
@@ -490,7 +507,10 @@ def _task_summary(
         "updated_at": _isoformat(task.updated_at),
     }
     if include_awaiting_since:
-        summary["awaiting_since"] = task_awaiting_local_runner_since(task)
+        summary["awaiting_since"] = (
+            task_awaiting_local_runner_since(task)
+            or task_awaiting_strategic_local_runner_since(task)
+        )
     blocked_reason = _compact_text(task.blocked_reason, max_chars=180)
     if blocked_reason:
         summary["blocked_reason"] = blocked_reason
@@ -1022,7 +1042,10 @@ async def build_runtime_work_summary(
     ).scalar()
 
     local_runner_hold_filters = local_runner_hold_task_filters(project_id)
-    local_runner_hold_tasks = (
+    strategic_local_runner_hold_filters = strategic_local_runner_hold_task_filters(
+        project_id
+    )
+    compute_local_runner_hold_tasks = (
         await session.execute(
             select(Task)
             .where(*local_runner_hold_filters)
@@ -1030,9 +1053,36 @@ async def build_runtime_work_summary(
             .limit(_RUNTIME_WORK_PREVIEW_LIMIT)
         )
     ).scalars().all()
+    strategic_local_runner_hold_tasks = (
+        await session.execute(
+            select(Task)
+            .where(*strategic_local_runner_hold_filters)
+            .order_by(Task.priority.asc(), Task.created_at.asc())
+            .limit(_RUNTIME_WORK_PREVIEW_LIMIT)
+        )
+    ).scalars().all()
+    local_runner_hold_tasks = [
+        *compute_local_runner_hold_tasks,
+        *[
+            task
+            for task in strategic_local_runner_hold_tasks
+            if all(task.id != existing.id for existing in compute_local_runner_hold_tasks)
+        ],
+    ]
+    local_runner_hold_tasks.sort(
+        key=lambda task: (task.priority, task.created_at or _utcnow())
+    )
+    local_runner_hold_tasks = local_runner_hold_tasks[:_RUNTIME_WORK_PREVIEW_LIMIT]
     local_runner_hold_count = (
         await session.execute(
             select(func.count()).select_from(Task).where(*local_runner_hold_filters)
+        )
+    ).scalar()
+    strategic_local_runner_hold_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(*strategic_local_runner_hold_filters)
         )
     ).scalar()
 
@@ -1159,7 +1209,10 @@ async def build_runtime_work_summary(
             "items": [_task_summary(task) for task in held_tasks],
         },
         "local_runner_holds": {
-            "count": int(local_runner_hold_count or 0),
+            "count": int(local_runner_hold_count or 0)
+            + int(strategic_local_runner_hold_count or 0),
+            "compute_count": int(local_runner_hold_count or 0),
+            "strategic_count": int(strategic_local_runner_hold_count or 0),
             "items": [
                 _task_summary(task, include_awaiting_since=True)
                 for task in local_runner_hold_tasks

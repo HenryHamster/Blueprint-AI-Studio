@@ -5,7 +5,7 @@ import { ErrorBoundary } from './ErrorBoundary';
 import { KanbanBoard } from './KanbanBoard';
 import type { KanbanColumn, SortBy } from './KanbanBoard';
 import { PipelineView } from './PipelineView';
-import { TaskContextRail } from './TaskContextRail';
+import { TaskContextRail, type AttentionTaskInput } from './TaskContextRail';
 import TaskStreamPanel, { type TaskStreamPanelProps } from './TaskStreamPanel';
 import type { Task } from './TaskCard';
 import { WorkbenchSurface } from './WorkbenchLayout';
@@ -53,7 +53,7 @@ interface PipelineFlowProps {
 
 interface PipelineRailProps {
   currentTask: Task | null;
-  attentionTasks: Task[];
+  attentionTasks: AttentionTaskInput[];
   localFallbackTasks: Task[];
   trackedTaskIds: Set<string>;
   taskContextSessionProps: Pick<TaskContextRailProps, 'sessionRefs' | 'savingSessionRefs' | 'onUpdateSessionRefs'>;
@@ -106,6 +106,7 @@ interface PipelineNowItem {
   task: Task;
   label: string;
   tone: PipelineNowTone;
+  detail?: string | null;
 }
 
 export interface PipelineWorkspaceStatus {
@@ -362,16 +363,43 @@ function pipelineNowToneClass(tone: PipelineNowTone): string {
   }[tone];
 }
 
+function taskFromAttentionInput(input: AttentionTaskInput): Task {
+  return 'task' in input ? input.task : input;
+}
+
+function taskStatusLabel(status: string): string {
+  const normalized = status.toLowerCase().replace(/_/g, ' ');
+  return normalized.replace(/\b\w/g, letter => letter.toUpperCase());
+}
+
+function attentionLabelFromInput(input: AttentionTaskInput): string {
+  return 'task' in input
+    ? (input.attention?.label || taskStatusLabel(input.task.status))
+    : taskStatusLabel(input.status);
+}
+
+function attentionDetailFromInput(input: AttentionTaskInput): string | null | undefined {
+  return 'task' in input ? (input.attention?.detail || input.task.latest_status_message) : input.latest_status_message;
+}
+
 function pipelineNowItems(rail: PipelineRailProps, metrics: PipelineMetricsProps, tasks: Task[]): PipelineNowItem[] {
   const items: PipelineNowItem[] = [];
   const seen = new Set<string>();
-  const push = (task: Task | null | undefined, label: string, tone: PipelineNowTone) => {
+  const push = (task: Task | null | undefined, label: string, tone: PipelineNowTone, detail?: string | null) => {
     if (!task || seen.has(task.id)) return;
     seen.add(task.id);
-    items.push({ task, label, tone });
+    items.push({ task, label, tone, detail });
   };
 
   push(rail.currentTask, 'Selected', 'selected');
+  rail.attentionTasks
+    .slice(0, 3)
+    .forEach(entry => push(
+      taskFromAttentionInput(entry),
+      attentionLabelFromInput(entry),
+      'attention',
+      attentionDetailFromInput(entry),
+    ));
   metrics.failedTasks.slice(0, 2).forEach(task => push(task, 'Failed', 'attention'));
   metrics.blockedTasks.slice(0, 2).forEach(task => push(task, 'Blocked', 'attention'));
   tasks.filter(task => task.status === 'PARKED').slice(0, 2).forEach(task => push(task, 'Parked', 'waiting'));
@@ -391,7 +419,8 @@ function PipelineNowRow({
   onOpenTask: (task: Task) => void;
   onTrackTask?: (task: Task) => void;
 }) {
-  const statusDetail = item.task.latest_status_message
+  const statusDetail = item.detail
+    || item.task.latest_status_message
     || (item.task.started_at ? `started ${timeAgo(item.task.started_at)}` : `created ${timeAgo(item.task.created_at)}`);
 
   return (
@@ -485,7 +514,12 @@ function PipelineNowPanel({ rail, metrics, tasks }: { rail: PipelineRailProps; m
 
 function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardProps) {
   const parkedTasks = flow.tasks.filter(task => task.status === 'PARKED');
-  const attentionCount = metrics.blockedTasks.length + metrics.failedTasks.length + parkedTasks.length;
+  const attentionTaskIds = new Set<string>();
+  rail.attentionTasks.forEach(entry => attentionTaskIds.add(taskFromAttentionInput(entry).id));
+  metrics.blockedTasks.forEach(task => attentionTaskIds.add(task.id));
+  metrics.failedTasks.forEach(task => attentionTaskIds.add(task.id));
+  parkedTasks.forEach(task => attentionTaskIds.add(task.id));
+  const attentionCount = attentionTaskIds.size;
   const attentionLabel = attentionCount > 0
     ? `${attentionCount} need attention`
     : 'clear';

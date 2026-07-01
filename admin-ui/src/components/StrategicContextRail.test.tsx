@@ -1148,6 +1148,85 @@ describe('StrategicContextRail', () => {
     expect(props.onOpenPipeline).not.toHaveBeenCalled();
   });
 
+  test('attention items prefer explicit backend targets', () => {
+    const attentionState: StrategicStateResponse = {
+      ...STATE,
+      attention: {
+        ...STATE.attention!,
+        items: [
+          {
+            id: 'task:task-runner:stale_runner_pin',
+            kind: 'task',
+            severity: 'needs_operator',
+            reason: 'stale_runner_pin',
+            label: 'Runner pin stale',
+            detail: 'Runner has not checked in.',
+            ref: { kind: 'task', id: 'task-runner', project_id: 'proj-1' },
+            target: {
+              surface: 'runtime',
+              project_id: 'proj-1',
+              section: 'devices',
+              task_id: 'task-runner',
+              runner_id: 'runner-1',
+            },
+          },
+        ],
+      },
+    };
+    const onOpenTarget = vi.fn();
+    const { host, props } = mount({ state: attentionState, onOpenTarget });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Runner pin stale'))
+      ?.click();
+
+    expect(onOpenTarget).toHaveBeenCalledWith({
+      surface: 'runtime',
+      project_id: 'proj-1',
+      section: 'devices',
+      task_id: 'task-runner',
+      runner_id: 'runner-1',
+    });
+    expect(props.onOpenPipeline).not.toHaveBeenCalled();
+  });
+
+  test('explicit task attention targets still open the task drawer', () => {
+    const attentionState: StrategicStateResponse = {
+      ...STATE,
+      attention: {
+        ...STATE.attention!,
+        items: [
+          {
+            id: 'task:task-approve:approval_required',
+            kind: 'task',
+            severity: 'needs_operator',
+            reason: 'approval_required',
+            label: 'Approval required',
+            detail: 'Approve spend.',
+            ref: { kind: 'task', id: 'task-approve', project_id: 'proj-1' },
+            target: {
+              surface: 'task',
+              project_id: 'proj-1',
+              task_id: 'task-approve',
+              action: 'approve',
+            },
+          },
+        ],
+      },
+    };
+    const onOpenTask = vi.fn();
+    const onOpenTarget = vi.fn();
+    const { host, props } = mount({ state: attentionState, onOpenTask, onOpenTarget });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Approval required'))
+      ?.click();
+
+    expect(onOpenTask).toHaveBeenCalledWith('task-approve');
+    expect(onOpenTarget).not.toHaveBeenCalled();
+    expect(props.onOpenPipeline).not.toHaveBeenCalled();
+  });
+
   test('message attention item is navigable', () => {
     const attentionState: StrategicStateResponse = {
       ...STATE,

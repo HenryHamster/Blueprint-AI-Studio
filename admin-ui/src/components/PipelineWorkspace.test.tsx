@@ -537,6 +537,63 @@ describe('PipelineWorkspace task stream', () => {
     expect(screen.queryByText('clear')).not.toBeInTheDocument();
   });
 
+  test('includes backend attention entries in Now and task health summaries', () => {
+    const staleTask = makeTask({
+      id: 'task-stale-provision',
+      title: 'Stale provisioning task',
+      status: 'PROVISIONING',
+      latest_status_message: 'Raw provisioning status.',
+    });
+
+    renderWorkspace({
+      flow: {
+        tasks: [staleTask],
+        hasActiveFilters: false,
+        onViewLogs: vi.fn(),
+        onNavigateToParent: vi.fn(),
+        onArchiveGroup: vi.fn(),
+        onUnarchiveTask: vi.fn(),
+      },
+      rail: {
+        currentTask: null,
+        attentionTasks: [{
+          task: staleTask,
+          attention: {
+            id: 'task:task-stale-provision:stale_provisioning_task',
+            kind: 'task',
+            severity: 'needs_operator',
+            reason: 'stale_provisioning_task',
+            label: 'Provisioning stale',
+            detail: 'VM was dispatched but never claimed.',
+            ref: { kind: 'task', id: staleTask.id, project_id: 'proj-1' },
+          },
+        }],
+        localFallbackTasks: [],
+        trackedTaskIds: new Set<string>(),
+        taskContextSessionProps: {},
+        onOpenTask: vi.fn(),
+        onOpenPipeline: vi.fn(),
+        onTrackTask: vi.fn(),
+      },
+      metrics: {
+        activeTasks: [],
+        queuedTasks: [],
+        blockedTasks: [],
+        failedTasks: [],
+        terminalTasks: [],
+      },
+    });
+
+    const nowPanel = screen.getByTestId('pipeline-now-panel');
+    expect(within(nowPanel).getByText('Provisioning stale')).toBeInTheDocument();
+    expect(within(nowPanel).getByText('Stale provisioning task')).toBeInTheDocument();
+    expect(within(nowPanel).getByText('VM was dispatched but never claimed.')).toBeInTheDocument();
+
+    const healthPanel = screen.getByTestId('pipeline-health-panel');
+    expect(within(healthPanel).getByText('1 need attention')).toBeInTheDocument();
+    expect(screen.queryByText('clear')).not.toBeInTheDocument();
+  });
+
   test('does not render embedded stream when no tasks are tracked', () => {
     renderWorkspace({
       stream: {

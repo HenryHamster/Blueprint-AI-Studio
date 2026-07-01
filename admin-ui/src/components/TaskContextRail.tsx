@@ -1,6 +1,6 @@
 import type { ReactNode } from 'react';
 import { ArrowUpRight, BookmarkMinus, BookmarkPlus, GitPullRequest, ListTree, Radio, Route, Star } from 'lucide-react';
-import type { StrategicWorkbenchState } from '../strategicStateApi';
+import type { StrategicStateAttentionItem, StrategicWorkbenchState } from '../strategicStateApi';
 import type { Task } from '../types/task';
 import { timeAgo } from '../utils/time';
 import { removeStrategicSelectedRef, upsertStrategicSelectedRef } from '../utils/strategicWorkbenchSession';
@@ -9,7 +9,7 @@ import { StatusBadge, TaskTypeBadge } from './TaskCard';
 
 interface TaskContextRailProps {
   currentTask?: Task | null;
-  attentionTasks?: Task[];
+  attentionTasks?: AttentionTaskInput[];
   localFallbackTasks?: Task[];
   trackedTaskIds?: Set<string>;
   onOpenTask: (task: Task) => void;
@@ -21,6 +21,13 @@ interface TaskContextRailProps {
     updateRefs: (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs']
   ) => void;
 }
+
+export interface AttentionTaskEntry {
+  task: Task;
+  attention?: StrategicStateAttentionItem;
+}
+
+export type AttentionTaskInput = Task | AttentionTaskEntry;
 
 type StrategicSelectedRef = StrategicWorkbenchState['selected_refs'][number];
 
@@ -361,7 +368,15 @@ function CurrentTaskCard({
   );
 }
 
-function AttentionTaskRow({ task, onOpenTask }: { task: Task; onOpenTask: (task: Task) => void }) {
+function normalizeAttentionTask(entry: AttentionTaskInput): AttentionTaskEntry {
+  if ('task' in entry) return entry;
+  return { task: entry };
+}
+
+function AttentionTaskRow({ entry, onOpenTask }: { entry: AttentionTaskEntry; onOpenTask: (task: Task) => void }) {
+  const { task, attention } = entry;
+  const eyebrow = attention?.label || task.status;
+  const detail = attention?.detail || task.latest_status_message;
   return (
     <button
       type="button"
@@ -369,12 +384,12 @@ function AttentionTaskRow({ task, onOpenTask }: { task: Task; onOpenTask: (task:
       className={`block w-full rounded-md border px-3 py-2 text-left transition-colors hover:border-neutral-600 hover:bg-neutral-900 ${attentionTone(task)}`}
     >
       <div className="flex min-w-0 items-center justify-between gap-2">
-        <span className="truncate text-ui-sm font-medium uppercase text-neutral-500">{task.status}</span>
+        <span className="truncate text-ui-sm font-medium uppercase text-neutral-500" title={eyebrow}>{eyebrow}</span>
         <span className="shrink-0 font-mono text-ui-sm text-neutral-600">{task.id.slice(0, 8)}</span>
       </div>
       <div className="mt-1 truncate text-xs font-medium text-neutral-200">{task.title || task.id}</div>
-      {task.latest_status_message && (
-        <div className="mt-0.5 truncate text-ui-sm text-neutral-500">{task.latest_status_message}</div>
+      {detail && (
+        <div className="mt-0.5 truncate text-ui-sm text-neutral-500" title={detail}>{detail}</div>
       )}
     </button>
   );
@@ -384,13 +399,13 @@ function AttentionTaskList({
   tasks,
   onOpenTask,
 }: {
-  tasks: Task[];
+  tasks: AttentionTaskEntry[];
   onOpenTask: (task: Task) => void;
 }) {
   return (
     <div className="space-y-2">
-      {tasks.map(task => (
-        <AttentionTaskRow key={task.id} task={task} onOpenTask={onOpenTask} />
+      {tasks.map(entry => (
+        <AttentionTaskRow key={entry.task.id} entry={entry} onOpenTask={onOpenTask} />
       ))}
     </div>
   );
@@ -408,10 +423,16 @@ export function TaskContextRail({
   savingSessionRefs = false,
   onUpdateSessionRefs,
 }: TaskContextRailProps) {
-  const backendIds = new Set(attentionTasks.map(t => t.id));
-  const mergedAttention = [...attentionTasks, ...localFallbackTasks.filter(t => !backendIds.has(t.id))];
+  const backendAttention = attentionTasks.map(normalizeAttentionTask);
+  const backendIds = new Set(backendAttention.map(entry => entry.task.id));
+  const mergedAttention = [
+    ...backendAttention,
+    ...localFallbackTasks
+      .filter(task => !backendIds.has(task.id))
+      .map(task => ({ task })),
+  ];
   const visibleAttention = mergedAttention
-    .filter(task => task.id !== currentTask?.id)
+    .filter(entry => entry.task.id !== currentTask?.id)
     .slice(0, currentTask ? 3 : 5);
   const tracked = Boolean(currentTask && trackedTaskIds?.has(currentTask.id));
   const currentTaskRef = currentTask ? taskSessionRef(currentTask) : null;

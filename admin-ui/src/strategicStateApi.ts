@@ -55,6 +55,9 @@ export interface StrategicStateAttentionItem {
     id: string;
     project_id: string;
   };
+  target?: StrategicContextTarget | null;
+  awaiting_since?: string | null;
+  runner_id?: string | null;
   task_id?: string | null;
   domain?: string | null;
   event_type?: string | null;
@@ -336,6 +339,8 @@ export interface StrategicRuntimeWorkState {
   };
   local_runner_holds?: {
     count: number;
+    compute_count?: number;
+    strategic_count?: number;
     items: StrategicRuntimeLocalRunnerHoldPreview[];
   };
   parked_wakes: {
@@ -742,6 +747,12 @@ export interface StrategicStateResponse {
       bug_reports?: number;
       feedback?: number;
       approvals: number;
+      local_runner_holds?: number;
+      compute_local_runner_holds?: number;
+      strategic_local_runner_holds?: number;
+      stale_runner_pins?: number;
+      stale_provisioning_tasks?: number;
+      stale_queued_tasks?: number;
       manual_directions: number;
       alerts?: number;
       error_alerts?: number;

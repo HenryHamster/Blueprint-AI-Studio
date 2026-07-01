@@ -216,6 +216,38 @@ describe('TaskContextRail', () => {
     expect(onOpenTask).toHaveBeenCalledWith(expect.objectContaining({ id: 'task-failed' }));
   });
 
+  test('renders backend attention labels and details for attention tasks', () => {
+    const task = makeTask({
+      id: 'task-stale',
+      title: 'Provision stale runner task',
+      status: 'PROVISIONING',
+      latest_status_message: 'Raw task status message.',
+    });
+    render(
+      <TaskContextRail
+        currentTask={null}
+        attentionTasks={[{
+          task,
+          attention: {
+            id: 'task:task-stale:stale_provisioning_task',
+            kind: 'task',
+            severity: 'needs_operator',
+            reason: 'stale_provisioning_task',
+            label: 'Provisioning stale',
+            detail: 'VM was dispatched but never claimed.',
+            ref: { kind: 'task', id: 'task-stale', project_id: 'proj-1' },
+          },
+        }]}
+        onOpenTask={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('Provisioning stale')).toBeInTheDocument();
+    expect(screen.getByText('Provision stale runner task')).toBeInTheDocument();
+    expect(screen.getByText('VM was dispatched but never claimed.')).toBeInTheDocument();
+    expect(screen.queryByText('Raw task status message.')).not.toBeInTheDocument();
+  });
+
   test('keeps other attention tasks visible without duplicating the current task', () => {
     const task = makeTask();
     render(

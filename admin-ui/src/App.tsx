@@ -55,10 +55,11 @@ import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
 import { useCommandPaletteState } from './hooks/useCommandPaletteState';
 import { useStrategicContextNavigation } from './hooks/useStrategicContextNavigation';
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
-import { checkInStrategicSession, updateStrategicWorkbenchState, type StrategicWorkbenchState } from './strategicStateApi';
+import { checkInStrategicSession, updateStrategicWorkbenchState, type StrategicStateAttentionItem, type StrategicWorkbenchState } from './strategicStateApi';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 import { buildOptimisticStrategicWorkbench, normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSurfaceForTab } from './utils/strategicWorkbenchSession';
+import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
 
 type StrategicSessionRefs = StrategicWorkbenchState['selected_refs'];
 type PipelineDirectionOption = { id: string; text: string };
@@ -516,6 +517,10 @@ export default function App() {
     if (!counts) return s.needsAttentionCount;
     return (
       (counts.approvals ?? 0) +
+      (counts.local_runner_holds ?? 0) +
+      (counts.stale_runner_pins ?? 0) +
+      (counts.stale_provisioning_tasks ?? 0) +
+      (counts.stale_queued_tasks ?? 0) +
       (counts.failed_tasks ?? 0) +
       (counts.blocked_tasks ?? 0) +
       (counts.parked_tasks ?? 0)
@@ -626,17 +631,23 @@ export default function App() {
   const visibleBlockedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'BLOCKED' || (t.status === 'QUEUED' && !!t.depends_on && t.depends_on.length > 0)), [filteredTasks]);
   const visibleFailedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'FAILED'), [filteredTasks]);
   const visibleTerminalTasks = useMemo(() => filteredTasks.filter(t => TERMINAL_STATUSES.has(t.status)), [filteredTasks]);
-  const backendPipelineAttentionTaskIds = useMemo(() => (
-    strategicReadModel.data?.attention?.items
-      .filter(item => item.kind === 'task' && item.ref.id)
-      .map(item => item.ref.id) ?? []
-  ), [strategicReadModel.data?.attention?.items]);
+  const backendPipelineAttentionItems = useMemo(() => {
+    const byTaskId = new Map<string, StrategicStateAttentionItem>();
+    (strategicReadModel.data?.attention?.items ?? []).forEach(item => {
+      const taskId = pipelineTaskIdForAttentionItem(item);
+      if (taskId && !byTaskId.has(taskId)) byTaskId.set(taskId, item);
+    });
+    return Array.from(byTaskId.entries());
+  }, [strategicReadModel.data?.attention?.items]);
   const backendAttentionTasks = useMemo(() => {
     const taskById = new Map(s.tasks.map(task => [task.id, task]));
-    return backendPipelineAttentionTaskIds
-      .map(taskId => taskById.get(taskId))
-      .filter((task): task is Task => Boolean(task));
-  }, [backendPipelineAttentionTaskIds, s.tasks]);
+    return backendPipelineAttentionItems
+      .map(([taskId, attention]) => {
+        const task = taskById.get(taskId);
+        return task ? { task, attention } : null;
+      })
+      .filter((entry): entry is { task: Task; attention: StrategicStateAttentionItem } => Boolean(entry));
+  }, [backendPipelineAttentionItems, s.tasks]);
   const localAttentionTasks = useMemo(() => {
     const priority = (task: Task) => {
       if (task.status === 'FAILED') return 5;

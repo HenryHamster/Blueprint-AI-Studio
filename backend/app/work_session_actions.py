@@ -85,7 +85,14 @@ def _attention_action_kind(item: dict[str, Any]) -> str:
         return "reply"
     if reason == "approval_required":
         return "approve"
-    if reason in {"manual_intervention", "blocked_task", "failed_task"}:
+    if reason in {
+        "manual_intervention",
+        "blocked_task",
+        "failed_task",
+        "stale_queued_task",
+        "stale_provisioning_task",
+        "stale_runner_pin",
+    }:
         return "review"
     return "inspect"
 
@@ -97,6 +104,9 @@ def _attention_action_priority(item: dict[str, Any]) -> str:
         "question",
         "blocker",
         "local_runner_hold",
+        "stale_runner_pin",
+        "stale_provisioning_task",
+        "stale_queued_task",
         "alert",
     }:
         return "critical"
@@ -117,6 +127,12 @@ def _attention_action_label(item: dict[str, Any]) -> str:
         return "Review approval"
     if reason == "local_runner_hold":
         return "Check local runner"
+    if reason == "stale_runner_pin":
+        return "Check pinned runner"
+    if reason == "stale_provisioning_task":
+        return "Inspect stale provisioning"
+    if reason == "stale_queued_task":
+        return "Inspect queued dependency"
     if reason == "manual_intervention":
         return "Review direction"
     if reason == "failed_task":
@@ -131,6 +147,12 @@ def _attention_action_label(item: dict[str, Any]) -> str:
 
 
 def _attention_action_target(item: dict[str, Any]) -> dict[str, Any] | None:
+    explicit_target = _compact_action_target(
+        item.get("target") if isinstance(item.get("target"), dict) else None
+    )
+    if explicit_target:
+        return explicit_target
+
     ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
     ref_kind = str(ref.get("kind") or item.get("kind") or "")
     ref_id = _compact_text(ref.get("id"), max_chars=160)
@@ -145,12 +167,14 @@ def _attention_action_target(item: dict[str, Any]) -> dict[str, Any] | None:
         }
     elif ref_kind == "task" and ref_id:
         target = {
-            "surface": "runtime" if reason == "local_runner_hold" else "task",
+            "surface": "runtime"
+            if reason in {"local_runner_hold", "stale_runner_pin"}
+            else "task",
             "task_id": ref_id,
         }
         if reason == "approval_required":
             target["action"] = "approve"
-        if reason == "local_runner_hold":
+        if reason in {"local_runner_hold", "stale_runner_pin"}:
             target["section"] = "devices"
     elif ref_kind == "direction" and ref_id:
         target = {
