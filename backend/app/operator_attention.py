@@ -64,6 +64,140 @@ _MAX_ATTENTION_ITEMS = 8
 _ACTIONABLE_ALERT_SEVERITIES = (AlertSeverity.ERROR, AlertSeverity.WARNING)
 _STALE_DEPENDENCY_QUEUE_AFTER = timedelta(minutes=10)
 _STALE_TASK_PREVIEW_LIMIT = 4
+_MESSAGE_BLOCKER_PREVIEW_LIMIT = 8
+_MESSAGE_QUESTION_PREVIEW_LIMIT = 8
+_MESSAGE_WATCH_PREVIEW_LIMIT = 24
+_ALERT_ERROR_PREVIEW_LIMIT = 4
+_ALERT_WARNING_PREVIEW_LIMIT = 4
+
+_ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
+    ("needs_operator", "approval_required"): 10,
+    ("needs_operator", "alert"): 20,
+    ("needs_operator", "local_runner_hold"): 30,
+    ("needs_operator", "stale_runner_pin"): 40,
+    ("needs_operator", "stale_provisioning_task"): 50,
+    ("needs_operator", "stale_queued_task"): 60,
+    ("needs_operator", "manual_intervention"): 70,
+    ("needs_operator", "blocker"): 80,
+    ("needs_operator", "question"): 90,
+    ("watch", "alert"): 200,
+    ("watch", "failed_task"): 210,
+    ("watch", "blocked_task"): 220,
+    ("watch", "parked_task"): 230,
+    ("watch", "bug_report"): 240,
+    ("watch", "feedback"): 250,
+}
+_DEFAULT_NEEDS_OPERATOR_VISIBLE_PRIORITY = 100
+_DEFAULT_WATCH_VISIBLE_PRIORITY = 300
+
+_ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
+    "question": {
+        "mode": "message_lifecycle",
+        "clears_when": "message_resolved_or_deleted",
+        "operator_action": "reply_or_resolve_message",
+        "acknowledgeable": True,
+        "acknowledge_effect": "clears_unread_only",
+    },
+    "blocker": {
+        "mode": "message_lifecycle",
+        "clears_when": "message_resolved_or_deleted",
+        "operator_action": "inspect_or_resolve_message",
+        "acknowledgeable": True,
+        "acknowledge_effect": "clears_unread_only",
+    },
+    "bug_report": {
+        "mode": "message_lifecycle",
+        "clears_when": "message_resolved_or_deleted",
+        "operator_action": "inspect_or_resolve_message",
+        "acknowledgeable": True,
+        "acknowledge_effect": "clears_unread_only",
+    },
+    "feedback": {
+        "mode": "message_lifecycle",
+        "clears_when": "message_resolved_or_deleted",
+        "operator_action": "inspect_or_resolve_message",
+        "acknowledgeable": True,
+        "acknowledge_effect": "clears_unread_only",
+    },
+    "approval_required": {
+        "mode": "task_lifecycle",
+        "clears_when": "approval_resolved_or_task_terminal_or_archived",
+        "operator_action": "approve_or_reject_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "local_runner_hold": {
+        "mode": "runtime_lifecycle",
+        "clears_when": "eligible_runner_available_or_task_dispatches_expires_terminal_or_archived",
+        "operator_action": "connect_or_select_local_runner",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "stale_runner_pin": {
+        "mode": "runtime_lifecycle",
+        "clears_when": "runner_recovers_task_unpins_dispatches_terminal_or_archived",
+        "operator_action": "recover_runner_or_retarget_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "stale_provisioning_task": {
+        "mode": "task_lifecycle",
+        "clears_when": "task_claims_healthy_runtime_recovers_terminal_or_archived",
+        "operator_action": "inspect_runtime_or_requeue_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "stale_queued_task": {
+        "mode": "task_lifecycle",
+        "clears_when": "dependency_recovers_task_leaves_queue_terminal_or_archived",
+        "operator_action": "inspect_dependency_or_requeue_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "manual_intervention": {
+        "mode": "direction_lifecycle",
+        "clears_when": "direction_flag_cleared_or_direction_inactive",
+        "operator_action": "update_direction",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "alert": {
+        "mode": "alert_lifecycle",
+        "clears_when": "alert_dismissed_or_resolved_at_source",
+        "operator_action": "dismiss_or_fix_alert_source",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "blocked_task": {
+        "mode": "task_lifecycle",
+        "clears_when": "task_unblocked_terminal_or_archived",
+        "operator_action": "inspect_blocked_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "parked_task": {
+        "mode": "task_lifecycle",
+        "clears_when": "task_unparked_terminal_or_archived",
+        "operator_action": "inspect_parked_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "failed_task": {
+        "mode": "task_lifecycle",
+        "clears_when": "task_requeued_archived_or_otherwise_resolved",
+        "operator_action": "inspect_failed_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+}
+
+_DEFAULT_ATTENTION_LIFECYCLE = {
+    "mode": "source_lifecycle",
+    "clears_when": "underlying_source_clears",
+    "operator_action": "inspect_source",
+    "acknowledgeable": False,
+    "acknowledge_effect": "none",
+}
 
 
 def _enum_value(value: Any) -> str:
@@ -76,6 +210,29 @@ def _compact_text(value: Any, *, max_chars: int = 180) -> str:
 
 def _attention_target(target: dict[str, Any]) -> dict[str, Any]:
     return normalize_target(target) or {}
+
+
+def _attention_lifecycle(reason: Any) -> dict[str, Any]:
+    reason_key = str(reason or "")
+    return dict(
+        _ATTENTION_LIFECYCLE_BY_REASON.get(
+            reason_key,
+            _DEFAULT_ATTENTION_LIFECYCLE,
+        )
+    )
+
+
+def _attention_visible_priority(item: dict[str, Any]) -> int:
+    severity = str(item.get("severity") or "")
+    reason = str(item.get("reason") or "")
+    mapped_priority = _ATTENTION_VISIBLE_PRIORITY.get((severity, reason))
+    if mapped_priority is not None:
+        return mapped_priority
+    if severity == "needs_operator":
+        return _DEFAULT_NEEDS_OPERATOR_VISIBLE_PRIORITY
+    if severity == "watch":
+        return _DEFAULT_WATCH_VISIBLE_PRIORITY
+    return _DEFAULT_WATCH_VISIBLE_PRIORITY + 100
 
 
 def _direction_manual_intervention(direction: Any) -> bool:
@@ -587,7 +744,7 @@ async def build_operator_attention(
         )
     ).scalar_one_or_none()
 
-    message_rows = list(
+    blocker_message_rows = list(
         (
             await session.execute(
                 select(ProjectMessage)
@@ -595,15 +752,52 @@ async def build_operator_attention(
                     ProjectMessage.project_id == project.id,
                     ProjectMessage.status == OPEN_STATUS,
                     ProjectMessage.from_type != "user",
-                    ProjectMessage.message_type.in_(list(_HIGH_SIGNAL_MESSAGE_TYPES)),
+                    ProjectMessage.message_type == MessageType.BLOCKER,
                 )
                 .order_by(ProjectMessage.created_at.desc())
-                .limit(24)
+                .limit(_MESSAGE_BLOCKER_PREVIEW_LIMIT)
             )
         )
         .scalars()
         .all()
     )
+    question_message_rows = list(
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.from_type != "user",
+                    ProjectMessage.message_type == MessageType.QUESTION,
+                )
+                .order_by(ProjectMessage.created_at.desc())
+                .limit(_MESSAGE_QUESTION_PREVIEW_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    watch_message_rows = list(
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.status == OPEN_STATUS,
+                    ProjectMessage.from_type != "user",
+                    ProjectMessage.message_type.in_(
+                        [MessageType.BUG_REPORT, MessageType.FEEDBACK]
+                    ),
+                )
+                .order_by(ProjectMessage.created_at.desc())
+                .limit(_MESSAGE_WATCH_PREVIEW_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    message_rows = [*blocker_message_rows, *question_message_rows, *watch_message_rows]
     message_count_rows = (
         await session.execute(
             select(ProjectMessage.message_type, func.count())
@@ -855,22 +1049,39 @@ async def build_operator_attention(
         .scalars()
         .all()
     )
-    alerts = list(
+    error_alerts = list(
         (
             await session.execute(
                 select(Alert)
                 .where(
                     Alert.project_id == project.id,
                     Alert.dismissed_at.is_(None),
-                    Alert.severity.in_(list(_ACTIONABLE_ALERT_SEVERITIES)),
+                    Alert.severity == AlertSeverity.ERROR,
                 )
                 .order_by(Alert.created_at.desc())
-                .limit(4)
+                .limit(_ALERT_ERROR_PREVIEW_LIMIT)
             )
         )
         .scalars()
         .all()
     )
+    warning_alerts = list(
+        (
+            await session.execute(
+                select(Alert)
+                .where(
+                    Alert.project_id == project.id,
+                    Alert.dismissed_at.is_(None),
+                    Alert.severity == AlertSeverity.WARNING,
+                )
+                .order_by(Alert.created_at.desc())
+                .limit(_ALERT_WARNING_PREVIEW_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    alerts = [*error_alerts, *warning_alerts]
 
     directions = project.directions if isinstance(project.directions, list) else []
     manual_directions = [
@@ -882,21 +1093,22 @@ async def build_operator_attention(
     ]
     manual_directions.sort(key=_direction_priority)
 
-    items: list[dict[str, Any]] = []
+    candidate_items: list[dict[str, Any]] = []
 
-    def add_item(item: dict[str, Any]) -> None:
-        if len(items) < _MAX_ATTENTION_ITEMS:
-            items.append(item)
+    def add_candidate(item: dict[str, Any]) -> None:
+        item.setdefault("lifecycle", _attention_lifecycle(item.get("reason")))
+        item["_visible_priority"] = _attention_visible_priority(item)
+        candidate_items.append(item)
 
     for message in [*open_questions, *open_blockers]:
-        add_item(
+        add_candidate(
             _message_attention_item(
                 message,
                 unread=message.id in unread_message_ids,
             )
         )
     for task in approval_tasks:
-        add_item(
+        add_candidate(
             _task_attention_item(
                 task,
                 reason="approval_required",
@@ -904,29 +1116,36 @@ async def build_operator_attention(
             )
         )
     for task in local_runner_hold_tasks:
-        add_item(_local_runner_hold_attention_item(task))
+        add_candidate(_local_runner_hold_attention_item(task))
     for task, runner in stale_runner_pin_tasks:
-        add_item(_stale_runner_pin_attention_item(task, runner=runner))
+        add_candidate(_stale_runner_pin_attention_item(task, runner=runner))
     for task in stale_provisioning_tasks:
-        add_item(_stale_task_attention_item(task, reason="stale_provisioning_task"))
+        add_candidate(
+            _stale_task_attention_item(task, reason="stale_provisioning_task")
+        )
     for task in stale_queued_tasks:
-        add_item(_stale_task_attention_item(task, reason="stale_queued_task"))
+        add_candidate(_stale_task_attention_item(task, reason="stale_queued_task"))
     for direction in manual_directions[:3]:
-        add_item(_direction_attention_item(project.id, direction))
+        add_candidate(_direction_attention_item(project.id, direction))
     for alert in alerts:
-        add_item(_alert_attention_item(alert))
+        add_candidate(_alert_attention_item(alert))
     for task in held_tasks:
         reason = "parked_task" if task.status == TaskStatus.PARKED else "blocked_task"
-        add_item(_task_attention_item(task, reason=reason, severity="watch"))
+        add_candidate(_task_attention_item(task, reason=reason, severity="watch"))
     for task in failed_tasks:
-        add_item(_task_attention_item(task, reason="failed_task", severity="watch"))
+        add_candidate(_task_attention_item(task, reason="failed_task", severity="watch"))
     for message in watch_messages:
-        add_item(
+        add_candidate(
             _message_attention_item(
                 message,
                 unread=message.id in unread_message_ids,
             )
         )
+
+    candidate_items.sort(key=lambda item: item.get("_visible_priority", 999))
+    items = candidate_items[:_MAX_ATTENTION_ITEMS]
+    for item in items:
+        item.pop("_visible_priority", None)
 
     needs_operator_count = sum(
         1 for item in items if item["severity"] == "needs_operator"
@@ -966,11 +1185,22 @@ async def build_operator_attention(
         summary = f"{total_watch} pipeline item{plural} worth watching"
     else:
         summary = "No operator action is currently flagged"
+    total_attention_count = total_needs_operator + total_watch
 
     return {
         "level": level,
         "summary": summary,
         "last_seen_at": last_seen_at.isoformat() if last_seen_at else None,
+        "has_more": total_attention_count > len(items),
+        "limits": {
+            "items": _MAX_ATTENTION_ITEMS,
+            "message_blocker_preview": _MESSAGE_BLOCKER_PREVIEW_LIMIT,
+            "message_question_preview": _MESSAGE_QUESTION_PREVIEW_LIMIT,
+            "message_watch_preview": _MESSAGE_WATCH_PREVIEW_LIMIT,
+            "stale_task_preview": _STALE_TASK_PREVIEW_LIMIT,
+            "alert_error_preview": _ALERT_ERROR_PREVIEW_LIMIT,
+            "alert_warning_preview": _ALERT_WARNING_PREVIEW_LIMIT,
+        },
         "counts": {
             "needs_operator": total_needs_operator,
             "watch": total_watch,

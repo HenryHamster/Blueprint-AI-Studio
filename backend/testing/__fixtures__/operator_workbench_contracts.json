@@ -475,8 +475,18 @@
         "unread": 1,
         "watch": 1
       },
+      "has_more": true,
       "items": [],
       "last_seen_at": null,
+      "limits": {
+        "items": 8,
+        "message_blocker_preview": 8,
+        "message_question_preview": 8,
+        "message_watch_preview": 24,
+        "stale_task_preview": 4,
+        "alert_error_preview": 4,
+        "alert_warning_preview": 4
+      },
       "level": "watch",
       "summary": "1 open message"
     },

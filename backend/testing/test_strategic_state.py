@@ -2344,12 +2344,14 @@ async def test_strategic_session_command_executes_attention_housekeeping(
     client: AsyncClient, db_session
 ):
     project = await _make_project(db_session)
+    message_created_at = _utcnow() - timedelta(minutes=10)
     message = ProjectMessage(
         project_id=project.id,
         message_type=MessageType.QUESTION,
         from_type="strategic",
         content="Need operator input.",
         status="open",
+        created_at=message_created_at,
     )
     alert = Alert(
         project_id=project.id,
@@ -2361,8 +2363,9 @@ async def test_strategic_session_command_executes_attention_housekeeping(
     )
     db_session.add_all([message, alert])
     await db_session.commit()
+    await db_session.refresh(message)
     await db_session.refresh(alert)
-    observed_at = naive_utc_to_epoch_ms(_utcnow() - timedelta(minutes=5))
+    observed_at = naive_utc_to_epoch_ms(message_created_at + timedelta(minutes=5))
 
     seen_resp = await client.post(
         f"/api/admin/projects/{project.id}/strategic-session/commands/attention.messages.mark_seen/execute",
@@ -2404,6 +2407,21 @@ async def test_strategic_session_command_executes_attention_housekeeping(
     assert duplicate_command["status"] == "duplicate"
     assert duplicate_command["applied"] is False
     assert duplicate_command["receipt"]["id"] == dismiss_resp.json()["command"]["receipt"]["id"]
+
+    state_resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert state_resp.status_code == 200, state_resp.text
+    attention = state_resp.json()["attention"]
+    assert attention["counts"]["unread"] == 0
+    assert attention["counts"]["questions"] == 1
+    assert attention["counts"]["alerts"] == 0
+    assert attention["counts"]["warning_alerts"] == 0
+    assert attention["level"] == "needs_operator"
+    attention_items = {item["id"]: item for item in attention["items"]}
+    message_item = attention_items[f"message:{message.id}"]
+    assert message_item["unread"] is False
+    assert message_item["reason"] == "question"
+    assert message_item["lifecycle"]["acknowledge_effect"] == "clears_unread_only"
+    assert f"alert:{alert.id}" not in attention_items
 
 
 @pytest.mark.asyncio
@@ -4812,6 +4830,16 @@ async def test_strategic_state_includes_operator_attention(
     assert attention["counts"]["blocked_tasks"] == 1
     assert attention["counts"]["needs_operator"] == 5
     assert attention["counts"]["watch"] == 2
+    assert attention["has_more"] is False
+    assert attention["limits"] == {
+        "items": 8,
+        "message_blocker_preview": 8,
+        "message_question_preview": 8,
+        "message_watch_preview": 24,
+        "stale_task_preview": 4,
+        "alert_error_preview": 4,
+        "alert_warning_preview": 4,
+    }
     assert len(attention["items"]) <= 8
 
     item_ids = {item["id"] for item in attention["items"]}
@@ -4823,24 +4851,42 @@ async def test_strategic_state_includes_operator_attention(
     assert f"alert:{dismissed_alert.id}" not in item_ids
     assert "direction:d-manual:manual_intervention" in item_ids
     assert all(len(item.get("detail") or "") <= 180 for item in attention["items"])
+    assert all(item.get("lifecycle") for item in attention["items"])
     attention_items = {item["id"]: item for item in attention["items"]}
+    question_lifecycle = attention_items[f"message:{question.id}"]["lifecycle"]
+    assert question_lifecycle == {
+        "mode": "message_lifecycle",
+        "clears_when": "message_resolved_or_deleted",
+        "operator_action": "reply_or_resolve_message",
+        "acknowledgeable": True,
+        "acknowledge_effect": "clears_unread_only",
+    }
+    alert_lifecycle = attention_items[f"alert:{active_alert.id}"]["lifecycle"]
+    assert alert_lifecycle["mode"] == "alert_lifecycle"
+    assert alert_lifecycle["clears_when"] == "alert_dismissed_or_resolved_at_source"
+    assert alert_lifecycle["acknowledgeable"] is False
     assert attention_items[
         f"task:{approval_task.id}:approval_required"
     ]["movement_explanation"] == "Waiting for operator approval."
+    approval_lifecycle = attention_items[
+        f"task:{approval_task.id}:approval_required"
+    ]["lifecycle"]
+    assert approval_lifecycle["mode"] == "task_lifecycle"
+    assert approval_lifecycle["operator_action"] == "approve_or_reject_task"
 
     actions = data["work_session"]["actions"]
     assert len(actions) <= 10
-    assert actions[0]["id"] == f"attention.message:{question.id}"
-    assert actions[0]["kind"] == "reply"
-    assert actions[0]["label"] == "Reply to Strategic question"
-    assert actions[0]["priority"] == "critical"
-    assert actions[0]["target"] == {
+    actions_by_id = {entry["id"]: entry for entry in actions}
+    question_action = actions_by_id[f"attention.message:{question.id}"]
+    assert question_action["kind"] == "reply"
+    assert question_action["label"] == "Reply to Strategic question"
+    assert question_action["priority"] == "critical"
+    assert question_action["target"] == {
         "surface": "messages",
         "project_id": str(project.id),
         "message_id": str(question.id),
         "action": "reply",
     }
-    actions_by_id = {entry["id"]: entry for entry in actions}
     approval_action = actions_by_id[
         f"attention.task:{approval_task.id}:approval_required"
     ]
@@ -4958,8 +5004,145 @@ async def test_operator_attention_message_counts_are_not_capped_by_preview_limit
     assert attention["counts"]["approvals"] == 1
     assert attention["counts"]["needs_operator"] == 2
     assert attention["counts"]["watch"] == 30
+    assert attention["has_more"] is True
+    item_ids = {item["id"] for item in attention["items"]}
+    assert f"message:{old_question.id}" in item_ids
+    assert f"task:{approval_task.id}:approval_required" in item_ids
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_cap_prioritizes_non_message_operator_items(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    for idx in range(8):
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.QUESTION,
+                from_type="agent",
+                content=f"Open question {idx}",
+                status="open",
+                created_at=now - timedelta(minutes=idx),
+            )
+        )
+    approval_task = Task(
+        project_id=project.id,
+        title="Visible approval",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.QUEUED,
+        requires_approval=True,
+    )
+    error_alert = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.ERROR,
+        title="Visible runtime error",
+        message="Runner pool cannot dispatch work.",
+        domain="runtime",
+        event_type="dispatch_error",
+    )
+    db_session.add(approval_task)
+    db_session.add(error_alert)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["questions"] == 8
+    assert attention["counts"]["approvals"] == 1
+    assert attention["counts"]["error_alerts"] == 1
+    assert attention["counts"]["needs_operator"] == 10
+    assert len(attention["items"]) == 8
+    assert attention["has_more"] is True
     item_ids = {item["id"] for item in attention["items"]}
     assert f"task:{approval_task.id}:approval_required" in item_ids
+    assert f"alert:{error_alert.id}" in item_ids
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_needs_preview_preserves_older_blockers(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    for idx in range(8):
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.QUESTION,
+                from_type="agent",
+                content=f"Newer open question {idx}",
+                status="open",
+                created_at=now - timedelta(minutes=idx),
+            )
+        )
+    older_blocker = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.BLOCKER,
+        from_type="agent",
+        content="Older blocker must still stay visible.",
+        status="open",
+        created_at=now - timedelta(days=1),
+    )
+    db_session.add(older_blocker)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["questions"] == 8
+    assert attention["counts"]["blockers"] == 1
+    assert len(attention["items"]) == 8
+    assert attention["has_more"] is True
+    assert f"message:{older_blocker.id}" in {
+        item["id"] for item in attention["items"]
+    }
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_cap_prioritizes_local_runner_holds(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    for idx in range(8):
+        db_session.add(
+            ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.QUESTION,
+                from_type="agent",
+                content=f"Open question before local runner hold {idx}",
+                status="open",
+                created_at=now - timedelta(minutes=idx),
+            )
+        )
+    awaiting_since = (now - timedelta(minutes=30)).isoformat()
+    local_hold = Task(
+        project_id=project.id,
+        title="Local hardware wait",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.QUEUED,
+        latest_status_message="require_local_runner is waiting for hardware.",
+        context={"awaiting_local_runner_since": awaiting_since},
+        priority=1,
+    )
+    db_session.add(local_hold)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["questions"] == 8
+    assert attention["counts"]["local_runner_holds"] == 1
+    assert len(attention["items"]) == 8
+    assert attention["has_more"] is True
+    assert f"task:{local_hold.id}:local_runner_hold" in {
+        item["id"] for item in attention["items"]
+    }
 
 
 @pytest.mark.asyncio
@@ -5142,6 +5325,51 @@ async def test_operator_attention_pure_blocked_not_requiring_approval_stays_in_w
     item_ids = {item["id"] for item in attention["items"]}
     assert f"task:{plain_blocked.id}:blocked_task" in item_ids
     assert f"task:{plain_blocked.id}:approval_required" not in item_ids
+    blocked_lifecycle = attention["items"][0]["lifecycle"]
+    assert blocked_lifecycle["mode"] == "task_lifecycle"
+    assert blocked_lifecycle["operator_action"] == "inspect_blocked_task"
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_watch_lifecycle_for_parked_task_and_warning_alert(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    parked = Task(
+        project_id=project.id,
+        title="Parked without approval flag",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.PARKED,
+        requires_approval=False,
+        park_reason="Waiting for a scheduled wake.",
+    )
+    warning = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.WARNING,
+        title="Runner warm pool warning",
+        message="Warm pool is below target.",
+        domain="runtime",
+        event_type="warm_pool_warning",
+    )
+    db_session.add_all([parked, warning])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["level"] == "watch"
+    assert attention["counts"]["needs_operator"] == 0
+    assert attention["counts"]["watch"] == 2
+    assert attention["counts"]["parked_tasks"] == 1
+    assert attention["counts"]["warning_alerts"] == 1
+    items = {item["id"]: item for item in attention["items"]}
+    parked_item = items[f"task:{parked.id}:parked_task"]
+    assert parked_item["severity"] == "watch"
+    assert parked_item["lifecycle"]["clears_when"] == "task_unparked_terminal_or_archived"
+    warning_item = items[f"alert:{warning.id}"]
+    assert warning_item["severity"] == "watch"
+    assert warning_item["lifecycle"]["mode"] == "alert_lifecycle"
 
 
 @pytest.mark.asyncio

@@ -433,6 +433,20 @@ def test_operator_workbench_contract_fixture_is_current():
     assert _operator_workbench_fixture() == build_operator_workbench_contract_fixture()
 
 
+def test_operator_workbench_fixture_attention_has_more_matches_counts():
+    fixture_attention = _operator_workbench_fixture()["strategic_state_response"][
+        "attention"
+    ]
+    total_attention = (
+        fixture_attention["counts"]["needs_operator"]
+        + fixture_attention["counts"]["watch"]
+    )
+
+    assert fixture_attention["has_more"] is (
+        total_attention > len(fixture_attention["items"])
+    )
+
+
 def test_operator_workbench_fixture_validates_core_contracts():
     fixture = _operator_workbench_fixture()
 

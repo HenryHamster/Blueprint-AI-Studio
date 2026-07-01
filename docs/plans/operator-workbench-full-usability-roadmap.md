@@ -27,7 +27,7 @@ Legend:
 | M5. Strategic context and canvas/artifact surface | Done | Context package, selected refs, canvas descriptors, `StrategicContextWorkspace`, map/resource rows, Chat artifact slot, descriptor schema, renderer tests, golden fixtures. | Keep v1 read-only; revisit writable canvas/layout persistence only with a concrete requirement. |
 | M6. Pipeline monitoring and task sideboard | Done | Pipeline workspace, task tree, task rail, stale attention routing, task sideboard context, task-sideboard contract, Chat task-target drawer routing, waiting-vs-blocked health labels. | Further tracked-stream affordance polish can continue without reopening the sideboard contract. |
 | M7. Runtime, devices, accounts, settings, project management | Done | Canonical Project/Runtime settings homes, workspace-hosted settings router semantics, command/context routing to Project Manage and Runtime Settings/Accounts, reachability and viewport tests. | Keep regression coverage while remaining project/runtime policy work lands. |
-| M8. Operator attention and work-session read model | Partial | Derived attention state, registry-backed curated metric metadata, actions, events, jobs, command receipts, and command receipts excluded from check-in deltas. | Finish lifecycle clearing semantics and performance review for larger event/metric volumes. |
+| M8. Operator attention and work-session read model | Partial | Derived attention state, lifecycle metadata, prioritized bounded attention candidates, registry-backed curated metric metadata, actions, events, jobs, command receipts, and command receipts excluded from check-in deltas. | Extend lifecycle regression coverage across remaining rare reasons during M12 audits. |
 | M9. Unified event and message contracts | Done | Workbench event v1 envelope, websocket emitter/v1-producer inventory guards, backend-owned operator workbench fixture, frontend fixture consumption, canonical target/refetch vocabulary. | Keep fixtures and emitter inventory updated as read models evolve. |
 | M10. Visual system and UI polish | Done | Workbench theme tokens, shell/header/workspace token migration, raw-shell-color guard, Pipeline duplicate task-open cleanup, focused viewport assertions and capture review. | Extend token coverage opportunistically to lower-level panels without changing IA. |
 | M11. Background operator jobs | Planned | Existing compute jobs, runner jobs, orchestrator loops, command receipts. | Only build a real operator-job table if a concrete async operator command needs it. |
@@ -360,21 +360,18 @@ Purpose: Give the operator a reliable "what needs me" and "what is happening now
 Existing:
 - `operator_attention.py` derives high-signal message, question/blocker, approval, local runner hold, stale runner pin, stale provisioning, stale queued dependency, failed, blocked, parked, alert, and manual-intervention direction items.
 - Attention items now include canonical targets for task/runtime routing.
+- Attention items expose lifecycle metadata: source lifecycle, clearing condition, operator action, and whether acknowledgement only clears unread message state.
+- Attention assembly collects bounded source previews and prioritizes visible items so approvals, runtime holds, blockers, and error alerts cannot be hidden by a long message/watch queue.
+- Attention exposes `has_more` and source preview limits for item, message, stale-task, and alert pools.
 - Work-session projections include actions, commands, curated metrics, events, jobs/receipts, selected refs, context package, and runtime work.
 - Work-session command execution emits receipts.
 - Curated work-session metrics are now registry-backed with source path, unit, window, denominator, target, and stale behavior metadata while preserving the existing UI-facing IDs/labels/values.
 - Check-in deltas now ignore operator command receipts, so internal command acknowledgements do not inflate "since last check-in" activity counts.
 
 Remaining work:
-- Define lifecycle semantics for attention:
-  - what clears automatically
-  - what can be acknowledged
-  - what must be dismissed on the underlying object
-  - what is only watch-level
 - Consider a lightweight acknowledgement model only if indirect clearing is not enough.
-- Ensure read-model performance does not degrade as more metrics/events are added.
-- Make stale Strategic local runner holds bounded, as covered in M2.
-- Keep attention item count bounded while preserving high-priority ordering.
+- Extend lifecycle regression coverage across less common reasons during M12 audits: blocker, bug/feedback, local runner hold, stale runner pin/provisioning/queued, manual direction, and failed task.
+- Run larger-volume strategic-state profiling during M12 if real project volumes expose latency.
 
 Authoritative files:
 - `backend/app/operator_attention.py`
@@ -587,15 +584,15 @@ Final verification gates:
 
 ## Next Batch Recommendation
 
-Recommended next implementation batches: continue M4/M9 and M8, then run M12 audit loops.
+Recommended next implementation batches: run M12 completion audit loops, then address any concrete backend/frontend gaps they surface.
 
 Scope:
-1. M4/M9: finish command registry semantics, mutation allowlist documentation, and backend/frontend fixture convergence.
-2. M8: finish lifecycle clearing semantics and performance review for larger event/metric volumes.
+1. M12: run backend contract, frontend viewport, and visual-surface audits against the current workbench.
+2. M8: add any rare-reason lifecycle regressions found by the audit; do not build a separate acknowledgement table unless the audit proves indirect clearing is insufficient.
 3. Keep M7/M10 token and settings-home regression coverage current while lower-level panels change.
-4. Start M12 completion audit passes once M4/M8/M9 have their remaining contract coverage.
+4. Address remaining UI alignment issues as polish batches, not new IA.
 
-Reason: the highest-risk M2 reliability gap is closed, M3/M5/M6/M7/M10 have landed, and the remaining material progress is now command/contracts plus read-model/event hardening.
+Reason: the highest-risk M2 reliability gap is closed, M3/M4/M5/M6/M7/M9/M10 have landed, and the remaining material progress is now hardening, audit-driven fixes, and targeted polish.
 
 ## Update Log
 
@@ -609,3 +606,4 @@ Reason: the highest-risk M2 reliability gap is closed, M3/M5/M6/M7/M10 have land
 | 2026-07-01 | `33dd23e38` | Pushed stale operator attention paths: stale runner pins, provisioning, queued dependencies, Strategic local runner hold counts, frontend routing/sideboard integration, and regression tests. |
 | 2026-07-01 | M7/M10 runtime and visual polish | Implemented M7/M10 cleanup: canonical settings homes, workspace router host semantics, workbench theme tokens, primary shell token migration, Pipeline duplicate-open cleanup, reachability tests, focused typecheck/unit/viewport/capture evidence. |
 | 2026-07-01 | M2 continuation ownership/TTL | Added 12-hour workday continuation TTL, owner/lease read-model fields, foreign-owner and duplicate-session marker protection, Devices ownership warning, and focused backend/frontend tests. |
+| 2026-07-01 | M8 attention lifecycle/caps | Added lifecycle metadata, bounded priority selection for attention items, split message/alert previews, `has_more`/limit contract fields, command-housekeeping regressions, fixture invariants, and focused backend/frontend tests. |

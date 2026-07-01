@@ -784,6 +784,16 @@ def build_operator_workbench_contract_fixture() -> dict[str, Any]:
             "level": "watch",
             "summary": "1 open message",
             "last_seen_at": None,
+            "has_more": True,
+            "limits": {
+                "items": 8,
+                "message_blocker_preview": 8,
+                "message_question_preview": 8,
+                "message_watch_preview": 24,
+                "stale_task_preview": 4,
+                "alert_error_preview": 4,
+                "alert_warning_preview": 4,
+            },
             "counts": {
                 "needs_operator": 0,
                 "watch": 1,

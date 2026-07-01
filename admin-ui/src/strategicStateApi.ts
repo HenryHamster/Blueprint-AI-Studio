@@ -56,6 +56,13 @@ export interface StrategicStateAttentionItem {
     project_id: string;
   };
   target?: StrategicContextTarget | null;
+  lifecycle?: {
+    mode?: string | null;
+    clears_when?: string | null;
+    operator_action?: string | null;
+    acknowledgeable?: boolean | null;
+    acknowledge_effect?: string | null;
+  } | null;
   awaiting_since?: string | null;
   runner_id?: string | null;
   task_id?: string | null;
@@ -819,6 +826,16 @@ export interface StrategicStateResponse {
     level: 'clear' | 'watch' | 'needs_operator' | string;
     summary: string;
     last_seen_at: string | null;
+    has_more?: boolean;
+    limits?: {
+      items?: number;
+      message_blocker_preview?: number;
+      message_question_preview?: number;
+      message_watch_preview?: number;
+      stale_task_preview?: number;
+      alert_error_preview?: number;
+      alert_warning_preview?: number;
+    };
     counts: {
       needs_operator: number;
       watch: number;
