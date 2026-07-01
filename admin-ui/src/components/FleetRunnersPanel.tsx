@@ -57,6 +57,9 @@ function activeTaskCount(runner: FleetRunner): number {
 
 function activeWorkCount(runner: FleetRunner): number {
   if (runner.health?.active_work_count !== undefined) return runner.health.active_work_count;
+  if (runner.health?.active_compute_job_count !== undefined) {
+    return activeTaskCount(runner) + runner.health.active_compute_job_count;
+  }
   const activeCompute = Array.isArray(runner.capabilities.active_compute_job_ids)
     ? runner.capabilities.active_compute_job_ids.length
     : 0;
@@ -64,10 +67,18 @@ function activeWorkCount(runner: FleetRunner): number {
 }
 
 function availableSlots(runner: FleetRunner): number | null {
-  if (runner.health) return runner.health.available_slots;
+  if (runner.health) {
+    const health = runner.health as { available_slots?: number | null; max_concurrent?: number | null };
+    if (typeof health.available_slots === 'number') return health.available_slots;
+    if (health.available_slots === null) return null;
+    if (typeof health.max_concurrent === 'number') {
+      return Math.max(0, health.max_concurrent - activeWorkCount(runner));
+    }
+    return null;
+  }
   const max = runner.capabilities.max_concurrent;
   if (typeof max !== 'number') return null;
-  return Math.max(0, max - activeTaskCount(runner));
+  return Math.max(0, max - activeWorkCount(runner));
 }
 
 function maxSlotsForRunner(runner: FleetRunner): number | null {
@@ -350,8 +361,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
   const liveGpuRunners = liveRunners.filter(runner => runner.capabilities.has_gpu);
   const liveStrategicRunners = liveRunners.filter(isStrategicRunner);
   const liveRunnerReadiness = liveRunners.map(runner => runnerReadiness(runner, true, availableSlots(runner)));
+  const liveStrategicRunnerReadiness = liveStrategicRunners.map(runner => runnerReadiness(runner, true, availableSlots(runner)));
   const readyRunners = liveRunnerReadiness.filter(readiness => readiness.ready).length;
+  const eligibleStrategicRunners = liveStrategicRunnerReadiness.filter(readiness => readiness.ready).length;
   const agentUnavailable = liveRunners.filter(runner => runner.health?.agent_available === false).length;
+  const strategicAgentUnavailable = liveStrategicRunners.filter(runner => runner.health?.agent_available === false).length;
   const busyWork = liveRunners.reduce((sum, runner) => sum + activeWorkCount(runner), 0);
   const maxSlots = liveRunners.reduce((sum, runner) => sum + (maxSlotsForRunner(runner) ?? 0), 0);
   const slotValues = liveRunners.map(availableSlots);
@@ -389,6 +403,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
           <button
             onClick={load}
             className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-md border border-neutral-800 text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-[#151c25] hover:text-neutral-200 md:min-h-9 md:min-w-9"
+            aria-label="Refresh runners"
             title="Refresh"
           >
             <RefreshCw className="w-3.5 h-3.5" />
@@ -440,11 +455,13 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
           </div>
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
             <div className="text-ui-md uppercase tracking-wide text-neutral-500">strategic</div>
-            <div className={`mt-0.5 font-mono ${liveStrategicRunners.length > 0 ? 'text-emerald-300' : 'text-neutral-500'}`} data-testid="fleet-runner-strategic-readiness">
-              {liveStrategicRunners.length > 0 ? `${liveStrategicRunners.length} connected` : 'none connected'}
+            <div className={`mt-0.5 font-mono ${eligibleStrategicRunners > 0 ? 'text-emerald-300' : 'text-neutral-500'}`} data-testid="fleet-runner-strategic-readiness">
+              {eligibleStrategicRunners > 0 ? `${eligibleStrategicRunners} eligible live` : 'none eligible'}
             </div>
-            <div className={`mt-0.5 truncate text-ui-sm ${agentUnavailable > 0 ? 'text-red-300' : 'text-neutral-600'}`}>
-              {agentUnavailable > 0 ? `${agentUnavailable} agent blocked` : 'agents ok'}
+            <div className={`mt-0.5 truncate text-ui-sm ${strategicAgentUnavailable > 0 ? 'text-red-300' : 'text-neutral-600'}`}>
+              {strategicAgentUnavailable > 0
+                ? `${liveStrategicRunners.length} connected / ${strategicAgentUnavailable} agent blocked`
+                : `${liveStrategicRunners.length} connected`}
             </div>
           </div>
         </div>
@@ -483,7 +500,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
             // distinct from the timestamp-derived live/stale label above.
             const isActive = runner.status === 'active';
             const runnerLive = isRunnerLive(runner);
-            const activeCount = activeTaskCount(runner);
+            const activeCount = activeWorkCount(runner);
             const slots = runnerLive ? availableSlots(runner) : null;
             const strategicRunner = isStrategicRunner(runner);
             const readiness = runnerReadiness(runner, runnerLive, slots);
@@ -545,6 +562,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
                   onClick={() => handleRevoke(runner)}
                   disabled={revoking === runner.id}
                   className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-red-500/10 hover:text-red-300 disabled:opacity-40 md:min-h-9 md:min-w-9"
+                  aria-label={`Revoke runner ${runner.hostname ?? runner.id.slice(0, 8)}`}
                   title="Revoke runner"
                 >
                   <Trash2 className="w-3.5 h-3.5" />

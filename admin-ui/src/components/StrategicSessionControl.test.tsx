@@ -111,7 +111,8 @@ describe('StrategicSessionControl', () => {
     );
 
     const devices = screen.getByRole('button', { name: /open devices: runner online, 2\/3 devices/i });
-    expect(devices).toHaveAttribute('title', 'Open devices: 2/3 devices');
+    expect(devices).toHaveAttribute('title', 'Open Devices: 2/3 devices');
+    expect(devices).toHaveTextContent('Devices');
     expect(devices.getAttribute('aria-label')?.match(/2\/3 devices/g)).toHaveLength(1);
 
     await user.click(devices);
@@ -129,6 +130,7 @@ describe('StrategicSessionControl', () => {
           eligible_live_count: 1,
           busy_runner_count: 1,
           continuation: { enabled: true, fresh: true, preferred_runner_id: 'runner-abcdef123456' },
+          runners: [{ id: 'runner-abcdef123456', hostname: 'operator-desk', is_preferred: true }],
         }}
         onModeChange={vi.fn()}
         onOpenDevices={vi.fn()}
@@ -137,7 +139,7 @@ describe('StrategicSessionControl', () => {
 
     expect(
       screen.getByRole('button', {
-        name: /open devices: runner ready, continuation ready on runner runner-a, 2\/3 live, 1 ready, 1 busy, continue fresh/i,
+        name: /open devices: runner ready, fresh continuation, preferred runner operator-desk runner-a, 2\/3 live, 1 eligible live, 1 busy/i,
       }),
     ).toBeInTheDocument();
   });
@@ -156,8 +158,29 @@ describe('StrategicSessionControl', () => {
     );
 
     const devices = screen.getByRole('button', {
-      name: /open devices: runner waiting, continuation is stale, continue stale/i,
+      name: /open devices: runner waiting, stale continuation, preferred runner runner-s/i,
     });
+    expect(devices.className).toContain('border-amber-500/30');
+  });
+
+  it('does not label unknown local continuation freshness as fresh', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        localRunnerStatus={{
+          mode: 'pending_local',
+          continuation: { enabled: true, preferred_runner_id: 'runner-unknown123' },
+        }}
+        onModeChange={vi.fn()}
+        onOpenDevices={vi.fn()}
+      />,
+    );
+
+    const devices = screen.getByRole('button', {
+      name: /open devices: runner waiting, continuation status unknown, preferred runner runner-u/i,
+    });
+    expect(devices).toHaveTextContent('Continuation status unknown');
+    expect(devices).not.toHaveTextContent('Fresh continuation');
     expect(devices.className).toContain('border-amber-500/30');
   });
 
@@ -348,6 +371,38 @@ describe('StrategicSessionControl', () => {
       name: /open compute: runtime work needs check, 2 local runner holds/i,
     });
     expect(compute.className).toContain('border-amber-500/30');
+  });
+
+  it('breaks out Strategic local runner holds when backend exposes them', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        runtimeWorkStatus={{ local_runner_holds: { count: 3, strategic_count: 2, compute_count: 1 } }}
+        onModeChange={vi.fn()}
+        onOpenCompute={vi.fn()}
+      />,
+    );
+
+    const compute = screen.getByRole('button', {
+      name: /open compute: runtime work needs check, 2 strategic holds \/ 1 compute hold/i,
+    });
+    expect(compute).toHaveTextContent('2 Strategic holds / 1 compute hold');
+  });
+
+  it('uses split local runner hold counts when aggregate count is absent', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        runtimeWorkStatus={{ local_runner_holds: { strategic_count: 2, compute_count: 1 } }}
+        onModeChange={vi.fn()}
+        onOpenCompute={vi.fn()}
+      />,
+    );
+
+    const compute = screen.getByRole('button', {
+      name: /open compute: runtime work needs check, 2 strategic holds \/ 1 compute hold/i,
+    });
+    expect(compute).toHaveTextContent('2 Strategic holds / 1 compute hold');
   });
 
   it('does not make idle runtime work open compute', () => {

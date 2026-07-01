@@ -8,7 +8,7 @@ The rule for this file: after every major batch, update the status ledger, miles
 
 ## Status Ledger
 
-Overall implementation estimate: 68%.
+Overall implementation estimate: 70%.
 
 Legend:
 - Done: implemented, reviewed, tested, and pushed.
@@ -21,7 +21,7 @@ Legend:
 | --- | --- | --- | --- |
 | M0. Workbench IA foundation | Done | Four-mode shell, Chat/Pipeline/Project/Runtime homes, task archive moved under Pipeline, runtime settings/devices/accounts rehosted. | Keep regression coverage while later cleanup lands. |
 | M1. Roadmap and tracking discipline | In progress | This document. | Keep this file updated after every pushed batch. |
-| M2. Persistent local Strategic workday mode | Partial | Workbench state, continuous mode markers, Strategic local runner requirement, local runner selection, attention for holds. | Add bounded recovery/timeout and make persistence/ownership explicit. |
+| M2. Persistent local Strategic workday mode | Partial | Workbench state, continuous mode markers, Strategic local runner requirement, local runner selection, attention for holds, stale Strategic hold timeout, clearer Devices UI. | Make continuation persistence/ownership explicit and settle workday TTL semantics. |
 | M3. Messages as the active-work interface | Partial | `MessagesPanel` page, clean composer mode, strategic session messages, context descriptors. | Finish message contract cleanup and remove remaining always-visible advanced chrome from primary chat. |
 | M4. Ctrl+K and hotkey operating layer | Partial | Command palette, shortcut hooks, server command descriptors, allowlisted command execution. | Finish canonical command/target registry and missing hotkeys. |
 | M5. Strategic context and canvas/artifact surface | Partial | Context package, selected refs, canvas descriptors, `StrategicContextWorkspace`, map/resource rows. | Add first-class Chat canvas slot and contract fixtures before any writable canvas system. |
@@ -105,14 +105,13 @@ Existing:
 - Strategic runner preset restricts task types and concurrency.
 - Orchestrator can select eligible local runners and hold local-required Strategic tasks instead of falling back to cloud.
 - Attention now surfaces Strategic local runner holds.
+- Stale Strategic local runner holds now share the compute local-runner bounded timeout path and terminally fail with an operator alert instead of waiting forever.
+- Runtime Devices and Strategic session controls now distinguish fresh, stale, and unknown continuation state; preferred runners; eligible live Strategic runners; connected runners; and Strategic vs compute local-runner holds.
 
 Remaining work:
-- Add bounded timeout/recovery for stale Strategic local holds, comparable to compute local-runner hold safety.
 - Make continuation-marker ownership explicit for multi-operator cases. Current project-level marker is intentionally lossy.
 - Decide whether the current 4-hour workbench TTL is enough for a workday or whether continuous mode needs a longer durable marker.
-- Make UI copy/state precise: local Strategic is persistent while the operator device is connected, not a separate Strategic backend.
-- Add clearer Runtime Devices affordances for registering/selecting/prefering a local Strategic runner.
-- Add tests for stale Strategic local hold timeout, recovery, preferred-runner loss, and duplicate operator sessions.
+- Add any remaining tests for duplicate operator sessions and final preferred-runner loss cases not covered by current runner heartbeat/delete tests.
 
 Authoritative files:
 - `backend/app/workbench_state.py`
@@ -613,26 +612,21 @@ Final verification gates:
 
 ## Next Batch Recommendation
 
-Recommended next implementation batch: M2 plus the contract parts that protect it.
+Recommended next implementation batches: the dispatched parallel tracks for M3, M4/M9, M5/M6, and M7/M10.
 
 Scope:
-1. Add stale Strategic local hold timeout/recovery.
-2. Add tests for Strategic local runner hold lifecycle and preferred-runner loss.
-3. Tighten continuous-mode UI state in Runtime Devices and Strategic session controls.
-4. Add/update contract tests for the affected attention/runtime fields.
-5. Update this roadmap after push.
+1. M3: clean the message/chat contract and active-work surface.
+2. M4/M9: harden Ctrl+K commands, context targets, and backend/frontend fixtures.
+3. M5/M6: add first-class Chat canvas/artifact rendering and task sideboard fixture coverage.
+4. M7/M10: continue Runtime/settings cleanup and visual token polish.
+5. After those land, return to M2 only for continuation ownership and TTL semantics.
 
-Reason: persistent local Strategic is one of the few remaining backend features that can make the workday mode genuinely reliable. It also directly affects the active-work Chat workflow and the Runtime Devices surface.
-
-Parallelizable follow-up batch:
-1. Chat canvas/artifact slot in frontend.
-2. Command/target registry hardening.
-3. Message contract fixture cleanup.
-4. Visual token cleanup for shell/header/Chat/Pipeline.
+Reason: the highest-risk M2 reliability gap is closed; the next material progress is making Chat, command/contracts, canvas/sideboard, and visual/runtime cleanup move in parallel.
 
 ## Update Log
 
 | Date | Commit | Change |
 | --- | --- | --- |
+| 2026-07-01 | M2 local Strategic reliability | Added bounded stale Strategic local runner hold timeout/recovery, frontend Devices/session state clarity, and focused tests. |
 | 2026-07-01 | roadmap creation | Created full usability roadmap and milestone ledger. |
 | 2026-07-01 | `33dd23e38` | Pushed stale operator attention paths: stale runner pins, provisioning, queued dependencies, Strategic local runner hold counts, frontend routing/sideboard integration, and regression tests. |

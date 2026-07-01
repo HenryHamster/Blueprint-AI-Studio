@@ -323,7 +323,7 @@ describe('FleetRunnersPanel — behavioral', () => {
     const el = await mount();
     expect(el.textContent).toContain('connected');
     expect(el.textContent).toContain('Strategic capable');
-    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('1 connected');
+    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('1 eligible live');
     expect(el.textContent).toContain('1 slots free');
     expect(el.textContent).toContain('design_doc_update, strategic_review');
     expect(el.querySelector('[data-testid="fleet-next-action"]')?.textContent).toContain('Fleet has dispatch capacity');
@@ -518,8 +518,130 @@ describe('FleetRunnersPanel — behavioral', () => {
     ]);
     const el = await mount();
 
-    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('1 connected');
+    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('1 eligible live');
     expect(el.textContent).toContain('Strategic capable');
+  });
+
+  test('strategic summary distinguishes connected runners from eligible live runners', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: {
+          task_types: ['design_doc_update', 'strategic_review'],
+          has_gpu: false,
+          max_concurrent: 1,
+          runner_preset: 'strategic_local',
+          workload: 'strategic',
+        },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          seconds_since_last_seen: 8,
+          active_task_count: 1,
+          active_compute_job_count: 0,
+          active_work_count: 1,
+          max_concurrent: 1,
+          available_slots: 0,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('none eligible');
+    expect(el.textContent).toContain('1 connected');
+    expect(el.textContent).toContain('full');
+  });
+
+  test('strategic summary ignores blocked agents on compute-only runners', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        id: 'strategic-runner',
+        capabilities: {
+          task_types: ['design_doc_update', 'strategic_review'],
+          has_gpu: false,
+          max_concurrent: 1,
+          runner_preset: 'strategic_local',
+          workload: 'strategic',
+        },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          seconds_since_last_seen: 8,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 1,
+          available_slots: 1,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+        },
+      },
+      {
+        ...SAMPLE_RUNNERS[0],
+        id: 'compute-runner',
+        capabilities: {
+          task_types: ['compute_experiment'],
+          has_gpu: true,
+          max_concurrent: 1,
+        },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          seconds_since_last_seen: 10,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 1,
+          available_slots: 1,
+          stale_reason: null,
+          agent_available: false,
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('1 eligible live');
+    expect(el.textContent).toContain('1 connected');
+    expect(el.textContent).not.toContain('agent blocked');
+  });
+
+  test('active work summary includes active compute jobs when aggregate is absent', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: {
+          task_types: ['compute_experiment'],
+          has_gpu: true,
+          max_concurrent: 3,
+        },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          seconds_since_last_seen: 10,
+          active_task_count: 1,
+          active_compute_job_count: 1,
+          max_concurrent: 3,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    expect(el.querySelector('[data-testid="fleet-runner-work-capacity"]')?.textContent).toBe('2/3');
+    expect(el.textContent).toContain('2 active');
+    expect(el.textContent).toContain('1 slots free');
   });
 
   test('summary capacity ignores inactive runners even with recent health', async () => {
@@ -551,7 +673,7 @@ describe('FleetRunnersPanel — behavioral', () => {
     const el = await mount();
 
     expect(el.querySelector('[data-testid="fleet-runner-work-capacity"]')?.textContent).toBe('0/-');
-    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('none connected');
+    expect(el.querySelector('[data-testid="fleet-runner-strategic-readiness"]')?.textContent).toBe('none eligible');
     expect(el.textContent).toContain('offline (deactivated)');
     expect(el.textContent).not.toContain('1 active');
     expect(el.textContent).not.toContain('2 slots free');

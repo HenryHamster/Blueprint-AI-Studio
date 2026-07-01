@@ -52,6 +52,13 @@ export interface StrategicLocalRunnerStatus {
     vm_instance_id?: string | null;
     runner_target_id?: string | null;
   } | null;
+  runners?: Array<{
+    id?: string | null;
+    hostname?: string | null;
+    is_preferred?: boolean | null;
+    eligible_for_active_task?: boolean | null;
+    blocked_reason?: string | null;
+  }> | null;
   fallback_reason?: string | null;
   liveness_window_seconds?: number | null;
 }
@@ -83,6 +90,8 @@ export interface StrategicRuntimeWorkStatus {
   } | null;
   local_runner_holds?: {
     count?: number | null;
+    compute_count?: number | null;
+    strategic_count?: number | null;
   } | null;
   parked_wakes?: {
     counts?: {
@@ -270,6 +279,21 @@ function shortId(value?: string | null): string | null {
   return trimmed ? trimmed.slice(0, 8) : null;
 }
 
+function preferredRunnerId(status: StrategicLocalRunnerStatus): string | null {
+  return cleanText(status.continuation?.preferred_runner_id);
+}
+
+function preferredRunnerLabel(status: StrategicLocalRunnerStatus): string | null {
+  const id = preferredRunnerId(status);
+  const preferredCandidate = id
+    ? status.runners?.find(runner => cleanText(runner.id) === id)
+    : status.runners?.find(runner => runner.is_preferred === true);
+  const candidateName = cleanText(preferredCandidate?.hostname);
+  const compactId = shortId(preferredCandidate?.id ?? id);
+  if (candidateName && compactId) return `${candidateName} ${compactId}`;
+  return candidateName ?? compactId;
+}
+
 function runnerStatusValue(status: StrategicLocalRunnerStatus): string {
   return normalizedStatus(status.status ?? status.mode);
 }
@@ -278,8 +302,9 @@ function runnerTone(status: StrategicLocalRunnerStatus): Tone {
   const value = runnerStatusValue(status);
   const fallbackReason = normalizedStatus(status.fallback_reason);
   const hasStaleContinuation = status.continuation?.enabled === true && status.continuation.fresh === false;
+  const hasUnknownContinuation = status.continuation?.enabled === true && status.continuation.fresh == null;
   if (value.includes('error') || value.includes('fail')) return 'danger';
-  if (hasStaleContinuation || WARNING_FALLBACK_REASONS.has(fallbackReason)) return 'warning';
+  if (hasStaleContinuation || hasUnknownContinuation || WARNING_FALLBACK_REASONS.has(fallbackReason)) return 'warning';
   if (value.includes('warn')) return 'warning';
   if (status.connected === true || status.active === true) return 'success';
   if ((firstCount(status.eligible_live_count) ?? 0) > 0) return 'success';
@@ -307,7 +332,7 @@ function runnerDetail(status: StrategicLocalRunnerStatus): string | null {
   if (explicit) return explicit;
   const statusReason = cleanText(status.status_reason);
   const activeRunner = shortId(status.active_runner_id);
-  const preferredRunner = shortId(status.continuation?.preferred_runner_id);
+  const preferredRunner = preferredRunnerLabel(status);
   const runtimeModel = cleanText(status.active_task_runtime?.model);
   const value = runnerStatusValue(status);
   if (value === 'local') {
@@ -337,16 +362,27 @@ function runnerDetail(status: StrategicLocalRunnerStatus): string | null {
   if (fallbackReason === 'capability_mismatch') return 'Runner cannot handle this cycle';
   if (fallbackReason === 'runner_claim_pending') return 'Waiting for runner claim';
   if (fallbackReason === 'runner_unavailable') return 'Runner unavailable';
+  if (fallbackReason === 'local_required_cloud_dispatch') return 'Local Strategic work is running in cloud';
   if (statusReason) return humanizeStatus(statusReason);
   if (busy != null && busy > 0 && (ready == null || ready === 0)) return `${busy} busy`;
   if (status.continuation?.enabled === true) {
-    if (status.continuation.fresh === false) return 'Continuation is stale';
-    if (preferredRunner) return `Continuation ready on runner ${preferredRunner}`;
-    return 'Continuation ready';
+    if (status.continuation.fresh === false) {
+      return preferredRunner
+        ? `Stale continuation, preferred runner ${preferredRunner}`
+        : 'Stale continuation';
+    }
+    if (status.continuation.fresh !== true) {
+      return preferredRunner
+        ? `Continuation status unknown, preferred runner ${preferredRunner}`
+        : 'Continuation status unknown';
+    }
+    if (preferredRunner) return `Fresh continuation, preferred runner ${preferredRunner}`;
+    if (ready != null) return `Fresh continuation, ${ready} eligible live`;
+    return 'Fresh continuation';
   }
   if (online != null && total != null) return `${online}/${total} devices`;
   if (count != null) return `${count} device${count === 1 ? '' : 's'}`;
-  if (ready != null && ready > 0) return `${ready} ready`;
+  if (ready != null) return `${ready} eligible live`;
   if (busy != null && busy > 0) return `${busy} busy`;
   if (live != null && enrolled != null) return `${live}/${enrolled} live`;
   if (enrolled != null) return pluralize(enrolled, 'runner');
@@ -364,18 +400,26 @@ function runnerMeta(status: StrategicLocalRunnerStatus, primaryDetail: string | 
   const stale = firstCount(status.stale_runner_count);
   const unavailable = firstCount(status.agent_unavailable_count);
   const continuation = status.continuation;
+  const preferredRunner = preferredRunnerLabel(status);
   const parts = [
     online != null && totalDevices != null ? `${online}/${totalDevices} devices` : null,
     online == null && deviceCount != null ? pluralize(deviceCount, 'device') : null,
     live != null && enrolled != null ? `${live}/${enrolled} live` : null,
-    ready != null && ready > 0 ? `${ready} ready` : null,
+    ready != null ? `${ready} eligible live` : null,
     busy != null && busy > 0 ? `${busy} busy` : null,
     stale != null && stale > 0 ? `${stale} stale` : null,
     unavailable != null && unavailable > 0 ? `${unavailable} unavailable` : null,
+    preferredRunner ? `preferred runner ${preferredRunner}` : null,
     status.active_task_pinned === true ? 'pinned' : null,
-    continuation?.enabled === true ? `continue ${continuation.fresh === false ? 'stale' : 'fresh'}` : null,
+    continuation?.enabled === true
+      ? `${continuation.fresh === true ? 'fresh' : continuation.fresh === false ? 'stale' : 'unknown'} continuation`
+      : null,
   ];
-  return parts.filter((part): part is string => Boolean(part) && part !== primaryDetail);
+  return parts.filter((part): part is string => {
+    if (!part) return false;
+    if (part === primaryDetail) return false;
+    return !primaryDetail?.toLowerCase().includes(part.toLowerCase());
+  });
 }
 
 function runtimeComputeCounts(status: StrategicRuntimeWorkStatus): NonNullable<StrategicRuntimeWorkStatus['compute_jobs']>['counts'] {
@@ -387,7 +431,33 @@ function runtimeHeldApprovalCount(status: StrategicRuntimeWorkStatus): number {
 }
 
 function runtimeLocalRunnerHoldCount(status: StrategicRuntimeWorkStatus): number {
-  return firstCount(status.local_runner_holds?.count) ?? 0;
+  const explicit = firstCount(status.local_runner_holds?.count);
+  if (explicit != null) return explicit;
+  return (
+    (firstCount(status.local_runner_holds?.strategic_count) ?? 0)
+    + (firstCount(status.local_runner_holds?.compute_count) ?? 0)
+  );
+}
+
+function runtimeStrategicLocalRunnerHoldCount(status: StrategicRuntimeWorkStatus): number {
+  return firstCount(status.local_runner_holds?.strategic_count) ?? 0;
+}
+
+function runtimeLocalRunnerHoldParts(status: StrategicRuntimeWorkStatus): string[] {
+  const total = runtimeLocalRunnerHoldCount(status);
+  if (total === 0) return [];
+  const strategic = runtimeStrategicLocalRunnerHoldCount(status);
+  const compute = firstCount(status.local_runner_holds?.compute_count);
+  const parts = [
+    strategic > 0 ? pluralize(strategic, 'Strategic hold') : null,
+    compute != null && compute > 0 ? pluralize(compute, 'compute hold') : null,
+  ].filter((part): part is string => Boolean(part));
+  if (parts.length > 0) {
+    const covered = strategic + (compute ?? 0);
+    if (covered < total) parts.push(pluralize(total - covered, 'local runner hold'));
+    return parts;
+  }
+  return [pluralize(total, 'local runner hold')];
 }
 
 function runtimeParkedWakeActiveCount(status: StrategicRuntimeWorkStatus): number {
@@ -461,7 +531,7 @@ function runtimeDetail(status: StrategicRuntimeWorkStatus): string | null {
   const parts = [
     active > 0 ? `${active} active` : null,
     queued > 0 ? `${queued} queued` : null,
-    runtimeLocalRunnerHoldCount(status) > 0 ? pluralize(runtimeLocalRunnerHoldCount(status), 'local runner hold') : null,
+    ...runtimeLocalRunnerHoldParts(status),
     runtimeHeldApprovalCount(status) > 0 ? pluralize(runtimeHeldApprovalCount(status), 'approval') : null,
     runtimeParkedWakeProblemCount(status) > 0 ? pluralize(runtimeParkedWakeProblemCount(status), 'wake issue') : null,
     runtimeRecentFailureCount(status) > 0 ? pluralize(runtimeRecentFailureCount(status), 'recent failure') : null,
@@ -681,19 +751,19 @@ export function StrategicSessionControl({
                 className={`group inline-grid min-h-11 w-full min-w-0 grid-cols-[auto,minmax(0,1fr),auto] items-center gap-2 rounded border px-2 py-1.5 text-left transition-colors hover:border-neutral-500 hover:bg-neutral-900/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 sm:min-h-8 sm:w-auto sm:max-w-[22rem] ${
                   toneClasses[runner.tone].border
                 } ${toneClasses[runner.tone].bg} disabled:cursor-not-allowed disabled:opacity-60`}
-                aria-label={`Open devices: runner ${runner.label}${runner.detail ? `, ${runner.detail}` : ''}${
+                aria-label={`Open Devices: runner ${runner.label}${runner.detail ? `, ${runner.detail}` : ''}${
                   runner.meta.length > 0 ? `, ${runner.meta.join(', ')}` : ''
                 }`}
-                title={runner.detail ? `Open devices: ${runner.detail}` : 'Open devices'}
+                title={runner.detail ? `Open Devices: ${runner.detail}` : 'Open Devices'}
               >
                 <Server className={`h-3.5 w-3.5 shrink-0 ${toneClasses[runner.tone].icon}`} aria-hidden="true" />
                 <span className="min-w-0 flex-1">
                   <span className="flex min-w-0 items-center gap-1.5 leading-tight">
-                    <span className="shrink-0 font-mono text-ui-sm font-semibold uppercase text-neutral-500">Runner</span>
+                    <span className="shrink-0 font-mono text-ui-sm font-semibold uppercase text-neutral-500">Devices</span>
                     <StatusDot tone={runner.tone} />
                     <span className={`truncate text-xs font-semibold ${toneClasses[runner.tone].text}`}>{runner.label}</span>
                   </span>
-                  <span className="block truncate text-ui-sm text-neutral-400">{runner.detail ?? 'Open device and runner state'}</span>
+                  <span className="block truncate text-ui-sm text-neutral-400">{runner.detail ?? 'Open device and Strategic runner state'}</span>
                 </span>
                 <span className="hidden min-w-0 items-center gap-1 lg:flex">
                   {runner.meta.slice(0, 2).map(item => (

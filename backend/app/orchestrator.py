@@ -1427,8 +1427,18 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
             )
 
 
+def _parse_local_runner_hold_timestamp(raw: object) -> datetime | None:
+    try:
+        stamped_at = datetime.fromisoformat(str(raw))
+    except (ValueError, TypeError):
+        return None
+    if stamped_at.tzinfo is not None:
+        stamped_at = stamped_at.astimezone(timezone.utc).replace(tzinfo=None)
+    return stamped_at
+
+
 async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
-    """Terminally fail compute_experiment tasks held too long for a local runner.
+    """Terminally fail tasks held too long for a local runner.
 
     A require-local project's compute_experiment is held QUEUED (with
     ``context['awaiting_local_runner_since']`` stamped) instead of provisioned in
@@ -1436,6 +1446,11 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
     safety valve: a hold older than ``_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS`` is
     marked terminal-FAILED with an actionable reason so the project can never
     wedge forever when the operator's hardware stays offline.
+
+    Continuous local Strategic work uses the same bounded wait contract, with
+    ``context['awaiting_strategic_local_runner_since']`` and
+    ``context['strategic_local_runner_required']`` proving that the task was
+    intentionally held for the operator's local Strategic runner.
 
     Returns the number of tasks failed. Mirrors the terminal-fail pattern used by
     the stale-provisioning reaper: TaskStatus.FAILED + latest_status_message +
@@ -1462,26 +1477,45 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
     failed = 0
     for task in rows:
         ctx = task.context or {}
-        stamped = ctx.get("awaiting_local_runner_since")
-        if not stamped:
+        task_type = str((task.first_payload or {}).get("type") or "")
+        compute_stamp = ctx.get("awaiting_local_runner_since")
+        strategic_stamp = ctx.get(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY)
+        is_compute_hold = (
+            bool(compute_stamp)
+            and task_type == "compute_experiment"
+            and not task.archived
+            and task.requires_approval is not True
+        )
+        is_strategic_hold = (
+            bool(strategic_stamp)
+            and task_type in STRATEGIC_TASK_TYPES
+            and ctx.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+            and not task.archived
+            and task.requires_approval is not True
+        )
+        if not is_compute_hold and not is_strategic_hold:
             continue
-        # Belt-and-suspenders: only ever act on compute_experiment holds.
-        if str((task.first_payload or {}).get("type") or "") != "compute_experiment":
+
+        stamped = strategic_stamp if is_strategic_hold else compute_stamp
+        stamped_at = _parse_local_runner_hold_timestamp(stamped)
+        if stamped_at is None:
             continue
-        try:
-            stamped_at = datetime.fromisoformat(str(stamped))
-        except (ValueError, TypeError):
-            continue
-        if stamped_at.tzinfo is not None:
-            stamped_at = stamped_at.astimezone(timezone.utc).replace(tzinfo=None)
         if stamped_at > cutoff:
             continue  # within the wait window — keep holding
 
         hours = _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS // 3600
-        reason = (
-            f"require_local_runner: no self-hosted runner became available within "
-            f"{hours}h — operator hardware offline; bring a runner online and requeue"
-        )
+        if is_strategic_hold:
+            reason = (
+                f"strategic_local_runner_required: no Strategic-capable local "
+                f"runner became available within {hours}h — operator device "
+                f"offline; bring a Strategic runner online and requeue"
+            )
+        else:
+            reason = (
+                f"require_local_runner: no self-hosted runner became available "
+                f"within {hours}h — operator hardware offline; bring a runner "
+                f"online and requeue"
+            )
         task.status = TaskStatus.FAILED
         task.latest_status_message = reason[:500]
         persist_failure_category(task, PROVISION_FAILURE)
@@ -1496,12 +1530,13 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             success=False,
             failure_class=PROVISION_FAILURE,
             task_id=str(task.id),
-            task_type="compute_experiment",
+            task_type=task_type or "unknown",
         )
         logger.warning(
-            "[RUNNERS] Failed compute_experiment %s: no local runner within %sh "
-            "(held since %s)",
+            "[RUNNERS] Failed local-runner-held task %s (type=%s): no runner "
+            "within %sh (held since %s)",
             task.id,
+            task_type,
             hours,
             stamped,
         )
