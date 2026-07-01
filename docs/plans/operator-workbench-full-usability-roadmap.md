@@ -8,7 +8,7 @@ The rule for this file: after every major batch, update the status ledger, miles
 
 ## Status Ledger
 
-Overall implementation estimate: 74%.
+Overall implementation estimate: 76%.
 
 Legend:
 - Done: implemented, reviewed, tested, and pushed.
@@ -27,7 +27,7 @@ Legend:
 | M5. Strategic context and canvas/artifact surface | Partial | Context package, selected refs, canvas descriptors, `StrategicContextWorkspace`, map/resource rows. | Add first-class Chat canvas slot and contract fixtures before any writable canvas system. |
 | M6. Pipeline monitoring and task sideboard | Partial | Pipeline workspace, task tree, task rail, stale attention routing, task sideboard context. | Tighten sideboard integration, status flow, tracked streams, and fixture-based contract tests. |
 | M7. Runtime, devices, accounts, settings, project management | Partial | Runtime workspace, fleet/devices, accounts, settings router, project manage sections. | Remove modal-era assumptions and split project policy vs runtime settings cleanly. |
-| M8. Operator attention and work-session read model | Partial | Derived attention state, curated metrics, actions, events, jobs, command receipts. | Harden lifecycle semantics, targets, metrics registry, and stale/local safety. |
+| M8. Operator attention and work-session read model | Partial | Derived attention state, registry-backed curated metric metadata, actions, events, jobs, command receipts, and command receipts excluded from check-in deltas. | Finish lifecycle clearing semantics and performance review for larger event/metric volumes. |
 | M9. Unified event and message contracts | Partial | Workbench event v1 envelope exists, project message creation/projection are centralized. | Inventory legacy emitters and converge backend/frontend fixtures. |
 | M10. Visual system and UI polish | Partial | Dark developer-tool direction, reduced chrome, viewport tests. | Tokenize theme, reduce hardcoded colors/panels, align spacing/header/margins/fonts. |
 | M11. Background operator jobs | Planned | Existing compute jobs, runner jobs, orchestrator loops, command receipts. | Only build a real operator-job table if a concrete async operator command needs it. |
@@ -365,6 +365,8 @@ Existing:
 - Attention items now include canonical targets for task/runtime routing.
 - Work-session projections include actions, commands, curated metrics, events, jobs/receipts, selected refs, context package, and runtime work.
 - Work-session command execution emits receipts.
+- Curated work-session metrics are now registry-backed with source path, unit, window, denominator, target, and stale behavior metadata while preserving the existing UI-facing IDs/labels/values.
+- Check-in deltas now ignore operator command receipts, so internal command acknowledgements do not inflate "since last check-in" activity counts.
 
 Remaining work:
 - Define lifecycle semantics for attention:
@@ -373,14 +375,6 @@ Remaining work:
   - what must be dismissed on the underlying object
   - what is only watch-level
 - Consider a lightweight acknowledgement model only if indirect clearing is not enough.
-- Add metric registry:
-  - id
-  - source/provenance path
-  - unit
-  - time window
-  - denominator
-  - target
-  - stale behavior
 - Ensure read-model performance does not degrade as more metrics/events are added.
 - Make stale Strategic local runner holds bounded, as covered in M2.
 - Keep attention item count bounded while preserving high-priority ordering.
@@ -609,21 +603,22 @@ Final verification gates:
 
 ## Next Batch Recommendation
 
-Recommended next implementation batches: the dispatched parallel tracks for M3, M4/M9, M5/M6, and M7/M10.
+Recommended next implementation batches: continue the dispatched parallel tracks for M4/M9, M5/M6, and M7/M10, then return to M2/M8 hardening.
 
 Scope:
-1. M3: clean the message/chat contract and active-work surface.
-2. M4/M9: harden Ctrl+K commands, context targets, and backend/frontend fixtures.
-3. M5/M6: add first-class Chat canvas/artifact rendering and task sideboard fixture coverage.
-4. M7/M10: continue Runtime/settings cleanup and visual token polish.
-5. After those land, return to M2 only for continuation ownership and TTL semantics.
+1. M4/M9: harden Ctrl+K commands, context targets, and backend/frontend fixtures.
+2. M5/M6: add first-class Chat canvas/artifact rendering and task sideboard fixture coverage.
+3. M7/M10: continue Runtime/settings cleanup and visual token polish.
+4. Return to M2 for continuation ownership and TTL semantics.
+5. Return to M8 for lifecycle clearing semantics and performance review.
 
-Reason: the highest-risk M2 reliability gap is closed; the next material progress is making Chat, command/contracts, canvas/sideboard, and visual/runtime cleanup move in parallel.
+Reason: the highest-risk M2 reliability gap is closed and M3 has landed; the next material progress is making command/contracts, canvas/sideboard, and visual/runtime cleanup move in parallel while preserving time for read-model hardening.
 
 ## Update Log
 
 | Date | Commit | Change |
 | --- | --- | --- |
+| 2026-07-01 | M8 read-model metrics | Added registry-backed work-session metric metadata and excluded operator command receipts from check-in delta counts. |
 | 2026-07-01 | M2 local Strategic reliability | Added bounded stale Strategic local runner hold timeout/recovery, frontend Devices/session state clarity, and focused tests. |
 | 2026-07-01 | roadmap creation | Created full usability roadmap and milestone ledger. |
 | 2026-07-01 | `33dd23e38` | Pushed stale operator attention paths: stale runner pins, provisioning, queued dependencies, Strategic local runner hold counts, frontend routing/sideboard integration, and regression tests. |

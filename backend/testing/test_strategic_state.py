@@ -43,6 +43,8 @@ from app.workbench_state import (
     sanitize_strategic_session_snapshot,
 )
 from app.workbench_events import SURFACE_MESSAGES, SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION
+from app.work_session_command_execution import OPERATOR_COMMAND_EVENT_TYPE
+from app.work_session_metrics import WORK_SESSION_METRIC_REGISTRY
 
 TEST_USER_ID = "test-user-123"
 
@@ -93,12 +95,24 @@ EXPECTED_CURATED_METRIC_PROVENANCE = {
 
 
 def _assert_curated_metric_provenance(metrics: dict[str, dict]) -> None:
+    assert set(metrics) == set(WORK_SESSION_METRIC_REGISTRY)
     assert set(EXPECTED_CURATED_METRIC_PROVENANCE).issubset(metrics)
     for metric_id, metric in metrics.items():
         provenance = metric.get("provenance")
         assert isinstance(provenance, dict), metric_id
         assert isinstance(provenance.get("surface"), str), metric_id
         assert isinstance(provenance.get("path"), str), metric_id
+        definition = metric.get("definition")
+        assert isinstance(definition, dict), metric_id
+        assert definition.get("source") == provenance["surface"], metric_id
+        assert definition.get("path") == provenance["path"], metric_id
+        assert isinstance(definition.get("unit"), str), metric_id
+        assert isinstance(definition.get("window"), dict), metric_id
+        assert isinstance(definition["window"].get("type"), str), metric_id
+        assert isinstance(definition.get("denominator"), dict), metric_id
+        assert isinstance(definition["denominator"].get("kind"), str), metric_id
+        assert definition.get("target") == metric.get("target"), metric_id
+        assert isinstance(definition.get("stale_behavior"), str), metric_id
     for metric_id, (surface, path) in EXPECTED_CURATED_METRIC_PROVENANCE.items():
         provenance = metrics[metric_id]["provenance"]
         assert provenance["surface"] == surface
@@ -154,6 +168,15 @@ def _assert_generated_at_iso_utc(payload: dict) -> None:
     parsed = datetime.fromisoformat(generated_at)
     assert parsed.tzinfo is not None
     assert parsed.utcoffset() == timedelta(0)
+
+
+def _resolve_dotted_path(root: dict, path: str):
+    current = root
+    for part in path.split("."):
+        assert isinstance(current, dict), path
+        assert part in current, path
+        current = current[part]
+    return current
 
 
 async def _make_project(session) -> Project:
@@ -1209,15 +1232,14 @@ async def test_strategic_state_marks_active_cycle_with_cancelled_task_as_stale(
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
     assert resp.status_code == 200
-    active = resp.json()["strategic"]["active_cycle"]
+    data = resp.json()
+    active = data["strategic"]["active_cycle"]
     assert active["id"] == "sc-stale"
     assert active["has_active_task"] is False
     assert active["stale"] is True
-    assert resp.json()["strategic"]["active_task"] is None
-    assert resp.json()["context_package"]["status"] == "stale"
-    metrics = {
-        entry["id"]: entry for entry in resp.json()["work_session"]["curated_metrics"]
-    }
+    assert data["strategic"]["active_task"] is None
+    assert data["context_package"]["status"] == "stale"
+    metrics = {entry["id"]: entry for entry in data["work_session"]["curated_metrics"]}
     assert metrics["context.stale"]["value"] == 1
     assert metrics["context.stale"]["tone"] == "warning"
     assert metrics["context.stale"]["target"] == {
@@ -1227,6 +1249,13 @@ async def test_strategic_state_marks_active_cycle_with_cancelled_task_as_stale(
     _assert_curated_metric_provenance(metrics)
     assert metrics["context.stale"]["provenance"]["status"] == "stale"
     assert metrics["context.stale"]["provenance"]["transform"] == "equals:stale"
+    for metric in metrics.values():
+        assert _resolve_dotted_path(data, metric["provenance"]["path"]) is not None
+        definition = metric["definition"]
+        for metadata_key in ("window", "denominator"):
+            metadata_path = (definition.get(metadata_key) or {}).get("path")
+            if metadata_path:
+                assert _resolve_dotted_path(data, metadata_path) is not None
 
 
 @pytest.mark.asyncio
@@ -3563,6 +3592,23 @@ async def test_strategic_state_counts_changes_since_last_check_in(
             content="Should we ship the runner update today?",
             status="open",
             created_at=after,
+        )
+    )
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="Command completed: mark messages seen",
+            status="resolved",
+            created_at=after + timedelta(seconds=10),
+            context={
+                "event_type": OPERATOR_COMMAND_EVENT_TYPE,
+                "operator_command": {
+                    "command_id": "attention.messages.mark_seen",
+                    "status": "succeeded",
+                },
+            },
         )
     )
     db_session.add(
