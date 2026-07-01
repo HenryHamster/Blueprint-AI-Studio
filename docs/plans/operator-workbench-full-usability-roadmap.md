@@ -24,8 +24,8 @@ Legend:
 | M2. Persistent local Strategic workday mode | Partial | Workbench state, continuous mode markers, Strategic local runner requirement, local runner selection, attention for holds, stale Strategic hold timeout, clearer Devices UI. | Make continuation persistence/ownership explicit and settle workday TTL semantics. |
 | M3. Messages as the active-work interface | Done | Shared `ProjectMessage` creation/projection, bounded workbench message context, minimal Strategic-session Chat, backend/frontend arming fixtures. | Keep regression coverage while M4/M5 add richer command and context surfaces. |
 | M4. Ctrl+K and hotkey operating layer | Partial | Command palette, shortcut hooks, server command descriptors, allowlisted command execution. | Finish canonical command/target registry and missing hotkeys. |
-| M5. Strategic context and canvas/artifact surface | Partial | Context package, selected refs, canvas descriptors, `StrategicContextWorkspace`, map/resource rows. | Add first-class Chat canvas slot and contract fixtures before any writable canvas system. |
-| M6. Pipeline monitoring and task sideboard | Partial | Pipeline workspace, task tree, task rail, stale attention routing, task sideboard context. | Tighten sideboard integration, status flow, tracked streams, and fixture-based contract tests. |
+| M5. Strategic context and canvas/artifact surface | Done | Context package, selected refs, canvas descriptors, `StrategicContextWorkspace`, map/resource rows, Chat artifact slot, descriptor schema, renderer tests, golden fixtures. | Keep v1 read-only; revisit writable canvas/layout persistence only with a concrete requirement. |
+| M6. Pipeline monitoring and task sideboard | Done | Pipeline workspace, task tree, task rail, stale attention routing, task sideboard context, task-sideboard contract, Chat task-target drawer routing, waiting-vs-blocked health labels. | Further tracked-stream affordance polish can continue without reopening the sideboard contract. |
 | M7. Runtime, devices, accounts, settings, project management | Done | Canonical Project/Runtime settings homes, workspace-hosted settings router semantics, command/context routing to Project Manage and Runtime Settings/Accounts, reachability and viewport tests. | Keep regression coverage while remaining project/runtime policy work lands. |
 | M8. Operator attention and work-session read model | Partial | Derived attention state, registry-backed curated metric metadata, actions, events, jobs, command receipts, and command receipts excluded from check-in deltas. | Finish lifecycle clearing semantics and performance review for larger event/metric volumes. |
 | M9. Unified event and message contracts | Partial | Workbench event v1 envelope exists, project message creation/projection are centralized. | Inventory legacy emitters and converge backend/frontend fixtures. |
@@ -230,7 +230,7 @@ Acceptance gates:
 
 ## M5. Strategic Context and Canvas/Artifact Surface
 
-Status: Partial.
+Status: Done.
 
 Purpose: Let Strategic pull up actual numbers, diagrams, plots, resources, and task context while the main chat stays clean.
 
@@ -240,21 +240,12 @@ Existing:
 - Canvas descriptor has nodes/edges and an open command.
 - Frontend has `StrategicContextWorkspace`, `StrategicContextMap`, context rail, descriptor chips, and selected-ref handling.
 
-Remaining work:
-- Make canvas/artifact a first-class Chat workspace slot on desktop and an accessible surface on mobile.
-- Decide the v1 rendering set:
-  - context map
-  - metric cards
-  - table
-  - markdown/text artifact
-  - image
-  - chart/plot descriptor
-  - task/direction/message/resource detail
-- Add stable descriptor schemas for artifact/canvas resources that frontend can render without guessing.
-- Add backend-generated golden fixtures for context package/canvas descriptors.
-- Keep v1 read-only unless a concrete writable canvas requirement appears.
-- Do not create canvas layout persistence until versioning/storage is justified.
-- Add loading, stale, empty, and unsupported-artifact states.
+Completed in this milestone:
+- Added stable v1 renderable descriptor schema in `admin-ui/src/strategicStateApi.ts` for context map, metric cards, table, markdown/text, image, chart/plot, task/direction/message/resource detail, and unsupported states.
+- Added backend descriptor generation in `backend/app/strategic_context_package.py` from the existing bounded context package. The contract stays read-only and does not expose artifact logs, storage URIs, or knowledge bodies.
+- Added `StrategicContextArtifactSlot` and rendered it inside `StrategicContextRail`, giving Chat a first-class desktop canvas/artifact slot while preserving existing selected-ref controls and the mobile context drawer path.
+- Added backend golden fixture `backend/testing/__fixtures__/operator_strategic_context_package_v1.json` and frontend/backend tests that render/validate the exact v1 descriptor set.
+- Added empty/unsupported/stale-ready rendering states in the artifact slot. Writable canvas and layout persistence remain explicit non-goals.
 
 Authoritative files:
 - `backend/app/strategic_context_package.py`
@@ -273,7 +264,7 @@ Acceptance gates:
 
 ## M6. Pipeline Monitoring and Task Sideboard
 
-Status: Partial.
+Status: Done.
 
 Purpose: Preserve passive monitoring of task flow while making task-level detail more useful and less cluttered.
 
@@ -283,20 +274,13 @@ Existing:
 - `TaskDetailDrawerSideboardContext` renders bounded context.
 - Recent milestone added stale queued/provisioning/runner attention into Pipeline/sideboard flows.
 
-Remaining work:
-- Clean up Pipeline view spacing and visual hierarchy without losing information.
-- Make task sideboard fully integrated:
-  - open from Pipeline and Chat context
-  - show task state, current blocker, artifact/PR, direction, parent wave, runner, cost, messages, and next action
-  - avoid duplicating task rows or status labels
-- Add backend-to-frontend fixture for task detail sideboard context.
-- Ensure failed/blocked/parked/attention states are deduped and labeled correctly.
-- Improve tracked stream affordances for passive monitoring:
-  - what is running
-  - what changed recently
-  - what needs intervention
-  - logs only when expanded or tracked
-- Keep task-by-task management available but not the primary workflow.
+Completed in this milestone:
+- Extended `backend/app/admin.py` task sideboard context with a bounded `task` block for task state, current blocker, runner, cost, and next action, alongside existing project/strategic/pipeline/artifact/message/link groups.
+- Updated `TaskDetailDrawerSideboardContext` and `TaskSideboardContext` types to render the backend task block without exposing raw project model or task payload internals.
+- Routed Chat/Strategic context `surface: task` targets through the task drawer callback while preserving Pipeline task selection for context.
+- Split queued dependency waits from true blocked work in Pipeline sideboard health and Now labels. Waiting tasks no longer inflate blocked/attention counts.
+- Added backend golden fixture `backend/testing/__fixtures__/operator_task_sideboard_context_v1.json` and frontend/backend tests for the backend-to-frontend sideboard contract.
+- Added Pipeline/Strategic rail viewport coverage for the changed sideboard and artifact-slot surfaces.
 
 Authoritative files:
 - `backend/app/operator_attention.py`

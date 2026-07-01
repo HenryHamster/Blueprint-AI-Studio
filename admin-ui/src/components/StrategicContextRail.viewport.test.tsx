@@ -280,6 +280,28 @@ const STATE: StrategicStateResponse = {
       { id: 'pipeline', label: 'Pipeline', target: { surface: 'pipeline' } },
       { id: 'runtime', label: 'Runtime', target: { surface: 'runtime', section: 'health' } },
     ],
+    descriptors: [
+      {
+        schema_version: 1,
+        id: 'strategic-canvas:proj-1',
+        kind: 'context_map',
+        title: 'Strategic context map',
+        summary: '8 nodes / 7 links',
+        status: 'ready',
+        target: { surface: 'project', section: 'problem-model' },
+      },
+      {
+        schema_version: 1,
+        id: 'context-metrics',
+        kind: 'metric_cards',
+        title: 'Context health',
+        status: 'ready',
+        metrics: [
+          { label: 'Items', value: 41, tone: 'info', target: { surface: 'project', section: 'problem-model' } },
+          { label: 'Tasks', value: 29, tone: 'neutral', target: { surface: 'pipeline' } },
+        ],
+      },
+    ],
   },
   runtime: {
     local_runner: {
@@ -421,6 +443,8 @@ describe('StrategicContextRail — viewport regression', () => {
     const contextButton = host?.querySelector<HTMLButtonElement>('button[aria-label="Open Strategic context"]');
     expect(host?.querySelector('[data-testid="strategic-chat-primary"]')?.textContent).toContain('Strategic chat');
     expect(host?.querySelector('[data-testid="strategic-context-descriptor"]')?.tagName).toBe('DIV');
+    expect(host?.querySelector('[data-testid="strategic-chat-artifact-slot"]')?.textContent).toContain('Canvas and artifacts');
+    expect(host?.querySelector('[data-testid="strategic-context-descriptor-context_map"]')?.textContent).toContain('Strategic context map');
     expect(rail).toBeTruthy();
     expect(contextButton).toBeTruthy();
     expect(getComputedStyle(rail!).display).not.toBe('none');

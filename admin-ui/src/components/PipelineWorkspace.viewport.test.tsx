@@ -5,7 +5,7 @@ import { act } from 'react';
 import { PipelineWorkspace, type PipelineWorkspaceProps } from './PipelineWorkspace';
 import type { Task } from './TaskCard';
 import type { TrackLogEntry } from '../types/task';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectMinTouchTargetAt, expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -205,6 +205,20 @@ describe('PipelineWorkspace viewport regression', () => {
     const detailsButtonRect = detailsButton?.getBoundingClientRect();
     expect(detailsButtonRect?.width).toBeGreaterThanOrEqual(44);
     expect(detailsButtonRect?.height).toBeGreaterThanOrEqual(44);
+  });
+
+  test('mobile flow has no silent text truncation at 375px', async () => {
+    await expectNoTextTruncationAt(375, renderWorkspace, {
+      height: 720,
+      selector: '[data-testid="pipeline-now-panel"] *, [data-testid="pipeline-health-panel"] *',
+    });
+  });
+
+  test('mobile flow controls meet touch target at 375px', async () => {
+    await expectMinTouchTargetAt(375, renderWorkspace, {
+      height: 720,
+      selector: '[data-testid="pipeline-now-panel"] button, button[aria-controls="pipeline-status-details"]',
+    });
   });
 
   test('desktop flow keeps sideboard in the right column with embedded monitoring', async () => {

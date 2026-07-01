@@ -24,6 +24,7 @@ import {
   type StrategicSelectedRef,
 } from '../utils/strategicWorkbenchSession';
 import { StrategicContextMap } from './StrategicContextMap';
+import { StrategicContextArtifactSlot } from './StrategicContextArtifactSlot';
 import { StrategicSessionEvents } from './StrategicSessionEvents';
 import {
   StrategicSessionControl,
@@ -905,6 +906,20 @@ export function StrategicContextWorkspace({
                     </button>
                   ))}
                 </div>
+              </Section>
+            )}
+
+            {contextPackage && (
+              <Section
+                title="Canvas and artifacts"
+                meta={`${formatCompactNumber((contextPackage.descriptors?.length ?? 0) + (canvas ? 1 : 0))}`}
+                testId="strategic-context-workspace-artifacts"
+              >
+                <StrategicContextArtifactSlot
+                  contextPackage={contextPackage}
+                  onOpenTarget={handleOpenTarget}
+                  showHeader={false}
+                />
               </Section>
             )}
 

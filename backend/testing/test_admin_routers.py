@@ -22919,6 +22919,15 @@ class TestPostCommitPendingField:
         assert sideboard["pipeline"]["blocked_reason"] == "Waiting for reviewer feedback."
         assert sideboard["pipeline"]["movement_explanation"] == "Waiting for reviewer feedback."
         assert resp.json()["movement_explanation"] == "Waiting for reviewer feedback."
+        assert sideboard["task"]["id"] == str(task.id)
+        assert sideboard["task"]["title"] == "Integrate task sideboard"
+        assert sideboard["task"]["status"] == "IN_PROGRESS"
+        assert sideboard["task"]["task_type"] == "create"
+        assert sideboard["task"]["blocker"]["reason"] == "Waiting for reviewer feedback."
+        assert sideboard["task"]["runner"]["vm_instance_id"] is None
+        assert sideboard["task"]["cost"]["estimated_vm_usd"] is None
+        assert sideboard["task"]["cost"]["llm_usd"] is None
+        assert sideboard["task"]["next_action"]["label"] == "Monitor progress"
         assert sideboard["artifacts"]["total"] == 1
         assert sideboard["artifacts"]["by_type"] == {
             "PULL_REQUEST": 1,

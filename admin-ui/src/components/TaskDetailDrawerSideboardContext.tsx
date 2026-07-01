@@ -1,9 +1,11 @@
 import type { ReactNode } from 'react';
-import { Box, GitBranch, GitPullRequest, Link2, MessageSquare, Network, Route } from 'lucide-react';
+import { Activity, AlertTriangle, Box, Cpu, DollarSign, GitBranch, GitPullRequest, Link2, MessageSquare, Network, Route } from 'lucide-react';
 import type { Task } from '../types/task';
 import { SectionHeader } from './TaskDetailDrawerPrimitives';
 
 type SideboardLink = NonNullable<Task['sideboard_context']>['links'][number];
+type SideboardTaskContext = NonNullable<Task['sideboard_context']>['task'];
+type SideboardRunnerContext = NonNullable<NonNullable<SideboardTaskContext>['runner']>;
 
 function artifactSummary(byType: Record<string, number>): string {
   const entries = Object.entries(byType);
@@ -61,6 +63,22 @@ function linkTargetLabel(target: SideboardLink['target']): string {
 
 function formatInlineLabel(value?: string | null): string | null {
   return value ? value.replace(/_/g, ' ') : null;
+}
+
+function formatCost(value?: number | null): string | null {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+  return `$${value.toFixed(2)}`;
+}
+
+function runnerSummary(runner?: SideboardRunnerContext | null): string | null {
+  if (!runner) return null;
+  return [
+    runner.vm_instance_id,
+    runner.runner_target_id ? `runner ${runner.runner_target_id}` : null,
+    runner.machine_type,
+    runner.provider,
+    runner.account_id,
+  ].filter(Boolean).join(' / ') || null;
 }
 
 function ContextSurface({ children }: { children: ReactNode }) {
@@ -124,6 +142,22 @@ export function TaskSideboardContextSection({
 }) {
   const context = task.sideboard_context;
   if (!context) return null;
+  const taskContext = context.task;
+  const blocker = taskContext?.blocker;
+  const runner = taskContext?.runner;
+  const runnerLabel = runnerSummary(runner);
+  const vmCost = formatCost(taskContext?.cost?.estimated_vm_usd);
+  const llmCost = formatCost(taskContext?.cost?.llm_usd);
+  const hasTaskContext = Boolean(
+    taskContext?.status ||
+    taskContext?.task_type ||
+    taskContext?.latest_status_message ||
+    taskContext?.next_action ||
+    blocker?.reason ||
+    runnerLabel ||
+    vmCost ||
+    llmCost,
+  );
   const parentTaskId = context.pipeline.parent_task_id;
   const pipelineMovementExplanation = context.pipeline.movement_explanation?.trim();
   const pipelineReason = pipelineMovementExplanation || context.pipeline.blocked_reason;
@@ -154,6 +188,82 @@ export function TaskSideboardContextSection({
     <>
       <SectionHeader>Context</SectionHeader>
       <ContextSurface>
+        {hasTaskContext && taskContext && (
+          <ContextGroup
+            icon={<Activity className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
+            label="Task"
+            meta={formatInlineLabel(taskContext.status)}
+          >
+            <div className="grid min-w-0 gap-2">
+              <div className="grid min-w-0 grid-cols-2 gap-1.5 sm:grid-cols-3">
+                <ContextStat label="State" value={formatInlineLabel(taskContext.status) ?? task.status} />
+                {taskContext.task_type && <ContextStat label="Type" value={formatInlineLabel(taskContext.task_type)} />}
+                {taskContext.next_action?.label && (
+                  <ContextStat label="Next" value={taskContext.next_action.label} />
+                )}
+              </div>
+              {taskContext.latest_status_message && (
+                <ContextValue>{taskContext.latest_status_message}</ContextValue>
+              )}
+              {taskContext.next_action?.reason && (
+                <div className="break-words rounded border border-cyan-500/20 bg-cyan-500/5 px-2 py-1.5 text-sm text-cyan-200">
+                  {taskContext.next_action.reason}
+                </div>
+              )}
+            </div>
+          </ContextGroup>
+        )}
+
+        {(blocker?.reason || blocker?.kind || blocker?.recheck_after || blocker?.parked_at) && (
+          <ContextGroup
+            icon={<AlertTriangle className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
+            label="Current blocker"
+            meta={formatInlineLabel(blocker?.kind)}
+          >
+            <div className="grid min-w-0 gap-1.5">
+              {blocker?.reason && (
+                <div className="break-words rounded border border-amber-500/25 bg-amber-500/5 px-2 py-1.5 text-sm text-amber-200">
+                  {blocker.reason}
+                </div>
+              )}
+              <div className="grid min-w-0 grid-cols-2 gap-1.5 sm:grid-cols-3">
+                {blocker?.blocked_at && <ContextStat label="Blocked" value={blocker.blocked_at} />}
+                {blocker?.parked_at && <ContextStat label="Parked" value={blocker.parked_at} />}
+                {blocker?.recheck_after && <ContextStat label="Recheck" value={blocker.recheck_after} />}
+              </div>
+            </div>
+          </ContextGroup>
+        )}
+
+        {(runnerLabel || vmCost || llmCost || taskContext?.cost?.llm_any_unpriced) && (
+          <ContextGroup
+            icon={<Cpu className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
+            label="Runner"
+            meta={runner?.spot ? 'spot' : runner?.warm_start ? 'warm' : undefined}
+          >
+            <div className="grid min-w-0 gap-2">
+              {runnerLabel && <ContextValue>{runnerLabel}</ContextValue>}
+              {(vmCost || llmCost || taskContext?.cost?.llm_any_unpriced) && (
+                <div className="grid min-w-0 grid-cols-2 gap-1.5 sm:grid-cols-3">
+                  {vmCost && <ContextStat label="VM cost" value={vmCost} />}
+                  {llmCost && <ContextStat label="LLM cost" value={llmCost} />}
+                  {taskContext?.cost?.llm_any_unpriced && (
+                    <ContextStat
+                      label="LLM pricing"
+                      value={(
+                        <span className="inline-flex items-center gap-1">
+                          <DollarSign className="h-3 w-3" aria-hidden="true" />
+                          partial
+                        </span>
+                      )}
+                    />
+                  )}
+                </div>
+              )}
+            </div>
+          </ContextGroup>
+        )}
+
         <ContextGroup
           icon={<Network className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
           label="Project"

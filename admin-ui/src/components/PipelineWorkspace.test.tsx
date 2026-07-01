@@ -421,6 +421,7 @@ describe('PipelineWorkspace task stream', () => {
     expect(within(healthPanel).getByText('filtered')).toBeInTheDocument();
     expect(within(healthPanel).getByText('Running')).toBeInTheDocument();
     expect(within(healthPanel).getByText('Queued')).toBeInTheDocument();
+    expect(within(healthPanel).getByText('Waiting')).toBeInTheDocument();
     expect(within(healthPanel).getByText('Parked')).toBeInTheDocument();
     expect(within(healthPanel).getByText('Finished')).toBeInTheDocument();
     expect(within(healthPanel).getByText('clear')).toBeInTheDocument();
@@ -535,6 +536,44 @@ describe('PipelineWorkspace task stream', () => {
     expect(within(healthPanel).getByText('Parked')).toBeInTheDocument();
     expect(within(healthPanel).getByText('1')).toBeInTheDocument();
     expect(screen.queryByText('clear')).not.toBeInTheDocument();
+  });
+
+  test('separates queued dependency waits from blocked attention', () => {
+    const readyQueuedTask = makeTask({ id: 'task-health-queued', title: 'Ready queued task', status: 'QUEUED' });
+    const waitingTask = makeTask({
+      id: 'task-health-waiting',
+      title: 'Waiting dependency task',
+      status: 'QUEUED',
+      depends_on: ['task-upstream'],
+    });
+
+    renderWorkspace({
+      flow: {
+        tasks: [readyQueuedTask, waitingTask],
+        hasActiveFilters: false,
+        onViewLogs: vi.fn(),
+        onNavigateToParent: vi.fn(),
+        onArchiveGroup: vi.fn(),
+        onUnarchiveTask: vi.fn(),
+      },
+      metrics: {
+        activeTasks: [],
+        queuedTasks: [readyQueuedTask, waitingTask],
+        blockedTasks: [],
+        failedTasks: [],
+        terminalTasks: [],
+      },
+    });
+
+    const healthPanel = screen.getByTestId('pipeline-health-panel');
+    const healthRows = Array.from(healthPanel.querySelectorAll('div'));
+    expect(healthRows.find(row => row.textContent?.includes('Queued'))?.textContent).toContain('1');
+    expect(healthRows.find(row => row.textContent?.includes('Waiting'))?.textContent).toContain('1');
+    expect(healthRows.find(row => row.textContent?.includes('Blocked'))?.textContent).toContain('0');
+    expect(within(healthPanel).getByText('clear')).toBeInTheDocument();
+    expect(within(screen.getByTestId('pipeline-now-row-task-health-waiting')).getByText('Waiting')).toBeInTheDocument();
+    expect(within(screen.getByTestId('pipeline-now-row-task-health-waiting')).getByText('1 upstream')).toBeInTheDocument();
+    expect(within(screen.getByTestId('pipeline-now-row-task-health-queued')).getByText('Queued')).toBeInTheDocument();
   });
 
   test('includes backend attention entries in Now and task health summaries', () => {

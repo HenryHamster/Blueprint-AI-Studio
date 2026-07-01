@@ -462,6 +462,21 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     assert package["resources"][0]["kind"] == "canvas"
     assert any(resource["kind"] == "knowledge_document" for resource in package["resources"])
     assert any(resource["kind"] == "artifact" for resource in package["resources"])
+    descriptors = package["descriptors"]
+    descriptor_kinds = {descriptor["kind"] for descriptor in descriptors}
+    assert {"context_map", "metric_cards", "table", "markdown", "resource_detail"} <= descriptor_kinds
+    assert all(descriptor["schema_version"] == 1 for descriptor in descriptors)
+    assert descriptors[0]["id"] == package["canvas"]["id"]
+    assert descriptors[0]["target"] == {
+        "surface": "project",
+        "section": "problem-model",
+    }
+    assert any(
+        metric["label"] == "Tasks"
+        for descriptor in descriptors
+        if descriptor["kind"] == "metric_cards"
+        for metric in descriptor["metrics"]
+    )
     assert package["evidence"]["knowledge"]["total"] == 1
     assert package["evidence"]["knowledge"]["items"][0]["id"] == str(knowledge_doc.id)
     assert package["evidence"]["knowledge"]["items"][0]["target"]["document_id"] == str(knowledge_doc.id)

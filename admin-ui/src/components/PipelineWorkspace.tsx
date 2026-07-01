@@ -402,9 +402,16 @@ function pipelineNowItems(rail: PipelineRailProps, metrics: PipelineMetricsProps
     ));
   metrics.failedTasks.slice(0, 2).forEach(task => push(task, 'Failed', 'attention'));
   metrics.blockedTasks.slice(0, 2).forEach(task => push(task, 'Blocked', 'attention'));
+  metrics.queuedTasks
+    .filter(task => (task.depends_on?.length ?? 0) > 0)
+    .slice(0, 2)
+    .forEach(task => push(task, 'Waiting', 'waiting', `${task.depends_on?.length ?? 0} upstream`));
   tasks.filter(task => task.status === 'PARKED').slice(0, 2).forEach(task => push(task, 'Parked', 'waiting'));
   metrics.activeTasks.slice(0, 3).forEach(task => push(task, 'Running', 'active'));
-  metrics.queuedTasks.slice(0, 2).forEach(task => push(task, 'Queued', 'queued'));
+  metrics.queuedTasks
+    .filter(task => (task.depends_on?.length ?? 0) === 0)
+    .slice(0, 2)
+    .forEach(task => push(task, 'Queued', 'queued'));
   return items.slice(0, 6);
 }
 
@@ -506,6 +513,8 @@ function PipelineNowPanel({ rail, metrics, tasks }: { rail: PipelineRailProps; m
 
 function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardProps) {
   const parkedTasks = flow.tasks.filter(task => task.status === 'PARKED');
+  const waitingTasks = metrics.queuedTasks.filter(task => (task.depends_on?.length ?? 0) > 0);
+  const queuedReadyTasks = metrics.queuedTasks.filter(task => (task.depends_on?.length ?? 0) === 0);
   const attentionTaskIds = new Set<string>();
   rail.attentionTasks.forEach(entry => attentionTaskIds.add(taskFromAttentionInput(entry).id));
   metrics.blockedTasks.forEach(task => attentionTaskIds.add(task.id));
@@ -541,7 +550,8 @@ function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardPro
         </div>
         <dl className="divide-y divide-neutral-800/70">
           <PipelineHealthRow label="Running" value={metrics.activeTasks.length} tone="good" />
-          <PipelineHealthRow label="Queued" value={metrics.queuedTasks.length} />
+          <PipelineHealthRow label="Queued" value={queuedReadyTasks.length} />
+          <PipelineHealthRow label="Waiting" value={waitingTasks.length} tone={waitingTasks.length > 0 ? 'warn' : 'neutral'} />
           <PipelineHealthRow label="Blocked" value={metrics.blockedTasks.length} tone={metrics.blockedTasks.length > 0 ? 'warn' : 'neutral'} />
           <PipelineHealthRow label="Parked" value={parkedTasks.length} tone={parkedTasks.length > 0 ? 'warn' : 'neutral'} />
           <PipelineHealthRow label="Failed" value={metrics.failedTasks.length} tone={metrics.failedTasks.length > 0 ? 'bad' : 'neutral'} />

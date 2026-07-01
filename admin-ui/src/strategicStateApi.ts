@@ -93,6 +93,81 @@ export interface StrategicContextPackageDrilldown {
   target: StrategicContextTarget;
 }
 
+export interface StrategicContextDescriptorMetric {
+  label: string;
+  value: string | number;
+  unit?: string | null;
+  tone?: 'neutral' | 'info' | 'good' | 'warning' | 'critical' | string;
+  target?: StrategicContextTarget | null;
+}
+
+export interface StrategicContextDescriptorTableColumn {
+  key: string;
+  label: string;
+}
+
+export interface StrategicContextDescriptorTableRow {
+  id?: string | null;
+  cells: Record<string, string | number | boolean | null>;
+  target?: StrategicContextTarget | null;
+}
+
+export interface StrategicContextDescriptorDetail {
+  label: string;
+  value: string | number | boolean | null;
+  target?: StrategicContextTarget | null;
+}
+
+export interface StrategicContextDescriptorChartPoint {
+  label: string;
+  value: number;
+}
+
+export interface StrategicContextRenderableDescriptor {
+  schema_version: 1;
+  id: string;
+  kind:
+    | 'context_map'
+    | 'metric_cards'
+    | 'table'
+    | 'markdown'
+    | 'text'
+    | 'image'
+    | 'chart'
+    | 'plot'
+    | 'task_detail'
+    | 'direction_detail'
+    | 'message_detail'
+    | 'resource_detail'
+    | 'unsupported'
+    | string;
+  title: string;
+  summary?: string | null;
+  status?: string | null;
+  target?: StrategicContextTarget | null;
+  empty?: boolean;
+  stale?: boolean;
+  unsupported_reason?: string | null;
+  metrics?: StrategicContextDescriptorMetric[];
+  columns?: StrategicContextDescriptorTableColumn[];
+  rows?: StrategicContextDescriptorTableRow[];
+  details?: StrategicContextDescriptorDetail[];
+  body?: string | null;
+  language?: string | null;
+  image?: {
+    url?: string | null;
+    alt?: string | null;
+    width?: number | null;
+    height?: number | null;
+  } | null;
+  chart?: {
+    kind?: 'bar' | 'line' | string;
+    x_label?: string | null;
+    y_label?: string | null;
+    points?: StrategicContextDescriptorChartPoint[];
+  } | null;
+}
+
 export interface StrategicContextCanvasNode {
   id: string;
   kind: string;
@@ -176,6 +251,7 @@ export interface StrategicContextPackageDescriptor {
     knowledge?: StrategicContextEvidenceCollection<StrategicContextKnowledgeEvidence>;
     artifacts?: StrategicContextEvidenceCollection<StrategicContextArtifactEvidence>;
   } | null;
+  descriptors?: StrategicContextRenderableDescriptor[];
   drilldowns?: StrategicContextPackageDrilldown[];
 }
 

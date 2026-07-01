@@ -958,6 +958,261 @@ def _strategic_context_canvas(
     }
 
 
+def _descriptor_detail(
+    label: Any,
+    value: Any,
+    *,
+    target: Dict[str, Any] | None = None,
+) -> Dict[str, Any] | None:
+    compact_label = _compact_text(label, max_chars=80)
+    if not compact_label:
+        return None
+    compact_value = _compact_text(value, max_chars=220)
+    if compact_value is None and value is not None:
+        compact_value = str(value)
+    if compact_value is None:
+        return None
+    detail: Dict[str, Any] = {"label": compact_label, "value": compact_value}
+    if isinstance(target, dict):
+        detail["target"] = target
+    return detail
+
+
+def _strategic_context_source_table_descriptor(
+    sources: List[Dict[str, Any]],
+) -> Dict[str, Any] | None:
+    rows = [
+        {
+            "id": _compact_text(source.get("kind"), max_chars=80),
+            "cells": {
+                "source": str(source.get("kind") or "source").replace("_", " "),
+                "count": int(source.get("count") or 0),
+            },
+        }
+        for source in sources[:8]
+    ]
+    if not rows:
+        return None
+    return {
+        "schema_version": 1,
+        "id": "sources",
+        "kind": "table",
+        "title": "Context sources",
+        "summary": "Bounded source counts included in this package.",
+        "status": "ready",
+        "columns": [
+            {"key": "source", "label": "Source"},
+            {"key": "count", "label": "Items"},
+        ],
+        "rows": rows,
+    }
+
+
+def _artifact_renderable_kind(artifact: Dict[str, Any]) -> str:
+    fingerprint = " ".join(
+        str(value or "").lower()
+        for value in [
+            artifact.get("artifact_type"),
+            artifact.get("logical_key"),
+            artifact.get("label"),
+            artifact.get("kind"),
+        ]
+    )
+    if any(
+        token in fingerprint
+        for token in ["image", ".png", ".jpg", ".jpeg", ".webp", ".gif"]
+    ):
+        return "image"
+    if any(token in fingerprint for token in ["chart", "plot", "graph"]):
+        return "chart"
+    if any(
+        token in fingerprint
+        for token in ["markdown", "report", "summary", "note", "design"]
+    ):
+        return "markdown"
+    if any(token in fingerprint for token in ["log", "trace", "stdout", "stderr"]):
+        return "text"
+    return "resource_detail"
+
+
+def _artifact_descriptor(artifact: Dict[str, Any]) -> Dict[str, Any] | None:
+    artifact_id = _compact_text(artifact.get("id"), max_chars=120)
+    if not artifact_id:
+        return None
+    kind = _artifact_renderable_kind(artifact)
+    title = (
+        _compact_text(artifact.get("label"), max_chars=90)
+        or _compact_text(artifact.get("artifact_type"), max_chars=90)
+        or "Artifact"
+    )
+    details = [
+        _descriptor_detail("Task", artifact.get("task_title"), target=artifact.get("target")),
+        _descriptor_detail("Type", artifact.get("artifact_type") or artifact.get("kind")),
+        _descriptor_detail("Status", artifact.get("task_status")),
+        _descriptor_detail("Created", artifact.get("created_at")),
+    ]
+    descriptor: Dict[str, Any] = {
+        "schema_version": 1,
+        "id": f"artifact:{artifact_id}",
+        "kind": kind,
+        "title": title,
+        "summary": _compact_text(artifact.get("task_title"), max_chars=160),
+        "status": _compact_text(artifact.get("task_status"), max_chars=60)
+        or "ready",
+        "target": artifact.get("target"),
+        "details": [detail for detail in details if detail],
+    }
+    if kind == "markdown":
+        descriptor["body"] = (
+            descriptor["summary"] or "Read-only artifact metadata is available."
+        )
+        descriptor["language"] = "markdown"
+    elif kind == "text":
+        descriptor["body"] = (
+            descriptor["summary"] or "Read-only log metadata is available."
+        )
+        descriptor["language"] = "text"
+    elif kind == "image":
+        descriptor["image"] = {"url": None, "alt": title}
+        descriptor[
+            "unsupported_reason"
+        ] = "Image artifact previews require a signed preview URL."
+    elif kind == "chart":
+        descriptor["chart"] = {
+            "kind": "bar",
+            "points": [{"label": "artifact", "value": 1}],
+        }
+    return descriptor
+
+
+def _resource_descriptor(resource: Dict[str, Any]) -> Dict[str, Any] | None:
+    resource_id = _compact_text(resource.get("id"), max_chars=140)
+    if not resource_id:
+        return None
+    details = [
+        _descriptor_detail("Kind", resource.get("kind")),
+        _descriptor_detail("Summary", resource.get("summary"), target=resource.get("target")),
+        _descriptor_detail("Updated", resource.get("updated_at") or resource.get("created_at")),
+    ]
+    return {
+        "schema_version": 1,
+        "id": resource_id,
+        "kind": "resource_detail",
+        "title": _compact_text(resource.get("label"), max_chars=90) or resource_id,
+        "summary": _compact_text(resource.get("summary"), max_chars=180),
+        "status": "ready",
+        "target": resource.get("target"),
+        "details": [detail for detail in details if detail],
+    }
+
+
+def _strategic_context_descriptors(
+    *,
+    canvas: Dict[str, Any],
+    resources: List[Dict[str, Any]],
+    sources: List[Dict[str, Any]],
+    evidence: Dict[str, Any],
+    source_item_count: int,
+    task_counts: Dict[str, int],
+    attention_count: int,
+    status: str,
+) -> List[Dict[str, Any]]:
+    blocked_count = int(task_counts.get("blocked") or 0)
+    failed_count = int(task_counts.get("failed") or 0)
+    descriptors: List[Dict[str, Any]] = [
+        {
+            "schema_version": 1,
+            "id": canvas["id"],
+            "kind": "context_map",
+            "title": canvas["title"],
+            "summary": f"{canvas['node_count']} nodes / {canvas['edge_count']} links",
+            "status": status,
+            "target": {"surface": "project", "section": "problem-model"},
+            "empty": int(canvas.get("node_count") or 0) == 0,
+        },
+        {
+            "schema_version": 1,
+            "id": "context-metrics",
+            "kind": "metric_cards",
+            "title": "Context health",
+            "summary": "Read-only counts from the Strategic package.",
+            "status": status,
+            "metrics": [
+                {
+                    "label": "Items",
+                    "value": source_item_count,
+                    "tone": "info",
+                    "target": {"surface": "project", "section": "problem-model"},
+                },
+                {
+                    "label": "Tasks",
+                    "value": int(task_counts.get("total") or 0),
+                    "tone": "neutral",
+                    "target": {"surface": "pipeline"},
+                },
+                {
+                    "label": "Active",
+                    "value": int(
+                        task_counts.get("active") or task_counts.get("running") or 0
+                    ),
+                    "tone": "active",
+                    "target": {"surface": "pipeline", "section": "flow"},
+                },
+                {
+                    "label": "Attention",
+                    "value": attention_count,
+                    "tone": "warning" if attention_count else "neutral",
+                    "target": {"surface": "runtime", "section": "health"},
+                },
+                {
+                    "label": "Blocked",
+                    "value": blocked_count,
+                    "tone": "critical" if blocked_count else "neutral",
+                    "target": {"surface": "pipeline", "section": "flow"},
+                },
+                {
+                    "label": "Failed",
+                    "value": failed_count,
+                    "tone": "critical" if failed_count else "neutral",
+                    "target": {"surface": "pipeline", "section": "flow"},
+                },
+            ],
+        },
+    ]
+    source_table = _strategic_context_source_table_descriptor(sources)
+    if source_table:
+        descriptors.append(source_table)
+
+    seen_ids = {str(descriptor["id"]) for descriptor in descriptors}
+    for artifact in (evidence.get("artifacts") or {}).get("items", [])[:4]:
+        descriptor = _artifact_descriptor(artifact)
+        if descriptor and descriptor["id"] not in seen_ids:
+            seen_ids.add(str(descriptor["id"]))
+            descriptors.append(descriptor)
+
+    for resource in resources[:5]:
+        if resource.get("kind") == "canvas":
+            continue
+        descriptor = _resource_descriptor(resource)
+        if descriptor and descriptor["id"] not in seen_ids:
+            seen_ids.add(str(descriptor["id"]))
+            descriptors.append(descriptor)
+
+    if len(descriptors) == 2 and source_table is None:
+        descriptors.append(
+            {
+                "schema_version": 1,
+                "id": "unsupported-empty-artifacts",
+                "kind": "unsupported",
+                "title": "No artifacts attached",
+                "summary": "The context package is ready, but no renderable artifacts are available.",
+                "status": "empty",
+                "empty": True,
+            }
+        )
+    return descriptors[:10]
+
+
 def build_strategic_context_package_summary(
     project: Project,
     *,
@@ -1125,6 +1380,16 @@ def build_strategic_context_package_summary(
         },
         *mixed_resources,
     ][:7]
+    descriptors = _strategic_context_descriptors(
+        canvas=canvas,
+        resources=resources,
+        sources=sources,
+        evidence=evidence,
+        source_item_count=source_item_count,
+        task_counts=task_counts,
+        attention_count=attention_count,
+        status=status,
+    )
 
     return {
         "id": f"strategic-context:{project.id}",
@@ -1138,4 +1403,5 @@ def build_strategic_context_package_summary(
         "resources": resources,
         "evidence": evidence,
         "drilldowns": drilldowns,
+        "descriptors": descriptors,
     }

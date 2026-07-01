@@ -5,6 +5,8 @@
     "DirectionsPanel",
     "TaskDetailDrawer",
     "ResearchBrowser",
+    "StrategicContextRail",
+    "PipelineWorkspace",
     "PipelineView",
     "KanbanBoard",
     "MessagesPanel",

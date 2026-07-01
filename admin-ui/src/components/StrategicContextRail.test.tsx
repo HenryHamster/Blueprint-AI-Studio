@@ -2,6 +2,9 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 import type { ComponentProps } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { StrategicContextRail } from './StrategicContextRail';
 import type {
   StrategicStateResponse,
@@ -9,6 +12,16 @@ import type {
   StrategicWorkSessionAction,
   StrategicWorkSessionEvent,
 } from '../strategicStateApi';
+
+const BACKEND_CONTEXT_FIXTURE = JSON.parse(
+  readFileSync(
+    path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '../../../backend/testing/__fixtures__/operator_strategic_context_package_v1.json',
+    ),
+    'utf-8',
+  ),
+) as { context_package: StrategicStateResponse['context_package'] };
 
 type SessionRefs = StrategicWorkbenchState['selected_refs'];
 
@@ -390,6 +403,166 @@ const STATE: StrategicStateResponse = {
       { id: 'problem_model', label: 'Model', target: { surface: 'project', section: 'problem-model' } },
       { id: 'pipeline', label: 'Pipeline', target: { surface: 'pipeline' } },
       { id: 'runtime', label: 'Runtime', target: { surface: 'runtime', section: 'health' } },
+    ],
+    descriptors: [
+      {
+        schema_version: 1,
+        id: 'strategic-canvas:proj-1',
+        kind: 'context_map',
+        title: 'Strategic context map',
+        summary: '9 nodes / 8 links',
+        status: 'ready',
+        target: { surface: 'project', section: 'problem-model' },
+      },
+      {
+        schema_version: 1,
+        id: 'context-metrics',
+        kind: 'metric_cards',
+        title: 'Context health',
+        status: 'ready',
+        metrics: [
+          { label: 'Items', value: 32, tone: 'info', target: { surface: 'project', section: 'problem-model' } },
+          { label: 'Tasks', value: 20, tone: 'neutral', target: { surface: 'pipeline' } },
+          { label: 'Attention', value: 2, tone: 'warning', target: { surface: 'runtime', section: 'health' } },
+        ],
+      },
+      {
+        schema_version: 1,
+        id: 'sources',
+        kind: 'table',
+        title: 'Context sources',
+        status: 'ready',
+        columns: [
+          { key: 'source', label: 'Source' },
+          { key: 'count', label: 'Items' },
+        ],
+        rows: [
+          { id: 'tasks', cells: { source: 'tasks', count: 20 } },
+          { id: 'messages', cells: { source: 'messages', count: 3 } },
+        ],
+      },
+      {
+        schema_version: 1,
+        id: 'artifact:markdown-report',
+        kind: 'markdown',
+        title: 'Markdown report',
+        summary: 'Preview of the investigation report.',
+        status: 'ready',
+        target: { surface: 'task', task_id: 'task-strat', artifact_id: 'markdown-report' },
+        body: '## Read-only report\nContext package evidence is bounded.',
+        language: 'markdown',
+      },
+      {
+        schema_version: 1,
+        id: 'artifact:text-log',
+        kind: 'text',
+        title: 'Text artifact',
+        status: 'ready',
+        body: 'agent step completed',
+        language: 'text',
+      },
+      {
+        schema_version: 1,
+        id: 'artifact:image-preview',
+        kind: 'image',
+        title: 'Image artifact',
+        summary: 'Diagram preview.',
+        status: 'ready',
+        image: {
+          url: 'https://example.com/operator-context.png',
+          alt: 'Operator context diagram',
+          width: 640,
+          height: 360,
+        },
+      },
+      {
+        schema_version: 1,
+        id: 'artifact:chart',
+        kind: 'chart',
+        title: 'Chart artifact',
+        summary: 'Recent task trend.',
+        status: 'ready',
+        chart: {
+          kind: 'bar',
+          points: [
+            { label: 'running', value: 2 },
+            { label: 'waiting', value: 1 },
+          ],
+        },
+      },
+      {
+        schema_version: 1,
+        id: 'artifact:plot',
+        kind: 'plot',
+        title: 'Plot artifact',
+        status: 'ready',
+        chart: {
+          kind: 'line',
+          points: [
+            { label: 'phase 1', value: 1.2 },
+            { label: 'phase 2', value: 2.4 },
+          ],
+        },
+      },
+      {
+        schema_version: 1,
+        id: 'task:task-strat',
+        kind: 'task_detail',
+        title: 'Strategic review task',
+        status: 'IN_PROGRESS',
+        target: { surface: 'task', task_id: 'task-strat' },
+        details: [
+          { label: 'State', value: 'IN_PROGRESS' },
+          { label: 'Runner', value: 'agent-vm-strat' },
+        ],
+      },
+      {
+        schema_version: 1,
+        id: 'direction:d-1',
+        kind: 'direction_detail',
+        title: 'Keep context visible',
+        status: 'active',
+        target: { surface: 'project', section: 'directions', direction_id: 'd-1' },
+        details: [
+          { label: 'Priority', value: 'high' },
+          { label: 'Status', value: 'active' },
+        ],
+      },
+      {
+        schema_version: 1,
+        id: 'message:msg-1',
+        kind: 'message_detail',
+        title: 'Operator question',
+        summary: 'Question needs reply.',
+        status: 'needs_operator',
+        target: { surface: 'messages', message_id: 'msg-1', action: 'reply' },
+        details: [
+          { label: 'Sender', value: 'operator' },
+          { label: 'Intent', value: 'reply' },
+        ],
+      },
+      {
+        schema_version: 1,
+        id: 'knowledge:kdoc-1',
+        kind: 'resource_detail',
+        title: 'Operator notes',
+        summary: 'Context should be available when requested.',
+        status: 'ready',
+        target: { surface: 'knowledge', document_id: 'kdoc-1', direction_id: 'd-1', task_id: 'task-strat' },
+        details: [
+          { label: 'Kind', value: 'knowledge document' },
+          { label: 'Topic', value: 'operator context' },
+        ],
+      },
+      {
+        schema_version: 1,
+        id: 'artifact:unsupported-preview',
+        kind: 'unsupported',
+        title: 'Unsupported artifact',
+        summary: 'Descriptor exists but cannot preview this artifact type.',
+        status: 'unsupported',
+        unsupported_reason: 'Binary artifact preview is not supported in v1.',
+      },
     ],
   },
   runtime: {
@@ -778,6 +951,75 @@ describe('StrategicContextRail', () => {
     });
     expect(props.onOpenProjectSection).not.toHaveBeenCalled();
     expect(props.onOpenPipeline).not.toHaveBeenCalled();
+  });
+
+  test('renders the v1 strategic canvas and artifact descriptor matrix in the chat rail', () => {
+    const onOpenTarget = vi.fn();
+    const { host } = mount({ onOpenTarget });
+
+    expect(host.querySelector('[data-testid="strategic-chat-artifact-slot"]')).toBeTruthy();
+    expect(host.querySelector('[data-testid="strategic-chat-canvas-slot"]')).toBeTruthy();
+    [
+      'context_map',
+      'metric_cards',
+      'table',
+      'markdown',
+      'text',
+      'image',
+      'chart',
+      'plot',
+      'task_detail',
+      'direction_detail',
+      'message_detail',
+      'resource_detail',
+      'unsupported',
+    ].forEach(kind => {
+      expect(host.querySelector(`[data-testid="strategic-context-descriptor-${kind}"]`)).toBeTruthy();
+    });
+    expect(host.textContent).toContain('Canvas and artifacts');
+    expect(host.textContent).toContain('Context health');
+    expect(host.textContent).toContain('Read-only report');
+    expect(host.textContent).toContain('agent step completed');
+    expect(host.textContent).toContain('running');
+    expect(host.textContent).toContain('phase 2');
+    expect(host.textContent).toContain('Binary artifact preview is not supported in v1.');
+    expect(host.querySelector('img[alt="Operator context diagram"]')).toHaveAttribute(
+      'src',
+      'https://example.com/operator-context.png',
+    );
+
+    host.querySelector<HTMLButtonElement>('button[title="Open Strategic review task"]')?.click();
+    expect(onOpenTarget).toHaveBeenCalledWith({ surface: 'task', task_id: 'task-strat' });
+  });
+
+  test('renders the backend v1 strategic context package fixture shape', () => {
+    const { host } = mount({
+      state: {
+        ...STATE,
+        context_package: BACKEND_CONTEXT_FIXTURE.context_package,
+      },
+    });
+
+    [
+      'context_map',
+      'metric_cards',
+      'table',
+      'markdown',
+      'text',
+      'image',
+      'chart',
+      'plot',
+      'task_detail',
+      'direction_detail',
+      'message_detail',
+      'resource_detail',
+      'unsupported',
+    ].forEach(kind => {
+      expect(host.querySelector(`[data-testid="strategic-context-descriptor-${kind}"]`)).toBeTruthy();
+    });
+    expect(host.textContent).toContain('Operator workbench context');
+    expect(host.textContent).toContain('Binary artifact preview is not supported in v1.');
+    expect(host.querySelector('img[alt="Operator context diagram"]')).toBeTruthy();
   });
 
   test('fallback context resource routing preserves message target intent', () => {

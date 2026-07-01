@@ -1,0 +1,298 @@
+{
+  "_doc": "Golden v1 operator workbench strategic context package fixture. Read-only descriptor contract; no artifact logs, storage URIs, or knowledge bodies.",
+  "context_package": {
+    "id": "strategic-context:fixture-project",
+    "title": "Operator workbench context",
+    "status": "ready",
+    "updated_at": "2026-07-01T12:00:00Z",
+    "token_count": null,
+    "item_count": 18,
+    "sources": [
+      { "kind": "running_update", "count": 1 },
+      { "kind": "problem_model", "count": 4 },
+      { "kind": "directions", "count": 2 },
+      { "kind": "messages", "count": 3 },
+      { "kind": "tasks", "count": 6 },
+      { "kind": "knowledge", "count": 1 },
+      { "kind": "artifacts", "count": 1 }
+    ],
+    "canvas": {
+      "id": "strategic-canvas:fixture-project",
+      "title": "Strategic context map",
+      "kind": "strategic_context",
+      "node_count": 5,
+      "edge_count": 4,
+      "nodes": [
+        {
+          "id": "project:fixture-project",
+          "kind": "project",
+          "label": "Operator workbench context",
+          "target": { "surface": "project", "section": "running-update" }
+        },
+        {
+          "id": "task:task-sideboard",
+          "kind": "task",
+          "label": "Integrate sideboard context",
+          "status": "IN_PROGRESS",
+          "target": { "surface": "task", "task_id": "task-sideboard" }
+        },
+        {
+          "id": "direction:direction-passive-work",
+          "kind": "direction",
+          "label": "Make passive work readable",
+          "target": { "surface": "project", "section": "directions", "direction_id": "direction-passive-work" }
+        },
+        {
+          "id": "message:message-operator-question",
+          "kind": "message",
+          "label": "Operator question",
+          "target": { "surface": "messages", "message_id": "message-operator-question", "action": "reply" }
+        },
+        {
+          "id": "artifact:artifact-context-report",
+          "kind": "artifact",
+          "label": "Context report",
+          "target": { "surface": "task", "task_id": "task-sideboard", "artifact_id": "artifact-context-report" }
+        }
+      ],
+      "edges": [
+        { "source": "project:fixture-project", "target": "direction:direction-passive-work", "label": "direction" },
+        { "source": "direction:direction-passive-work", "target": "task:task-sideboard", "label": "executes" },
+        { "source": "task:task-sideboard", "target": "artifact:artifact-context-report", "label": "artifact" },
+        { "source": "message:message-operator-question", "target": "task:task-sideboard", "label": "asks" }
+      ],
+      "drilldowns": [
+        { "id": "pipeline", "label": "Pipeline", "target": { "surface": "pipeline", "task_id": "task-sideboard" } }
+      ]
+    },
+    "resources": [
+      {
+        "id": "strategic-canvas:fixture-project",
+        "kind": "canvas",
+        "label": "Strategic context map",
+        "summary": "5 nodes / 4 links",
+        "target": { "surface": "project", "section": "problem-model" }
+      },
+      {
+        "id": "knowledge:knowledge-operator-note",
+        "kind": "knowledge_document",
+        "label": "Operator note",
+        "summary": "Sideboard and canvas context should stay readable.",
+        "target": { "surface": "knowledge", "document_id": "knowledge-operator-note", "direction_id": "direction-passive-work" }
+      },
+      {
+        "id": "artifact:artifact-context-report",
+        "kind": "artifact",
+        "label": "Context report",
+        "summary": "Strategic review",
+        "target": { "surface": "task", "task_id": "task-sideboard", "artifact_id": "artifact-context-report" }
+      }
+    ],
+    "evidence": {
+      "knowledge": {
+        "total": 1,
+        "items": [
+          {
+            "id": "knowledge-operator-note",
+            "kind": "knowledge_document",
+            "label": "Operator note",
+            "summary": "Sideboard and canvas context should stay readable.",
+            "source_kind": "design",
+            "direction_id": "direction-passive-work",
+            "source_task_id": "task-sideboard",
+            "target": { "surface": "knowledge", "document_id": "knowledge-operator-note", "direction_id": "direction-passive-work" }
+          }
+        ]
+      },
+      "artifacts": {
+        "total": 1,
+        "items": [
+          {
+            "id": "artifact-context-report",
+            "kind": "artifact",
+            "label": "Context report",
+            "artifact_type": "INVESTIGATION_REPORT",
+            "task_id": "task-sideboard",
+            "task_title": "Strategic review",
+            "task_status": "IN_PROGRESS",
+            "target": { "surface": "task", "task_id": "task-sideboard", "artifact_id": "artifact-context-report" }
+          }
+        ]
+      }
+    },
+    "drilldowns": [
+      { "id": "running_update", "label": "Update", "target": { "surface": "project", "section": "running-update" } },
+      { "id": "problem_model", "label": "Model", "target": { "surface": "project", "section": "problem-model" } },
+      { "id": "pipeline", "label": "Pipeline", "target": { "surface": "pipeline" } },
+      { "id": "runtime", "label": "Runtime", "target": { "surface": "runtime", "section": "health" } }
+    ],
+    "descriptors": [
+      {
+        "schema_version": 1,
+        "id": "strategic-canvas:fixture-project",
+        "kind": "context_map",
+        "title": "Strategic context map",
+        "summary": "5 nodes / 4 links",
+        "status": "ready",
+        "target": { "surface": "project", "section": "problem-model" },
+        "empty": false
+      },
+      {
+        "schema_version": 1,
+        "id": "context-metrics",
+        "kind": "metric_cards",
+        "title": "Context health",
+        "summary": "Read-only counts from the Strategic package.",
+        "status": "ready",
+        "metrics": [
+          { "label": "Items", "value": 18, "tone": "info", "target": { "surface": "project", "section": "problem-model" } },
+          { "label": "Tasks", "value": 6, "tone": "neutral", "target": { "surface": "pipeline" } },
+          { "label": "Attention", "value": 2, "tone": "warning", "target": { "surface": "runtime", "section": "health" } }
+        ]
+      },
+      {
+        "schema_version": 1,
+        "id": "sources",
+        "kind": "table",
+        "title": "Context sources",
+        "summary": "Bounded source counts included in this package.",
+        "status": "ready",
+        "columns": [
+          { "key": "source", "label": "Source" },
+          { "key": "count", "label": "Items" }
+        ],
+        "rows": [
+          { "id": "tasks", "cells": { "source": "tasks", "count": 6 } },
+          { "id": "messages", "cells": { "source": "messages", "count": 3 } }
+        ]
+      },
+      {
+        "schema_version": 1,
+        "id": "artifact:markdown-report",
+        "kind": "markdown",
+        "title": "Markdown report",
+        "summary": "Preview of the investigation report.",
+        "status": "ready",
+        "target": { "surface": "task", "task_id": "task-sideboard", "artifact_id": "markdown-report" },
+        "body": "## Read-only report\nContext package evidence is bounded.",
+        "language": "markdown"
+      },
+      {
+        "schema_version": 1,
+        "id": "artifact:text-log",
+        "kind": "text",
+        "title": "Text artifact",
+        "summary": "Short artifact preview.",
+        "status": "ready",
+        "body": "agent step completed",
+        "language": "text"
+      },
+      {
+        "schema_version": 1,
+        "id": "artifact:image-preview",
+        "kind": "image",
+        "title": "Image artifact",
+        "summary": "Diagram preview.",
+        "status": "ready",
+        "image": {
+          "url": "https://example.com/operator-context.png",
+          "alt": "Operator context diagram",
+          "width": 640,
+          "height": 360
+        }
+      },
+      {
+        "schema_version": 1,
+        "id": "artifact:chart",
+        "kind": "chart",
+        "title": "Chart artifact",
+        "summary": "Recent task trend.",
+        "status": "ready",
+        "chart": {
+          "kind": "bar",
+          "points": [
+            { "label": "running", "value": 2 },
+            { "label": "waiting", "value": 1 },
+            { "label": "blocked", "value": 0 }
+          ]
+        }
+      },
+      {
+        "schema_version": 1,
+        "id": "artifact:plot",
+        "kind": "plot",
+        "title": "Plot artifact",
+        "summary": "Cost by stage.",
+        "status": "ready",
+        "chart": {
+          "kind": "line",
+          "points": [
+            { "label": "phase 1", "value": 1.2 },
+            { "label": "phase 2", "value": 2.4 }
+          ]
+        }
+      },
+      {
+        "schema_version": 1,
+        "id": "task:task-sideboard",
+        "kind": "task_detail",
+        "title": "Integrate sideboard context",
+        "summary": "Task detail descriptor.",
+        "status": "IN_PROGRESS",
+        "target": { "surface": "task", "task_id": "task-sideboard" },
+        "details": [
+          { "label": "State", "value": "IN_PROGRESS" },
+          { "label": "Runner", "value": "agent-vm-sideboard" }
+        ]
+      },
+      {
+        "schema_version": 1,
+        "id": "direction:direction-passive-work",
+        "kind": "direction_detail",
+        "title": "Make passive work readable",
+        "summary": "Direction detail descriptor.",
+        "status": "active",
+        "target": { "surface": "project", "section": "directions", "direction_id": "direction-passive-work" },
+        "details": [
+          { "label": "Priority", "value": "high" },
+          { "label": "Status", "value": "active" }
+        ]
+      },
+      {
+        "schema_version": 1,
+        "id": "message:message-operator-question",
+        "kind": "message_detail",
+        "title": "Operator question",
+        "summary": "Question needs reply.",
+        "status": "needs_operator",
+        "target": { "surface": "messages", "message_id": "message-operator-question", "action": "reply" },
+        "details": [
+          { "label": "Sender", "value": "operator" },
+          { "label": "Intent", "value": "reply" }
+        ]
+      },
+      {
+        "schema_version": 1,
+        "id": "knowledge:knowledge-operator-note",
+        "kind": "resource_detail",
+        "title": "Operator note",
+        "summary": "Sideboard and canvas context should stay readable.",
+        "status": "ready",
+        "target": { "surface": "knowledge", "document_id": "knowledge-operator-note", "direction_id": "direction-passive-work" },
+        "details": [
+          { "label": "Kind", "value": "knowledge document" },
+          { "label": "Topic", "value": "operator context" }
+        ]
+      },
+      {
+        "schema_version": 1,
+        "id": "artifact:unsupported-preview",
+        "kind": "unsupported",
+        "title": "Unsupported artifact",
+        "summary": "Descriptor exists but cannot preview this artifact type.",
+        "status": "unsupported",
+        "unsupported_reason": "Binary artifact preview is not supported in v1."
+      }
+    ]
+  }
+}

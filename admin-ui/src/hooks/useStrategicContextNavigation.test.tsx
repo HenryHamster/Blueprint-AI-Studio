@@ -179,4 +179,32 @@ describe('useStrategicContextNavigation', () => {
     expect(selectPipelineTaskById).toHaveBeenCalledWith('task-flow-1');
     expect(handleTabChange).toHaveBeenCalledWith('pipeline');
   });
+
+  test('task targets select the pipeline task and open the task drawer when a drawer handler is provided', () => {
+    const handleTabChange = vi.fn();
+    const openTask = vi.fn();
+    const selectPipelineTaskById = vi.fn();
+    const setPipelineSection = vi.fn();
+    const setShowArchive = vi.fn();
+    const setViewMode = vi.fn();
+    const open = mount({
+      handleTabChange,
+      openTask,
+      selectPipelineTaskById,
+      setPipelineSection,
+      setShowArchive,
+      setViewMode,
+    });
+
+    act(() => {
+      open({ surface: 'task', task_id: 'task-drawer-1' } as Target);
+    });
+
+    expect(setPipelineSection).toHaveBeenCalledWith('flow');
+    expect(setViewMode).toHaveBeenCalledWith('pipeline');
+    expect(setShowArchive).toHaveBeenCalledWith(false);
+    expect(selectPipelineTaskById).toHaveBeenCalledWith('task-drawer-1');
+    expect(openTask).toHaveBeenCalledWith('task-drawer-1');
+    expect(handleTabChange).not.toHaveBeenCalledWith('pipeline');
+  });
 });

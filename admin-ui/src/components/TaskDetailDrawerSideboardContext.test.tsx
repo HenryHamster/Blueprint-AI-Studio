@@ -1,8 +1,21 @@
 import { render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, test, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { Task } from '../types/task';
 import { TaskSideboardContextSection } from './TaskDetailDrawerSideboardContext';
+
+const BACKEND_SIDEBOARD_FIXTURE = JSON.parse(
+  readFileSync(
+    path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '../../../backend/testing/__fixtures__/operator_task_sideboard_context_v1.json',
+    ),
+    'utf-8',
+  ),
+) as { task: Task };
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -16,6 +29,39 @@ function makeTask(overrides: Partial<Task> = {}): Task {
     requires_approval: false,
     created_at: '2026-06-29T12:00:00Z',
     sideboard_context: {
+      task: {
+        id: 'task-12345678',
+        title: 'Implement sideboard polish',
+        status: 'IN_PROGRESS',
+        task_type: 'create',
+        latest_status_message: 'Implementing compact sideboard rows.',
+        blocker: {
+          kind: 'dependency',
+          reason: 'Waiting for upstream verification.',
+          blocked_at: '2026-06-29T13:00:00Z',
+          recheck_after: '2026-06-29T14:00:00Z',
+          parked_at: null,
+        },
+        runner: {
+          vm_instance_id: 'agent-vm-sideboard',
+          runner_target_id: 'runner-local-1',
+          machine_type: 'n2-standard-4',
+          spot: true,
+          warm_start: false,
+          provider: 'anthropic',
+          account_id: 'acct-sideboard',
+        },
+        cost: {
+          estimated_vm_usd: 1.25,
+          llm_usd: 0.42,
+          llm_any_unpriced: false,
+        },
+        next_action: {
+          label: 'Monitor progress',
+          reason: 'Implementing compact sideboard rows.',
+          target: { surface: 'task', id: 'task-12345678', task_id: 'task-12345678' },
+        },
+      },
       project: { id: 'proj-1', name: 'Blueprint', repo: 'HenryHamster/BlueprintAIStudio' },
       purpose: 'Make passive work readable from the task drawer.',
       strategic: {
@@ -74,6 +120,9 @@ describe('TaskSideboardContextSection', () => {
     render(<TaskSideboardContextSection task={makeTask()} onNavigateToTask={onNavigateToTask} />);
 
     expect(screen.getByText('Context')).toBeInTheDocument();
+    expect(screen.getByText('Task')).toBeInTheDocument();
+    expect(screen.getByText('Current blocker')).toBeInTheDocument();
+    expect(screen.getByText('Runner')).toBeInTheDocument();
     expect(screen.getByText('Project')).toBeInTheDocument();
     expect(screen.getByText('Strategic')).toBeInTheDocument();
     expect(screen.getByText('Pipeline')).toBeInTheDocument();
@@ -81,13 +130,18 @@ describe('TaskSideboardContextSection', () => {
     expect(screen.getByText('Links')).toBeInTheDocument();
     expect(screen.getByText('Messages')).toBeInTheDocument();
     expect(screen.getByText('HenryHamster/BlueprintAIStudio')).toBeInTheDocument();
+    expect(screen.getByText('Monitor progress')).toBeInTheDocument();
+    expect(screen.getAllByText('Implementing compact sideboard rows.').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('agent-vm-sideboard / runner runner-local-1 / n2-standard-4 / anthropic / acct-sideboard')).toBeInTheDocument();
+    expect(screen.getByText('$1.25')).toBeInTheDocument();
+    expect(screen.getByText('$0.42')).toBeInTheDocument();
     expect(screen.getByText('Make passive work readable from the task drawer.')).toBeInTheDocument();
     expect(screen.getByText('Keep monitoring context dense and legible for passive tasks.')).toBeInTheDocument();
     expect(screen.getByText('cycle-2026-06-30')).toBeInTheDocument();
     expect(screen.getByText('implementation review')).toBeInTheDocument();
     expect(screen.getByText('Dependencies')).toBeInTheDocument();
     expect(screen.getByText('Children')).toBeInTheDocument();
-    expect(screen.getByText('Waiting for upstream verification.')).toBeInTheDocument();
+    expect(screen.getAllByText('Waiting for upstream verification.').length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText('pull request 1 · log 1')).toBeInTheDocument();
     expect(screen.getByText('abcdef123456')).toBeInTheDocument();
     expect(screen.getByRole('link', { name: 'PR' })).toHaveAttribute(
@@ -104,6 +158,25 @@ describe('TaskSideboardContextSection', () => {
 
     await user.click(screen.getByRole('button', { name: 'parent parent-task-abcdef' }));
     expect(onNavigateToTask).toHaveBeenCalledWith('parent-task-abcdef');
+  });
+
+  test('renders the backend v1 sideboard fixture shape', () => {
+    render(<TaskSideboardContextSection task={BACKEND_SIDEBOARD_FIXTURE.task} onNavigateToTask={vi.fn()} />);
+
+    expect(screen.getByText('Task')).toBeInTheDocument();
+    expect(screen.getByText('Current blocker')).toBeInTheDocument();
+    expect(screen.getByText('Runner')).toBeInTheDocument();
+    expect(screen.getAllByText('blocked').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('Resolve blocker')).toBeInTheDocument();
+    expect(screen.getAllByText('Waiting for upstream verification.').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText('agent-vm-sideboard / runner runner-local-1 / n2-standard-4 / anthropic / acct-sideboard')).toBeInTheDocument();
+    expect(screen.getByText('$1.25')).toBeInTheDocument();
+    expect(screen.getByText('$0.42')).toBeInTheDocument();
+    expect(screen.getByText('Keep active work understandable.')).toBeInTheDocument();
+    expect(screen.getByText('Keep passive work legible from the operator sideboard.')).toBeInTheDocument();
+    expect(screen.getByText('task-parent-wave')).toBeInTheDocument();
+    expect(screen.getByText('pull request 1 · log 1')).toBeInTheDocument();
+    expect(screen.getByText('The task is waiting on verification.')).toBeInTheDocument();
   });
 
   test('prefers pipeline movement_explanation over blocked_reason', () => {

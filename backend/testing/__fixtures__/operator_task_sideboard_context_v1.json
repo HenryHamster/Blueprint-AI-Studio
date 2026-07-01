@@ -1,0 +1,142 @@
+{
+  "_doc": "Golden v1 operator workbench task sideboard fixture. Read-only summary context; no raw project problem model or task design_doc payload.",
+  "task": {
+    "id": "task-sideboard",
+    "project_id": "project-sideboard",
+    "title": "Integrate task sideboard",
+    "description": "Expose task state and supporting context in the drawer.",
+    "status": "BLOCKED",
+    "task_type": "create",
+    "vm_instance_id": "agent-vm-sideboard",
+    "latest_status_message": "Waiting for upstream verification.",
+    "created_by": "ORCHESTRATOR",
+    "requires_approval": false,
+    "parent_task_id": "task-parent-wave",
+    "depends_on": ["task-upstream-verification"],
+    "created_at": "2026-07-01T11:00:00Z",
+    "blocker_kind": "dependency",
+    "blocked_reason": "Waiting for upstream verification.",
+    "blocked_at": "2026-07-01T11:30:00Z",
+    "recheck_after": "2026-07-01T12:30:00Z",
+    "estimated_cost_usd": 1.25,
+    "task_llm_cost_usd": 0.42,
+    "task_llm_cost_any_unpriced": false,
+    "pr_url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/42",
+    "commit_hash": "abc123def456",
+    "sideboard_context": {
+      "task": {
+        "id": "task-sideboard",
+        "title": "Integrate task sideboard",
+        "status": "BLOCKED",
+        "task_type": "create",
+        "latest_status_message": "Waiting for upstream verification.",
+        "blocker": {
+          "kind": "dependency",
+          "reason": "Waiting for upstream verification.",
+          "blocked_at": "2026-07-01T11:30:00Z",
+          "recheck_after": "2026-07-01T12:30:00Z",
+          "parked_at": null
+        },
+        "runner": {
+          "vm_instance_id": "agent-vm-sideboard",
+          "runner_target_id": "runner-local-1",
+          "machine_type": "n2-standard-4",
+          "spot": true,
+          "warm_start": false,
+          "provider": "anthropic",
+          "account_id": "acct-sideboard"
+        },
+        "cost": {
+          "estimated_vm_usd": 1.25,
+          "llm_usd": 0.42,
+          "llm_any_unpriced": false
+        },
+        "next_action": {
+          "label": "Resolve blocker",
+          "reason": "Waiting for upstream verification.",
+          "target": { "surface": "task", "id": "task-sideboard", "task_id": "task-sideboard" }
+        }
+      },
+      "project": {
+        "id": "project-sideboard",
+        "name": "Blueprint",
+        "repo": "HenryHamster/BlueprintAIStudio"
+      },
+      "purpose": "Keep active work understandable.",
+      "strategic": {
+        "direction": {
+          "id": "direction-passive-work",
+          "text": "Keep passive work legible from the operator sideboard.",
+          "priority": "high",
+          "status": "active"
+        },
+        "cycle": {
+          "id": "cycle-sideboard",
+          "phase": "strategic_review",
+          "outcome": "phase2_running"
+        }
+      },
+      "pipeline": {
+        "parent_task_id": "task-parent-wave",
+        "child_count": 2,
+        "dependency_count": 1,
+        "blocked_reason": "Waiting for upstream verification.",
+        "movement_explanation": "Waiting for upstream verification."
+      },
+      "artifacts": {
+        "total": 2,
+        "by_type": {
+          "PULL_REQUEST": 1,
+          "LOG": 1
+        },
+        "primary_pr_url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/42",
+        "primary_commit": "abc123def456"
+      },
+      "messages": {
+        "total_recent": 2,
+        "items": [
+          {
+            "id": "message-sideboard-1",
+            "role": "assistant",
+            "content": "The task is waiting on verification.",
+            "created_at": "2026-07-01T11:20:00Z",
+            "context": { "event_type": "task_update" }
+          },
+          {
+            "id": "message-sideboard-2",
+            "role": "user",
+            "content": "Keep the parent wave visible.",
+            "created_at": "2026-07-01T11:25:00Z",
+            "context": { "event_type": "operator_reply" }
+          }
+        ]
+      },
+      "links": [
+        {
+          "id": "pipeline",
+          "label": "Pipeline",
+          "target": { "surface": "pipeline", "id": "task-sideboard", "task_id": "task-sideboard" }
+        },
+        {
+          "id": "parent_task",
+          "label": "Parent",
+          "target": { "surface": "task", "id": "task-parent-wave", "task_id": "task-parent-wave" }
+        },
+        {
+          "id": "direction",
+          "label": "Direction",
+          "target": { "surface": "project", "section": "directions", "id": "direction-passive-work", "direction_id": "direction-passive-work" }
+        },
+        {
+          "id": "pull_request",
+          "label": "PR",
+          "target": {
+            "surface": "external",
+            "id": "https://github.com/HenryHamster/BlueprintAIStudio/pull/42",
+            "url": "https://github.com/HenryHamster/BlueprintAIStudio/pull/42"
+          }
+        }
+      ]
+    }
+  }
+}

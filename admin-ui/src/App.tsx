@@ -628,7 +628,7 @@ export default function App() {
   const hasActiveFilters = s.tasks.length > 0 && (filteredTasks.length < s.tasks.length || s.failureClassFilter.length > 0);
   const visibleActiveTasks = useMemo(() => filteredTasks.filter(t => ACTIVE_PIPELINE_STATUSES.has(t.status)), [filteredTasks]);
   const visibleQueuedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'QUEUED'), [filteredTasks]);
-  const visibleBlockedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'BLOCKED' || (t.status === 'QUEUED' && !!t.depends_on && t.depends_on.length > 0)), [filteredTasks]);
+  const visibleBlockedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'BLOCKED'), [filteredTasks]);
   const visibleFailedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'FAILED'), [filteredTasks]);
   const visibleTerminalTasks = useMemo(() => filteredTasks.filter(t => TERMINAL_STATUSES.has(t.status)), [filteredTasks]);
   const backendPipelineAttentionItems = useMemo(() => {
@@ -946,7 +946,7 @@ export default function App() {
   }, [handleTabChange, setCommandPaletteOpen]);
   const strategicMessageTarget = useStrategicMessageTarget(() => handleTabChange('chat'), selectedProjectId);
   const openStrategicContextTarget = useStrategicContextNavigation({
-    handleTabChange, openMessages: strategicMessageTarget.open, selectPipelineTaskById,
+    handleTabChange, openMessages: strategicMessageTarget.open, openTask: handleViewTaskById, selectPipelineTaskById,
     setKnowledgeBrowserDirectionId, setKnowledgeBrowserInitialDocId,
     setPipelineSection, setProjectSection, setProjectManageSection, setRuntimeSection, setRuntimeConfigSection,
     setShowArchive: s.setShowArchive, setShowKnowledgeBrowser: s.setShowKnowledgeBrowser, setViewMode: s.setViewMode,

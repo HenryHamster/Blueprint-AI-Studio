@@ -24,6 +24,7 @@ import {
   upsertStrategicSelectedRef,
   type StrategicSelectedRef,
 } from '../utils/strategicWorkbenchSession';
+import { StrategicContextArtifactSlot } from './StrategicContextArtifactSlot';
 import { StrategicSessionEvents } from './StrategicSessionEvents';
 import type { StrategicAccountSpendStatus } from './StrategicSessionControl';
 import { WorkbenchPanel } from './WorkbenchLayout';
@@ -878,6 +879,10 @@ function ContextPackageBlock({
         onOpenTarget={onOpenTarget}
         onRemove={onRemoveRef}
         disabled={savingSessionRefs}
+      />
+      <StrategicContextArtifactSlot
+        contextPackage={contextPackage}
+        onOpenTarget={onOpenTarget}
       />
       {mapNodes.length > 0 && (
         <div className="mt-2" data-testid="strategic-context-map">

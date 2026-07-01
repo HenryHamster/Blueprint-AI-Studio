@@ -1277,6 +1277,67 @@ def _strategic_cycle_sideboard_ref(
     }
 
 
+def _task_sideboard_next_action(task: Task) -> dict[str, Any]:
+    status = _status_value(task.status)
+    target = {"surface": "task", "id": str(task.id), "task_id": str(task.id)}
+    if status == "FAILED":
+        return {
+            "label": "Inspect failure",
+            "reason": compact_text(task.latest_status_message, max_chars=220),
+            "target": {**target, "section": "logs"},
+        }
+    if status == "BLOCKED":
+        return {
+            "label": "Resolve blocker",
+            "reason": compact_text(task.blocked_reason, max_chars=220),
+            "target": target,
+        }
+    if status == "PARKED":
+        return {
+            "label": "Review parked wake",
+            "reason": compact_text(task.park_reason, max_chars=220),
+            "target": target,
+        }
+    if task.requires_approval:
+        return {
+            "label": "Review approval",
+            "reason": compact_text(task.latest_status_message, max_chars=220),
+            "target": target,
+        }
+    if status == "QUEUED" and task.depends_on:
+        return {
+            "label": "Wait for dependencies",
+            "reason": f"{len(task.depends_on)} upstream task{'s' if len(task.depends_on) != 1 else ''}",
+            "target": {"surface": "pipeline", "id": str(task.id), "task_id": str(task.id)},
+        }
+    if status in _status_values(
+        (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
+    ):
+        return {
+            "label": "Monitor progress",
+            "reason": compact_text(task.latest_status_message, max_chars=220),
+            "target": target,
+        }
+    return {
+        "label": "Open task detail",
+        "reason": compact_text(task.latest_status_message, max_chars=220),
+        "target": target,
+    }
+
+
+def _task_runner_sideboard_context(task: Task) -> dict[str, Any]:
+    ctx = task.context if isinstance(task.context, dict) else {}
+    return {
+        "vm_instance_id": compact_text(task.vm_instance_id, max_chars=120),
+        "runner_target_id": compact_text(ctx.get("runner_target_id"), max_chars=120),
+        "machine_type": compact_text(task.vm_machine_type, max_chars=80),
+        "spot": task.vm_spot,
+        "warm_start": task.vm_warm_start,
+        "provider": compact_text(task.provider, max_chars=80),
+        "account_id": compact_text(task.account_id, max_chars=120),
+    }
+
+
 def _task_sideboard_context(
     task: Task,
     *,
@@ -1299,6 +1360,8 @@ def _task_sideboard_context(
     )
     dependency_count = len(task.depends_on or [])
     movement_explanation = build_task_movement_explanation(task)
+    llm_cost_fields = _task_llm_cost_fields(task)
+    task_type = (task.first_payload).get("type", "create")
     pipeline = {
         "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
         "child_count": child_count,
@@ -1360,6 +1423,35 @@ def _task_sideboard_context(
         )
 
     return {
+        "task": {
+            "id": str(task.id),
+            "title": compact_text(task.title, max_chars=160),
+            "status": _status_value(task.status),
+            "task_type": compact_text(task_type, max_chars=80),
+            "latest_status_message": compact_text(
+                task.latest_status_message,
+                max_chars=220,
+            ),
+            "blocker": {
+                "kind": compact_text(task.blocker_kind, max_chars=80),
+                "reason": compact_text(
+                    task.blocked_reason or task.park_reason,
+                    max_chars=220,
+                ),
+                "blocked_at": task.blocked_at.isoformat() if task.blocked_at else None,
+                "recheck_after": task.recheck_after.isoformat()
+                if task.recheck_after
+                else None,
+                "parked_at": task.parked_at.isoformat() if task.parked_at else None,
+            },
+            "runner": _task_runner_sideboard_context(task),
+            "cost": {
+                "estimated_vm_usd": get_task_total_vm_cost_usd_or_none(task),
+                "llm_usd": llm_cost_fields["task_llm_cost_usd"],
+                "llm_any_unpriced": llm_cost_fields["task_llm_cost_any_unpriced"],
+            },
+            "next_action": _task_sideboard_next_action(task),
+        },
         "project": {
             "id": str(project.id) if project else str(task.project_id),
             "name": project.name if project else None,

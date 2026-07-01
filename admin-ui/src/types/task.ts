@@ -93,6 +93,45 @@ export interface TaskArtifact {
 }
 
 export interface TaskSideboardContext {
+  task?: {
+    id: string;
+    title?: string | null;
+    status: string;
+    task_type?: string | null;
+    latest_status_message?: string | null;
+    blocker?: {
+      kind?: string | null;
+      reason?: string | null;
+      blocked_at?: string | null;
+      recheck_after?: string | null;
+      parked_at?: string | null;
+    };
+    runner?: {
+      vm_instance_id?: string | null;
+      runner_target_id?: string | null;
+      machine_type?: string | null;
+      spot?: boolean | null;
+      warm_start?: boolean | null;
+      provider?: string | null;
+      account_id?: string | null;
+    };
+    cost?: {
+      estimated_vm_usd?: number | null;
+      llm_usd?: number | null;
+      llm_any_unpriced?: boolean | null;
+    };
+    next_action?: {
+      label: string;
+      reason?: string | null;
+      target?: {
+        surface: string;
+        section?: string | null;
+        id?: string | null;
+        task_id?: string | null;
+        url?: string | null;
+      } | null;
+    };
+  };
   project: {
     id: string;
     name?: string | null;

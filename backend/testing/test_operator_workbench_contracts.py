@@ -1,4 +1,6 @@
+import json
 from datetime import timedelta
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -18,6 +20,7 @@ from app.models import (
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 
 TEST_USER_ID = "test-user-123"
+FIXTURE_DIR = Path(__file__).parent / "__fixtures__"
 
 
 async def _make_project(session) -> Project:
@@ -63,6 +66,10 @@ async def _make_project(session) -> Project:
 def _assert_has_keys(payload: dict[str, Any], keys: set[str]) -> None:
     missing = keys.difference(payload)
     assert not missing, f"missing keys: {sorted(missing)}"
+
+
+def _fixture(name: str) -> dict:
+    return json.loads((FIXTURE_DIR / name).read_text(encoding="utf-8"))
 
 
 @pytest.mark.asyncio
@@ -335,3 +342,75 @@ async def test_operator_workbench_current_state_contract_surfaces(
         },
     )
     assert isinstance(fleet["served_stale"], bool)
+
+
+def test_strategic_context_package_v1_fixture_covers_renderer_contract():
+    package = _fixture("operator_strategic_context_package_v1.json")[
+        "context_package"
+    ]
+    descriptors = package["descriptors"]
+    kinds = {descriptor["kind"] for descriptor in descriptors}
+
+    assert {
+        "context_map",
+        "metric_cards",
+        "table",
+        "markdown",
+        "text",
+        "image",
+        "chart",
+        "plot",
+        "task_detail",
+        "direction_detail",
+        "message_detail",
+        "resource_detail",
+        "unsupported",
+    } <= kinds
+    assert all(descriptor["schema_version"] == 1 for descriptor in descriptors)
+    assert package["canvas"]["nodes"]
+    assert package["canvas"]["edges"]
+    assert package["resources"][0]["kind"] == "canvas"
+
+    serialized = json.dumps(package)
+    assert "storage_uri" not in serialized
+    assert "gs://blueprint" not in serialized
+    assert "artifact logs" not in serialized.lower()
+    assert "knowledge body" not in serialized.lower()
+
+
+def test_task_sideboard_context_v1_fixture_covers_pipeline_and_task_contract():
+    task = _fixture("operator_task_sideboard_context_v1.json")["task"]
+    sideboard = task["sideboard_context"]
+
+    assert sideboard["task"]["status"] == "BLOCKED"
+    assert sideboard["task"]["task_type"] == "create"
+    assert sideboard["task"]["blocker"] == {
+        "kind": "dependency",
+        "reason": "Waiting for upstream verification.",
+        "blocked_at": "2026-07-01T11:30:00Z",
+        "recheck_after": "2026-07-01T12:30:00Z",
+        "parked_at": None,
+    }
+    assert sideboard["task"]["runner"]["vm_instance_id"] == "agent-vm-sideboard"
+    assert sideboard["task"]["runner"]["runner_target_id"] == "runner-local-1"
+    assert sideboard["task"]["cost"] == {
+        "estimated_vm_usd": 1.25,
+        "llm_usd": 0.42,
+        "llm_any_unpriced": False,
+    }
+    assert sideboard["task"]["next_action"]["label"] == "Resolve blocker"
+    assert sideboard["pipeline"]["parent_task_id"] == "task-parent-wave"
+    assert sideboard["artifacts"]["primary_pr_url"].endswith("/pull/42")
+    assert sideboard["strategic"]["direction"]["id"] == "direction-passive-work"
+    assert sideboard["messages"]["total_recent"] == 2
+    assert {link["id"] for link in sideboard["links"]} >= {
+        "pipeline",
+        "parent_task",
+        "direction",
+        "pull_request",
+    }
+
+    serialized = json.dumps(sideboard)
+    assert "problem_model" not in serialized
+    assert "design_doc" not in serialized
+    assert "huge" not in serialized
