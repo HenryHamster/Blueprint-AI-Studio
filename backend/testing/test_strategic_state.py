@@ -35,7 +35,7 @@ from app.models import (
     _utcnow,
 )
 from app.workbench_state import sanitize_strategic_session_snapshot
-from app.workbench_events import SURFACE_MESSAGES, SURFACE_STRATEGIC_SESSION
+from app.workbench_events import SURFACE_MESSAGES, SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION
 
 TEST_USER_ID = "test-user-123"
 
@@ -58,6 +58,7 @@ def test_strategic_session_snapshot_preserves_canonical_context_target_fields():
                         "action": "open " + ("x" * 220),
                         "document_id": "document-1",
                         "artifact_id": "artifact-1",
+                        "runner_id": "runner-1",
                         "cycle_id": "cycle-1",
                         "secret": "drop-me",
                     },
@@ -77,6 +78,7 @@ def test_strategic_session_snapshot_preserves_canonical_context_target_fields():
         "action": "open " + ("x" * 175),
         "document_id": "document-1",
         "artifact_id": "artifact-1",
+        "runner_id": "runner-1",
         "cycle_id": "cycle-1",
     }
 
@@ -1941,24 +1943,36 @@ async def test_strategic_session_create_persists_project_session(
 ):
     project = await _make_project(db_session)
 
-    resp = await client.post(
-        f"/api/admin/projects/{project.id}/strategic-session",
-        json={
-            "workbench": {
-                "interaction_mode": "check_in",
-                "active_surface": "project",
-                "selected_refs": [
-                    {
-                        "kind": "direction",
-                        "id": "d-high",
-                        "label": "Operator workbench direction",
-                    }
-                ],
-            }
-        },
-    )
+    with patch("app.workbench_events.broadcast_to_project", new=AsyncMock()) as bcast:
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/strategic-session",
+            json={
+                "workbench": {
+                    "interaction_mode": "check_in",
+                    "active_surface": "project",
+                    "selected_refs": [
+                        {
+                            "kind": "direction",
+                            "id": "d-high",
+                            "label": "Operator workbench direction",
+                        }
+                    ],
+                }
+            },
+        )
 
     assert resp.status_code == 200, resp.text
+    bcast.assert_awaited_once()
+    assert bcast.await_args.args[:2] == (str(project.id), "workbench_refetch")
+    event_payload = bcast.await_args.args[2]
+    assert event_payload["resource"] == "strategic_workbench"
+    assert event_payload["action"] == "updated"
+    assert event_payload["refetch"] == {
+        "surfaces": [SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME],
+    }
+    assert event_payload["workbench"]["interaction_mode"] == "check_in"
+    assert event_payload["workbench"]["active_surface"] == "project"
+    assert event_payload["workbench"]["arming"] == "steering"
     data = resp.json()
     assert data["arming"] == "steering"
     assert data["session"]["mode"] == "check_in"
@@ -2270,6 +2284,25 @@ async def test_strategic_session_message_records_operator_message_and_snapshot(
         "message_type": "FEEDBACK",
         "content": "Keep this session pinned to the local Strategic runner.",
         "idempotency_key": "strategic-session-message-1",
+        "workbench_context": {
+            "interaction_mode": "monitor",
+            "active_surface": "pipeline",
+            "selected_refs": [
+                {"kind": "task", "id": "task-9", "label": "Watch task"}
+            ],
+            "selected_ref_descriptors": [
+                {
+                    "kind": "runner",
+                    "id": "runner-ready",
+                    "label": "Local Strategic runner",
+                    "target": {
+                        "surface": "runtime",
+                        "section": "devices",
+                        "runner_id": "runner-ready",
+                    },
+                }
+            ],
+        },
     }
     with patch(
         "app.routers.admin_projects.broadcast_to_project",
@@ -2314,6 +2347,11 @@ async def test_strategic_session_message_records_operator_message_and_snapshot(
     assert session_snapshot["selected_refs"] == [
         {"kind": "task", "id": "task-9", "label": "Watch task"}
     ]
+    assert session_snapshot["selected_ref_descriptors"][0]["target"] == {
+        "surface": "runtime",
+        "section": "devices",
+        "runner_id": "runner-ready",
+    }
     count = await db_session.scalar(
         select(func.count())
         .select_from(ProjectMessage)

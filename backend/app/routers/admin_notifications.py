@@ -54,6 +54,11 @@ from app.workbench_state import (
     workbench_context_for_strategic_session_snapshot,
     workbench_state_exceeds_max_bytes, workbench_state_size_bytes,
 )
+from app.workbench_events import (
+    SURFACE_RUNTIME,
+    SURFACE_STRATEGIC_SESSION,
+    emit_workbench_refetch,
+)
 from app.strategic_trigger import (
     ARMING_STEERING,
     maybe_arm_operator_refresh,
@@ -974,6 +979,18 @@ async def put_messages_workbench_state(
         current_user["user_id"],
         pid,
         payload.workbench,
+    )
+    await emit_workbench_refetch(
+        pid,
+        resource="strategic_workbench",
+        action="updated",
+        refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+        summary_key="workbench",
+        summary={
+            "interaction_mode": result.state.get("interaction_mode"),
+            "active_surface": result.state.get("active_surface"),
+            "arming": result.arming,
+        },
     )
     return {"status": "ok", "workbench": result.state, "arming": result.arming}
 

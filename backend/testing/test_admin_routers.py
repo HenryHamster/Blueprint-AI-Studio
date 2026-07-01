@@ -48,6 +48,7 @@ from app.models import (
 )
 from app.auth import get_current_user, require_admin
 from app.schemas import AgentStatusPayload
+from app.workbench_events import SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
@@ -6427,11 +6428,23 @@ class TestMessagesWorkbenchState:
                 {"kind": "", "id": "ignored"},
             ],
         }
-        put_resp = await client.put(
-            "/api/admin/messages/workbench-state",
-            json={"project_id": str(project.id), "workbench": payload},
-        )
+        with patch("app.workbench_events.broadcast_to_project", new=AsyncMock()) as bcast:
+            put_resp = await client.put(
+                "/api/admin/messages/workbench-state",
+                json={"project_id": str(project.id), "workbench": payload},
+            )
         assert put_resp.status_code == 200
+        bcast.assert_awaited_once()
+        assert bcast.await_args.args[:2] == (str(project.id), "workbench_refetch")
+        event_payload = bcast.await_args.args[2]
+        assert event_payload["resource"] == "strategic_workbench"
+        assert event_payload["action"] == "updated"
+        assert event_payload["refetch"] == {
+            "surfaces": [SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME],
+        }
+        assert event_payload["workbench"]["interaction_mode"] == "continuous"
+        assert event_payload["workbench"]["active_surface"] == "pipeline"
+        assert event_payload["workbench"]["arming"] == "steering"
         assert put_resp.json()["arming"] == "steering"
         stored = put_resp.json()["workbench"]
         assert stored["interaction_mode"] == "continuous"

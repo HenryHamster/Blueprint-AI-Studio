@@ -1,4 +1,5 @@
 import { useMemo } from 'react';
+import { apiFetch } from '../api';
 import type { WorkbenchCommand } from '../components/CommandPalette';
 import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
@@ -32,6 +33,7 @@ const WORK_SESSION_ACTION_COMMAND_LIMIT = 4;
 const MESSAGE_COMMAND_LIMIT = 6;
 const TASK_FOCUS_COMMAND_LIMIT = 6;
 const STRATEGIC_INTERACTION_MODES: readonly StrategicInteractionMode[] = ['chat', 'check_in', 'monitor', 'continuous'];
+const WORK_SESSION_MUTATION_METHODS = new Set(['PATCH', 'POST', 'PUT']);
 
 interface UseWorkbenchCommandsOptions {
   selectedProjectId: string | null;
@@ -288,6 +290,30 @@ function strategicModeFromCommandId(commandId: string): StrategicInteractionMode
   if (!commandId.startsWith('session.mode.')) return null;
   const mode = commandId.slice('session.mode.'.length);
   return isStrategicInteractionMode(mode) ? mode : null;
+}
+
+function isAllowedWorkSessionMutationCommandId(commandId: string): boolean {
+  return Boolean(strategicModeFromCommandId(commandId)) || commandId === 'session.clear_selected_refs';
+}
+
+function isStrategicSessionMutationPath(path: string, projectId: string): boolean {
+  const prefix = `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-session`;
+  return path === prefix || path.startsWith(`${prefix}?`);
+}
+
+function hasAllowedWorkSessionMutation(command: StrategicWorkSessionCommand, projectId: string | null): boolean {
+  const mutation = command.mutation;
+  const method = mutation?.method?.trim().toUpperCase();
+  const path = mutation?.path?.trim();
+  return Boolean(
+    projectId
+      && mutation
+      && method
+      && WORK_SESSION_MUTATION_METHODS.has(method)
+      && path
+      && isAllowedWorkSessionMutationCommandId(command.id)
+      && isStrategicSessionMutationPath(path, projectId),
+  );
 }
 
 function humanizeCommandToken(value?: string | null): string | null {
@@ -560,7 +586,11 @@ export function useWorkbenchCommands({
 
       closePalette();
     };
+    const commandHasAllowedMutation = (command: StrategicWorkSessionCommand): boolean => (
+      hasAllowedWorkSessionMutation(command, selectedProjectId)
+    );
     const workSessionCommandCanRoute = (command: StrategicWorkSessionCommand): boolean => {
+      if (commandHasAllowedMutation(command)) return true;
       if (command.id === 'session.check_in') return Boolean(markStrategicChecked);
       if (command.id.startsWith('session.mode.')) return Boolean(strategicModeFromCommandId(command.id));
       if (command.id === 'session.clear_selected_refs') return Boolean(updateStrategicSessionRefs);
@@ -586,11 +616,32 @@ export function useWorkbenchCommands({
         workSessionCommandPriorityDetail(command.priority),
       ) ?? undefined;
     };
+    const runWorkSessionCommandMutation = (command: StrategicWorkSessionCommand): boolean => {
+      if (!commandHasAllowedMutation(command) || !command.mutation) return false;
+
+      const requestInit: RequestInit = {
+        method: command.mutation.method.trim().toUpperCase(),
+      };
+      if (command.mutation.body !== undefined) {
+        requestInit.headers = { 'Content-Type': 'application/json' };
+        requestInit.body = JSON.stringify(command.mutation.body);
+      }
+
+      void Promise.resolve(apiFetch(command.mutation.path.trim(), requestInit))
+        .finally(() => {
+          if (typeof refreshWorkbench === 'function') refreshWorkbench();
+        })
+        .catch(() => undefined);
+      closePalette();
+      return true;
+    };
     const runWorkSessionCommandDescriptor = (command: StrategicWorkSessionCommand, disabled: boolean) => {
       if (disabled) {
         closePalette();
         return;
       }
+
+      if (runWorkSessionCommandMutation(command)) return;
 
       if (command.id === 'session.check_in') {
         markStrategicChecked?.();

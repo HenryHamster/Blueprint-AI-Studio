@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { useEffect } from 'react';
@@ -7,6 +7,14 @@ import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSetti
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import type { StrategicStateResponse, StrategicWorkbenchState, StrategicWorkSessionAction, StrategicWorkSessionCommand } from '../strategicStateApi';
 import type { ViewMode } from './useViewPreferences';
+
+const { apiFetchMock } = vi.hoisted(() => ({
+  apiFetchMock: vi.fn(),
+}));
+
+vi.mock('../api', () => ({
+  apiFetch: apiFetchMock,
+}));
 
 type Captured = ReturnType<typeof useWorkbenchCommands>;
 let captured: Captured = [];
@@ -58,6 +66,11 @@ function Harness(overrides: Partial<Parameters<typeof useWorkbenchCommands>[0]> 
 describe('useWorkbenchCommands', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
+
+  beforeEach(() => {
+    apiFetchMock.mockReset();
+    apiFetchMock.mockResolvedValue(new Response('{}', { status: 200 }));
+  });
 
   afterEach(() => {
     const r = root;
@@ -292,7 +305,144 @@ describe('useWorkbenchCommands', () => {
     expect(updateStrategicSessionRefs).toHaveBeenCalledWith(expect.any(Function));
     const updater = updateStrategicSessionRefs.mock.calls.at(-1)?.[0] as (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs'];
     expect(updater([{ kind: 'task', id: 'task-1', label: 'Task 1' }])).toEqual([]);
+    expect(apiFetchMock).not.toHaveBeenCalled();
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
+  test('executes backend mutation descriptors for Strategic mode changes and refreshes workbench', async () => {
+    const switchStrategicInteractionMode = vi.fn<(mode: StrategicInteractionMode) => void>();
+    const refreshWorkbench = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const mutationBody = { workbench: { interaction_mode: 'monitor' } };
+    const commands: StrategicWorkSessionCommand[] = [
+      {
+        id: 'session.mode.monitor',
+        label: 'Monitor mode',
+        group: 'mode',
+        priority: 'normal',
+        enabled: true,
+        target: { surface: 'messages', action: 'set_monitor_mode' },
+        mutation: {
+          method: 'PATCH',
+          path: '/api/admin/projects/project-1/strategic-session',
+          body: mutationBody,
+        },
+      },
+    ];
+
+    mount({
+      strategicState: { work_session: { commands } } as StrategicStateResponse,
+      switchStrategicInteractionMode,
+      refreshWorkbench,
+      setCommandPaletteOpen,
+    });
+
+    const command = captured.find(item => item.id === 'session.mode.monitor');
+    expect(command).toMatchObject({ detail: 'Set session mode', disabled: false });
+
+    command?.run();
+
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+    expect(switchStrategicInteractionMode).not.toHaveBeenCalled();
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/projects/project-1/strategic-session', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(mutationBody),
+    });
+    await vi.waitFor(() => {
+      expect(refreshWorkbench).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  test('uses backend mutation descriptors to clear selected refs when present', async () => {
+    const updateStrategicSessionRefs = vi.fn();
+    const refreshWorkbench = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const mutationBody = { workbench: { selected_refs: [] } };
+    const commands: StrategicWorkSessionCommand[] = [
+      {
+        id: 'session.clear_selected_refs',
+        label: 'Clear selected refs',
+        group: 'context',
+        priority: 'normal',
+        enabled: true,
+        target: { surface: 'project', section: 'selected_refs', action: 'clear' },
+        mutation: {
+          method: 'POST',
+          path: '/api/admin/projects/project-1/strategic-session',
+          body: mutationBody,
+        },
+      },
+    ];
+    const strategicState = {
+      work_session: {
+        selected_refs: [
+          { kind: 'task', id: 'task-1', label: 'Task 1' },
+          { kind: 'artifact', id: 'artifact-1', label: 'Report' },
+        ],
+        commands,
+      },
+    } as StrategicStateResponse;
+
+    mount({
+      strategicState,
+      updateStrategicSessionRefs,
+      refreshWorkbench,
+      setCommandPaletteOpen,
+    });
+
+    const command = captured.find(item => item.id === 'session.clear_selected_refs');
+    expect(command).toMatchObject({ detail: '2 selected', disabled: false });
+
+    command?.run();
+
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+    expect(updateStrategicSessionRefs).not.toHaveBeenCalled();
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/projects/project-1/strategic-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(mutationBody),
+    });
+    await vi.waitFor(() => {
+      expect(refreshWorkbench).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  test.each([
+    ['subpath', { method: 'PATCH', path: '/api/admin/projects/project-1/strategic-session/messages' }],
+    ['wrong project', { method: 'PATCH', path: '/api/admin/projects/other-project/strategic-session' }],
+    ['disallowed method', { method: 'DELETE', path: '/api/admin/projects/project-1/strategic-session' }],
+  ])('falls back to local command handling for unsafe backend mutation descriptors: %s', (_caseName, mutation) => {
+    const switchStrategicInteractionMode = vi.fn<(mode: StrategicInteractionMode) => void>();
+    const refreshWorkbench = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const commands: StrategicWorkSessionCommand[] = [
+      {
+        id: 'session.mode.monitor',
+        label: 'Monitor mode',
+        group: 'mode',
+        priority: 'normal',
+        enabled: true,
+        target: { surface: 'messages', action: 'set_monitor_mode' },
+        mutation: {
+          ...mutation,
+          body: { workbench: { interaction_mode: 'monitor' } },
+        },
+      },
+    ];
+
+    mount({
+      strategicState: { work_session: { commands } } as StrategicStateResponse,
+      switchStrategicInteractionMode,
+      refreshWorkbench,
+      setCommandPaletteOpen,
+    });
+
+    captured.find(item => item.id === 'session.mode.monitor')?.run();
+
+    expect(apiFetchMock).not.toHaveBeenCalled();
+    expect(refreshWorkbench).not.toHaveBeenCalled();
+    expect(switchStrategicInteractionMode).toHaveBeenCalledWith('monitor');
   });
 
   test('routes message descriptors through context navigation when message opener is unavailable', () => {

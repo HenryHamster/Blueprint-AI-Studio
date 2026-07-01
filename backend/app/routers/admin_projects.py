@@ -86,6 +86,8 @@ from app.workbench_state import (
     workbench_state_size_bytes,
 )
 from app.workbench_events import (
+    SURFACE_RUNTIME,
+    SURFACE_STRATEGIC_SESSION,
     build_workbench_event_feed,
     emit_workbench_refetch,
 )
@@ -2239,6 +2241,18 @@ async def upsert_project_strategic_session(
         state_response,
     )
     response["arming"] = workbench_write.arming
+    await emit_workbench_refetch(
+        project_id,
+        resource="strategic_workbench",
+        action="updated",
+        refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+        summary_key="workbench",
+        summary={
+            "interaction_mode": workbench_write.state.get("interaction_mode"),
+            "active_surface": workbench_write.state.get("active_surface"),
+            "arming": workbench_write.arming,
+        },
+    )
     return response
 
 

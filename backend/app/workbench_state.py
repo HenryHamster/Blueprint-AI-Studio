@@ -53,6 +53,7 @@ _OPERATOR_CONTEXT_TARGET_KEYS = (
     "action",
     "document_id",
     "artifact_id",
+    "runner_id",
     "cycle_id",
 )
 
