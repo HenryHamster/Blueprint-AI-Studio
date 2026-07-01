@@ -10150,6 +10150,69 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
 
 
 @pytest.mark.asyncio
+async def test_finalize_rolls_back_after_pre_lock_phase(
+    db_session, mocker
+):
+    """The pre-lock phase must rollback the session before taking the FOR UPDATE.
+
+    Regression guard: a swallowed DBAPI error inside a fail-closed pre-lock
+    helper (e.g. _resolve_ci_at_finalize catching Exception) leaves the
+    SQLAlchemy transaction aborted. Without the post-pre-lock rollback the later
+    FOR UPDATE/commit surfaces as PendingRollbackError and the sweep
+    misclassifies the qualification as a finalizer crash.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    clean_audit = {
+        "audit_score": 1.0,
+        "test_erosion": {
+            "deleted_test_files": [],
+            "assertion_delta": 5,
+            "test_count_delta": 2,
+        },
+    }
+    clean_smoke = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal="Deliver rollback recovery for pre-lock phase",
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    rollback_calls = 0
+    original_rollback = db_session.rollback
+
+    async def tracked_rollback():
+        nonlocal rollback_calls
+        rollback_calls += 1
+        await original_rollback()
+
+    mocker.patch.object(db_session, "rollback", new=tracked_rollback)
+
+    result = await rq._finalize_in_dedicated_session(
+        version.id,
+        timeout_now=None,
+        session_factory=_shared_session_factory(db_session),
+    )
+    await db_session.commit()
+
+    assert rollback_calls >= 1
+    assert result is not None
+
+
+@pytest.mark.asyncio
 async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocker):
     """Fail-safe: when the apply gate cannot determine safety (prod state
     unreadable, candidate fetch failed, scratch DB unprovisionable) it returns
@@ -27296,9 +27359,8 @@ async def test_finalize_locked_version_gates_skip_on_timeout_reaper_path(
 
     When sweep_stuck_qualifications calls _finalize_in_dedicated_session with
     timeout_now set, the timeout fires for aged versions and returns early before
-    ever reaching _finalize_qualification.  The pre-lock gates must not run on
-    every reaper sweep iteration — only the task-completion path (timeout_now=None
-    with all children terminal) is the correct trigger for pre-lock gate calls.
+    ever reaching _finalize_qualification. The pre-lock gates must not run when
+    the timeout backstop has already expired.
     """
     from datetime import datetime as dt, timezone
 
@@ -27344,6 +27406,57 @@ async def test_finalize_locked_version_gates_skip_on_timeout_reaper_path(
     assert result.get("blocker") == "qualification_timeout", (
         f"expected qualification_timeout blocker, got {result!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_finalize_locked_version_timeout_beats_pre_gates_when_children_terminal(
+    db_session, mocker
+):
+    """An expired sweep timeout must force-finalize before pre-lock gate I/O.
+
+    Regression guard for the sweep path: terminal children normally allow the
+    pre-lock gates to run, but an already-expired timeout is the escape hatch for
+    a stuck qualification and must not depend on CI/GitHub/migration gate calls.
+    """
+    from datetime import datetime as dt, timezone
+
+    project, version = await _make_project_and_version(db_session)
+    old_started_at = dt(2020, 1, 1, tzinfo=timezone.utc).isoformat()
+    await _seed_pending_qualification(
+        db_session,
+        project,
+        version,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+        started_at=old_started_at,
+    )
+
+    def _gate_must_not_be_called(*args, **kwargs):
+        raise AssertionError("GitHub-bound gate called before expired timeout")
+
+    mocker.patch(
+        "app.release_qualifier._resolve_ci_at_finalize",
+        side_effect=_gate_must_not_be_called,
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_identity_at_finalize",
+        side_effect=_gate_must_not_be_called,
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_migration_apply_at_finalize",
+        side_effect=_gate_must_not_be_called,
+    )
+
+    result = await rq._finalize_in_dedicated_session(
+        version.id,
+        timeout_now=dt(2026, 6, 15, tzinfo=timezone.utc),
+        session_factory=_shared_session_factory(db_session),
+    )
+    await db_session.commit()
+
+    assert result is not None
+    assert result["status"] == "infra_failure"
+    assert result["blocker"] == "qualification_timeout"
 
 
 @pytest.mark.asyncio
