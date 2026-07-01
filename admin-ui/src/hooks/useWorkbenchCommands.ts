@@ -241,7 +241,11 @@ function taskFocusCommandDetail(item: StrategicStateTaskFocusItem): string | und
   return compactContextDetail(
     taskFocusBucketLabel(item.bucket),
     item.status,
-    item.detail ?? item.latest_status_message ?? item.blocked_reason ?? item.park_reason,
+    item.movement_explanation
+      ?? item.detail
+      ?? item.latest_status_message
+      ?? item.blocked_reason
+      ?? item.park_reason,
   ) ?? undefined;
 }
 
@@ -705,11 +709,16 @@ export function useWorkbenchCommands({
         workSessionCommandExecutionPayload(command),
       )
         .then(response => {
+          const receipt = response.command.receipt;
+          if (response.command.status === 'failed' || receipt.status === 'failed') {
+            if (typeof refreshWorkbench === 'function') refreshWorkbench();
+            throw new Error(receipt.summary ?? 'Command failed');
+          }
           setWorkSessionCommandStatuses(prev => ({
             ...prev,
             [workSessionCommandStatusKey(selectedProjectId, command.id)]: {
               state: 'success',
-              message: response.command.receipt.summary ?? 'Completed',
+              message: receipt.summary ?? 'Completed',
             },
           }));
           if (typeof refreshWorkbench === 'function') refreshWorkbench();

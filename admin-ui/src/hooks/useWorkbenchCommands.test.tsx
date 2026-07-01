@@ -96,6 +96,37 @@ function commandExecutionResponse(commandId: string, label = 'Command') {
   });
 }
 
+function commandFailedExecutionResponse(commandId: string, label = 'Command', summary = 'Command failed') {
+  return jsonResponse({
+    project_id: 'project-1',
+    status: 'idle',
+    location: 'locally',
+    session: {
+      version: 1,
+      id: 'strategic-session:project-1',
+      mode: 'chat',
+      active_surface: 'strategic',
+      selected_refs: [],
+      selected_ref_descriptors: [],
+      curated_metrics: [],
+    },
+    conversation: { limit: 20, items: [] },
+    recent_outputs: [],
+    command: {
+      status: 'failed',
+      applied: false,
+      command_id: commandId,
+      receipt: {
+        id: `receipt-${commandId}`,
+        command_id: commandId,
+        label,
+        status: 'failed',
+        summary,
+      },
+    },
+  });
+}
+
 function Harness(overrides: Partial<Parameters<typeof useWorkbenchCommands>[0]> = {}) {
   const commands = useWorkbenchCommands({
     selectedProjectId: 'project-1',
@@ -723,6 +754,54 @@ describe('useWorkbenchCommands', () => {
       });
     });
     expect(refreshWorkbench).not.toHaveBeenCalled();
+    expect(setCommandPaletteOpen).not.toHaveBeenCalledWith(false);
+  });
+
+  test('treats durable failed command receipts as retryable command errors', async () => {
+    const refreshWorkbench = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    apiFetchMock.mockResolvedValue(commandFailedExecutionResponse(
+      'attention.messages.mark_seen',
+      'Mark messages seen',
+      'Command failed: Mark messages seen - Command is disabled',
+    ));
+    const commands: StrategicWorkSessionCommand[] = [
+      {
+        id: 'attention.messages.mark_seen',
+        label: 'Mark messages seen',
+        group: 'attention',
+        priority: 'normal',
+        enabled: true,
+        target: {
+          surface: 'messages',
+          project_id: 'project-1',
+          action: 'mark_seen',
+        },
+        mutation: {
+          method: 'PUT',
+          path: '/api/admin/messages/last-seen',
+          body: { project_id: 'project-1', timestamp: 1_782_912_000_000 },
+        },
+      },
+    ];
+
+    mount({
+      strategicState: { work_session: { commands } } as StrategicStateResponse,
+      refreshWorkbench,
+      setCommandPaletteOpen,
+    });
+
+    act(() => {
+      captured.find(item => item.id === 'attention.messages.mark_seen')?.run();
+    });
+
+    await vi.waitFor(() => {
+      expect(captured.find(item => item.id === 'attention.messages.mark_seen')).toMatchObject({
+        detail: 'Failed: Command failed: Mark messages seen - Command is disabled',
+        disabled: false,
+      });
+    });
+    expect(refreshWorkbench).toHaveBeenCalledTimes(1);
     expect(setCommandPaletteOpen).not.toHaveBeenCalledWith(false);
   });
 
@@ -1379,6 +1458,7 @@ describe('useWorkbenchCommands', () => {
                   status: 'EVALUATING',
                   title: 'Review runner registration',
                   task_type: 'review',
+                  movement_explanation: 'Backend says this is waiting for approval',
                   detail: 'Operator judgment needed',
                   requires_approval: true,
                   reasons: ['approval'],
@@ -1422,7 +1502,7 @@ describe('useWorkbenchCommands', () => {
 
     expect(captured.find(command => command.id === 'strategic.task_focus.needs_judgment.task-judgment')).toMatchObject({
       label: 'Open task: Review runner registration',
-      detail: 'Needs judgment / EVALUATING / Operator judgment needed',
+      detail: 'Needs judgment / EVALUATING / Backend says this is waiting for approval',
     });
     captured.find(command => command.id === 'strategic.task_focus.active.task-active')?.run();
     expect(openStrategicContextTarget).toHaveBeenCalledWith({ surface: 'task', task_id: 'task-active' });

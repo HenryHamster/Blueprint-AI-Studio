@@ -35,6 +35,23 @@ from app.workbench_state import (
 
 OPERATOR_COMMAND_EVENT_TYPE = "operator_command"
 WORK_SESSION_COMMAND_JOB_LIMIT = 8
+_EXECUTABLE_SESSION_MODES = frozenset(("chat", "continuous", "monitor"))
+_RUNNER_PREFER_PREFIX = "session.runner.prefer."
+_ALERT_DISMISS_PREFIX = "attention.alert.dismiss:"
+_COMMAND_TARGET_KEYS = (
+    "surface",
+    "project_id",
+    "section",
+    "task_id",
+    "message_id",
+    "direction_id",
+    "alert_id",
+    "action",
+    "document_id",
+    "artifact_id",
+    "runner_id",
+    "cycle_id",
+)
 
 
 def _compact_text(value: Any, *, max_chars: int = 240) -> str | None:
@@ -45,7 +62,9 @@ def _compact_text(value: Any, *, max_chars: int = 240) -> str | None:
         return None
     if len(text) <= max_chars:
         return text
-    return f"{text[: max_chars - 1]}..."
+    if max_chars <= 3:
+        return text[:max_chars]
+    return f"{text[: max_chars - 3]}..."
 
 
 def _bounded_mapping(value: Any, *, max_items: int = 16) -> dict[str, Any] | None:
@@ -69,6 +88,22 @@ def _bounded_mapping(value: Any, *, max_items: int = 16) -> dict[str, Any] | Non
 
 def _command_label(command: dict[str, Any]) -> str:
     return _compact_text(command.get("label"), max_chars=120) or "Workbench command"
+
+
+def _command_id(command: dict[str, Any]) -> str:
+    return str(command.get("id") or "")
+
+
+def _safe_command_target(command: dict[str, Any]) -> dict[str, Any] | None:
+    target = command.get("target") if isinstance(command.get("target"), dict) else None
+    if target is None:
+        return None
+    safe: dict[str, Any] = {}
+    for key in _COMMAND_TARGET_KEYS:
+        value = _compact_text(target.get(key), max_chars=160)
+        if value:
+            safe[key] = value
+    return safe or None
 
 
 def _command_refetch_surfaces(command: dict[str, Any]) -> list[str]:
@@ -172,13 +207,78 @@ def _mutation_body(command: dict[str, Any]) -> dict[str, Any]:
     return body if isinstance(body, dict) else {}
 
 
-def _is_strategic_workbench_command(command_id: str) -> bool:
-    return (
-        command_id.startswith("session.mode.")
-        or command_id == "session.clear_selected_refs"
-        or command_id.startswith("session.runner.prefer.")
-        or command_id == "session.runner.clear_preferred"
+def _alert_id_from_command_id(command_id: str) -> str | None:
+    alert_id = command_id.removeprefix(_ALERT_DISMISS_PREFIX)
+    try:
+        return str(uuid.UUID(alert_id))
+    except (TypeError, ValueError, AttributeError):
+        return None
+
+
+def _runner_id_from_command_id(command_id: str) -> str | None:
+    if not command_id.startswith(_RUNNER_PREFER_PREFIX):
+        return None
+    return _compact_text(
+        command_id.removeprefix(_RUNNER_PREFER_PREFIX),
+        max_chars=160,
     )
+
+
+def _allowed_command_kind(command_id: str) -> str | None:
+    if command_id.startswith("session.mode."):
+        mode = command_id.removeprefix("session.mode.")
+        return "strategic_workbench" if mode in _EXECUTABLE_SESSION_MODES else None
+    if command_id == "session.clear_selected_refs":
+        return "strategic_workbench"
+    if command_id.startswith(_RUNNER_PREFER_PREFIX):
+        return "strategic_workbench" if _runner_id_from_command_id(command_id) else None
+    if command_id == "session.runner.clear_preferred":
+        return "strategic_workbench"
+    if command_id == "attention.messages.mark_seen":
+        return "messages_last_seen"
+    if command_id.startswith(_ALERT_DISMISS_PREFIX):
+        return "alert_dismiss" if _alert_id_from_command_id(command_id) else None
+    return None
+
+
+def _is_strategic_workbench_command(command_id: str) -> bool:
+    return _allowed_command_kind(command_id) == "strategic_workbench"
+
+
+def _can_persist_failed_receipt(command: dict[str, Any]) -> bool:
+    command_id = _command_id(command)
+    kind = _allowed_command_kind(command_id)
+    if kind is None or _safe_command_target(command) is None:
+        return False
+    if not bool(command.get("enabled", True)) or not _mutation(command):
+        return False
+    if command_id == "attention.messages.mark_seen":
+        return isinstance(_mutation_body(command).get("timestamp"), int)
+    if command_id.startswith(_RUNNER_PREFER_PREFIX):
+        target = _safe_command_target(command) or {}
+        return target.get("runner_id") == _runner_id_from_command_id(command_id)
+    if command_id.startswith(_ALERT_DISMISS_PREFIX):
+        alert_id = _alert_id_from_command_id(command_id)
+        target = _safe_command_target(command) or {}
+        return alert_id is not None and target.get("alert_id") == alert_id
+    return True
+
+
+def _failed_command_result(exc: HTTPException) -> dict[str, Any]:
+    detail = exc.detail if isinstance(exc.detail, str) else "Command failed"
+    return {
+        "kind": "command_failed",
+        "status_code": int(exc.status_code or 500),
+        "error": _compact_text(detail, max_chars=240) or "Command failed",
+    }
+
+
+def _failed_receipt_content(label: str, result: dict[str, Any]) -> str:
+    error = _compact_text(result.get("error"), max_chars=260) or "Command failed"
+    content = f"Command failed: {label} - {error}"
+    if len(content) > MESSAGE_CONTENT_MAX:
+        content = content[:MESSAGE_CONTENT_MAX]
+    return content
 
 
 async def _execute_strategic_workbench_command(
@@ -198,8 +298,9 @@ async def _execute_strategic_workbench_command(
     elif command_id == "session.clear_selected_refs":
         workbench = {"selected_refs": []}
     elif command_id.startswith("session.runner.prefer."):
-        runner_id = _compact_text(target.get("runner_id"), max_chars=160)
-        if not runner_id:
+        runner_id = _runner_id_from_command_id(command_id)
+        target_runner_id = _compact_text(target.get("runner_id"), max_chars=160)
+        if not runner_id or target_runner_id != runner_id:
             raise HTTPException(status_code=409, detail="Command is no longer executable")
         workbench = {"preferred_runner_id": runner_id}
     elif command_id == "session.runner.clear_preferred":
@@ -371,6 +472,74 @@ async def _update_receipt_result(
     return receipt
 
 
+async def _persist_failed_command_receipt(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    user_id: str,
+    command: dict[str, Any],
+    idempotency_key: str,
+    exc: HTTPException,
+) -> dict[str, Any]:
+    command_id = _command_id(command)
+    now = _utcnow()
+    label = _command_label(command)
+    receipt_result = _failed_command_result(exc)
+    receipt = ProjectMessage(
+        project_id=project_id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content=_failed_receipt_content(label, receipt_result),
+        context={
+            "event_type": OPERATOR_COMMAND_EVENT_TYPE,
+            OPERATOR_COMMAND_EVENT_TYPE: {
+                "version": 1,
+                "command_id": command_id,
+                "label": label,
+                "status": "failed",
+                "operator_user_id": user_id,
+                "executed_at": now.isoformat(),
+                "failed_at": now.isoformat(),
+                "target": _safe_command_target(command),
+                "refetch_surfaces": _command_refetch_surfaces(command),
+                "result": _bounded_mapping(receipt_result) or {},
+            },
+        },
+        status="resolved",
+        resolved_at=now,
+        idempotency_key=idempotency_key,
+    )
+    session.add(receipt)
+    try:
+        await session.commit()
+    except IntegrityError:
+        await session.rollback()
+        existing = await _receipt_for_idempotency_key(
+            session,
+            project_id,
+            idempotency_key,
+        )
+        if existing is not None and _existing_receipt_matches(
+            existing,
+            user_id=user_id,
+            command_id=command_id,
+        ):
+            return {
+                "status": "duplicate",
+                "applied": False,
+                "command_id": command_id,
+                "receipt": _receipt_from_message(existing),
+            }
+        raise
+    await session.refresh(receipt)
+    return {
+        "status": "failed",
+        "applied": False,
+        "command_id": command_id,
+        "receipt": _receipt_from_message(receipt),
+    }
+
+
 async def execute_work_session_command(
     session: AsyncSession,
     *,
@@ -403,19 +572,35 @@ async def execute_work_session_command(
         raise HTTPException(status_code=409, detail="Command is disabled")
     if not _mutation(command):
         raise HTTPException(status_code=409, detail="Command is not executable")
+    if _allowed_command_kind(command_id) is None:
+        raise HTTPException(status_code=409, detail="Command is not executable")
 
-    result = await _apply_command(
-        session,
-        user_id=user_id,
-        project_id=project_id,
-        command=command,
-        observed_at_ms=observed_at_ms,
-    )
+    try:
+        result = await _apply_command(
+            session,
+            user_id=user_id,
+            project_id=project_id,
+            command=command,
+            observed_at_ms=observed_at_ms,
+        )
+    except HTTPException as exc:
+        with contextlib.suppress(Exception):
+            await session.rollback()
+        if not _can_persist_failed_receipt(command):
+            raise
+        return await _persist_failed_command_receipt(
+            session,
+            project_id=project_id,
+            user_id=user_id,
+            command=command,
+            idempotency_key=idem_key,
+            exc=exc,
+        )
     receipt_result = _public_result(result)
 
     now = _utcnow()
     label = _command_label(command)
-    target = command.get("target") if isinstance(command.get("target"), dict) else None
+    target = _safe_command_target(command)
     refetch_surfaces = _command_refetch_surfaces(command)
     content = f"Command completed: {label}"
     if len(content) > MESSAGE_CONTENT_MAX:

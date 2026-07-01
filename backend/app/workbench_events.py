@@ -41,7 +41,9 @@ def _compact_str(value: Any, *, max_chars: int = 160) -> str | None:
         return None
     if len(text) <= max_chars:
         return text
-    return f"{text[: max_chars - 1]}..."
+    if max_chars <= 3:
+        return text[:max_chars]
+    return f"{text[: max_chars - 3]}..."
 
 
 def _bounded_int(value: Any) -> int:
@@ -106,6 +108,25 @@ def _bounded_surfaces(values: Sequence[str] | None) -> list[str]:
         if len(surfaces) >= 8:
             break
     return surfaces
+
+
+def _bounded_mapping(value: Any, *, max_items: int = 16) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    bounded: dict[str, Any] = {}
+    for key, item in value.items():
+        if len(bounded) >= max_items:
+            break
+        key_text = _compact_str(key, max_chars=80)
+        if not key_text:
+            continue
+        if isinstance(item, (int, float, bool)) or item is None:
+            bounded[key_text] = item
+        else:
+            item_text = _compact_str(item, max_chars=240)
+            if item_text:
+                bounded[key_text] = item_text
+    return bounded or None
 
 
 def workbench_event_envelope(
@@ -264,8 +285,15 @@ def _operator_command_feed_item(
         "status": status,
     }
     result = receipt.get("result")
-    if isinstance(result, Mapping):
-        data["result"] = dict(result)
+    bounded_result = _bounded_mapping(result)
+    if bounded_result:
+        data["result"] = bounded_result
+    tone = "active"
+    if status == "failed":
+        status_code = _bounded_int(bounded_result.get("status_code") if bounded_result else None)
+        tone = "critical" if status_code >= 500 else "warning"
+    elif status != "succeeded":
+        tone = "warning"
     return _feed_item(
         message.project_id,
         item_id=f"operator_command:{message.id}:{status}",
@@ -275,7 +303,7 @@ def _operator_command_feed_item(
         action=status,
         title=f"Command: {label}",
         summary=message.content,
-        tone="active" if status == "succeeded" else "warning",
+        tone=tone,
         ref={"kind": _OPERATOR_COMMAND_EVENT_TYPE, "id": str(message.id)},
         target=target,
         refetch_surfaces=refetch_surfaces,

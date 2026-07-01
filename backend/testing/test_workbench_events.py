@@ -282,6 +282,68 @@ async def test_build_workbench_event_feed_projects_operator_command_receipts(db_
 
 
 @pytest.mark.asyncio
+async def test_build_workbench_event_feed_projects_failed_operator_command_receipts(
+    db_session,
+):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    long_error = "Upstream command handler failed " + ("x" * 500)
+    receipt = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="Command failed: Dismiss alert - " + long_error,
+        status="resolved",
+        resolved_at=now,
+        created_at=now,
+        context={
+            "event_type": "operator_command",
+            "operator_command": {
+                "version": 1,
+                "command_id": "attention.alert.dismiss:"
+                "11111111-1111-1111-1111-111111111111",
+                "label": "Dismiss alert",
+                "status": "failed",
+                "target": {
+                    "surface": "runtime",
+                    "section": "health",
+                    "alert_id": "11111111-1111-1111-1111-111111111111",
+                },
+                "refetch_surfaces": ["runtime", "strategic_session"],
+                "result": {
+                    "kind": "command_failed",
+                    "status_code": 503,
+                    "error": long_error,
+                },
+            },
+        },
+    )
+    db_session.add(receipt)
+    await db_session.commit()
+
+    feed = await build_workbench_event_feed(db_session, project.id, limit=1)
+
+    item = feed["items"][0]
+    assert item["resource"] == "operator_command"
+    assert item["action"] == "failed"
+    assert item["tone"] == "critical"
+    assert item["summary"].startswith("Command failed: Dismiss alert")
+    assert len(item["summary"]) <= 280
+    assert item["target"] == {
+        "surface": "runtime",
+        "section": "health",
+        "alert_id": "11111111-1111-1111-1111-111111111111",
+    }
+    assert item["refetch"]["surfaces"] == [
+        SURFACE_RUNTIME,
+        SURFACE_STRATEGIC_SESSION,
+    ]
+    assert item["data"]["result"]["status_code"] == 503
+    assert item["data"]["result"]["error"].endswith("...")
+    assert len(item["data"]["result"]["error"]) <= 240
+
+
+@pytest.mark.asyncio
 async def test_build_workbench_event_feed_orders_tasks_by_semantic_activity(db_session):
     project = await _make_project(db_session)
     now = _utcnow()

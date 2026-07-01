@@ -2500,7 +2500,10 @@ async def execute_project_strategic_session_command(
         if isinstance(command_result.get("receipt"), dict)
         else {}
     )
-    if command_result.get("applied"):
+    if (
+        command_result.get("status") in {"succeeded", "failed"}
+        and receipt.get("id")
+    ):
         await emit_workbench_refetch(
             project_id,
             resource=OPERATOR_COMMAND_EVENT_TYPE,

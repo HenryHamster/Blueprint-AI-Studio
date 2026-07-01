@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef, useMemo, useLayoutEffect } from 'react';
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker } from '../api';
 import type { StrategicCycleProgress, StrategicCycleCompletion } from '../hooks/useLogViewer';
@@ -546,21 +546,6 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     focusComposerTextarea();
     if (conversationMode) onOpenCommandPalette?.();
   }, [conversationMode, focusComposerTextarea, onOpenCommandPalette]);
-
-  useLayoutEffect(() => {
-    function handleMessageCommandShortcut(event: KeyboardEvent) {
-      if (event.defaultPrevented) return;
-      if (event.altKey || event.shiftKey || !(event.ctrlKey || event.metaKey) || event.key.toLowerCase() !== 'k') return;
-      if (showSaveDialog || pendingConvertMsg) return;
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation();
-      openMessageCommandSurface();
-    }
-
-    document.addEventListener('keydown', handleMessageCommandShortcut, true);
-    return () => document.removeEventListener('keydown', handleMessageCommandShortcut, true);
-  }, [openMessageCommandSurface, pendingConvertMsg, showSaveDialog]);
 
   // Last-seen tracking: dividerTime is the threshold; when operator scrolls past or timeout fires, we persist it
   const [dividerTime, setDividerTime] = useState<number | null>(null);
@@ -1704,7 +1689,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   }
 
   const bubbleProps = {
-    actionMode: conversationMode ? 'none' as const : 'full' as const,
+    actionMode: conversationMode ? 'reply-only' as const : 'full' as const,
     resolvingId,
     resolveInput,
     deletingIds,

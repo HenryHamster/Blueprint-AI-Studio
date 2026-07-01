@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from fastapi import HTTPException
 from httpx import AsyncClient
 from sqlalchemy import func
 from sqlmodel import select
@@ -2243,6 +2244,69 @@ async def test_strategic_session_command_executes_attention_housekeeping(
     )
     await db_session.refresh(alert)
     assert alert.dismissed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_command_failed_receipt_refetches(
+    client: AsyncClient,
+    db_session,
+):
+    project = await _make_project(db_session)
+    alert = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.WARNING,
+        title="Runner offline",
+        message="The local runner stopped heartbeating.",
+        domain="runner",
+        event_type="local_runner_stale",
+    )
+    db_session.add(alert)
+    await db_session.commit()
+    await db_session.refresh(alert)
+
+    with (
+        patch(
+            "app.work_session_command_execution._execute_alert_dismiss",
+            new=AsyncMock(
+                side_effect=HTTPException(
+                    status_code=503,
+                    detail="Alert dismiss handler unavailable",
+                )
+            ),
+        ),
+        patch("app.routers.admin_projects.emit_workbench_refetch", new=AsyncMock()) as bcast,
+    ):
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/strategic-session/commands/"
+            f"attention.alert.dismiss:{alert.id}/execute",
+            json={"idempotency_key": "cmd-dismiss-alert-failed-1"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    command = resp.json()["command"]
+    assert command["status"] == "failed"
+    assert command["applied"] is False
+    assert command["receipt"]["command_id"] == f"attention.alert.dismiss:{alert.id}"
+    assert command["receipt"]["status"] == "failed"
+    assert command["receipt"]["result"] == {
+        "kind": "command_failed",
+        "status_code": 503,
+        "error": "Alert dismiss handler unavailable",
+    }
+    assert resp.json()["session"]["jobs"]["items"][0]["status"] == "failed"
+
+    bcast.assert_awaited_once()
+    assert bcast.await_args.args[0] == project.id
+    assert bcast.await_args.kwargs["resource"] == "operator_command"
+    assert bcast.await_args.kwargs["action"] == "failed"
+    assert bcast.await_args.kwargs["summary"]["status"] == "failed"
+    assert bcast.await_args.kwargs["summary"]["receipt_id"] == command["receipt"]["id"]
+    assert bcast.await_args.kwargs["message_id"] == command["receipt"]["id"]
+
+    stored = await db_session.get(ProjectMessage, uuid.UUID(command["receipt"]["id"]))
+    assert stored is not None
+    assert stored.context["operator_command"]["status"] == "failed"
+    assert stored.idempotency_key == "cmd-dismiss-alert-failed-1"
 
 
 @pytest.mark.asyncio

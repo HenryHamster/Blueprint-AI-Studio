@@ -124,4 +124,29 @@ describe('useStrategicContextNavigation', () => {
     expect(setShowKnowledgeBrowser).toHaveBeenCalledWith(true);
     expect(handleTabChange).toHaveBeenCalledTimes(1);
   });
+
+  test('pipeline targets preserve task specificity when a task id is present', () => {
+    const handleTabChange = vi.fn();
+    const selectPipelineTaskById = vi.fn();
+    const setPipelineSection = vi.fn();
+    const setShowArchive = vi.fn();
+    const setViewMode = vi.fn();
+    const open = mount({
+      handleTabChange,
+      selectPipelineTaskById,
+      setPipelineSection,
+      setShowArchive,
+      setViewMode,
+    });
+
+    act(() => {
+      open({ surface: 'pipeline', section: 'flow', task_id: 'task-flow-1' } as Target);
+    });
+
+    expect(setPipelineSection).toHaveBeenCalledWith('flow');
+    expect(setViewMode).toHaveBeenCalledWith('pipeline');
+    expect(setShowArchive).toHaveBeenCalledWith(false);
+    expect(selectPipelineTaskById).toHaveBeenCalledWith('task-flow-1');
+    expect(handleTabChange).toHaveBeenCalledWith('pipeline');
+  });
 });

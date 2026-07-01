@@ -667,7 +667,7 @@ describe('MessagesPanel chrome modes', () => {
     expect(expandedButtons.filter(button => button.title?.includes('Event type visibility'))).toHaveLength(1);
   });
 
-  test('Ctrl+K focuses the message composer in compact chrome without duplicating command controls', async () => {
+  test('compact chrome leaves Ctrl+K to the app shortcut without duplicating command controls', async () => {
     const onOpenCommandPalette = vi.fn();
     const el = await renderPanel({ variant: 'page', filterChrome: 'compact', onOpenCommandPalette });
     const textarea = el.querySelector('textarea') as HTMLTextAreaElement | null;
@@ -678,21 +678,29 @@ describe('MessagesPanel chrome modes', () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true }));
     });
 
-    await waitFor(() => expect(document.activeElement).toBe(textarea));
+    expect(document.activeElement).not.toBe(textarea);
     expect(onOpenCommandPalette).not.toHaveBeenCalled();
     expect(el.querySelectorAll('button[title="Open command palette (Ctrl+K)"]')).toHaveLength(0);
   });
 
-  test('Ctrl+K opens the Strategic command surface and focuses the minimal chat composer', async () => {
+  test('minimal chat composer command button opens the Strategic command surface and focuses composer', async () => {
     const onOpenCommandPalette = vi.fn();
     const el = await renderPanel({ filterChrome: 'minimal', onOpenCommandPalette });
     const textarea = el.querySelector('textarea') as HTMLTextAreaElement | null;
     expect(textarea).not.toBeNull();
-    expect(el.querySelectorAll('button[title="Open command palette (Ctrl+K)"]')).toHaveLength(1);
+    const commandButton = el.querySelector<HTMLButtonElement>('button[title="Open command palette (Ctrl+K)"]');
+    expect(commandButton).not.toBeNull();
     expect(el.querySelector('input[placeholder="Search messages..."]')).toBeNull();
 
     await act(async () => {
       document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true }));
+    });
+
+    expect(document.activeElement).not.toBe(textarea);
+    expect(onOpenCommandPalette).not.toHaveBeenCalled();
+
+    await act(async () => {
+      commandButton?.click();
     });
 
     await waitFor(() => expect(document.activeElement).toBe(textarea));
@@ -1131,14 +1139,19 @@ describe('MessagesPanel chrome modes', () => {
     expect(el.querySelector('[data-testid="saved-views-tab-strip"]')).toBeNull();
     expect(filterToggle(el)).toBeUndefined();
     expect(el.querySelector('button[title="Copy message ref"]')).toBeNull();
-    expect(el.querySelector('[data-message-id="strategic"] button[title="Reply"]')).toBeNull();
-    expect(el.querySelector('[data-message-id="question"] button[title="Reply"]')).toBeNull();
+    const questionReply = el.querySelector<HTMLButtonElement>('[data-message-id="question"] button[title="Reply"]');
+    expect(el.querySelector('[data-message-id="strategic"] button[title="Reply"]')).not.toBeNull();
+    expect(questionReply).not.toBeNull();
     expect(el.querySelector('button[title="Resolve"]')).toBeNull();
     expect(el.querySelector('button[title="Delete"]')).toBeNull();
     expect(el.querySelector('button[title="Create Direction"]')).toBeNull();
     expect(el.querySelector('button[title="Investigate"]')).toBeNull();
     expect(text.indexOf('Operator steering')).toBeLessThan(text.indexOf('Should I keep this path?'));
     expect(text.indexOf('Should I keep this path?')).toBeLessThan(text.indexOf('Strategic reply'));
+
+    await act(async () => { questionReply?.click(); });
+    expect(el.textContent).toContain('Replying to Agent');
+    expect(el.textContent).toContain('Should I keep this path?');
   });
 
   test('full message chrome keeps triage actions available', async () => {

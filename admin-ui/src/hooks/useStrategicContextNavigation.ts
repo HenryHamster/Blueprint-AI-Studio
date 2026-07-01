@@ -79,6 +79,7 @@ export function useStrategicContextNavigation({
       if (section === 'board') setViewMode('kanban');
       if (section === 'flow') setViewMode('pipeline');
       setShowArchive(section === 'archive');
+      if (target.task_id) selectPipelineTaskById(target.task_id);
       handleTabChange('pipeline');
       return;
     }
