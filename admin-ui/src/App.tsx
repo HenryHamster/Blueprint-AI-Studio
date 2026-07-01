@@ -1465,6 +1465,7 @@ export default function App() {
                 onStrategicStateRefresh={() => { void strategicReadModel.refresh(); }}
                 onStrategicInteraction={() => { void persistStrategicWorkbench({ active_surface: 'strategic' }); }}
                 onOpenCommandPalette={openCommandPalette}
+                onOpenStrategicContextWorkspace={openStrategicContextWorkspace}
               />
             )}
             rail={(

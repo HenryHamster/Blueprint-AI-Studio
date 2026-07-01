@@ -627,13 +627,20 @@ export async function updateStrategicWorkbenchState(
   projectId: string,
   workbench: Partial<StrategicWorkbenchState>,
 ): Promise<StrategicWorkbenchStateResponse> {
-  const res = await apiFetch('/api/admin/messages/workbench-state', {
-    method: 'PUT',
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/strategic-session`, {
+    method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ project_id: projectId, workbench }),
+    body: JSON.stringify({ workbench }),
   });
   if (!res.ok) throw new Error(`Failed to update Strategic workbench state: ${res.status}`);
-  return res.json() as Promise<StrategicWorkbenchStateResponse>;
+  const data = await res.json() as StrategicSessionResponse | StrategicWorkbenchStateResponse;
+  if (!data.workbench) {
+    throw new Error('Failed to update Strategic workbench state: missing workbench in response');
+  }
+  const result: StrategicWorkbenchStateResponse = { workbench: data.workbench };
+  if (typeof data.arming === 'string') result.arming = data.arming;
+  if (!('session' in data) && typeof data.status === 'string') result.status = data.status;
+  return result;
 }
 
 export async function fetchStrategicSession(
