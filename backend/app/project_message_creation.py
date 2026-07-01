@@ -22,6 +22,27 @@ from app.workbench_state import (
     workbench_state_exceeds_max_bytes,
 )
 
+OPERATOR_CONTEXT_MAX_BYTES = 50_000
+
+# Operator-authored context remains free-form for legacy callers, but the keys
+# owned by the workbench contract are bounded before they become durable hidden
+# message state.
+OPERATOR_CONTEXT_TEXT_CAPS = {
+    "user_event_type": 120,
+    "reply_to": 160,
+    "reply_preview": 240,
+    "answer": 2_000,
+    "resolution": 2_000,
+    "direction_id": 160,
+    "task_id": 160,
+    "source_task_id": 160,
+    "source_message_id": 160,
+    "dedupe_key": 240,
+}
+RESERVED_OPERATOR_CONTEXT_KEYS = frozenset(
+    {"event_type", "strategic_session", "operator_command", "check_in"}
+)
+
 
 @dataclass(frozen=True)
 class OperatorMessageCreateResult:
@@ -54,14 +75,25 @@ def parse_operator_message_type(
 def _operator_context(raw_context: dict[str, Any] | None) -> dict[str, Any]:
     context = dict(raw_context or {})
     user_supplied_event_type = context.pop("event_type", None)
+    for reserved_key in RESERVED_OPERATOR_CONTEXT_KEYS - {"event_type"}:
+        context.pop(reserved_key, None)
     if user_supplied_event_type is not None:
-        context["user_event_type"] = str(user_supplied_event_type)[:120]
+        context["user_event_type"] = user_supplied_event_type
+    for key, max_chars in OPERATOR_CONTEXT_TEXT_CAPS.items():
+        value = context.get(key)
+        if value is not None:
+            context[key] = _compact_context_text(value, max_chars=max_chars)
     return context
+
+
+def _compact_context_text(value: Any, *, max_chars: int) -> str:
+    text = " ".join(str(value or "").strip().split())
+    return text[:max_chars]
 
 
 def _ensure_context_size(context: dict[str, Any], *, compact: bool) -> None:
     separators = ((",", ":") if compact else None)
-    if len(json.dumps(context, separators=separators, default=str)) > 50_000:
+    if len(json.dumps(context, separators=separators, default=str)) > OPERATOR_CONTEXT_MAX_BYTES:
         raise HTTPException(status_code=400, detail="Context too large (max 50KB)")
 
 

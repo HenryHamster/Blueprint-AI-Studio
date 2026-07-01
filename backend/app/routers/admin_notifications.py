@@ -802,13 +802,22 @@ async def delete_message(
 ):
     """Delete a message (idempotent)."""
     msg = await session.get(ProjectMessage, message_id)
+    message_response: dict[str, Any] | None = None
     if msg:
         # Verify user has access to the project
         await _get_user_project(msg.project_id, current_user["user_id"], session)
+        message_response = {**admin_message_dict(msg), "status": "deleted"}
         await session.delete(msg)
         await session.commit()
     # Return success whether or not the message existed (idempotent)
-    return {"deleted": True}
+    response: dict[str, Any] = {
+        "id": str(message_id),
+        "status": "deleted" if message_response is not None else "not_found",
+        "deleted": True,
+    }
+    if message_response is not None:
+        response["message"] = message_response
+    return response
 
 
 # ── Messages Last-Seen Endpoints ─────────────────────────────────────────────

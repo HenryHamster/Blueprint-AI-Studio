@@ -4331,6 +4331,106 @@ class TestMessages:
         assert rows == []
 
     @pytest.mark.asyncio
+    async def test_create_message_bounds_operator_workbench_context_keys(
+        self, client: AsyncClient, db_session
+    ):
+        """Workbench-owned context keys are bounded, while legacy extras survive."""
+        project = await _make_project(db_session)
+        selected_refs = [
+            {"kind": "task", "id": "task-1", "label": "Release blocker"},
+            {"kind": "task", "id": "task-1", "label": "Duplicate"},
+        ]
+        payload_context = {
+            "event_type": "x" * 150,
+            "user_event_type": "y" * 200,
+            "reply_to": " reply-1 " * 80,
+            "reply_preview": " preview " * 80,
+            "answer": " answer " * 500,
+            "resolution": " resolution " * 500,
+            "dedupe_key": " dedupe " * 100,
+            "strategic_session": {
+                "interaction_mode": "continuous",
+                "selected_refs": [{"kind": "task", "id": "attacker"}],
+            },
+            "operator_command": {"status": "succeeded"},
+            "check_in": {"kind": "spoofed"},
+            "legacy_extra": {"kept": True},
+        }
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "FEEDBACK",
+                "content": "Attach the current context without expanding it inline.",
+                "context": payload_context,
+                "workbench_context": {
+                    "interaction_mode": "continuous",
+                    "active_surface": "pipeline",
+                    "session_started_at": "2026-06-29T12:00:00Z",
+                    "context_package_id": "strategic-context:test",
+                    "selected_refs": selected_refs,
+                },
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        body_context = resp.json()["message"]["context"]
+        msg = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
+        assert msg is not None
+        stored_context = msg.context or {}
+        for context in (body_context, stored_context):
+            assert "event_type" not in context
+            assert "operator_command" not in context
+            assert "check_in" not in context
+            assert context["user_event_type"] == "x" * 120
+            assert len(context["reply_to"]) == 160
+            assert len(context["reply_preview"]) == 240
+            assert len(context["answer"]) == 2_000
+            assert len(context["resolution"]) == 2_000
+            assert len(context["dedupe_key"]) == 240
+            assert context["legacy_extra"] == {"kept": True}
+            session = context["strategic_session"]
+            assert session["interaction_mode"] == "continuous"
+            assert session["active_surface"] == "pipeline"
+            assert session["context_package_id"] == "strategic-context:test"
+            assert session["selected_refs"] == [
+                {"kind": "task", "id": "task-1", "label": "Release blocker"}
+            ]
+
+    @pytest.mark.asyncio
+    async def test_create_message_drops_raw_strategic_session_without_workbench_context(
+        self, client: AsyncClient, db_session
+    ):
+        """User context cannot inject a trusted Strategic session snapshot."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "Raw session context should not become trusted context.",
+                "context": {
+                    "strategic_session": {
+                        "interaction_mode": "continuous",
+                        "selected_refs": [{"kind": "task", "id": "attacker"}],
+                    },
+                    "legacy_extra": "kept",
+                },
+            },
+        )
+
+        assert resp.status_code == 200, resp.text
+        body_context = resp.json()["message"]["context"]
+        msg = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
+        assert msg is not None
+        stored_context = msg.context or {}
+        for context in (body_context, stored_context):
+            assert "strategic_session" not in context
+            assert context["legacy_extra"] == "kept"
+
+    @pytest.mark.asyncio
     async def test_create_message_at_limit_succeeds(
         self, client: AsyncClient, db_session
     ):
@@ -5642,14 +5742,25 @@ class TestMessages:
 
         resp = await client.delete(f"/api/admin/messages/{msg.id}")
         assert resp.status_code == 200
-        assert resp.json()["deleted"] is True
+        body = resp.json()
+        assert body["deleted"] is True
+        assert body["id"] == str(msg.id)
+        assert body["status"] == "deleted"
+        assert body["message"]["id"] == str(msg.id)
+        assert body["message"]["message_type"] == "BUG_REPORT"
+        assert body["message"]["status"] == "deleted"
 
     @pytest.mark.asyncio
     async def test_delete_message_not_found_is_idempotent(self, client: AsyncClient):
         """Deleting a non-existent message returns idempotent success."""
-        resp = await client.delete(f"/api/admin/messages/{uuid.uuid4()}")
+        missing_id = uuid.uuid4()
+        resp = await client.delete(f"/api/admin/messages/{missing_id}")
         assert resp.status_code == 200
-        assert resp.json()["deleted"] is True
+        body = resp.json()
+        assert body["deleted"] is True
+        assert body["id"] == str(missing_id)
+        assert body["status"] == "not_found"
+        assert "message" not in body
 
     @pytest.mark.asyncio
     async def test_delete_message_twice_is_idempotent(
@@ -5672,11 +5783,13 @@ class TestMessages:
         resp1 = await client.delete(f"/api/admin/messages/{msg.id}")
         assert resp1.status_code == 200
         assert resp1.json()["deleted"] is True
+        assert resp1.json()["status"] == "deleted"
 
         # Retry delete
         resp2 = await client.delete(f"/api/admin/messages/{msg.id}")
         assert resp2.status_code == 200
         assert resp2.json()["deleted"] is True
+        assert resp2.json()["status"] == "not_found"
 
     @pytest.mark.asyncio
     async def test_list_messages_status_filter(self, client: AsyncClient, db_session):

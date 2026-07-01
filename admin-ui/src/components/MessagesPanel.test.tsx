@@ -4581,10 +4581,38 @@ describe('MessagesPanel send arming receipt', () => {
     vi.clearAllMocks();
   });
 
+  function backendLikeSendResponse(postBody: Record<string, unknown>): Record<string, unknown> {
+    const arming = typeof postBody.arming === 'string' ? postBody.arming : null;
+    const messageId = typeof postBody.id === 'string' ? postBody.id : 'm-send-response';
+    const messageOverride = postBody.message && typeof postBody.message === 'object'
+      ? postBody.message as Record<string, unknown>
+      : {};
+    const response: Record<string, unknown> = {
+      id: messageId,
+      status: arming === 'duplicate' ? 'duplicate' : 'created',
+      message: {
+        id: messageId,
+        project_id: 'proj-1',
+        message_type: 'FEEDBACK',
+        from_type: 'user',
+        from_task_id: null,
+        content: 'Operator message',
+        context: {},
+        status: 'open',
+        resolution: null,
+        resolved_at: null,
+        created_at: '2026-07-01T12:00:00Z',
+        ...messageOverride,
+      },
+      ...postBody,
+    };
+    return response;
+  }
+
   // Serves the panel's mount-time GETs normally (empty message list, no
-  // last-seen, 404'd sync endpoints) and returns `postBody` as the JSON body of
-  // POST /api/admin/messages — the response the send handler parses its arming
-  // decision from. Pass `{}` to model an older server that omits the field.
+  // last-seen, 404'd sync endpoints) and returns a backend-like create response
+  // for POST /api/admin/messages. Pass `{}` to model an older server that omits
+  // the `arming` field while still returning the durable message envelope.
   function _setupSendMock(postBody: Record<string, unknown>): void {
     (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
       const urlStr = String(url);
@@ -4593,7 +4621,7 @@ describe('MessagesPanel send arming receipt', () => {
         return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
       }
       if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'POST') {
-        return new Response(JSON.stringify(postBody), { status: 200 });
+        return new Response(JSON.stringify(backendLikeSendResponse(postBody)), { status: 200 });
       }
       if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
         return new Response(JSON.stringify({ messages: [] }), { status: 200 });
@@ -4662,9 +4690,9 @@ describe('MessagesPanel send arming receipt', () => {
     return host as HTMLDivElement;
   }
 
-  // The composer hint <p> always renders one of the four ArmingOutcome hint
+  // The composer hint <p> always renders one of the send-result ArmingOutcome hint
   // strings; locate it by matching its text against that closed set.
-  const ALL_HINTS = (['steering', 'passive_note', 'routine_event', 'not_armed'] as ArmingOutcome[])
+  const ALL_HINTS = (['steering', 'passive_note', 'routine_event', 'not_armed', 'duplicate'] as ArmingOutcome[])
     .map(armingHintCopy);
   function hintText(el: HTMLElement): string | null {
     const p = [...el.querySelectorAll('p')].find(p => ALL_HINTS.includes(p.textContent ?? ''));
@@ -5090,6 +5118,8 @@ describe('MessagesPanel send arming receipt', () => {
 
     await typeAndSend(el, 'steer: focus on the migration work');
     await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    expect(addToast).toHaveBeenCalledWith(armingToastCopy('duplicate'), 'success');
+    expect(hintText(el)).toBe(armingHintCopy('duplicate'));
     expect(onStrategicRefresh).toHaveBeenCalledTimes(1);
   });
 });

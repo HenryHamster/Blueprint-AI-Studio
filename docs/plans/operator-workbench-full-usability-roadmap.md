@@ -8,7 +8,7 @@ The rule for this file: after every major batch, update the status ledger, miles
 
 ## Status Ledger
 
-Overall implementation estimate: 70%.
+Overall implementation estimate: 74%.
 
 Legend:
 - Done: implemented, reviewed, tested, and pushed.
@@ -22,7 +22,7 @@ Legend:
 | M0. Workbench IA foundation | Done | Four-mode shell, Chat/Pipeline/Project/Runtime homes, task archive moved under Pipeline, runtime settings/devices/accounts rehosted. | Keep regression coverage while later cleanup lands. |
 | M1. Roadmap and tracking discipline | In progress | This document. | Keep this file updated after every pushed batch. |
 | M2. Persistent local Strategic workday mode | Partial | Workbench state, continuous mode markers, Strategic local runner requirement, local runner selection, attention for holds, stale Strategic hold timeout, clearer Devices UI. | Make continuation persistence/ownership explicit and settle workday TTL semantics. |
-| M3. Messages as the active-work interface | Partial | `MessagesPanel` page, clean composer mode, strategic session messages, context descriptors. | Finish message contract cleanup and remove remaining always-visible advanced chrome from primary chat. |
+| M3. Messages as the active-work interface | Done | Shared `ProjectMessage` creation/projection, bounded workbench message context, minimal Strategic-session Chat, backend/frontend arming fixtures. | Keep regression coverage while M4/M5 add richer command and context surfaces. |
 | M4. Ctrl+K and hotkey operating layer | Partial | Command palette, shortcut hooks, server command descriptors, allowlisted command execution. | Finish canonical command/target registry and missing hotkeys. |
 | M5. Strategic context and canvas/artifact surface | Partial | Context package, selected refs, canvas descriptors, `StrategicContextWorkspace`, map/resource rows. | Add first-class Chat canvas slot and contract fixtures before any writable canvas system. |
 | M6. Pipeline monitoring and task sideboard | Partial | Pipeline workspace, task tree, task rail, stale attention routing, task sideboard context. | Tighten sideboard integration, status flow, tracked streams, and fixture-based contract tests. |
@@ -132,7 +132,7 @@ Acceptance gates:
 
 ## M3. Messages as the Active-Work Interface
 
-Status: Partial.
+Status: Done.
 
 Purpose: Make Chat the clean place to talk to Strategic, discuss plans/results, and let Strategic pull relevant context or artifacts into view.
 
@@ -144,20 +144,17 @@ Existing:
 - Conversation filtering keeps user/operator/Strategic/high-signal messages visible.
 - Message context can include session snapshots and selected refs.
 
-Remaining work:
-- Finalize the backend message contract:
-  - Keep `ProjectMessage` as the durable source.
-  - Reduce legacy projection drift across `admin_message_dict`, `legacy_direction_message_dict`, `agent_thread_message_dict`, and `agent_fetch_message_dict`.
-  - Bound and document free-form `context` keys used by operator workbench.
-  - Align message create/update/delete/resolve responses with frontend types.
-- Move low-frequency message controls out of the primary chat surface:
-  - Search, saved views, resolved visibility, batch actions, event noise preferences, delete/resolve, convert-to-direction, investigation launch.
-  - Keep them accessible through command palette, context menu, or secondary surfaces.
-- Keep the composer plain:
-  - No fake action chips such as "render chart" or "pull spend" unless backed by real commands.
-  - The primary action is sending a message to Strategic.
-- Add a clean mechanism for Strategic to attach or reference a context artifact/canvas without stuffing it inline into every answer.
-- Tighten unread/high-signal counting so routine alerts do not crowd active chat.
+Completed:
+- `ProjectMessage` remains the durable source; shared creation/projection helpers own the canonical message shape while legacy aliases remain isolated to legacy readers.
+- Operator workbench context keys are explicitly bounded before storage; raw `event_type` is namespaced to `user_event_type`, and raw `strategic_session`/internal receipt-key injection is dropped in favor of trusted snapshots and receipts.
+- Message create/resolve/delete responses now carry stable status/id/message contracts where the route can do so without breaking legacy callers.
+- Primary Chat uses the Strategic-session message route and minimal composer/list chrome; search, saved views, resolved visibility, batch actions, noise preferences, delete/resolve, convert-to-direction, and investigation controls stay in the secondary triage surface.
+- Strategic context is attached by bounded `strategic_session` snapshots with selected refs, selected-ref descriptors, and context package descriptors instead of copying artifacts inline.
+- Routine events stay out of the active conversation and arming/unread copy distinguishes steering, passive notes, routine events, failed arming, and idempotent duplicates.
+
+Evidence:
+- Backend tests cover operator context caps/reserved keys, arming outcomes, strategic-session snapshots, idempotent duplicates, and delete response shape.
+- Frontend tests consume backend-like arming fixtures for all five outcomes and keep primary Chat in minimal Strategic-session mode.
 
 Authoritative files:
 - `backend/app/project_message_creation.py`
