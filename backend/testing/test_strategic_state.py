@@ -2688,7 +2688,7 @@ async def test_strategic_session_message_does_not_persist_selected_message_body(
         "selected_ref_descriptors"
     ][0]
     assert stored_descriptor == {
-        "kind": "MESSAGE",
+        "kind": "message",
         "id": f"message:{selected_message.id}",
         "target": {
             "surface": "messages",
@@ -2832,6 +2832,7 @@ async def test_strategic_session_check_in_records_quiet_durable_receipt(
     client: AsyncClient, db_session
 ):
     project = await _make_project(db_session)
+    original_refresh = dict((project.vision or {}).get("_strategic_refresh") or {})
     body = {
         "content": "Daily check-in: focus on release readiness.",
         "kind": "daily",
@@ -2887,6 +2888,23 @@ async def test_strategic_session_check_in_records_quiet_durable_receipt(
         {"kind": "task", "id": "task-check", "label": "Release task"}
     ]
 
+    prefs_row = (
+        await db_session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.project_id == project.id,
+                MessagesNoisePrefs.user_id == TEST_USER_ID,
+            )
+        )
+    ).scalar_one()
+    stored_workbench = (prefs_row.prefs or {})["_strategic_workbench"]
+    assert stored_workbench["interaction_mode"] == "check_in"
+    assert stored_workbench["active_surface"] == "strategic"
+    assert stored_workbench["selected_refs"] == [
+        {"kind": "task", "id": "task-check", "label": "Release task"}
+    ]
+    await db_session.refresh(project)
+    assert (project.vision or {}).get("_strategic_refresh") == original_refresh
+
     data = first.json()
     assert data["session"]["last_check_in"]["message_id"] == str(message_id)
     assert data["session"]["last_check_in"]["kind"] == "daily"
@@ -2901,6 +2919,235 @@ async def test_strategic_session_check_in_records_quiet_durable_receipt(
         .where(ProjectMessage.idempotency_key == "daily-check-in-2026-06-30")
     )
     assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_check_in_continuous_mode_updates_local_marker_without_arming(
+    client: AsyncClient, db_session
+):
+    from app.workbench_state import STRATEGIC_LOCAL_CONTINUATION_KEY
+
+    project = await _make_project(db_session)
+    original_refresh = dict((project.vision or {}).get("_strategic_refresh") or {})
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/check-in",
+        json={
+            "content": "Keep the local Strategic session warm.",
+            "idempotency_key": "check-in-continuous-local",
+            "workbench_context": {
+                "interaction_mode": "continuous",
+                "active_surface": "runtime",
+                "selected_refs": [
+                    {
+                        "kind": "task",
+                        "id": "local-strategic-task",
+                        "label": "Local Strategic task",
+                    }
+                ],
+            },
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["check_in"]["status"] == "created"
+    prefs_row = (
+        await db_session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.project_id == project.id,
+                MessagesNoisePrefs.user_id == TEST_USER_ID,
+            )
+        )
+    ).scalar_one()
+    stored_workbench = (prefs_row.prefs or {})["_strategic_workbench"]
+    assert stored_workbench["interaction_mode"] == "continuous"
+    assert stored_workbench["active_surface"] == "runtime"
+    await db_session.refresh(project)
+    vision = project.vision or {}
+    marker = vision[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert marker["active"] is True
+    assert marker["operator_user_id"] == TEST_USER_ID
+    assert vision.get("_strategic_refresh") == original_refresh
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_check_in_duplicate_does_not_replace_snapshot(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    future_task_id = uuid.uuid4()
+    first = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/check-in",
+        json={
+            "content": "First checkpoint.",
+            "idempotency_key": "check-in-stable-snapshot",
+            "workbench_context": {
+                "interaction_mode": "continuous",
+                "active_surface": "runtime",
+                "selected_refs": [
+                    {
+                        "kind": "task",
+                        "id": str(future_task_id),
+                        "label": "First task",
+                    }
+                ],
+                "selected_ref_descriptors": [
+                    {
+                        "kind": "task",
+                        "id": str(future_task_id),
+                        "label": "First task snapshot",
+                        "summary": "Operator context before the task row existed.",
+                    }
+                ],
+            },
+        },
+    )
+    db_session.add(
+        Task(
+            id=future_task_id,
+            project_id=project.id,
+            title="Resolved task that appeared later",
+            status=TaskStatus.IN_PROGRESS,
+            latest_status_message="This must not rewrite the duplicate snapshot.",
+        )
+    )
+    await db_session.commit()
+    duplicate = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/check-in",
+        json={
+            "content": "Replay with newer context.",
+            "idempotency_key": "check-in-stable-snapshot",
+            "workbench_context": {
+                "interaction_mode": "monitor",
+                "active_surface": "pipeline",
+                "selected_refs": [
+                    {"kind": "task", "id": "second-task", "label": "Second task"}
+                ],
+            },
+        },
+    )
+
+    assert first.status_code == 200, first.text
+    assert duplicate.status_code == 200, duplicate.text
+    assert duplicate.json()["check_in"]["status"] == "duplicate"
+    message = await db_session.get(
+        ProjectMessage,
+        uuid.UUID(first.json()["check_in"]["message_id"]),
+    )
+    assert message is not None
+    session_snapshot = (message.context or {})["strategic_session"]
+    assert session_snapshot["interaction_mode"] == "continuous"
+    assert session_snapshot["active_surface"] == "runtime"
+    assert session_snapshot["selected_refs"] == [
+        {"kind": "task", "id": str(future_task_id), "label": "First task"}
+    ]
+    assert session_snapshot["selected_ref_descriptors"] == [
+        {
+            "kind": "task",
+            "id": str(future_task_id),
+            "label": "First task snapshot",
+            "summary": "Operator context before the task row existed.",
+        }
+    ]
+    prefs_row = (
+        await db_session.execute(
+            select(MessagesNoisePrefs).where(
+                MessagesNoisePrefs.project_id == project.id,
+                MessagesNoisePrefs.user_id == TEST_USER_ID,
+            )
+        )
+    ).scalar_one()
+    assert (prefs_row.prefs or {})["_strategic_workbench"]["selected_refs"] == [
+        {"kind": "task", "id": str(future_task_id), "label": "First task"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_check_in_replaces_stale_selected_ref_descriptors(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Server resolved auth task",
+        status=TaskStatus.IN_PROGRESS,
+        latest_status_message="OAuth flow is active.",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/check-in",
+        json={
+            "content": "Checkpoint with selected task.",
+            "idempotency_key": "check-in-resolved-descriptor",
+            "workbench_context": {
+                "interaction_mode": "check_in",
+                "active_surface": "pipeline",
+                "selected_refs": [
+                    {
+                        "kind": "task",
+                        "id": str(task.id),
+                        "label": "Client stale task",
+                    },
+                    {
+                        "kind": "task",
+                        "id": "operator-only-task",
+                        "label": "Fallback task",
+                    }
+                ],
+                "selected_ref_descriptors": [
+                    {
+                        "kind": "task",
+                        "id": str(task.id),
+                        "label": "Stale client title",
+                        "summary": "Stale client summary",
+                        "status": "stale",
+                    },
+                    {
+                        "kind": "task",
+                        "id": "operator-only-task",
+                        "label": "Operator-only task",
+                        "summary": "Keep this sideboard note.",
+                        "target": {
+                            "surface": "project",
+                            "section": "directions",
+                        },
+                    }
+                ],
+            },
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    message = await db_session.get(
+        ProjectMessage,
+        uuid.UUID(resp.json()["check_in"]["message_id"]),
+    )
+    assert message is not None
+    descriptors = (message.context or {})["strategic_session"][
+        "selected_ref_descriptors"
+    ]
+    assert descriptors == [
+        {
+            "kind": "task",
+            "id": str(task.id),
+            "label": "Server resolved auth task",
+            "summary": "OAuth flow is active.",
+            "status": "IN_PROGRESS",
+            "target": {"surface": "task", "task_id": str(task.id)},
+        },
+        {
+            "kind": "task",
+            "id": "operator-only-task",
+            "label": "Operator-only task",
+            "summary": "Keep this sideboard note.",
+            "target": {
+                "surface": "project",
+                "section": "directions",
+            },
+        }
+    ]
 
 
 @pytest.mark.asyncio

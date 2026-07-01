@@ -83,6 +83,7 @@ from app.workbench_state import (
     get_strategic_workbench_state,
     persist_strategic_workbench_update,
     sanitize_strategic_session_snapshot,
+    workbench_context_for_strategic_session_snapshot,
     workbench_state_size_bytes,
 )
 from app.workbench_events import (
@@ -1273,6 +1274,61 @@ async def _message_preview_for_session_state(
     )
 
 
+def _selected_ref_descriptor_key(
+    descriptor: Any,
+) -> tuple[str, str] | None:
+    if not isinstance(descriptor, dict):
+        return None
+    kind = _compact_text(descriptor.get("kind"), max_chars=40)
+    ref_id = _compact_text(descriptor.get("id"), max_chars=160)
+    if not kind or not ref_id:
+        return None
+    return (kind.lower(), ref_id)
+
+
+def _descriptor_has_resolved_context(descriptor: Any) -> bool:
+    return isinstance(descriptor, dict) and any(
+        key in descriptor for key in ("summary", "status", "target")
+    )
+
+
+def _merge_stored_and_preview_ref_descriptors(
+    stored_descriptors: Any,
+    preview_descriptors: list[Any],
+) -> list[Any]:
+    if not isinstance(stored_descriptors, list) or not stored_descriptors:
+        return preview_descriptors
+
+    preview_by_key: dict[tuple[str, str], Any] = {}
+    for descriptor in preview_descriptors:
+        key = _selected_ref_descriptor_key(descriptor)
+        if key is not None and key not in preview_by_key:
+            preview_by_key[key] = descriptor
+
+    merged: list[Any] = []
+    stored_keys: set[tuple[str, str]] = set()
+    for descriptor in stored_descriptors:
+        key = _selected_ref_descriptor_key(descriptor)
+        if key is None:
+            merged.append(descriptor)
+            continue
+        stored_keys.add(key)
+        preview = preview_by_key.get(key)
+        if _descriptor_has_resolved_context(preview):
+            merged.append(preview)
+        else:
+            merged.append(descriptor)
+
+    for descriptor in preview_descriptors:
+        key = _selected_ref_descriptor_key(descriptor)
+        if key is None or key in stored_keys:
+            continue
+        if _descriptor_has_resolved_context(descriptor):
+            merged.append(descriptor)
+
+    return merged
+
+
 async def _persist_message_preview_strategic_session_descriptors(
     session: AsyncSession,
     message: ProjectMessage,
@@ -1298,15 +1354,20 @@ async def _persist_message_preview_strategic_session_descriptors(
     stored_snapshot = context.get("strategic_session")
     if not isinstance(stored_snapshot, dict):
         return
-    if isinstance(stored_snapshot.get("selected_ref_descriptors"), list):
-        return
+    stored_descriptors = stored_snapshot.get("selected_ref_descriptors")
+    next_descriptors = _merge_stored_and_preview_ref_descriptors(
+        stored_descriptors,
+        preview_descriptors,
+    )
 
     updated_snapshot = sanitize_strategic_session_snapshot(
         {
             **stored_snapshot,
-            "selected_ref_descriptors": preview_descriptors,
+            "selected_ref_descriptors": next_descriptors,
         }
     )
+    if updated_snapshot == stored_snapshot:
+        return
     message.context = {
         **context,
         "strategic_session": updated_snapshot,
@@ -2416,11 +2477,28 @@ async def create_project_strategic_session_check_in(
     if message is None:
         now = _utcnow()
         kind = _compact_text(data.kind, max_chars=40) or "manual"
+        workbench_context_for_snapshot = data.workbench_context
+        if data.workbench_context is not None:
+            workbench_write = await persist_strategic_workbench_update(
+                session,
+                current_user["user_id"],
+                project_id,
+                data.workbench_context,
+                sync_local_continuation_marker=True,
+                arm_interaction_mode=False,
+                commit=False,
+            )
+            workbench_context_for_snapshot = (
+                workbench_context_for_strategic_session_snapshot(
+                    workbench_write.state,
+                    data.workbench_context,
+                )
+            )
         strategic_session = await build_message_strategic_session_snapshot(
             session,
             current_user["user_id"],
             project_id,
-            data.workbench_context,
+            workbench_context_for_snapshot,
         )
         message_context: Dict[str, Any] = {
             "event_type": _CHECK_IN_EVENT_TYPE,
@@ -2485,6 +2563,18 @@ async def create_project_strategic_session_check_in(
         session=session,
         current_user=current_user,
     )
+    message_preview = await _message_preview_for_session_state(
+        session,
+        project_id,
+        state_response,
+        message,
+    )
+    if status == "created":
+        await _persist_message_preview_strategic_session_descriptors(
+            session,
+            message,
+            message_preview,
+        )
     session_read_model = await _build_strategic_session_response(
         session,
         project_id,
@@ -2552,11 +2642,12 @@ async def create_project_strategic_session_message(
         state_response,
         result.message,
     )
-    await _persist_message_preview_strategic_session_descriptors(
-        session,
-        result.message,
-        message_preview,
-    )
+    if result.status == "created":
+        await _persist_message_preview_strategic_session_descriptors(
+            session,
+            result.message,
+            message_preview,
+        )
     session_read_model = await _build_strategic_session_response(
         session,
         project_id,
