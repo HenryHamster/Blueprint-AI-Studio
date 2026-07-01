@@ -58,7 +58,7 @@ import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
 import { useCommandPaletteState } from './hooks/useCommandPaletteState';
 import { useStrategicContextNavigation } from './hooks/useStrategicContextNavigation';
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
-import { updateStrategicWorkbenchState, type StrategicWorkbenchState } from './strategicStateApi';
+import { checkInStrategicSession, updateStrategicWorkbenchState, type StrategicWorkbenchState } from './strategicStateApi';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 import { buildOptimisticStrategicWorkbench, normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSurfaceForTab } from './utils/strategicWorkbenchSession';
@@ -427,9 +427,11 @@ export default function App() {
   }, [strategicReadModel.refresh]);
   const [optimisticStrategicWorkbench, setOptimisticStrategicWorkbench] = useState<StrategicWorkbenchState | null>(null);
   const [savingStrategicWorkbench, setSavingStrategicWorkbench] = useState(false);
+  const [checkingInStrategicSession, setCheckingInStrategicSession] = useState(false);
   const strategicWorkbenchStateRef = useRef<StrategicWorkbenchState | null>(null);
   const strategicWorkbenchSaveSeqRef = useRef(0);
   const strategicWorkbenchSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+  const strategicCheckInIdempotencyKeyRef = useRef<string | null>(null);
   const strategicWorkbenchOperatorSurfaceTouchedRef = useRef(false);
   const strategicWorkbenchRestoreProjectRef = useRef<string | null>(null);
   useEffect(() => {
@@ -440,6 +442,8 @@ export default function App() {
     strategicWorkbenchSaveQueueRef.current = Promise.resolve();
     strategicWorkbenchOperatorSurfaceTouchedRef.current = false;
     strategicWorkbenchRestoreProjectRef.current = null;
+    strategicCheckInIdempotencyKeyRef.current = null;
+    setCheckingInStrategicSession(false);
   }, [selectedProjectId]);
   const strategicReadModelWorkbench = strategicReadModel.data?.project_id === selectedProjectId
     ? strategicReadModel.data?.workbench ?? null
@@ -490,6 +494,36 @@ export default function App() {
     const baseRefs = (strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench)?.selected_refs ?? [];
     persistStrategicWorkbench({ selected_refs: updateRefs(baseRefs) });
   }, [persistStrategicWorkbench, strategicReadModelWorkbench]);
+  const handleStrategicCheckIn = useCallback(async () => {
+    const projectId = s.selectedProjectId;
+    if (!projectId || checkingInStrategicSession) return;
+    setCheckingInStrategicSession(true);
+    try {
+      const workbenchContext = strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench;
+      if (!strategicCheckInIdempotencyKeyRef.current) {
+        strategicCheckInIdempotencyKeyRef.current = `strategic-check-in:${projectId}:${Date.now()}`;
+      }
+      const checkInResponse = await checkInStrategicSession(projectId, {
+        kind: 'manual',
+        workbench_context: workbenchContext ? { ...workbenchContext } : undefined,
+        idempotency_key: strategicCheckInIdempotencyKeyRef.current,
+      });
+      if (selectedProjectIdRef.current !== projectId) return;
+      strategicCheckInIdempotencyKeyRef.current = null;
+      s.addToast('Strategic check-in recorded', 'success');
+      if (strategicReadModel.data) {
+        strategicReadModel.applySessionResponse(checkInResponse);
+      } else {
+        void strategicReadModel.refresh();
+      }
+    } catch {
+      if (selectedProjectIdRef.current === projectId) {
+        s.addToast('Could not record Strategic check-in', 'error');
+      }
+    } finally {
+      if (selectedProjectIdRef.current === projectId) setCheckingInStrategicSession(false);
+    }
+  }, [checkingInStrategicSession, s, strategicReadModel, strategicReadModelWorkbench]);
   const taskContextSessionProps = { sessionRefs: strategicWorkbenchState?.selected_refs, savingSessionRefs: savingStrategicWorkbench, onUpdateSessionRefs: updateStrategicSessionRefs };
   const pipelineAttentionCount = useMemo(() => {
     const counts = strategicReadModel.data?.attention?.counts;
@@ -1418,7 +1452,11 @@ export default function App() {
                 saving={savingStrategicWorkbench}
                 localRunner={strategicReadModel.data?.runtime?.local_runner ?? null}
                 runtimeWork={strategicReadModel.data?.runtime?.work ?? null}
+                lastCheckIn={strategicReadModel.data?.work_session?.last_check_in ?? null}
+                sinceLastCheckIn={strategicReadModel.data?.work_session?.since_last_check_in ?? null}
+                checkingIn={checkingInStrategicSession}
                 onModeChange={setStrategicInteractionMode}
+                onCheckIn={handleStrategicCheckIn}
                 onOpenDevices={() => {
                   setRuntimeSection('devices');
                   handleTabChange('runtime');

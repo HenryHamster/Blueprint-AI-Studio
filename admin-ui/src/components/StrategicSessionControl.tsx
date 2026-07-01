@@ -1,4 +1,5 @@
 import {
+  CheckCircle2,
   ChevronRight,
   Clock3,
   Cpu,
@@ -10,6 +11,7 @@ import {
   Server,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
+import type { StrategicWorkSessionLastCheckIn, StrategicWorkSessionSinceLastCheckIn } from '../strategicStateApi';
 
 export type StrategicInteractionMode = 'chat' | 'check_in' | 'monitor' | 'continuous';
 
@@ -97,7 +99,11 @@ export interface StrategicSessionControlProps {
   localRunner?: StrategicLocalRunnerStatus | null;
   runtimeWorkStatus?: StrategicRuntimeWorkStatus | null;
   runtimeWork?: StrategicRuntimeWorkStatus | null;
+  lastCheckIn?: StrategicWorkSessionLastCheckIn | null;
+  sinceLastCheckIn?: StrategicWorkSessionSinceLastCheckIn | null;
+  checkingIn?: boolean;
   onModeChange?: (mode: StrategicInteractionMode) => void;
+  onCheckIn?: () => void;
   onOpenDevices?: () => void;
   onOpenCompute?: () => void;
   className?: string;
@@ -184,6 +190,46 @@ function firstCount(...values: Array<number | null | undefined>): number | null 
 
 function pluralize(count: number, singular: string): string {
   return `${count} ${singular}${count === 1 ? '' : 's'}`;
+}
+
+function formatRelativeTime(timestamp?: string | null): string | null {
+  if (!timestamp) return null;
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return null;
+  const diffMs = Date.now() - date.getTime();
+  if (diffMs < 60_000) return 'just now';
+  const minutes = Math.floor(diffMs / 60_000);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return date.toLocaleDateString();
+}
+
+function checkInChangeCount(since?: StrategicWorkSessionSinceLastCheckIn | null): number | null {
+  if (!since?.available) return null;
+  return (
+    (since.messages?.total ?? 0)
+    + (since.tasks?.updated ?? 0)
+    + (since.alerts?.raised ?? 0)
+    + (since.strategic?.cycles_completed ?? 0)
+  );
+}
+
+function checkInDetail(
+  lastCheckIn?: StrategicWorkSessionLastCheckIn | null,
+  sinceLastCheckIn?: StrategicWorkSessionSinceLastCheckIn | null,
+): string {
+  if (!lastCheckIn?.created_at) return 'Never checked';
+  const relative = formatRelativeTime(lastCheckIn.created_at);
+  const changeCount = checkInChangeCount(sinceLastCheckIn);
+  const changeLabel = changeCount == null
+    ? null
+    : changeCount === 0
+      ? '0 new'
+      : `${changeCount} new`;
+  return [relative ? `Last ${relative}` : null, changeLabel].filter(Boolean).join(' / ') || 'Checked';
 }
 
 function shortId(value?: string | null): string | null {
@@ -405,7 +451,11 @@ export function StrategicSessionControl({
   localRunner = null,
   runtimeWorkStatus = null,
   runtimeWork = null,
+  lastCheckIn = null,
+  sinceLastCheckIn = null,
+  checkingIn = false,
   onModeChange,
+  onCheckIn,
   onOpenDevices,
   onOpenCompute,
   className = '',
@@ -413,6 +463,8 @@ export function StrategicSessionControl({
   const selectedMode = currentMode ?? mode ?? 'chat';
   const runnerStatus = localRunnerStatus ?? localRunner;
   const workStatus = runtimeWorkStatus ?? runtimeWork;
+  const checkInSummary = checkInDetail(lastCheckIn, sinceLastCheckIn);
+  const checkInChanges = checkInChangeCount(sinceLastCheckIn);
 
   const runner = runnerStatus
     ? (() => {
@@ -484,6 +536,30 @@ export function StrategicSessionControl({
             Saving
           </span>
         )}
+
+        <button
+          type="button"
+          onClick={onCheckIn}
+          disabled={!onCheckIn || checkingIn}
+          className="group inline-grid min-h-11 w-full min-w-0 grid-cols-[auto,minmax(0,1fr),auto] items-center gap-2 rounded border border-neutral-800 bg-neutral-950/70 px-2 py-1.5 text-left transition-colors hover:border-neutral-600 hover:bg-neutral-900/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 disabled:cursor-not-allowed disabled:opacity-60 sm:min-h-8 sm:w-auto sm:max-w-[16rem]"
+          aria-label={`Mark Strategic session checked: ${checkInSummary}`}
+          title={`Mark Strategic session checked: ${checkInSummary}`}
+        >
+          {checkingIn ? (
+            <LoaderCircle className="h-3.5 w-3.5 shrink-0 animate-spin text-cyan-300" aria-hidden="true" />
+          ) : (
+            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-neutral-500 transition-colors group-hover:text-neutral-200" aria-hidden="true" />
+          )}
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-xs font-semibold text-neutral-200">Mark checked</span>
+            <span className="block truncate text-ui-sm text-neutral-400">{checkInSummary}</span>
+          </span>
+          {checkInChanges != null && checkInChanges > 0 && (
+            <span className="shrink-0 rounded border border-cyan-500/25 bg-cyan-500/10 px-1.5 py-0.5 font-mono text-ui-sm font-semibold text-cyan-300">
+              {checkInChanges}
+            </span>
+          )}
+        </button>
 
         {runner && (
           <button

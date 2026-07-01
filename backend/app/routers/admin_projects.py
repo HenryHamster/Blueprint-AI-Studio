@@ -10,19 +10,26 @@ self-improvement flags.
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, delete
-from sqlalchemy import and_, func, or_, update
+from sqlalchemy import and_, case, func, or_, update
 from typing import Dict, Any, List
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session, resolve_dialect_name
 from app.broadcast import broadcast_to_project
+from app.messages_noise_prefs_store import (
+    get_messages_noise_prefs_row,
+    mutate_messages_noise_prefs,
+)
 from app.shared_state import limiter
 from app.models import (
+    Alert,
+    MESSAGE_CONTENT_MAX,
     ProjectMessage,
     MessageType,
     ReleaseVersion,
@@ -68,6 +75,7 @@ from app.strategic_runtime_work import build_strategic_runtime_summary
 from app.work_session_actions import build_work_session_actions
 from app.workbench_state import (
     WORKBENCH_STATE_MAX_BYTES,
+    build_message_strategic_session_snapshot,
     get_strategic_workbench_state,
     persist_strategic_workbench_update,
     sanitize_strategic_session_snapshot,
@@ -81,6 +89,8 @@ router = APIRouter(
 )
 
 TASK_FOCUS_BUCKET_LIMIT = 8
+_CHECK_IN_EVENT_TYPE = "strategic_check_in"
+_CHECK_IN_PREFS_KEY = "_strategic_check_in"
 
 logger = logging.getLogger(__name__)
 
@@ -466,6 +476,299 @@ def _build_work_session_summary(
     }
 
 
+async def _latest_strategic_check_in(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    user_id: str,
+) -> ProjectMessage | None:
+    prefs_row = await get_messages_noise_prefs_row(session, user_id, project_id)
+    marker = (
+        (prefs_row.prefs or {}).get(_CHECK_IN_PREFS_KEY)
+        if prefs_row is not None
+        else None
+    )
+    message_id = marker.get("message_id") if isinstance(marker, dict) else None
+    if not isinstance(message_id, str):
+        return None
+    try:
+        parsed_message_id = uuid.UUID(message_id)
+    except ValueError:
+        return None
+    message = await session.get(ProjectMessage, parsed_message_id)
+    if message is None or message.project_id != project_id:
+        return None
+    return message if _message_is_operator_check_in(message, user_id) else None
+
+
+async def _count_rows(session: AsyncSession, statement: Any) -> int:
+    return int((await session.scalar(statement)) or 0)
+
+
+def _sum_case(condition: Any) -> Any:
+    return func.coalesce(func.sum(case((condition, 1), else_=0)), 0)
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).replace(
+            tzinfo=None
+        )
+    except ValueError:
+        return None
+
+
+def _work_session_last_check_in(message: ProjectMessage) -> Dict[str, Any]:
+    context = message.context if isinstance(message.context, dict) else {}
+    check_in = context.get("check_in") if isinstance(context, dict) else {}
+    kind = check_in.get("kind") if isinstance(check_in, dict) else None
+    return {
+        "message_id": str(message.id),
+        "created_at": message.created_at.isoformat() if message.created_at else None,
+        "content": message.content,
+        "kind": _compact_text(kind, max_chars=40) or "manual",
+    }
+
+
+def _message_is_operator_check_in(message: ProjectMessage, user_id: str) -> bool:
+    context = message.context if isinstance(message.context, dict) else {}
+    check_in = context.get("check_in") if isinstance(context, dict) else {}
+    return (
+        context.get("event_type") == _CHECK_IN_EVENT_TYPE
+        and isinstance(check_in, dict)
+        and check_in.get("operator_user_id") == user_id
+    )
+
+
+async def _persist_strategic_check_in_marker(
+    session: AsyncSession,
+    *,
+    user_id: str,
+    project_id: uuid.UUID,
+    message: ProjectMessage,
+) -> None:
+    context = message.context if isinstance(message.context, dict) else {}
+    check_in = context.get("check_in") if isinstance(context, dict) else {}
+    marker = {
+        "version": 1,
+        "message_id": str(message.id),
+        "operator_user_id": user_id,
+        "created_at": message.created_at.isoformat() if message.created_at else None,
+        "kind": _compact_text(
+            check_in.get("kind") if isinstance(check_in, dict) else None,
+            max_chars=40,
+        )
+        or "manual",
+    }
+
+    def merge(existing_prefs: dict[str, Any]) -> dict[str, Any]:
+        prefs = dict(existing_prefs)
+        existing_marker = prefs.get(_CHECK_IN_PREFS_KEY)
+        if isinstance(existing_marker, dict):
+            existing_created_at = _parse_iso_datetime(existing_marker.get("created_at"))
+            marker_created_at = _parse_iso_datetime(marker.get("created_at"))
+            if (
+                existing_created_at is not None
+                and marker_created_at is not None
+                and existing_created_at > marker_created_at
+            ):
+                return prefs
+        prefs[_CHECK_IN_PREFS_KEY] = marker
+        return prefs
+
+    await mutate_messages_noise_prefs(session, user_id, project_id, merge)
+    await session.commit()
+
+
+async def _work_session_since_last_check_in(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    since: Any,
+    until: Any,
+) -> Dict[str, Any]:
+    message_since_filter = [
+        ProjectMessage.project_id == project_id,
+        ProjectMessage.created_at > since,
+        ProjectMessage.created_at <= until,
+        or_(
+            ProjectMessage.context["event_type"].as_string().is_(None),
+            ProjectMessage.context["event_type"].as_string() != _CHECK_IN_EVENT_TYPE,
+        ),
+    ]
+    task_since_filter = [
+        Task.project_id == project_id,
+        Task.archived.is_(False),
+    ]
+    alert_since_filter = [
+        Alert.project_id == project_id,
+        Alert.created_at > since,
+        Alert.created_at <= until,
+    ]
+    completed_cycle_at = func.coalesce(
+        StrategicCycle.phase2_completed_at,
+        StrategicCycle.phase1_completed_at,
+        StrategicCycle.updated_at,
+    )
+    completed_cycle_filter = [
+        StrategicCycle.project_id == project_id,
+        StrategicCycle.outcome == "completed",
+        completed_cycle_at > since,
+        completed_cycle_at <= until,
+    ]
+    message_counts = (
+        await session.execute(
+            select(
+                func.count(),
+                _sum_case(ProjectMessage.from_type.in_(["user", "operator"])),
+                _sum_case(
+                    ProjectMessage.from_type.in_(
+                        ["strategic", "strategist", "system"]
+                    )
+                ),
+                _sum_case(
+                    and_(
+                        ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
+                        ProjectMessage.message_type.in_(
+                            [
+                                MessageType.QUESTION,
+                                MessageType.BLOCKER,
+                                MessageType.BUG_REPORT,
+                            ]
+                        ),
+                    )
+                ),
+                _sum_case(
+                    and_(
+                        ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
+                        ProjectMessage.message_type == MessageType.FEEDBACK,
+                    )
+                ),
+            ).where(*message_since_filter)
+        )
+    ).one()
+    task_window_filter = or_(
+        and_(Task.created_at > since, Task.created_at <= until),
+        and_(Task.updated_at > since, Task.updated_at <= until),
+        and_(Task.completed_at > since, Task.completed_at <= until),
+    )
+    task_counts = (
+        await session.execute(
+            select(
+                _sum_case(and_(Task.created_at > since, Task.created_at <= until)),
+                _sum_case(and_(Task.updated_at > since, Task.updated_at <= until)),
+                _sum_case(
+                    and_(Task.completed_at > since, Task.completed_at <= until)
+                ),
+                _sum_case(
+                    and_(
+                        Task.updated_at > since,
+                        Task.updated_at <= until,
+                        Task.status == TaskStatus.FAILED,
+                    )
+                ),
+                _sum_case(
+                    and_(
+                        Task.updated_at > since,
+                        Task.updated_at <= until,
+                        Task.status == TaskStatus.BLOCKED,
+                    )
+                ),
+                _sum_case(
+                    and_(
+                        Task.updated_at > since,
+                        Task.updated_at <= until,
+                        Task.status == TaskStatus.PARKED,
+                    )
+                ),
+            ).where(*task_since_filter, task_window_filter)
+        )
+    ).one()
+    alert_counts = (
+        await session.execute(
+            select(
+                func.count(),
+                _sum_case(Alert.dismissed_at.is_(None)),
+                _sum_case(Alert.severity == "ERROR"),
+                _sum_case(Alert.severity == "WARNING"),
+            ).where(*alert_since_filter)
+        )
+    ).one()
+    strategic_count = await _count_rows(
+        session,
+        select(func.count()).select_from(StrategicCycle).where(*completed_cycle_filter),
+    )
+    latest_cycle = (
+        await session.execute(
+            select(StrategicCycle)
+            .where(*completed_cycle_filter)
+            .order_by(completed_cycle_at.desc())
+            .limit(1)
+        )
+    ).scalars().first()
+    return {
+        "version": 1,
+        "available": True,
+        "since": since.isoformat() if since else None,
+        "until": until.isoformat() if until else None,
+        "messages": {
+            "total": int(message_counts[0] or 0),
+            "operator": int(message_counts[1] or 0),
+            "strategic": int(message_counts[2] or 0),
+            "needs_operator": int(message_counts[3] or 0),
+            "watch": int(message_counts[4] or 0),
+        },
+        "tasks": {
+            "created": int(task_counts[0] or 0),
+            "updated": int(task_counts[1] or 0),
+            "completed": int(task_counts[2] or 0),
+            "failed": int(task_counts[3] or 0),
+            "blocked": int(task_counts[4] or 0),
+            "parked": int(task_counts[5] or 0),
+        },
+        "alerts": {
+            "raised": int(alert_counts[0] or 0),
+            "active": int(alert_counts[1] or 0),
+            "errors": int(alert_counts[2] or 0),
+            "warnings": int(alert_counts[3] or 0),
+        },
+        "strategic": {
+            "cycles_completed": strategic_count,
+            "latest_cycle": _cycle_summary(latest_cycle),
+        },
+    }
+
+
+async def _build_work_session_check_in_projection(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    user_id: str,
+) -> Dict[str, Any]:
+    now = _utcnow()
+    latest = await _latest_strategic_check_in(session, project_id, user_id)
+    if latest is None:
+        return {
+            "last_check_in": None,
+            "since_last_check_in": {
+                "version": 1,
+                "available": False,
+                "reason": "no_prior_check_in",
+                "since": None,
+                "until": now.isoformat(),
+            },
+        }
+    return {
+        "last_check_in": _work_session_last_check_in(latest),
+        "since_last_check_in": await _work_session_since_last_check_in(
+            session,
+            project_id,
+            since=latest.created_at,
+            until=now,
+        ),
+    }
+
+
 _LIVE_STRATEGIC_TASK_STATUSES = frozenset(
     {
         TaskStatus.QUEUED,
@@ -486,6 +789,13 @@ class StrategicSessionMessageCreate(BaseModel):
     content: str
     message_type: str = "NOTE"
     context: Dict[str, Any] | None = None
+    workbench_context: Dict[str, Any] | None = None
+    idempotency_key: str | None = None
+
+
+class StrategicSessionCheckInCreate(BaseModel):
+    content: str | None = None
+    kind: str = "manual"
     workbench_context: Dict[str, Any] | None = None
     idempotency_key: str | None = None
 
@@ -724,6 +1034,11 @@ async def _recent_session_outputs(
             .where(
                 ProjectMessage.project_id == project_id,
                 ProjectMessage.from_type.in_(["strategic", "system"]),
+                or_(
+                    ProjectMessage.context["event_type"].as_string().is_(None),
+                    ProjectMessage.context["event_type"].as_string()
+                    != _CHECK_IN_EVENT_TYPE,
+                ),
             )
             .order_by(ProjectMessage.created_at.desc())
             .limit(_SESSION_OUTPUT_LIMIT)
@@ -1738,6 +2053,14 @@ async def get_project_strategic_state(
         "location": session_status["location"],
         "status_reason": session_status["reason"],
     }
+    work_session = {
+        **work_session,
+        **await _build_work_session_check_in_projection(
+            session,
+            project.id,
+            current_user["user_id"],
+        ),
+    }
 
     # SHA-aware freshness: resolve candidate vs integration HEAD, best-effort.
     # A GitHub API failure must not break the endpoint — verdict degrades to unknown.
@@ -1898,6 +2221,165 @@ async def upsert_project_strategic_session(
     )
     response["arming"] = workbench_write.arming
     return response
+
+
+async def _project_message_for_idempotency_key(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    idempotency_key: str,
+) -> ProjectMessage | None:
+    return (
+        await session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.idempotency_key == idempotency_key,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+@router.post("/projects/{project_id}/strategic-session/check-in")
+@limiter.limit("30/minute")
+async def create_project_strategic_session_check_in(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: StrategicSessionCheckInCreate | None = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Record a quiet durable Strategic check-in checkpoint for this operator."""
+
+    await _get_user_project_with_role(
+        project_id,
+        current_user["user_id"],
+        session,
+        "member",
+    )
+    data = payload or StrategicSessionCheckInCreate()
+    trimmed_content = (data.content or "").strip()
+    if len(trimmed_content) > MESSAGE_CONTENT_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Content exceeds {MESSAGE_CONTENT_MAX} character limit",
+        )
+    if data.workbench_context is not None and workbench_state_size_bytes(
+        data.workbench_context
+    ) > WORKBENCH_STATE_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail="Workbench context too large (max 50KB)",
+        )
+    idem_key = (data.idempotency_key or "").strip() or None
+    if idem_key and len(idem_key) > 255:
+        raise HTTPException(
+            status_code=400,
+            detail="idempotency_key exceeds 255 characters",
+        )
+
+    status = "created"
+    message: ProjectMessage | None = None
+    if idem_key:
+        message = await _project_message_for_idempotency_key(
+            session,
+            project_id,
+            idem_key,
+        )
+        if message is not None:
+            if not _message_is_operator_check_in(message, current_user["user_id"]):
+                raise HTTPException(
+                    status_code=409,
+                    detail="idempotency_key already belongs to another message",
+                )
+            status = "duplicate"
+
+    if message is None:
+        now = _utcnow()
+        kind = _compact_text(data.kind, max_chars=40) or "manual"
+        strategic_session = await build_message_strategic_session_snapshot(
+            session,
+            current_user["user_id"],
+            project_id,
+            data.workbench_context,
+        )
+        message_context: Dict[str, Any] = {
+            "event_type": _CHECK_IN_EVENT_TYPE,
+            "check_in": {
+                "version": 1,
+                "kind": kind,
+                "operator_user_id": current_user["user_id"],
+                "captured_at": now.isoformat(),
+            },
+        }
+        if strategic_session:
+            message_context["strategic_session"] = strategic_session
+        message = ProjectMessage(
+            project_id=project_id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content=trimmed_content or "Checked in with Strategic.",
+            context=message_context,
+            status="resolved",
+            resolved_at=now,
+            idempotency_key=idem_key,
+        )
+        session.add(message)
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            if idem_key:
+                message = await _project_message_for_idempotency_key(
+                    session,
+                    project_id,
+                    idem_key,
+                )
+                if message is not None:
+                    if not _message_is_operator_check_in(
+                        message,
+                        current_user["user_id"],
+                    ):
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "idempotency_key already belongs to another message"
+                            ),
+                        )
+                    status = "duplicate"
+                else:
+                    raise
+            else:
+                raise
+        await session.refresh(message)
+
+    await _persist_strategic_check_in_marker(
+        session,
+        user_id=current_user["user_id"],
+        project_id=project_id,
+        message=message,
+    )
+
+    state_response = await get_project_strategic_state(
+        request,
+        project_id,
+        session=session,
+        current_user=current_user,
+    )
+    session_read_model = await _build_strategic_session_response(
+        session,
+        project_id,
+        state_response,
+    )
+    session_read_model["check_in"] = {
+        "status": status,
+        "message_id": str(message.id),
+    }
+    if status == "created":
+        await broadcast_to_project(
+            str(project_id),
+            "workbench_refetch",
+            {"refetch": {"surfaces": ["strategic_session"]}},
+        )
+    return session_read_model
 
 
 @router.post("/projects/{project_id}/strategic-session/messages")

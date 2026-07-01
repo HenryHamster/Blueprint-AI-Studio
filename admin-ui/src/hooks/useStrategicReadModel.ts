@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { fetchStrategicState, type StrategicStateResponse } from '../strategicStateApi';
+import { fetchStrategicState, type StrategicSessionResponse, type StrategicStateResponse } from '../strategicStateApi';
 import { DEFAULT_POLL_MS, usePoller } from './usePoller';
 
 export function useStrategicReadModel(projectId: string | null) {
@@ -44,11 +44,37 @@ export function useStrategicReadModel(projectId: string | null) {
     [data, projectId],
   );
 
+  const applySessionResponse = useCallback(
+    (sessionResponse: StrategicSessionResponse) => {
+      if (
+        !projectId ||
+        currentProjectIdRef.current !== projectId ||
+        sessionResponse.project_id !== projectId
+      ) {
+        return;
+      }
+      setData(prev => {
+        if (!prev || prev.project_id !== sessionResponse.project_id) return prev;
+        return {
+          ...prev,
+          strategic: sessionResponse.strategic ?? prev.strategic,
+          runtime: sessionResponse.runtime ?? prev.runtime,
+          context_package: sessionResponse.context_package ?? prev.context_package,
+          workbench: sessionResponse.workbench ?? prev.workbench,
+          work_session: sessionResponse.session ?? prev.work_session,
+        };
+      });
+      setError(null);
+      setLoading(false);
+    },
+    [projectId],
+  );
+
   usePoller(refresh, {
     intervalMs: DEFAULT_POLL_MS,
     enabled: Boolean(projectId),
     deps: [projectId],
   });
 
-  return { data, loading, error, refresh };
+  return { data, loading, error, refresh, applySessionResponse };
 }

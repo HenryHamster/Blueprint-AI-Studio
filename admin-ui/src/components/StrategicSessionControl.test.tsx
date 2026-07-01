@@ -43,6 +43,60 @@ describe('StrategicSessionControl', () => {
     expect(onModeChange).not.toHaveBeenCalled();
   });
 
+  it('renders the durable check-in action without confusing it with mode selection', async () => {
+    const onCheckIn = vi.fn();
+    const user = userEvent.setup();
+    const checkedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+
+    render(
+      <StrategicSessionControl
+        currentMode="check_in"
+        lastCheckIn={{ message_id: 'msg-check', created_at: checkedAt, kind: 'manual' }}
+        sinceLastCheckIn={{
+          version: 1,
+          available: true,
+          since: checkedAt,
+          until: new Date().toISOString(),
+          messages: { total: 2 },
+          tasks: { created: 1, updated: 4 },
+          alerts: { raised: 1 },
+          strategic: { cycles_completed: 0 },
+        }}
+        onModeChange={vi.fn()}
+        onCheckIn={onCheckIn}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /switch strategic mode to check-in/i })).toHaveAttribute('aria-pressed', 'true');
+    const checkIn = screen.getByRole('button', { name: /mark strategic session checked/i });
+    expect(checkIn).toHaveTextContent('Mark checked');
+    expect(checkIn).toHaveTextContent('7');
+
+    await user.click(checkIn);
+    expect(onCheckIn).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows first-run and saving states for the durable check-in action', async () => {
+    const onCheckIn = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <StrategicSessionControl
+        currentMode="chat"
+        sinceLastCheckIn={{ version: 1, available: false, reason: 'no_prior_check_in' }}
+        checkingIn
+        onModeChange={vi.fn()}
+        onCheckIn={onCheckIn}
+      />,
+    );
+
+    const checkIn = screen.getByRole('button', { name: /mark strategic session checked: never checked/i });
+    expect(checkIn).toBeDisabled();
+
+    await user.click(checkIn);
+    expect(onCheckIn).not.toHaveBeenCalled();
+  });
+
   it('renders a local runner pill that opens devices', async () => {
     const onOpenDevices = vi.fn();
     const user = userEvent.setup();

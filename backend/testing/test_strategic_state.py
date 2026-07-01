@@ -2591,6 +2591,306 @@ async def test_strategic_session_message_touches_workbench_freshness(
 
 
 @pytest.mark.asyncio
+async def test_strategic_state_marks_check_in_unavailable_without_prior_receipt(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+
+    state_resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    session_resp = await client.get(f"/api/admin/projects/{project.id}/strategic-session")
+
+    assert state_resp.status_code == 200, state_resp.text
+    assert session_resp.status_code == 200, session_resp.text
+    state_work_session = state_resp.json()["work_session"]
+    session_work_session = session_resp.json()["session"]
+    assert state_work_session["last_check_in"] is None
+    assert state_work_session["since_last_check_in"]["available"] is False
+    assert state_work_session["since_last_check_in"]["reason"] == "no_prior_check_in"
+    assert session_work_session["last_check_in"] is None
+    assert session_work_session["since_last_check_in"]["available"] is False
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_check_in_records_quiet_durable_receipt(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    body = {
+        "content": "Daily check-in: focus on release readiness.",
+        "kind": "daily",
+        "idempotency_key": "daily-check-in-2026-06-30",
+        "workbench_context": {
+            "interaction_mode": "check_in",
+            "active_surface": "strategic",
+            "selected_refs": [
+                {"kind": "task", "id": "task-check", "label": "Release task"}
+            ],
+        },
+    }
+
+    with patch(
+        "app.routers.admin_projects.broadcast_to_project",
+        new_callable=AsyncMock,
+    ) as broadcast:
+        first = await client.post(
+            f"/api/admin/projects/{project.id}/strategic-session/check-in",
+            json=body,
+        )
+        second = await client.post(
+            f"/api/admin/projects/{project.id}/strategic-session/check-in",
+            json=body,
+        )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json()["check_in"]["status"] == "created"
+    assert second.json()["check_in"]["status"] == "duplicate"
+    assert second.json()["check_in"]["message_id"] == first.json()["check_in"]["message_id"]
+    broadcast.assert_awaited_once_with(
+        str(project.id),
+        "workbench_refetch",
+        {"refetch": {"surfaces": ["strategic_session"]}},
+    )
+
+    message_id = uuid.UUID(first.json()["check_in"]["message_id"])
+    msg = await db_session.get(ProjectMessage, message_id)
+    assert msg is not None
+    assert msg.from_type == "system"
+    assert msg.status == "resolved"
+    assert msg.message_type == MessageType.NOTE
+    assert msg.content == "Daily check-in: focus on release readiness."
+    assert msg.idempotency_key == "daily-check-in-2026-06-30"
+    assert msg.context["event_type"] == "strategic_check_in"
+    assert msg.context["check_in"]["operator_user_id"] == TEST_USER_ID
+    assert msg.context["check_in"]["kind"] == "daily"
+    assert msg.context["strategic_session"]["interaction_mode"] == "check_in"
+    assert msg.context["strategic_session"]["selected_refs"] == [
+        {"kind": "task", "id": "task-check", "label": "Release task"}
+    ]
+
+    data = first.json()
+    assert data["session"]["last_check_in"]["message_id"] == str(message_id)
+    assert data["session"]["last_check_in"]["kind"] == "daily"
+    assert data["session"]["since_last_check_in"]["available"] is True
+    assert all(item["id"] != str(message_id) for item in data["conversation"]["items"])
+    assert all(item["id"] != str(message_id) for item in data["recent_outputs"])
+
+    count = await db_session.scalar(
+        select(func.count())
+        .select_from(ProjectMessage)
+        .where(ProjectMessage.project_id == project.id)
+        .where(ProjectMessage.idempotency_key == "daily-check-in-2026-06-30")
+    )
+    assert count == 1
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_check_in_duplicate_replay_does_not_move_marker_backward(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    old_resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/check-in",
+        json={
+            "content": "Older check-in",
+            "idempotency_key": "check-in-old",
+        },
+    )
+    assert old_resp.status_code == 200, old_resp.text
+    old_message = await db_session.get(
+        ProjectMessage,
+        uuid.UUID(old_resp.json()["check_in"]["message_id"]),
+    )
+    assert old_message is not None
+    old_message.created_at = _utcnow() - timedelta(minutes=10)
+    old_message.resolved_at = old_message.created_at
+    db_session.add(old_message)
+    await db_session.commit()
+
+    new_resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/check-in",
+        json={
+            "content": "Newer check-in",
+            "idempotency_key": "check-in-new",
+        },
+    )
+    replay_resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/check-in",
+        json={
+            "content": "Older check-in replay",
+            "idempotency_key": "check-in-old",
+        },
+    )
+    state_resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+
+    assert new_resp.status_code == 200, new_resp.text
+    assert replay_resp.status_code == 200, replay_resp.text
+    assert replay_resp.json()["check_in"]["status"] == "duplicate"
+    assert state_resp.status_code == 200, state_resp.text
+    assert (
+        state_resp.json()["work_session"]["last_check_in"]["message_id"]
+        == new_resp.json()["check_in"]["message_id"]
+    )
+    assert state_resp.json()["work_session"]["last_check_in"]["content"] == "Newer check-in"
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_counts_changes_since_last_check_in(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    check_in_resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/check-in",
+        json={"idempotency_key": "check-in-before-change-counts"},
+    )
+    assert check_in_resp.status_code == 200, check_in_resp.text
+    check_in_message = await db_session.get(
+        ProjectMessage,
+        uuid.UUID(check_in_resp.json()["check_in"]["message_id"]),
+    )
+    assert check_in_message is not None
+    check_in_message.created_at = _utcnow() - timedelta(minutes=10)
+    check_in_message.resolved_at = check_in_message.created_at
+    db_session.add(check_in_message)
+    await db_session.commit()
+    await db_session.refresh(check_in_message)
+    since = check_in_message.created_at
+    after = since + timedelta(minutes=1)
+    before = since - timedelta(minutes=1)
+    future = _utcnow() + timedelta(hours=1)
+
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="strategic",
+            content="Should we ship the runner update today?",
+            status="open",
+            created_at=after,
+        )
+    )
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BLOCKER,
+            from_type="strategic",
+            content="This future blocker must not be counted yet.",
+            status="open",
+            created_at=future,
+        )
+    )
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="Blocked post-check-in task",
+            status=TaskStatus.BLOCKED,
+            created_at=before,
+            updated_at=after,
+        )
+    )
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="Completed post-check-in task",
+            status=TaskStatus.COMPLETED,
+            created_at=before,
+            updated_at=after,
+            completed_at=after,
+        )
+    )
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="Failed post-check-in task",
+            status=TaskStatus.FAILED,
+            created_at=after,
+            updated_at=after,
+        )
+    )
+    db_session.add(
+        Task(
+            project_id=project.id,
+            title="Future failed task",
+            status=TaskStatus.FAILED,
+            created_at=future,
+            updated_at=future,
+        )
+    )
+    db_session.add(
+        Alert(
+            project_id=project.id,
+            severity=AlertSeverity.ERROR,
+            title="Runner disconnected",
+            message="The local runner missed its heartbeat.",
+            created_at=after,
+        )
+    )
+    db_session.add(
+        Alert(
+            project_id=project.id,
+            severity=AlertSeverity.ERROR,
+            title="Future alert",
+            message="This alert is outside the check-in window.",
+            created_at=future,
+        )
+    )
+    db_session.add(
+        StrategicCycle(
+            id=str(uuid.uuid4()),
+            project_id=project.id,
+            outcome="completed",
+            phase1_started_at=before,
+            phase1_completed_at=after,
+            phase2_started_at=after,
+            phase2_completed_at=after,
+            summary_text="Opened a release readiness direction.",
+            directions_created=1,
+            tasks_spawned=2,
+        )
+    )
+    db_session.add(
+        StrategicCycle(
+            id=str(uuid.uuid4()),
+            project_id=project.id,
+            outcome="completed",
+            phase1_started_at=future,
+            phase1_completed_at=future,
+            phase2_started_at=future,
+            phase2_completed_at=future,
+            summary_text="Future cycle should not be counted.",
+        )
+    )
+    await db_session.commit()
+
+    state_resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    session_resp = await client.get(f"/api/admin/projects/{project.id}/strategic-session")
+
+    assert state_resp.status_code == 200, state_resp.text
+    assert session_resp.status_code == 200, session_resp.text
+    since_state = state_resp.json()["work_session"]["since_last_check_in"]
+    assert since_state["available"] is True
+    assert since_state["messages"]["total"] == 1
+    assert since_state["messages"]["strategic"] == 1
+    assert since_state["messages"]["needs_operator"] == 1
+    assert since_state["tasks"]["created"] == 1
+    assert since_state["tasks"]["updated"] == 3
+    assert since_state["tasks"]["completed"] == 1
+    assert since_state["tasks"]["failed"] == 1
+    assert since_state["tasks"]["blocked"] == 1
+    assert since_state["alerts"]["raised"] == 1
+    assert since_state["alerts"]["errors"] == 1
+    assert since_state["strategic"]["cycles_completed"] == 1
+    assert since_state["strategic"]["latest_cycle"]["summary_text"] == "Opened a release readiness direction."
+    session_since = session_resp.json()["session"]["since_last_check_in"]
+    assert session_since["available"] is True
+    assert session_since["since"] == since_state["since"]
+    assert session_since["messages"] == since_state["messages"]
+    assert session_since["tasks"] == since_state["tasks"]
+    assert session_since["alerts"] == since_state["alerts"]
+    assert session_since["strategic"] == since_state["strategic"]
+
+
+@pytest.mark.asyncio
 async def test_strategic_state_includes_runtime_background_work(
     client: AsyncClient, db_session
 ):

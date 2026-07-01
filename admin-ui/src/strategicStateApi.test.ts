@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 import { apiFetch } from './api';
-import { updateStrategicWorkbenchState, type StrategicWorkbenchState } from './strategicStateApi';
+import { checkInStrategicSession, updateStrategicWorkbenchState, type StrategicWorkbenchState } from './strategicStateApi';
 
 vi.mock('./api', () => ({
   apiFetch: vi.fn(),
@@ -97,5 +97,95 @@ describe('updateStrategicWorkbenchState', () => {
     await expect(
       updateStrategicWorkbenchState('proj-1', { active_surface: 'runtime' }),
     ).rejects.toThrow('missing workbench');
+  });
+});
+
+describe('checkInStrategicSession', () => {
+  beforeEach(() => {
+    apiFetchMock.mockReset();
+  });
+
+  test('records a Strategic check-in through the canonical session endpoint', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({
+      project_id: 'proj-1',
+      status: 'idle',
+      location: 'locally',
+      session: {
+        version: 1,
+        id: 'strategic-session:proj-1',
+        mode: 'chat',
+        active_surface: 'strategic',
+        selected_refs: [],
+        selected_ref_descriptors: [],
+        curated_metrics: [],
+        last_check_in: {
+          message_id: 'msg-check',
+          created_at: '2026-06-30T12:00:00Z',
+          content: 'Checked in with Strategic.',
+          kind: 'manual',
+        },
+        since_last_check_in: {
+          version: 1,
+          available: true,
+          since: '2026-06-30T12:00:00Z',
+          until: '2026-06-30T12:00:01Z',
+          messages: { total: 0 },
+          tasks: { created: 0, updated: 0 },
+          alerts: { raised: 0 },
+          strategic: { cycles_completed: 0 },
+        },
+      },
+      workbench: savedWorkbench,
+      conversation: { limit: 20, items: [] },
+      recent_outputs: [],
+      check_in: { status: 'created', message_id: 'msg-check' },
+    }));
+
+    await expect(
+      checkInStrategicSession('proj-1', {
+        kind: 'manual',
+        idempotency_key: 'check-in-1',
+      }),
+    ).resolves.toMatchObject({
+      check_in: { status: 'created', message_id: 'msg-check' },
+      session: {
+        last_check_in: { message_id: 'msg-check' },
+      },
+    });
+
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/projects/proj-1/strategic-session/check-in', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        kind: 'manual',
+        idempotency_key: 'check-in-1',
+      }),
+    });
+  });
+
+  test('encodes the project id when recording a check-in', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({
+      project_id: 'owner/repo project',
+      status: 'idle',
+      location: 'locally',
+      session: {
+        version: 1,
+        id: 'strategic-session:owner/repo project',
+        mode: 'chat',
+        active_surface: 'strategic',
+        selected_refs: [],
+        selected_ref_descriptors: [],
+        curated_metrics: [],
+      },
+      conversation: { limit: 20, items: [] },
+      recent_outputs: [],
+    }));
+
+    await checkInStrategicSession('owner/repo project');
+
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/admin/projects/owner%2Frepo%20project/strategic-session/check-in',
+      expect.objectContaining({ method: 'POST' }),
+    );
   });
 });

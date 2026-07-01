@@ -392,6 +392,46 @@ export interface StrategicWorkSessionRefDescriptor {
   target?: StrategicContextPackageDrilldown['target'] | null;
 }
 
+export interface StrategicWorkSessionLastCheckIn {
+  message_id: string;
+  created_at?: string | null;
+  content?: string | null;
+  kind?: string | null;
+}
+
+export interface StrategicWorkSessionSinceLastCheckIn {
+  version: 1;
+  available: boolean;
+  reason?: string | null;
+  since?: string | null;
+  until?: string | null;
+  messages?: {
+    total: number;
+    operator?: number;
+    strategic?: number;
+    needs_operator?: number;
+    watch?: number;
+  };
+  tasks?: {
+    created: number;
+    updated: number;
+    completed?: number;
+    failed?: number;
+    blocked?: number;
+    parked?: number;
+  };
+  alerts?: {
+    raised: number;
+    active?: number;
+    errors?: number;
+    warnings?: number;
+  };
+  strategic?: {
+    cycles_completed: number;
+    latest_cycle?: StrategicStateCycle | null;
+  };
+}
+
 export interface StrategicWorkSession {
   version: 1;
   id: string;
@@ -406,6 +446,8 @@ export interface StrategicWorkSession {
   curated_metrics: StrategicWorkSessionMetric[];
   context_sources?: StrategicContextPackageSource[];
   actions?: StrategicWorkSessionAction[];
+  last_check_in?: StrategicWorkSessionLastCheckIn | null;
+  since_last_check_in?: StrategicWorkSessionSinceLastCheckIn | null;
 }
 
 export interface StrategicSessionConversation {
@@ -446,12 +488,23 @@ export interface StrategicSessionResponse {
   conversation: StrategicSessionConversation;
   recent_outputs: StrategicSessionOutput[];
   arming?: string | null;
+  check_in?: {
+    status: 'created' | 'duplicate' | string;
+    message_id: string;
+  };
 }
 
 export interface StrategicSessionMessageCreate {
   content: string;
   message_type?: string;
   context?: Record<string, unknown>;
+  workbench_context?: Record<string, unknown>;
+  idempotency_key?: string;
+}
+
+export interface StrategicSessionCheckInCreate {
+  content?: string | null;
+  kind?: string;
   workbench_context?: Record<string, unknown>;
   idempotency_key?: string;
 }
@@ -710,4 +763,17 @@ export async function createStrategicSessionMessage(
   });
   if (!res.ok) throw new Error(`Failed to create Strategic session message: ${res.status}`);
   return res.json() as Promise<StrategicSessionMessageResponse>;
+}
+
+export async function checkInStrategicSession(
+  projectId: string,
+  payload: StrategicSessionCheckInCreate = {},
+): Promise<StrategicSessionResponse> {
+  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/strategic-session/check-in`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) throw new Error(`Failed to check in Strategic session: ${res.status}`);
+  return res.json() as Promise<StrategicSessionResponse>;
 }

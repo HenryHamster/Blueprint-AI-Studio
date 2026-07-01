@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, cleanup } from '@testing-library/react';
 import { useStrategicReadModel } from './useStrategicReadModel';
 import { fetchStrategicState } from '../strategicStateApi';
-import type { StrategicStateResponse } from '../strategicStateApi';
+import type { StrategicSessionResponse, StrategicStateResponse } from '../strategicStateApi';
 
 vi.mock('../strategicStateApi', () => ({
   fetchStrategicState: vi.fn(),
@@ -169,6 +169,57 @@ describe('useStrategicReadModel', () => {
     });
     await act(async () => { await result.current.refresh(); });
     expect(loadingMidPoll).toBe(false);
+  });
+
+  it('merges Strategic session responses into the current read model', async () => {
+    const state = makeState();
+    mockFetch.mockResolvedValueOnce(state);
+    const { result } = renderHook(() => useStrategicReadModel('proj-1'));
+    await act(async () => { await result.current.refresh(); });
+
+    const sessionResponse: StrategicSessionResponse = {
+      project_id: 'proj-1',
+      status: 'idle',
+      location: 'locally',
+      session: {
+        version: 1,
+        id: 'strategic-session:proj-1',
+        mode: 'chat',
+        active_surface: 'strategic',
+        selected_refs: [],
+        selected_ref_descriptors: [],
+        curated_metrics: [],
+        last_check_in: {
+          message_id: 'msg-check',
+          created_at: '2026-06-30T12:00:00Z',
+          kind: 'manual',
+        },
+        since_last_check_in: {
+          version: 1,
+          available: true,
+          since: '2026-06-30T12:00:00Z',
+          until: '2026-06-30T12:00:01Z',
+          messages: { total: 0 },
+          tasks: { created: 0, updated: 0 },
+          alerts: { raised: 0 },
+          strategic: { cycles_completed: 0 },
+        },
+      },
+      workbench: null,
+      strategic: state.strategic,
+      runtime: { local_runner: null, work: null },
+      context_package: null,
+      conversation: { limit: 20, items: [] },
+      recent_outputs: [],
+    };
+
+    act(() => {
+      result.current.applySessionResponse(sessionResponse);
+    });
+
+    expect(result.current.data?.work_session?.last_check_in?.message_id).toBe('msg-check');
+    expect(result.current.data?.work_session?.since_last_check_in?.available).toBe(true);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
   it('skips fetch when signal is already aborted before the call starts', async () => {
