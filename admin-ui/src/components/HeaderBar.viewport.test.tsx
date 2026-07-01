@@ -181,7 +181,9 @@ describe('HeaderBar — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenCommandPalette={onOpenCommandPalette} />); });
+    await act(async () => {
+      r.render(<HeaderBar {...makeProps()} activeTab="runtime" onOpenCommandPalette={onOpenCommandPalette} />);
+    });
     const commandButton = host.querySelector<HTMLButtonElement>('button[title="Open command palette (Ctrl+K)"]');
     expect(commandButton).toBeNull();
     expect(onOpenCommandPalette).not.toHaveBeenCalled();
@@ -215,7 +217,7 @@ describe('HeaderBar — viewport regression', () => {
     expect(oldStrategicTab).toBeUndefined();
   });
 
-  test('mobile menu does not duplicate the Strategic composer command launcher', async () => {
+  test('mobile menu exposes a real command palette launcher outside Chat composer', async () => {
     const onOpenCommandPalette = vi.fn();
     host = document.createElement('div');
     host.style.padding = '12px';
@@ -223,7 +225,30 @@ describe('HeaderBar — viewport regression', () => {
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenCommandPalette={onOpenCommandPalette} />); });
+    await act(async () => {
+      r.render(<HeaderBar {...makeProps()} activeTab="runtime" onOpenCommandPalette={onOpenCommandPalette} />);
+    });
+    const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
+    await act(async () => { hamburger?.click(); });
+
+    const commandButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.includes('Command palette'));
+    expect(commandButton).toBeTruthy();
+    await act(async () => { commandButton?.click(); });
+    expect(onOpenCommandPalette).toHaveBeenCalledOnce();
+  });
+
+  test('mobile Chat menu leaves command palette to the composer affordance', async () => {
+    const onOpenCommandPalette = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.minHeight = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<HeaderBar {...makeProps()} activeTab="chat" onOpenCommandPalette={onOpenCommandPalette} />);
+    });
     const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
     await act(async () => { hamburger?.click(); });
 
@@ -231,6 +256,28 @@ describe('HeaderBar — viewport regression', () => {
       .find(button => button.textContent?.includes('Command palette'));
     expect(commandButton).toBeUndefined();
     expect(onOpenCommandPalette).not.toHaveBeenCalled();
+  });
+
+  test('global header does not expose permanent New task chrome outside Pipeline', async () => {
+    const onOpenNewTaskModal = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.minHeight = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<HeaderBar {...makeProps()} activeTab="chat" onOpenNewTaskModal={onOpenNewTaskModal} />);
+    });
+    const desktopNewTask = host.querySelector<HTMLButtonElement>('button[title="New task"]');
+    const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
+    await act(async () => { hamburger?.click(); });
+    const mobileNewTask = Array.from(host.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'New task');
+
+    expect(desktopNewTask).toBeNull();
+    expect(mobileNewTask).toBeUndefined();
+    expect(onOpenNewTaskModal).not.toHaveBeenCalled();
   });
 
   test('mobile menu does not duplicate primary mode navigation', async () => {
@@ -370,21 +417,4 @@ describe('HeaderBar — viewport regression', () => {
     expect(pipelineTab?.textContent).toContain('7');
   });
 
-  test('desktop new task launcher remains available outside pipeline', async () => {
-    const onOpenNewTaskModal = vi.fn();
-    host = document.createElement('div');
-    host.style.padding = '12px';
-    document.body.appendChild(host);
-    const r = createRoot(host);
-    root = r;
-    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenNewTaskModal={onOpenNewTaskModal} activeTab="chat" />); });
-
-    const newTaskButton = host.querySelector<HTMLButtonElement>('button[title="New task"]');
-    expect(newTaskButton).toBeTruthy();
-    await act(async () => { newTaskButton?.click(); });
-    expect(onOpenNewTaskModal).toHaveBeenCalledOnce();
-
-    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenNewTaskModal={onOpenNewTaskModal} activeTab="pipeline" />); });
-    expect(host.querySelector<HTMLButtonElement>('button[title="New task"]')).toBeNull();
-  });
 });

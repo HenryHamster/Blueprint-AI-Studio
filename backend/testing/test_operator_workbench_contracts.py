@@ -24,6 +24,7 @@ from app.workbench_contracts import (
     normalize_target,
     validate_executable_command_descriptor,
 )
+from app.workbench_state import STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY
 
 TEST_USER_ID = "test-user-123"
 FIXTURE_DIR = Path(__file__).parent / "__fixtures__"
@@ -122,6 +123,7 @@ async def test_operator_workbench_current_state_contract_surfaces(
         latest_status_message="Reviewing operator workbench contract.",
         vm_instance_id=f"runner:{runner.id}",
         context={
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
             "runner_target_id": str(runner.id),
             "llm_provider": "openai",
             "llm_model": "gpt-5.4",
@@ -236,6 +238,8 @@ async def test_operator_workbench_current_state_contract_surfaces(
     assert local_runner["status"] == "working"
     assert local_runner["active_runner_id"] == str(runner.id)
     assert local_runner["active_task_pinned"] is True
+    assert local_runner["active_task_requires_local"] is True
+    assert "continuation" in local_runner
     assert local_runner["active_task_runtime"]["runner_target_id"] == str(runner.id)
     assert local_runner["runners"][0]["health"]["device_status"] == "connected"
     assert local_runner["runners"][0]["health"]["active_task_count"] == 1
@@ -246,8 +250,40 @@ async def test_operator_workbench_current_state_contract_surfaces(
     assert state["context_package"]["canvas"]["kind"] == "strategic_context"
     _assert_has_keys(
         state["attention"]["counts"],
-        {"needs_operator", "watch", "unread", "questions", "blockers"},
+        {
+            "needs_operator",
+            "watch",
+            "visible_needs_operator",
+            "visible_watch",
+            "unread",
+            "questions",
+            "blockers",
+            "feedback",
+            "local_runner_holds",
+            "compute_local_runner_holds",
+            "strategic_local_runner_holds",
+            "alerts",
+        },
     )
+    _assert_has_keys(
+        state["tasks"]["counts"],
+        {
+            "queued",
+            "running",
+            "evaluating",
+            "blocked",
+            "parked",
+            "failed",
+            "cancelled",
+            "completed",
+            "total",
+        },
+    )
+    _assert_has_keys(
+        state["runtime"]["work"]["local_runner_holds"],
+        {"count", "compute_count", "strategic_count", "items"},
+    )
+    assert state["sha_freshness"] is not None
 
     session_resp = await client.get(
         f"/api/admin/projects/{project.id}/strategic-session"
@@ -422,6 +458,11 @@ def test_task_sideboard_context_v1_fixture_covers_pipeline_and_task_contract():
         "direction",
         "pull_request",
     }
+    for link in sideboard["links"]:
+        assert normalize_target(link["target"]) == link["target"]
+    pull_request = next(link for link in sideboard["links"] if link["id"] == "pull_request")
+    assert pull_request["target"]["surface"] == "external"
+    assert pull_request["target"]["url"].startswith("https://")
 
     serialized = json.dumps(sideboard)
     assert "problem_model" not in serialized
@@ -460,6 +501,12 @@ def test_operator_workbench_fixture_validates_core_contracts():
         "section": "devices",
     }
     assert normalize_target({"surface": "runtime", "section": "unknown"}) is None
+    assert normalize_target({"surface": "external", "url": "https://example.com/pr/1"}) == {
+        "surface": "external",
+        "url": "https://example.com/pr/1",
+    }
+    assert normalize_target({"surface": "external"}) is None
+    assert normalize_target({"surface": "external", "url": "javascript:alert(1)"}) is None
 
     command = fixture["command_descriptor"]
     assert command["executable"] is True

@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Microscope, BookOpen, LogOut, MoreHorizontal, Settings, Bell, Plus } from 'lucide-react';
+import { Activity, Microscope, BookOpen, Command, LogOut, MoreHorizontal, Settings, Bell } from 'lucide-react';
 import { AutonomousStatus } from './AutonomousStatus';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
 import type { DetailedHealth, PipelineThrottle } from './OrchestratorHealthBar';
@@ -129,7 +129,6 @@ export function HeaderBar(props: HeaderBarProps) {
     showKnowledgeBrowser,
     onToggleKnowledgeBrowser,
     onOpenActivityFeed,
-    onOpenNewTaskModal,
     onOpenSettings,
     openMessageCount,
     newSinceLastVisitCount,
@@ -297,17 +296,6 @@ export function HeaderBar(props: HeaderBarProps) {
             >
               <BookOpen className="h-3.5 w-3.5" />
             </button>
-            {props.activeTab !== 'pipeline' && (
-              /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
-              <button
-                onClick={onOpenNewTaskModal}
-                title="New task"
-                className="flex h-7 items-center gap-1 rounded px-1.5 text-xs font-semibold text-neutral-300 transition-colors hover:bg-workbench-layer hover:text-neutral-100"
-              >
-                <Plus className="h-3.5 w-3.5" />
-                <span>New</span>
-              </button>
-            )}
             {/* Activity */}
             {onOpenActivityFeed && (
               <button
@@ -365,6 +353,20 @@ export function HeaderBar(props: HeaderBarProps) {
             </button>
             {showMobileMenu && (
               <div className="absolute right-0 top-full z-50 mt-2 max-h-[calc(100vh-96px)] w-60 overflow-auto rounded-md border border-workbench-border bg-workbench-panel p-2 shadow-2xl">
+                {props.activeTab !== 'chat' && props.onOpenCommandPalette && (
+                  <button
+                    onClick={() => {
+                      props.onOpenCommandPalette?.();
+                      setShowMobileMenu(false);
+                      setShowMobileShortcuts(false);
+                    }}
+                    className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
+                  >
+                    <Command className="w-4 h-4 shrink-0" />
+                    <span>Command palette</span>
+                    <kbd className="ml-auto bg-neutral-800 border border-neutral-700 text-neutral-400 px-1.5 py-0.5 rounded text-ui-sm font-mono">Ctrl+K</kbd>
+                  </button>
+                )}
                 <button
                   onClick={() => { onToggleResearchBrowser(); setShowMobileMenu(false); }}
                   className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
@@ -406,15 +408,6 @@ export function HeaderBar(props: HeaderBarProps) {
                   <span className={`h-2 w-2 rounded-full shrink-0 ${healthDotColor}`} />
                   <span>{healthExpanded ? 'Hide health panel' : 'Health panel'}</span>
                 </button>
-                {props.activeTab !== 'pipeline' && (
-                  <button
-                    onClick={() => { onOpenNewTaskModal(); setShowMobileMenu(false); }}
-                    className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
-                  >
-                    <span className="w-4 h-4 flex items-center justify-center font-mono shrink-0">N</span>
-                    <span>New task</span>
-                  </button>
-                )}
                 <button
                   onClick={() => setShowMobileShortcuts(prev => !prev)}
                   className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
@@ -428,7 +421,6 @@ export function HeaderBar(props: HeaderBarProps) {
                     <div className="space-y-1.5 text-xs">
                       {[
                         ['Ctrl+K', 'Command palette'],
-                        ['N', 'New task'],
                         ['R', 'Refresh'],
                         ['1', 'Chat'],
                         ['2', 'Pipeline'],

@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 WORKBENCH_CONTRACT_VERSION = 1
 
@@ -18,6 +18,7 @@ SURFACE_TASK = "task"
 SURFACE_KNOWLEDGE = "knowledge"
 SURFACE_STRATEGIC_SESSION = "strategic_session"
 SURFACE_DIRECTIONS = "directions"
+SURFACE_EXTERNAL = "external"
 
 TARGET_SURFACES = frozenset(
     (
@@ -27,6 +28,7 @@ TARGET_SURFACES = frozenset(
         SURFACE_RUNTIME,
         SURFACE_TASK,
         SURFACE_KNOWLEDGE,
+        SURFACE_EXTERNAL,
     )
 )
 REFETCH_SURFACES = frozenset(
@@ -80,6 +82,7 @@ RUNTIME_SECTIONS = frozenset(
 
 TARGET_KEYS = (
     "surface",
+    "id",
     "project_id",
     "section",
     "task_id",
@@ -91,6 +94,7 @@ TARGET_KEYS = (
     "artifact_id",
     "cycle_id",
     "runner_id",
+    "url",
 )
 
 COMMAND_GROUPS = frozenset(
@@ -294,6 +298,13 @@ def normalize_target(target: Mapping[str, Any] | None) -> dict[str, Any] | None:
 
     if surface == SURFACE_TASK and "task_id" not in normalized:
         return None
+    if surface == SURFACE_EXTERNAL:
+        url = normalized.get("url")
+        if not url:
+            return None
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None
     return normalized
 
 
@@ -632,7 +643,7 @@ def executable_work_session_command_contract(
             or method != "POST"
             or path != alert_dismiss_endpoint(alert_id)
             or target.get("surface") != SURFACE_RUNTIME
-            or target.get("section") != "health"
+            or target.get("section") not in {"health", "devices"}
             or target.get("action") != "dismiss_alert"
             or target.get("alert_id") != alert_id
             or not _body_exact(command, {})
@@ -774,6 +785,7 @@ def build_operator_workbench_contract_fixture() -> dict[str, Any]:
                 "blocked": 0,
                 "parked": 0,
                 "failed": 0,
+                "cancelled": 0,
                 "completed": 0,
                 "total": 1,
             },
@@ -797,11 +809,24 @@ def build_operator_workbench_contract_fixture() -> dict[str, Any]:
             "counts": {
                 "needs_operator": 0,
                 "watch": 1,
+                "visible_needs_operator": 0,
+                "visible_watch": 0,
                 "unread": 1,
                 "questions": 0,
                 "blockers": 0,
+                "bug_reports": 0,
+                "feedback": 1,
                 "approvals": 0,
+                "local_runner_holds": 0,
+                "compute_local_runner_holds": 0,
+                "strategic_local_runner_holds": 0,
+                "stale_runner_pins": 0,
+                "stale_provisioning_tasks": 0,
+                "stale_queued_tasks": 0,
                 "manual_directions": 0,
+                "alerts": 0,
+                "error_alerts": 0,
+                "warning_alerts": 0,
                 "failed_tasks": 0,
                 "blocked_tasks": 0,
                 "parked_tasks": 0,
@@ -861,6 +886,9 @@ def build_operator_workbench_contract_fixture() -> dict[str, Any]:
                 "agent_unavailable_count": 0,
                 "active_runner_id": None,
                 "active_task_pinned": False,
+                "active_task_requires_local": False,
+                "active_task_awaiting_local_runner_since": None,
+                "active_task_runtime": None,
                 "runners": [
                     {
                         "id": "runner-1",
@@ -896,6 +924,20 @@ def build_operator_workbench_contract_fixture() -> dict[str, Any]:
                 ],
                 "fallback_reason": None,
                 "liveness_window_seconds": 300,
+                "continuation": {
+                    "enabled": False,
+                    "expires_at": None,
+                    "fresh": False,
+                    "last_seen_at": None,
+                    "owned_by_current_operator": False,
+                    "owner_session_started_at": None,
+                    "owner_user_id": None,
+                    "ownership": "none",
+                    "preferred_runner_id": None,
+                    "reason": "not_enabled",
+                    "ttl_seconds": 43200,
+                    "updated_at": None,
+                },
             },
             "work": {
                 "compute_jobs": {
@@ -923,7 +965,12 @@ def build_operator_workbench_contract_fixture() -> dict[str, Any]:
                     "items": [],
                 },
                 "held_approvals": {"count": 0, "items": []},
-                "local_runner_holds": {"count": 0, "items": []},
+                "local_runner_holds": {
+                    "count": 0,
+                    "compute_count": 0,
+                    "strategic_count": 0,
+                    "items": [],
+                },
                 "parked_wakes": {
                     "counts": {
                         "active": 0,
@@ -1022,7 +1069,16 @@ def build_operator_workbench_contract_fixture() -> dict[str, Any]:
             },
         },
         "design": {"has_design_doc": False, "revision": None},
-        "sha_freshness": None,
+        "sha_freshness": {
+            "active_candidate_sha": None,
+            "integration_head_sha": None,
+            "verdict": "unknown",
+            "generated_at": None,
+            "checked_at": None,
+            "integration_branch": None,
+            "stale": None,
+            "stale_reason": "no_open_version",
+        },
     }
     strategic_session_response = {
         "project_id": project_id,

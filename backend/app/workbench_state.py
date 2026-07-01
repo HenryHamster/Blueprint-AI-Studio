@@ -662,6 +662,7 @@ def strategic_local_continuation_status_from_vision(
         expires_at = (
             freshness_ts + timedelta(seconds=STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS)
         ).isoformat()
+    public_owner_user_id = owner_user_id if owned_by_current_operator else None
 
     return {
         "enabled": True,
@@ -674,7 +675,7 @@ def strategic_local_continuation_status_from_vision(
         "updated_at": updated_at,
         "last_seen_at": last_seen_at,
         "expires_at": expires_at,
-        "owner_user_id": owner_user_id,
+        "owner_user_id": public_owner_user_id,
         "owner_session_started_at": owner_session_started_at,
         "owned_by_current_operator": owned_by_current_operator,
         "ownership": ownership,

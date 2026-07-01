@@ -480,7 +480,7 @@ async def get_all_tasks(
 
     result_list = []
     for t in tasks:
-        task_type = (t.first_payload).get("type", "create")
+        task_type = _task_payload_dict(t).get("type", "create")
         task_dict = {
             "id": str(t.id),
             "project_id": str(t.project_id),
@@ -820,7 +820,7 @@ async def _bulk_retry_one_task(
             # task.id to _terminated_task_ids, revoking any outstanding JWT.
             # Drop the cache entry so the next provisioned VM can claim.
             _terminated_task_ids.pop(str(task.id), None)
-            task_type = (task.first_payload).get("type", "")
+            task_type = _task_payload_dict(task).get("type", "")
             is_parent_type = task_type in ("research", "plan")
             if preloaded_has_children is not None:
                 # Use pre-fetched boolean (batch query in bulk_action_tasks)
@@ -953,7 +953,7 @@ async def bulk_action_tasks(
         _parent_type_ids = [
             task_obj.id
             for task_obj in fetched.values()
-            if (task_obj.first_payload or {}).get("type") in ("research", "plan")
+            if _task_payload_dict(task_obj).get("type") in ("research", "plan")
         ]
         if _parent_type_ids:
             _child_parent_rows = (
@@ -1206,6 +1206,13 @@ def _status_values(statuses: tuple[TaskStatus, ...]) -> list[str]:
     return [_status_value(status) for status in statuses]
 
 
+def _task_payload_dict(task: Task | None) -> dict[str, Any]:
+    if task is None:
+        return {}
+    payload = task.first_payload or {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _task_direction_id(task: Task) -> str | None:
     return first_task_direction_id(task)
 
@@ -1361,7 +1368,7 @@ def _task_sideboard_context(
     dependency_count = len(task.depends_on or [])
     movement_explanation = build_task_movement_explanation(task)
     llm_cost_fields = _task_llm_cost_fields(task)
-    task_type = (task.first_payload).get("type", "create")
+    task_type = _task_payload_dict(task).get("type", "create")
     pipeline = {
         "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
         "child_count": child_count,
@@ -1747,7 +1754,7 @@ async def get_task(
         primary_commit=commit_hash,
     )
 
-    task_type = (task.first_payload).get("type", "create")
+    task_type = _task_payload_dict(task).get("type", "create")
     movement_explanation = build_task_movement_explanation(task)
     return {
         "id": str(task.id),
@@ -3200,7 +3207,7 @@ async def rerun_compute_experiment(
     """
     source = await _get_user_task(task_id, current_user["user_id"], session)
 
-    source_payload = source.first_payload
+    source_payload = _task_payload_dict(source)
     if not source_payload or source_payload.get("type") != "compute_experiment":
         raise HTTPException(
             status_code=422,
@@ -3327,7 +3334,7 @@ async def request_changes(
         raise HTTPException(status_code=400, detail="No PR found for this task")
 
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
-    task_payload = task.first_payload
+    task_payload = _task_payload_dict(task)
     _project = await session.get(Project, task.project_id)
     branch = _resolve_task_branch(task, get_project_task_branch_namespace(_project))
     base_branch = task_payload.get("base_branch") or get_project_integration_branch(
@@ -3424,7 +3431,7 @@ async def request_fresh_reviewer(
         raise HTTPException(status_code=400, detail="No PR found for this task")
 
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
-    task_payload = task.first_payload
+    task_payload = _task_payload_dict(task)
     review_loop = ctx.get("review_loop") or {}
     _project = await session.get(Project, task.project_id)
     branch = (
@@ -3547,7 +3554,7 @@ async def reset_iteration_cap(
     )
     archived_count = 0
     for t in failed_result.scalars().all():
-        fp = t.first_payload
+        fp = _task_payload_dict(t)
         if fp.get("type") not in ("review", "fix"):
             continue
         t.archived = True

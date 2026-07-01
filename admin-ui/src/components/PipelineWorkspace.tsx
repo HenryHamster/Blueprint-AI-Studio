@@ -654,40 +654,50 @@ export function PipelineWorkspace({
         <div className="flex h-full min-h-0 flex-col">
           {chrome.filterStrip}
           {status && <PipelineStatusStrip status={status} />}
-          <ErrorBoundary level="panel">
-            <div className="min-h-0 flex-1 overflow-hidden px-3 py-3 md:px-4">
-              <KanbanBoard
-                tasks={board.tasks}
-                columns={board.columns}
-                loading={board.loading}
-                maxRetries={board.maxRetries}
-                actionLoadingMap={board.actionLoadingMap}
-                compact={board.compact}
-                sortBy={board.sortBy}
-                selectionMode={board.selectionMode}
-                selectedTaskIds={board.selectedTaskIds}
-                onToggleTaskSelection={board.onToggleTaskSelection}
-                onCtrlClick={board.onCtrlClick}
-                onBulkToggle={board.onBulkToggle}
-                onShiftSelect={board.onShiftSelect}
-                hasActiveFilters={board.hasActiveFilters}
-                onArchiveColumn={board.onArchiveColumn}
-                onApprove={board.onApprove}
-                onRequestChanges={board.onRequestChanges}
-                onCancel={board.onCancel}
-                onRetry={board.onRetry}
-                onEditPrompt={board.onEditPrompt}
-                onDismiss={board.onDismiss}
-                onArchive={board.onArchive}
-                onViewLogs={board.onViewLogs}
-                onTrack={board.onTrack}
-                trackedTaskIds={board.trackedTaskIds}
-                onDuplicate={board.onDuplicate}
-                searchQuery={board.searchQuery}
-                onDirectionClick={board.onDirectionClick}
+          <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1 grid-rows-[auto_minmax(0,1fr)] overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(300px,25vw)] lg:grid-rows-1">
+            <aside className="max-h-[34vh] min-h-0 min-w-0 overflow-auto border-b border-workbench-border bg-workbench-panel p-1.5 custom-scrollbar lg:col-start-2 lg:row-start-1 lg:max-h-none lg:border-b-0 lg:border-l">
+              <PipelineSideboard
+                flow={flow}
+                rail={rail}
+                metrics={metrics}
+                stream={stream}
               />
-            </div>
-          </ErrorBoundary>
+            </aside>
+            <ErrorBoundary level="panel">
+              <main data-testid="pipeline-board-main" className="min-h-0 min-w-0 overflow-hidden px-3 py-3 md:px-4 lg:col-start-1 lg:row-start-1">
+                <KanbanBoard
+                  tasks={board.tasks}
+                  columns={board.columns}
+                  loading={board.loading}
+                  maxRetries={board.maxRetries}
+                  actionLoadingMap={board.actionLoadingMap}
+                  compact={board.compact}
+                  sortBy={board.sortBy}
+                  selectionMode={board.selectionMode}
+                  selectedTaskIds={board.selectedTaskIds}
+                  onToggleTaskSelection={board.onToggleTaskSelection}
+                  onCtrlClick={board.onCtrlClick}
+                  onBulkToggle={board.onBulkToggle}
+                  onShiftSelect={board.onShiftSelect}
+                  hasActiveFilters={board.hasActiveFilters}
+                  onArchiveColumn={board.onArchiveColumn}
+                  onApprove={board.onApprove}
+                  onRequestChanges={board.onRequestChanges}
+                  onCancel={board.onCancel}
+                  onRetry={board.onRetry}
+                  onEditPrompt={board.onEditPrompt}
+                  onDismiss={board.onDismiss}
+                  onArchive={board.onArchive}
+                  onViewLogs={board.onViewLogs}
+                  onTrack={board.onTrack}
+                  trackedTaskIds={board.trackedTaskIds}
+                  onDuplicate={board.onDuplicate}
+                  searchQuery={board.searchQuery}
+                  onDirectionClick={board.onDirectionClick}
+                />
+              </main>
+            </ErrorBoundary>
+          </div>
           {chrome.pagination}
         </div>
       )}

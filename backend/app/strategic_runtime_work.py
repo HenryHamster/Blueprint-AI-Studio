@@ -111,6 +111,13 @@ def _task_type(task: Task | None) -> str | None:
     return _string_or_none(payload.get("type"))
 
 
+def _task_payload(task: Task | None) -> dict[str, Any]:
+    if task is None:
+        return {}
+    payload = task.first_payload or {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def task_awaiting_local_runner_since(task: Task | None) -> str | None:
     if task is None:
         return None
@@ -138,7 +145,7 @@ def task_awaiting_strategic_local_runner_since(task: Task | None) -> str | None:
 def task_requires_strategic_local_runner(task: Task | None) -> bool:
     if task is None:
         return False
-    payload = task.first_payload or {}
+    payload = _task_payload(task)
     return (
         payload.get("type") in STRATEGIC_TASK_TYPES
         and bool((task.context or {}).get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY))
@@ -482,7 +489,7 @@ def _runner_candidate_sort_key(candidate: Dict[str, Any]) -> tuple[Any, ...]:
 def _active_strategic_task_types(task: Task | None) -> frozenset[str]:
     if task is None:
         return _CORE_STRATEGIC_CYCLE_TASK_TYPES
-    payload = task.first_payload or {}
+    payload = _task_payload(task)
     task_type = payload.get("type")
     if isinstance(task_type, str) and task_type in STRATEGIC_TASK_TYPES:
         return frozenset({task_type})
@@ -567,12 +574,12 @@ def _local_operator_status(
 
 def _compute_job_preview(job: ComputeJob, task: Task | None) -> Dict[str, Any]:
     cost = job.final_cost_usd if job.final_cost_usd is not None else job.accrued_cost_usd
-    payload = task.first_payload if task is not None else {}
+    payload = _task_payload(task)
     return {
         "id": str(job.id),
         "task_id": str(job.task_id) if job.task_id else None,
         "task_title": _compact_text(task.title, max_chars=120) if task else None,
-        "task_type": payload.get("type") if isinstance(payload, dict) else None,
+        "task_type": payload.get("type"),
         "status": _enum_value(job.status),
         "backend": job.backend,
         "machine_type": job.machine_type,

@@ -8,7 +8,7 @@ The rule for this file: after every major batch, update the status ledger, miles
 
 ## Status Ledger
 
-Overall implementation estimate: 91%.
+Overall implementation estimate: 93%.
 
 Legend:
 - Done: implemented, reviewed, tested, and pushed.
@@ -27,11 +27,11 @@ Legend:
 | M5. Strategic context and canvas/artifact surface | Done | Context package, selected refs, canvas descriptors, `StrategicContextWorkspace`, map/resource rows, Chat artifact slot, descriptor schema, renderer tests, golden fixtures. | Keep v1 read-only; revisit writable canvas/layout persistence only with a concrete requirement. |
 | M6. Pipeline monitoring and task sideboard | Done | Pipeline workspace, task tree, task rail, stale attention routing, task sideboard context, task-sideboard contract, Chat task-target drawer routing, waiting-vs-blocked health labels. | Further tracked-stream affordance polish can continue without reopening the sideboard contract. |
 | M7. Runtime, devices, accounts, settings, project management | Done | Canonical Project/Runtime settings homes, workspace-hosted settings router semantics, command/context routing to Project Manage and Runtime Settings/Accounts, reachability and viewport tests. | Keep regression coverage while remaining project/runtime policy work lands. |
-| M8. Operator attention and work-session read model | Partial | Derived attention state, lifecycle metadata, prioritized bounded attention candidates, registry-backed curated metric metadata, actions, events, jobs, command receipts, and command receipts excluded from check-in deltas. | Extend lifecycle regression coverage across remaining rare reasons during M12 audits. |
+| M8. Operator attention and work-session read model | Done | Derived attention state, lifecycle metadata across common and rare reasons, prioritized bounded attention candidates with newest tie-breaks, registry-backed curated metric metadata, actions, events, jobs, command receipts, and command receipts excluded from check-in deltas. | Keep lifecycle/count regressions current as new attention reasons are added. |
 | M9. Unified event and message contracts | Done | Workbench event v1 envelope, websocket emitter/v1-producer inventory guards, backend-owned operator workbench fixture, frontend fixture consumption, canonical target/refetch vocabulary. | Keep fixtures and emitter inventory updated as read models evolve. |
 | M10. Visual system and UI polish | Done | Workbench theme tokens, shell/header/workspace token migration, raw-shell-color guard, Pipeline duplicate task-open cleanup, focused viewport assertions and capture review. | Extend token coverage opportunistically to lower-level panels without changing IA. |
 | M11. Background operator jobs | Planned | Existing compute jobs, runner jobs, orchestrator loops, command receipts. | Only build a real operator-job table if a concrete async operator command needs it. |
-| M12. Completion audit and hardening | Planned | Focused tests exist across major components. | Run full backend/frontend audit loops, viewport screenshots, and contract gates. |
+| M12. Completion audit and hardening | Partial | Backend/frontend audit wave fixed Pipeline board sideboard loss, duplicate context/global task chrome, stale command affordances, contract shape drift, malformed payload crashes, attention ordering, and local continuation privacy. Focused backend, frontend, viewport, and typecheck gates are green. | Run subagent review, fix any findings, then push this audit batch to `automain`; continue with final visual/UX audit afterward. |
 
 ## Operating Principles
 
@@ -522,9 +522,21 @@ Acceptance gates:
 
 ## M12. Completion Audit and Hardening
 
-Status: Planned.
+Status: Partial.
 
 Purpose: Prove the full operator workbench is usable, not just locally green.
+
+Completed in current audit batch:
+- Restored Pipeline board monitoring sideboard and current task context so Board no longer drops passive monitoring.
+- Removed permanent global New task chrome outside Pipeline and stale shortcut copy; mobile HeaderBar now exposes a real Command palette launcher.
+- Removed duplicate mobile Strategic context launchers when the Chat composer already has the context descriptor.
+- Kept task archive rendering scoped to Pipeline instead of leaking into other workspaces.
+- Updated backend-owned workbench fixture and frontend types for live Strategic-state shape: task cancelled counts, expanded attention counts, local runner continuation, active-task fields, local-runner hold split counts, and non-null SHA freshness.
+- Hardened malformed `Task.first_payload` reads in task detail/admin runtime paths and shared task outcome helpers.
+- Added attention lifecycle and newest tie-break coverage across local-runner holds, stale task reasons, bug/feedback watch items, failed tasks, and manual direction intervention.
+- Hid foreign local Strategic continuation owner identifiers from other operators while preserving durable ownership markers.
+- Aligned runner-alert dismiss command targets with Runtime Devices.
+- Canonicalized sideboard external links and `id`/`url` target fields.
 
 Required audit checklist:
 - Active work:
@@ -584,15 +596,15 @@ Final verification gates:
 
 ## Next Batch Recommendation
 
-Recommended next implementation batches: run M12 completion audit loops, then address any concrete backend/frontend gaps they surface.
+Recommended next implementation batches: finish the M12 review/push loop for this audit batch, then run the final visual/UX audit against the live localhost surface.
 
 Scope:
-1. M12: run backend contract, frontend viewport, and visual-surface audits against the current workbench.
-2. M8: add any rare-reason lifecycle regressions found by the audit; do not build a separate acknowledgement table unless the audit proves indirect clearing is insufficient.
+1. M12: complete subagent review for the current hardening batch, fix concrete findings, and push to `automain`.
+2. Run a final visual/UX pass on the live workbench: spacing, header weight, token consistency, mobile composer reachability, and non-placeholder lower-level panels.
 3. Keep M7/M10 token and settings-home regression coverage current while lower-level panels change.
 4. Address remaining UI alignment issues as polish batches, not new IA.
 
-Reason: the highest-risk M2 reliability gap is closed, M3/M4/M5/M6/M7/M9/M10 have landed, and the remaining material progress is now hardening, audit-driven fixes, and targeted polish.
+Reason: the highest-risk backend reliability gaps are now covered by contract and route regressions; the remaining material progress is review, final visual polish, and any concrete issues surfaced by localhost usage.
 
 ## Update Log
 
@@ -607,3 +619,4 @@ Reason: the highest-risk M2 reliability gap is closed, M3/M4/M5/M6/M7/M9/M10 hav
 | 2026-07-01 | M7/M10 runtime and visual polish | Implemented M7/M10 cleanup: canonical settings homes, workspace router host semantics, workbench theme tokens, primary shell token migration, Pipeline duplicate-open cleanup, reachability tests, focused typecheck/unit/viewport/capture evidence. |
 | 2026-07-01 | M2 continuation ownership/TTL | Added 12-hour workday continuation TTL, owner/lease read-model fields, foreign-owner and duplicate-session marker protection, Devices ownership warning, and focused backend/frontend tests. |
 | 2026-07-01 | M8 attention lifecycle/caps | Added lifecycle metadata, bounded priority selection for attention items, split message/alert previews, `has_more`/limit contract fields, command-housekeeping regressions, fixture invariants, and focused backend/frontend tests. |
+| 2026-07-01 | M12 audit hardening | Fixed audit findings across Pipeline board monitoring, HeaderBar command/global-task affordances, context launcher duplication, archive scoping, backend contract drift, malformed payload handling, attention ordering/lifecycle coverage, continuation privacy, and sideboard target canonicalization. Gates: 133 backend tests, 440 frontend tests, 59 viewport tests, and `npm run typecheck`. |

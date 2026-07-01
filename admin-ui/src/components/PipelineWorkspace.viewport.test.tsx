@@ -162,14 +162,16 @@ describe('PipelineWorkspace viewport regression', () => {
     host = null;
   });
 
-  async function renderWorkspace() {
+  async function renderWorkspace(section: PipelineWorkspaceProps['surface']['pipelineSection'] = 'flow') {
     host = document.createElement('div');
     host.style.height = '720px';
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
+    const props = workspaceProps();
+    props.surface.pipelineSection = section;
     await act(async () => {
-      r.render(<PipelineWorkspace {...workspaceProps()} />);
+      r.render(<PipelineWorkspace {...props} />);
     });
   }
 
@@ -237,6 +239,24 @@ describe('PipelineWorkspace viewport regression', () => {
     expect(sideboard.textContent).toContain('Now');
     expect(sideboard.textContent).toContain('Task health');
     expect(sideboard.textContent).toContain('Task context');
+    expect(aside.getBoundingClientRect().left).toBeGreaterThanOrEqual(main.getBoundingClientRect().right - 1);
+  });
+
+  test('desktop board keeps monitoring sideboard and current task context visible', async () => {
+    await page.viewport(1280, 800);
+    await renderWorkspace('board');
+
+    if (!host) throw new Error('Expected viewport test host to be mounted');
+    const sideboard = host.querySelector<HTMLElement>('[data-testid="pipeline-sideboard"]');
+    const aside = sideboard?.closest('aside') as HTMLElement | null;
+    const main = host.querySelector<HTMLElement>('[data-testid="pipeline-board-main"]');
+    if (!sideboard || !aside || !main) {
+      throw new Error('Expected Pipeline board sideboard and main region to render');
+    }
+    expect(sideboard.textContent).toContain('Now');
+    expect(sideboard.textContent).toContain('Task health');
+    expect(sideboard.textContent).toContain('Task context');
+    expect(sideboard.textContent).toContain(trackedTask.title);
     expect(aside.getBoundingClientRect().left).toBeGreaterThanOrEqual(main.getBoundingClientRect().right - 1);
   });
 });

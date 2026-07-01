@@ -7,7 +7,7 @@ not create a second task/message/alert lifecycle.
 from __future__ import annotations
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import and_, case, func
@@ -233,6 +233,24 @@ def _attention_visible_priority(item: dict[str, Any]) -> int:
     if severity == "watch":
         return _DEFAULT_WATCH_VISIBLE_PRIORITY
     return _DEFAULT_WATCH_VISIBLE_PRIORITY + 100
+
+
+def _attention_timestamp_sort_value(item: dict[str, Any]) -> float:
+    timestamp = item.get("updated_at") or item.get("created_at")
+    if not isinstance(timestamp, str) or not timestamp:
+        return 0.0
+    try:
+        return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _attention_visible_sort_key(item: dict[str, Any]) -> tuple[int, float, str]:
+    return (
+        int(item.get("_visible_priority", 999)),
+        -_attention_timestamp_sort_value(item),
+        str(item.get("id") or ""),
+    )
 
 
 def _direction_manual_intervention(direction: Any) -> bool:
@@ -1142,7 +1160,7 @@ async def build_operator_attention(
             )
         )
 
-    candidate_items.sort(key=lambda item: item.get("_visible_priority", 999))
+    candidate_items.sort(key=_attention_visible_sort_key)
     items = candidate_items[:_MAX_ATTENTION_ITEMS]
     for item in items:
         item.pop("_visible_priority", None)

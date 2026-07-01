@@ -23093,6 +23093,28 @@ class TestPostCommitPendingField:
         assert sideboard["messages"] == {"total_recent": 0, "items": []}
 
     @pytest.mark.asyncio
+    async def test_task_detail_handles_malformed_first_payload(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            title="Malformed payload task",
+            status=TaskStatus.QUEUED,
+            payloads=["not-a-payload-object"],
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks/{task.id}")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        assert body["task_type"] == "create"
+        assert body["sideboard_context"]["task"]["task_type"] == "create"
+
+    @pytest.mark.asyncio
     async def test_task_detail_sideboard_child_count_stays_exact_when_child_ids_truncated(
         self, client: AsyncClient, db_session
     ):

@@ -133,8 +133,25 @@
       "local_runner": {
         "active_runner_id": null,
         "active_task_pinned": false,
+        "active_task_awaiting_local_runner_since": null,
+        "active_task_requires_local": false,
+        "active_task_runtime": null,
         "agent_unavailable_count": 0,
         "busy_runner_count": 0,
+        "continuation": {
+          "enabled": false,
+          "expires_at": null,
+          "fresh": false,
+          "last_seen_at": null,
+          "owned_by_current_operator": false,
+          "owner_session_started_at": null,
+          "owner_user_id": null,
+          "ownership": "none",
+          "preferred_runner_id": null,
+          "reason": "not_enabled",
+          "ttl_seconds": 43200,
+          "updated_at": null
+        },
         "eligible_live_count": 1,
         "fallback_reason": null,
         "live_runner_count": 1,
@@ -212,8 +229,10 @@
           "items": []
         },
         "local_runner_holds": {
+          "compute_count": 0,
           "count": 0,
-          "items": []
+          "items": [],
+          "strategic_count": 0
         },
         "parked_wakes": {
           "counts": {
@@ -375,8 +394,25 @@
       "runtime": {
         "active_runner_id": null,
         "active_task_pinned": false,
+        "active_task_awaiting_local_runner_since": null,
+        "active_task_requires_local": false,
+        "active_task_runtime": null,
         "agent_unavailable_count": 0,
         "busy_runner_count": 0,
+        "continuation": {
+          "enabled": false,
+          "expires_at": null,
+          "fresh": false,
+          "last_seen_at": null,
+          "owned_by_current_operator": false,
+          "owner_session_started_at": null,
+          "owner_user_id": null,
+          "ownership": "none",
+          "preferred_runner_id": null,
+          "reason": "not_enabled",
+          "ttl_seconds": 43200,
+          "updated_at": null
+        },
         "eligible_live_count": 1,
         "fallback_reason": null,
         "live_runner_count": 1,
@@ -467,12 +503,25 @@
         "approvals": 0,
         "blocked_tasks": 0,
         "blockers": 0,
+        "bug_reports": 0,
+        "compute_local_runner_holds": 0,
+        "error_alerts": 0,
         "failed_tasks": 0,
+        "feedback": 1,
+        "local_runner_holds": 0,
         "manual_directions": 0,
         "needs_operator": 0,
         "parked_tasks": 0,
         "questions": 0,
+        "stale_provisioning_tasks": 0,
+        "stale_queued_tasks": 0,
+        "stale_runner_pins": 0,
+        "strategic_local_runner_holds": 0,
         "unread": 1,
+        "visible_needs_operator": 0,
+        "visible_watch": 0,
+        "alerts": 0,
+        "warning_alerts": 0,
         "watch": 1
       },
       "has_more": true,
@@ -594,8 +643,25 @@
       "local_runner": {
         "active_runner_id": null,
         "active_task_pinned": false,
+        "active_task_awaiting_local_runner_since": null,
+        "active_task_requires_local": false,
+        "active_task_runtime": null,
         "agent_unavailable_count": 0,
         "busy_runner_count": 0,
+        "continuation": {
+          "enabled": false,
+          "expires_at": null,
+          "fresh": false,
+          "last_seen_at": null,
+          "owned_by_current_operator": false,
+          "owner_session_started_at": null,
+          "owner_user_id": null,
+          "ownership": "none",
+          "preferred_runner_id": null,
+          "reason": "not_enabled",
+          "ttl_seconds": 43200,
+          "updated_at": null
+        },
         "eligible_live_count": 1,
         "fallback_reason": null,
         "live_runner_count": 1,
@@ -673,8 +739,10 @@
           "items": []
         },
         "local_runner_holds": {
+          "compute_count": 0,
           "count": 0,
-          "items": []
+          "items": [],
+          "strategic_count": 0
         },
         "parked_wakes": {
           "counts": {
@@ -689,7 +757,16 @@
         }
       }
     },
-    "sha_freshness": null,
+    "sha_freshness": {
+      "active_candidate_sha": null,
+      "checked_at": null,
+      "generated_at": null,
+      "integration_branch": null,
+      "integration_head_sha": null,
+      "stale": null,
+      "stale_reason": "no_open_version",
+      "verdict": "unknown"
+    },
     "strategic": {
       "active_cycle": null,
       "active_phase": null,
@@ -704,6 +781,7 @@
     "tasks": {
       "counts": {
         "blocked": 0,
+        "cancelled": 0,
         "completed": 0,
         "evaluating": 0,
         "failed": 0,
@@ -915,6 +993,7 @@
       "settings"
     ],
     "surfaces": [
+      "external",
       "knowledge",
       "messages",
       "pipeline",
@@ -924,6 +1003,7 @@
     ],
     "target_keys": [
       "surface",
+      "id",
       "project_id",
       "section",
       "task_id",
@@ -934,7 +1014,8 @@
       "document_id",
       "artifact_id",
       "cycle_id",
-      "runner_id"
+      "runner_id",
+      "url"
     ]
   },
   "task_detail_sideboard_context": {

@@ -363,14 +363,6 @@ describe('WorkbenchComposition viewport regression', () => {
                     showMonitoringControls={false}
                     className="hidden md:flex"
                   />
-                  <button
-                    type="button"
-                    onClick={options.onOpenContext ?? vi.fn()}
-                    aria-label="Open Strategic context"
-                    className="inline-flex min-h-11 shrink-0 items-center rounded-md border border-neutral-800 px-2.5 text-xs font-semibold text-neutral-300 sm:min-h-9 lg:hidden"
-                  >
-                    Context
-                  </button>
                 </>
               )}
               flush
@@ -471,7 +463,6 @@ describe('WorkbenchComposition viewport regression', () => {
 
     const sessionControl = host?.querySelector('[data-testid="strategic-session-control"]');
     const rail = host?.querySelector('[data-testid="strategic-context-rail"]');
-    const contextButton = host?.querySelector<HTMLButtonElement>('button[aria-label="Open Strategic context"]');
     const railButtons = Array.from(rail?.querySelectorAll<HTMLButtonElement>('button') ?? []);
     const commandButtons = Array.from(host?.querySelectorAll<HTMLButtonElement>('button[title="Open command palette (Ctrl+K)"]') ?? [])
       .filter(button => {
@@ -495,8 +486,7 @@ describe('WorkbenchComposition viewport regression', () => {
     expect(pipelineButton).toBeTruthy();
     expect(rail).toBeTruthy();
     expect(getComputedStyle(rail!.closest('aside')!).display).not.toBe('none');
-    expect(contextButton).toBeTruthy();
-    expect(getComputedStyle(contextButton!).display).toBe('none');
+    expect(host?.querySelector<HTMLButtonElement>('button[aria-label="Open Strategic context"]')).toBeNull();
     expect(commandButtons).toHaveLength(1);
     expect(commandButtons[0].closest('[data-testid="strategic-composer-box"]')).toBeTruthy();
     await act(async () => { commandButtons[0].click(); });
@@ -514,12 +504,16 @@ describe('WorkbenchComposition viewport regression', () => {
     expect(onOpenPipeline).toHaveBeenCalledOnce();
   });
 
-  test('mobile shell keeps composer, hides rail, and exposes context button without overflow', async () => {
+  test('mobile shell keeps composer, hides rail, and exposes one context launcher without overflow', async () => {
     await expectNoOverflowAt(375, renderWorkbenchShell, { height: 800, waitMs: 50 });
 
     const composer = host?.querySelector('[data-testid="strategic-composer-box"]');
     const railAside = host?.querySelector('[data-testid="strategic-context-rail"]')?.closest('aside');
-    const contextButton = host?.querySelector<HTMLButtonElement>('button[aria-label="Open Strategic context"]');
+    const contextButtons = Array.from(host?.querySelectorAll<HTMLButtonElement>('button[title="Open Strategic context"]') ?? [])
+      .filter(button => {
+        const rect = button.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0 && getComputedStyle(button).display !== 'none';
+      });
     const mobileNav = host?.querySelector<HTMLElement>('[data-testid="mobile-primary-tab-nav"]');
     const sessionControl = host?.querySelector('[data-testid="strategic-session-control"]');
 
@@ -528,8 +522,9 @@ describe('WorkbenchComposition viewport regression', () => {
     expect(getComputedStyle(sessionControl as Element).display).toBe('none');
     expect(railAside).toBeTruthy();
     expect(getComputedStyle(railAside!).display).toBe('none');
-    expect(contextButton).toBeTruthy();
-    expect(getComputedStyle(contextButton!).display).not.toBe('none');
+    expect(contextButtons).toHaveLength(1);
+    expect(contextButtons[0].closest('[data-testid="strategic-composer-box"]')).toBeNull();
+    expect(contextButtons[0].dataset.testid).toBe('strategic-context-descriptor');
     expect(mobileNav).toBeTruthy();
     expect(getComputedStyle(mobileNav!).display).toBe('grid');
     expect(composer!.getBoundingClientRect().bottom).toBeLessThanOrEqual(mobileNav!.getBoundingClientRect().top);

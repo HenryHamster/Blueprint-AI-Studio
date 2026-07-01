@@ -30,7 +30,6 @@ import type { SortBy } from './components/KanbanBoard';
 import { ACTIVE_PIPELINE_STATUSES, CANCELLABLE_STATUSES, COLUMNS, SORT_KEY, TERMINAL_STATUSES } from './appWorkbenchConstants';
 import { downloadTaskCsv, orderTasksForKanbanExport } from './utils/taskCsv';
 import { Pagination } from './components/Pagination';
-import ArchiveView from './components/ArchiveView';
 import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
 import ActivityFeed from './components/ActivityFeed';
@@ -61,6 +60,7 @@ import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 import { buildOptimisticStrategicWorkbench, normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSurfaceForTab } from './utils/strategicWorkbenchSession';
 import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
+import { buildStrategicContextDescriptor } from './utils/strategicContextDescriptor';
 
 type StrategicSessionRefs = StrategicWorkbenchState['selected_refs'];
 type PipelineDirectionOption = { id: string; text: string };
@@ -446,7 +446,14 @@ export default function App() {
   const strategicReadModelWorkbench = strategicReadModel.data?.project_id === selectedProjectId
     ? strategicReadModel.data?.workbench ?? null
     : null;
+  const selectedStrategicReadModel = strategicReadModel.data?.project_id === selectedProjectId
+    ? strategicReadModel.data
+    : null;
   const strategicWorkbenchState = optimisticStrategicWorkbench ?? strategicReadModelWorkbench;
+  const chatComposerContextDescriptor = useMemo(
+    () => buildStrategicContextDescriptor(selectedStrategicReadModel, strategicWorkbenchState),
+    [selectedStrategicReadModel, strategicWorkbenchState],
+  );
   useEffect(() => {
     strategicWorkbenchStateRef.current = strategicWorkbenchState;
   }, [strategicWorkbenchState]);
@@ -1445,16 +1452,18 @@ export default function App() {
                 showMonitoringControls={false}
                 className="hidden md:flex"
               />
-              <button
-                type="button"
-                onClick={openStrategicContextWorkspace}
-                className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950 px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9 lg:hidden"
-                title="Open Strategic context"
-                aria-label="Open Strategic context"
-              >
-                <PanelRightOpen className="h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
-                <span>Context</span>
-              </button>
+              {!chatComposerContextDescriptor && (
+                <button
+                  type="button"
+                  onClick={openStrategicContextWorkspace}
+                  className="inline-flex min-h-11 shrink-0 items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950 px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9 lg:hidden"
+                  title="Open Strategic context"
+                  aria-label="Open Strategic context"
+                >
+                  <PanelRightOpen className="h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
+                  <span>Context</span>
+                </button>
+              )}
             </>
           )}
           flush
@@ -1510,32 +1519,9 @@ export default function App() {
                 onUpdateSessionRefs={updateStrategicSessionRefs}
               />
             )}
-            railClassName="bg-[#080d13]"
+            railClassName="bg-workbench-rail"
           />
         </WorkbenchSurface>
-      ) : activeTab !== 'pipeline' && s.showArchive ? (
-        <ArchiveView
-          archiveTasks={s.archiveTasks}
-          archiveLoading={s.archiveLoading}
-          archivePage={s.archivePage}
-          archivePageSize={s.archivePageSize}
-          archiveStatusFilter={s.archiveStatusFilter}
-          archiveSearchQuery={s.archiveSearchQuery}
-          archiveDateRange={s.archiveDateRange}
-          archiveTotalTasks={s.archiveTotalTasks}
-          setShowArchive={s.setShowArchive}
-          setArchivePage={s.setArchivePage}
-          setArchivePageSize={s.setArchivePageSize}
-          setArchiveStatusFilter={s.setArchiveStatusFilter}
-          setArchiveSearchQuery={s.setArchiveSearchQuery}
-          setArchiveDateRange={s.setArchiveDateRange}
-          handleViewLogs={handleOpenTaskDetails}
-          onRetryTask={s.handleRetry}
-          onUnarchiveTask={s.handleUnarchiveTask}
-          archiveSortOrder={s.archiveSortOrder}
-          setArchiveSortOrder={s.setArchiveSortOrder}
-          onPurgeArchive={s.handlePurgeArchive}
-        />
       ) : activeTab === 'project' ? (
         <ErrorBoundary level="panel">
           <ProjectWorkspace

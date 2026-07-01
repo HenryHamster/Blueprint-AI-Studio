@@ -2838,7 +2838,7 @@ async def test_strategic_state_preserves_fresh_foreign_local_continuation_marker
     continuation = state_resp.json()["runtime"]["local_runner"]["continuation"]
     assert continuation["enabled"] is True
     assert continuation["fresh"] is True
-    assert continuation["owner_user_id"] == other_operator
+    assert continuation["owner_user_id"] is None
     assert continuation["owner_session_started_at"] == other_session_started_at
     assert continuation["owned_by_current_operator"] is False
     assert continuation["ownership"] == "other_operator"
@@ -2846,12 +2846,12 @@ async def test_strategic_state_preserves_fresh_foreign_local_continuation_marker
 
     assert leave_resp.status_code == 200, leave_resp.text
     leave_continuation = leave_resp.json()["runtime"]["local_runner"]["continuation"]
-    assert leave_continuation["owner_user_id"] == other_operator
+    assert leave_continuation["owner_user_id"] is None
     assert leave_continuation["ownership"] == "other_operator"
     assert enter_resp.status_code == 200, enter_resp.text
     enter_continuation = enter_resp.json()["runtime"]["local_runner"]["continuation"]
     assert enter_resp.json()["workbench"]["interaction_mode"] == "continuous"
-    assert enter_continuation["owner_user_id"] == other_operator
+    assert enter_continuation["owner_user_id"] is None
     assert enter_continuation["ownership"] == "other_operator"
     await db_session.refresh(project)
     marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
@@ -4334,6 +4334,13 @@ async def test_strategic_state_surfaces_local_runner_holds(
     assert local_attention["awaiting_since"] == awaiting_since
     assert "Waiting for local runner hardware" in local_attention["detail"]
     assert local_attention["movement_explanation"] == "No eligible local runner is online."
+    assert local_attention["lifecycle"] == {
+        "mode": "runtime_lifecycle",
+        "clears_when": "eligible_runner_available_or_task_dispatches_expires_terminal_or_archived",
+        "operator_action": "connect_or_select_local_runner",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    }
 
     actions = {entry["id"]: entry for entry in data["work_session"]["actions"]}
     hold_action = actions[f"attention.task:{held_for_runner.id}:local_runner_hold"]
@@ -4416,6 +4423,8 @@ async def test_strategic_state_surfaces_strategic_local_runner_holds(
         "section": "devices",
         "task_id": str(strategic_hold.id),
     }
+    assert item["lifecycle"]["mode"] == "runtime_lifecycle"
+    assert item["lifecycle"]["operator_action"] == "connect_or_select_local_runner"
 
 
 @pytest.mark.asyncio
@@ -4562,6 +4571,12 @@ async def test_operator_attention_surfaces_stale_pipeline_intervention_tasks(
     queued_item = items[f"task:{stale_queued.id}:stale_queued_task"]
     assert queued_item["label"] == "Dependency queue stale"
     assert queued_item["detail"] == "Waiting on upstream foundation."
+    assert queued_item["lifecycle"]["clears_when"] == (
+        "dependency_recovers_task_leaves_queue_terminal_or_archived"
+    )
+    assert queued_item["lifecycle"]["operator_action"] == (
+        "inspect_dependency_or_requeue_task"
+    )
     assert queued_item["target"] == {
         "surface": "task",
         "project_id": str(project.id),
@@ -4576,6 +4591,12 @@ async def test_operator_attention_surfaces_stale_pipeline_intervention_tasks(
     ]
     assert provisioning_item["label"] == "Provisioning stale"
     assert provisioning_item["detail"] == "VM was dispatched but never claimed."
+    assert provisioning_item["lifecycle"]["clears_when"] == (
+        "task_claims_healthy_runtime_recovers_terminal_or_archived"
+    )
+    assert provisioning_item["lifecycle"]["operator_action"] == (
+        "inspect_runtime_or_requeue_task"
+    )
     assert f"task:{fresh_provisioning.id}:stale_provisioning_task" not in items
     assert (
         f"task:{approval_provisioning.id}:stale_provisioning_task"
@@ -4586,6 +4607,10 @@ async def test_operator_attention_surfaces_stale_pipeline_intervention_tasks(
     runner_item = items[f"task:{stale_runner_pin.id}:stale_runner_pin"]
     assert runner_item["label"] == "Runner pin stale"
     assert runner_item["runner_id"] == str(stale_runner.id)
+    assert runner_item["lifecycle"]["mode"] == "runtime_lifecycle"
+    assert runner_item["lifecycle"]["clears_when"] == (
+        "runner_recovers_task_unpins_dispatches_terminal_or_archived"
+    )
     assert runner_item["target"] == {
         "surface": "runtime",
         "project_id": str(project.id),
@@ -4873,6 +4898,12 @@ async def test_strategic_state_includes_operator_attention(
     ]["lifecycle"]
     assert approval_lifecycle["mode"] == "task_lifecycle"
     assert approval_lifecycle["operator_action"] == "approve_or_reject_task"
+    failed_lifecycle = attention_items[f"task:{failed_task.id}:failed_task"][
+        "lifecycle"
+    ]
+    assert failed_lifecycle["mode"] == "task_lifecycle"
+    assert failed_lifecycle["clears_when"] == "task_requeued_archived_or_otherwise_resolved"
+    assert failed_lifecycle["operator_action"] == "inspect_failed_task"
 
     actions = data["work_session"]["actions"]
     assert len(actions) <= 10
@@ -4930,7 +4961,7 @@ async def test_strategic_state_includes_operator_attention(
     assert dismiss_alert["target"] == {
         "surface": "runtime",
         "project_id": str(project.id),
-        "section": "health",
+        "section": "devices",
         "alert_id": str(active_alert.id),
         "action": "dismiss_alert",
     }
@@ -5177,6 +5208,47 @@ async def test_operator_attention_surfaces_bug_and_feedback_as_watch_items(
     item_ids = {item["id"] for item in attention["items"]}
     assert f"message:{bug.id}" in item_ids
     assert f"message:{feedback.id}" in item_ids
+    items = {item["id"]: item for item in attention["items"]}
+    bug_lifecycle = items[f"message:{bug.id}"]["lifecycle"]
+    feedback_lifecycle = items[f"message:{feedback.id}"]["lifecycle"]
+    assert bug_lifecycle["mode"] == "message_lifecycle"
+    assert bug_lifecycle["acknowledge_effect"] == "clears_unread_only"
+    assert feedback_lifecycle["mode"] == "message_lifecycle"
+    assert feedback_lifecycle["acknowledgeable"] is True
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_same_priority_items_use_newest_tie_break(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    messages = [
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.FEEDBACK,
+            from_type="strategic",
+            content=f"Feedback item {idx}",
+            status="open",
+            created_at=now - timedelta(minutes=idx),
+        )
+        for idx in range(10)
+    ]
+    db_session.add_all(messages)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["level"] == "watch"
+    assert attention["counts"]["feedback"] == 10
+    assert attention["has_more"] is True
+    item_ids = [item["id"] for item in attention["items"]]
+    expected_visible = [f"message:{message.id}" for message in messages[:8]]
+    expected_hidden = {f"message:{message.id}" for message in messages[8:]}
+    assert item_ids == expected_visible
+    assert expected_hidden.isdisjoint(item_ids)
 
 
 @pytest.mark.asyncio
@@ -5237,6 +5309,13 @@ async def test_operator_attention_ignores_inert_manual_intervention_directions(
     assert "direction:d-completed-manual:manual_intervention" not in item_ids
     assert "direction:d-proposed-manual:manual_intervention" not in item_ids
     assert "direction:d-staged-manual:manual_intervention" not in item_ids
+    items = {item["id"]: item for item in attention["items"]}
+    manual_lifecycle = items["direction:d-active-manual:manual_intervention"][
+        "lifecycle"
+    ]
+    assert manual_lifecycle["mode"] == "direction_lifecycle"
+    assert manual_lifecycle["clears_when"] == "direction_flag_cleared_or_direction_inactive"
+    assert manual_lifecycle["operator_action"] == "update_direction"
 
 
 @pytest.mark.asyncio

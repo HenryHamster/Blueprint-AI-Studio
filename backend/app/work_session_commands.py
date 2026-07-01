@@ -398,6 +398,14 @@ def _attention_commands(
             alert_id = _uuid_text(ref.get("id"))
             if ref_kind != "alert" or ref_project_id != project_id or not alert_id:
                 continue
+            item_target = _compact_target(item.get("target") if isinstance(item.get("target"), dict) else None)
+            runtime_section = (
+                item_target.get("section")
+                if item_target
+                and item_target.get("surface") == SURFACE_RUNTIME
+                and item_target.get("section") in {"health", "devices"}
+                else "health"
+            )
             commands.append(
                 _command(
                     alert_dismiss_command_id(alert_id),
@@ -408,7 +416,7 @@ def _attention_commands(
                     target={
                         "surface": SURFACE_RUNTIME,
                         "project_id": project_id,
-                        "section": "health",
+                        "section": runtime_section,
                         "alert_id": alert_id,
                         "action": "dismiss_alert",
                     },

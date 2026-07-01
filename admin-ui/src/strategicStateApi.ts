@@ -335,6 +335,8 @@ export interface StrategicLocalRunnerState {
   agent_unavailable_count: number;
   active_runner_id?: string | null;
   active_task_pinned: boolean;
+  active_task_requires_local?: boolean;
+  active_task_awaiting_local_runner_since?: string | null;
   active_task_runtime?: StrategicLocalRunnerRuntime | null;
   runners?: StrategicLocalRunnerCandidate[];
   fallback_reason?:
@@ -816,6 +818,7 @@ export interface StrategicStateResponse {
       blocked: number;
       parked: number;
       failed: number;
+      cancelled?: number;
       completed: number;
       total: number;
     };
