@@ -8,7 +8,7 @@ The rule for this file: after every major batch, update the status ledger, miles
 
 ## Status Ledger
 
-Overall implementation estimate: 85%.
+Overall implementation estimate: 86%.
 
 Legend:
 - Done: implemented, reviewed, tested, and pushed.
@@ -28,7 +28,7 @@ Legend:
 | M6. Pipeline monitoring and task sideboard | Done | Pipeline workspace, task tree, task rail, stale attention routing, task sideboard context, task-sideboard contract, Chat task-target drawer routing, waiting-vs-blocked health labels. | Further tracked-stream affordance polish can continue without reopening the sideboard contract. |
 | M7. Runtime, devices, accounts, settings, project management | Done | Canonical Project/Runtime settings homes, workspace-hosted settings router semantics, command/context routing to Project Manage and Runtime Settings/Accounts, reachability and viewport tests. | Keep regression coverage while remaining project/runtime policy work lands. |
 | M8. Operator attention and work-session read model | Partial | Derived attention state, registry-backed curated metric metadata, actions, events, jobs, command receipts, and command receipts excluded from check-in deltas. | Finish lifecycle clearing semantics and performance review for larger event/metric volumes. |
-| M9. Unified event and message contracts | Partial | Workbench event v1 envelope exists, project message creation/projection are centralized, backend/frontend target/refetch helpers now share the same vocabulary. | Inventory legacy emitters and converge backend/frontend fixtures. |
+| M9. Unified event and message contracts | Partial | Workbench event v1 envelope exists, project message creation/projection are centralized, backend/frontend target/refetch helpers now share the same vocabulary, websocket emitter inventory snapshot gates new raw emitters. | Converge backend/frontend fixtures and migrate or document review-required legacy emitters. |
 | M10. Visual system and UI polish | Done | Workbench theme tokens, shell/header/workspace token migration, raw-shell-color guard, Pipeline duplicate task-open cleanup, focused viewport assertions and capture review. | Extend token coverage opportunistically to lower-level panels without changing IA. |
 | M11. Background operator jobs | Planned | Existing compute jobs, runner jobs, orchestrator loops, command receipts. | Only build a real operator-job table if a concrete async operator command needs it. |
 | M12. Completion audit and hardening | Planned | Focused tests exist across major components. | Run full backend/frontend audit loops, viewport screenshots, and contract gates. |
@@ -416,12 +416,13 @@ Completed in latest batch:
 - Operator command receipts are normalized consistently on persistence and projection.
 - Frontend websocket helpers now filter refetch surfaces through the same known surface list.
 - Frontend target routing now rejects unknown target surfaces and normalizes constrained sections before changing tabs.
+- Added AST-based websocket emitter inventory coverage with a checked-in snapshot of backend emitters. The snapshot classifies workbench v1, Strategic v1, message v1, transport/raw control, generic legacy, and `legacy_review_required` emitters while ignoring line-number churn for drift detection.
 
 Remaining work:
-- Inventory all websocket emitters:
-  - mark as workbench v1 envelope
-  - mark as legacy compatibility
-  - migrate or document why legacy stays
+- Use the inventory to migrate or explicitly document `legacy_review_required` websocket emitters:
+  - raw `alert_dismissed`
+  - raw `project_updated`
+  - raw autonomous/operator-state signals
 - Add backend-owned golden fixtures or JSON schemas for:
   - `StrategicStateResponse`
   - `StrategicSessionResponse`
@@ -444,6 +445,9 @@ Authoritative files:
 - `backend/app/project_message_creation.py`
 - `backend/app/work_session_commands.py`
 - `backend/app/work_session_command_execution.py`
+- `backend/testing/test_websocket_emitter_inventory.py`
+- `backend/testing/websocket_event_inventory.py`
+- `backend/testing/__fixtures__/websocket_event_inventory_v1.json`
 - `admin-ui/src/strategicStateApi.ts`
 - `admin-ui/src/types/workbenchTargets.ts`
 - `admin-ui/src/types/workbenchEvents.ts`
