@@ -384,6 +384,23 @@ export interface StrategicWorkSessionAction {
   blocked_reason?: string | null;
 }
 
+export interface StrategicWorkSessionCommandMutation {
+  method: 'GET' | 'POST' | 'PATCH' | 'PUT' | 'DELETE' | string;
+  path: string;
+  body?: Record<string, unknown>;
+}
+
+export interface StrategicWorkSessionCommand {
+  id: string;
+  label: string;
+  group: string;
+  priority: 'critical' | 'high' | 'normal' | 'low' | string;
+  enabled: boolean;
+  target?: StrategicContextPackageDrilldown['target'] | null;
+  refetch_surfaces?: string[];
+  mutation?: StrategicWorkSessionCommandMutation;
+}
+
 export interface StrategicWorkSessionRefDescriptor {
   kind: string;
   id: string;
@@ -469,6 +486,7 @@ export interface StrategicWorkSession {
   curated_metrics: StrategicWorkSessionMetric[];
   context_sources?: StrategicContextPackageSource[];
   actions?: StrategicWorkSessionAction[];
+  commands?: StrategicWorkSessionCommand[];
   events?: StrategicWorkSessionEventFeed;
   last_check_in?: StrategicWorkSessionLastCheckIn | null;
   since_last_check_in?: StrategicWorkSessionSinceLastCheckIn | null;

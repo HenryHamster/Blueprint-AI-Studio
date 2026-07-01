@@ -24,6 +24,7 @@ import {
   upsertStrategicSelectedRef,
   type StrategicSelectedRef,
 } from '../utils/strategicWorkbenchSession';
+import { StrategicSessionEvents } from './StrategicSessionEvents';
 import { WorkbenchPanel } from './WorkbenchLayout';
 
 type ProjectTarget = 'running-update' | 'directions' | 'problem-model' | 'design-doc';
@@ -958,6 +959,7 @@ export function StrategicContextRail({
   const firstLocalRunnerHold = runtimeWork?.local_runner_holds?.items[0] ?? null;
   const hasLocalRunnerHolds = (runtimeWork?.local_runner_holds?.count ?? 0) > 0;
   const workSessionActions = state?.work_session?.actions ?? [];
+  const workSessionEvents = state?.work_session?.events?.items ?? [];
   const visibleWorkSessionActions = workSessionActions.slice(0, 4);
   const visibleWorkSessionActionIds = new Set(visibleWorkSessionActions.filter(action => action.enabled).map(action => action.id));
   const visibleAttentionItems = attentionItems.filter(item => !visibleWorkSessionActionIds.has(`attention.${item.id}`));
@@ -1184,6 +1186,22 @@ export function StrategicContextRail({
                 />
               ))}
             </div>
+          </div>
+        )}
+        {workSessionEvents.length > 0 && (
+          <div className="mt-3 border-t border-neutral-800 pt-3" data-testid="strategic-session-activity">
+            <div className="mb-1 flex min-w-0 items-center justify-between gap-2">
+              <span className="truncate text-xs font-semibold text-neutral-100">Recent flow</span>
+              <span className="shrink-0 font-mono text-ui-sm text-neutral-600">
+                {formatCompactNumber(workSessionEvents.length)}
+              </span>
+            </div>
+            <StrategicSessionEvents
+              events={workSessionEvents}
+              limit={3}
+              density="compact"
+              onOpenTarget={openContextTarget}
+            />
           </div>
         )}
         <ShaFreshnessBlock shaFreshness={shaFreshness} />

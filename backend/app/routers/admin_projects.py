@@ -73,6 +73,7 @@ from app.strategic_context_package import (
 )
 from app.strategic_runtime_work import build_strategic_runtime_summary
 from app.work_session_actions import build_work_session_actions
+from app.work_session_commands import build_work_session_commands
 from app.workbench_state import (
     WORKBENCH_STATE_MAX_BYTES,
     build_message_strategic_session_snapshot,
@@ -456,6 +457,12 @@ def _build_work_session_summary(
         context_status=context_status,
         local_runner=local_runner if isinstance(local_runner, dict) else None,
     )
+    commands = build_work_session_commands(
+        project_id=project.id,
+        actions=actions,
+        workbench_state=workbench_state,
+        context_package=context_package,
+    )
     return {
         "version": 1,
         "id": session_id[:240],
@@ -477,6 +484,7 @@ def _build_work_session_summary(
         ],
         "curated_metrics": metrics,
         "actions": actions,
+        "commands": commands,
         "context_sources": context_sources[:8] if isinstance(context_sources, list) else [],
     }
 

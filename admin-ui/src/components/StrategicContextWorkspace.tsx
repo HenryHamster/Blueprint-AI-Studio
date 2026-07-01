@@ -23,6 +23,7 @@ import {
   type StrategicSelectedRef,
 } from '../utils/strategicWorkbenchSession';
 import { StrategicContextMap } from './StrategicContextMap';
+import { StrategicSessionEvents } from './StrategicSessionEvents';
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
 type StrategicContextCanvas = NonNullable<StrategicContextPackageDescriptor['canvas']>;
@@ -618,6 +619,7 @@ export function StrategicContextWorkspace({
   const runtimeWorkStatus = runtimeWork ? runtimeWorkTone(runtimeWork) : null;
   const workSessionActions = (workSession?.actions ?? []).slice(0, 4);
   const workSessionMetrics = rankStrategicWorkSessionMetrics(workSession?.curated_metrics ?? [], 6);
+  const workSessionEvents = workSession?.events?.items ?? [];
   const attentionCounts = state?.attention?.counts ?? null;
   const attentionPills = attentionCounts ? [
     { label: 'needs', value: attentionCounts.needs_operator },
@@ -799,6 +801,21 @@ export function StrategicContextWorkspace({
                 )}
               </div>
             </Section>
+
+            {workSessionEvents.length > 0 && (
+              <Section
+                title="Recent flow"
+                meta={workSession?.events?.has_more ? `${workSessionEvents.length}+` : `${workSessionEvents.length}`}
+                testId="strategic-context-workspace-events"
+              >
+                <StrategicSessionEvents
+                  events={workSessionEvents}
+                  limit={10}
+                  density="comfortable"
+                  onOpenTarget={handleOpenTarget}
+                />
+              </Section>
+            )}
 
             <Section
               title="Kept context"

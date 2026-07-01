@@ -2608,6 +2608,7 @@ async def test_strategic_state_marks_check_in_unavailable_without_prior_receipt(
     assert state_work_session["since_last_check_in"]["reason"] == "no_prior_check_in"
     assert session_work_session["last_check_in"] is None
     assert session_work_session["since_last_check_in"]["available"] is False
+    assert session_work_session["commands"] == state_work_session["commands"]
 
 
 @pytest.mark.asyncio
