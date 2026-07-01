@@ -18,7 +18,7 @@ function accessProps(overrides: Partial<SettingsSectionRouterProps> = {}): Setti
 }
 
 describe('SettingsSectionRouter access actions', () => {
-  test('closes the modal host by default when opening project members', () => {
+  test('closes the legacy modal host by default when opening project members', () => {
     const onToggleProjectMembers = vi.fn();
     const onToggleSettings = vi.fn();
 
@@ -34,14 +34,37 @@ describe('SettingsSectionRouter access actions', () => {
     expect(onToggleSettings).toHaveBeenCalledOnce();
   });
 
-  test('keeps embedded project/runtime hosts open when opening user management', () => {
+  test('uses explicit modal host close callback when provided', () => {
+    const onToggleProjectMembers = vi.fn();
+    const onToggleSettings = vi.fn();
+    const onCloseHost = vi.fn();
+
+    render(
+      <SettingsSectionRouter
+        {...accessProps({
+          hostKind: 'modal',
+          onCloseHost,
+          onToggleProjectMembers,
+          onToggleSettings,
+        })}
+      />,
+    );
+
+    fireEvent.click(screen.getByTestId('toggle-project-members'));
+
+    expect(onToggleProjectMembers).toHaveBeenCalledOnce();
+    expect(onCloseHost).toHaveBeenCalledOnce();
+    expect(onToggleSettings).not.toHaveBeenCalled();
+  });
+
+  test('keeps explicit workspace hosts open when opening user management', () => {
     const onToggleUserManagement = vi.fn();
     const onToggleSettings = vi.fn();
 
     render(
       <SettingsSectionRouter
         {...accessProps({
-          closeOnExternalPanelOpen: false,
+          hostKind: 'workspace',
           onToggleUserManagement,
           onToggleSettings,
         })}

@@ -74,8 +74,8 @@ export function PrimaryTabNav({
 }: PrimaryTabNavProps) {
   const mobile = placement === 'mobile';
   const navClassName = mobile
-    ? `grid grid-cols-4 gap-1 border-t border-neutral-800/90 bg-[#020407] px-1.5 py-1.5 ${className}`
-    : `hidden min-w-0 flex-1 items-center gap-0.5 overflow-x-auto rounded-md border border-neutral-800/80 bg-[#05080d] p-0.5 md:flex md:flex-none ${className}`;
+    ? `grid grid-cols-4 gap-1 border-t border-workbench-border/90 bg-workbench-shell px-1.5 py-1.5 ${className}`
+    : `workbench-control hidden min-w-0 flex-1 items-center gap-0.5 overflow-x-auto rounded-md border p-0.5 md:flex md:flex-none ${className}`;
 
   return (
     <nav
@@ -98,12 +98,12 @@ export function PrimaryTabNav({
             key={tab}
             type="button"
             onClick={() => onTabChange(tab)}
-            className={`inline-flex min-h-[44px] min-w-0 items-center justify-center rounded text-sm font-semibold leading-none transition-colors whitespace-nowrap ${
+            className={`workbench-focus inline-flex min-h-[44px] min-w-0 items-center justify-center rounded text-sm font-semibold leading-none transition-colors whitespace-nowrap ${
               mobile ? 'px-1.5' : 'shrink-0 px-2.5 py-1 md:min-h-6 md:px-2 md:text-xs'
             } ${
               isActive
-                ? 'bg-neutral-800/90 text-neutral-100 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]'
-                : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100'
+                ? 'bg-neutral-800/90 text-neutral-100 ring-1 ring-inset ring-white/5'
+                : 'text-neutral-400 hover:bg-workbench-layer hover:text-neutral-100'
             }`}
           >
             <span className="truncate">{label}</span>
@@ -204,11 +204,11 @@ export function HeaderBar(props: HeaderBarProps) {
       )}
 
       {/* Unified top bar: compact global shell with fixed utility clusters and a scrolling tab strip. */}
-      <header className="flex min-h-10 flex-wrap items-center gap-1 border-b border-neutral-800/90 bg-[#020407] px-1.5 py-0.5 md:min-h-8 md:flex-nowrap md:px-2">
+      <header className="flex min-h-10 flex-wrap items-center gap-1 border-b border-workbench-border/90 bg-workbench-shell px-1.5 py-0.5 md:min-h-8 md:flex-nowrap md:px-2">
         {/* LEFT: ProjectSwitcher + Manage projects slot */}
         <div className="flex min-w-0 shrink-0 items-center gap-1">
           <div className="hidden items-center lg:flex" aria-label="Blueprint">
-            <span className="grid h-4 w-4 grid-cols-2 gap-0.5 rounded border border-neutral-800/80 bg-[#05080d] p-0.5" aria-hidden="true">
+            <span className="grid h-3.5 w-3.5 grid-cols-2 gap-0.5 rounded border border-workbench-border/80 bg-workbench-control p-0.5" aria-hidden="true">
               <span className="rounded-[1px] bg-neutral-500/80" />
               <span className="rounded-[1px] bg-neutral-700" />
               <span className="rounded-[1px] bg-neutral-700" />
@@ -249,7 +249,7 @@ export function HeaderBar(props: HeaderBarProps) {
         <div className="ml-auto flex shrink-0 items-center gap-0.5">
 
           {/* Desktop icon cluster */}
-          <div className="hidden items-center gap-0.5 rounded-md border border-neutral-800/80 bg-[#05080d] p-0.5 md:flex">
+          <div className="workbench-control hidden items-center gap-0.5 rounded-md border p-0.5 md:flex">
             {/* Alerts — only when active alerts exist */}
             {(props.alertCount ?? 0) > 0 && (
               /* eslint-disable-next-line viewport/min-touch-target -- desktop-only (inside hidden md:flex); never visible at 375px mobile width */
@@ -261,7 +261,7 @@ export function HeaderBar(props: HeaderBarProps) {
                     ? (props.alertMaxSeverity === 'ERROR' ? 'text-red-400 bg-red-500/10'
                       : props.alertMaxSeverity === 'WARNING' ? 'text-amber-400 bg-amber-500/10'
                       : 'text-blue-400 bg-blue-500/10')
-                    : 'text-neutral-400 hover:text-neutral-200 hover:bg-neutral-800'
+                    : 'text-neutral-400 hover:bg-workbench-layer hover:text-neutral-200'
                 }`}
               >
                 <span className={`w-2 h-2 rounded-full ${
@@ -277,7 +277,7 @@ export function HeaderBar(props: HeaderBarProps) {
               title="Research findings"
               aria-pressed={showResearchBrowser}
               className={`relative flex h-7 w-7 items-center justify-center rounded text-xs transition-colors ${
-                showResearchBrowser ? 'bg-cyan-500/10 text-cyan-300' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'
+                showResearchBrowser ? 'bg-cyan-500/10 text-cyan-300' : 'text-neutral-400 hover:bg-workbench-layer hover:text-neutral-200'
               }`}
             >
               <Microscope className="h-3.5 w-3.5" />
@@ -292,7 +292,7 @@ export function HeaderBar(props: HeaderBarProps) {
               title="Knowledge library"
               aria-pressed={showKnowledgeBrowser}
               className={`flex h-7 w-7 items-center justify-center rounded text-xs transition-colors ${
-                showKnowledgeBrowser ? 'bg-violet-500/10 text-violet-300' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'
+                showKnowledgeBrowser ? 'bg-violet-500/10 text-violet-300' : 'text-neutral-400 hover:bg-workbench-layer hover:text-neutral-200'
               }`}
             >
               <BookOpen className="h-3.5 w-3.5" />
@@ -302,7 +302,7 @@ export function HeaderBar(props: HeaderBarProps) {
               <button
                 onClick={onOpenNewTaskModal}
                 title="New task"
-                className="flex h-7 items-center gap-1 rounded px-1.5 text-xs font-semibold text-neutral-300 transition-colors hover:bg-neutral-900 hover:text-neutral-100"
+                className="flex h-7 items-center gap-1 rounded px-1.5 text-xs font-semibold text-neutral-300 transition-colors hover:bg-workbench-layer hover:text-neutral-100"
               >
                 <Plus className="h-3.5 w-3.5" />
                 <span>New</span>
@@ -313,7 +313,7 @@ export function HeaderBar(props: HeaderBarProps) {
               <button
                 onClick={onOpenActivityFeed}
                 title="Chronological activity stream"
-                className="flex h-7 w-7 items-center justify-center rounded text-xs text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-200"
+                className="flex h-7 w-7 items-center justify-center rounded text-xs text-neutral-400 transition-colors hover:bg-workbench-layer hover:text-neutral-200"
               >
                 <Activity className="h-3.5 w-3.5" />
               </button>
@@ -323,7 +323,7 @@ export function HeaderBar(props: HeaderBarProps) {
             <button
               onClick={() => setHealthExpanded(prev => !prev)}
               title={healthExpanded ? 'Hide health panel' : 'Show orchestrator health'}
-              className={`flex h-7 items-center gap-1 rounded px-1.5 text-xs transition-colors ${healthExpanded ? 'bg-neutral-800/90 text-neutral-200' : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-200'}`}
+              className={`flex h-7 items-center gap-1 rounded px-1.5 text-xs transition-colors ${healthExpanded ? 'bg-neutral-800/90 text-neutral-200' : 'text-neutral-400 hover:bg-workbench-layer hover:text-neutral-200'}`}
             >
               <span className={`w-2 h-2 rounded-full shrink-0 ${healthDotColor}`} />
               <span className="hidden font-mono xl:inline">health</span>
@@ -333,14 +333,14 @@ export function HeaderBar(props: HeaderBarProps) {
           <button
             onClick={onOpenSettings}
             title="Runtime settings"
-            className="hidden h-7 w-7 items-center justify-center rounded border border-neutral-800/80 bg-[#070a0f] text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-100 md:inline-flex"
+            className="hidden h-7 w-7 items-center justify-center rounded border border-workbench-border/80 bg-workbench-control text-neutral-400 transition-colors hover:bg-workbench-layer hover:text-neutral-100 md:inline-flex"
           >
             <Settings className="h-3.5 w-3.5" />
           </button>
           <button
             onClick={props.onSignOut}
             title={props.userEmail ? `Sign out ${props.userEmail}` : 'Sign out'}
-            className="hidden h-7 w-7 items-center justify-center rounded border border-neutral-800/80 bg-[#070a0f] text-neutral-500 transition-colors hover:bg-red-950/20 hover:text-red-300 md:inline-flex"
+            className="hidden h-7 w-7 items-center justify-center rounded border border-workbench-border/80 bg-workbench-control text-neutral-500 transition-colors hover:bg-red-950/20 hover:text-red-300 md:inline-flex"
           >
             <LogOut className="h-3.5 w-3.5" />
           </button>
@@ -358,13 +358,13 @@ export function HeaderBar(props: HeaderBarProps) {
           <div className="relative md:hidden" ref={mobileMenuRef}>
             <button
               onClick={() => setShowMobileMenu(prev => !prev)}
-              className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-md border border-neutral-800 bg-[#0b0f14] p-3 text-xs text-neutral-300 transition-colors hover:bg-neutral-900"
+              className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-md border border-workbench-border bg-workbench-panel p-3 text-xs text-neutral-300 transition-colors hover:bg-workbench-layer"
               title="More options"
             >
               <MoreHorizontal className="w-4 h-4" />
             </button>
             {showMobileMenu && (
-              <div className="absolute right-0 top-full z-50 mt-2 max-h-[calc(100vh-96px)] w-60 overflow-auto rounded-md border border-neutral-800 bg-[#0b0f14] p-2 shadow-2xl">
+              <div className="absolute right-0 top-full z-50 mt-2 max-h-[calc(100vh-96px)] w-60 overflow-auto rounded-md border border-workbench-border bg-workbench-panel p-2 shadow-2xl">
                 <button
                   onClick={() => { onToggleResearchBrowser(); setShowMobileMenu(false); }}
                   className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}

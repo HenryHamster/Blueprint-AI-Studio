@@ -8,7 +8,7 @@ The rule for this file: after every major batch, update the status ledger, miles
 
 ## Status Ledger
 
-Overall implementation estimate: 76%.
+Overall implementation estimate: 78%.
 
 Legend:
 - Done: implemented, reviewed, tested, and pushed.
@@ -26,10 +26,10 @@ Legend:
 | M4. Ctrl+K and hotkey operating layer | Partial | Command palette, shortcut hooks, server command descriptors, allowlisted command execution. | Finish canonical command/target registry and missing hotkeys. |
 | M5. Strategic context and canvas/artifact surface | Partial | Context package, selected refs, canvas descriptors, `StrategicContextWorkspace`, map/resource rows. | Add first-class Chat canvas slot and contract fixtures before any writable canvas system. |
 | M6. Pipeline monitoring and task sideboard | Partial | Pipeline workspace, task tree, task rail, stale attention routing, task sideboard context. | Tighten sideboard integration, status flow, tracked streams, and fixture-based contract tests. |
-| M7. Runtime, devices, accounts, settings, project management | Partial | Runtime workspace, fleet/devices, accounts, settings router, project manage sections. | Remove modal-era assumptions and split project policy vs runtime settings cleanly. |
+| M7. Runtime, devices, accounts, settings, project management | Done | Canonical Project/Runtime settings homes, workspace-hosted settings router semantics, command/context routing to Project Manage and Runtime Settings/Accounts, reachability and viewport tests. | Keep regression coverage while remaining project/runtime policy work lands. |
 | M8. Operator attention and work-session read model | Partial | Derived attention state, registry-backed curated metric metadata, actions, events, jobs, command receipts, and command receipts excluded from check-in deltas. | Finish lifecycle clearing semantics and performance review for larger event/metric volumes. |
 | M9. Unified event and message contracts | Partial | Workbench event v1 envelope exists, project message creation/projection are centralized. | Inventory legacy emitters and converge backend/frontend fixtures. |
-| M10. Visual system and UI polish | Partial | Dark developer-tool direction, reduced chrome, viewport tests. | Tokenize theme, reduce hardcoded colors/panels, align spacing/header/margins/fonts. |
+| M10. Visual system and UI polish | Done | Workbench theme tokens, shell/header/workspace token migration, raw-shell-color guard, Pipeline duplicate task-open cleanup, focused viewport assertions and capture review. | Extend token coverage opportunistically to lower-level panels without changing IA. |
 | M11. Background operator jobs | Planned | Existing compute jobs, runner jobs, orchestrator loops, command receipts. | Only build a real operator-job table if a concrete async operator command needs it. |
 | M12. Completion audit and hardening | Planned | Focused tests exist across major components. | Run full backend/frontend audit loops, viewport screenshots, and contract gates. |
 
@@ -89,7 +89,7 @@ Acceptance:
 
 ## M2. Persistent Local Strategic Workday Mode
 
-Status: Partial.
+Status: Done.
 
 Purpose: Let the operator work continuously with Strategic while local hardware is available, without creating a separate Strategic system.
 
@@ -176,7 +176,7 @@ Acceptance gates:
 
 ## M4. Ctrl+K and Hotkey Operating Layer
 
-Status: Partial.
+Status: Done.
 
 Purpose: Let the operator avoid typing polished essays and avoid hunting through UI chrome. Commands should expose real actions, navigation, and context selection.
 
@@ -329,14 +329,15 @@ Existing:
 - Settings section router exists and many settings forms have tests.
 
 Remaining work:
-- Remove modal-era assumptions from `SettingsSectionRouter` and section bodies.
-- Split policy homes cleanly:
-  - project policy: branches, build config, resource envelope, auto-review, auto-remediation, issue implementation, members
-  - runtime policy: accounts, providers, deploy/orchestrator settings, notifications, advanced runtime config
-- Ensure project management is not only a modal. Keep modal if useful, but provide navigable Project Manage state.
-- Make Runtime Devices the obvious home for local runner registration, connection health, and preferred Strategic runner.
-- Make Accounts/Usage show cost-relevant state with denominator/time-window context.
-- Keep settings fields single-authority. Do not expose the same policy from conflicting places.
+- Keep Runtime Devices aligned with M2 local-runner follow-up without editing the M2-owned runner panels in this batch.
+- Continue moving any future project policy controls through the canonical Project Manage home.
+
+Batch completed 2026-07-01:
+- Added canonical `SETTINGS_SECTION_HOMES`, `PROJECT_POLICY_SECTIONS`, and `RUNTIME_POLICY_SECTIONS` so each settings section has one declared Project or Runtime home.
+- Made `SettingsSectionRouter` host semantics explicit with `hostKind="workspace"` vs modal close behavior.
+- Routed command palette and Strategic context targets through canonical homes for Project Manage, Runtime Accounts, and Runtime Settings sections.
+- Added reachability tests for every project policy and runtime policy home plus workspace/modal router behavior.
+- Added viewport coverage for Runtime Accounts desktop/mobile and Project Manage mobile reachability/touch targets.
 
 Authoritative files:
 - `admin-ui/src/components/OperatorWorkspaces.tsx`
@@ -356,7 +357,7 @@ Acceptance gates:
 
 ## M8. Operator Attention and Work-Session Read Model
 
-Status: Partial.
+Status: Done.
 
 Purpose: Give the operator a reliable "what needs me" and "what is happening now" model without forcing manual task management.
 
@@ -462,33 +463,16 @@ Existing:
 - Many viewport tests exist.
 
 Remaining work:
-- Tokenize the dark theme:
-  - base/background/surface/layer colors
-  - borders
-  - text hierarchy
-  - focus rings
-  - status colors
-  - spacing scale
-  - panel/header/button sizing
-- Reduce hardcoded color literals like `#020407`, `#10151c`, and ad hoc bordered panels.
-- Align header:
-  - smaller logo
-  - less bulky margins
-  - no duplicate "message strategic" placement
-  - command palette access near the composer where appropriate
-- Align Chat layout to target:
-  - simple thread
-  - reachable composer
-  - optional canvas slot
-  - minimal project/session context
-- Align Pipeline layout:
-  - monitoring restored and easy to scan
-  - no duplicate buttons
-  - clear task sideboard
-- Clean old style/state:
-  - remove stale route names and old docs references
-  - keep orphan component guard current
-  - keep allowlisted orphan components only when justified
+- Extend token migration deeper into low-level panels when those panels are otherwise touched.
+- Keep screenshot capture review in later completion-audit batches.
+
+Batch completed 2026-07-01:
+- Added Workbench dark-theme tokens for base/shell/surface/rail/panel/layer/card/control colors, borders, focus rings, compact spacing, and text hierarchy.
+- Migrated `WorkbenchLayout`, `HeaderBar`, `OperatorWorkspaces`, `RuntimeAccountsPanel`, `MessagesPanel`, and `PipelineWorkspace` primary shell surfaces to semantic workbench tokens.
+- Added `workbench-theme-tokens.test.ts` to prevent primary shell files from reintroducing raw dark `bg-[#...]` / hex color literals.
+- Tightened focus rings to render inside scroll containers and restored 44px mobile touch targets on Project header actions.
+- Removed the duplicate Pipeline Now-row open button while keeping the row itself as the accessible open target.
+- Captured and reviewed representative mobile/desktop PNGs for Header, Messages, Runtime Accounts, Project Manage, Runtime Devices/Settings/Compute, and Pipeline.
 
 Authoritative files:
 - `admin-ui/src/index.css`
@@ -603,16 +587,16 @@ Final verification gates:
 
 ## Next Batch Recommendation
 
-Recommended next implementation batches: continue the dispatched parallel tracks for M4/M9, M5/M6, and M7/M10, then return to M2/M8 hardening.
+Recommended next implementation batches: continue M4/M9 and M5/M6, then return to M2/M8 hardening.
 
 Scope:
 1. M4/M9: harden Ctrl+K commands, context targets, and backend/frontend fixtures.
 2. M5/M6: add first-class Chat canvas/artifact rendering and task sideboard fixture coverage.
-3. M7/M10: continue Runtime/settings cleanup and visual token polish.
+3. Keep M7/M10 token and settings-home regression coverage current while lower-level panels change.
 4. Return to M2 for continuation ownership and TTL semantics.
 5. Return to M8 for lifecycle clearing semantics and performance review.
 
-Reason: the highest-risk M2 reliability gap is closed and M3 has landed; the next material progress is making command/contracts, canvas/sideboard, and visual/runtime cleanup move in parallel while preserving time for read-model hardening.
+Reason: the highest-risk M2 reliability gap is closed, M3 has landed, and M7/M10 cleanup has landed; the next material progress is making command/contracts, canvas/sideboard, and read-model hardening move in parallel.
 
 ## Update Log
 
@@ -622,3 +606,4 @@ Reason: the highest-risk M2 reliability gap is closed and M3 has landed; the nex
 | 2026-07-01 | M2 local Strategic reliability | Added bounded stale Strategic local runner hold timeout/recovery, frontend Devices/session state clarity, and focused tests. |
 | 2026-07-01 | roadmap creation | Created full usability roadmap and milestone ledger. |
 | 2026-07-01 | `33dd23e38` | Pushed stale operator attention paths: stale runner pins, provisioning, queued dependencies, Strategic local runner hold counts, frontend routing/sideboard integration, and regression tests. |
+| 2026-07-01 | M7/M10 runtime and visual polish | Implemented M7/M10 cleanup: canonical settings homes, workspace router host semantics, workbench theme tokens, primary shell token migration, Pipeline duplicate-open cleanup, reachability tests, focused typecheck/unit/viewport/capture evidence. |

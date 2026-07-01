@@ -19,7 +19,9 @@ function Harness(overrides: Partial<Parameters<typeof useStrategicContextNavigat
     setKnowledgeBrowserInitialDocId: vi.fn(),
     setPipelineSection: vi.fn(),
     setProjectSection: vi.fn(),
+    setProjectManageSection: vi.fn(),
     setRuntimeSection: vi.fn(),
+    setRuntimeConfigSection: vi.fn(),
     setShowArchive: vi.fn(),
     setShowKnowledgeBrowser: vi.fn(),
     setViewMode: vi.fn(),
@@ -83,6 +85,34 @@ describe('useStrategicContextNavigation', () => {
     expect(handleTabChange).toHaveBeenCalledWith('project');
     expect(handleTabChange).toHaveBeenCalledWith('pipeline');
     expect(handleTabChange).toHaveBeenCalledWith('runtime');
+  });
+
+  test('routes settings targets through their canonical project and runtime homes', () => {
+    const handleTabChange = vi.fn();
+    const setProjectSection = vi.fn();
+    const setProjectManageSection = vi.fn();
+    const setRuntimeSection = vi.fn();
+    const setRuntimeConfigSection = vi.fn();
+    const open = mount({
+      handleTabChange,
+      setProjectSection,
+      setProjectManageSection,
+      setRuntimeSection,
+      setRuntimeConfigSection,
+    });
+
+    act(() => {
+      open({ surface: 'project', section: 'build-config' } as Target);
+      open({ surface: 'runtime', section: 'provider-settings' } as Target);
+      open({ surface: 'runtime', section: 'accounts' } as Target);
+    });
+
+    expect(setProjectSection).toHaveBeenCalledWith('manage');
+    expect(setProjectManageSection).toHaveBeenCalledWith('build-config');
+    expect(setRuntimeSection).toHaveBeenCalledWith('settings');
+    expect(setRuntimeConfigSection).toHaveBeenCalledWith('provider-settings');
+    expect(setRuntimeSection).toHaveBeenCalledWith('accounts');
+    expect(handleTabChange.mock.calls.map(([tab]) => tab)).toEqual(['project', 'runtime', 'runtime']);
   });
 
   test('routes messages, tasks, and knowledge targets through their owning surfaces', () => {

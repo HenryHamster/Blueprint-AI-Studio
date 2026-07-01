@@ -9,6 +9,12 @@ import {
   type RuntimeSection,
   type RuntimeSettingsSection,
 } from './OperatorWorkspaces';
+import {
+  PROJECT_POLICY_SECTIONS,
+  RUNTIME_POLICY_SECTIONS,
+  SETTINGS_SECTION_HOMES,
+} from './OperatorWorkspaceSections';
+import type { SectionId } from './settingsSections';
 import type { Task } from './TaskCard';
 import type { Project } from '../types/project';
 
@@ -223,6 +229,65 @@ describe('Operator workspaces', () => {
 
     rerender(<RuntimeWorkspace {...runtimeProps({ runtimeSection: 'settings', runtimeConfigSection: 'provider-settings' })} />);
     expect(screen.getByTestId('settings-section')).toHaveTextContent('provider-settings');
+  });
+
+  test('keeps every settings section assigned to one canonical workbench home', () => {
+    const allSections: SectionId[] = [
+      'general',
+      'provider-routing',
+      'provider-settings',
+      'orchestrator',
+      'deploy',
+      'accounts',
+      'notifications',
+      'advanced',
+      'build-config',
+      'alert-domains',
+      'auto-remediation',
+      'issue-implementation',
+      'auto-review',
+      'resource-envelope',
+      'branches',
+      'access',
+    ];
+    const projectHomes = new Set<string>(PROJECT_POLICY_SECTIONS);
+    const runtimeHomes = new Set<string>(RUNTIME_POLICY_SECTIONS);
+
+    expect(Object.keys(SETTINGS_SECTION_HOMES).sort()).toEqual([...allSections].sort());
+    for (const section of allSections) {
+      const home = SETTINGS_SECTION_HOMES[section];
+      expect(projectHomes.has(section)).toBe(home.surface === 'project');
+      expect(runtimeHomes.has(section)).toBe(home.surface === 'runtime');
+    }
+    for (const section of PROJECT_POLICY_SECTIONS) {
+      expect(SETTINGS_SECTION_HOMES[section]).toMatchObject({ surface: 'project', section });
+    }
+    for (const section of RUNTIME_POLICY_SECTIONS) {
+      const home = SETTINGS_SECTION_HOMES[section];
+      expect(home.surface).toBe('runtime');
+      expect(home.section).toBe(section === 'accounts' ? 'accounts' : 'settings');
+    }
+  });
+
+  test('routes each canonical project policy home through project manage', () => {
+    const { rerender } = render(
+      <ProjectWorkspace {...projectProps({ projectSection: 'manage', projectManageSection: 'overview' })} />,
+    );
+
+    for (const section of PROJECT_POLICY_SECTIONS) {
+      rerender(<ProjectWorkspace {...projectProps({ projectSection: 'manage', projectManageSection: section })} />);
+      expect(screen.getByTestId('settings-section')).toHaveTextContent(section);
+    }
+  });
+
+  test('routes each canonical runtime policy home through accounts or runtime settings', () => {
+    const { rerender } = render(<RuntimeWorkspace {...runtimeProps({ runtimeSection: 'accounts' })} />);
+    expect(screen.getByTestId('runtime-accounts-panel')).toHaveTextContent('account monitor');
+
+    for (const section of RUNTIME_POLICY_SECTIONS.filter((item): item is RuntimeSettingsSection => item !== 'accounts')) {
+      rerender(<RuntimeWorkspace {...runtimeProps({ runtimeSection: 'settings', runtimeConfigSection: section })} />);
+      expect(screen.getByTestId('settings-section')).toHaveTextContent(section);
+    }
   });
 
   test('keeps runtime scope and health visible beside settings navigation', () => {

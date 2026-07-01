@@ -43,9 +43,9 @@ function RuntimeSectionIntro<T extends string>({
 }) {
   const Icon = item.icon;
   return (
-    <div className="flex min-w-0 flex-col gap-2 border-b border-neutral-800/80 pb-3 md:flex-row md:items-end md:justify-between">
+    <div className="flex min-w-0 flex-col gap-2 border-b border-workbench-border/80 pb-3 md:flex-row md:items-end md:justify-between">
       <div className="flex min-w-0 items-start gap-3">
-        <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-[#10151c] text-neutral-300">
+        <span className="workbench-layer flex h-9 w-9 shrink-0 items-center justify-center rounded-md border text-neutral-300">
           <Icon className="h-4 w-4" />
         </span>
         <div className="min-w-0">
@@ -78,7 +78,7 @@ function RuntimeStatusPill({
   }[tone];
 
   return (
-    <div className="inline-flex min-h-7 max-w-full items-center gap-1.5 rounded-md border border-neutral-800 bg-[#0d1218] px-2 text-ui-md">
+    <div className="workbench-card inline-flex min-h-7 max-w-full items-center gap-1.5 rounded-md border px-2 text-ui-md">
       <span className="shrink-0 uppercase tracking-wide text-neutral-500">{label}</span>
       <span className={`min-w-0 truncate font-mono font-semibold ${valueClass}`}>{value}</span>
     </div>
@@ -126,7 +126,7 @@ function RuntimeSettingsStatusRail({
       <WorkbenchPanel title="Runtime" meta={apiHealthy && wsConnected ? 'live' : 'check'}>
         <dl className="grid gap-1.5 text-xs">
           {rows.map(row => (
-            <div key={row.label} className="grid min-w-0 grid-cols-[4.4rem_minmax(0,1fr)] gap-2 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1.5">
+            <div key={row.label} className="workbench-card grid min-w-0 grid-cols-[4.4rem_minmax(0,1fr)] gap-2 rounded border px-2 py-1.5">
               <dt className="font-semibold uppercase tracking-wide text-neutral-500">{row.label}</dt>
               <dd className={`min-w-0 truncate font-mono ${row.tone}`} title={row.value}>{row.value}</dd>
             </div>
@@ -218,7 +218,7 @@ export function ProjectWorkspace({
   const activeProjectManageItem = resolveProjectManageItem(projectManageSection);
   const ActiveProjectManageIcon = activeProjectManageItem.icon;
   const activeProjectSettingsSection = activeProjectManageItem.id === 'overview' ? null : activeProjectManageItem.id;
-  const actionButtonClass = 'inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-[#10151c] px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-[#151c25] hover:text-neutral-100';
+  const actionButtonClass = 'workbench-focus inline-flex min-h-11 items-center gap-1.5 rounded-md border border-workbench-border bg-workbench-layer px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-workbench-border-strong hover:bg-workbench-hover hover:text-neutral-100 sm:min-h-9';
 
   const projectSurfaceActions = (
     <>
@@ -285,7 +285,7 @@ export function ProjectWorkspace({
         />
       ) : (
         <div className="grid h-full min-h-0 grid-cols-1 overflow-hidden lg:grid-cols-[280px_minmax(0,1fr)]">
-          <aside className="min-h-0 overflow-auto border-b border-neutral-800 bg-[#0b0f14] p-3 custom-scrollbar lg:border-b-0 lg:border-r">
+          <aside className="min-h-0 overflow-auto border-b border-workbench-border bg-workbench-rail p-3 custom-scrollbar lg:border-b-0 lg:border-r">
             <WorkbenchPanel title="Project" meta={selectedProject?.my_role ?? 'none'}>
               <div className="space-y-3 text-sm text-neutral-400">
                 <div className="min-w-0">
@@ -293,11 +293,11 @@ export function ProjectWorkspace({
                   <div className="mt-1 truncate font-medium text-neutral-200">{selectedProjectRepoLabel ?? 'No project selected'}</div>
                 </div>
                 <div className="grid grid-cols-2 gap-2 text-xs">
-                  <div className="rounded border border-neutral-800 bg-[#0d1218] px-2 py-1.5">
+                  <div className="workbench-card rounded border px-2 py-1.5">
                     <div className="text-ui-md uppercase tracking-wide text-neutral-500">role</div>
                     <div className="mt-0.5 text-neutral-300">{selectedProject?.my_role ?? 'none'}</div>
                   </div>
-                  <div className="rounded border border-neutral-800 bg-[#0d1218] px-2 py-1.5">
+                  <div className="workbench-card rounded border px-2 py-1.5">
                     <div className="text-ui-md uppercase tracking-wide text-neutral-500">self repo</div>
                     <div className="mt-0.5 text-neutral-300">{selectedProject?.is_self_repo ? 'yes' : 'no'}</div>
                   </div>
@@ -318,8 +318,8 @@ export function ProjectWorkspace({
                     onClick={() => onProjectManageSectionChange(item.id)}
                     className={`flex w-full items-start gap-2 rounded-md border px-2.5 py-2 text-left transition-colors ${
                       selected
-                        ? 'border-neutral-700 bg-neutral-800 text-neutral-100'
-                        : 'border-transparent text-neutral-400 hover:border-neutral-800 hover:bg-neutral-900/70 hover:text-neutral-200'
+                        ? 'border-workbench-border-strong bg-neutral-800 text-neutral-100'
+                        : 'border-transparent text-neutral-400 hover:border-workbench-border hover:bg-workbench-layer/70 hover:text-neutral-200'
                     } disabled:cursor-not-allowed disabled:opacity-40`}
                   >
                     <Icon className="mt-0.5 h-3.5 w-3.5 shrink-0" />
@@ -349,7 +349,7 @@ export function ProjectWorkspace({
                       <button
                         type="button"
                         onClick={onOpenProjectManagement}
-                        className="inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-700 px-3 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-800"
+                        className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 px-3 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-800 sm:min-h-9"
                       >
                         <Wrench className="h-3.5 w-3.5" />
                         Manage projects
@@ -358,7 +358,7 @@ export function ProjectWorkspace({
                         <button
                           type="button"
                           onClick={onOpenProjectMembers}
-                          className="inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-700 px-3 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-800"
+                          className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 px-3 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-800 sm:min-h-9"
                         >
                           <Users className="h-3.5 w-3.5" />
                           Members
@@ -383,14 +383,14 @@ export function ProjectWorkspace({
                       <button
                         type="button"
                         onClick={() => onProjectSectionChange('running-update')}
-                        className="rounded-md border border-neutral-700 px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-800"
+                        className="min-h-11 rounded-md border border-neutral-700 px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-800 sm:min-h-9"
                       >
                         Open update
                       </button>
                       <button
                         type="button"
                         onClick={() => onProjectSectionChange('directions')}
-                        className="rounded-md border border-neutral-700 px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-800"
+                        className="min-h-11 rounded-md border border-neutral-700 px-3 py-2 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-800 sm:min-h-9"
                       >
                         Open directions
                       </button>
@@ -408,7 +408,7 @@ export function ProjectWorkspace({
                           type="button"
                           disabled={!selectedProjectId}
                           onClick={() => onProjectManageSectionChange(item.id)}
-                          className="flex min-h-[78px] items-start gap-2 rounded-md border border-neutral-800 bg-[#0d1218] p-3 text-left text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 disabled:cursor-not-allowed disabled:opacity-40"
+                          className="workbench-card flex min-h-[78px] items-start gap-2 rounded-md border p-3 text-left text-neutral-300 transition-colors hover:border-workbench-border-strong hover:bg-workbench-layer disabled:cursor-not-allowed disabled:opacity-40"
                         >
                           <Icon className="mt-0.5 h-4 w-4 shrink-0 text-neutral-500" />
                           <span className="min-w-0">
@@ -424,7 +424,7 @@ export function ProjectWorkspace({
             ) : (
               <div className="mx-auto max-w-6xl space-y-4">
                 <div className="flex min-w-0 items-start gap-3 border-b border-neutral-800 pb-3">
-                  <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-[#111820] text-neutral-300">
+                  <span className="workbench-layer flex h-9 w-9 shrink-0 items-center justify-center rounded-md border text-neutral-300">
                     <ActiveProjectManageIcon className="h-4 w-4" />
                   </span>
                   <div className="min-w-0">
@@ -433,7 +433,7 @@ export function ProjectWorkspace({
                   </div>
                 </div>
                 {activeProjectSettingsSection && (
-                  <SettingsSectionRouter {...settingsRouterProps} activeSection={activeProjectSettingsSection} />
+                  <SettingsSectionRouter {...settingsRouterProps} hostKind="workspace" activeSection={activeProjectSettingsSection} />
                 )}
               </div>
             )}
@@ -525,7 +525,7 @@ export function RuntimeWorkspace({
 
   const runtimeSurfaceActions = (
     <>
-      <span className="hidden min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-[#10151c] px-2.5 text-xs text-neutral-400 md:inline-flex">
+      <span className="workbench-layer hidden min-h-9 items-center gap-1.5 rounded-md border px-2.5 text-xs text-neutral-400 md:inline-flex">
         <span className={`h-1.5 w-1.5 rounded-full ${apiHealthy && wsConnected ? 'bg-emerald-400' : 'bg-amber-400'}`} />
         {apiHealthy && wsConnected ? 'API + WS' : 'degraded'}
       </span>
@@ -607,10 +607,10 @@ export function RuntimeWorkspace({
             />
           </RuntimeSectionIntro>
           <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(360px,420px)]">
-            <section className="min-w-0 rounded-md border border-neutral-800 bg-[#10151c] p-3" aria-label="Warm VM devices">
+            <section className="workbench-layer min-w-0 rounded-md border p-3" aria-label="Warm VM devices">
               <WarmVmPanel onViewTask={onViewTaskById} projects={projects} />
             </section>
-            <section className="min-w-0 rounded-md border border-neutral-800 bg-[#10151c] p-3" aria-label="Self-hosted runner devices">
+            <section className="workbench-layer min-w-0 rounded-md border p-3" aria-label="Self-hosted runner devices">
               {selectedProjectId ? (
                 <FleetRunnersPanel
                   projectId={selectedProjectId}
@@ -710,7 +710,7 @@ export function RuntimeWorkspace({
         </div>
       ) : (
         <div className="grid h-full min-h-0 grid-cols-1 overflow-hidden lg:grid-cols-[260px_minmax(0,1fr)]">
-          <aside className="min-h-0 overflow-auto border-b border-neutral-800 bg-[#080c11] p-3 custom-scrollbar lg:border-b-0 lg:border-r">
+          <aside className="min-h-0 overflow-auto border-b border-workbench-border bg-workbench-rail p-3 custom-scrollbar lg:border-b-0 lg:border-r">
             <RuntimeSettingsStatusRail
               selectedProjectRepoLabel={selectedProjectRepoLabel}
               selectedProjectId={selectedProjectId}
@@ -729,8 +729,8 @@ export function RuntimeWorkspace({
                     onClick={() => onRuntimeConfigSectionChange(item.id)}
                     className={`flex min-h-11 w-full items-center gap-2 rounded-md border px-2.5 py-2 text-left transition-colors ${
                       selected
-                        ? 'border-neutral-700 bg-[#151c25] text-neutral-100'
-                        : 'border-transparent text-neutral-400 hover:border-neutral-800 hover:bg-[#10151c] hover:text-neutral-200'
+                        ? 'border-workbench-border-strong bg-workbench-hover text-neutral-100'
+                        : 'border-transparent text-neutral-400 hover:border-workbench-border hover:bg-workbench-layer hover:text-neutral-200'
                     }`}
                   >
                     <Icon className="h-3.5 w-3.5 shrink-0" />
@@ -748,7 +748,7 @@ export function RuntimeWorkspace({
           <div className="min-h-0 overflow-auto p-3 custom-scrollbar">
             <div className="mx-auto max-w-6xl space-y-4">
               <RuntimeSectionIntro item={activeRuntimeSettingsItem} />
-              <SettingsSectionRouter {...settingsRouterProps} activeSection={activeRuntimeSettingsItem.id} />
+              <SettingsSectionRouter {...settingsRouterProps} hostKind="workspace" activeSection={activeRuntimeSettingsItem.id} />
             </div>
           </div>
         </div>

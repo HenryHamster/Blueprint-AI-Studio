@@ -1,5 +1,5 @@
 import { useEffect, useState, type ComponentProps, type ReactNode } from 'react';
-import { ArrowUpRight, ChevronDown, ChevronRight, Star } from 'lucide-react';
+import { ChevronDown, ChevronRight, Star } from 'lucide-react';
 import ArchiveView from './ArchiveView';
 import { ErrorBoundary } from './ErrorBoundary';
 import { KanbanBoard } from './KanbanBoard';
@@ -200,7 +200,7 @@ function PipelineStatusDetail({
   }[tone];
 
   return (
-    <div className="min-w-0 bg-[#070b11] px-3 py-2" title={title}>
+    <div className="min-w-0 bg-workbench-rail px-3 py-2" title={title}>
       <dt className="text-ui-sm font-semibold uppercase text-neutral-600">{label}</dt>
       <dd className={`mt-0.5 min-w-0 truncate font-mono text-ui-md ${valueClass}`}>{value}</dd>
     </div>
@@ -230,7 +230,7 @@ function PipelineStatusStrip({ status }: { status: PipelineWorkspaceStatus }) {
     : null;
 
   return (
-    <section className="border-b border-neutral-800 bg-[#070b11] text-xs" data-testid="pipeline-status-strip">
+    <section className="border-b border-workbench-border bg-workbench-rail text-xs" data-testid="pipeline-status-strip">
       <div
         data-viewport-allow-overflow
         className="flex w-full min-w-0 max-w-full items-center gap-1.5 px-2.5 py-1.5"
@@ -431,8 +431,9 @@ function PipelineNowRow({
       <button
         type="button"
         onClick={() => onOpenTask(item.task)}
-        className="min-w-0 text-left"
+        className="min-h-11 min-w-0 text-left"
         title={item.task.title || item.task.id}
+        aria-label={`Open ${item.task.title || item.task.id}`}
       >
         <div className="flex min-w-0 items-center gap-2">
           <span className="shrink-0 rounded border border-current/20 px-1.5 py-0.5 font-mono text-ui-sm uppercase">
@@ -454,15 +455,6 @@ function PipelineNowRow({
             <Star className="h-3.5 w-3.5" aria-hidden="true" />
           </button>
         )}
-        <button
-          type="button"
-          onClick={() => onOpenTask(item.task)}
-          className="inline-flex min-h-11 min-w-11 items-center justify-center rounded border border-neutral-800 bg-neutral-950/55 text-neutral-500 transition-colors hover:border-neutral-700 hover:text-neutral-200"
-          title={`Open ${item.task.title || item.task.id}`}
-          aria-label={`Open ${item.task.title || item.task.id}`}
-        >
-          <ArrowUpRight className="h-3.5 w-3.5" aria-hidden="true" />
-        </button>
       </div>
     </div>
   );
@@ -476,7 +468,7 @@ function PipelineNowPanel({ rail, metrics, tasks }: { rail: PipelineRailProps; m
   return (
     <section
       data-testid="pipeline-now-panel"
-      className="min-w-0 overflow-hidden rounded border border-neutral-800/80 bg-[#0b1118]/90"
+      className="min-w-0 overflow-hidden rounded border border-workbench-border/80 bg-workbench-panel/90"
     >
       <div className="flex min-w-0 items-center justify-between gap-3 border-b border-neutral-800/80 px-2.5 py-2">
         <h2 className="truncate text-sm font-semibold text-neutral-100">Now</h2>
@@ -530,7 +522,7 @@ function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardPro
 
       <section
         data-testid="pipeline-health-panel"
-        className="min-w-0 overflow-hidden rounded border border-neutral-800/80 bg-[#0b1118]/90"
+        className="min-w-0 overflow-hidden rounded border border-workbench-border/80 bg-workbench-panel/90"
       >
         <div className="flex min-w-0 items-center justify-between gap-3 border-b border-neutral-800/80 px-2.5 py-2">
           <div className="min-w-0">
@@ -624,7 +616,7 @@ export function PipelineWorkspace({
           {chrome.filterStrip}
           {status && <PipelineStatusStrip status={status} />}
           <div className="grid min-h-0 min-w-0 flex-1 grid-cols-1 grid-rows-[auto_minmax(0,1fr)] overflow-hidden lg:grid-cols-[minmax(0,1fr)_minmax(300px,25vw)] lg:grid-rows-1">
-            <aside className="max-h-[34vh] min-h-0 min-w-0 overflow-auto border-b border-neutral-800 bg-[#0b1118] p-1.5 custom-scrollbar lg:col-start-2 lg:row-start-1 lg:max-h-none lg:border-b-0 lg:border-l">
+            <aside className="max-h-[34vh] min-h-0 min-w-0 overflow-auto border-b border-workbench-border bg-workbench-panel p-1.5 custom-scrollbar lg:col-start-2 lg:row-start-1 lg:max-h-none lg:border-b-0 lg:border-l">
               <PipelineSideboard
                 flow={flow}
                 rail={rail}

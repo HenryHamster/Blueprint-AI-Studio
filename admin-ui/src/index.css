@@ -13,6 +13,31 @@
   --color-status-info: var(--color-blue-400);
   --color-status-neutral: var(--color-neutral-400);
 
+  /* Operator workbench visual-system tokens. Keep shell/layout surfaces on
+     these semantic colors instead of repeating literal dark values. */
+  --color-workbench-base: #03060a;
+  --color-workbench-shell: #020407;
+  --color-workbench-surface: #04070b;
+  --color-workbench-rail: #080d13;
+  --color-workbench-panel: #0c1219;
+  --color-workbench-layer: #10151c;
+  --color-workbench-card: #0d1218;
+  --color-workbench-hover: #151c25;
+  --color-workbench-control: #05080d;
+  --color-workbench-border: #1f2933;
+  --color-workbench-border-strong: #374151;
+  --color-workbench-focus: #22d3ee;
+  --color-workbench-text: #f5f5f5;
+  --color-workbench-text-muted: #a3a3a3;
+  --color-workbench-text-subtle: #737373;
+
+  --spacing-workbench-1: 2px;
+  --spacing-workbench-2: 4px;
+  --spacing-workbench-3: 6px;
+  --spacing-workbench-4: 8px;
+  --spacing-workbench-5: 12px;
+  --spacing-workbench-6: 16px;
+
   /* Font size tokens for compact UI typography (8-11px range).
      Use text-ui-2xs (8px), text-ui-xs (9px), text-ui-sm (10px), or text-ui-md (11px) for
      dense labels, badges, and secondary meta inside cards. */
@@ -29,6 +54,38 @@
   }
   html::-webkit-scrollbar, body::-webkit-scrollbar {
     display: none;
+  }
+}
+
+@layer components {
+  .workbench-focus {
+    outline: none;
+  }
+
+  .workbench-focus:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--color-workbench-focus) 75%, transparent);
+    outline-offset: -2px;
+    box-shadow: inset 0 0 0 1px var(--color-workbench-shell);
+  }
+
+  .workbench-panel {
+    background: var(--color-workbench-panel);
+    border-color: var(--color-workbench-border);
+  }
+
+  .workbench-card {
+    background: var(--color-workbench-card);
+    border-color: var(--color-workbench-border);
+  }
+
+  .workbench-layer {
+    background: var(--color-workbench-layer);
+    border-color: var(--color-workbench-border);
+  }
+
+  .workbench-control {
+    background: color-mix(in srgb, var(--color-workbench-control) 88%, transparent);
+    border-color: color-mix(in srgb, var(--color-workbench-border) 82%, transparent);
   }
 }
 

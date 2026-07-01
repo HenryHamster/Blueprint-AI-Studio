@@ -168,7 +168,7 @@ export function RuntimeAccountsPanel({
 
   return (
     <div className="space-y-3">
-      <section aria-label="Runtime account monitor" className="rounded-md border border-neutral-800 bg-[#10151c]">
+      <section aria-label="Runtime account monitor" className="workbench-layer rounded-md border">
         <div className="flex flex-col gap-2 border-b border-neutral-800 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
           <div className="min-w-0">
             <h3 className="text-xs font-semibold uppercase tracking-wider text-neutral-300">Account monitor</h3>
@@ -259,13 +259,13 @@ export function RuntimeAccountsPanel({
       </section>
 
       <div className="grid gap-3 xl:grid-cols-[minmax(360px,0.95fr)_minmax(0,1.05fr)]">
-        <section className="min-w-0 rounded-md border border-neutral-800 bg-[#10151c] p-3" aria-label="Account configuration">
-          <SettingsSectionRouter {...settingsRouterProps} activeSection="accounts" />
+        <section className="workbench-layer min-w-0 rounded-md border p-3" aria-label="Account configuration">
+          <SettingsSectionRouter {...settingsRouterProps} hostKind="workspace" activeSection="accounts" />
         </section>
 
         <section className="min-w-0 space-y-3" aria-label="Account runtime signals">
           {!selectedProjectId && (
-            <div className="rounded-md border border-neutral-800 bg-[#10151c] px-3 py-2 text-ui-md text-neutral-500">
+            <div className="workbench-layer rounded-md border px-3 py-2 text-ui-md text-neutral-500">
               No project selected. Provider/model and cost panels are showing fleet-wide readings.
             </div>
           )}
@@ -276,7 +276,7 @@ export function RuntimeAccountsPanel({
             generatedAt={generatedAt}
           />
           {!loadingHealth && !pollError && accountHealth && accountHealth.length === 0 && (
-            <div className="rounded-md border border-neutral-800 bg-[#10151c] px-3 py-4 text-center text-xs text-neutral-500">
+            <div className="workbench-layer rounded-md border px-3 py-4 text-center text-xs text-neutral-500">
               No provider account health rows are available yet.
             </div>
           )}

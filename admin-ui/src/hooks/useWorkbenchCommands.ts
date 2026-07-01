@@ -1,6 +1,8 @@
 import { useMemo, useState } from 'react';
 import type { WorkbenchCommand } from '../components/CommandPalette';
 import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
+import { SETTINGS_SECTION_HOMES } from '../components/OperatorWorkspaceSections';
+import type { SectionId } from '../components/settingsSections';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import { executeStrategicWorkSessionCommand } from '../strategicStateApi';
 import type {
@@ -516,6 +518,18 @@ export function useWorkbenchCommands({
       setRuntimeConfigSection(section);
       handleTabChange('runtime');
       closePalette();
+    };
+    const openSettingsSectionHome = (section: SectionId) => {
+      const home = SETTINGS_SECTION_HOMES[section];
+      if (home.surface === 'project') {
+        openProjectManageSection(home.section);
+        return;
+      }
+      if (home.section === 'accounts') {
+        openRuntimeSection('accounts');
+        return;
+      }
+      if (home.settingsSection) openRuntimeSettingsSection(home.settingsSection);
     };
     const openPipelineSection = (section: PipelineSection) => {
       setPipelineSection(section);
@@ -1260,7 +1274,7 @@ export function useWorkbenchCommands({
         detail: 'Detection, test, install commands',
         keywords: ['settings', 'build', 'test', 'install', 'commands'],
         disabled: projectDisabled,
-        run: () => openProjectManageSection('build-config'),
+        run: () => openSettingsSectionHome('build-config'),
       },
       {
         id: 'project.branches',
@@ -1269,7 +1283,7 @@ export function useWorkbenchCommands({
         detail: 'Integration and promotion targets',
         keywords: ['settings', 'branches', 'integration', 'promotion'],
         disabled: projectDisabled,
-        run: () => openProjectManageSection('branches'),
+        run: () => openSettingsSectionHome('branches'),
       },
       {
         id: 'project.review',
@@ -1278,7 +1292,7 @@ export function useWorkbenchCommands({
         detail: 'Review gates and autonomous decisions',
         keywords: ['settings', 'review', 'auto-review', 'approval', 'gates'],
         disabled: projectDisabled,
-        run: () => openProjectManageSection('auto-review'),
+        run: () => openSettingsSectionHome('auto-review'),
       },
       {
         id: 'project.resources',
@@ -1287,7 +1301,7 @@ export function useWorkbenchCommands({
         detail: 'Runtime and budget envelope',
         keywords: ['settings', 'resources', 'budget', 'runtime', 'envelope'],
         disabled: projectDisabled,
-        run: () => openProjectManageSection('resource-envelope'),
+        run: () => openSettingsSectionHome('resource-envelope'),
       },
       {
         id: 'project.remediation',
@@ -1296,7 +1310,7 @@ export function useWorkbenchCommands({
         detail: 'Failure recovery behavior',
         keywords: ['settings', 'remediation', 'recovery', 'failure', 'auto-remediation'],
         disabled: projectDisabled,
-        run: () => openProjectManageSection('auto-remediation'),
+        run: () => openSettingsSectionHome('auto-remediation'),
       },
       {
         id: 'project.issue_implementation',
@@ -1305,7 +1319,7 @@ export function useWorkbenchCommands({
         detail: 'Issue implementation policy',
         keywords: ['settings', 'issues', 'implementation', 'github', 'policy'],
         disabled: projectDisabled,
-        run: () => openProjectManageSection('issue-implementation'),
+        run: () => openSettingsSectionHome('issue-implementation'),
       },
       {
         id: 'project.alert_domains',
@@ -1314,7 +1328,7 @@ export function useWorkbenchCommands({
         detail: 'Project alert routing',
         keywords: ['settings', 'alerts', 'domains', 'routing', 'notifications'],
         disabled: projectDisabled,
-        run: () => openProjectManageSection('alert-domains'),
+        run: () => openSettingsSectionHome('alert-domains'),
       },
       {
         id: 'project.access',
@@ -1323,7 +1337,7 @@ export function useWorkbenchCommands({
         detail: 'Roles and project access policy',
         keywords: ['settings', 'access', 'members', 'roles', 'users'],
         disabled: projectDisabled,
-        run: () => openProjectManageSection('access'),
+        run: () => openSettingsSectionHome('access'),
       },
       {
         id: 'project.members',
@@ -1373,7 +1387,7 @@ export function useWorkbenchCommands({
         section: 'Runtime',
         detail: `${maxPlanAccountCount} LLM accounts`,
         keywords: ['accounts', 'cost', 'spend', 'models', 'usage', 'caps', 'pool', 'github', 'llm'],
-        run: () => openRuntimeSection('accounts'),
+        run: () => openSettingsSectionHome('accounts'),
       },
       {
         id: 'runtime.compute',
@@ -1389,7 +1403,7 @@ export function useWorkbenchCommands({
         section: 'Runtime',
         detail: 'Orchestrator defaults',
         keywords: ['settings', 'runtime', 'orchestrator', 'provider', 'routing', 'configuration'],
-        run: () => openRuntimeSettingsSection('orchestrator'),
+        run: () => openSettingsSectionHome('orchestrator'),
       },
       {
         id: 'runtime.settings.general',
@@ -1398,7 +1412,7 @@ export function useWorkbenchCommands({
         detail: 'Defaults, refresh, and local UI behavior',
         keywords: ['settings', 'runtime', 'general', 'defaults', 'refresh', 'local'],
         shortcut: 'S',
-        run: () => openRuntimeSettingsSection('general'),
+        run: () => openSettingsSectionHome('general'),
       },
       {
         id: 'runtime.settings.deploy',
@@ -1407,7 +1421,7 @@ export function useWorkbenchCommands({
         detail: 'Pipeline health and deploy controls',
         keywords: ['settings', 'runtime', 'deploy', 'deployment', 'health'],
         disabled: !isAdmin,
-        run: () => openRuntimeSettingsSection('deploy'),
+        run: () => openSettingsSectionHome('deploy'),
       },
       {
         id: 'runtime.settings.provider-routing',
@@ -1416,7 +1430,7 @@ export function useWorkbenchCommands({
         detail: 'Task and category policy',
         keywords: ['settings', 'provider', 'routing', 'models', 'policy'],
         disabled: !isAdmin,
-        run: () => openRuntimeSettingsSection('provider-routing'),
+        run: () => openSettingsSectionHome('provider-routing'),
       },
       {
         id: 'runtime.settings.provider-settings',
@@ -1425,7 +1439,7 @@ export function useWorkbenchCommands({
         detail: 'Model defaults and effort routing',
         keywords: ['settings', 'provider', 'models', 'effort', 'defaults'],
         disabled: !isAdmin,
-        run: () => openRuntimeSettingsSection('provider-settings'),
+        run: () => openSettingsSectionHome('provider-settings'),
       },
       {
         id: 'runtime.settings.notifications',
@@ -1433,7 +1447,7 @@ export function useWorkbenchCommands({
         section: 'Runtime',
         detail: 'Webhook, event, and spend alerts',
         keywords: ['settings', 'notifications', 'alerts', 'webhook', 'spend'],
-        run: () => openRuntimeSettingsSection('notifications'),
+        run: () => openSettingsSectionHome('notifications'),
       },
       {
         id: 'runtime.settings.advanced',
@@ -1441,7 +1455,7 @@ export function useWorkbenchCommands({
         section: 'Runtime',
         detail: 'Health checks and diagnostics',
         keywords: ['settings', 'advanced', 'health checks', 'diagnostics'],
-        run: () => openRuntimeSettingsSection('advanced'),
+        run: () => openSettingsSectionHome('advanced'),
       },
       {
         id: 'activity.open',

@@ -734,6 +734,7 @@ export default function App() {
         setRuntimeConfigSection('notifications');
       }
     },
+    hostKind: 'workspace',
     closeOnExternalPanelOpen: false,
     onToggleSettings: ignoreEmbeddedSettingsClose,
     allModelOptions,
@@ -947,7 +948,7 @@ export default function App() {
   const openStrategicContextTarget = useStrategicContextNavigation({
     handleTabChange, openMessages: strategicMessageTarget.open, selectPipelineTaskById,
     setKnowledgeBrowserDirectionId, setKnowledgeBrowserInitialDocId,
-    setPipelineSection, setProjectSection, setRuntimeSection,
+    setPipelineSection, setProjectSection, setProjectManageSection, setRuntimeSection, setRuntimeConfigSection,
     setShowArchive: s.setShowArchive, setShowKnowledgeBrowser: s.setShowKnowledgeBrowser, setViewMode: s.setViewMode,
   });
   const openStrategicContextWorkspace = useCallback(() => {

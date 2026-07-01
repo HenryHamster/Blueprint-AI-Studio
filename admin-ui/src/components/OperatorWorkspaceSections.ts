@@ -39,6 +39,10 @@ export type RuntimeSettingsSection = Extract<
   | 'notifications'
   | 'advanced'
 >;
+export type RuntimePolicySection = RuntimeSettingsSection | 'accounts';
+export type SettingsSectionHome =
+  | { surface: 'project'; section: ProjectManageSection }
+  | { surface: 'runtime'; section: RuntimeSection; settingsSection?: RuntimeSettingsSection };
 
 export type SectionNavItem<T extends string> = {
   id: T;
@@ -78,6 +82,34 @@ export const RUNTIME_SECTIONS: SectionNavItem<RuntimeSection>[] = [
   { id: 'settings', label: 'Settings', description: 'Runtime defaults, automation limits, providers, deploy controls, and alerts.', icon: SlidersHorizontal },
   { id: 'analytics', label: 'Analytics', description: 'Cost, account health, portfolio signals, and provider/model breakdowns.', icon: Activity },
 ];
+
+export const PROJECT_POLICY_SECTIONS = PROJECT_MANAGE_SECTIONS
+  .map(item => item.id)
+  .filter((id): id is Exclude<ProjectManageSection, 'overview'> => id !== 'overview');
+
+export const RUNTIME_POLICY_SECTIONS: RuntimePolicySection[] = [
+  'accounts',
+  ...RUNTIME_SETTINGS_SECTIONS.map(item => item.id),
+];
+
+export const SETTINGS_SECTION_HOMES: Record<SectionId, SettingsSectionHome> = {
+  'build-config': { surface: 'project', section: 'build-config' },
+  branches: { surface: 'project', section: 'branches' },
+  'auto-review': { surface: 'project', section: 'auto-review' },
+  'resource-envelope': { surface: 'project', section: 'resource-envelope' },
+  'auto-remediation': { surface: 'project', section: 'auto-remediation' },
+  'issue-implementation': { surface: 'project', section: 'issue-implementation' },
+  'alert-domains': { surface: 'project', section: 'alert-domains' },
+  access: { surface: 'project', section: 'access' },
+  accounts: { surface: 'runtime', section: 'accounts' },
+  general: { surface: 'runtime', section: 'settings', settingsSection: 'general' },
+  orchestrator: { surface: 'runtime', section: 'settings', settingsSection: 'orchestrator' },
+  deploy: { surface: 'runtime', section: 'settings', settingsSection: 'deploy' },
+  'provider-routing': { surface: 'runtime', section: 'settings', settingsSection: 'provider-routing' },
+  'provider-settings': { surface: 'runtime', section: 'settings', settingsSection: 'provider-settings' },
+  notifications: { surface: 'runtime', section: 'settings', settingsSection: 'notifications' },
+  advanced: { surface: 'runtime', section: 'settings', settingsSection: 'advanced' },
+};
 
 export function visibleRuntimeSettingsSections(userRole: 'admin' | 'user' | null) {
   return RUNTIME_SETTINGS_SECTIONS.filter(item => !item.adminOnly || userRole === 'admin');

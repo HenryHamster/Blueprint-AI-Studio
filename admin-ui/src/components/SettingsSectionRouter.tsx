@@ -46,9 +46,9 @@ import type { SectionId } from './settingsSections';
 
 /**
  * Props consumed by {@link SettingsSectionRouter}. These are exactly the
- * section-specific props that were previously threaded through every
- * `renderXxx()` helper inside the retired settings modal. Keeping them here
- * lets Runtime and Project host the settings bodies directly.
+ * section-specific props consumed by the existing settings bodies. Keeping
+ * them here lets Runtime and Project host the forms directly while the legacy
+ * settings modal can still host the same router.
  *
  * The shape is intentionally identical (same names, same types) to the
  * corresponding settings section props so the behavior is preserved exactly —
@@ -59,8 +59,12 @@ export interface SettingsSectionRouterProps {
   isAdmin: boolean;
   /** Navigate to another section (used by the General section's CTA). */
   onNavigateToSection: (section: SectionId) => void;
-  /** Close the whole settings panel when this router is hosted in the modal. */
+  hostKind?: 'workspace' | 'modal';
+  /** Close the containing modal/panel when this router is hosted outside a workspace. */
+  onCloseHost?: () => void;
+  /** @deprecated Use hostKind/onCloseHost. Kept for older modal hosts. */
   onToggleSettings: () => void;
+  /** @deprecated Use hostKind="workspace" for embedded Runtime/Project hosts. */
   closeOnExternalPanelOpen?: boolean;
   /** Computed union of every model name referenced by routing/preferences. */
   allModelOptions: string[];
@@ -247,7 +251,10 @@ export interface SettingsSectionRouterProps {
  */
 export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
   const closeExternalPanelHost = () => {
-    if (props.closeOnExternalPanelOpen ?? true) props.onToggleSettings();
+    const shouldClose = props.hostKind
+      ? props.hostKind === 'modal'
+      : (props.closeOnExternalPanelOpen ?? true);
+    if (shouldClose) (props.onCloseHost ?? props.onToggleSettings)();
   };
 
   switch (props.activeSection) {

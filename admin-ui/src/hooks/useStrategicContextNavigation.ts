@@ -1,5 +1,7 @@
 import { useCallback } from 'react';
-import type { ProjectSection, RuntimeSection } from '../components/OperatorWorkspaces';
+import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
+import { SETTINGS_SECTION_HOMES } from '../components/OperatorWorkspaceSections';
+import type { SectionId } from '../components/settingsSections';
 import type { PipelineSection } from './useWorkbenchCommands';
 import type { PrimaryTab } from './useUIState';
 import type { ViewMode } from './useViewPreferences';
@@ -15,7 +17,9 @@ interface UseStrategicContextNavigationOptions {
   setKnowledgeBrowserInitialDocId: (documentId: string | null) => void;
   setPipelineSection: (section: PipelineSection) => void;
   setProjectSection: (section: ProjectSection) => void;
+  setProjectManageSection: (section: ProjectManageSection) => void;
   setRuntimeSection: (section: RuntimeSection) => void;
+  setRuntimeConfigSection: (section: RuntimeSettingsSection) => void;
   setShowArchive: (show: boolean) => void;
   setShowKnowledgeBrowser: (show: boolean) => void;
   setViewMode: (mode: ViewMode) => void;
@@ -38,6 +42,10 @@ function isRuntimeSection(value?: string | null): value is RuntimeSection {
     value === 'analytics';
 }
 
+function isSettingsSection(value?: string | null): value is SectionId {
+  return typeof value === 'string' && value in SETTINGS_SECTION_HOMES;
+}
+
 function normalizePipelineSection(value?: string | null): PipelineSection {
   if (value === 'board' || value === 'archive' || value === 'flow') return value;
   return 'flow';
@@ -58,7 +66,9 @@ export function useStrategicContextNavigation({
   setKnowledgeBrowserInitialDocId,
   setPipelineSection,
   setProjectSection,
+  setProjectManageSection,
   setRuntimeSection,
+  setRuntimeConfigSection,
   setShowArchive,
   setShowKnowledgeBrowser,
   setViewMode,
@@ -69,6 +79,15 @@ export function useStrategicContextNavigation({
       return;
     }
     if (target.surface === 'project') {
+      if (isSettingsSection(target.section)) {
+        const home = SETTINGS_SECTION_HOMES[target.section];
+        if (home.surface === 'project') {
+          setProjectSection('manage');
+          setProjectManageSection(home.section);
+          handleTabChange('project');
+          return;
+        }
+      }
       if (isProjectSection(target.section)) setProjectSection(target.section);
       handleTabChange('project');
       return;
@@ -84,6 +103,15 @@ export function useStrategicContextNavigation({
       return;
     }
     if (target.surface === 'runtime') {
+      if (isSettingsSection(target.section)) {
+        const home = SETTINGS_SECTION_HOMES[target.section];
+        if (home.surface === 'runtime') {
+          setRuntimeSection(home.section);
+          if (home.settingsSection) setRuntimeConfigSection(home.settingsSection);
+          handleTabChange('runtime');
+          return;
+        }
+      }
       setRuntimeSection(isRuntimeSection(target.section) ? target.section : 'health');
       handleTabChange('runtime');
       return;
@@ -113,7 +141,9 @@ export function useStrategicContextNavigation({
     setKnowledgeBrowserInitialDocId,
     setPipelineSection,
     setProjectSection,
+    setProjectManageSection,
     setRuntimeSection,
+    setRuntimeConfigSection,
     setShowArchive,
     setShowKnowledgeBrowser,
     setViewMode,
