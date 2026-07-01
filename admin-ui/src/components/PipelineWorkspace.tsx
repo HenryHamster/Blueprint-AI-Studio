@@ -425,7 +425,7 @@ export function PipelineWorkspace({
       tabLayout="stacked"
       flush
     >
-      {surface.pipelineSection === 'archive' && surface.showArchive ? (
+      {surface.pipelineSection === 'archive' ? (
         <ArchiveView
           {...archive}
           setShowArchive={(show) => {
@@ -436,7 +436,7 @@ export function PipelineWorkspace({
             }
           }}
         />
-      ) : surface.viewMode === 'pipeline' ? (
+      ) : surface.pipelineSection === 'flow' ? (
         <div className="flex h-full min-h-0 flex-col">
           {chrome.filterStrip}
           {status && <PipelineStatusStrip status={status} />}

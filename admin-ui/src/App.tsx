@@ -1180,7 +1180,7 @@ export default function App() {
   const pipelinePagination = (
     <Pagination page={s.page} onPageChange={s.setPage} taskCount={filteredTasks.length} serverTaskCount={s.tasks.length} limit={s.limit} onLimitChange={s.setLimit} totalTasks={s.totalTasks} />
   );
-  const pipelineFlowOwnsTaskStream = activeTab === 'pipeline' && pipelineSection === 'flow' && s.viewMode === 'pipeline';
+  const pipelineFlowOwnsTaskStream = activeTab === 'pipeline' && pipelineSection === 'flow';
 
   if (s.authLoading) {
     return (

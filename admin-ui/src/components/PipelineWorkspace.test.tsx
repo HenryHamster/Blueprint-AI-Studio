@@ -271,6 +271,79 @@ describe('PipelineWorkspace status strip', () => {
   });
 });
 
+describe('PipelineWorkspace section routing', () => {
+  test('renders archive from the selected section even when the legacy archive flag is stale', () => {
+    renderWorkspace({
+      surface: {
+        pipelineSection: 'archive',
+        onPipelineSectionChange: vi.fn(),
+        showArchive: false,
+        setShowArchive: vi.fn(),
+        viewMode: 'pipeline',
+        setViewMode: vi.fn(),
+      },
+    });
+
+    expect(screen.getByRole('button', { name: 'Archive' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByTestId('archive-view')).toBeInTheDocument();
+    expect(screen.queryByTestId('pipeline-view')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('kanban-board')).not.toBeInTheDocument();
+  });
+
+  test('renders board from the selected section even when the legacy view mode is stale', () => {
+    renderWorkspace({
+      surface: {
+        pipelineSection: 'board',
+        onPipelineSectionChange: vi.fn(),
+        showArchive: false,
+        setShowArchive: vi.fn(),
+        viewMode: 'pipeline',
+        setViewMode: vi.fn(),
+      },
+    });
+
+    expect(screen.getByRole('button', { name: 'Board' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByTestId('kanban-board')).toBeInTheDocument();
+    expect(screen.queryByTestId('pipeline-view')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('archive-view')).not.toBeInTheDocument();
+  });
+
+  test('renders tasks from the selected section even when the legacy view mode is stale', () => {
+    const trackedTask = makeTask({ id: 'task-stale-flow-stream', title: 'Tracked stale flow task', status: 'IN_PROGRESS' });
+    renderWorkspace({
+      surface: {
+        pipelineSection: 'flow',
+        onPipelineSectionChange: vi.fn(),
+        showArchive: true,
+        setShowArchive: vi.fn(),
+        viewMode: 'kanban',
+        setViewMode: vi.fn(),
+      },
+      flow: {
+        tasks: [trackedTask],
+        hasActiveFilters: false,
+        onViewLogs: vi.fn(),
+        onNavigateToParent: vi.fn(),
+        onArchiveGroup: vi.fn(),
+        onUnarchiveTask: vi.fn(),
+      },
+      stream: {
+        trackedTaskIds: new Set([trackedTask.id]),
+        trackedLogs: new Map([[trackedTask.id, [{ id: 1, t: '2026-06-30T12:00:01Z', type: 'system', msg: 'stream attached' }]]]),
+        tasks: [trackedTask],
+        onUntrack: vi.fn(),
+        onUntrackAll: vi.fn(),
+      },
+    });
+
+    expect(screen.getByRole('button', { name: 'Tasks' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByTestId('pipeline-view')).toBeInTheDocument();
+    expect(screen.getByTestId('task-stream-panel')).toHaveAttribute('data-variant', 'embedded');
+    expect(screen.queryByTestId('kanban-board')).not.toBeInTheDocument();
+    expect(screen.queryByTestId('archive-view')).not.toBeInTheDocument();
+  });
+});
+
 describe('PipelineWorkspace task stream', () => {
   test('composes pipeline metrics, embedded stream, and task context in the flow sideboard', () => {
     const trackedTask = makeTask({ id: 'task-stream-1', title: 'Tracked pipeline task', status: 'IN_PROGRESS' });
