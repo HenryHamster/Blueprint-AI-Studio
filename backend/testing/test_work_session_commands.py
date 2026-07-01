@@ -141,6 +141,35 @@ def test_work_session_commands_clear_selected_refs_uses_existing_session_endpoin
     assert clear_refs["refetch_surfaces"] == ["strategic_session"]
 
 
+def test_work_session_command_mutations_url_encode_project_id_path_segment():
+    commands = build_work_session_commands(
+        project_id="owner/repo project",
+        workbench_state={
+            "interaction_mode": "monitor",
+            "selected_refs": [
+                {"kind": "task", "id": "task-1", "label": "Selected task"}
+            ],
+        },
+        context_package=None,
+        actions=[],
+    )
+
+    mutation_paths = [
+        command["mutation"]["path"]
+        for command in commands
+        if "mutation" in command
+    ]
+
+    assert mutation_paths
+    assert set(mutation_paths) == {
+        "/api/admin/projects/owner%2Frepo%20project/strategic-session"
+    }
+    assert (
+        "/api/admin/projects/owner/repo project/strategic-session"
+        not in mutation_paths
+    )
+
+
 def test_work_session_commands_dedupe_and_bound_list():
     actions = [
         {

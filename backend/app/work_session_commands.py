@@ -8,6 +8,7 @@ endpoints.
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote
 
 
 MAX_WORK_SESSION_COMMANDS = 24
@@ -111,7 +112,8 @@ def _command(
 
 
 def _strategic_session_endpoint(project_id: Any) -> str:
-    return f"/api/admin/projects/{project_id}/strategic-session"
+    encoded_project_id = quote(str(project_id), safe="")
+    return f"/api/admin/projects/{encoded_project_id}/strategic-session"
 
 
 def _mode_command(

@@ -5,7 +5,7 @@ import { useEffect } from 'react';
 import { useWorkbenchCommands, type PipelineSection } from './useWorkbenchCommands';
 import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
-import type { StrategicStateResponse, StrategicWorkbenchState, StrategicWorkSessionAction } from '../strategicStateApi';
+import type { StrategicStateResponse, StrategicWorkbenchState, StrategicWorkSessionAction, StrategicWorkSessionCommand } from '../strategicStateApi';
 import type { ViewMode } from './useViewPreferences';
 
 type Captured = ReturnType<typeof useWorkbenchCommands>;
@@ -180,6 +180,256 @@ describe('useWorkbenchCommands', () => {
       detail: 'Recording check-in',
       disabled: true,
     });
+  });
+
+  test('routes backend work session command descriptors through existing callbacks', () => {
+    const markStrategicChecked = vi.fn();
+    const switchStrategicInteractionMode = vi.fn<(mode: StrategicInteractionMode) => void>();
+    const openStrategicMessageTarget = vi.fn();
+    const openStrategicContextTarget = vi.fn();
+    const updateStrategicSessionRefs = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const runtimeTarget = { surface: 'runtime', section: 'compute', task_id: 'task-runtime' } as const;
+    const commands: StrategicWorkSessionCommand[] = [
+      {
+        id: 'session.check_in',
+        label: 'Check in',
+        group: 'session',
+        priority: 'normal',
+        enabled: true,
+        target: { surface: 'messages', action: 'check_in' },
+      },
+      {
+        id: 'session.mode.continuous',
+        label: 'Workday mode',
+        group: 'mode',
+        priority: 'normal',
+        enabled: true,
+        target: { surface: 'messages', action: 'set_continuous_mode' },
+      },
+      {
+        id: 'session.clear_selected_refs',
+        label: 'Clear selected refs',
+        group: 'context',
+        priority: 'normal',
+        enabled: true,
+        target: { surface: 'project', section: 'selected_refs', action: 'clear' },
+      },
+      {
+        id: 'attention.message:msg-command',
+        label: 'Reply to Strategic question',
+        group: 'attention',
+        priority: 'critical',
+        enabled: true,
+        target: { surface: 'messages', message_id: 'msg-command', action: 'reply' },
+      },
+      {
+        id: 'runtime.inspect',
+        label: 'Inspect runtime hold',
+        group: 'runtime',
+        priority: 'high',
+        enabled: true,
+        target: runtimeTarget,
+      },
+    ];
+    const strategicState = {
+      work_session: {
+        selected_refs: [
+          { kind: 'task', id: 'task-1', label: 'Task 1' },
+          { kind: 'artifact', id: 'artifact-1', label: 'Report' },
+        ],
+        commands,
+        actions: [
+          {
+            id: 'attention.message:msg-command',
+            kind: 'reply',
+            label: 'Duplicate local action',
+            reason: 'Descriptor should own this command',
+            priority: 'critical',
+            source: 'attention',
+            target: { surface: 'messages', message_id: 'msg-command', action: 'reply' },
+            enabled: true,
+          },
+        ],
+      },
+    } as StrategicStateResponse;
+
+    mount({
+      strategicState,
+      markStrategicChecked,
+      switchStrategicInteractionMode,
+      openStrategicMessageTarget,
+      openStrategicContextTarget,
+      updateStrategicSessionRefs,
+      setCommandPaletteOpen,
+    });
+
+    expect(captured.find(command => command.id === 'strategic.check_in.mark')).toBeUndefined();
+    expect(captured.find(command => command.id === 'strategic.mode.continuous')).toBeUndefined();
+    expect(captured.find(command => command.id === 'strategic.session.action.attention.message:msg-command')).toBeUndefined();
+    expect(captured.find(command => command.id === 'session.check_in')).toMatchObject({
+      label: 'Check in',
+      section: 'Strategic',
+      detail: 'Never checked',
+      disabled: false,
+    });
+    expect(captured.find(command => command.id === 'session.clear_selected_refs')?.detail).toBe('2 selected');
+    expect(captured.find(command => command.id === 'runtime.inspect')).toMatchObject({
+      section: 'Runtime',
+      detail: 'Runtime compute / high',
+    });
+
+    captured.find(command => command.id === 'session.check_in')?.run();
+    captured.find(command => command.id === 'session.mode.continuous')?.run();
+    captured.find(command => command.id === 'session.clear_selected_refs')?.run();
+    captured.find(command => command.id === 'attention.message:msg-command')?.run();
+    captured.find(command => command.id === 'runtime.inspect')?.run();
+
+    expect(markStrategicChecked).toHaveBeenCalledTimes(1);
+    expect(switchStrategicInteractionMode).toHaveBeenCalledWith('continuous');
+    expect(openStrategicMessageTarget).toHaveBeenCalledWith({ messageId: 'msg-command', action: 'reply' });
+    expect(openStrategicContextTarget).toHaveBeenCalledWith(runtimeTarget);
+    expect(updateStrategicSessionRefs).toHaveBeenCalledWith(expect.any(Function));
+    const updater = updateStrategicSessionRefs.mock.calls.at(-1)?.[0] as (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs'];
+    expect(updater([{ kind: 'task', id: 'task-1', label: 'Task 1' }])).toEqual([]);
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
+  test('routes message descriptors through context navigation when message opener is unavailable', () => {
+    const openStrategicContextTarget = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const target = { surface: 'messages', message_id: 'msg-command', action: 'reply' } as const;
+    const commands: StrategicWorkSessionCommand[] = [
+      {
+        id: 'attention.message:msg-command',
+        label: 'Reply to Strategic question',
+        group: 'attention',
+        priority: 'critical',
+        enabled: true,
+        target,
+      },
+    ];
+    const strategicState = {
+      work_session: {
+        commands,
+        actions: [
+          {
+            id: 'attention.message:msg-command',
+            kind: 'reply',
+            label: 'Duplicate local action',
+            reason: 'Descriptor should preserve the route',
+            priority: 'critical',
+            source: 'attention',
+            target,
+            enabled: true,
+          },
+        ],
+      },
+    } as StrategicStateResponse;
+
+    mount({ strategicState, openStrategicContextTarget, setCommandPaletteOpen });
+
+    const command = captured.find(item => item.id === 'attention.message:msg-command');
+    expect(command).toMatchObject({ disabled: false, section: 'Messages' });
+    expect(captured.find(item => item.id === 'strategic.session.action.attention.message:msg-command')).toBeUndefined();
+
+    command?.run();
+
+    expect(openStrategicContextTarget).toHaveBeenCalledWith(target);
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
+  test('honors disabled descriptor state and current Strategic mode', () => {
+    const markStrategicChecked = vi.fn();
+    const switchStrategicInteractionMode = vi.fn<(mode: StrategicInteractionMode) => void>();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const commands: StrategicWorkSessionCommand[] = [
+      {
+        id: 'session.mode.chat',
+        label: 'Chat mode',
+        group: 'mode',
+        priority: 'normal',
+        enabled: true,
+        target: { surface: 'messages', action: 'set_chat_mode' },
+      },
+      {
+        id: 'session.mode.monitor',
+        label: 'Monitor mode',
+        group: 'mode',
+        priority: 'normal',
+        enabled: false,
+        target: { surface: 'messages', action: 'set_monitor_mode' },
+      },
+      {
+        id: 'session.check_in',
+        label: 'Check in',
+        group: 'session',
+        priority: 'normal',
+        enabled: true,
+        target: { surface: 'messages', action: 'check_in' },
+      },
+    ];
+
+    mount({
+      strategicInteractionMode: 'chat',
+      checkingInStrategicSession: true,
+      strategicState: { work_session: { commands } } as StrategicStateResponse,
+      markStrategicChecked,
+      switchStrategicInteractionMode,
+      setCommandPaletteOpen,
+    });
+
+    const currentMode = captured.find(command => command.id === 'session.mode.chat');
+    expect(currentMode).toMatchObject({ detail: 'Current mode', disabled: true });
+    currentMode?.run();
+
+    const disabledMode = captured.find(command => command.id === 'session.mode.monitor');
+    expect(disabledMode).toMatchObject({ detail: 'Unavailable', disabled: true });
+    disabledMode?.run();
+
+    const checkIn = captured.find(command => command.id === 'session.check_in');
+    expect(checkIn).toMatchObject({ detail: 'Recording check-in', disabled: true });
+    checkIn?.run();
+
+    expect(switchStrategicInteractionMode).not.toHaveBeenCalled();
+    expect(markStrategicChecked).not.toHaveBeenCalled();
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
+  test('keeps legacy session and action fallbacks when descriptors are absent', () => {
+    const markStrategicChecked = vi.fn();
+    const switchStrategicInteractionMode = vi.fn<(mode: StrategicInteractionMode) => void>();
+    const openStrategicMessageTarget = vi.fn();
+    const action: StrategicWorkSessionAction = {
+      id: 'action-reply-fallback',
+      kind: 'reply',
+      label: 'Reply from fallback action',
+      reason: 'No backend command descriptor was provided',
+      priority: 'critical',
+      source: 'attention',
+      target: { surface: 'messages', message_id: 'msg-fallback', action: 'reply' },
+      enabled: true,
+    };
+
+    mount({
+      strategicState: { work_session: { actions: [action] } } as StrategicStateResponse,
+      markStrategicChecked,
+      switchStrategicInteractionMode,
+      openStrategicMessageTarget,
+    });
+
+    expect(captured.find(command => command.id === 'session.check_in')).toBeUndefined();
+    expect(captured.find(command => command.id === 'strategic.check_in.mark')).toBeDefined();
+    expect(captured.find(command => command.id === 'strategic.mode.continuous')).toBeDefined();
+    expect(captured.find(command => command.id === 'strategic.session.action.action-reply-fallback')).toBeDefined();
+
+    captured.find(command => command.id === 'strategic.check_in.mark')?.run();
+    captured.find(command => command.id === 'strategic.mode.continuous')?.run();
+    captured.find(command => command.id === 'strategic.session.action.action-reply-fallback')?.run();
+
+    expect(markStrategicChecked).toHaveBeenCalledTimes(1);
+    expect(switchStrategicInteractionMode).toHaveBeenCalledWith('continuous');
+    expect(openStrategicMessageTarget).toHaveBeenCalledWith({ messageId: 'msg-fallback', action: 'reply' });
   });
 
   test('exposes dynamic Strategic context commands for open, keep, and remove actions', () => {

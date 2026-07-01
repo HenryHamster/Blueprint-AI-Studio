@@ -17,6 +17,7 @@ import type {
   StrategicStateTaskFocusItem,
   StrategicWorkbenchState,
   StrategicWorkSessionAction,
+  StrategicWorkSessionCommand,
   StrategicWorkSessionRefDescriptor,
 } from '../strategicStateApi';
 import { formatStrategicMetricValue, rankStrategicWorkSessionMetrics } from '../utils/strategicWorkSessionMetrics';
@@ -30,6 +31,7 @@ type StrategicContextCanvas = NonNullable<StrategicContextPackageDescriptor['can
 const WORK_SESSION_ACTION_COMMAND_LIMIT = 4;
 const MESSAGE_COMMAND_LIMIT = 6;
 const TASK_FOCUS_COMMAND_LIMIT = 6;
+const STRATEGIC_INTERACTION_MODES: readonly StrategicInteractionMode[] = ['chat', 'check_in', 'monitor', 'continuous'];
 
 interface UseWorkbenchCommandsOptions {
   selectedProjectId: string | null;
@@ -278,6 +280,64 @@ function workSessionActionContextTarget(action: StrategicWorkSessionAction): Str
   return null;
 }
 
+function isStrategicInteractionMode(value: string | null | undefined): value is StrategicInteractionMode {
+  return Boolean(value && (STRATEGIC_INTERACTION_MODES as readonly string[]).includes(value));
+}
+
+function strategicModeFromCommandId(commandId: string): StrategicInteractionMode | null {
+  if (!commandId.startsWith('session.mode.')) return null;
+  const mode = commandId.slice('session.mode.'.length);
+  return isStrategicInteractionMode(mode) ? mode : null;
+}
+
+function humanizeCommandToken(value?: string | null): string | null {
+  const text = value?.replace(/[._:-]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return text || null;
+}
+
+function workSessionCommandLabel(command: StrategicWorkSessionCommand): string {
+  return command.label?.trim() || humanizeCommandToken(command.id) || 'Open command';
+}
+
+function workSessionCommandPriorityDetail(priority?: string | null): string | null {
+  return priority === 'critical' || priority === 'high' ? priority : null;
+}
+
+function workSessionCommandTargetDetail(target?: StrategicContextTarget | null): string | null {
+  if (!target) return null;
+  const section = humanizeCommandToken(target.section);
+  if (target.surface === 'messages') return target.message_id ? 'Message' : 'Messages';
+  if (target.surface === 'task') return 'Task';
+  if (target.surface === 'runtime') return section ? `Runtime ${section}` : 'Runtime';
+  if (target.surface === 'pipeline') return section ? `Pipeline ${section}` : 'Pipeline';
+  if (target.surface === 'project') return section ? `Project ${section}` : 'Project';
+  if (target.surface === 'knowledge') return 'Knowledge';
+  return humanizeCommandToken(target.surface) ?? 'Target';
+}
+
+function workSessionCommandSection(command: StrategicWorkSessionCommand): string {
+  const group = command.group?.trim();
+  const surface = command.target?.surface;
+  if (command.id === 'session.check_in' || command.id.startsWith('session.mode.') || group === 'session' || group === 'mode') {
+    return 'Strategic';
+  }
+  if (surface === 'messages' || group === 'message') return 'Messages';
+  if (group === 'attention') return 'Attention';
+  if (surface === 'task' || group === 'task') return 'Tasks';
+  if (surface === 'runtime' || group === 'runtime') return 'Runtime';
+  if (surface === 'pipeline') return 'Pipeline';
+  if (surface === 'project' || surface === 'knowledge' || group === 'context') return 'Context';
+  return 'Session';
+}
+
+function messageTargetFromCommand(command: StrategicWorkSessionCommand): StrategicMessageTarget | undefined {
+  const messageId = command.target?.message_id?.trim();
+  if (!messageId) return undefined;
+  const action = command.target?.action;
+  if (action === 'reply' || action === 'highlight') return { messageId, action };
+  return { messageId };
+}
+
 export function useWorkbenchCommands({
   selectedProjectId,
   selectedProjectRepoLabel,
@@ -435,7 +495,25 @@ export function useWorkbenchCommands({
       }
       runAndClose(focusStrategicComposer);
     };
-    const visibleWorkSessionActions = (strategicState?.work_session?.actions ?? []).slice(0, WORK_SESSION_ACTION_COMMAND_LIMIT);
+    const seenWorkSessionCommandIds = new Set<string>();
+    const workSessionCommandDescriptors = (strategicState?.work_session?.commands ?? []).filter(command => {
+      const id = command.id?.trim();
+      if (!id || seenWorkSessionCommandIds.has(id)) return false;
+      seenWorkSessionCommandIds.add(id);
+      return true;
+    });
+    const workSessionCommandIds = seenWorkSessionCommandIds;
+    const workSessionCommandModes = new Set<StrategicInteractionMode>();
+    const workSessionCommandMessageIds = new Set<string>();
+    workSessionCommandDescriptors.forEach(command => {
+      const mode = strategicModeFromCommandId(command.id);
+      if (mode) workSessionCommandModes.add(mode);
+      const messageId = command.target?.message_id?.trim();
+      if (messageId) workSessionCommandMessageIds.add(messageId);
+    });
+    const legacyWorkSessionActions = (strategicState?.work_session?.actions ?? [])
+      .filter(action => !workSessionCommandIds.has(action.id));
+    const visibleWorkSessionActions = legacyWorkSessionActions.slice(0, WORK_SESSION_ACTION_COMMAND_LIMIT);
     const strategicCheckInDetail = checkingInStrategicSession ? 'Recording check-in' : checkInCommandDetail(strategicState?.work_session);
     const visibleEnabledWorkSessionActionIds = new Set(
       visibleWorkSessionActions.filter(action => action.enabled).map(action => action.id),
@@ -445,6 +523,7 @@ export function useWorkbenchCommands({
         .map(action => workSessionActionMessageId(action))
         .filter((id): id is string => Boolean(id)),
     );
+    workSessionCommandMessageIds.forEach(messageId => coveredMessageIds.add(messageId));
     (strategicState?.attention?.items ?? []).forEach(item => {
       if (item.kind === 'message' && item.ref?.id) coveredMessageIds.add(item.ref.id);
     });
@@ -481,6 +560,107 @@ export function useWorkbenchCommands({
 
       closePalette();
     };
+    const workSessionCommandCanRoute = (command: StrategicWorkSessionCommand): boolean => {
+      if (command.id === 'session.check_in') return Boolean(markStrategicChecked);
+      if (command.id.startsWith('session.mode.')) return Boolean(strategicModeFromCommandId(command.id));
+      if (command.id === 'session.clear_selected_refs') return Boolean(updateStrategicSessionRefs);
+      if (command.target?.surface === 'messages') return Boolean(openStrategicMessageTarget || openStrategicContextTarget);
+      return Boolean(command.target && openStrategicContextTarget);
+    };
+    const workSessionDescriptorCommandDetail = (command: StrategicWorkSessionCommand, routeable: boolean): string | undefined => {
+      const mode = strategicModeFromCommandId(command.id);
+      if (command.id === 'session.check_in') return strategicCheckInDetail;
+      if (mode) {
+        if (mode === strategicInteractionMode) return 'Current mode';
+        if (savingStrategicWorkbench) return 'Saving session';
+        if (!command.enabled) return 'Unavailable';
+        return 'Set session mode';
+      }
+      if (command.id === 'session.clear_selected_refs') {
+        if (selectedRefs.length === 0) return 'No selected refs';
+        return `${selectedRefs.length} selected`;
+      }
+      if (!routeable) return 'No navigation target';
+      return compactContextDetail(
+        workSessionCommandTargetDetail(command.target),
+        workSessionCommandPriorityDetail(command.priority),
+      ) ?? undefined;
+    };
+    const runWorkSessionCommandDescriptor = (command: StrategicWorkSessionCommand, disabled: boolean) => {
+      if (disabled) {
+        closePalette();
+        return;
+      }
+
+      if (command.id === 'session.check_in') {
+        markStrategicChecked?.();
+        closePalette();
+        return;
+      }
+
+      const mode = strategicModeFromCommandId(command.id);
+      if (mode) {
+        setStrategicModeAndOpenChat(mode);
+        return;
+      }
+
+      if (command.id === 'session.clear_selected_refs') {
+        updateStrategicSessionRefs?.(() => []);
+        closePalette();
+        return;
+      }
+
+      const target = command.target ?? null;
+      if (target?.surface === 'messages') {
+        if (openStrategicMessageTarget) {
+          openStrategicMessageTarget(messageTargetFromCommand(command));
+          closePalette();
+        } else {
+          openContextTarget(target);
+        }
+        return;
+      }
+
+      if (target) {
+        openContextTarget(target);
+        return;
+      }
+
+      closePalette();
+    };
+    const workSessionDescriptorCommands = workSessionCommandDescriptors.map((command): WorkbenchCommand => {
+      const routeable = workSessionCommandCanRoute(command);
+      const mode = strategicModeFromCommandId(command.id);
+      const disabled = projectDisabled
+        || !command.enabled
+        || !routeable
+        || (command.id === 'session.check_in' && checkingInStrategicSession)
+        || (Boolean(mode) && (savingStrategicWorkbench || mode === strategicInteractionMode))
+        || (command.id === 'session.clear_selected_refs' && savingStrategicWorkbench);
+      return {
+        id: command.id,
+        label: workSessionCommandLabel(command),
+        section: workSessionCommandSection(command),
+        detail: workSessionDescriptorCommandDetail(command, routeable),
+        keywords: [
+          'strategic',
+          'session',
+          'command',
+          command.id,
+          command.group,
+          command.priority,
+          command.label,
+          command.target?.surface ?? '',
+          command.target?.section ?? '',
+          command.target?.task_id ?? '',
+          command.target?.message_id ?? '',
+          command.target?.document_id ?? '',
+          command.target?.artifact_id ?? '',
+        ],
+        disabled,
+        run: () => runWorkSessionCommandDescriptor(command, disabled),
+      };
+    });
     const workSessionActionCommands = visibleWorkSessionActions.map((action): WorkbenchCommand => {
       const routeable = workSessionActionCanRoute(action);
       const disabled = projectDisabled || !action.enabled || !routeable;
@@ -554,7 +734,7 @@ export function useWorkbenchCommands({
         });
       }
     };
-    if (contextPackage) {
+    if (contextPackage && !workSessionCommandIds.has('context.canvas.open')) {
       const resourceCount = listedResources.length;
       const mapTarget = canvasResources.find(resource => resource.target)?.target
         ?? { surface: 'project', section: 'problem-model' };
@@ -657,6 +837,7 @@ export function useWorkbenchCommands({
     });
     const attentionCommandEntries = (strategicState?.attention?.items ?? [])
       .filter(item => !visibleEnabledWorkSessionActionIds.has(`attention.${item.id}`))
+      .filter(item => !workSessionCommandIds.has(item.id) && !workSessionCommandIds.has(`attention.${item.id}`))
       .slice(0, 8)
       .map((item): WorkbenchCommand => ({
         id: `strategic.attention.${item.kind}.${item.id}`,
@@ -792,7 +973,8 @@ export function useWorkbenchCommands({
         disabled: projectDisabled,
         run: focusStrategicComposer,
       },
-      {
+      ...workSessionDescriptorCommands,
+      ...(workSessionCommandIds.has('session.check_in') ? [] : [{
         id: 'strategic.check_in.mark',
         label: 'Mark Strategic checked',
         section: 'Strategic',
@@ -800,8 +982,8 @@ export function useWorkbenchCommands({
         keywords: ['check-in', 'check in', 'checked', 'daily', 'status', 'since last', 'strategic'],
         disabled: projectDisabled || checkingInStrategicSession || !markStrategicChecked,
         run: markStrategicChecked ? () => runAndClose(markStrategicChecked) : closePalette,
-      },
-      ...strategicModeCommands.map((command): WorkbenchCommand => ({
+      }]),
+      ...strategicModeCommands.filter(command => !workSessionCommandModes.has(command.mode)).map((command): WorkbenchCommand => ({
         id: command.id,
         label: command.label.replace('Switch Strategic to', 'Set Strategic mode:'),
         section: 'Strategic',
