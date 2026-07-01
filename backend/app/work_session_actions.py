@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.workbench_targets import compact_workbench_target
+
 
 def _compact_text(value: Any, *, max_chars: int = 180) -> str | None:
     if value is None:
@@ -24,27 +26,7 @@ def _compact_text(value: Any, *, max_chars: int = 180) -> str | None:
 
 
 def _compact_action_target(target: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not isinstance(target, dict):
-        return None
-    compact: dict[str, Any] = {}
-    for key in (
-        "surface",
-        "project_id",
-        "section",
-        "task_id",
-        "message_id",
-        "direction_id",
-        "alert_id",
-        "action",
-        "document_id",
-        "artifact_id",
-        "cycle_id",
-        "runner_id",
-    ):
-        value = _compact_text(target.get(key), max_chars=160)
-        if value:
-            compact[key] = value
-    return compact or None
+    return compact_workbench_target(target)
 
 
 def _action(

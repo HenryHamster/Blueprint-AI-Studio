@@ -12,25 +12,15 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
+from app.workbench_targets import (
+    REFETCH_SURFACE_MESSAGES as _MESSAGES_SURFACE,
+    REFETCH_SURFACE_RUNTIME as _RUNTIME_SURFACE,
+    REFETCH_SURFACE_STRATEGIC_SESSION as _STRATEGIC_SESSION_SURFACE,
+    bounded_workbench_refetch_surfaces,
+    compact_workbench_target,
+)
 
 MAX_WORK_SESSION_COMMANDS = 24
-_MESSAGES_SURFACE = "messages"
-_STRATEGIC_SESSION_SURFACE = "strategic_session"
-_RUNTIME_SURFACE = "runtime"
-_COMMAND_TARGET_KEYS = (
-    "surface",
-    "project_id",
-    "section",
-    "task_id",
-    "message_id",
-    "direction_id",
-    "alert_id",
-    "action",
-    "document_id",
-    "artifact_id",
-    "cycle_id",
-    "runner_id",
-)
 
 
 def _compact_text(value: Any, *, max_chars: int = 180) -> str | None:
@@ -47,28 +37,7 @@ def _compact_text(value: Any, *, max_chars: int = 180) -> str | None:
 
 
 def _compact_target(target: dict[str, Any] | None) -> dict[str, Any] | None:
-    if not isinstance(target, dict):
-        return None
-    compact: dict[str, Any] = {}
-    for key in _COMMAND_TARGET_KEYS:
-        value = _compact_text(target.get(key), max_chars=160)
-        if value:
-            compact[key] = value
-    return compact or None
-
-
-def _bounded_surfaces(values: list[str] | tuple[str, ...] | None) -> list[str]:
-    surfaces: list[str] = []
-    seen: set[str] = set()
-    for raw in values or ():
-        surface = _compact_text(raw, max_chars=80)
-        if not surface or surface in seen:
-            continue
-        surfaces.append(surface)
-        seen.add(surface)
-        if len(surfaces) >= 8:
-            break
-    return surfaces
+    return compact_workbench_target(target)
 
 
 def _mutation(
@@ -107,7 +76,7 @@ def _command(
         "priority": _compact_text(priority, max_chars=40) or "normal",
         "enabled": bool(enabled),
         "target": compact_target,
-        "refetch_surfaces": _bounded_surfaces(refetch_surfaces),
+        "refetch_surfaces": bounded_workbench_refetch_surfaces(refetch_surfaces),
     }
     if mutation:
         command["mutation"] = mutation

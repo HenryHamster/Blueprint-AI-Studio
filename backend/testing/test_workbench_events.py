@@ -49,6 +49,7 @@ def test_workbench_event_envelope_is_v1_and_dedupes_refetch_surfaces():
         action="heartbeat",
         refetch_surfaces=(
             SURFACE_STRATEGIC_SESSION,
+            "debug",
             SURFACE_RUNTIME,
             SURFACE_STRATEGIC_SESSION,
         ),
@@ -279,6 +280,49 @@ async def test_build_workbench_event_feed_projects_operator_command_receipts(db_
         SURFACE_RUNTIME,
     ]
     assert feed["items"][0]["data"]["command_id"] == "session.mode.monitor"
+
+
+@pytest.mark.asyncio
+async def test_build_workbench_event_feed_normalizes_operator_command_receipt_contract(
+    db_session,
+):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    receipt = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="Command completed: Unknown debug action",
+        status="resolved",
+        resolved_at=now,
+        created_at=now,
+        context={
+            "event_type": "operator_command",
+            "operator_command": {
+                "version": 1,
+                "command_id": "debug.command",
+                "label": "Unknown debug action",
+                "status": "succeeded",
+                "target": {
+                    "surface": "debug",
+                    "section": "raw",
+                    "secret": "must-not-leak",
+                },
+                "refetch_surfaces": ["debug"],
+                "result": {"kind": "noop"},
+            },
+        },
+    )
+    db_session.add(receipt)
+    await db_session.commit()
+
+    feed = await build_workbench_event_feed(db_session, project.id, limit=1)
+
+    item = feed["items"][0]
+    assert item["resource"] == "operator_command"
+    assert "target" not in item
+    assert item["refetch"]["surfaces"] == [SURFACE_STRATEGIC_SESSION]
+    assert "must-not-leak" not in str(item)
 
 
 @pytest.mark.asyncio

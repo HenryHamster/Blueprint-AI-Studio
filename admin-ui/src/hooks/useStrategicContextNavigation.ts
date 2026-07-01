@@ -6,6 +6,7 @@ import type { PipelineSection } from './useWorkbenchCommands';
 import type { PrimaryTab } from './useUIState';
 import type { ViewMode } from './useViewPreferences';
 import type { StrategicContextPackageDrilldown, StrategicMessageTarget } from '../strategicStateApi';
+import { normalizeWorkbenchTarget } from '../types/workbenchTargets';
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
 
@@ -80,9 +81,12 @@ export function useStrategicContextNavigation({
       handleTabChange('chat');
       return;
     }
-    if (target.surface === 'project') {
-      if (isSettingsSection(target.section)) {
-        const home = SETTINGS_SECTION_HOMES[target.section];
+    const normalizedTarget = normalizeWorkbenchTarget(target) as StrategicContextTarget | null;
+    if (!normalizedTarget) return;
+
+    if (normalizedTarget.surface === 'project') {
+      if (isSettingsSection(normalizedTarget.section)) {
+        const home = SETTINGS_SECTION_HOMES[normalizedTarget.section];
         if (home.surface === 'project') {
           setProjectSection('manage');
           setProjectManageSection(home.section);
@@ -90,23 +94,23 @@ export function useStrategicContextNavigation({
           return;
         }
       }
-      if (isProjectSection(target.section)) setProjectSection(target.section);
+      if (isProjectSection(normalizedTarget.section)) setProjectSection(normalizedTarget.section);
       handleTabChange('project');
       return;
     }
-    if (target.surface === 'pipeline') {
-      const section = normalizePipelineSection(target.section);
+    if (normalizedTarget.surface === 'pipeline') {
+      const section = normalizePipelineSection(normalizedTarget.section);
       setPipelineSection(section);
       if (section === 'board') setViewMode('kanban');
       if (section === 'flow') setViewMode('pipeline');
       setShowArchive(section === 'archive');
-      if (target.task_id) selectPipelineTaskById(target.task_id);
+      if (normalizedTarget.task_id) selectPipelineTaskById(normalizedTarget.task_id);
       handleTabChange('pipeline');
       return;
     }
-    if (target.surface === 'runtime') {
-      if (isSettingsSection(target.section)) {
-        const home = SETTINGS_SECTION_HOMES[target.section];
+    if (normalizedTarget.surface === 'runtime') {
+      if (isSettingsSection(normalizedTarget.section)) {
+        const home = SETTINGS_SECTION_HOMES[normalizedTarget.section];
         if (home.surface === 'runtime') {
           setRuntimeSection(home.section);
           if (home.settingsSection) setRuntimeConfigSection(home.settingsSection);
@@ -114,29 +118,29 @@ export function useStrategicContextNavigation({
           return;
         }
       }
-      setRuntimeSection(isRuntimeSection(target.section) ? target.section : 'health');
+      setRuntimeSection(isRuntimeSection(normalizedTarget.section) ? normalizedTarget.section : 'health');
       handleTabChange('runtime');
       return;
     }
-    if (target.surface === 'messages') {
-      openMessages(messageTargetFromContextTarget(target));
+    if (normalizedTarget.surface === 'messages') {
+      openMessages(messageTargetFromContextTarget(normalizedTarget));
       return;
     }
-    if (target.surface === 'task') {
+    if (normalizedTarget.surface === 'task') {
       setPipelineSection('flow');
       setViewMode('pipeline');
       setShowArchive(false);
-      if (target.task_id) selectPipelineTaskById(target.task_id);
-      if (target.task_id && openTask) {
-        openTask(target.task_id);
+      if (normalizedTarget.task_id) selectPipelineTaskById(normalizedTarget.task_id);
+      if (normalizedTarget.task_id && openTask) {
+        openTask(normalizedTarget.task_id);
         return;
       }
       handleTabChange('pipeline');
       return;
     }
-    if (target.surface === 'knowledge') {
-      setKnowledgeBrowserInitialDocId(target.document_id ?? null);
-      setKnowledgeBrowserDirectionId(target.direction_id ?? null);
+    if (normalizedTarget.surface === 'knowledge') {
+      setKnowledgeBrowserInitialDocId(normalizedTarget.document_id ?? null);
+      setKnowledgeBrowserDirectionId(normalizedTarget.direction_id ?? null);
       setShowKnowledgeBrowser(true);
     }
   }, [

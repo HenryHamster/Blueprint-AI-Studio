@@ -31,6 +31,11 @@ from app.workbench_state import (
     workbench_mode_should_arm_strategic_refresh,
     workbench_state_size_bytes,
 )
+from app.workbench_targets import (
+    DEFAULT_WORKBENCH_REFETCH_SURFACES,
+    bounded_workbench_refetch_surfaces,
+    compact_workbench_target,
+)
 
 
 OPERATOR_COMMAND_EVENT_TYPE = "operator_command"
@@ -38,20 +43,6 @@ WORK_SESSION_COMMAND_JOB_LIMIT = 8
 _EXECUTABLE_SESSION_MODES = frozenset(("chat", "continuous", "monitor"))
 _RUNNER_PREFER_PREFIX = "session.runner.prefer."
 _ALERT_DISMISS_PREFIX = "attention.alert.dismiss:"
-_COMMAND_TARGET_KEYS = (
-    "surface",
-    "project_id",
-    "section",
-    "task_id",
-    "message_id",
-    "direction_id",
-    "alert_id",
-    "action",
-    "document_id",
-    "artifact_id",
-    "runner_id",
-    "cycle_id",
-)
 
 
 def _compact_text(value: Any, *, max_chars: int = 240) -> str | None:
@@ -96,28 +87,19 @@ def _command_id(command: dict[str, Any]) -> str:
 
 def _safe_command_target(command: dict[str, Any]) -> dict[str, Any] | None:
     target = command.get("target") if isinstance(command.get("target"), dict) else None
-    if target is None:
-        return None
-    safe: dict[str, Any] = {}
-    for key in _COMMAND_TARGET_KEYS:
-        value = _compact_text(target.get(key), max_chars=160)
-        if value:
-            safe[key] = value
-    return safe or None
+    return compact_workbench_target(target)
 
 
 def _command_refetch_surfaces(command: dict[str, Any]) -> list[str]:
-    surfaces = []
-    seen = set()
-    for raw in command.get("refetch_surfaces") or ["strategic_session"]:
-        surface = _compact_text(raw, max_chars=80)
-        if not surface or surface in seen:
-            continue
-        surfaces.append(surface)
-        seen.add(surface)
-        if len(surfaces) >= 8:
-            break
-    return surfaces or ["strategic_session"]
+    values = (
+        command.get("refetch_surfaces")
+        if isinstance(command.get("refetch_surfaces"), list)
+        else None
+    )
+    return bounded_workbench_refetch_surfaces(
+        values,
+        default=DEFAULT_WORKBENCH_REFETCH_SURFACES,
+    )
 
 
 def _receipt_from_message(message: ProjectMessage) -> dict[str, Any]:
@@ -141,12 +123,15 @@ def _receipt_from_message(message: ProjectMessage) -> dict[str, Any]:
             if message.created_at
             else None
         ),
-        "target": receipt.get("target") if isinstance(receipt.get("target"), dict) else None,
-        "refetch_surfaces": [
-            item
-            for item in receipt.get("refetch_surfaces", [])
-            if isinstance(item, str)
-        ][:8],
+        "target": compact_workbench_target(
+            receipt.get("target") if isinstance(receipt.get("target"), dict) else None
+        ),
+        "refetch_surfaces": bounded_workbench_refetch_surfaces(
+            receipt.get("refetch_surfaces")
+            if isinstance(receipt.get("refetch_surfaces"), list)
+            else None,
+            default=DEFAULT_WORKBENCH_REFETCH_SURFACES,
+        ),
         "result": receipt.get("result") if isinstance(receipt.get("result"), dict) else None,
     }
 

@@ -180,6 +180,34 @@ describe('useStrategicContextNavigation', () => {
     expect(handleTabChange).toHaveBeenCalledWith('pipeline');
   });
 
+  test('ignores unknown target surfaces and normalizes constrained sections', () => {
+    const handleTabChange = vi.fn();
+    const setRuntimeSection = vi.fn();
+    const open = mount({ handleTabChange, setRuntimeSection });
+
+    act(() => {
+      open({ surface: 'debug', section: 'raw' } as Target);
+    });
+
+    expect(handleTabChange).not.toHaveBeenCalled();
+    expect(setRuntimeSection).not.toHaveBeenCalled();
+
+    act(() => {
+      open({ surface: 'runtime', section: 'runners', runner_id: 'runner-1' } as Target);
+    });
+
+    expect(setRuntimeSection).toHaveBeenCalledWith('devices');
+    expect(handleTabChange).toHaveBeenCalledWith('runtime');
+    vi.clearAllMocks();
+
+    act(() => {
+      open({ surface: 'runtime', section: 'debug-panel', runner_id: 'runner-1' } as Target);
+    });
+
+    expect(setRuntimeSection).toHaveBeenCalledWith('health');
+    expect(handleTabChange).toHaveBeenCalledWith('runtime');
+  });
+
   test('task targets select the pipeline task and open the task drawer when a drawer handler is provided', () => {
     const handleTabChange = vi.fn();
     const openTask = vi.fn();

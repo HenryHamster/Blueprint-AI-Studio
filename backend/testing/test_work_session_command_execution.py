@@ -129,6 +129,12 @@ async def test_malformed_or_non_allowlisted_commands_do_not_persist_receipts(
     db_session,
 ):
     project = await _make_project(db_session)
+    unsupported_target_alert = _dismiss_alert_command(project.id, uuid.uuid4())
+    unsupported_target_alert["target"] = {
+        "surface": "debug",
+        "project_id": str(project.id),
+        "section": "raw",
+    }
     commands = [
         (
             {
@@ -177,6 +183,10 @@ async def test_malformed_or_non_allowlisted_commands_do_not_persist_receipts(
                 },
             },
             "mismatched-runner-preference",
+        ),
+        (
+            unsupported_target_alert,
+            "unsupported-alert-target",
         ),
     ]
 

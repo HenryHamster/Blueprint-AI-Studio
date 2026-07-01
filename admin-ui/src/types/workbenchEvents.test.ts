@@ -36,12 +36,12 @@ describe('workbench event envelope helpers', () => {
       project_id: 'project-1',
       resource: 'project_message',
       action: 'created',
-      refetch: { surfaces: ['messages', 'strategic_session', 'messages', 12] },
+      refetch: { surfaces: ['messages', 'debug', 'strategic_session', 'messages', 12] },
     }))).toEqual(['messages', 'strategic_session']);
 
     expect(Array.from(workbenchRefetchSurfacesFromMessage({
       event: 'workbench_refetch',
-      data: { refetch: { surfaces: ['directions'] } },
+      data: { refetch: { surfaces: ['directions', 'raw-debug'] } },
     }))).toEqual(['directions']);
 
     expect(Array.from(workbenchRefetchSurfacesFromMessage({ event: 'noop' }))).toEqual([]);

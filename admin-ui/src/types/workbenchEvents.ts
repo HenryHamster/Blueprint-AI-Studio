@@ -1,3 +1,5 @@
+import { normalizeWorkbenchRefetchSurfaces } from './workbenchTargets';
+
 export interface WorkbenchEventEnvelopeV1 {
   schema_version: 1;
   project_id: string;
@@ -31,8 +33,7 @@ export function workbenchRefetchSurfacesFromData(
     return new Set();
   }
   const refetch = isObject(data.refetch) ? data.refetch : null;
-  const surfaces = Array.isArray(refetch?.surfaces) ? refetch.surfaces : [];
-  return new Set(surfaces.filter((surface): surface is string => typeof surface === 'string'));
+  return new Set(normalizeWorkbenchRefetchSurfaces(refetch?.surfaces));
 }
 
 export function workbenchRefetchSurfacesFromMessage(

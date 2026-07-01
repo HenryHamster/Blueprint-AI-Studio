@@ -54,6 +54,67 @@ def test_work_session_commands_convert_actions_to_navigation_descriptors():
     assert "mutation" not in command
 
 
+def test_work_session_commands_validate_action_target_vocabulary():
+    commands = build_work_session_commands(
+        project_id="project-1",
+        workbench_state={"interaction_mode": "chat", "selected_refs": []},
+        context_package=None,
+        actions=[
+            {
+                "id": "attention.debug:raw",
+                "kind": "inspect",
+                "label": "Open raw target",
+                "priority": "normal",
+                "source": "attention",
+                "target": {
+                    "surface": "debug",
+                    "section": "raw",
+                    "task_id": "task-1",
+                },
+                "enabled": True,
+            },
+            {
+                "id": "attention.runtime:runner",
+                "kind": "inspect",
+                "label": "Open runner",
+                "priority": "normal",
+                "source": "attention",
+                "target": {
+                    "surface": "runtime",
+                    "section": "debug-panel",
+                    "runner_id": "runner-1",
+                },
+                "enabled": True,
+            },
+            {
+                "id": "attention.runtime:legacy-runner",
+                "kind": "inspect",
+                "label": "Open legacy runner",
+                "priority": "normal",
+                "source": "attention",
+                "target": {
+                    "surface": "runtime",
+                    "section": "runners",
+                    "runner_id": "runner-2",
+                },
+                "enabled": True,
+            },
+        ],
+    )
+
+    by_id = _commands_by_id(commands)
+    assert "attention.debug:raw" not in by_id
+    assert by_id["attention.runtime:runner"]["target"] == {
+        "surface": "runtime",
+        "runner_id": "runner-1",
+    }
+    assert by_id["attention.runtime:legacy-runner"]["target"] == {
+        "surface": "runtime",
+        "section": "devices",
+        "runner_id": "runner-2",
+    }
+
+
 def test_work_session_commands_include_fixed_session_commands_and_canvas():
     commands = build_work_session_commands(
         project_id="project-1",

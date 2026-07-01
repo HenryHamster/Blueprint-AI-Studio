@@ -18,14 +18,17 @@ from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
 from app.models import Alert, MessageType, ProjectMessage, StrategicCycle, Task
+from app.workbench_targets import (
+    REFETCH_SURFACE_DIRECTIONS as SURFACE_DIRECTIONS,
+    REFETCH_SURFACE_MESSAGES as SURFACE_MESSAGES,
+    REFETCH_SURFACE_PIPELINE as SURFACE_PIPELINE,
+    REFETCH_SURFACE_RUNTIME as SURFACE_RUNTIME,
+    REFETCH_SURFACE_STRATEGIC_SESSION as SURFACE_STRATEGIC_SESSION,
+    bounded_workbench_refetch_surfaces,
+    compact_workbench_target,
+)
 
 WORKBENCH_EVENT_SCHEMA_VERSION = 1
-
-SURFACE_MESSAGES = "messages"
-SURFACE_STRATEGIC_SESSION = "strategic_session"
-SURFACE_DIRECTIONS = "directions"
-SURFACE_PIPELINE = "pipeline"
-SURFACE_RUNTIME = "runtime"
 
 DEFAULT_WORKBENCH_REFETCH_SURFACES = (SURFACE_STRATEGIC_SESSION,)
 DEFAULT_WORKBENCH_EVENT_FEED_LIMIT = 24
@@ -96,20 +99,6 @@ def _event_tone(*, resource: str, action: str, severity: str | None = None) -> s
     return "neutral"
 
 
-def _bounded_surfaces(values: Sequence[str] | None) -> list[str]:
-    surfaces: list[str] = []
-    seen: set[str] = set()
-    for raw in values or DEFAULT_WORKBENCH_REFETCH_SURFACES:
-        surface = _compact_str(raw, max_chars=80)
-        if not surface or surface in seen:
-            continue
-        surfaces.append(surface)
-        seen.add(surface)
-        if len(surfaces) >= 8:
-            break
-    return surfaces
-
-
 def _bounded_mapping(value: Any, *, max_items: int = 16) -> dict[str, Any] | None:
     if not isinstance(value, Mapping):
         return None
@@ -143,7 +132,12 @@ def workbench_event_envelope(
         "project_id": str(project_id),
         "resource": _compact_str(resource, max_chars=80) or "workbench",
         "action": _compact_str(action, max_chars=80) or "updated",
-        "refetch": {"surfaces": _bounded_surfaces(refetch_surfaces)},
+        "refetch": {
+            "surfaces": bounded_workbench_refetch_surfaces(
+                refetch_surfaces,
+                default=DEFAULT_WORKBENCH_REFETCH_SURFACES,
+            )
+        },
     }
 
 
@@ -213,8 +207,9 @@ def _feed_item(
         payload["tone"] = tone
     if ref:
         payload["ref"] = dict(ref)
-    if target:
-        payload["target"] = dict(target)
+    compact_target = compact_workbench_target(target)
+    if compact_target:
+        payload["target"] = compact_target
     if data:
         payload["data"] = dict(data)
     return payload

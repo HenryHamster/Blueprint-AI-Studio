@@ -8,7 +8,7 @@ The rule for this file: after every major batch, update the status ledger, miles
 
 ## Status Ledger
 
-Overall implementation estimate: 82%.
+Overall implementation estimate: 85%.
 
 Legend:
 - Done: implemented, reviewed, tested, and pushed.
@@ -23,12 +23,12 @@ Legend:
 | M1. Roadmap and tracking discipline | In progress | This document. | Keep this file updated after every pushed batch. |
 | M2. Persistent local Strategic workday mode | Done | Workbench state, 12-hour continuation markers, explicit marker ownership/lease diagnostics, duplicate-session protection, Strategic local runner requirement, local runner selection, attention for holds, stale Strategic hold timeout, and clearer Devices UI. | Only revisit explicit takeover or heartbeat fallback renewal if real multi-operator contention appears. |
 | M3. Messages as the active-work interface | Done | Shared `ProjectMessage` creation/projection, bounded workbench message context, minimal Strategic-session Chat, backend/frontend arming fixtures. | Keep regression coverage while M4/M5 add richer command and context surfaces. |
-| M4. Ctrl+K and hotkey operating layer | Partial | Command palette, shortcut hooks, server command descriptors, allowlisted command execution. | Finish canonical command/target registry and missing hotkeys. |
+| M4. Ctrl+K and hotkey operating layer | Partial | Command palette, shortcut hooks, server command descriptors, allowlisted command execution, shared target/refetch vocabulary for command routing. | Finish missing hotkeys and shortcut-help behavior. |
 | M5. Strategic context and canvas/artifact surface | Done | Context package, selected refs, canvas descriptors, `StrategicContextWorkspace`, map/resource rows, Chat artifact slot, descriptor schema, renderer tests, golden fixtures. | Keep v1 read-only; revisit writable canvas/layout persistence only with a concrete requirement. |
 | M6. Pipeline monitoring and task sideboard | Done | Pipeline workspace, task tree, task rail, stale attention routing, task sideboard context, task-sideboard contract, Chat task-target drawer routing, waiting-vs-blocked health labels. | Further tracked-stream affordance polish can continue without reopening the sideboard contract. |
 | M7. Runtime, devices, accounts, settings, project management | Done | Canonical Project/Runtime settings homes, workspace-hosted settings router semantics, command/context routing to Project Manage and Runtime Settings/Accounts, reachability and viewport tests. | Keep regression coverage while remaining project/runtime policy work lands. |
 | M8. Operator attention and work-session read model | Partial | Derived attention state, registry-backed curated metric metadata, actions, events, jobs, command receipts, and command receipts excluded from check-in deltas. | Finish lifecycle clearing semantics and performance review for larger event/metric volumes. |
-| M9. Unified event and message contracts | Partial | Workbench event v1 envelope exists, project message creation/projection are centralized. | Inventory legacy emitters and converge backend/frontend fixtures. |
+| M9. Unified event and message contracts | Partial | Workbench event v1 envelope exists, project message creation/projection are centralized, backend/frontend target/refetch helpers now share the same vocabulary. | Inventory legacy emitters and converge backend/frontend fixtures. |
 | M10. Visual system and UI polish | Done | Workbench theme tokens, shell/header/workspace token migration, raw-shell-color guard, Pipeline duplicate task-open cleanup, focused viewport assertions and capture review. | Extend token coverage opportunistically to lower-level panels without changing IA. |
 | M11. Background operator jobs | Planned | Existing compute jobs, runner jobs, orchestrator loops, command receipts. | Only build a real operator-job table if a concrete async operator command needs it. |
 | M12. Completion audit and hardening | Planned | Focused tests exist across major components. | Run full backend/frontend audit loops, viewport screenshots, and contract gates. |
@@ -195,8 +195,15 @@ Existing:
   - dismiss alert
 - Frontend maps server commands plus local navigation/action commands.
 
+Completed in latest batch:
+- Added shared backend target/refetch vocabulary in `backend/app/workbench_targets.py`.
+- Reused that contract from work-session commands, command execution receipts/jobs, action targets, and event-feed target/refetch projection.
+- Added shared frontend target/refetch normalization in `admin-ui/src/types/workbenchTargets.ts`.
+- Routed command descriptors, attention targets, context navigation, and websocket refetch handling through the frontend helper without changing the public command-palette shape.
+- Preserved legacy `runtime/runners` target links by aliasing them to the current Runtime Devices section.
+
 Remaining work:
-- Create a canonical command registry/contract:
+- Complete the command registry/contract beyond target/refetch normalization:
   - command id
   - label
   - group
@@ -205,7 +212,7 @@ Remaining work:
   - refetch surfaces
   - executable vs navigation-only
   - mutation allowlist
-- Remove duplicated target/command semantics between backend and frontend.
+- Continue removing duplicated command semantics between backend and frontend where the command id and mutation allowlists still exist in both places.
 - Add missing hotkeys from the IA target:
   - `[` and `]` for previous/next subtab within the current mode
   - `/` to focus current mode search/filter where available
@@ -218,12 +225,14 @@ Remaining work:
 Authoritative files:
 - `backend/app/work_session_commands.py`
 - `backend/app/work_session_command_execution.py`
+- `backend/app/workbench_targets.py`
 - `admin-ui/src/components/CommandPalette.tsx`
 - `admin-ui/src/components/CommandPaletteHost.tsx`
 - `admin-ui/src/hooks/useWorkbenchCommands.ts`
 - `admin-ui/src/hooks/useOperatorKeyboardShortcuts.ts`
 - `admin-ui/src/hooks/useWorkbenchShortcutRouter.ts`
 - `admin-ui/src/hooks/useCommandPaletteShortcut.ts`
+- `admin-ui/src/types/workbenchTargets.ts`
 
 Acceptance gates:
 - Backend tests cover every server command id and malformed/disabled/stale command rejection.
@@ -400,6 +409,14 @@ Existing:
 - Frontend consumes event envelopes as invalidation hints.
 - Message creation/projection code is centralized enough to build from.
 
+Completed in latest batch:
+- Added backend-owned target/refetch constants for workbench targets and invalidation surfaces.
+- Event envelopes now filter/dedupe refetch surfaces against the canonical list and fall back to `strategic_session` when needed.
+- Event-feed items now normalize targets before projection, so unsupported target surfaces are dropped instead of being handed to the UI.
+- Operator command receipts are normalized consistently on persistence and projection.
+- Frontend websocket helpers now filter refetch surfaces through the same known surface list.
+- Frontend target routing now rejects unknown target surfaces and normalizes constrained sections before changing tabs.
+
 Remaining work:
 - Inventory all websocket emitters:
   - mark as workbench v1 envelope
@@ -418,15 +435,17 @@ Remaining work:
   - surfaces: chat/messages, pipeline, project, runtime, task, knowledge
   - sections per surface
   - ids allowed per target type
-- Normalize or reject unknown backend target sections before they reach UI.
+- Expand canonical target fixture coverage from helper tests into backend-generated golden fixtures.
 
 Authoritative files:
 - `backend/app/workbench_events.py`
+- `backend/app/workbench_targets.py`
 - `backend/app/project_message_projection.py`
 - `backend/app/project_message_creation.py`
 - `backend/app/work_session_commands.py`
 - `backend/app/work_session_command_execution.py`
 - `admin-ui/src/strategicStateApi.ts`
+- `admin-ui/src/types/workbenchTargets.ts`
 - `admin-ui/src/types/workbenchEvents.ts`
 - `admin-ui/src/hooks/useStrategicContextNavigation.ts`
 - `admin-ui/src/hooks/useWorkbenchCommands.ts`

@@ -84,6 +84,7 @@ export interface StrategicContextTarget {
   action?: string | null;
   document_id?: string | null;
   artifact_id?: string | null;
+  cycle_id?: string | null;
   runner_id?: string | null;
 }
 

@@ -5,6 +5,7 @@ import { SETTINGS_SECTION_HOMES } from '../components/OperatorWorkspaceSections'
 import type { SectionId } from '../components/settingsSections';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import { executeStrategicWorkSessionCommand } from '../strategicStateApi';
+import { normalizeWorkbenchTarget } from '../types/workbenchTargets';
 import type {
   StrategicContextArtifactEvidence,
   StrategicContextCanvasNode,
@@ -35,6 +36,10 @@ const MESSAGE_COMMAND_LIMIT = 6;
 const TASK_FOCUS_COMMAND_LIMIT = 6;
 const STRATEGIC_INTERACTION_MODES: readonly StrategicInteractionMode[] = ['chat', 'check_in', 'monitor', 'continuous'];
 const WORK_SESSION_MUTATION_METHODS = new Set(['PATCH', 'POST', 'PUT']);
+
+function normalizeStrategicContextTarget(target?: StrategicContextTarget | null): StrategicContextTarget | null {
+  return normalizeWorkbenchTarget(target) as StrategicContextTarget | null;
+}
 
 type WorkSessionCommandRunStatus = {
   state: 'pending' | 'success' | 'error';
@@ -280,14 +285,14 @@ function workSessionActionMessageId(action: StrategicWorkSessionAction): string 
 }
 
 function workSessionActionIsMessageTarget(action: StrategicWorkSessionAction): boolean {
-  return Boolean(workSessionActionMessageId(action) || action.target?.surface === 'messages');
+  const target = normalizeStrategicContextTarget(action.target);
+  return Boolean(workSessionActionMessageId(action) || target?.surface === 'messages');
 }
 
 function workSessionActionContextTarget(action: StrategicWorkSessionAction): StrategicContextTarget | null {
-  const target = action.target ?? null;
-  if (!target) return null;
-  if (target.surface) return target;
-  if (target.task_id) return { ...target, surface: 'task' };
+  const target = normalizeStrategicContextTarget(action.target);
+  if (target) return target;
+  if (action.target?.task_id) return normalizeStrategicContextTarget({ ...action.target, surface: 'task' });
   return null;
 }
 
@@ -379,24 +384,25 @@ function workSessionCommandPriorityDetail(priority?: string | null): string | nu
 }
 
 function workSessionCommandTargetDetail(target?: StrategicContextTarget | null): string | null {
-  if (!target) return null;
-  const section = humanizeCommandToken(target.section);
-  if (target.surface === 'messages') return target.message_id ? 'Message' : 'Messages';
-  if (target.surface === 'task') return 'Task';
-  if (target.surface === 'runtime' && target.action === 'dismiss_alert' && target.alert_id) {
-    const alertRef = target.alert_id.slice(0, 8);
+  const normalizedTarget = normalizeStrategicContextTarget(target);
+  if (!normalizedTarget) return null;
+  const section = humanizeCommandToken(normalizedTarget.section);
+  if (normalizedTarget.surface === 'messages') return normalizedTarget.message_id ? 'Message' : 'Messages';
+  if (normalizedTarget.surface === 'task') return 'Task';
+  if (normalizedTarget.surface === 'runtime' && normalizedTarget.action === 'dismiss_alert' && normalizedTarget.alert_id) {
+    const alertRef = normalizedTarget.alert_id.slice(0, 8);
     return section ? `Runtime ${section} / alert ${alertRef}` : `Runtime alert ${alertRef}`;
   }
-  if (target.surface === 'runtime') return section ? `Runtime ${section}` : 'Runtime';
-  if (target.surface === 'pipeline') return section ? `Pipeline ${section}` : 'Pipeline';
-  if (target.surface === 'project') return section ? `Project ${section}` : 'Project';
-  if (target.surface === 'knowledge') return 'Knowledge';
-  return humanizeCommandToken(target.surface) ?? 'Target';
+  if (normalizedTarget.surface === 'runtime') return section ? `Runtime ${section}` : 'Runtime';
+  if (normalizedTarget.surface === 'pipeline') return section ? `Pipeline ${section}` : 'Pipeline';
+  if (normalizedTarget.surface === 'project') return section ? `Project ${section}` : 'Project';
+  if (normalizedTarget.surface === 'knowledge') return 'Knowledge';
+  return null;
 }
 
 function workSessionCommandSection(command: StrategicWorkSessionCommand): string {
   const group = command.group?.trim();
-  const surface = command.target?.surface;
+  const surface = normalizeStrategicContextTarget(command.target)?.surface;
   if (command.id === 'session.check_in' || command.id.startsWith('session.mode.') || group === 'session' || group === 'mode') {
     return 'Strategic';
   }
@@ -410,9 +416,10 @@ function workSessionCommandSection(command: StrategicWorkSessionCommand): string
 }
 
 function messageTargetFromCommand(command: StrategicWorkSessionCommand): StrategicMessageTarget | undefined {
-  const messageId = command.target?.message_id?.trim();
+  const target = normalizeStrategicContextTarget(command.target);
+  const messageId = target?.message_id?.trim();
   if (!messageId) return undefined;
-  const action = command.target?.action;
+  const action = target?.action;
   if (action === 'reply' || action === 'highlight') return { messageId, action };
   return { messageId };
 }
@@ -577,6 +584,11 @@ export function useWorkbenchCommands({
       closePalette();
     };
     const openAttentionItem = (item: StrategicStateAttentionItem) => {
+      const target = normalizeStrategicContextTarget(item.target);
+      if (target && openStrategicContextTarget) {
+        openContextTarget(target);
+        return;
+      }
       if (item.kind === 'message') {
         const messageId = item.ref?.id;
         if (openStrategicMessageTarget) {
@@ -609,12 +621,17 @@ export function useWorkbenchCommands({
       runAndClose(focusStrategicComposer);
     };
     const seenWorkSessionCommandIds = new Set<string>();
-    const workSessionCommandDescriptors = (strategicState?.work_session?.commands ?? []).filter(command => {
-      const id = command.id?.trim();
-      if (!id || seenWorkSessionCommandIds.has(id)) return false;
-      seenWorkSessionCommandIds.add(id);
-      return true;
-    });
+    const workSessionCommandDescriptors = (strategicState?.work_session?.commands ?? [])
+      .map(command => ({
+        ...command,
+        target: normalizeStrategicContextTarget(command.target),
+      }))
+      .filter(command => {
+        const id = command.id?.trim();
+        if (!id || seenWorkSessionCommandIds.has(id)) return false;
+        seenWorkSessionCommandIds.add(id);
+        return true;
+      });
     const workSessionCommandIds = seenWorkSessionCommandIds;
     const workSessionCommandModes = new Set<StrategicInteractionMode>();
     const workSessionCommandMessageIds = new Set<string>();
@@ -650,7 +667,7 @@ export function useWorkbenchCommands({
         return;
       }
 
-      const target = action.target ?? null;
+      const target = normalizeStrategicContextTarget(action.target);
       const messageId = workSessionActionMessageId(action);
       if (messageId || target?.surface === 'messages') {
         if (openStrategicMessageTarget) {
@@ -681,8 +698,9 @@ export function useWorkbenchCommands({
       if (command.id === 'session.check_in') return Boolean(markStrategicChecked);
       if (command.id.startsWith('session.mode.')) return Boolean(strategicModeFromCommandId(command.id));
       if (command.id === 'session.clear_selected_refs') return Boolean(updateStrategicSessionRefs);
-      if (command.target?.surface === 'messages') return Boolean(openStrategicMessageTarget || openStrategicContextTarget);
-      return Boolean(command.target && openStrategicContextTarget);
+      const target = normalizeStrategicContextTarget(command.target);
+      if (target?.surface === 'messages') return Boolean(openStrategicMessageTarget || openStrategicContextTarget);
+      return Boolean(target && openStrategicContextTarget);
     };
     const workSessionDescriptorCommandDetail = (
       command: StrategicWorkSessionCommand,
@@ -776,7 +794,7 @@ export function useWorkbenchCommands({
         return;
       }
 
-      const target = command.target ?? null;
+      const target = normalizeStrategicContextTarget(command.target);
       if (target?.surface === 'messages') {
         if (openStrategicMessageTarget) {
           openStrategicMessageTarget(messageTargetFromCommand(command));
