@@ -881,6 +881,7 @@ async def claim_task(
     _claimed_task_id = task.id
     _claimed_project_id = task.project_id
     _claimed_context = dict(task.context or {})
+    _claimed_payloads = list(task.payloads or [])
     _claimed_first_payload = task.first_payload
 
     # Broadcast status change to frontend
@@ -914,7 +915,7 @@ async def claim_task(
     _claim_runtime_execution_mode = _claimed_context.get("llm_execution_mode")
 
     response_payloads: list = []
-    for entry in task.payloads or []:
+    for entry in _claimed_payloads:
         if isinstance(entry, dict):
             patched = dict(entry)
             if isinstance(_claim_runtime_model, str) and _claim_runtime_model.strip():
