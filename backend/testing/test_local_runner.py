@@ -8,11 +8,12 @@ Covers the four new surfaces:
 """
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import select
 
 from app import auth as auth_mod
@@ -31,8 +32,14 @@ from app.models import (
     TaskStatus,
     _utcnow,
 )
+from app.messages_noise_prefs_store import get_messages_noise_prefs_row
 from app.routers.runner import _parse_multipart_form
 from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.workbench_state import (
+    STRATEGIC_LOCAL_CONTINUATION_KEY,
+    STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
+    WORKBENCH_STATE_KEY,
+)
 
 TEST_USER_ID = "test-user-123"
 
@@ -63,6 +70,56 @@ async def _make_runner(session, project_id, **kwargs):
     await session.commit()
     await session.refresh(runner)
     return runner, token
+
+
+def _parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+
+
+async def _seed_strategic_continuation(
+    session,
+    project,
+    *,
+    timestamp: str,
+    interaction_mode: str = "continuous",
+    runner_id: str | None = None,
+    include_marker: bool = True,
+    include_marker_runner: bool = True,
+    include_workbench_runner: bool = True,
+) -> None:
+    workbench = {
+        "version": 1,
+        "interaction_mode": interaction_mode,
+        "active_surface": "runtime",
+        "selected_refs": [],
+        "session_started_at": timestamp,
+        "last_interaction_at": timestamp,
+    }
+    if runner_id and include_workbench_runner:
+        workbench["preferred_runner_id"] = runner_id
+    session.add(
+        MessagesNoisePrefs(
+            user_id=TEST_USER_ID,
+            project_id=project.id,
+            prefs={WORKBENCH_STATE_KEY: workbench},
+        )
+    )
+    if include_marker:
+        marker = {
+            "version": 1,
+            "active": True,
+            "operator_user_id": TEST_USER_ID,
+            "updated_at": timestamp,
+            "last_seen_at": timestamp,
+        }
+        if runner_id and include_marker_runner:
+            marker["preferred_runner_id"] = runner_id
+        project.vision = {
+            **(project.vision or {}),
+            STRATEGIC_LOCAL_CONTINUATION_KEY: marker,
+        }
+        session.add(project)
+    await session.commit()
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -109,6 +166,58 @@ class TestRunnerAuth:
         db_session.add(runner)
         await db_session.commit()
         assert await auth_mod.verify_runner_token(token, db_session) is None
+
+
+@pytest.mark.asyncio
+async def test_locked_noise_prefs_read_refreshes_identity_mapped_row(db_session):
+    project = await _make_project(db_session)
+    old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+    await _seed_strategic_continuation(
+        db_session,
+        project,
+        timestamp=old_at,
+        runner_id=str(uuid.uuid4()),
+    )
+
+    first = await get_messages_noise_prefs_row(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+    )
+    assert first is not None
+    assert first.prefs[WORKBENCH_STATE_KEY]["interaction_mode"] == "continuous"
+    await db_session.commit()
+
+    Session = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with Session() as other_session:
+        row = await get_messages_noise_prefs_row(
+            other_session,
+            TEST_USER_ID,
+            project.id,
+            for_update=True,
+        )
+        assert row is not None
+        prefs = dict(row.prefs or {})
+        workbench = dict(prefs[WORKBENCH_STATE_KEY])
+        workbench["interaction_mode"] = "chat"
+        prefs[WORKBENCH_STATE_KEY] = workbench
+        row.prefs = prefs
+        other_session.add(row)
+        await other_session.commit()
+
+    refreshed = await get_messages_noise_prefs_row(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+        for_update=True,
+    )
+    assert refreshed is not None
+    assert refreshed is first
+    assert refreshed.prefs[WORKBENCH_STATE_KEY]["interaction_mode"] == "chat"
 
 
 # ── Admin endpoints ──────────────────────────────────────────────────────────
@@ -658,6 +767,362 @@ class TestRunnerEndpoints:
         await db_session.refresh(runner)
         assert runner.last_seen_at > old_seen
         assert runner.capabilities["active_task_ids"] == ["abc", "def"]
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_renews_pinned_strategic_continuation(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+        preferred_runner_id = str(runner.id)
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            runner_id=preferred_runner_id,
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                    MessagesNoisePrefs.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        workbench = prefs_row.prefs[WORKBENCH_STATE_KEY]
+        assert _parse_iso(workbench["last_interaction_at"]) > _parse_iso(old_at)
+        assert workbench["preferred_runner_id"] == preferred_runner_id
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert _parse_iso(marker["last_seen_at"]) > _parse_iso(old_at)
+        assert _parse_iso(marker["updated_at"]) > _parse_iso(old_at)
+        assert marker["preferred_runner_id"] == preferred_runner_id
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_does_not_renew_unpinned_strategic_continuation(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            runner_id=str(runner.id),
+            include_marker_runner=False,
+            include_workbench_runner=False,
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                    MessagesNoisePrefs.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        assert (
+            prefs_row.prefs[WORKBENCH_STATE_KEY]["last_interaction_at"]
+            == old_at
+        )
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["last_seen_at"] == old_at
+        assert "preferred_runner_id" not in marker
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_does_not_renew_mismatched_runner_continuation(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        other_runner, _other_token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            runner_id=str(other_runner.id),
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                    MessagesNoisePrefs.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        assert (
+            prefs_row.prefs[WORKBENCH_STATE_KEY]["last_interaction_at"]
+            == old_at
+        )
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["last_seen_at"] == old_at
+        assert marker["preferred_runner_id"] == str(other_runner.id)
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_does_not_renew_stale_strategic_continuation(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        old_at = (
+            _utcnow()
+            - timedelta(seconds=STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS + 60)
+        ).isoformat()
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            runner_id=str(runner.id),
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["last_seen_at"] == old_at
+        assert marker["updated_at"] == old_at
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_does_not_renew_when_owner_left_continuous_mode(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            interaction_mode="chat",
+            runner_id=str(runner.id),
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                    MessagesNoisePrefs.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        assert (
+            prefs_row.prefs[WORKBENCH_STATE_KEY]["last_interaction_at"]
+            == old_at
+        )
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["last_seen_at"] == old_at
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_skips_recent_strategic_continuation_renewal(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        recent_at = (_utcnow() - timedelta(seconds=30)).isoformat()
+        preferred_runner_id = str(runner.id)
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=recent_at,
+            runner_id=preferred_runner_id,
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                    MessagesNoisePrefs.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        assert (
+            prefs_row.prefs[WORKBENCH_STATE_KEY]["last_interaction_at"]
+            == recent_at
+        )
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["last_seen_at"] == recent_at
+        assert marker["updated_at"] == recent_at
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_does_not_renew_continuation_for_non_strategic_runner(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["docs"],
+                "max_concurrent": 1,
+                "agent_available": True,
+            },
+        )
+        old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+        preferred_runner_id = str(runner.id)
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            runner_id=preferred_runner_id,
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["last_seen_at"] == old_at
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_does_not_recreate_continuation_after_continuous_mode(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            interaction_mode="chat",
+            runner_id=str(runner.id),
+            include_marker=False,
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        assert STRATEGIC_LOCAL_CONTINUATION_KEY not in (project.vision or {})
 
     @pytest.mark.asyncio
     async def test_heartbeat_emits_workbench_runner_refresh(

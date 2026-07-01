@@ -21,7 +21,7 @@ from sqlmodel import select
 from app.messages_noise_prefs_store import (
     get_messages_noise_prefs_row,
 )
-from app.models import LocalRunner, MessagesNoisePrefs, _utcnow
+from app.models import LocalRunner, MessagesNoisePrefs, Project, _utcnow
 from app.strategic_trigger import (
     ARMING_NOT_ARMED,
     ARMING_PASSIVE_NOTE,
@@ -37,6 +37,7 @@ STRATEGIC_LOCAL_CONTINUATION_KEY = "_strategic_local_continuation"
 WORKBENCH_STATE_MAX_BYTES = 50_000
 SESSION_IDLE_TTL_SECONDS = 14_400  # 4 hours
 STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS = SESSION_IDLE_TTL_SECONDS
+STRATEGIC_LOCAL_CONTINUATION_RENEWAL_MIN_SECONDS = 60
 
 _ALLOWED_INTERACTION_MODES = frozenset(
     {"chat", "check_in", "monitor", "continuous"}
@@ -446,6 +447,38 @@ def _strategic_local_continuation_marker_is_fresh(marker: dict[str, Any]) -> boo
     return elapsed <= STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS
 
 
+def _timestamp_is_older_than(
+    value: Any,
+    *,
+    now: datetime,
+    seconds: int,
+) -> bool:
+    parsed = _parse_naive_utc_timestamp(value)
+    if parsed is None:
+        return True
+    return (now - parsed).total_seconds() >= seconds
+
+
+def _strategic_local_continuation_renewal_due(
+    marker: dict[str, Any],
+    workbench_state: dict[str, Any],
+    *,
+    now: datetime,
+) -> bool:
+    return (
+        _timestamp_is_older_than(
+            marker.get("last_seen_at") or marker.get("updated_at"),
+            now=now,
+            seconds=STRATEGIC_LOCAL_CONTINUATION_RENEWAL_MIN_SECONDS,
+        )
+        or _timestamp_is_older_than(
+            _effective_last_active(workbench_state),
+            now=now,
+            seconds=STRATEGIC_LOCAL_CONTINUATION_RENEWAL_MIN_SECONDS,
+        )
+    )
+
+
 def _strategic_local_continuation_marker_owner_id(
     marker: dict[str, Any],
 ) -> str | None:
@@ -695,6 +728,154 @@ async def clear_preferred_runner_references(
         "workbench_states": cleared_workbench_states,
         "continuation_marker": cleared_marker,
     }
+
+
+async def refresh_strategic_local_continuation_on_runner_heartbeat(
+    session: AsyncSession,
+    *,
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID | str,
+    capabilities: dict[str, Any] | None,
+) -> bool:
+    """Renew an existing local Strategic continuation marker from runner liveness.
+
+    The helper is intentionally strict. It only extends a fresh, active marker
+    that is already pinned to the heartbeating Strategic-capable runner and
+    whose owner still has a continuous workbench session. It never creates or
+    re-arms a marker.
+    """
+
+    runner_id_text = _string(str(runner_id), max_chars=80)
+    if not runner_id_text or not _runner_handles_any_strategic_work(capabilities):
+        return False
+
+    project_snapshot = (
+        await session.execute(
+            select(Project)
+            .where(Project.id == project_id)
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    marker_snapshot = (
+        (project_snapshot.vision or {}).get(STRATEGIC_LOCAL_CONTINUATION_KEY)
+        if project_snapshot is not None
+        else None
+    )
+    if not isinstance(marker_snapshot, dict):
+        return False
+    if marker_snapshot.get("active") is not True:
+        return False
+    if not _strategic_local_continuation_marker_is_fresh(marker_snapshot):
+        return False
+    if (
+        _string(marker_snapshot.get("preferred_runner_id"), max_chars=80)
+        != runner_id_text
+    ):
+        return False
+
+    operator_id = _strategic_local_continuation_marker_owner_id(marker_snapshot)
+    if operator_id is None:
+        return False
+
+    row_snapshot = await get_messages_noise_prefs_row(
+        session,
+        operator_id,
+        project_id,
+    )
+    if row_snapshot is None:
+        return False
+
+    prefs_snapshot = dict(row_snapshot.prefs or {})
+    workbench_snapshot = workbench_state_from_prefs(prefs_snapshot)
+    if workbench_snapshot.get("interaction_mode") != "continuous":
+        return False
+    workbench_runner_id = _string(
+        workbench_snapshot.get("preferred_runner_id"),
+        max_chars=80,
+    )
+    if workbench_runner_id is not None and workbench_runner_id != runner_id_text:
+        return False
+    now = _utcnow()
+    if not _strategic_local_continuation_renewal_due(
+        marker_snapshot,
+        workbench_snapshot,
+        now=now,
+    ):
+        return False
+
+    row = await get_messages_noise_prefs_row(
+        session,
+        operator_id,
+        project_id,
+        for_update=True,
+    )
+    if row is None:
+        return False
+
+    prefs = dict(row.prefs or {})
+    workbench = workbench_state_from_prefs(prefs)
+    if workbench.get("interaction_mode") != "continuous":
+        await session.commit()
+        return False
+    workbench_runner_id = _string(workbench.get("preferred_runner_id"), max_chars=80)
+    if workbench_runner_id is not None and workbench_runner_id != runner_id_text:
+        await session.commit()
+        return False
+    now = _utcnow()
+    if not _strategic_local_continuation_renewal_due(
+        marker_snapshot,
+        workbench,
+        now=now,
+    ):
+        await session.commit()
+        return False
+
+    now_iso = now.isoformat()
+    renewed_marker = False
+
+    def _renew_marker(vision: dict[str, Any]) -> None:
+        nonlocal renewed_marker
+        marker = vision.get(STRATEGIC_LOCAL_CONTINUATION_KEY)
+        if not isinstance(marker, dict):
+            return
+        if marker.get("active") is not True:
+            return
+        if not _strategic_local_continuation_marker_is_fresh(marker):
+            return
+        if _strategic_local_continuation_marker_owner_id(marker) != operator_id:
+            return
+        if _string(marker.get("preferred_runner_id"), max_chars=80) != runner_id_text:
+            return
+        if not _strategic_local_continuation_renewal_due(marker, workbench, now=now):
+            return
+        next_marker = dict(marker)
+        next_marker["updated_at"] = now_iso
+        next_marker["last_seen_at"] = now_iso
+        vision[STRATEGIC_LOCAL_CONTINUATION_KEY] = next_marker
+        renewed_marker = True
+
+    await with_vision_locked(
+        session,
+        project_id,
+        _renew_marker,
+        skip_locked=False,
+    )
+    if not renewed_marker:
+        await session.rollback()
+        return False
+
+    next_workbench = dict(workbench)
+    next_workbench["last_interaction_at"] = now_iso
+    if not next_workbench.get("session_started_at"):
+        next_workbench["session_started_at"] = now_iso
+    next_prefs = dict(prefs)
+    next_prefs[WORKBENCH_STATE_KEY] = next_workbench
+    row.prefs = next_prefs
+    flag_modified(row, "prefs")
+    session.add(row)
+
+    await session.commit()
+    return True
 
 
 async def upsert_strategic_workbench_state(

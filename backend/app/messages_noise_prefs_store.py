@@ -26,7 +26,7 @@ async def get_messages_noise_prefs_row(
         MessagesNoisePrefs.project_id == project_id,
     )
     if for_update:
-        stmt = stmt.with_for_update()
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
     return (await session.execute(stmt)).scalar_one_or_none()
 
 

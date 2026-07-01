@@ -44,6 +44,9 @@ from app.workbench_events import (
     SURFACE_STRATEGIC_SESSION,
     emit_workbench_refetch,
 )
+from app.workbench_state import (
+    refresh_strategic_local_continuation_on_runner_heartbeat,
+)
 
 _MAX_RUNNER_COMMAND_LOG_BYTES = 65536
 _MAX_RUNNER_RESULT_METRICS_KEYS = 256
@@ -234,6 +237,8 @@ async def heartbeat(
     previous_version = runner.version
     previous_last_seen_at = runner.last_seen_at
     previous_caps = dict(runner.capabilities or {})
+    runner_id = runner.id
+    runner_project_id = runner.project_id
     now = _utcnow()
     previous_health = _runner_liveness_health(
         status=previous_status,
@@ -270,6 +275,12 @@ async def heartbeat(
     runner.capabilities = caps
     session.add(runner)
     await session.commit()
+    await refresh_strategic_local_continuation_on_runner_heartbeat(
+        session,
+        project_id=runner_project_id,
+        runner_id=runner_id,
+        capabilities=caps,
+    )
     current_health = _runner_liveness_health(
         status=runner.status,
         last_seen_at=runner.last_seen_at,
