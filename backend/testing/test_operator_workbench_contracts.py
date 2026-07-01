@@ -197,6 +197,8 @@ async def test_operator_workbench_current_state_contract_surfaces(
     assert work_session["events"]["version"] == 1
     assert work_session["events"]["items"]
     assert all(item["schema_version"] == 1 for item in work_session["events"]["items"])
+    assert work_session["jobs"]["version"] == 1
+    assert isinstance(work_session["jobs"]["items"], list)
     metrics = {entry["id"]: entry for entry in work_session["curated_metrics"]}
     for metric_id in {
         "attention.needs_operator",

@@ -1,9 +1,9 @@
-import { useMemo } from 'react';
-import { apiFetch } from '../api';
+import { useMemo, useState } from 'react';
 import type { WorkbenchCommand } from '../components/CommandPalette';
 import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import type { SectionId } from '../components/SettingsDropdown';
+import { executeStrategicWorkSessionCommand } from '../strategicStateApi';
 import type {
   StrategicContextArtifactEvidence,
   StrategicContextCanvasNode,
@@ -34,6 +34,11 @@ const MESSAGE_COMMAND_LIMIT = 6;
 const TASK_FOCUS_COMMAND_LIMIT = 6;
 const STRATEGIC_INTERACTION_MODES: readonly StrategicInteractionMode[] = ['chat', 'check_in', 'monitor', 'continuous'];
 const WORK_SESSION_MUTATION_METHODS = new Set(['PATCH', 'POST', 'PUT']);
+
+type WorkSessionCommandRunStatus = {
+  state: 'pending' | 'success' | 'error';
+  message?: string;
+};
 
 interface UseWorkbenchCommandsOptions {
   selectedProjectId: string | null;
@@ -408,6 +413,33 @@ function messageTargetFromCommand(command: StrategicWorkSessionCommand): Strateg
   return { messageId };
 }
 
+function workSessionCommandIdempotencyKey(commandId: string): string {
+  const randomValue = globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2);
+  const compactCommandId = commandId.replace(/\s+/g, '-').slice(0, 140);
+  return `work-session-command:${compactCommandId}:${Date.now().toString(36)}:${randomValue}`.slice(0, 255);
+}
+
+function commandExecutionErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message.trim()) return error.message.trim();
+  if (typeof error === 'string' && error.trim()) return error.trim();
+  return 'Command failed';
+}
+
+function workSessionCommandStatusKey(projectId: string | null, commandId: string): string {
+  return `${projectId ?? 'no-project'}:${commandId}`;
+}
+
+function workSessionCommandExecutionPayload(command: StrategicWorkSessionCommand) {
+  const payload: { idempotency_key: string; observed_at?: number } = {
+    idempotency_key: workSessionCommandIdempotencyKey(command.id),
+  };
+  const timestamp = command.mutation?.body?.timestamp;
+  if (command.id === 'attention.messages.mark_seen' && typeof timestamp === 'number') {
+    payload.observed_at = timestamp;
+  }
+  return payload;
+}
+
 export function useWorkbenchCommands({
   selectedProjectId,
   selectedProjectRepoLabel,
@@ -452,6 +484,8 @@ export function useWorkbenchCommands({
   openProjectManagement,
   openProjectMembers,
 }: UseWorkbenchCommandsOptions): WorkbenchCommand[] {
+  const [workSessionCommandStatuses, setWorkSessionCommandStatuses] = useState<Record<string, WorkSessionCommandRunStatus>>({});
+
   return useMemo(() => {
     const projectDisabled = !selectedProjectId;
     const closePalette = () => setCommandPaletteOpen(false);
@@ -641,7 +675,14 @@ export function useWorkbenchCommands({
       if (command.target?.surface === 'messages') return Boolean(openStrategicMessageTarget || openStrategicContextTarget);
       return Boolean(command.target && openStrategicContextTarget);
     };
-    const workSessionDescriptorCommandDetail = (command: StrategicWorkSessionCommand, routeable: boolean): string | undefined => {
+    const workSessionDescriptorCommandDetail = (
+      command: StrategicWorkSessionCommand,
+      routeable: boolean,
+      runStatus?: WorkSessionCommandRunStatus,
+    ): string | undefined => {
+      if (runStatus?.state === 'pending') return 'Running command...';
+      if (runStatus?.state === 'error') return `Failed: ${runStatus.message ?? 'Command failed'}`;
+      if (runStatus?.state === 'success') return runStatus.message ?? 'Completed';
       const mode = strategicModeFromCommandId(command.id);
       if (command.id === 'session.check_in') return strategicCheckInDetail;
       if (mode) {
@@ -661,22 +702,38 @@ export function useWorkbenchCommands({
       ) ?? undefined;
     };
     const runWorkSessionCommandMutation = (command: StrategicWorkSessionCommand): boolean => {
-      if (!commandHasAllowedMutation(command) || !command.mutation) return false;
+      if (!selectedProjectId || !commandHasAllowedMutation(command) || !command.mutation) return false;
 
-      const requestInit: RequestInit = {
-        method: command.mutation.method.trim().toUpperCase(),
-      };
-      if (command.mutation.body !== undefined) {
-        requestInit.headers = { 'Content-Type': 'application/json' };
-        requestInit.body = JSON.stringify(command.mutation.body);
-      }
-
-      void Promise.resolve(apiFetch(command.mutation.path.trim(), requestInit))
-        .finally(() => {
+      setWorkSessionCommandStatuses(prev => ({
+        ...prev,
+        [workSessionCommandStatusKey(selectedProjectId, command.id)]: { state: 'pending' },
+      }));
+      void executeStrategicWorkSessionCommand(
+        selectedProjectId,
+        command.id,
+        workSessionCommandExecutionPayload(command),
+      )
+        .then(response => {
+          setWorkSessionCommandStatuses(prev => ({
+            ...prev,
+            [workSessionCommandStatusKey(selectedProjectId, command.id)]: {
+              state: 'success',
+              message: response.command.receipt.summary ?? 'Completed',
+            },
+          }));
           if (typeof refreshWorkbench === 'function') refreshWorkbench();
+          closePalette();
+        })
+        .catch(error => {
+          setWorkSessionCommandStatuses(prev => ({
+            ...prev,
+            [workSessionCommandStatusKey(selectedProjectId, command.id)]: {
+              state: 'error',
+              message: commandExecutionErrorMessage(error),
+            },
+          }));
         })
         .catch(() => undefined);
-      closePalette();
       return true;
     };
     const runWorkSessionCommandDescriptor = (command: StrategicWorkSessionCommand, disabled: boolean) => {
@@ -726,9 +783,11 @@ export function useWorkbenchCommands({
     const workSessionDescriptorCommands = workSessionCommandDescriptors.map((command): WorkbenchCommand => {
       const routeable = workSessionCommandCanRoute(command);
       const mode = strategicModeFromCommandId(command.id);
+      const runStatus = workSessionCommandStatuses[workSessionCommandStatusKey(selectedProjectId, command.id)];
       const disabled = projectDisabled
         || !command.enabled
         || !routeable
+        || runStatus?.state === 'pending'
         || (command.id === 'session.check_in' && checkingInStrategicSession)
         || (Boolean(mode) && (savingStrategicWorkbench || mode === strategicInteractionMode))
         || (command.id === 'session.clear_selected_refs' && savingStrategicWorkbench);
@@ -736,7 +795,7 @@ export function useWorkbenchCommands({
         id: command.id,
         label: workSessionCommandLabel(command),
         section: workSessionCommandSection(command),
-        detail: workSessionDescriptorCommandDetail(command, routeable),
+        detail: workSessionDescriptorCommandDetail(command, routeable, runStatus),
         keywords: [
           'strategic',
           'session',
@@ -1484,5 +1543,6 @@ export function useWorkbenchCommands({
     updateStrategicSessionRefs,
     visibleActiveCount,
     visibleQueuedCount,
+    workSessionCommandStatuses,
   ]);
 }

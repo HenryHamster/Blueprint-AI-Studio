@@ -62,6 +62,41 @@ const REQUIRED_OPERATOR_ROUTE_COMMANDS = [
   { id: 'settings.general', section: 'Workbench', shortcut: 'S' },
 ] as const;
 
+function jsonResponse(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), { status });
+}
+
+function commandExecutionResponse(commandId: string, label = 'Command') {
+  return jsonResponse({
+    project_id: 'project-1',
+    status: 'idle',
+    location: 'locally',
+    session: {
+      version: 1,
+      id: 'strategic-session:project-1',
+      mode: 'chat',
+      active_surface: 'strategic',
+      selected_refs: [],
+      selected_ref_descriptors: [],
+      curated_metrics: [],
+    },
+    conversation: { limit: 20, items: [] },
+    recent_outputs: [],
+    command: {
+      status: 'succeeded',
+      applied: true,
+      command_id: commandId,
+      receipt: {
+        id: `receipt-${commandId}`,
+        command_id: commandId,
+        label,
+        status: 'succeeded',
+        summary: `Command completed: ${label}`,
+      },
+    },
+  });
+}
+
 function Harness(overrides: Partial<Parameters<typeof useWorkbenchCommands>[0]> = {}) {
   const commands = useWorkbenchCommands({
     selectedProjectId: 'project-1',
@@ -356,7 +391,7 @@ describe('useWorkbenchCommands', () => {
     const switchStrategicInteractionMode = vi.fn<(mode: StrategicInteractionMode) => void>();
     const refreshWorkbench = vi.fn();
     const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
-    const mutationBody = { workbench: { interaction_mode: 'monitor' } };
+    apiFetchMock.mockResolvedValue(commandExecutionResponse('session.mode.monitor', 'Monitor mode'));
     const commands: StrategicWorkSessionCommand[] = [
       {
         id: 'session.mode.monitor',
@@ -368,7 +403,7 @@ describe('useWorkbenchCommands', () => {
         mutation: {
           method: 'PATCH',
           path: '/api/admin/projects/project-1/strategic-session',
-          body: mutationBody,
+          body: { workbench: { interaction_mode: 'monitor' } },
         },
       },
     ];
@@ -385,15 +420,15 @@ describe('useWorkbenchCommands', () => {
 
     command?.run();
 
-    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
     expect(switchStrategicInteractionMode).not.toHaveBeenCalled();
-    expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/projects/project-1/strategic-session', {
-      method: 'PATCH',
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/projects/project-1/strategic-session/commands/session.mode.monitor/execute', {
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(mutationBody),
+      body: expect.stringMatching(/"idempotency_key":"work-session-command:session\.mode\.monitor:/),
     });
     await vi.waitFor(() => {
       expect(refreshWorkbench).toHaveBeenCalledTimes(1);
+      expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
     });
   });
 
@@ -401,7 +436,7 @@ describe('useWorkbenchCommands', () => {
     const updateStrategicSessionRefs = vi.fn();
     const refreshWorkbench = vi.fn();
     const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
-    const mutationBody = { workbench: { selected_refs: [] } };
+    apiFetchMock.mockResolvedValue(commandExecutionResponse('session.clear_selected_refs', 'Clear selected refs'));
     const commands: StrategicWorkSessionCommand[] = [
       {
         id: 'session.clear_selected_refs',
@@ -413,7 +448,7 @@ describe('useWorkbenchCommands', () => {
         mutation: {
           method: 'POST',
           path: '/api/admin/projects/project-1/strategic-session',
-          body: mutationBody,
+          body: { workbench: { selected_refs: [] } },
         },
       },
     ];
@@ -439,23 +474,24 @@ describe('useWorkbenchCommands', () => {
 
     command?.run();
 
-    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
     expect(updateStrategicSessionRefs).not.toHaveBeenCalled();
-    expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/projects/project-1/strategic-session', {
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/projects/project-1/strategic-session/commands/session.clear_selected_refs/execute', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(mutationBody),
+      body: expect.stringMatching(/"idempotency_key":"work-session-command:session\.clear_selected_refs:/),
     });
     await vi.waitFor(() => {
       expect(refreshWorkbench).toHaveBeenCalledTimes(1);
+      expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
     });
   });
 
   test('executes backend mutation descriptors for runner preference changes', async () => {
     const refreshWorkbench = vi.fn();
     const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
-    const preferBody = { workbench: { preferred_runner_id: 'runner-1' } };
-    const clearBody = { workbench: { preferred_runner_id: null } };
+    apiFetchMock
+      .mockResolvedValueOnce(commandExecutionResponse('session.runner.prefer.runner-1', 'Prefer desk-mini'))
+      .mockResolvedValueOnce(commandExecutionResponse('session.runner.clear_preferred', 'Clear preferred runner'));
     const commands: StrategicWorkSessionCommand[] = [
       {
         id: 'session.runner.prefer.runner-1',
@@ -472,7 +508,7 @@ describe('useWorkbenchCommands', () => {
         mutation: {
           method: 'POST',
           path: '/api/admin/projects/project-1/strategic-session',
-          body: preferBody,
+          body: { workbench: { preferred_runner_id: 'runner-1' } },
         },
       },
       {
@@ -490,7 +526,7 @@ describe('useWorkbenchCommands', () => {
         mutation: {
           method: 'POST',
           path: '/api/admin/projects/project-1/strategic-session',
-          body: clearBody,
+          body: { workbench: { preferred_runner_id: null } },
         },
       },
     ];
@@ -515,25 +551,28 @@ describe('useWorkbenchCommands', () => {
     captured.find(item => item.id === 'session.runner.prefer.runner-1')?.run();
     captured.find(item => item.id === 'session.runner.clear_preferred')?.run();
 
-    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
-    expect(apiFetchMock).toHaveBeenNthCalledWith(1, '/api/admin/projects/project-1/strategic-session', {
+    expect(apiFetchMock).toHaveBeenNthCalledWith(1, '/api/admin/projects/project-1/strategic-session/commands/session.runner.prefer.runner-1/execute', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(preferBody),
+      body: expect.stringMatching(/"idempotency_key":"work-session-command:session\.runner\.prefer\.runner-1:/),
     });
-    expect(apiFetchMock).toHaveBeenNthCalledWith(2, '/api/admin/projects/project-1/strategic-session', {
+    expect(apiFetchMock).toHaveBeenNthCalledWith(2, '/api/admin/projects/project-1/strategic-session/commands/session.runner.clear_preferred/execute', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(clearBody),
+      body: expect.stringMatching(/"idempotency_key":"work-session-command:session\.runner\.clear_preferred:/),
     });
     await vi.waitFor(() => {
       expect(refreshWorkbench).toHaveBeenCalledTimes(2);
+      expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
     });
   });
 
   test('executes backend mutation descriptors for attention housekeeping', async () => {
     const refreshWorkbench = vi.fn();
     const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    apiFetchMock
+      .mockResolvedValueOnce(commandExecutionResponse('attention.messages.mark_seen', 'Mark messages seen'))
+      .mockResolvedValueOnce(commandExecutionResponse(`attention.alert.dismiss:${'11111111-1111-1111-1111-111111111111'}`, 'Dismiss alert'));
     const alertId = '11111111-1111-1111-1111-111111111111';
     const secondAlertId = '22222222-2222-2222-2222-222222222222';
     const commands: StrategicWorkSessionCommand[] = [
@@ -621,20 +660,72 @@ describe('useWorkbenchCommands', () => {
     captured.find(item => item.id === 'attention.messages.mark_seen')?.run();
     captured.find(item => item.id === `attention.alert.dismiss:${alertId}`)?.run();
 
-    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
-    expect(apiFetchMock).toHaveBeenNthCalledWith(1, '/api/admin/messages/last-seen', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ project_id: 'project-1', timestamp: 1_782_912_000_000 }),
-    });
-    expect(apiFetchMock).toHaveBeenNthCalledWith(2, `/api/admin/alerts/${alertId}/dismiss`, {
+    expect(apiFetchMock).toHaveBeenNthCalledWith(1, '/api/admin/projects/project-1/strategic-session/commands/attention.messages.mark_seen/execute', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
+      body: expect.stringMatching(/"observed_at":1782912000000/),
+    });
+    expect(apiFetchMock).toHaveBeenNthCalledWith(2, `/api/admin/projects/project-1/strategic-session/commands/attention.alert.dismiss%3A${alertId}/execute`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: expect.stringMatching(/"idempotency_key":"work-session-command:attention\.alert\.dismiss:11111111/),
     });
     await vi.waitFor(() => {
       expect(refreshWorkbench).toHaveBeenCalledTimes(2);
+      expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
     });
+  });
+
+  test('shows pending and retryable error state for backend command execution', async () => {
+    const refreshWorkbench = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    let resolveCommand: (value: Response) => void = () => {};
+    apiFetchMock.mockReturnValueOnce(new Promise<Response>(resolve => {
+      resolveCommand = resolve;
+    }));
+    const commands: StrategicWorkSessionCommand[] = [
+      {
+        id: 'session.mode.monitor',
+        label: 'Monitor mode',
+        group: 'mode',
+        priority: 'normal',
+        enabled: true,
+        target: { surface: 'messages', action: 'set_monitor_mode' },
+        mutation: {
+          method: 'POST',
+          path: '/api/admin/projects/project-1/strategic-session',
+          body: { workbench: { interaction_mode: 'monitor' } },
+        },
+      },
+    ];
+
+    mount({
+      strategicState: { work_session: { commands } } as StrategicStateResponse,
+      refreshWorkbench,
+      setCommandPaletteOpen,
+    });
+
+    act(() => {
+      captured.find(item => item.id === 'session.mode.monitor')?.run();
+    });
+
+    await vi.waitFor(() => {
+      expect(captured.find(item => item.id === 'session.mode.monitor')).toMatchObject({
+        detail: 'Running command...',
+        disabled: true,
+      });
+    });
+
+    resolveCommand(jsonResponse({ detail: 'Command is disabled' }, 409));
+
+    await vi.waitFor(() => {
+      expect(captured.find(item => item.id === 'session.mode.monitor')).toMatchObject({
+        detail: 'Failed: Command is disabled',
+        disabled: false,
+      });
+    });
+    expect(refreshWorkbench).not.toHaveBeenCalled();
+    expect(setCommandPaletteOpen).not.toHaveBeenCalledWith(false);
   });
 
   test.each([

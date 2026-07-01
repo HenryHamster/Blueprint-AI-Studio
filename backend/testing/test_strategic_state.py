@@ -34,6 +34,7 @@ from app.models import (
     WakeDeliveryState,
     _utcnow,
 )
+from app.messages_last_seen import naive_utc_to_epoch_ms
 from app.workbench_state import sanitize_strategic_session_snapshot
 from app.workbench_events import SURFACE_MESSAGES, SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION
 
@@ -2084,6 +2085,145 @@ async def test_strategic_session_create_persists_project_session(
     marker = (project.vision or {})["_strategic_refresh"]
     assert marker["reason"] == "workbench_interaction_mode"
     assert marker["origin"] == "operator"
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_command_executes_mode_and_records_receipt(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+
+    with patch("app.routers.admin_projects.emit_workbench_refetch", new=AsyncMock()) as bcast:
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/strategic-session/commands/session.mode.continuous/execute",
+            json={"idempotency_key": "cmd-mode-continuous-1"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["command"]["status"] == "succeeded"
+    assert data["command"]["applied"] is True
+    assert data["command"]["receipt"]["command_id"] == "session.mode.continuous"
+    assert data["command"]["receipt"]["result"]["arming"] == "steering"
+    assert "_arm_after_receipt" not in data["command"]["receipt"]["result"]
+    assert data["workbench"]["interaction_mode"] == "continuous"
+    assert data["session"]["mode"] == "continuous"
+    assert data["session"]["jobs"]["items"][0]["command_id"] == "session.mode.continuous"
+
+    bcast.assert_awaited_once()
+    assert bcast.await_args.args[0] == project.id
+    assert bcast.await_args.kwargs["resource"] == "operator_command"
+    assert bcast.await_args.kwargs["action"] == "succeeded"
+    assert bcast.await_args.kwargs["summary"]["command_id"] == "session.mode.continuous"
+    assert bcast.await_args.kwargs["refetch_surfaces"] == [
+        SURFACE_STRATEGIC_SESSION,
+        SURFACE_RUNTIME,
+    ]
+
+    duplicate = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/commands/session.mode.continuous/execute",
+        json={"idempotency_key": "cmd-mode-continuous-1"},
+    )
+
+    assert duplicate.status_code == 200, duplicate.text
+    duplicate_command = duplicate.json()["command"]
+    assert duplicate_command["status"] == "duplicate"
+    assert duplicate_command["applied"] is False
+    assert duplicate_command["receipt"]["id"] == data["command"]["receipt"]["id"]
+
+    receipts = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.context["event_type"].as_string()
+                == "operator_command",
+            )
+        )
+    ).scalars().all()
+    assert len(receipts) == 1
+    assert receipts[0].idempotency_key == "cmd-mode-continuous-1"
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_command_rejects_disabled_and_navigation_commands(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+
+    disabled = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/commands/session.mode.chat/execute",
+        json={"idempotency_key": "cmd-disabled-chat-1"},
+    )
+    navigation = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/commands/context.canvas.open/execute",
+        json={"idempotency_key": "cmd-navigation-1"},
+    )
+
+    assert disabled.status_code == 409, disabled.text
+    disabled_body = disabled.json()
+    assert (
+        disabled_body.get("detail")
+        or (disabled_body.get("error") or {}).get("message")
+    ) == "Command is disabled"
+    assert navigation.status_code in {404, 409}, navigation.text
+
+
+@pytest.mark.asyncio
+async def test_strategic_session_command_executes_attention_housekeeping(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    message = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.QUESTION,
+        from_type="strategic",
+        content="Need operator input.",
+        status="open",
+    )
+    alert = Alert(
+        project_id=project.id,
+        severity=AlertSeverity.WARNING,
+        title="Runner offline",
+        message="The local runner stopped heartbeating.",
+        domain="runner",
+        event_type="local_runner_stale",
+    )
+    db_session.add_all([message, alert])
+    await db_session.commit()
+    await db_session.refresh(alert)
+    observed_at = naive_utc_to_epoch_ms(_utcnow() - timedelta(minutes=5))
+
+    seen_resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/commands/attention.messages.mark_seen/execute",
+        json={
+            "idempotency_key": "cmd-mark-seen-1",
+            "observed_at": observed_at,
+        },
+    )
+    dismiss_resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session/commands/attention.alert.dismiss:{alert.id}/execute",
+        json={"idempotency_key": "cmd-dismiss-alert-1"},
+    )
+
+    assert seen_resp.status_code == 200, seen_resp.text
+    assert seen_resp.json()["command"]["receipt"]["command_id"] == "attention.messages.mark_seen"
+    last_seen = (
+        await db_session.execute(
+            select(MessagesLastSeen).where(
+                MessagesLastSeen.user_id == TEST_USER_ID,
+                MessagesLastSeen.project_id == project.id,
+            )
+        )
+    ).scalar_one()
+    assert last_seen.last_seen_at is not None
+    assert naive_utc_to_epoch_ms(last_seen.last_seen_at) == observed_at
+
+    assert dismiss_resp.status_code == 200, dismiss_resp.text
+    assert dismiss_resp.json()["command"]["receipt"]["command_id"] == (
+        f"attention.alert.dismiss:{alert.id}"
+    )
+    await db_session.refresh(alert)
+    assert alert.dismissed_at is not None
 
 
 @pytest.mark.asyncio

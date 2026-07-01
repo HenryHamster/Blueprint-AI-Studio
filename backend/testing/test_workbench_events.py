@@ -238,6 +238,50 @@ async def test_build_workbench_event_feed_reports_more_from_single_source(db_ses
 
 
 @pytest.mark.asyncio
+async def test_build_workbench_event_feed_projects_operator_command_receipts(db_session):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    receipt = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="Command completed: Monitor mode",
+        status="resolved",
+        resolved_at=now,
+        created_at=now,
+        context={
+            "event_type": "operator_command",
+            "operator_command": {
+                "version": 1,
+                "command_id": "session.mode.monitor",
+                "label": "Monitor mode",
+                "status": "succeeded",
+                "target": {"surface": "messages", "action": "set_monitor_mode"},
+                "refetch_surfaces": ["strategic_session", "runtime"],
+                "result": {"kind": "workbench_update"},
+            },
+        },
+    )
+    db_session.add(receipt)
+    await db_session.commit()
+
+    feed = await build_workbench_event_feed(db_session, project.id, limit=1)
+
+    assert feed["items"][0]["resource"] == "operator_command"
+    assert feed["items"][0]["action"] == "succeeded"
+    assert feed["items"][0]["title"] == "Command: Monitor mode"
+    assert feed["items"][0]["target"] == {
+        "surface": "messages",
+        "action": "set_monitor_mode",
+    }
+    assert feed["items"][0]["refetch"]["surfaces"] == [
+        SURFACE_STRATEGIC_SESSION,
+        SURFACE_RUNTIME,
+    ]
+    assert feed["items"][0]["data"]["command_id"] == "session.mode.monitor"
+
+
+@pytest.mark.asyncio
 async def test_build_workbench_event_feed_orders_tasks_by_semantic_activity(db_session):
     project = await _make_project(db_session)
     now = _utcnow()

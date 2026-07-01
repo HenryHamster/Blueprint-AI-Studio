@@ -30,6 +30,7 @@ SURFACE_RUNTIME = "runtime"
 DEFAULT_WORKBENCH_REFETCH_SURFACES = (SURFACE_STRATEGIC_SESSION,)
 DEFAULT_WORKBENCH_EVENT_FEED_LIMIT = 24
 _SOURCE_QUERY_LIMIT = 12
+_OPERATOR_COMMAND_EVENT_TYPE = "operator_command"
 
 
 def _compact_str(value: Any, *, max_chars: int = 160) -> str | None:
@@ -192,6 +193,10 @@ def _feed_item(
 
 
 def _message_feed_item(message: ProjectMessage) -> dict[str, Any]:
+    context = message.context if isinstance(message.context, Mapping) else {}
+    if context.get("event_type") == _OPERATOR_COMMAND_EVENT_TYPE:
+        return _operator_command_feed_item(message, context)
+
     message_type = _enum_value(message.message_type)
     status = _enum_value(message.status)
     action = "resolved" if status == "resolved" else "linked" if status == "linked" else "created"
@@ -225,6 +230,49 @@ def _message_feed_item(message: ProjectMessage) -> dict[str, Any]:
             "status": status,
             "from_type": str(message.from_type),
         },
+    )
+
+
+def _operator_command_feed_item(
+    message: ProjectMessage,
+    context: Mapping[str, Any],
+) -> dict[str, Any]:
+    receipt = context.get(_OPERATOR_COMMAND_EVENT_TYPE)
+    receipt = receipt if isinstance(receipt, Mapping) else {}
+    status = _compact_str(receipt.get("status"), max_chars=40) or "succeeded"
+    label = _compact_str(receipt.get("label"), max_chars=120) or "Workbench command"
+    command_id = _compact_str(receipt.get("command_id"), max_chars=180)
+    target = receipt.get("target") if isinstance(receipt.get("target"), Mapping) else None
+    refetch_surfaces = (
+        [
+            surface
+            for surface in receipt.get("refetch_surfaces", [])
+            if isinstance(surface, str)
+        ]
+        if isinstance(receipt.get("refetch_surfaces"), list)
+        else (SURFACE_STRATEGIC_SESSION,)
+    )
+    data = {
+        "command_id": command_id,
+        "status": status,
+    }
+    result = receipt.get("result")
+    if isinstance(result, Mapping):
+        data["result"] = dict(result)
+    return _feed_item(
+        message.project_id,
+        item_id=f"operator_command:{message.id}:{status}",
+        occurred_at=message.resolved_at or message.created_at,
+        source="operator_command",
+        resource=_OPERATOR_COMMAND_EVENT_TYPE,
+        action=status,
+        title=f"Command: {label}",
+        summary=message.content,
+        tone="active" if status == "succeeded" else "warning",
+        ref={"kind": _OPERATOR_COMMAND_EVENT_TYPE, "id": str(message.id)},
+        target=target,
+        refetch_surfaces=refetch_surfaces,
+        data=data,
     )
 
 

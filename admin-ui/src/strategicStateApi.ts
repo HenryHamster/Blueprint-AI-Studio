@@ -409,6 +409,26 @@ export interface StrategicWorkSessionCommand {
   mutation?: StrategicWorkSessionCommandMutation;
 }
 
+export interface StrategicWorkSessionCommandExecutionReceipt {
+  id: string;
+  command_id?: string | null;
+  label?: string | null;
+  status: 'succeeded' | 'failed' | 'duplicate' | string;
+  summary?: string | null;
+  created_at?: string | null;
+  completed_at?: string | null;
+  target?: StrategicContextPackageDrilldown['target'] | null;
+  refetch_surfaces?: string[];
+  result?: Record<string, unknown> | null;
+}
+
+export interface StrategicWorkSessionCommandJobFeed {
+  version: 1;
+  limit: number;
+  has_more: boolean;
+  items: StrategicWorkSessionCommandExecutionReceipt[];
+}
+
 export interface StrategicWorkSessionRefDescriptor {
   kind: string;
   id: string;
@@ -498,6 +518,7 @@ export interface StrategicWorkSession {
   context_sources?: StrategicContextPackageSource[];
   actions?: StrategicWorkSessionAction[];
   commands?: StrategicWorkSessionCommand[];
+  jobs?: StrategicWorkSessionCommandJobFeed;
   events?: StrategicWorkSessionEventFeed;
   last_check_in?: StrategicWorkSessionLastCheckIn | null;
   since_last_check_in?: StrategicWorkSessionSinceLastCheckIn | null;
@@ -561,6 +582,22 @@ export interface StrategicSessionCheckInCreate {
   kind?: string;
   workbench_context?: Record<string, unknown>;
   idempotency_key?: string;
+}
+
+export interface StrategicSessionCommandExecute {
+  idempotency_key: string;
+  observed_at?: number | null;
+}
+
+export interface StrategicSessionCommandExecutionResult {
+  status: 'succeeded' | 'duplicate' | string;
+  applied: boolean;
+  command_id: string;
+  receipt: StrategicWorkSessionCommandExecutionReceipt;
+}
+
+export interface StrategicSessionCommandExecutionResponse extends StrategicSessionResponse {
+  command: StrategicSessionCommandExecutionResult;
 }
 
 export interface StrategicSessionMessageResponse {
@@ -830,4 +867,43 @@ export async function checkInStrategicSession(
   });
   if (!res.ok) throw new Error(`Failed to check in Strategic session: ${res.status}`);
   return res.json() as Promise<StrategicSessionResponse>;
+}
+
+async function strategicSessionErrorMessage(res: Response, fallback: string): Promise<string> {
+  try {
+    const data = await res.json() as { detail?: unknown; error?: { message?: unknown }; message?: unknown };
+    if (typeof data.detail === 'string' && data.detail.trim()) return data.detail.trim();
+    if (typeof data.error?.message === 'string' && data.error.message.trim()) return data.error.message.trim();
+    if (typeof data.message === 'string' && data.message.trim()) return data.message.trim();
+  } catch {
+    // Use the fallback below.
+  }
+  return fallback;
+}
+
+export async function executeStrategicWorkSessionCommand(
+  projectId: string,
+  commandId: string,
+  payload: StrategicSessionCommandExecute,
+): Promise<StrategicSessionCommandExecutionResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-session/commands/${encodeURIComponent(commandId)}/execute`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+  );
+  if (!res.ok) {
+    const detail = await strategicSessionErrorMessage(
+      res,
+      `Failed to execute Strategic session command: ${res.status}`,
+    );
+    throw new Error(detail);
+  }
+  const data = await res.json() as StrategicSessionCommandExecutionResponse;
+  if (!data.command?.receipt?.id) {
+    throw new Error('Failed to execute Strategic session command: missing command receipt');
+  }
+  return data;
 }

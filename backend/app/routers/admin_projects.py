@@ -76,6 +76,11 @@ from app.strategic_context_package import (
 )
 from app.strategic_runtime_work import build_strategic_runtime_summary
 from app.work_session_actions import build_work_session_actions
+from app.work_session_command_execution import (
+    OPERATOR_COMMAND_EVENT_TYPE,
+    build_work_session_command_jobs,
+    execute_work_session_command,
+)
 from app.work_session_commands import build_work_session_commands
 from app.workbench_state import (
     WORKBENCH_STATE_MAX_BYTES,
@@ -87,6 +92,7 @@ from app.workbench_state import (
     workbench_state_size_bytes,
 )
 from app.workbench_events import (
+    SURFACE_MESSAGES,
     SURFACE_RUNTIME,
     SURFACE_STRATEGIC_SESSION,
     build_workbench_event_feed,
@@ -907,6 +913,29 @@ class StrategicSessionCheckInCreate(BaseModel):
     idempotency_key: str | None = None
 
 
+class StrategicSessionCommandExecute(BaseModel):
+    idempotency_key: str
+    observed_at: int | None = None
+
+
+def _work_session_command_by_id(
+    state: Dict[str, Any],
+    command_id: str,
+) -> Dict[str, Any] | None:
+    work_session = state.get("work_session")
+    commands = (
+        work_session.get("commands")
+        if isinstance(work_session, dict)
+        else None
+    )
+    if not isinstance(commands, list):
+        return None
+    for command in commands:
+        if isinstance(command, dict) and command.get("id") == command_id:
+            return command
+    return None
+
+
 _SESSION_CONVERSATION_LIMIT = 20
 _SESSION_OUTPUT_LIMIT = 8
 _SESSION_CONVERSATION_FROM_TYPES = ("user", "operator", "strategic", "strategist")
@@ -1143,8 +1172,12 @@ async def _recent_session_outputs(
                 ProjectMessage.from_type.in_(["strategic", "system"]),
                 or_(
                     ProjectMessage.context["event_type"].as_string().is_(None),
-                    ProjectMessage.context["event_type"].as_string()
-                    != _CHECK_IN_EVENT_TYPE,
+                    and_(
+                        ProjectMessage.context["event_type"].as_string()
+                        != _CHECK_IN_EVENT_TYPE,
+                        ProjectMessage.context["event_type"].as_string()
+                        != OPERATOR_COMMAND_EVENT_TYPE,
+                    ),
                 ),
             )
             .order_by(ProjectMessage.created_at.desc())
@@ -2231,6 +2264,11 @@ async def get_project_strategic_state(
     work_session = {
         **work_session,
         "events": await build_workbench_event_feed(session, project.id),
+        "jobs": await build_work_session_command_jobs(
+            session,
+            project.id,
+            user_id=current_user["user_id"],
+        ),
     }
 
     # SHA-aware freshness: resolve candidate vs integration HEAD, best-effort.
@@ -2403,6 +2441,74 @@ async def upsert_project_strategic_session(
             "arming": workbench_write.arming,
         },
     )
+    return response
+
+
+@router.post("/projects/{project_id}/strategic-session/commands/{command_id}/execute")
+@limiter.limit("30/minute")
+async def execute_project_strategic_session_command(
+    request: Request,
+    project_id: uuid.UUID,
+    command_id: str,
+    payload: StrategicSessionCommandExecute,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Execute a current server-validated Strategic work-session command."""
+
+    state_response = await get_project_strategic_state(
+        request,
+        project_id,
+        session=session,
+        current_user=current_user,
+    )
+    command = _work_session_command_by_id(state_response, command_id)
+    if command is None:
+        raise HTTPException(status_code=404, detail="Command not found")
+
+    command_result = await execute_work_session_command(
+        session,
+        project_id=project_id,
+        user_id=current_user["user_id"],
+        command=command,
+        idempotency_key=payload.idempotency_key,
+        observed_at_ms=payload.observed_at,
+    )
+
+    refreshed_state = await get_project_strategic_state(
+        request,
+        project_id,
+        session=session,
+        current_user=current_user,
+    )
+    response = await _build_strategic_session_response(
+        session,
+        project_id,
+        refreshed_state,
+    )
+    response["command"] = command_result
+    receipt = (
+        command_result.get("receipt")
+        if isinstance(command_result.get("receipt"), dict)
+        else {}
+    )
+    if command_result.get("applied"):
+        await emit_workbench_refetch(
+            project_id,
+            resource=OPERATOR_COMMAND_EVENT_TYPE,
+            action=str(command_result.get("status") or "succeeded"),
+            refetch_surfaces=receipt.get("refetch_surfaces")
+            if isinstance(receipt.get("refetch_surfaces"), list)
+            else (SURFACE_MESSAGES, SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+            summary_key="command",
+            summary={
+                "command_id": command_result.get("command_id"),
+                "label": receipt.get("label"),
+                "status": command_result.get("status"),
+                "receipt_id": receipt.get("id"),
+            },
+            message_id=receipt.get("id"),
+        )
     return response
 
 

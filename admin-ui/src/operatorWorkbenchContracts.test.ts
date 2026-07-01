@@ -292,6 +292,25 @@ const strategicStateFixture = {
       },
     ],
     context_sources: [{ kind: 'runtime', count: 1 }],
+    jobs: {
+      version: 1,
+      limit: 8,
+      has_more: false,
+      items: [
+        {
+          id: 'receipt-1',
+          command_id: 'session.mode.continuous',
+          label: 'Workday mode',
+          status: 'succeeded',
+          summary: 'Command completed: Workday mode',
+          created_at: '2026-07-01T10:00:00Z',
+          completed_at: '2026-07-01T10:00:00Z',
+          target: { surface: 'messages', action: 'set_continuous_mode' },
+          refetch_surfaces: ['strategic_session', 'runtime'],
+          result: { kind: 'workbench_update' },
+        },
+      ],
+    },
     events: {
       version: 1,
       limit: 30,
@@ -409,6 +428,7 @@ describe('operator workbench contract fixtures', () => {
     });
     expect(state.work_session?.status).toBe('idle');
     expect(state.work_session?.location).toBe('locally');
+    expect(state.work_session?.jobs?.items[0].command_id).toBe('session.mode.continuous');
     expect(state.work_session?.events?.items[0].schema_version).toBe(1);
     expect(state.runtime?.local_runner?.runners?.[0].health?.device_status).toBe('connected');
 

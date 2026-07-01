@@ -1,6 +1,11 @@
 import { beforeEach, describe, expect, test, vi } from 'vitest';
 import { apiFetch } from './api';
-import { checkInStrategicSession, updateStrategicWorkbenchState, type StrategicWorkbenchState } from './strategicStateApi';
+import {
+  checkInStrategicSession,
+  executeStrategicWorkSessionCommand,
+  updateStrategicWorkbenchState,
+  type StrategicWorkbenchState,
+} from './strategicStateApi';
 
 vi.mock('./api', () => ({
   apiFetch: vi.fn(),
@@ -187,5 +192,89 @@ describe('checkInStrategicSession', () => {
       '/api/admin/projects/owner%2Frepo%20project/strategic-session/check-in',
       expect.objectContaining({ method: 'POST' }),
     );
+  });
+});
+
+describe('executeStrategicWorkSessionCommand', () => {
+  beforeEach(() => {
+    apiFetchMock.mockReset();
+  });
+
+  test('executes a work-session command through the canonical command endpoint', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({
+      project_id: 'proj-1',
+      status: 'idle',
+      location: 'locally',
+      session: {
+        version: 1,
+        id: 'strategic-session:proj-1',
+        mode: 'monitor',
+        active_surface: 'strategic',
+        selected_refs: [],
+        selected_ref_descriptors: [],
+        curated_metrics: [],
+      },
+      workbench: savedWorkbench,
+      conversation: { limit: 20, items: [] },
+      recent_outputs: [],
+      command: {
+        status: 'succeeded',
+        applied: true,
+        command_id: 'session.mode.monitor',
+        receipt: {
+          id: 'receipt-1',
+          command_id: 'session.mode.monitor',
+          label: 'Monitor mode',
+          status: 'succeeded',
+          summary: 'Command completed: Monitor mode',
+        },
+      },
+    }));
+
+    await expect(
+      executeStrategicWorkSessionCommand(
+        'owner/repo project',
+        'session.mode.monitor',
+        { idempotency_key: 'cmd-1', observed_at: 1_782_912_000_000 },
+      ),
+    ).resolves.toMatchObject({
+      command: {
+        status: 'succeeded',
+        receipt: { id: 'receipt-1', command_id: 'session.mode.monitor' },
+      },
+    });
+
+    expect(apiFetchMock).toHaveBeenCalledWith(
+      '/api/admin/projects/owner%2Frepo%20project/strategic-session/commands/session.mode.monitor/execute',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idempotency_key: 'cmd-1', observed_at: 1_782_912_000_000 }),
+      },
+    );
+  });
+
+  test('throws backend detail for failed command execution', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({ detail: 'Command is disabled' }, 409));
+
+    await expect(
+      executeStrategicWorkSessionCommand('proj-1', 'session.mode.chat', { idempotency_key: 'cmd-2' }),
+    ).rejects.toThrow('Command is disabled');
+  });
+
+  test('rejects malformed success responses without a command receipt', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({
+      project_id: 'proj-1',
+      status: 'idle',
+      location: 'locally',
+      session: {},
+      conversation: { limit: 20, items: [] },
+      recent_outputs: [],
+      command: { status: 'succeeded' },
+    }));
+
+    await expect(
+      executeStrategicWorkSessionCommand('proj-1', 'session.mode.chat', { idempotency_key: 'cmd-3' }),
+    ).rejects.toThrow('missing command receipt');
   });
 });
