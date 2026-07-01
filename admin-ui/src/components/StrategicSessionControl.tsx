@@ -124,6 +124,7 @@ export interface StrategicSessionControlProps {
   onOpenCompute?: () => void;
   onOpenAccounts?: () => void;
   onOpenSpend?: () => void;
+  showMonitoringControls?: boolean;
   className?: string;
 }
 
@@ -556,6 +557,7 @@ export function StrategicSessionControl({
   onOpenCompute,
   onOpenAccounts,
   onOpenSpend,
+  showMonitoringControls = true,
   className = '',
 }: StrategicSessionControlProps) {
   const selectedMode = currentMode ?? mode ?? 'chat';
@@ -669,41 +671,43 @@ export function StrategicSessionControl({
           )}
         </button>
 
-        {runner && (
-          <button
-            type="button"
-            onClick={onOpenDevices}
-            disabled={!onOpenDevices}
-            className={`group inline-grid min-h-11 w-full min-w-0 grid-cols-[auto,minmax(0,1fr),auto] items-center gap-2 rounded border px-2 py-1.5 text-left transition-colors hover:border-neutral-500 hover:bg-neutral-900/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 sm:min-h-8 sm:w-auto sm:max-w-[22rem] ${
-              toneClasses[runner.tone].border
-            } ${toneClasses[runner.tone].bg} disabled:cursor-not-allowed disabled:opacity-60`}
-            aria-label={`Open devices: runner ${runner.label}${runner.detail ? `, ${runner.detail}` : ''}${
-              runner.meta.length > 0 ? `, ${runner.meta.join(', ')}` : ''
-            }`}
-            title={runner.detail ? `Open devices: ${runner.detail}` : 'Open devices'}
-          >
-            <Server className={`h-3.5 w-3.5 shrink-0 ${toneClasses[runner.tone].icon}`} aria-hidden="true" />
-            <span className="min-w-0 flex-1">
-              <span className="flex min-w-0 items-center gap-1.5 leading-tight">
-                <span className="shrink-0 font-mono text-ui-sm font-semibold uppercase text-neutral-500">Runner</span>
-                <StatusDot tone={runner.tone} />
-                <span className={`truncate text-xs font-semibold ${toneClasses[runner.tone].text}`}>{runner.label}</span>
-              </span>
-              <span className="block truncate text-ui-sm text-neutral-400">{runner.detail ?? 'Open device and runner state'}</span>
-            </span>
-            <span className="hidden min-w-0 items-center gap-1 lg:flex">
-              {runner.meta.slice(0, 2).map(item => (
-                <span
-                  key={item}
-                  className="max-w-24 truncate rounded border border-neutral-800 bg-neutral-950/60 px-1.5 py-0.5 font-mono text-ui-sm text-neutral-400"
-                >
-                  {item}
+        {showMonitoringControls && (
+          <>
+            {runner && (
+              <button
+                type="button"
+                onClick={onOpenDevices}
+                disabled={!onOpenDevices}
+                className={`group inline-grid min-h-11 w-full min-w-0 grid-cols-[auto,minmax(0,1fr),auto] items-center gap-2 rounded border px-2 py-1.5 text-left transition-colors hover:border-neutral-500 hover:bg-neutral-900/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 sm:min-h-8 sm:w-auto sm:max-w-[22rem] ${
+                  toneClasses[runner.tone].border
+                } ${toneClasses[runner.tone].bg} disabled:cursor-not-allowed disabled:opacity-60`}
+                aria-label={`Open devices: runner ${runner.label}${runner.detail ? `, ${runner.detail}` : ''}${
+                  runner.meta.length > 0 ? `, ${runner.meta.join(', ')}` : ''
+                }`}
+                title={runner.detail ? `Open devices: ${runner.detail}` : 'Open devices'}
+              >
+                <Server className={`h-3.5 w-3.5 shrink-0 ${toneClasses[runner.tone].icon}`} aria-hidden="true" />
+                <span className="min-w-0 flex-1">
+                  <span className="flex min-w-0 items-center gap-1.5 leading-tight">
+                    <span className="shrink-0 font-mono text-ui-sm font-semibold uppercase text-neutral-500">Runner</span>
+                    <StatusDot tone={runner.tone} />
+                    <span className={`truncate text-xs font-semibold ${toneClasses[runner.tone].text}`}>{runner.label}</span>
+                  </span>
+                  <span className="block truncate text-ui-sm text-neutral-400">{runner.detail ?? 'Open device and runner state'}</span>
                 </span>
-              ))}
-            </span>
-            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-neutral-600 transition-colors group-hover:text-neutral-300" aria-hidden="true" />
-          </button>
-        )}
+                <span className="hidden min-w-0 items-center gap-1 lg:flex">
+                  {runner.meta.slice(0, 2).map(item => (
+                    <span
+                      key={item}
+                      className="max-w-24 truncate rounded border border-neutral-800 bg-neutral-950/60 px-1.5 py-0.5 font-mono text-ui-sm text-neutral-400"
+                    >
+                      {item}
+                    </span>
+                  ))}
+                </span>
+                <ChevronRight className="h-3.5 w-3.5 shrink-0 text-neutral-600 transition-colors group-hover:text-neutral-300" aria-hidden="true" />
+              </button>
+            )}
 
         {accountSpendControl ? (
           openAccountSpend ? (
@@ -807,6 +811,8 @@ export function StrategicSessionControl({
             </span>
           </span>
         ) : null}
+          </>
+        )}
       </div>
     </div>
   );

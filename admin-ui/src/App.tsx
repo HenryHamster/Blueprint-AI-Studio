@@ -1512,6 +1512,7 @@ export default function App() {
                 }}
                 onOpenAccounts={openRuntimeAccounts}
                 onOpenSpend={openRuntimeAnalytics}
+                showMonitoringControls={false}
               />
               <button
                 type="button"
@@ -1566,10 +1567,14 @@ export default function App() {
                 onOpenRuntimeHealth={() => openStrategicContextTarget({ surface: 'runtime', section: 'health' })}
                 onOpenRuntimeDevices={() => openStrategicContextTarget({ surface: 'runtime', section: 'devices' })}
                 onOpenRuntimeCompute={() => openStrategicContextTarget({ surface: 'runtime', section: 'compute' })}
+                onOpenAccounts={openRuntimeAccounts}
+                onOpenSpend={openRuntimeAnalytics}
+                onOpenContextWorkspace={openStrategicContextWorkspace}
                 onOpenTask={handleViewTaskById}
                 onOpenMessages={strategicMessageTarget.open}
                 onOpenTarget={openStrategicContextTarget}
                 workbenchState={strategicWorkbenchState}
+                accountSpend={strategicAccountSpend}
                 savingSessionRefs={savingStrategicWorkbench}
                 onUpdateSessionRefs={updateStrategicSessionRefs}
               />

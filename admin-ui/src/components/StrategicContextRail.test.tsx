@@ -666,6 +666,91 @@ describe('StrategicContextRail', () => {
     expect(onOpenRuntimeCompute).toHaveBeenCalled();
   });
 
+  test('keeps queued compute visible after monitoring moves out of the header', () => {
+    const onOpenRuntimeCompute = vi.fn();
+    const queuedOnlyState: StrategicStateResponse = {
+      ...STATE,
+      runtime: {
+        ...STATE.runtime,
+        work: {
+          ...STATE.runtime!.work!,
+          compute_jobs: {
+            ...STATE.runtime!.work!.compute_jobs,
+            counts: {
+              ...STATE.runtime!.work!.compute_jobs.counts,
+              active: 0,
+              terminal_recent: 0,
+              queued: 1,
+              starting: 0,
+              running: 0,
+              failed_recent: 0,
+              timed_out_recent: 0,
+            },
+            items: [
+              {
+                ...STATE.runtime!.work!.compute_jobs.items[0],
+                id: 'job-queued',
+                task_title: 'Queued compute check',
+                status: 'QUEUED',
+              },
+            ],
+          },
+          held_approvals: { count: 0, items: [] },
+          local_runner_holds: { count: 0, items: [] },
+          parked_wakes: {
+            counts: {
+              active: 0,
+              pending: 0,
+              fired: 0,
+              problem: 0,
+              expired: 0,
+              failed: 0,
+            },
+            items: [],
+          },
+        },
+      },
+    };
+    const { host } = mount({ state: queuedOnlyState, onOpenRuntimeCompute });
+
+    expect(host.textContent).toContain('Runtime work');
+    expect(host.textContent).toContain('queued');
+    expect(host.textContent).toContain('1 queued compute job');
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Compute'))
+      ?.click();
+
+    expect(onOpenRuntimeCompute).toHaveBeenCalled();
+  });
+
+  test('keeps configured account caps as neutral detail in the rail', () => {
+    const onOpenAccounts = vi.fn();
+    const { host } = mount({
+      accountSpend: {
+        totalAccounts: 2,
+        availableAccounts: 2,
+        enabledAccounts: 2,
+        configuredCapAccounts: 2,
+        trackedSpendUsd: 0,
+        dailyCostCeilingUsd: 0,
+      },
+      onOpenAccounts,
+    });
+
+    const accountStatus = host.querySelector('[data-testid="strategic-account-status"]');
+    expect(accountStatus?.textContent).toContain('available');
+    expect(accountStatus?.textContent).toContain('2/2 available');
+    expect(accountStatus?.textContent).toContain('2 with caps');
+    expect(accountStatus?.textContent).not.toContain('needs check');
+    expect(accountStatus?.textContent).not.toContain('$0.00');
+    const accountButton = accountStatus?.querySelector<HTMLButtonElement>('button[aria-label^="Open accounts: available"]');
+    expect(accountButton).toBeTruthy();
+
+    accountButton?.click();
+    expect(onOpenAccounts).toHaveBeenCalled();
+  });
+
   test('delegates context package targets to the canonical handler when provided', () => {
     const onOpenTarget = vi.fn();
     const { host, props } = mount({ onOpenTarget });

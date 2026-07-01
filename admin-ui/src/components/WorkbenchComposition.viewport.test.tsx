@@ -191,6 +191,56 @@ const STATE = {
       fallback_reason: null,
       liveness_window_seconds: 300,
     },
+    work: {
+      compute_jobs: {
+        window_minutes: 360,
+        counts: {
+          active: 0,
+          terminal_recent: 0,
+          total: 1,
+          queued: 1,
+          starting: 0,
+          running: 0,
+          polling: 0,
+          succeeded_recent: 0,
+          failed_recent: 0,
+          cancelled_recent: 0,
+          timed_out_recent: 0,
+          criterion_measured: 0,
+          criterion_met: 0,
+        },
+        spend: {
+          active_accrued_usd: 0,
+          recent_terminal_usd: 0,
+          window_total_usd: 0,
+        },
+        items: [
+          {
+            id: 'job-queued',
+            task_id: 'task-queued-compute',
+            task_title: 'Queued compute check',
+            task_type: 'compute_experiment',
+            status: 'QUEUED',
+            backend: 'local',
+            queued_at: '2026-06-29T01:06:00Z',
+            cost_usd: 0,
+          },
+        ],
+      },
+      held_approvals: { count: 0, items: [] },
+      local_runner_holds: { count: 0, items: [] },
+      parked_wakes: {
+        counts: {
+          active: 0,
+          pending: 0,
+          fired: 0,
+          problem: 0,
+          expired: 0,
+          failed: 0,
+        },
+        items: [],
+      },
+    },
   },
   design: { has_design_doc: true, revision: 2 },
 } as StrategicStateResponse;
@@ -412,6 +462,7 @@ describe('WorkbenchComposition viewport regression', () => {
     onOpenCompute?: () => void;
     onOpenAccounts?: () => void;
     onOpenContext?: () => void;
+    onOpenPipeline?: () => void;
   } = {}) {
     const onOpenCommandPalette = options.onOpenCommandPalette ?? vi.fn();
     await mockStrategicSession([
@@ -463,6 +514,7 @@ describe('WorkbenchComposition viewport regression', () => {
                     onOpenDevices={options.onOpenDevices ?? vi.fn()}
                     onOpenCompute={options.onOpenCompute ?? vi.fn()}
                     onOpenAccounts={options.onOpenAccounts ?? vi.fn()}
+                    showMonitoringControls={false}
                   />
                   <button
                     type="button"
@@ -494,13 +546,25 @@ describe('WorkbenchComposition viewport regression', () => {
                   <StrategicContextRail
                     state={STATE}
                     onOpenProjectSection={vi.fn()}
-                    onOpenPipeline={vi.fn()}
+                    onOpenPipeline={options.onOpenPipeline ?? vi.fn()}
                     onOpenRuntimeHealth={vi.fn()}
-                    onOpenRuntimeDevices={vi.fn()}
-                    onOpenRuntimeCompute={vi.fn()}
+                    onOpenRuntimeDevices={options.onOpenDevices ?? vi.fn()}
+                    onOpenRuntimeCompute={options.onOpenCompute ?? vi.fn()}
+                    onOpenAccounts={options.onOpenAccounts ?? vi.fn()}
+                    onOpenContextWorkspace={options.onOpenContext ?? vi.fn()}
                     onOpenTask={vi.fn()}
                     onOpenMessages={vi.fn()}
                     onOpenTarget={vi.fn()}
+                    accountSpend={{
+                      totalAccounts: 2,
+                      availableAccounts: 1,
+                      enabledAccounts: 1,
+                      activeAccountTasks: 1,
+                      configuredCapAccounts: 1,
+                      disabledModelCount: 0,
+                      trackedSpendUsd: 12.34,
+                      dailyCostCeilingUsd: 50,
+                    }}
                   />
                 )}
               />
@@ -533,16 +597,27 @@ describe('WorkbenchComposition viewport regression', () => {
     const onOpenCommandPalette = vi.fn();
     const onOpenDevices = vi.fn();
     const onOpenAccounts = vi.fn();
+    const onOpenCompute = vi.fn();
+    const onOpenContext = vi.fn();
+    const onOpenPipeline = vi.fn();
 
     await expectNoOverflowAt(
       1024,
-      () => renderWorkbenchShell({ onOpenCommandPalette, onOpenDevices, onOpenAccounts }),
+      () => renderWorkbenchShell({
+        onOpenCommandPalette,
+        onOpenDevices,
+        onOpenAccounts,
+        onOpenCompute,
+        onOpenContext,
+        onOpenPipeline,
+      }),
       { height: 800, waitMs: 50 },
     );
 
     const sessionControl = host?.querySelector('[data-testid="strategic-session-control"]');
     const rail = host?.querySelector('[data-testid="strategic-context-rail"]');
     const contextButton = host?.querySelector<HTMLButtonElement>('button[aria-label="Open Strategic context"]');
+    const railButtons = Array.from(rail?.querySelectorAll<HTMLButtonElement>('button') ?? []);
     const commandButtons = Array.from(host?.querySelectorAll<HTMLButtonElement>('button[title="Open command palette (Ctrl+K)"]') ?? [])
       .filter(button => {
         const rect = button.getBoundingClientRect();
@@ -551,9 +626,18 @@ describe('WorkbenchComposition viewport regression', () => {
 
     expect(sessionControl).toBeTruthy();
     expect(getComputedStyle(sessionControl as Element).display).not.toBe('none');
-    expect(host?.querySelector('button[aria-label^="Open devices: runner"]')).toBeTruthy();
-    const accountsButton = host?.querySelector<HTMLButtonElement>('button[aria-label^="Open accounts:"]');
+    expect(sessionControl?.querySelector('button[aria-label^="Open devices: runner"]')).toBeNull();
+    expect(sessionControl?.querySelector('button[aria-label^="Open accounts:"]')).toBeNull();
+    const devicesButton = railButtons.find(button => button.textContent?.trim() === 'Devices');
+    const accountsButton = railButtons.find(button => button.textContent?.trim() === 'Accounts');
+    const computeButton = railButtons.find(button => button.textContent?.trim() === 'Compute');
+    const contextRailButton = railButtons.find(button => button.textContent?.trim() === 'Open context');
+    const pipelineButton = railButtons.find(button => button.textContent?.trim() === 'Pipeline');
     expect(accountsButton).toBeTruthy();
+    expect(devicesButton).toBeTruthy();
+    expect(computeButton).toBeTruthy();
+    expect(contextRailButton).toBeTruthy();
+    expect(pipelineButton).toBeTruthy();
     expect(rail).toBeTruthy();
     expect(getComputedStyle(rail!.closest('aside')!).display).not.toBe('none');
     expect(contextButton).toBeTruthy();
@@ -563,8 +647,16 @@ describe('WorkbenchComposition viewport regression', () => {
     await act(async () => { commandButtons[0].click(); });
     expect(onOpenCommandPalette).toHaveBeenCalledOnce();
     expect(onOpenDevices).not.toHaveBeenCalled();
+    await act(async () => { devicesButton!.click(); });
+    expect(onOpenDevices).toHaveBeenCalledOnce();
     await act(async () => { accountsButton!.click(); });
     expect(onOpenAccounts).toHaveBeenCalledOnce();
+    await act(async () => { computeButton!.click(); });
+    expect(onOpenCompute).toHaveBeenCalledOnce();
+    await act(async () => { contextRailButton!.click(); });
+    expect(onOpenContext).toHaveBeenCalledOnce();
+    await act(async () => { pipelineButton!.click(); });
+    expect(onOpenPipeline).toHaveBeenCalledOnce();
   });
 
   test('mobile shell keeps composer, hides rail, and exposes context button without overflow', async () => {

@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { Activity, ArrowUpRight, CircleAlert, Cpu, FileText, GitBranch, Network, Plus, Radio, X } from 'lucide-react';
+import { Activity, ArrowUpRight, CircleAlert, Cpu, CreditCard, FileText, GitBranch, Network, Plus, Radio, X } from 'lucide-react';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import type {
   StrategicContextCanvasNode,
@@ -25,6 +25,7 @@ import {
   type StrategicSelectedRef,
 } from '../utils/strategicWorkbenchSession';
 import { StrategicSessionEvents } from './StrategicSessionEvents';
+import type { StrategicAccountSpendStatus } from './StrategicSessionControl';
 import { WorkbenchPanel } from './WorkbenchLayout';
 
 type ProjectTarget = 'running-update' | 'directions' | 'problem-model' | 'design-doc';
@@ -46,11 +47,15 @@ interface StrategicContextRailProps {
   onOpenRuntimeHealth: () => void;
   onOpenRuntimeDevices?: () => void;
   onOpenRuntimeCompute?: () => void;
+  onOpenAccounts?: () => void;
+  onOpenSpend?: () => void;
+  onOpenContextWorkspace?: () => void;
   onOpenTask?: (taskId: string) => void;
   onOpenMessages?: (target?: StrategicMessageTarget) => void;
   onOpenKnowledge?: (documentId?: string | null, directionId?: string | null) => void;
   onOpenTarget?: (target?: StrategicContextPackageDrilldown['target'] | null) => void;
   workbenchState?: StrategicWorkbenchState | null;
+  accountSpend?: StrategicAccountSpendStatus | null;
   savingSessionRefs?: boolean;
   onUpdateSessionRefs?: (
     updateRefs: (refs: StrategicWorkbenchState['selected_refs']) => StrategicWorkbenchState['selected_refs']
@@ -134,6 +139,9 @@ function runtimeWorkTone(work: StrategicRuntimeWorkState): { dot: string; text: 
   if ((work.compute_jobs?.counts.active ?? 0) > 0 || (work.parked_wakes?.counts.active ?? 0) > 0) {
     return { dot: 'bg-cyan-400', text: 'text-cyan-300', label: 'active' };
   }
+  if ((work.compute_jobs?.counts.queued ?? 0) > 0) {
+    return { dot: 'bg-cyan-400', text: 'text-cyan-300', label: 'queued' };
+  }
   if ((work.compute_jobs?.counts.terminal_recent ?? 0) > 0) {
     return { dot: 'bg-neutral-500', text: 'text-neutral-400', label: 'recent result' };
   }
@@ -145,6 +153,9 @@ function runtimeWorkDetail(work: StrategicRuntimeWorkState): string {
   const parts = [
     (work.compute_jobs?.counts.active ?? 0) > 0
       ? pluralize(work.compute_jobs.counts.active, 'compute job')
+      : null,
+    (work.compute_jobs?.counts.queued ?? 0) > 0
+      ? pluralize(work.compute_jobs.counts.queued, 'queued compute job')
       : null,
     localRunnerHoldCount > 0
       ? pluralize(localRunnerHoldCount, 'local runner hold')
@@ -162,6 +173,51 @@ function runtimeWorkDetail(work: StrategicRuntimeWorkState): string {
   if (parts.length > 0) return parts.join(', ');
   const terminal = work.compute_jobs?.counts.terminal_recent ?? 0;
   return terminal > 0 ? `${pluralize(terminal, 'recent compute result')}` : 'No active background work';
+}
+
+function accountSpendTone(accountSpend: StrategicAccountSpendStatus): { dot: string; text: string; label: string } {
+  const total = accountSpend.totalAccounts ?? null;
+  const available = accountSpend.availableAccounts ?? null;
+  const enabled = accountSpend.enabledAccounts ?? null;
+  if (total === 0) return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'not configured' };
+  if (available === 0 && (total == null || total > 0)) return { dot: 'bg-rose-400', text: 'text-rose-300', label: 'blocked' };
+  if (
+    (accountSpend.cooldownAccounts ?? 0) > 0 ||
+    (accountSpend.cappedAccounts ?? 0) > 0 ||
+    (accountSpend.disabledModelCount ?? 0) > 0 ||
+    (available != null && total != null && available < total)
+  ) {
+    return { dot: 'bg-amber-300', text: 'text-amber-300', label: 'needs check' };
+  }
+  if ((available ?? 0) > 0 || (enabled ?? 0) > 0) return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'available' };
+  return { dot: 'bg-neutral-600', text: 'text-neutral-400', label: 'unknown' };
+}
+
+function accountSpendDetail(accountSpend: StrategicAccountSpendStatus): string {
+  const total = accountSpend.totalAccounts ?? null;
+  const available = accountSpend.availableAccounts ?? null;
+  const enabled = accountSpend.enabledAccounts ?? null;
+  const trackedValue = accountSpend.trackedSpendUsd ?? accountSpend.cumulativeCostUsd ?? null;
+  const ceilingValue = accountSpend.dailyCostCeilingUsd ?? null;
+  const trackedSpend = typeof trackedValue === 'number' && Number.isFinite(trackedValue) && trackedValue > 0
+    ? formatCost(trackedValue)
+    : null;
+  const ceiling = typeof ceilingValue === 'number' && Number.isFinite(ceilingValue) && ceilingValue > 0
+    ? formatCost(ceilingValue)
+    : null;
+  const parts = [
+    total === 0 ? 'No accounts configured' : null,
+    available != null && total != null && total > 0 ? `${available}/${total} available` : null,
+    enabled != null && total == null ? pluralize(enabled, 'enabled account') : null,
+    enabled != null && total != null && total > 0 && enabled !== available ? pluralize(enabled, 'enabled account') : null,
+    (accountSpend.activeAccountTasks ?? 0) > 0 ? `${accountSpend.activeAccountTasks} active` : null,
+    (accountSpend.cooldownAccounts ?? 0) > 0 ? `${accountSpend.cooldownAccounts} cooldown` : null,
+    (accountSpend.configuredCapAccounts ?? 0) > 0 ? `${accountSpend.configuredCapAccounts} with caps` : null,
+    (accountSpend.disabledModelCount ?? 0) > 0 ? pluralize(accountSpend.disabledModelCount ?? 0, 'disabled model') : null,
+    trackedSpend ? `tracked ${trackedSpend}` : null,
+    ceiling ? `daily ceiling ${ceiling}` : null,
+  ].filter(Boolean);
+  return parts.length > 0 ? parts.join(' / ') : 'Account and spend status unavailable';
 }
 
 function shaFreshnessTone(verdict?: string | null): { dot: string; text: string; label: string } {
@@ -217,6 +273,7 @@ function runtimeWorkHasSignal(work?: StrategicRuntimeWorkState | null): work is 
   if (!work) return false;
   return (
     (work.compute_jobs?.counts.active ?? 0) > 0 ||
+    (work.compute_jobs?.counts.queued ?? 0) > 0 ||
     (work.compute_jobs?.counts.failed_recent ?? 0) > 0 ||
     (work.compute_jobs?.counts.timed_out_recent ?? 0) > 0 ||
     (work.local_runner_holds?.count ?? 0) > 0 ||
@@ -230,14 +287,20 @@ function runtimeWorkHasSignal(work?: StrategicRuntimeWorkState | null): work is 
 function RailButton({
   children,
   onClick,
+  ariaLabel,
+  title,
 }: {
   children: ReactNode;
   onClick: () => void;
+  ariaLabel?: string;
+  title?: string;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
+      aria-label={ariaLabel}
+      title={title ?? ariaLabel}
       className="inline-flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-2.5 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100"
     >
       <span>{children}</span>
@@ -873,11 +936,15 @@ export function StrategicContextRail({
   onOpenRuntimeHealth,
   onOpenRuntimeDevices,
   onOpenRuntimeCompute,
+  onOpenAccounts,
+  onOpenSpend,
+  onOpenContextWorkspace,
   onOpenTask,
   onOpenMessages,
   onOpenKnowledge,
   onOpenTarget,
   workbenchState,
+  accountSpend = null,
   savingSessionRefs = false,
   onUpdateSessionRefs,
 }: StrategicContextRailProps) {
@@ -958,6 +1025,11 @@ export function StrategicContextRail({
   const firstRuntimeJob = runtimeWork?.compute_jobs.items[0] ?? null;
   const firstLocalRunnerHold = runtimeWork?.local_runner_holds?.items[0] ?? null;
   const hasLocalRunnerHolds = (runtimeWork?.local_runner_holds?.count ?? 0) > 0;
+  const accountStatus = accountSpend ? accountSpendTone(accountSpend) : null;
+  const accountDetail = accountSpend ? accountSpendDetail(accountSpend) : null;
+  const openAccountSpend = onOpenAccounts ?? onOpenSpend;
+  const accountActionText = onOpenAccounts ? 'Accounts' : 'Spend';
+  const accountActionLabel = onOpenAccounts ? 'accounts' : 'spend';
   const workSessionActions = state?.work_session?.actions ?? [];
   const workSessionEvents = state?.work_session?.events?.items ?? [];
   const visibleWorkSessionActions = workSessionActions.slice(0, 4);
@@ -1089,6 +1161,10 @@ export function StrategicContextRail({
             ) : null}
           </div>
         )}
+        <div className="mt-3 flex flex-wrap gap-2 border-t border-neutral-800 pt-3">
+          {onOpenContextWorkspace && <RailButton onClick={onOpenContextWorkspace}>Open context</RailButton>}
+          <RailButton onClick={onOpenPipeline}>Pipeline</RailButton>
+        </div>
         {localRunner && localRunnerStatus && (
           <div className="mt-3 border-t border-neutral-800 pt-3">
             <div className="flex min-w-0 items-center gap-2">
@@ -1106,6 +1182,33 @@ export function StrategicContextRail({
                 </p>
               </div>
               <RailButton onClick={onOpenRuntimeDevices ?? onOpenRuntimeHealth}>Devices</RailButton>
+            </div>
+          </div>
+        )}
+        {accountSpend && accountStatus && (
+          <div className="mt-3 border-t border-neutral-800 pt-3" data-testid="strategic-account-status">
+            <div className="flex min-w-0 items-center gap-2">
+              <CreditCard className="h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="truncate text-xs font-semibold text-neutral-100">Accounts</span>
+                  <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${accountStatus.dot}`} aria-hidden="true" />
+                  <span className={`shrink-0 text-ui-sm font-semibold uppercase ${accountStatus.text}`}>
+                    {accountStatus.label}
+                  </span>
+                </div>
+                <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-neutral-500">
+                  {accountDetail}
+                </p>
+              </div>
+              {openAccountSpend && (
+                <RailButton
+                  onClick={openAccountSpend}
+                  ariaLabel={`Open ${accountActionLabel}: ${accountStatus.label}${accountDetail ? `, ${accountDetail}` : ''}`}
+                >
+                  {accountActionText}
+                </RailButton>
+              )}
             </div>
           </div>
         )}
@@ -1213,43 +1316,55 @@ export function StrategicContextRail({
         onOpenPipeline={onOpenPipeline}
       />
 
-      <WorkbenchPanel title="Problem" meta={state?.problem_model.revision ? `r${state.problem_model.revision}` : undefined}>
-        <div className="flex min-w-0 gap-2">
-          <Radio className="mt-0.5 h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
-          <p className="line-clamp-3 text-xs leading-relaxed text-neutral-300">
-            {state?.problem_model.current_focus || state?.problem_model.purpose || 'No problem model focus yet.'}
-          </p>
-        </div>
-        <div className="mt-3 border-t border-neutral-800 pt-2">
-          <StatRow label="active gaps" value={state?.problem_model.active_gap_count ?? 0} />
-          <StatRow label="capabilities" value={state?.problem_model.capability_count ?? 0} />
-          <StatRow label="needs answer" value={state?.problem_model.pending_confirmation_count ?? 0} />
-        </div>
-        {state?.problem_model.top_gap && (
-          <p className="mt-2 line-clamp-2 text-xs leading-relaxed text-neutral-500">
-            {state.problem_model.top_gap.name}
-          </p>
-        )}
-        <div className="mt-3">
-          <RailButton onClick={() => onOpenProjectSection('problem-model')}>Model</RailButton>
-        </div>
-      </WorkbenchPanel>
-
-      <WorkbenchPanel title="Direction" meta={`${state?.directions.active_count ?? 0} active`}>
-        <div className="flex min-w-0 gap-2">
-          <GitBranch className="mt-0.5 h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
-          <p className="line-clamp-3 text-xs leading-relaxed text-neutral-300">
-            {state?.directions.primary?.text || 'No active direction selected.'}
-          </p>
-        </div>
-        <div className="mt-3 flex flex-wrap gap-2">
-          <RailButton onClick={() => onOpenProjectSection('directions')}>Directions</RailButton>
-          <RailButton onClick={() => onOpenProjectSection('running-update')}>Update</RailButton>
-        </div>
-      </WorkbenchPanel>
-
       <WorkbenchPanel title="Context" meta={formatCost(state?.tasks.cumulative_estimated_cost_usd)}>
         <div className="space-y-3">
+          <div className="space-y-3 border-b border-neutral-800 pb-3">
+            <div data-testid="strategic-problem-summary">
+              <div className="flex min-w-0 gap-2">
+                <Radio className="mt-0.5 h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 items-center justify-between gap-2">
+                    <span className="truncate text-xs font-semibold text-neutral-100">Problem</span>
+                    {state?.problem_model.revision && (
+                      <span className="shrink-0 font-mono text-ui-sm text-neutral-600">r{state.problem_model.revision}</span>
+                    )}
+                  </div>
+                  <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-neutral-300">
+                    {state?.problem_model.current_focus || state?.problem_model.purpose || 'No problem model focus yet.'}
+                  </p>
+                  {state?.problem_model.top_gap && (
+                    <p className="mt-1 line-clamp-1 text-ui-sm text-neutral-500">
+                      {state.problem_model.top_gap.name}
+                    </p>
+                  )}
+                </div>
+              </div>
+              <div className="mt-2 flex flex-wrap gap-2 pl-6">
+                <RailButton onClick={() => onOpenProjectSection('problem-model')}>Model</RailButton>
+              </div>
+            </div>
+
+            <div className="border-t border-neutral-800 pt-3" data-testid="strategic-direction-summary">
+              <div className="flex min-w-0 gap-2">
+                <GitBranch className="mt-0.5 h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex min-w-0 items-center justify-between gap-2">
+                    <span className="truncate text-xs font-semibold text-neutral-100">Direction</span>
+                    <span className="shrink-0 font-mono text-ui-sm text-neutral-600">
+                      {state?.directions.active_count ?? 0} active
+                    </span>
+                  </div>
+                  <p className="mt-1 line-clamp-2 text-xs leading-relaxed text-neutral-300">
+                    {state?.directions.primary?.text || 'No active direction selected.'}
+                  </p>
+                </div>
+              </div>
+              <div className="mt-2 flex flex-wrap gap-2 pl-6">
+                <RailButton onClick={() => onOpenProjectSection('directions')}>Directions</RailButton>
+                <RailButton onClick={() => onOpenProjectSection('running-update')}>Update</RailButton>
+              </div>
+            </div>
+          </div>
           <ContextPackageBlock
             contextPackage={state?.context_package}
             sessionRefs={selectedRefDescriptors}
