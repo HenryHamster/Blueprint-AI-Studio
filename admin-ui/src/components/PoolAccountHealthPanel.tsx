@@ -202,7 +202,7 @@ export function PoolAccountHealthPanel({ accounts, loading, servedStale = false,
             <div key={acct.account_id} className={`bg-neutral-900/50 border border-neutral-800/50 rounded-lg p-2.5${dimmed ? ' opacity-50' : ''}`}>
               <button
                 type="button"
-                className="w-full text-left"
+                className="min-h-11 w-full text-left"
                 onClick={() => setExpandedId(expanded ? null : acct.account_id)}
               >
                 <div className="flex items-center gap-2 flex-wrap">

@@ -85,6 +85,93 @@ function RuntimeStatusPill({
   );
 }
 
+function RuntimeSettingsStatusRail({
+  selectedProjectRepoLabel,
+  selectedProjectId,
+  apiHealthy,
+  wsConnected,
+  userRole,
+}: {
+  selectedProjectRepoLabel: string | null;
+  selectedProjectId: string | null;
+  apiHealthy: boolean;
+  wsConnected: boolean;
+  userRole: 'admin' | 'user' | null;
+}) {
+  const rows = [
+    {
+      label: 'Scope',
+      value: selectedProjectRepoLabel ?? (selectedProjectId ? 'Project selected' : 'Fleet-wide'),
+      tone: selectedProjectId ? 'text-cyan-300' : 'text-neutral-300',
+    },
+    {
+      label: 'API',
+      value: apiHealthy ? 'connected' : 'degraded',
+      tone: apiHealthy ? 'text-emerald-300' : 'text-amber-300',
+    },
+    {
+      label: 'Events',
+      value: wsConnected ? 'connected' : 'stale',
+      tone: wsConnected ? 'text-emerald-300' : 'text-amber-300',
+    },
+    {
+      label: 'Role',
+      value: userRole ?? 'unknown',
+      tone: userRole === 'admin' ? 'text-neutral-100' : 'text-neutral-300',
+    },
+  ];
+
+  return (
+    <div data-testid="runtime-settings-status">
+      <WorkbenchPanel title="Runtime" meta={apiHealthy && wsConnected ? 'live' : 'check'}>
+        <dl className="grid gap-1.5 text-xs">
+          {rows.map(row => (
+            <div key={row.label} className="grid min-w-0 grid-cols-[4.4rem_minmax(0,1fr)] gap-2 rounded border border-neutral-800 bg-[#0d1218] px-2 py-1.5">
+              <dt className="font-semibold uppercase tracking-wide text-neutral-500">{row.label}</dt>
+              <dd className={`min-w-0 truncate font-mono ${row.tone}`} title={row.value}>{row.value}</dd>
+            </div>
+          ))}
+        </dl>
+      </WorkbenchPanel>
+    </div>
+  );
+}
+
+function ProjectNoSelectionState({
+  onOpenProjectManagement,
+  onProjectSectionChange,
+}: {
+  onOpenProjectManagement: () => void;
+  onProjectSectionChange: (section: ProjectSection) => void;
+}) {
+  return (
+    <div className="flex h-full min-h-0 items-center justify-center p-4">
+      <WorkbenchPanel title="Select project" meta="required" className="w-full max-w-lg">
+        <div className="space-y-3 text-sm text-neutral-400">
+          <p>No project is selected for this workspace.</p>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={onOpenProjectManagement}
+              className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-700 bg-neutral-900 px-3 text-sm font-semibold text-neutral-200 transition-colors hover:bg-neutral-800"
+            >
+              <Wrench className="h-3.5 w-3.5" />
+              Manage projects
+            </button>
+            <button
+              type="button"
+              onClick={() => onProjectSectionChange('manage')}
+              className="inline-flex min-h-11 items-center rounded-md border border-neutral-800 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900"
+            >
+              Project overview
+            </button>
+          </div>
+        </div>
+      </WorkbenchPanel>
+    </div>
+  );
+}
+
 interface ProjectWorkspaceProps {
   projectSection: ProjectSection;
   onProjectSectionChange: (section: ProjectSection) => void;
@@ -174,7 +261,12 @@ export function ProjectWorkspace({
       flush
       contentClassName="min-h-0 min-w-0 overflow-hidden"
     >
-      {projectSection !== 'manage' ? (
+      {projectSection !== 'manage' && !selectedProjectId ? (
+        <ProjectNoSelectionState
+          onOpenProjectManagement={onOpenProjectManagement}
+          onProjectSectionChange={onProjectSectionChange}
+        />
+      ) : projectSection !== 'manage' ? (
         <DirectionsPanel
           addToast={addToast}
           selectedProjectId={selectedProjectId}
@@ -308,7 +400,7 @@ export function ProjectWorkspace({
 
                 <WorkbenchPanel title="Project settings" className="xl:col-span-2">
                   <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-                    {PROJECT_MANAGE_SECTIONS.filter(item => item.id !== 'overview' && item.id !== 'access').map(item => {
+                    {PROJECT_MANAGE_SECTIONS.filter(item => item.id !== 'overview').map(item => {
                       const Icon = item.icon;
                       return (
                         <button
@@ -446,7 +538,7 @@ export function RuntimeWorkspace({
           aria-label="Restart orchestrator"
         >
           <RotateCw className="h-3.5 w-3.5" />
-          <span className="hidden sm:inline">Restart orchestrator</span>
+          <span className="hidden lg:inline">Restart</span>
         </button>
       )}
     </>
@@ -606,15 +698,27 @@ export function RuntimeWorkspace({
               <RuntimeStatusPill label="cooldowns" value={disabledModelCount} tone="warn" />
             )}
           </RuntimeSectionIntro>
-          <RuntimeAccountsPanel selectedProjectId={selectedProjectId} settingsRouterProps={settingsRouterProps} />
+          <RuntimeAccountsPanel
+            selectedProjectId={selectedProjectId}
+            settingsRouterProps={settingsRouterProps}
+            availableSettingsSections={runtimeSettingsSections.map(item => item.id)}
+            onOpenRuntimeSettingsSection={(section) => {
+              onRuntimeConfigSectionChange(section);
+              onRuntimeSectionChange('settings');
+            }}
+          />
         </div>
       ) : (
         <div className="grid h-full min-h-0 grid-cols-1 overflow-hidden lg:grid-cols-[260px_minmax(0,1fr)]">
           <aside className="min-h-0 overflow-auto border-b border-neutral-800 bg-[#080c11] p-3 custom-scrollbar lg:border-b-0 lg:border-r">
-            <div className="mb-3 hidden lg:block">
-              <div className="text-ui-md font-semibold uppercase tracking-wide text-neutral-500">Runtime settings</div>
-            </div>
-            <nav className="space-y-1" aria-label="Runtime settings sections">
+            <RuntimeSettingsStatusRail
+              selectedProjectRepoLabel={selectedProjectRepoLabel}
+              selectedProjectId={selectedProjectId}
+              apiHealthy={apiHealthy}
+              wsConnected={wsConnected}
+              userRole={userRole}
+            />
+            <nav className="mt-3 space-y-1" aria-label="Runtime settings sections">
               {runtimeSettingsSections.map(item => {
                 const Icon = item.icon;
                 const selected = item.id === activeRuntimeSettingsItem.id;

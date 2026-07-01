@@ -5,6 +5,7 @@ import { SettingsSectionRouter, type SettingsSectionRouterProps } from './Settin
 import { PoolAccountHealthPanel, type AccountHealthEntry } from './PoolAccountHealthPanel';
 import { ProviderModelBreakdownPanel } from './ProviderModelBreakdownPanel';
 import { ProviderCostPanel } from './ProviderCostPanel';
+import type { RuntimeSettingsSection } from './OperatorWorkspaceSections';
 
 const WINDOW_OPTIONS = [
   { label: '6h', value: 6 },
@@ -49,9 +50,13 @@ function StatCell({
 export function RuntimeAccountsPanel({
   selectedProjectId,
   settingsRouterProps,
+  availableSettingsSections = [],
+  onOpenRuntimeSettingsSection,
 }: {
   selectedProjectId: string | null;
   settingsRouterProps: Omit<SettingsSectionRouterProps, 'activeSection'>;
+  availableSettingsSections?: RuntimeSettingsSection[];
+  onOpenRuntimeSettingsSection?: (section: RuntimeSettingsSection) => void;
 }) {
   const [windowHours, setWindowHours] = useState(24);
   const [accountHealth, setAccountHealth] = useState<AccountHealthEntry[] | null>(null);
@@ -103,6 +108,13 @@ export function RuntimeAccountsPanel({
     (sum, account) => sum + account.rate_limited_models.length,
     0,
   );
+  const availableSettings = new Set(availableSettingsSections);
+  const shortcutOptions: Array<{ section: RuntimeSettingsSection; label: string; title: string }> = [
+    { section: 'provider-settings', label: 'Providers', title: 'Open provider model defaults' },
+    { section: 'provider-routing', label: 'Routing', title: 'Open provider routing policy' },
+    { section: 'notifications', label: 'Alerts', title: 'Open spend and notification settings' },
+  ];
+  const shortcuts = shortcutOptions.filter(shortcut => availableSettings.has(shortcut.section));
 
   return (
     <div className="space-y-3">
@@ -114,19 +126,32 @@ export function RuntimeAccountsPanel({
               Identity, account pool health, model regressions, and usage cost.
             </p>
           </div>
-          <label className="flex shrink-0 items-center gap-2 text-ui-md text-neutral-500">
-            Window
-            <select
-              aria-label="Usage window"
-              value={windowHours}
-              onChange={event => setWindowHours(Number(event.target.value))}
-              className="rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-xs text-neutral-300 focus:border-neutral-500 focus:outline-none"
-            >
-              {WINDOW_OPTIONS.map(option => (
-                <option key={option.value} value={option.value}>{option.label}</option>
-              ))}
-            </select>
-          </label>
+          <div className="flex min-w-0 flex-wrap items-center gap-2 sm:justify-end">
+            {shortcuts.map(shortcut => (
+              <button
+                key={shortcut.section}
+                type="button"
+                onClick={() => onOpenRuntimeSettingsSection?.(shortcut.section)}
+                className="inline-flex min-h-11 items-center rounded-md border border-neutral-800 bg-neutral-950/60 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-8 sm:text-xs"
+                title={shortcut.title}
+              >
+                {shortcut.label}
+              </button>
+            ))}
+            <label className="flex shrink-0 items-center gap-2 text-ui-md text-neutral-500">
+              Window
+              <select
+                aria-label="Usage window"
+                value={windowHours}
+                onChange={event => setWindowHours(Number(event.target.value))}
+                className="min-h-11 rounded border border-neutral-700 bg-neutral-900 px-2 text-sm text-neutral-300 focus:border-neutral-500 focus:outline-none sm:min-h-8 sm:text-xs"
+              >
+                {WINDOW_OPTIONS.map(option => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </label>
+          </div>
         </div>
         <div className="grid grid-cols-2 overflow-hidden sm:grid-cols-4 lg:grid-cols-6">
           <StatCell

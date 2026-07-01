@@ -170,4 +170,30 @@ describe('RuntimeAccountsPanel', () => {
     expect(screen.getByTestId('provider-cost-panel')).toHaveTextContent('cost window 168');
     expect(costPanelProps.at(-1)).toMatchObject({ selectedProjectId: 'proj-1', windowHours: 168 });
   });
+
+  it('routes account monitor shortcuts to runtime settings sections', async () => {
+    apiFetchMock.mockResolvedValue(jsonResponse({ accounts: [] }));
+    const user = userEvent.setup();
+    const onOpenRuntimeSettingsSection = vi.fn();
+
+    render(
+      <RuntimeAccountsPanel
+        selectedProjectId="proj-1"
+        settingsRouterProps={settingsProps()}
+        availableSettingsSections={['provider-settings', 'provider-routing', 'notifications']}
+        onOpenRuntimeSettingsSection={onOpenRuntimeSettingsSection}
+      />,
+    );
+    await act(async () => {});
+
+    await user.click(screen.getByRole('button', { name: 'Providers' }));
+    await user.click(screen.getByRole('button', { name: 'Routing' }));
+    await user.click(screen.getByRole('button', { name: 'Alerts' }));
+
+    expect(onOpenRuntimeSettingsSection.mock.calls.map(([section]) => section)).toEqual([
+      'provider-settings',
+      'provider-routing',
+      'notifications',
+    ]);
+  });
 });

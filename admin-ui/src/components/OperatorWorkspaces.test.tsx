@@ -169,7 +169,47 @@ describe('Operator workspaces', () => {
     expect(screen.getAllByText('No project selected')).toHaveLength(2);
     expect(screen.queryByRole('button', { name: /Members/ })).not.toBeInTheDocument();
     expect(within(screen.getByLabelText('Project management sections')).getByRole('button', { name: /Build/ })).toBeDisabled();
+    expect(within(screen.getByLabelText('Project management sections')).getByRole('button', { name: /Access/ })).toBeDisabled();
     expect(screen.getAllByRole('button', { name: /Build/ }).some(button => button.hasAttribute('disabled'))).toBe(true);
+  });
+
+  test('shows actionable project recovery when a project-scoped tab has no selected project', async () => {
+    const user = userEvent.setup();
+    const onOpenProjectManagement = vi.fn();
+    const onProjectSectionChange = vi.fn();
+
+    render(
+      <ProjectWorkspace
+        {...projectProps({
+          selectedProject: null,
+          selectedProjectId: null,
+          projectSection: 'problem-model',
+          onProjectSectionChange,
+        })}
+        onOpenProjectManagement={onOpenProjectManagement}
+      />,
+    );
+
+    expect(screen.queryByTestId('directions-panel')).not.toBeInTheDocument();
+    expect(screen.getByText('No project is selected for this workspace.')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /Manage projects/ }));
+    expect(onOpenProjectManagement).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole('button', { name: /Project overview/ }));
+    expect(onProjectSectionChange).toHaveBeenCalledWith('manage');
+  });
+
+  test('exposes access management from the project manage overview', async () => {
+    const user = userEvent.setup();
+    const onProjectManageSectionChange = vi.fn();
+
+    render(<ProjectWorkspace {...projectProps({ onProjectManageSectionChange })} />);
+
+    const accessButtons = screen.getAllByRole('button', { name: /Access/ });
+    expect(accessButtons.length).toBeGreaterThanOrEqual(2);
+    await user.click(accessButtons.at(-1)!);
+    expect(onProjectManageSectionChange).toHaveBeenCalledWith('access');
   });
 
   test('rehosts project and runtime settings sections through SettingsSectionRouter', () => {
@@ -183,6 +223,35 @@ describe('Operator workspaces', () => {
 
     rerender(<RuntimeWorkspace {...runtimeProps({ runtimeSection: 'settings', runtimeConfigSection: 'provider-settings' })} />);
     expect(screen.getByTestId('settings-section')).toHaveTextContent('provider-settings');
+  });
+
+  test('keeps runtime scope and health visible beside settings navigation', () => {
+    render(
+      <RuntimeWorkspace
+        {...runtimeProps({
+          runtimeSection: 'settings',
+          runtimeConfigSection: 'notifications',
+          userRole: 'user',
+        })}
+        selectedProjectId={null}
+        selectedProjectRepoLabel={null}
+        apiHealthy={false}
+        wsConnected={false}
+      />,
+    );
+
+    const status = screen.getByTestId('runtime-settings-status');
+    expect(status).toHaveTextContent('Runtime');
+    expect(status).toHaveTextContent('check');
+    expect(status).toHaveTextContent('Scope');
+    expect(status).toHaveTextContent('Fleet-wide');
+    expect(status).toHaveTextContent('API');
+    expect(status).toHaveTextContent('degraded');
+    expect(status).toHaveTextContent('Events');
+    expect(status).toHaveTextContent('stale');
+    expect(status).toHaveTextContent('Role');
+    expect(status).toHaveTextContent('user');
+    expect(screen.getByTestId('settings-section')).toHaveTextContent('notifications');
   });
 
   test('surfaces API and WebSocket state inside the runtime overview workspace', () => {

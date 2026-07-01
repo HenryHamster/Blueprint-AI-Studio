@@ -83,7 +83,7 @@ export function WorkbenchSurface<T extends string>({
     : 'min-w-0 border-b border-neutral-800/90 bg-[#020407] px-2 py-0.5 md:px-2';
 
   return (
-    <section className="grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)] bg-[#04070b]">
+    <section className="grid h-full min-h-0 min-w-0 overflow-hidden grid-rows-[auto_minmax(0,1fr)] bg-[#04070b]">
       <header className={headerClassName}>
         <div className="flex min-w-0 items-center gap-2">
           {showTitle && (
