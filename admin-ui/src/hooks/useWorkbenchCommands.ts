@@ -13,6 +13,8 @@ import type {
   StrategicMessageTarget,
   StrategicStateResponse,
   StrategicStateAttentionItem,
+  StrategicStateMessage,
+  StrategicStateTaskFocusItem,
   StrategicWorkbenchState,
   StrategicWorkSessionAction,
   StrategicWorkSessionRefDescriptor,
@@ -26,6 +28,8 @@ export type PipelineSection = 'flow' | 'board' | 'archive';
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
 type StrategicContextCanvas = NonNullable<StrategicContextPackageDescriptor['canvas']>;
 const WORK_SESSION_ACTION_COMMAND_LIMIT = 4;
+const MESSAGE_COMMAND_LIMIT = 6;
+const TASK_FOCUS_COMMAND_LIMIT = 6;
 
 interface UseWorkbenchCommandsOptions {
   selectedProjectId: string | null;
@@ -44,7 +48,9 @@ interface UseWorkbenchCommandsOptions {
   strategicState?: StrategicStateResponse | null;
   strategicWorkbenchState?: StrategicWorkbenchState | null;
   savingStrategicWorkbench?: boolean;
+  checkingInStrategicSession?: boolean;
   switchStrategicInteractionMode: (mode: StrategicInteractionMode) => void;
+  markStrategicChecked?: () => void;
   focusStrategicComposer: () => void;
   openStrategicContextTarget?: (target?: StrategicContextTarget | null) => void;
   openStrategicContextWorkspace?: () => void;
@@ -135,6 +141,41 @@ function fallbackSelectedRefLabel(ref: StrategicSelectedRef): string {
   return ref.label?.trim() || `${contextKindLabel(ref.kind)} ${ref.id.slice(0, 8)}`;
 }
 
+function formatRelativeTime(timestamp?: string | null): string | null {
+  if (!timestamp) return null;
+  const date = new Date(timestamp);
+  if (Number.isNaN(date.getTime())) return null;
+  const diffMs = Date.now() - date.getTime();
+  if (diffMs < 60_000) return 'just now';
+  const minutes = Math.floor(diffMs / 60_000);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return date.toLocaleDateString();
+}
+
+function checkInChangeCount(workSession: StrategicStateResponse['work_session'] | undefined | null): number | null {
+  const since = workSession?.since_last_check_in;
+  if (!since?.available) return null;
+  return (
+    (since.messages?.total ?? 0)
+    + (since.tasks?.updated ?? 0)
+    + (since.alerts?.raised ?? 0)
+    + (since.strategic?.cycles_completed ?? 0)
+  );
+}
+
+function checkInCommandDetail(workSession: StrategicStateResponse['work_session'] | undefined | null): string {
+  const lastCheckIn = workSession?.last_check_in;
+  if (!lastCheckIn?.created_at) return 'Never checked';
+  const relative = formatRelativeTime(lastCheckIn.created_at);
+  const changeCount = checkInChangeCount(workSession);
+  const changeLabel = changeCount == null ? null : `${changeCount} new`;
+  return [relative ? `Last ${relative}` : null, changeLabel].filter(Boolean).join(' / ') || 'Checked';
+}
+
 function compactContextDetail(...parts: Array<string | null | undefined>): string | null {
   const detailParts = parts.map(part => part?.trim()).filter((part): part is string => Boolean(part));
   return detailParts.length > 0 ? detailParts.join(' / ') : null;
@@ -158,6 +199,43 @@ function attentionItemLabel(item: StrategicStateAttentionItem): string {
   if (item.kind === 'direction') return `Open direction: ${label}`;
   if (item.kind === 'alert') return `Open alert: ${label}`;
   return `Open attention: ${label}`;
+}
+
+function messageCommandLabel(message: StrategicStateMessage): string {
+  const content = message.content?.trim();
+  if (message.message_type === 'QUESTION') return `Reply to message: ${content || 'Question waiting'}`;
+  if (message.message_type === 'BLOCKER') return `Open message: ${content || 'Blocker'}`;
+  if (message.message_type === 'BUG_REPORT') return `Open message: ${content || 'Bug report'}`;
+  return `Open message: ${content || message.message_type || 'Message'}`;
+}
+
+function messageCommandDetail(message: StrategicStateMessage): string | undefined {
+  return compactContextDetail(message.message_type, message.from_type, message.status) ?? undefined;
+}
+
+function messageCommandAction(message: StrategicStateMessage): StrategicMessageTarget['action'] {
+  return message.message_type === 'QUESTION' ? 'reply' : 'highlight';
+}
+
+function taskFocusBucketLabel(bucket: string): string {
+  if (bucket === 'needs_judgment') return 'Needs judgment';
+  if (bucket === 'active') return 'Active';
+  if (bucket === 'friction') return 'Friction';
+  if (bucket === 'queued') return 'Queued';
+  if (bucket === 'recent_completed') return 'Recent result';
+  return bucket.replace(/_/g, ' ');
+}
+
+function taskFocusCommandLabel(item: StrategicStateTaskFocusItem): string {
+  return `Open task: ${item.title?.trim() || item.task_type || item.id.slice(0, 8)}`;
+}
+
+function taskFocusCommandDetail(item: StrategicStateTaskFocusItem): string | undefined {
+  return compactContextDetail(
+    taskFocusBucketLabel(item.bucket),
+    item.status,
+    item.detail ?? item.latest_status_message ?? item.blocked_reason ?? item.park_reason,
+  ) ?? undefined;
 }
 
 function workSessionActionLabel(action: StrategicWorkSessionAction): string {
@@ -217,7 +295,9 @@ export function useWorkbenchCommands({
   strategicState,
   strategicWorkbenchState,
   savingStrategicWorkbench = false,
+  checkingInStrategicSession = false,
   switchStrategicInteractionMode,
+  markStrategicChecked,
   focusStrategicComposer,
   openStrategicContextTarget,
   openStrategicContextWorkspace,
@@ -356,9 +436,18 @@ export function useWorkbenchCommands({
       runAndClose(focusStrategicComposer);
     };
     const visibleWorkSessionActions = (strategicState?.work_session?.actions ?? []).slice(0, WORK_SESSION_ACTION_COMMAND_LIMIT);
+    const strategicCheckInDetail = checkingInStrategicSession ? 'Recording check-in' : checkInCommandDetail(strategicState?.work_session);
     const visibleEnabledWorkSessionActionIds = new Set(
       visibleWorkSessionActions.filter(action => action.enabled).map(action => action.id),
     );
+    const coveredMessageIds = new Set(
+      visibleWorkSessionActions
+        .map(action => workSessionActionMessageId(action))
+        .filter((id): id is string => Boolean(id)),
+    );
+    (strategicState?.attention?.items ?? []).forEach(item => {
+      if (item.kind === 'message' && item.ref?.id) coveredMessageIds.add(item.ref.id);
+    });
     const workSessionActionCanRoute = (action: StrategicWorkSessionAction): boolean => {
       if (workSessionActionIsMessageTarget(action)) return Boolean(openStrategicMessageTarget || openStrategicContextTarget);
       return Boolean(openStrategicContextTarget && workSessionActionContextTarget(action));
@@ -578,6 +667,70 @@ export function useWorkbenchCommands({
         disabled: projectDisabled,
         run: () => openAttentionItem(item),
       }));
+    const messageCommandEntries = (strategicState?.messages?.items ?? [])
+      .filter(message => !coveredMessageIds.has(message.id))
+      .slice(0, MESSAGE_COMMAND_LIMIT)
+      .map((message): WorkbenchCommand => ({
+        id: `strategic.messages.${messageCommandAction(message)}.${message.id}`,
+        label: messageCommandLabel(message),
+        section: 'Messages',
+        detail: messageCommandDetail(message),
+        keywords: [
+          'strategic',
+          'messages',
+          'message',
+          'reply',
+          'question',
+          'open',
+          message.message_type,
+          message.from_type,
+          message.status,
+          message.content,
+        ],
+        disabled: projectDisabled || !openStrategicMessageTarget,
+        run: openStrategicMessageTarget
+          ? () => runAndClose(() => openStrategicMessageTarget({
+              messageId: message.id,
+              action: messageCommandAction(message),
+            }))
+          : closePalette,
+      }));
+    const taskFocusEntries: StrategicStateTaskFocusItem[] = [];
+    const seenTaskFocusIds = new Set<string>();
+    ['needs_judgment', 'friction', 'active', 'queued', 'recent_completed'].forEach(bucket => {
+      const items = strategicState?.tasks?.focus?.buckets[bucket]?.items ?? [];
+      for (const item of items) {
+        if (seenTaskFocusIds.has(item.id)) continue;
+        seenTaskFocusIds.add(item.id);
+        taskFocusEntries.push(item);
+        if (taskFocusEntries.length >= TASK_FOCUS_COMMAND_LIMIT) return;
+      }
+    });
+    const taskFocusCommandEntries = taskFocusEntries
+      .slice(0, TASK_FOCUS_COMMAND_LIMIT)
+      .map((item): WorkbenchCommand => ({
+        id: `strategic.task_focus.${item.bucket}.${item.id}`,
+        label: taskFocusCommandLabel(item),
+        section: 'Tasks',
+        detail: taskFocusCommandDetail(item),
+        keywords: [
+          'strategic',
+          'task',
+          'tasks',
+          'task focus',
+          'sideboard',
+          'task context',
+          item.bucket,
+          item.status,
+          item.task_type ?? '',
+          item.title ?? '',
+          item.detail ?? '',
+          item.latest_status_message ?? '',
+          item.blocked_reason ?? '',
+        ],
+        disabled: projectDisabled || !openStrategicContextTarget,
+        run: () => openContextTarget({ surface: 'task', task_id: item.id }),
+      }));
     const sessionMetricCommands = rankStrategicWorkSessionMetrics(
       strategicState?.work_session?.curated_metrics ?? [],
       10,
@@ -631,17 +784,26 @@ export function useWorkbenchCommands({
     return [
       {
         id: 'strategic.focus',
-        label: 'Strategic chat',
+        label: 'Focus Strategic chat',
         section: 'Strategic',
         detail: selectedProjectRepoLabel ?? 'No project selected',
-        keywords: ['chat', 'message', 'steer', 'strategist'],
+        keywords: ['chat', 'message', 'messages', 'steer', 'strategist'],
         shortcut: '1',
         disabled: projectDisabled,
         run: focusStrategicComposer,
       },
+      {
+        id: 'strategic.check_in.mark',
+        label: 'Mark Strategic checked',
+        section: 'Strategic',
+        detail: strategicCheckInDetail,
+        keywords: ['check-in', 'check in', 'checked', 'daily', 'status', 'since last', 'strategic'],
+        disabled: projectDisabled || checkingInStrategicSession || !markStrategicChecked,
+        run: markStrategicChecked ? () => runAndClose(markStrategicChecked) : closePalette,
+      },
       ...strategicModeCommands.map((command): WorkbenchCommand => ({
         id: command.id,
-        label: command.label,
+        label: command.label.replace('Switch Strategic to', 'Set Strategic mode:'),
         section: 'Strategic',
         detail: command.mode === strategicInteractionMode ? 'Current mode' : command.detail,
         keywords: ['mode', 'session', 'interaction', 'strategic', ...command.keywords],
@@ -650,6 +812,17 @@ export function useWorkbenchCommands({
       })),
       ...workSessionActionCommands,
       ...attentionCommandEntries,
+      {
+        id: 'strategic.messages.open',
+        label: 'Open Strategic messages',
+        section: 'Messages',
+        detail: `${strategicState?.messages?.counts.open ?? 0} open, ${strategicState?.messages?.counts.linked ?? 0} linked`,
+        keywords: ['strategic', 'messages', 'message', 'reply', 'question', 'feedback', 'blocker'],
+        disabled: projectDisabled || !openStrategicMessageTarget,
+        run: openStrategicMessageTarget ? () => runAndClose(() => openStrategicMessageTarget(undefined)) : closePalette,
+      },
+      ...messageCommandEntries,
+      ...taskFocusCommandEntries,
       ...sessionMetricCommands,
       {
         id: 'strategic.context.workspace',
@@ -665,7 +838,7 @@ export function useWorkbenchCommands({
       ...contextCommandEntries,
       {
         id: 'workbench.refresh',
-        label: 'Refresh',
+        label: 'Refresh workbench',
         section: 'Workbench',
         detail: 'Tasks + Strategic',
         keywords: ['reload', 'sync', 'status'],
@@ -683,7 +856,7 @@ export function useWorkbenchCommands({
       },
       {
         id: 'pipeline.board',
-        label: 'Task board',
+        label: 'Pipeline board',
         section: 'Pipeline',
         detail: `${filteredTaskCount} visible tasks`,
         keywords: ['kanban', 'tasks', 'board'],
@@ -691,7 +864,7 @@ export function useWorkbenchCommands({
       },
       {
         id: 'pipeline.archive',
-        label: 'Archive',
+        label: 'Pipeline archive',
         section: 'Pipeline',
         detail: 'Terminal work',
         keywords: ['archived', 'terminal'],
@@ -700,7 +873,7 @@ export function useWorkbenchCommands({
       },
       {
         id: 'project.update',
-        label: 'Project update',
+        label: 'Project running update',
         section: 'Project',
         detail: selectedProjectRepoLabel ?? 'No project selected',
         keywords: ['status', 'context', 'brief'],
@@ -781,6 +954,33 @@ export function useWorkbenchCommands({
         run: () => openProjectManageSection('resource-envelope'),
       },
       {
+        id: 'project.remediation',
+        label: 'Project remediation',
+        section: 'Project',
+        detail: 'Failure recovery behavior',
+        keywords: ['settings', 'remediation', 'recovery', 'failure', 'auto-remediation'],
+        disabled: projectDisabled,
+        run: () => openProjectManageSection('auto-remediation'),
+      },
+      {
+        id: 'project.issue_implementation',
+        label: 'Project issue implementation',
+        section: 'Project',
+        detail: 'Issue implementation policy',
+        keywords: ['settings', 'issues', 'implementation', 'github', 'policy'],
+        disabled: projectDisabled,
+        run: () => openProjectManageSection('issue-implementation'),
+      },
+      {
+        id: 'project.alert_domains',
+        label: 'Project alert domains',
+        section: 'Project',
+        detail: 'Project alert routing',
+        keywords: ['settings', 'alerts', 'domains', 'routing', 'notifications'],
+        disabled: projectDisabled,
+        run: () => openProjectManageSection('alert-domains'),
+      },
+      {
         id: 'project.access',
         label: 'Project access settings',
         section: 'Project',
@@ -800,7 +1000,7 @@ export function useWorkbenchCommands({
       },
       {
         id: 'project.switcher',
-        label: 'Projects',
+        label: 'Manage projects',
         section: 'Project',
         detail: 'Create, archive, restore',
         keywords: ['project management', 'archive', 'delete'],
@@ -849,11 +1049,28 @@ export function useWorkbenchCommands({
       },
       {
         id: 'runtime.settings',
-        label: 'Runtime settings',
+        label: 'Runtime orchestrator settings',
         section: 'Runtime',
         detail: 'Orchestrator defaults',
         keywords: ['settings', 'runtime', 'orchestrator', 'provider', 'routing', 'configuration'],
         run: () => openRuntimeSettingsSection('orchestrator'),
+      },
+      {
+        id: 'runtime.settings.general',
+        label: 'Runtime general settings',
+        section: 'Runtime',
+        detail: 'Defaults, refresh, and local UI behavior',
+        keywords: ['settings', 'runtime', 'general', 'defaults', 'refresh', 'local'],
+        run: () => openRuntimeSettingsSection('general'),
+      },
+      {
+        id: 'runtime.settings.deploy',
+        label: 'Runtime deploy settings',
+        section: 'Runtime',
+        detail: 'Pipeline health and deploy controls',
+        keywords: ['settings', 'runtime', 'deploy', 'deployment', 'health'],
+        disabled: !isAdmin,
+        run: () => openRuntimeSettingsSection('deploy'),
       },
       {
         id: 'runtime.settings.provider-routing',
@@ -968,6 +1185,7 @@ export function useWorkbenchCommands({
     problemModelRevision,
     refreshWorkbench,
     savingStrategicWorkbench,
+    checkingInStrategicSession,
     selectedProjectId,
     selectedProjectRepoLabel,
     setCommandPaletteOpen,
@@ -983,6 +1201,7 @@ export function useWorkbenchCommands({
     strategicState,
     strategicWorkbenchState,
     switchStrategicInteractionMode,
+    markStrategicChecked,
     setViewMode,
     strategicInteractionMode,
     updateStrategicSessionRefs,

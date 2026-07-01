@@ -912,6 +912,10 @@ export default function App() {
     setStrategicContextWorkspaceOpen(false);
     openStrategicContextTarget(target);
   }, [openStrategicContextTarget]);
+  const openStrategicMessageTargetFromCommandPalette = useCallback((target?: Parameters<typeof strategicMessageTarget.open>[0]) => {
+    setStrategicContextWorkspaceOpen(false);
+    strategicMessageTarget.open(target);
+  }, [strategicMessageTarget.open]);
   const currentStrategicInteractionMode = normalizeStrategicInteractionMode(strategicWorkbenchState?.interaction_mode);
   const setStrategicInteractionMode = useCallback((mode: StrategicInteractionMode) => {
     void persistStrategicWorkbench({ interaction_mode: mode, active_surface: 'strategic' });
@@ -949,9 +953,14 @@ export default function App() {
     strategicInteractionMode: currentStrategicInteractionMode,
     strategicState: strategicReadModel.data ?? null, strategicWorkbenchState,
     savingStrategicWorkbench,
+    checkingInStrategicSession,
     switchStrategicInteractionMode,
+    markStrategicChecked: handleStrategicCheckIn,
     focusStrategicComposer,
-    openStrategicContextTarget, openStrategicContextWorkspace, openStrategicMessageTarget: strategicMessageTarget.open, updateStrategicSessionRefs,
+    openStrategicContextTarget: openStrategicContextWorkspaceTarget,
+    openStrategicContextWorkspace,
+    openStrategicMessageTarget: openStrategicMessageTargetFromCommandPalette,
+    updateStrategicSessionRefs,
     handleTabChange,
     setCommandPaletteOpen,
     setPipelineSection,

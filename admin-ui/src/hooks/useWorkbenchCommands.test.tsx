@@ -128,6 +128,60 @@ describe('useWorkbenchCommands', () => {
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
+  test('exposes the durable Strategic check-in action with server-backed session detail', () => {
+    const markStrategicChecked = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const checkedAt = new Date(Date.now() - 3 * 60 * 60 * 1000).toISOString();
+    const strategicState = {
+      work_session: {
+        last_check_in: {
+          message_id: 'msg-check',
+          created_at: checkedAt,
+          kind: 'manual',
+        },
+        since_last_check_in: {
+          version: 1,
+          available: true,
+          since: checkedAt,
+          until: new Date().toISOString(),
+          messages: { total: 2 },
+          tasks: { created: 1, updated: 4 },
+          alerts: { raised: 1 },
+          strategic: { cycles_completed: 0 },
+        },
+      },
+    } as StrategicStateResponse;
+
+    mount({ strategicState, markStrategicChecked, setCommandPaletteOpen });
+
+    const command = captured.find(item => item.id === 'strategic.check_in.mark');
+    expect(command).toMatchObject({
+      label: 'Mark Strategic checked',
+      section: 'Strategic',
+      disabled: false,
+    });
+    expect(command?.detail).toContain('Last');
+    expect(command?.detail).toContain('7 new');
+    expect(command?.keywords).toContain('daily');
+
+    command?.run();
+
+    expect(markStrategicChecked).toHaveBeenCalledTimes(1);
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
+  test('disables the Strategic check-in command while a receipt is being recorded', () => {
+    mount({
+      checkingInStrategicSession: true,
+      markStrategicChecked: vi.fn(),
+    });
+
+    expect(captured.find(command => command.id === 'strategic.check_in.mark')).toMatchObject({
+      detail: 'Recording check-in',
+      disabled: true,
+    });
+  });
+
   test('exposes dynamic Strategic context commands for open, keep, and remove actions', () => {
     const target = { surface: 'task', task_id: 'task-context-1' } as const;
     const openStrategicContextTarget = vi.fn();
@@ -452,6 +506,109 @@ describe('useWorkbenchCommands', () => {
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
+  test('exposes capped first-class message and task-focus commands', () => {
+    const openStrategicMessageTarget = vi.fn();
+    const openStrategicContextTarget = vi.fn();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    const strategicState = {
+      messages: {
+        counts: { open: 2, linked: 1 },
+        items: [
+          {
+            id: 'msg-question',
+            project_id: 'project-1',
+            message_type: 'QUESTION',
+            from_type: 'strategic',
+            from_task_id: null,
+            content: 'Pick a runner for local Strategic?',
+            context: {},
+            status: 'open',
+            resolution: null,
+            resolved_at: null,
+            created_at: '2026-06-30T12:00:00Z',
+          },
+          {
+            id: 'msg-blocker',
+            project_id: 'project-1',
+            message_type: 'BLOCKER',
+            from_type: 'system',
+            from_task_id: null,
+            content: 'Runner heartbeat stalled.',
+            context: {},
+            status: 'linked',
+            resolution: null,
+            resolved_at: null,
+            created_at: '2026-06-30T12:01:00Z',
+          },
+        ],
+      },
+      tasks: {
+        focus: {
+          version: 1,
+          bucket_limit: 6,
+          has_more: false,
+          buckets: {
+            needs_judgment: {
+              total: 1,
+              limit: 6,
+              has_more: false,
+              items: [
+                {
+                  id: 'task-judgment',
+                  bucket: 'needs_judgment',
+                  status: 'EVALUATING',
+                  title: 'Review runner registration',
+                  task_type: 'review',
+                  detail: 'Operator judgment needed',
+                  requires_approval: true,
+                  reasons: ['approval'],
+                },
+              ],
+            },
+            active: {
+              total: 1,
+              limit: 6,
+              has_more: false,
+              items: [
+                {
+                  id: 'task-active',
+                  bucket: 'active',
+                  status: 'IN_PROGRESS',
+                  title: 'Polish command palette',
+                  task_type: 'fix',
+                  latest_status_message: 'Adding task-focus command routes',
+                  requires_approval: false,
+                  reasons: [],
+                },
+              ],
+            },
+          },
+        },
+      },
+    } as StrategicStateResponse;
+
+    mount({ strategicState, openStrategicMessageTarget, openStrategicContextTarget, setCommandPaletteOpen });
+
+    expect(captured.find(command => command.id === 'strategic.messages.open')).toMatchObject({
+      label: 'Open Strategic messages',
+      detail: '2 open, 1 linked',
+    });
+
+    captured.find(command => command.id === 'strategic.messages.reply.msg-question')?.run();
+    expect(openStrategicMessageTarget).toHaveBeenCalledWith({ messageId: 'msg-question', action: 'reply' });
+
+    captured.find(command => command.id === 'strategic.messages.highlight.msg-blocker')?.run();
+    expect(openStrategicMessageTarget).toHaveBeenCalledWith({ messageId: 'msg-blocker', action: 'highlight' });
+
+    expect(captured.find(command => command.id === 'strategic.task_focus.needs_judgment.task-judgment')).toMatchObject({
+      label: 'Open task: Review runner registration',
+      detail: 'Needs judgment / EVALUATING / Operator judgment needed',
+    });
+    captured.find(command => command.id === 'strategic.task_focus.active.task-active')?.run();
+    expect(openStrategicContextTarget).toHaveBeenCalledWith({ surface: 'task', task_id: 'task-active' });
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+  });
+
   test('routes project manage subsection commands through the embedded project workspace', () => {
     const handleTabChange = vi.fn();
     const setProjectSection = vi.fn<(section: ProjectSection) => void>();
@@ -465,20 +622,26 @@ describe('useWorkbenchCommands', () => {
     captured.find(command => command.id === 'project.branches')?.run();
     captured.find(command => command.id === 'project.review')?.run();
     captured.find(command => command.id === 'project.resources')?.run();
+    captured.find(command => command.id === 'project.remediation')?.run();
+    captured.find(command => command.id === 'project.issue_implementation')?.run();
+    captured.find(command => command.id === 'project.alert_domains')?.run();
     captured.find(command => command.id === 'project.access')?.run();
 
-    expect(setProjectSection).toHaveBeenCalledTimes(5);
+    expect(setProjectSection).toHaveBeenCalledTimes(8);
     expect(setProjectSection).toHaveBeenCalledWith('manage');
     expect(setProjectManageSection.mock.calls.map(([section]) => section)).toEqual([
       'build-config',
       'branches',
       'auto-review',
       'resource-envelope',
+      'auto-remediation',
+      'issue-implementation',
+      'alert-domains',
       'access',
     ]);
     expect(handleTabChange).toHaveBeenCalledWith('project');
     expect(openGlobalSettings).not.toHaveBeenCalled();
-    expect(closeGlobalSettings).toHaveBeenCalledTimes(5);
+    expect(closeGlobalSettings).toHaveBeenCalledTimes(8);
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
@@ -725,6 +888,8 @@ describe('useWorkbenchCommands', () => {
     captured.find(command => command.id === 'runtime.devices')?.run();
     captured.find(command => command.id === 'runtime.accounts')?.run();
     captured.find(command => command.id === 'runtime.settings')?.run();
+    captured.find(command => command.id === 'runtime.settings.general')?.run();
+    captured.find(command => command.id === 'runtime.settings.deploy')?.run();
     captured.find(command => command.id === 'runtime.settings.provider-routing')?.run();
     captured.find(command => command.id === 'runtime.settings.provider-settings')?.run();
     captured.find(command => command.id === 'runtime.settings.notifications')?.run();
@@ -739,6 +904,8 @@ describe('useWorkbenchCommands', () => {
     expect(setRuntimeSection).toHaveBeenCalledWith('settings');
     expect(setRuntimeConfigSection.mock.calls.map(([section]) => section)).toEqual([
       'orchestrator',
+      'general',
+      'deploy',
       'provider-routing',
       'provider-settings',
       'notifications',
@@ -746,7 +913,7 @@ describe('useWorkbenchCommands', () => {
     ]);
     expect(handleTabChange).toHaveBeenCalledWith('pipeline');
     expect(handleTabChange).toHaveBeenCalledWith('runtime');
-    expect(closeGlobalSettings).toHaveBeenCalledTimes(8);
+    expect(closeGlobalSettings).toHaveBeenCalledTimes(10);
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
@@ -758,6 +925,21 @@ describe('useWorkbenchCommands', () => {
       detail: '3 active, 4 queued',
       section: 'Pipeline',
       shortcut: '2',
+    });
+    expect(captured.find(command => command.id === 'strategic.focus')).toMatchObject({
+      label: 'Focus Strategic chat',
+    });
+    expect(captured.find(command => command.id === 'pipeline.board')).toMatchObject({
+      label: 'Pipeline board',
+    });
+    expect(captured.find(command => command.id === 'pipeline.archive')).toMatchObject({
+      label: 'Pipeline archive',
+    });
+    expect(captured.find(command => command.id === 'project.update')).toMatchObject({
+      label: 'Project running update',
+    });
+    expect(captured.find(command => command.id === 'project.switcher')).toMatchObject({
+      label: 'Manage projects',
     });
     expect(captured.find(command => command.id === 'runtime.health')).toMatchObject({
       label: 'Runtime overview',
@@ -773,7 +955,7 @@ describe('useWorkbenchCommands', () => {
       detail: '5 LLM accounts',
     });
     expect(captured.find(command => command.id === 'runtime.settings')).toMatchObject({
-      label: 'Runtime settings',
+      label: 'Runtime orchestrator settings',
       detail: 'Orchestrator defaults',
     });
     expect(captured.find(command => command.id === 'settings.general')).toMatchObject({
@@ -783,15 +965,26 @@ describe('useWorkbenchCommands', () => {
   });
 
   test('disables project-scoped commands when no project is selected', () => {
-    mount({ selectedProjectId: null, selectedProjectRepoLabel: null });
+    mount({
+      selectedProjectId: null,
+      selectedProjectRepoLabel: null,
+      markStrategicChecked: vi.fn(),
+      openStrategicContextWorkspace: vi.fn(),
+      openStrategicMessageTarget: vi.fn(),
+    });
 
     expect(captured.find(command => command.id === 'strategic.focus')?.disabled).toBe(true);
+    expect(captured.find(command => command.id === 'strategic.check_in.mark')?.disabled).toBe(true);
     expect(captured.filter(command => command.id.startsWith('strategic.mode.')).every(command => command.disabled)).toBe(true);
     expect(captured.find(command => command.id === 'strategic.context.workspace')?.disabled).toBe(true);
+    expect(captured.find(command => command.id === 'strategic.messages.open')?.disabled).toBe(true);
     expect(captured.find(command => command.id === 'project.build')?.disabled).toBe(true);
     expect(captured.find(command => command.id === 'project.branches')?.disabled).toBe(true);
     expect(captured.find(command => command.id === 'project.review')?.disabled).toBe(true);
     expect(captured.find(command => command.id === 'project.resources')?.disabled).toBe(true);
+    expect(captured.find(command => command.id === 'project.remediation')?.disabled).toBe(true);
+    expect(captured.find(command => command.id === 'project.issue_implementation')?.disabled).toBe(true);
+    expect(captured.find(command => command.id === 'project.alert_domains')?.disabled).toBe(true);
     expect(captured.find(command => command.id === 'project.access')?.disabled).toBe(true);
     expect(captured.find(command => command.id === 'project.members')?.disabled).toBe(true);
     expect(captured.find(command => command.id === 'pipeline.flow')?.disabled).toBeFalsy();
@@ -802,6 +995,7 @@ describe('useWorkbenchCommands', () => {
   test('disables admin-only runtime settings commands for non-admin users', () => {
     mount({ isAdmin: false });
 
+    expect(captured.find(command => command.id === 'runtime.settings.deploy')?.disabled).toBe(true);
     expect(captured.find(command => command.id === 'runtime.settings.provider-routing')?.disabled).toBe(true);
     expect(captured.find(command => command.id === 'runtime.settings.provider-settings')?.disabled).toBe(true);
     expect(captured.find(command => command.id === 'runtime.settings.notifications')?.disabled).toBeFalsy();

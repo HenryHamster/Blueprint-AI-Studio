@@ -17,4 +17,10 @@ describe('App workbench wiring', () => {
     expect(appSource).toMatch(/await checkInStrategicSession[\s\S]*strategicCheckInIdempotencyKeyRef\.current = null;[\s\S]*Strategic check-in recorded/);
     expect(appSource).toContain('strategicReadModel.applySessionResponse(checkInResponse);');
   });
+
+  test('routes command-palette Strategic targets through overlay-safe wrappers', () => {
+    expect(appSource).toMatch(/const openStrategicContextWorkspaceTarget = useCallback\([\s\S]*setStrategicContextWorkspaceOpen\(false\);[\s\S]*openStrategicContextTarget\(target\);/);
+    expect(appSource).toMatch(/const openStrategicMessageTargetFromCommandPalette = useCallback\([\s\S]*setStrategicContextWorkspaceOpen\(false\);[\s\S]*strategicMessageTarget\.open\(target\);[\s\S]*\[strategicMessageTarget\.open\]/);
+    expect(appSource).toMatch(/checkingInStrategicSession,[\s\S]*markStrategicChecked: handleStrategicCheckIn,[\s\S]*openStrategicContextTarget: openStrategicContextWorkspaceTarget,[\s\S]*openStrategicMessageTarget: openStrategicMessageTargetFromCommandPalette,/);
+  });
 });
