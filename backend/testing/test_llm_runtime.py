@@ -1,3 +1,5 @@
+import json
+import uuid
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +15,12 @@ from app.orchestrator import (
     _resolve_env_runtime_fallback,
     _sync_task_payload_runtime_fields,
 )
+
+
+def _translation_args(env: dict) -> list[str]:
+    raw = env.get("LLM_CLI_TRANSLATION")
+    assert raw, "manifest must include a pre-translated CLI settings blob"
+    return json.loads(raw)["args"]
 
 
 _TEST_USER = "runtime-user"
@@ -740,6 +748,191 @@ def test_sync_task_payload_runtime_fields_overwrites_stale_values():
     assert changed is True
     assert task.payloads[0]["model"] == "gpt-5.4"
     assert task.payloads[0]["execution_mode"] == "advisor"
+
+
+def test_manifest_cli_translation_uses_tier_mapped_model():
+    from app.compute_manifest import build_agent_secret_manifest
+
+    task = _task(payload={"type": "create", "quality_tier": "opus"})
+    runtime_config = {
+        "provider_tier_model_map": {
+            "openai": {
+                "opus": "gpt-5.4",
+                "sonnet": "gpt-5.3-codex",
+                "haiku": "gpt-5.4-mini",
+            }
+        }
+    }
+    changed = _sync_task_payload_runtime_fields(
+        task,
+        model="gpt-5.4",
+        execution_mode=None,
+    )
+
+    manifest = build_agent_secret_manifest(
+        vm_instance_id="agent-vm-runtime-tier",
+        task_id=uuid.uuid4(),
+        oauth_token="sk-test",
+        provider="openai",
+        auth_mode="api_key",
+        model=task.payloads[0]["model"],
+        provider_settings={},
+    )
+
+    assert changed is True
+    assert task.payloads[0]["model"] == "gpt-5.4"
+    assert manifest["env"]["LLM_MODEL"] == "gpt-5.4"
+    args = _translation_args(manifest["env"])
+    assert args[args.index("-m") + 1] == "gpt-5.4"
+    assert runtime_config["provider_tier_model_map"]["openai"]["opus"] == "gpt-5.4"
+
+
+def test_manifest_cli_translation_uses_explicit_payload_model():
+    from app.compute_manifest import build_agent_secret_manifest
+
+    task = _task(payload={"type": "create", "model": "gpt-5-custom-preview"})
+    changed = _sync_task_payload_runtime_fields(
+        task,
+        model="gpt-5-custom-preview",
+        execution_mode=None,
+    )
+
+    manifest = build_agent_secret_manifest(
+        vm_instance_id="agent-vm-runtime-explicit",
+        task_id=uuid.uuid4(),
+        oauth_token="sk-test",
+        provider="openai",
+        auth_mode="api_key",
+        model=task.payloads[0]["model"],
+        provider_settings={"reasoning_effort": "high"},
+    )
+
+    assert changed is False
+    assert task.payloads[0]["model"] == "gpt-5-custom-preview"
+    assert manifest["env"]["LLM_MODEL"] == "gpt-5-custom-preview"
+    args = _translation_args(manifest["env"])
+    assert args[args.index("-m") + 1] == "gpt-5-custom-preview"
+
+
+@pytest.mark.asyncio
+async def test_selection_payload_and_manifest_agree_for_effort_settings_model(
+    clean_runtime_pool,
+):
+    from app.compute_manifest import build_agent_secret_manifest
+
+    account = {
+        "id": "acct-openai-effort",
+        "user_id": _TEST_USER,
+        "name": "openai effort",
+        "provider": "openai",
+        "auth_mode": "api_key",
+        "runtime_secret": "sk-test",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 0,
+    }
+    _max_plan_pools.setdefault(_TEST_USER, []).append(account)
+    _account_by_id[account["id"]] = account
+
+    runtime_config = {
+        "provider_selection_mode": "preferred",
+        "task_type_provider_preference": {"create": ["openai"]},
+        "provider_settings_by_effort": {
+            "openai": {
+                "medium": {
+                    "model": "gpt-5.4-mini",
+                    "reasoning_effort": "medium",
+                }
+            }
+        },
+    }
+    task = _task(payload={"type": "create"})
+    selection = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=task,
+        runtime_config=runtime_config,
+    )
+    assert selection is not None
+    changed = _sync_task_payload_runtime_fields(
+        task,
+        model=selection.model,
+        execution_mode=selection.execution_mode,
+    )
+
+    manifest = build_agent_secret_manifest(
+        vm_instance_id="agent-vm-runtime-effort",
+        task_id=uuid.uuid4(),
+        oauth_token=account["runtime_secret"],
+        provider=selection.provider,
+        auth_mode=selection.auth_mode,
+        model=selection.model,
+        provider_settings=selection.settings,
+    )
+
+    assert changed is True
+    assert task.payloads[0]["model"] == "gpt-5.4-mini"
+    assert manifest["env"]["LLM_MODEL"] == "gpt-5.4-mini"
+    assert json.loads(manifest["env"]["LLM_SETTINGS"])["model"] == "gpt-5.4-mini"
+    args = _translation_args(manifest["env"])
+    assert args[args.index("-m") + 1] == "gpt-5.4-mini"
+
+
+@pytest.mark.asyncio
+async def test_selection_payload_and_manifest_agree_for_model_fallback(
+    clean_runtime_pool,
+):
+    from app.compute_manifest import build_agent_secret_manifest
+
+    account = {
+        "id": "acct-gemini-ga",
+        "user_id": _TEST_USER,
+        "name": "gemini ga",
+        "provider": "gemini",
+        "auth_mode": "api_key",
+        "runtime_secret": "AIzaTestKeyForBlueprint",
+        "runtime_ready": True,
+        "enabled": True,
+        "active_tasks": 0,
+        "provider_metadata": {
+            "available_models": ["gemini-2.5-pro"],
+        },
+    }
+    _max_plan_pools.setdefault(_TEST_USER, []).append(account)
+    _account_by_id[account["id"]] = account
+
+    runtime_config = {
+        "provider_selection_mode": "preferred",
+        "task_type_provider_preference": {"create": ["gemini"]},
+    }
+    task = _task(payload={"type": "create", "model": "gemini-3.1-pro-preview"})
+    selection = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=task,
+        runtime_config=runtime_config,
+    )
+    assert selection is not None
+    changed = _sync_task_payload_runtime_fields(
+        task,
+        model=selection.model,
+        execution_mode=selection.execution_mode,
+    )
+
+    manifest = build_agent_secret_manifest(
+        vm_instance_id="agent-vm-runtime-fallback",
+        task_id=uuid.uuid4(),
+        oauth_token=account["runtime_secret"],
+        provider=selection.provider,
+        auth_mode=selection.auth_mode,
+        model=selection.model,
+        provider_settings=selection.settings,
+    )
+
+    assert changed is True
+    assert selection.model == "gemini-2.5-pro"
+    assert task.payloads[0]["model"] == "gemini-2.5-pro"
+    assert manifest["env"]["LLM_MODEL"] == "gemini-2.5-pro"
+    args = _translation_args(manifest["env"])
+    assert args[args.index("-m") + 1] == "gemini-2.5-pro"
 
 
 def test_resolve_env_runtime_fallback_prefers_openai_env(monkeypatch):
