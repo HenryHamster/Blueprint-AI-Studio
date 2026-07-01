@@ -1087,7 +1087,12 @@ def test_unblock_to_queued_clears_metadata_and_requeues():
         project_id=uuid.uuid4(),
         payloads=[{"type": "create", "prompt": "x"}],
         status=TaskStatus.IN_PROGRESS,
-        retry_after_until=datetime.utcnow() + timedelta(minutes=15),
+        vm_instance_id="agent-vm-stale-blocked",
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
+        started_at=_utcnow() - timedelta(minutes=12),
+        parked_at=_utcnow() - timedelta(minutes=8),
+        park_reason="stale park marker",
+        retry_after_until=_utcnow() + timedelta(minutes=15),
         context={"_retry_after_resets": 2, "_blocked_optimistic_retries": 3},
     )
     enter_blocked_state(task, waiting_on="dep", reason="blocked")
@@ -1106,6 +1111,11 @@ def test_unblock_to_queued_clears_metadata_and_requeues():
     assert task.retry_after_until is None
     assert "_retry_after_resets" not in (task.context or {})
     assert "_blocked_optimistic_retries" not in (task.context or {})
+    assert task.vm_instance_id is None
+    assert task.last_heartbeat is None
+    assert task.started_at is None
+    assert task.parked_at is None
+    assert task.park_reason is None
     assert task.blocker_kind is None
     assert task.blocked_reason is None
     assert task.blocked_at is None
@@ -1121,7 +1131,7 @@ def test_clear_blocker_metadata_preserves_authoritative_verdict():
         project_id=uuid.uuid4(),
         payloads=[{"type": "create", "prompt": "x"}],
         status=TaskStatus.IN_PROGRESS,
-        retry_after_until=datetime.utcnow() + timedelta(minutes=20),
+        retry_after_until=_utcnow() + timedelta(minutes=20),
         context={"_retry_after_resets": 1},
     )
     enter_blocked_state(task, waiting_on="dep", reason="blocked")
@@ -7471,6 +7481,8 @@ async def test_external_park_wake_delivery_is_exactly_once(tl_db):
             "_failure_class_history": ["SCOPE_OVERFLOW"],
         },
     )
+    task.last_heartbeat = _utcnow() - timedelta(minutes=10)
+    task.started_at = _utcnow() - timedelta(minutes=11)
     task.retry_after_until = datetime(2099, 1, 1)
 
     # --- Park the task on the compute-job-terminal source. -------------------
@@ -7523,7 +7535,10 @@ async def test_external_park_wake_delivery_is_exactly_once(tl_db):
     assert delivered_1 == 1
     assert task.status == TaskStatus.QUEUED  # RESUME re-queues for dispatch
     assert task.parked_at is None
+    assert task.park_reason is None
     assert task.vm_instance_id is None
+    assert task.last_heartbeat is None
+    assert task.started_at is None
     ctx = task.context or {}
     assert "failure_class" not in ctx
     assert "failure_category" not in ctx
