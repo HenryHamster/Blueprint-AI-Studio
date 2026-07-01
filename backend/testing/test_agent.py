@@ -41,6 +41,7 @@ from app.auth import create_agent_token, create_vm_scoped_token
 from app.schemas import AgentStatusPayload
 from app.routers.agent_status import _is_task_llm_auth_hard_disable
 from app.task_capabilities import TaskType, task_type_catalog
+from app.time_utils import _utcnow
 
 
 def _resolve_sr_recent_miss_examples_contract_fixture() -> Path:
@@ -127,12 +128,12 @@ async def _seed_deploy_state(
         id=1,
         current_revision="rev-test-1",
         current_sha="a" * 40,
-        deployed_at=datetime.utcnow() - timedelta(minutes=10),
+        deployed_at=_utcnow() - timedelta(minutes=10),
         status=status,
         last_known_good_revision="rev-good-1",
         last_known_good_sha="b" * 40,
         pause_reason=pause_reason,
-        paused_at=paused_at or (datetime.utcnow() - timedelta(minutes=3)),
+        paused_at=paused_at or (_utcnow() - timedelta(minutes=3)),
         pre_pause_max_vms=pre_pause_max_vms,
         runtime_max_concurrent_vms=runtime_max_concurrent_vms,
     )
@@ -532,7 +533,7 @@ async def test_agent_status_update_persists_runtime_identity(
     client: AsyncClient, db_session, mocker
 ):
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
-    now = datetime.utcnow()
+    now = _utcnow()
 
     project = Project(name="Agent Runtime Identity Test", user_id="test-user-123")
     db_session.add(project)
@@ -599,7 +600,7 @@ async def test_terminal_heartbeat_records_atomic_provider_model_pair(
        context_model is absent.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
-    now = datetime.utcnow()
+    now = _utcnow()
 
     project = Project(name="Atomic Pair Test", user_id="test-user-atomic")
     db_session.add(project)
@@ -745,7 +746,7 @@ async def test_agent_compute_job_launch_creates_pending_row(
         payloads=[{"type": TaskType.compute_experiment.value}],
         status=TaskStatus.IN_PROGRESS,
         vm_instance_id="agent-vm-compute-1",
-        spend_approval_cleared_at=datetime.utcnow(),
+        spend_approval_cleared_at=_utcnow(),
     )
     db_session.add(task)
     await db_session.commit()
@@ -772,7 +773,7 @@ async def test_agent_compute_job_launch_creates_pending_row(
     assert job.spend_cap_usd == pytest.approx(
         compute_jobs_module.MAX_COMPUTE_JOB_SPEND_CAP_USD
     )
-    deadline_delta = (job.wall_clock_deadline - datetime.utcnow()).total_seconds()
+    deadline_delta = (job.wall_clock_deadline - _utcnow()).total_seconds()
     assert deadline_delta <= compute_jobs_module.MAX_COMPUTE_JOB_DEADLINE_SECONDS + 5
     assert body["status"] == compute_jobs_module.ComputeJobStatus.QUEUED
 
@@ -852,7 +853,7 @@ async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed
         version_number=3,
         status="promoted",
         promoted_sha="abc123",
-        promoted_at=datetime.utcnow(),
+        promoted_at=_utcnow(),
     )
     db_session.add(version)
     await db_session.flush()
@@ -863,7 +864,7 @@ async def test_agent_compute_job_live_proof_requires_aggregate_serving_confirmed
                 artifact_kind="backend_revision",
                 serving_status="serving_confirmed",
                 served_identifier="abc123",
-                served_at=datetime.utcnow(),
+                served_at=_utcnow(),
             ),
             ReleaseDeployArtifact(
                 version_id=version.id,
@@ -929,7 +930,7 @@ async def test_agent_compute_job_live_proof_vacuous_absent_row_allows_launch(
         version_number=4,
         status="promoted",
         promoted_sha="abc123",
-        promoted_at=datetime.utcnow(),
+        promoted_at=_utcnow(),
         serving_status="serving_confirmed",
         served_sha="abc123",
     )
@@ -942,7 +943,7 @@ async def test_agent_compute_job_live_proof_vacuous_absent_row_allows_launch(
             artifact_kind="backend_revision",
             serving_status="serving_confirmed",
             served_identifier="abc123",
-            served_at=datetime.utcnow(),
+            served_at=_utcnow(),
         )
     )
     task = Task(
@@ -991,7 +992,7 @@ async def test_agent_compute_job_live_proof_fully_unarmed_blocks(
         version_number=5,
         status="promoted",
         promoted_sha="abc123",
-        promoted_at=datetime.utcnow(),
+        promoted_at=_utcnow(),
         # serving_status intentionally left None (unarmed promotion)
     )
     db_session.add(version)
@@ -1282,7 +1283,7 @@ async def test_agent_claim_idempotent_replay_expires(client: AsyncClient, db_ses
     await db_session.commit()
     await db_session.refresh(project)
 
-    stale_heartbeat = datetime.utcnow() - timedelta(minutes=10)
+    stale_heartbeat = _utcnow() - timedelta(minutes=10)
     task = Task(
         project_id=project.id,
         payloads=[{"cmd": "run"}],
@@ -1337,7 +1338,7 @@ async def test_agent_heartbeat_updates_last_heartbeat(client: AsyncClient, db_se
     assert task.last_heartbeat is not None
 
     # A task with a heartbeat this recent is well within the 5-minute reaper window
-    five_minutes_ago = datetime.utcnow() - timedelta(minutes=5)
+    five_minutes_ago = _utcnow() - timedelta(minutes=5)
     assert task.last_heartbeat > five_minutes_ago
 
 
@@ -1379,7 +1380,7 @@ async def test_agent_heartbeat_upserts_vm_contact(client: AsyncClient, db_sessio
     assert contact is not None
     first_contact_at = contact.last_contact_at
     assert first_contact_at is not None
-    assert first_contact_at > datetime.utcnow() - timedelta(minutes=5)
+    assert first_contact_at > _utcnow() - timedelta(minutes=5)
 
     # Second heartbeat upserts in place (still exactly one row for this VM) and
     # advances last_contact_at.
@@ -1423,7 +1424,7 @@ async def test_agent_heartbeat_upserts_vm_contact_tool_use(
     headers = {"x-agent-token": token}
 
     # Heartbeat WITH a tool_trace whose tail is a recent ISO-8601 timestamp.
-    recent = (datetime.utcnow() - timedelta(seconds=20)).isoformat()
+    recent = (_utcnow() - timedelta(seconds=20)).isoformat()
     payload = {
         "task_id": str(task.id),
         "status_message": "calling tools",
@@ -1439,12 +1440,12 @@ async def test_agent_heartbeat_upserts_vm_contact_tool_use(
     assert contact.last_tool_use_at is not None
     recorded = contact.last_tool_use_at
     # Within a few seconds of the supplied tail timestamp (tz stripped to naive).
-    assert recorded > datetime.utcnow() - timedelta(minutes=2)
+    assert recorded > _utcnow() - timedelta(minutes=2)
 
     # Monotonic: a LATER heartbeat whose tool_trace tail is OLDER than what we
     # already recorded must NOT regress the stored value.
     db_session.expire(contact)
-    older = (datetime.utcnow() - timedelta(minutes=10)).isoformat()
+    older = (_utcnow() - timedelta(minutes=10)).isoformat()
     payload_old = {
         "task_id": str(task.id),
         "tool_trace": [{"t": older, "tool": "Read", "input_preview": "x"}],
@@ -4180,7 +4181,7 @@ async def test_lessons_and_direction_history_survive_terminal_summary_cap(
         payloads=[{"type": "create", "prompt": "Build history"}],
         vm_instance_id="agent-vm-terminal-lesson",
         status=TaskStatus.COMPLETED,
-        created_at=datetime.utcnow() - timedelta(hours=2),
+        created_at=_utcnow() - timedelta(hours=2),
         context={
             "direction_id": "dir-history",
             "review_loop": {
@@ -4719,7 +4720,7 @@ async def _claim_with_playbook_provenance(
     entry = {
         "content": "module X defines helper Y",
         "source_task_id": source_id,
-        "updated_at": datetime.utcnow().isoformat(),
+        "updated_at": _utcnow().isoformat(),
         "confirmed_count": 1,
     }
     if entry_branch is not None:
@@ -9421,7 +9422,7 @@ async def test_external_api_requeue_sets_exponential_backoff(
             "failure_class": "EXTERNAL_API",
             "logs": "api.github.com returned 503",
         }
-        before = datetime.utcnow()
+        before = _utcnow()
         resp = await client.post("/api/agent/status", json=payload, headers=headers)
         assert resp.status_code == 200
 
@@ -11454,7 +11455,7 @@ async def test_playbook_claim_prioritises_local_relevance_and_includes_reasons(
     Claim prioritises entries that locally match task direction/system/related files and
     includes relevance metadata in response payload.
     """
-    now = datetime.utcnow().isoformat()
+    now = _utcnow().isoformat()
     project = Project(name="Playbook Relevance Test", user_id="test-user-relevance")
     project.design_doc = {
         "_file_to_system": {
@@ -11517,7 +11518,7 @@ async def test_playbook_claim_handles_non_dict_file_to_system(
     """
     Claim tolerates malformed _file_to_system metadata without crashing.
     """
-    now = datetime.utcnow().isoformat()
+    now = _utcnow().isoformat()
     project = Project(
         name="Playbook Bad Metadata Test", user_id="test-user-bad-metadata"
     )
@@ -11560,8 +11561,8 @@ async def test_playbook_claim_age_penalty_deprioritises_old_entries(
     Old entries (>30 days, confirmed_count < 3) are deprioritised in claim ordering.
     A recent unconfirmed entry should appear before an older unconfirmed entry.
     """
-    old_date = (datetime.utcnow() - timedelta(days=40)).isoformat()
-    recent_date = datetime.utcnow().isoformat()
+    old_date = (_utcnow() - timedelta(days=40)).isoformat()
+    recent_date = _utcnow().isoformat()
 
     project = Project(name="Age Penalty Test", user_id="test-user-age-penalty")
     project.design_doc = {
@@ -11612,7 +11613,7 @@ async def test_playbook_claim_stale_file_refs_deprioritised(
     Entries with stale_file_refs=True are deprioritised — a clean entry with the same
     confirmed_count should come before a stale entry.
     """
-    now = datetime.utcnow().isoformat()
+    now = _utcnow().isoformat()
 
     project = Project(name="Stale Refs Test", user_id="test-user-stale-refs")
     project.design_doc = {
@@ -11696,7 +11697,7 @@ async def test_playbook_claim_grounds_design_doc_against_integration_branch(
             "confirmed_count": 1,
             "reference_count": 1,
             "applicable_types": ["create"],
-            "updated_at": datetime.utcnow().isoformat(),
+            "updated_at": _utcnow().isoformat(),
         },
         "systems/gone": {
             "status": "functional",
@@ -11737,8 +11738,8 @@ async def test_playbook_claim_old_confirmed_entry_not_penalised(
     An old entry with confirmed_count >= 3 should NOT receive the age penalty.
     It should still be ordered before a less-confirmed recent entry.
     """
-    old_date = (datetime.utcnow() - timedelta(days=40)).isoformat()
-    recent_date = datetime.utcnow().isoformat()
+    old_date = (_utcnow() - timedelta(days=40)).isoformat()
+    recent_date = _utcnow().isoformat()
 
     project = Project(name="Confirmed Old Entry Test", user_id="test-user-conf-old")
     project.design_doc = {
@@ -12354,7 +12355,7 @@ async def test_playbook_admin_list_stale_flag(client: AsyncClient, db_session):
     """
     from app.models import ProjectMember
 
-    _now = datetime.utcnow()
+    _now = _utcnow()
     _yesterday = (_now - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
     _two_days_ago = (_now - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%S")
     _sixty_days_ago = (_now - timedelta(days=60)).strftime("%Y-%m-%dT%H:%M:%S")
@@ -13539,14 +13540,14 @@ async def test_agent_status_completed_downstream_artifact_delivers_dependent_bey
         ],
         vm_instance_id="agent-vm-downstream-scan-cap",
         status=TaskStatus.IN_PROGRESS,
-        created_at=datetime.utcnow() - timedelta(minutes=10),
+        created_at=_utcnow() - timedelta(minutes=10),
     )
     blocker = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "blocker"}],
         vm_instance_id="agent-vm-downstream-scan-cap-blocker",
         status=TaskStatus.QUEUED,
-        created_at=datetime.utcnow() - timedelta(minutes=11),
+        created_at=_utcnow() - timedelta(minutes=11),
     )
     db_session.add_all([producer, blocker])
     await db_session.commit()
@@ -13561,7 +13562,7 @@ async def test_agent_status_completed_downstream_artifact_delivers_dependent_bey
                 vm_instance_id=f"agent-vm-downstream-scan-cap-irrelevant-{i}",
                 status=TaskStatus.QUEUED,
                 depends_on=[str(blocker.id)],
-                created_at=datetime.utcnow()
+                created_at=_utcnow()
                 - timedelta(minutes=9, seconds=_DEPENDENT_SCAN_CAP + 1 - i),
             )
         )
@@ -13572,7 +13573,7 @@ async def test_agent_status_completed_downstream_artifact_delivers_dependent_bey
         vm_instance_id="agent-vm-downstream-scan-cap-dependent",
         status=TaskStatus.QUEUED,
         depends_on=[str(producer.id)],
-        created_at=datetime.utcnow(),
+        created_at=_utcnow(),
     )
     db_session.add(dependent)
     await db_session.commit()
@@ -15610,7 +15611,7 @@ async def test_next_role_claims_warm_pinned_queued_task(
     client: AsyncClient, db_session
 ):
     """next-role atomically claims a QUEUED task whose context.warm_target_vm_id matches."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
 
     project = Project(name="Next-Role Claim", user_id="test-user-123")
     db_session.add(project)
@@ -15625,7 +15626,7 @@ async def test_next_role_claims_warm_pinned_queued_task(
     )
     db_session.add(prior_task)
     # A QUEUED fix pinned to the same VM
-    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
     pinned_task = Task(
         project_id=project.id,
         payloads=[{"type": "fix", "pr_number": 1234, "branch": "feat/x"}],
@@ -15700,7 +15701,7 @@ async def test_next_role_respects_retry_after_for_warm_pinned_task(
         project_id=project.id,
         payloads=[{"type": "fix", "pr_number": 5555}],
         status=TaskStatus.QUEUED,
-        retry_after_until=datetime.utcnow() + timedelta(minutes=5),
+        retry_after_until=_utcnow() + timedelta(minutes=5),
         context={
             "warm_target_vm_id": "agent-vm-retry-after",
             "warm_target_pr": "5555",
@@ -15752,12 +15753,12 @@ async def test_next_role_defers_parked_task_when_retarget_has_no_account(
         project_id=project.id,
         payloads=[{"type": "fix", "pr_number": 6666}],
         status=TaskStatus.QUEUED,
-        retry_after_until=datetime.utcnow() - timedelta(minutes=1),
+        retry_after_until=_utcnow() - timedelta(minutes=1),
         context={
             "warm_target_vm_id": "agent-vm-parked-retarget",
             "warm_target_pr": "6666",
             "parked_for_retarget": True,
-            "park_deadline": (datetime.utcnow() + timedelta(minutes=5)).isoformat(),
+            "park_deadline": (_utcnow() + timedelta(minutes=5)).isoformat(),
             "blacklisted_accounts": ["acct-failed"],
         },
     )
@@ -15827,7 +15828,7 @@ async def test_next_role_returns_204_when_warm_continuity_suppressed(
         status=TaskStatus.COMPLETED,
     )
     db_session.add(prior_task)
-    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
     pinned_task = Task(
         project_id=project.id,
         payloads=[{"type": "fix", "pr_number": 9999}],
@@ -15873,7 +15874,7 @@ async def test_next_role_refuses_warm_claim_on_doomed_vm(
     exactly this — claimed warm VM that was already scheduled for
     delete by 41456ba8's agent_completion 9s earlier; SIGTERM landed
     ~50s later as the GCP delete completed."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from app.vm_lifecycle import _orchestrator_deleted_vms
     import time
 
@@ -15889,7 +15890,7 @@ async def test_next_role_refuses_warm_claim_on_doomed_vm(
         status=TaskStatus.COMPLETED,
     )
     db_session.add(prior_task)
-    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
     pinned_task = Task(
         project_id=project.id,
         payloads=[{"type": "review", "pr_number": 4321, "branch": "feat/y"}],
@@ -16143,7 +16144,7 @@ async def test_next_role_token_mint_failure_rolls_back(
     stay QUEUED (rollback) so a retry can succeed. Without rollback the task
     would be stuck IN_PROGRESS with no live JWT on the agent side.
     """
-    from datetime import datetime, timedelta
+    from datetime import timedelta
 
     project = Project(name="Next-Role Mint Failure", user_id="test-user-123")
     db_session.add(project)
@@ -16157,7 +16158,7 @@ async def test_next_role_token_mint_failure_rolls_back(
         status=TaskStatus.COMPLETED,
     )
     db_session.add(prior_task)
-    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
     pinned_task = Task(
         project_id=project.id,
         payloads=[{"type": "fix", "pr_number": 2222, "branch": "feat/mint-fail"}],
@@ -16275,7 +16276,7 @@ async def test_next_role_broadcasts_on_claim(client: AsyncClient, db_session, mo
     """A successful warm-claim MUST broadcast task_updated to the project so the UI
     reflects the IN_PROGRESS transition without waiting for the next status post.
     """
-    from datetime import datetime, timedelta
+    from datetime import timedelta
 
     broadcast_mock = mocker.patch(
         "app.routers.agent_warm_continuity.broadcast_to_project",
@@ -16294,7 +16295,7 @@ async def test_next_role_broadcasts_on_claim(client: AsyncClient, db_session, mo
         status=TaskStatus.COMPLETED,
     )
     db_session.add(prior_task)
-    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
     pinned_task = Task(
         project_id=project.id,
         payloads=[{"type": "fix", "pr_number": 7777, "branch": "feat/bcast"}],
@@ -16643,7 +16644,7 @@ async def test_next_role_claim_writes_warm_claim_origin(
         status=TaskStatus.COMPLETED,
     )
     db_session.add(prior_task)
-    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
     pinned_task = Task(
         project_id=project.id,
         payloads=[{"type": "fix", "pr_number": 4321, "branch": "feat/h3"}],
@@ -17800,7 +17801,7 @@ async def test_claim_records_vm_cold_start_ms_once(client: AsyncClient, db_sessi
     await db_session.commit()
     await db_session.refresh(project)
 
-    provisioned = datetime.utcnow() - timedelta(seconds=12)
+    provisioned = _utcnow() - timedelta(seconds=12)
     task = Task(
         project_id=project.id,
         payloads=[{"cmd": "ls"}],
@@ -17826,7 +17827,7 @@ async def test_claim_records_vm_cold_start_ms_once(client: AsyncClient, db_sessi
 
     # Simulate a re-provision restamp of vm_provisioned_at, then heartbeat.
     # The IS NULL guard must prevent vm_cold_start_ms from being overwritten.
-    task.vm_provisioned_at = datetime.utcnow()
+    task.vm_provisioned_at = _utcnow()
     db_session.add(task)
     await db_session.commit()
 
@@ -17856,7 +17857,7 @@ async def test_heartbeat_beacon_does_not_set_vm_cold_start_ms(
     await db_session.commit()
     await db_session.refresh(project)
 
-    provisioned = datetime.utcnow() - timedelta(seconds=8)
+    provisioned = _utcnow() - timedelta(seconds=8)
     task = Task(
         project_id=project.id,
         payloads=[{"cmd": "ls"}],
@@ -17913,8 +17914,8 @@ async def test_claim_uses_vm_dispatched_at_for_cold_start(
 
     # vm_dispatched_at set 20s ago (full dispatch→agent-ready window).
     # vm_provisioned_at set only 5s ago (provision-confirm restamp; excludes boot).
-    dispatched = datetime.utcnow() - timedelta(seconds=20)
-    provisioned = datetime.utcnow() - timedelta(seconds=5)
+    dispatched = _utcnow() - timedelta(seconds=20)
+    provisioned = _utcnow() - timedelta(seconds=5)
     task = Task(
         project_id=project.id,
         payloads=[{"cmd": "ls"}],
@@ -17953,7 +17954,7 @@ async def test_claim_stamps_provision_slot_acquired_at_from_compute(
     await db_session.commit()
     await db_session.refresh(project)
 
-    dispatched = datetime.utcnow() - timedelta(seconds=30)
+    dispatched = _utcnow() - timedelta(seconds=30)
     vm_id = "agent-vm-slot-acquired-test"
     task = Task(
         project_id=project.id,
@@ -17966,7 +17967,7 @@ async def test_claim_stamps_provision_slot_acquired_at_from_compute(
     await db_session.commit()
     await db_session.refresh(task)
 
-    slot_ts = (datetime.utcnow() - timedelta(seconds=20)).isoformat()
+    slot_ts = (_utcnow() - timedelta(seconds=20)).isoformat()
     _compute._vm_provision_slot_times[vm_id] = slot_ts
 
     try:
@@ -20977,8 +20978,8 @@ async def test_requeue_parent_task_uses_vm_stopped_at_for_rate_limit_correlation
         parent_task_id=parent.id,
         attempt_count=1,
         latest_status_message="Process exited with code 1",
-        vm_stopped_at=datetime.utcnow() - timedelta(minutes=30),
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=31),
+        vm_stopped_at=_utcnow() - timedelta(minutes=30),
+        last_heartbeat=_utcnow() - timedelta(minutes=31),
         context={"failure_category": "claude_code_failed"},
     )
     db_session.add(child)
@@ -21205,10 +21206,10 @@ async def test_warm_handoff_issues_short_ttl_for_refresh_capable_vm(
         vm_instance_id=vm_id,
         status=TaskStatus.COMPLETED,
         # The agent refreshed during this prior role — proves capability.
-        last_token_refresh_at=datetime.utcnow(),
+        last_token_refresh_at=_utcnow(),
     )
     db_session.add(prior_task)
-    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
     pinned_task = Task(
         project_id=project.id,
         payloads=[{"type": "fix", "pr_number": 4242, "branch": "feat/x"}],
@@ -21273,7 +21274,7 @@ async def test_warm_handoff_keeps_bootstrap_ttl_for_unconfirmed_vm(
         last_token_refresh_at=None,
     )
     db_session.add(prior_task)
-    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
     pinned_task = Task(
         project_id=project.id,
         payloads=[{"type": "fix", "pr_number": 5252, "branch": "feat/y"}],
@@ -21353,12 +21354,12 @@ async def test_deploy_state_payload_reports_dynamic_recovery_threshold(
     shared_state.runtime_config["flap_threshold"] = 3
     shared_state.runtime_config["flap_window_seconds"] = 1800
     shared_state.external_health["failed_deps"] = []
-    shared_state.external_health["last_check"] = datetime.utcnow()
+    shared_state.external_health["last_check"] = _utcnow()
     deploy_health._reset_health_recovery_history()
     deploy_health._health_recovery_history.extend([True, True, True])
     deploy_health._recent_auto_resumes.clear()
     if flapping:
-        now = datetime.utcnow()
+        now = _utcnow()
         deploy_health._recent_auto_resumes.extend(
             [
                 now - timedelta(minutes=15),
@@ -21391,10 +21392,10 @@ async def test_deploy_state_broadcast_matches_polled_payload(
     shared_state.runtime_config["flap_threshold"] = 3
     shared_state.runtime_config["flap_window_seconds"] = 1800
     shared_state.external_health["failed_deps"] = []
-    shared_state.external_health["last_check"] = datetime.utcnow()
+    shared_state.external_health["last_check"] = _utcnow()
     deploy_health._reset_health_recovery_history()
     deploy_health._health_recovery_history.extend([True, True, True, True, True])
-    now = datetime.utcnow()
+    now = _utcnow()
     deploy_health._recent_auto_resumes.clear()
     deploy_health._recent_auto_resumes.extend(
         [
@@ -21430,11 +21431,11 @@ async def test_reset_health_clears_flap_escalation_state(
     shared_state.runtime_config["flap_threshold"] = 3
     shared_state.runtime_config["flap_window_seconds"] = 1800
     shared_state.external_health["failed_deps"] = ["dispatch_api"]
-    shared_state.external_health["last_check"] = datetime.utcnow()
+    shared_state.external_health["last_check"] = _utcnow()
     deploy_health._pause_failure_streak = 3
     deploy_health._reset_health_recovery_history()
     deploy_health._health_recovery_history.extend([True, True, True, True])
-    now = datetime.utcnow()
+    now = _utcnow()
     deploy_health._recent_auto_resumes.clear()
     deploy_health._recent_auto_resumes.extend(
         [
@@ -21467,7 +21468,7 @@ async def test_reset_health_clears_flap_escalation_state(
     state.status = DeploymentStatus.PAUSED
     state.pause_reason = "External dependency down: dispatch_api"
     state.pre_pause_max_vms = 4
-    state.paused_at = datetime.utcnow() - timedelta(minutes=2)
+    state.paused_at = _utcnow() - timedelta(minutes=2)
     db_session.add(state)
     await db_session.commit()
 

@@ -159,12 +159,15 @@ async def _dispose_production_engine_per_test():
     why ``test_promote_does_not_commit_caller_unrelated_transaction`` failed in
     the full suite but passed in isolation).
 
-    Nulling ``_LazyEngine._engine`` forces ``AsyncSessionLocal`` (bound to the
-    lazy proxy) to rebuild a fresh engine on the *next* test's own loop.
-    ``dispose()`` is best-effort cleanup — a pool bound to an already-dead loop
-    may raise, which is harmless once the reference is dropped.  Reaching into
-    ``_LazyEngine._engine`` directly (not via the proxy) avoids re-creating the
-    engine on the teardown loop just to dispose it.
+    In PostgreSQL mode, nulling ``_LazyEngine._engine`` forces
+    ``AsyncSessionLocal`` (bound to the lazy proxy) to rebuild a fresh engine on
+    the *next* test's own loop.  In local SQLite mode, production
+    ``_make_engine`` cannot rebuild a valid SQLite engine because it carries
+    Postgres pool arguments, so the lazy engine is rebound to the shared test
+    engine after disposal.  ``dispose()`` is best-effort cleanup — a pool bound
+    to an already-dead loop may raise, which is harmless once the reference is
+    dropped.  Reaching into ``_LazyEngine._engine`` directly (not via the proxy)
+    avoids re-creating the engine on the teardown loop just to dispose it.
     """
     yield
     import contextlib
@@ -177,7 +180,7 @@ async def _dispose_production_engine_per_test():
         # intentionally ignorable; dropping the reference below is what matters.
         with contextlib.suppress(Exception):
             await eng.dispose()
-        database._LazyEngine._engine = None
+        database._LazyEngine._engine = None if USE_POSTGRES else engine
 
 
 @pytest.fixture(scope="function")

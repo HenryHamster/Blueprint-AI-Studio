@@ -3225,6 +3225,7 @@ class Artifact(SQLModel, table=True):
             "task_id",
             unique=True,
             postgresql_where=text("artifact_type = 'PULL_REQUEST'"),
+            sqlite_where=text("artifact_type = 'PULL_REQUEST'"),
         ),
         Index(
             "ix_artifact_pr_url_trgm",
