@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import type { WorkbenchCommand } from '../components/CommandPalette';
-import { useWorkbenchShortcutRouter } from './useWorkbenchShortcutRouter';
+import { WORKBENCH_SHORTCUT_COMMAND_ID_BY_KEY, useWorkbenchShortcutRouter } from './useWorkbenchShortcutRouter';
 
 function Harness({
   commands,
@@ -37,16 +37,7 @@ function Harness({
 }
 
 function makeCommands(overrides: Partial<WorkbenchCommand>[] = []): WorkbenchCommand[] {
-  const commandIds = [
-    'strategic.focus',
-    'pipeline.flow',
-    'project.update',
-    'runtime.health',
-    'workbench.refresh',
-    'task.new',
-    'settings.general',
-    'pipeline.archive',
-  ];
+  const commandIds = Object.values(WORKBENCH_SHORTCUT_COMMAND_ID_BY_KEY);
 
   return commandIds.map((id, index) => {
     const run = vi.fn();
@@ -111,23 +102,13 @@ describe('useWorkbenchShortcutRouter', () => {
   test('routes main workbench shortcuts to their commands', () => {
     const commands = mount();
 
-    dispatchShortcut('1');
-    dispatchShortcut('2');
-    dispatchShortcut('3');
-    dispatchShortcut('4');
-    dispatchShortcut('r');
-    dispatchShortcut('n');
-    dispatchShortcut('s');
-    dispatchShortcut('a');
+    for (const key of Object.keys(WORKBENCH_SHORTCUT_COMMAND_ID_BY_KEY)) {
+      dispatchShortcut(key);
+    }
 
-    expect(commands.find(command => command.id === 'strategic.focus')?.run).toHaveBeenCalledOnce();
-    expect(commands.find(command => command.id === 'pipeline.flow')?.run).toHaveBeenCalledOnce();
-    expect(commands.find(command => command.id === 'project.update')?.run).toHaveBeenCalledOnce();
-    expect(commands.find(command => command.id === 'runtime.health')?.run).toHaveBeenCalledOnce();
-    expect(commands.find(command => command.id === 'workbench.refresh')?.run).toHaveBeenCalledOnce();
-    expect(commands.find(command => command.id === 'task.new')?.run).toHaveBeenCalledOnce();
-    expect(commands.find(command => command.id === 'settings.general')?.run).toHaveBeenCalledOnce();
-    expect(commands.find(command => command.id === 'pipeline.archive')?.run).toHaveBeenCalledOnce();
+    for (const commandId of Object.values(WORKBENCH_SHORTCUT_COMMAND_ID_BY_KEY)) {
+      expect(commands.find(command => command.id === commandId)?.run).toHaveBeenCalledOnce();
+    }
   });
 
   test('runs the pre-run hook before successful shortcuts', () => {

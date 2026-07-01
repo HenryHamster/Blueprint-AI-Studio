@@ -3,6 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { useEffect } from 'react';
 import { useWorkbenchCommands, type PipelineSection } from './useWorkbenchCommands';
+import { WORKBENCH_SHORTCUT_COMMAND_ID_BY_KEY } from './useWorkbenchShortcutRouter';
 import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
 import type { StrategicStateResponse, StrategicWorkbenchState, StrategicWorkSessionAction, StrategicWorkSessionCommand } from '../strategicStateApi';
@@ -18,6 +19,48 @@ vi.mock('../api', () => ({
 
 type Captured = ReturnType<typeof useWorkbenchCommands>;
 let captured: Captured = [];
+
+const REQUIRED_OPERATOR_ROUTE_COMMANDS = [
+  { id: 'strategic.focus', section: 'Strategic', shortcut: '1' },
+  { id: 'strategic.context.workspace', section: 'Context' },
+  { id: 'strategic.messages.open', section: 'Messages' },
+  { id: 'workbench.refresh', section: 'Workbench', shortcut: 'R' },
+  { id: 'pipeline.flow', section: 'Pipeline', shortcut: '2' },
+  { id: 'pipeline.board', section: 'Pipeline' },
+  { id: 'pipeline.archive', section: 'Pipeline', shortcut: 'A' },
+  { id: 'project.update', section: 'Project', shortcut: '3' },
+  { id: 'project.directions', section: 'Project' },
+  { id: 'project.model', section: 'Project' },
+  { id: 'project.design', section: 'Project' },
+  { id: 'project.manage', section: 'Project' },
+  { id: 'project.build', section: 'Project' },
+  { id: 'project.branches', section: 'Project' },
+  { id: 'project.review', section: 'Project' },
+  { id: 'project.resources', section: 'Project' },
+  { id: 'project.remediation', section: 'Project' },
+  { id: 'project.issue_implementation', section: 'Project' },
+  { id: 'project.alert_domains', section: 'Project' },
+  { id: 'project.access', section: 'Project' },
+  { id: 'project.members', section: 'Project' },
+  { id: 'project.switcher', section: 'Project' },
+  { id: 'runtime.health', section: 'Runtime', shortcut: '4' },
+  { id: 'runtime.analytics', section: 'Runtime' },
+  { id: 'runtime.devices', section: 'Runtime' },
+  { id: 'runtime.accounts', section: 'Runtime' },
+  { id: 'runtime.compute', section: 'Runtime' },
+  { id: 'runtime.settings', section: 'Runtime' },
+  { id: 'runtime.settings.general', section: 'Runtime' },
+  { id: 'runtime.settings.deploy', section: 'Runtime' },
+  { id: 'runtime.settings.provider-routing', section: 'Runtime' },
+  { id: 'runtime.settings.provider-settings', section: 'Runtime' },
+  { id: 'runtime.settings.notifications', section: 'Runtime' },
+  { id: 'runtime.settings.advanced', section: 'Runtime' },
+  { id: 'activity.open', section: 'Workbench' },
+  { id: 'research.open', section: 'Workbench' },
+  { id: 'knowledge.open', section: 'Workbench' },
+  { id: 'task.new', section: 'Pipeline', shortcut: 'N' },
+  { id: 'settings.general', section: 'Workbench', shortcut: 'S' },
+] as const;
 
 function Harness(overrides: Partial<Parameters<typeof useWorkbenchCommands>[0]> = {}) {
   const commands = useWorkbenchCommands({
@@ -1483,6 +1526,23 @@ describe('useWorkbenchCommands', () => {
       label: 'Workbench settings',
       detail: 'UI defaults and controls',
     });
+  });
+
+  test('preserves the operator route command contract', () => {
+    mount();
+
+    const commandById = new Map(captured.map(command => [command.id, command]));
+    expect(commandById.size).toBe(captured.length);
+    for (const expected of REQUIRED_OPERATOR_ROUTE_COMMANDS) {
+      expect(commandById.get(expected.id)).toMatchObject(expected);
+    }
+
+    const shortcutOwners = captured
+      .filter(command => command.shortcut)
+      .map(command => [command.shortcut, command.id]);
+    expect(new Set(shortcutOwners.map(([shortcut]) => shortcut)).size).toBe(shortcutOwners.length);
+    expect(Object.fromEntries(shortcutOwners.map(([shortcut, commandId]) => [shortcut.toLowerCase(), commandId])))
+      .toEqual(WORKBENCH_SHORTCUT_COMMAND_ID_BY_KEY);
   });
 
   test('disables project-scoped commands when no project is selected', () => {
