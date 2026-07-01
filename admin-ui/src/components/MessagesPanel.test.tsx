@@ -5536,6 +5536,28 @@ describe('MessagesPanel composer draft persistence', () => {
     expect(typeof parsed.type).toBe('string');
   });
 
+  test('composer is explicitly disabled when no project is selected', async () => {
+    _mockMessagesFetch([]);
+    const { container, getByText } = render(
+      <MessagesPanel
+        selectedProjectId={null}
+        onClose={() => {}}
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+      />,
+    );
+
+    const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
+    const sendBtn = container.querySelector('button[aria-label="Send message"]') as HTMLButtonElement;
+
+    expect(textarea).toBeTruthy();
+    expect(textarea.disabled).toBe(true);
+    expect(textarea.placeholder).toBe('Select a project to message Strategic');
+    expect(sendBtn).toBeTruthy();
+    expect(sendBtn.disabled).toBe(true);
+    expect(getByText('Select a project to message Strategic')).toBeTruthy();
+  });
+
   test('draft is restored into the textarea when component remounts', async () => {
     // Pre-seed a draft for the project
     const draftKey = `messages_composer_draft:test-user@example.com:proj-draft`;

@@ -16,6 +16,7 @@ export interface MessagesComposerProps {
   /** Whether a strategic cycle is currently running (live WS-driven signal). */
   strategistBusy?: boolean;
   strategicContext?: StrategicContextDescriptorModel | null;
+  disabledReason?: string | null;
   onOpenStrategicContext?: () => void;
   onOpenCommandPalette?: () => void;
   onChangeType: (value: string) => void;
@@ -42,6 +43,7 @@ export function MessagesComposer({
   lastArming,
   strategistBusy,
   strategicContext,
+  disabledReason,
   onOpenStrategicContext,
   onOpenCommandPalette,
   onChangeType,
@@ -65,9 +67,10 @@ export function MessagesComposer({
   // than acting immediately.
   const minimal = chrome === 'minimal';
   const minimalColumnClass = 'mx-auto w-full max-w-[900px]';
+  const composerDisabled = Boolean(disabledReason);
   const hintArming = minimal && strategistBusy && lastArming !== 'not_armed' ? null : lastArming;
   const hintText = composerHintCopy(newType, hintArming, strategistBusy);
-  const showHint = !minimal || Boolean(strategistBusy) || lastArming === 'not_armed';
+  const showHint = Boolean(disabledReason) || !minimal || Boolean(strategistBusy) || lastArming === 'not_armed';
 
   return (
     <div className={minimal
@@ -116,20 +119,21 @@ export function MessagesComposer({
             value={newContent}
             onChange={e => { onChangeContent(e.target.value); handleTextareaInput(); }}
             onKeyDown={e => {
-              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSubmit(); }
+              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!composerDisabled) onSubmit(); }
             }}
-            placeholder={minimal ? 'Message Strategic' : 'Type a message...'}
+            placeholder={disabledReason ?? (minimal ? 'Message Strategic' : 'Type a message...')}
             rows={1}
+            disabled={composerDisabled}
             className={minimal
-              ? 'min-h-[44px] w-full resize-none rounded border-0 bg-transparent px-3 py-2 text-sm leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-600 md:min-h-8 md:py-1.5'
-              : 'w-full bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600 resize-none min-h-[44px] leading-relaxed'
+              ? 'min-h-[44px] w-full resize-none rounded border-0 bg-transparent px-3 py-2 text-sm leading-relaxed text-neutral-100 outline-none placeholder:text-neutral-600 disabled:cursor-not-allowed disabled:text-neutral-500 md:min-h-8 md:py-1.5'
+              : 'w-full bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600 resize-none min-h-[44px] leading-relaxed disabled:cursor-not-allowed disabled:text-neutral-500'
             }
           />
         </div>
         <button
           type="button"
           onClick={onSubmit}
-          disabled={submitting || !newContent.trim()}
+          disabled={composerDisabled || submitting || !newContent.trim()}
           aria-label="Send message"
           title="Send message"
           className={minimal
@@ -145,7 +149,7 @@ export function MessagesComposer({
       {showHint && (
         <div className={minimal ? `${minimalColumnClass} mt-1.5 px-1` : ''}>
           <p className={`${minimal ? 'text-ui-md text-neutral-600' : 'text-ui-md text-neutral-500'} leading-snug ${minimal ? '' : 'mt-1.5 px-0.5'}`}>
-            {hintText}
+            {disabledReason ?? hintText}
           </p>
         </div>
       )}

@@ -2021,6 +2021,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         replyTo={replyTo}
         lastArming={lastArming}
         strategistBusy={strategistActive}
+        disabledReason={selectedProjectId ? null : 'Select a project to message Strategic'}
         onChangeType={(value) => { setNewType(value); setLastArming(null); if (newContent) saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: value, content: newContent }); }}
         onChangeContent={(value) => { setNewContent(value); if (value) { saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value }); } else { clearComposerDraft(auth.currentUser?.email, selectedProjectId); } }}
         onCancelReply={() => setReplyTo(null)}

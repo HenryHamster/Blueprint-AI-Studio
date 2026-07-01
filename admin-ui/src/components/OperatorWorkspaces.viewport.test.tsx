@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { RuntimeWorkspace, type RuntimeSection } from './OperatorWorkspaces';
-import { expectNoOverflowAt } from '../test/viewport';
+import { expectMinTouchTargetAt, expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
 
 vi.mock('./ConsoleHome', () => ({
   ConsoleHome: () => <div className="min-h-[220px] rounded-md border border-neutral-800 p-3">health</div>,
@@ -70,7 +70,7 @@ describe('RuntimeWorkspace viewport regression', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;
 
-  afterEach(() => {
+  function cleanupHost() {
     const r = root;
     if (r) {
       act(() => {
@@ -80,9 +80,14 @@ describe('RuntimeWorkspace viewport regression', () => {
     root = null;
     host?.remove();
     host = null;
+  }
+
+  afterEach(() => {
+    cleanupHost();
   });
 
   async function renderRuntime(section: RuntimeSection) {
+    cleanupHost();
     host = document.createElement('div');
     host.style.height = '760px';
     document.body.appendChild(host);
@@ -95,6 +100,14 @@ describe('RuntimeWorkspace viewport regression', () => {
 
   test('devices surface fits mobile width without nested-panel overflow', async () => {
     await expectNoOverflowAt(375, () => renderRuntime('devices'));
+  });
+
+  test('settings surface satisfies required mobile viewport checks', async () => {
+    await expectNoTextTruncationAt(375, () => renderRuntime('settings'), {
+      height: 760,
+      selector: '[aria-label="Runtime settings sections"] *, [data-testid="settings-section"]',
+    });
+    await expectMinTouchTargetAt(375, () => renderRuntime('settings'), { height: 760 });
   });
 
   test('settings surface keeps compact navigation on mobile', async () => {

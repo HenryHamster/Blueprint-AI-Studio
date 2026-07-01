@@ -605,7 +605,7 @@ export function RuntimeWorkspace({
                     key={item.id}
                     type="button"
                     onClick={() => onRuntimeConfigSectionChange(item.id)}
-                    className={`flex w-full items-center gap-2 rounded-md border px-2.5 py-2 text-left transition-colors ${
+                    className={`flex min-h-11 w-full items-center gap-2 rounded-md border px-2.5 py-2 text-left transition-colors ${
                       selected
                         ? 'border-neutral-700 bg-[#151c25] text-neutral-100'
                         : 'border-transparent text-neutral-400 hover:border-neutral-800 hover:bg-[#10151c] hover:text-neutral-200'

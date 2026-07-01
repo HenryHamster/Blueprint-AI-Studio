@@ -15,6 +15,7 @@
     "NewProjectModal",
     "MetricsDashboard",
     "OrchestratorHealthBar",
+    "OperatorWorkspaces",
     "SearchFilterBar",
     "SettingsAccountsSection"
   ]
