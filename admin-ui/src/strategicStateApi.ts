@@ -370,6 +370,14 @@ export interface StrategicWorkSessionMetric {
   unit?: string | null;
   tone?: 'neutral' | 'watch' | 'warning' | 'critical' | 'active' | string;
   target?: StrategicContextPackageDrilldown['target'] | null;
+  provenance?: {
+    surface: string;
+    path: string;
+    status?: string | null;
+    transform?: string | null;
+    window_minutes?: number | null;
+    [key: string]: unknown;
+  };
 }
 
 export interface StrategicWorkSessionAction {
@@ -477,6 +485,9 @@ export interface StrategicWorkSession {
   id: string;
   mode: string;
   active_surface: string;
+  status?: string;
+  location?: string;
+  status_reason?: string | null;
   session_started_at?: string | null;
   last_interaction_at?: string | null;
   context_package_id?: string | null;
@@ -520,6 +531,7 @@ export interface StrategicSessionResponse {
     status?: string;
     location?: string;
     status_reason?: string | null;
+    runtime?: StrategicLocalRunnerState | null;
     conversation?: StrategicSessionConversation;
     recent_outputs?: StrategicSessionOutput[];
   };
