@@ -15,6 +15,7 @@ def test_work_session_action_target_preserves_canonical_context_fields():
             "document_id": "document-1",
             "artifact_id": "artifact-1",
             "cycle_id": "cycle-1",
+            "runner_id": "runner-1",
             "secret": "drop-me",
         }
     )
@@ -31,7 +32,39 @@ def test_work_session_action_target_preserves_canonical_context_fields():
         "document_id": "document-1",
         "artifact_id": "artifact-1",
         "cycle_id": "cycle-1",
+        "runner_id": "runner-1",
     }
+
+
+def test_work_session_action_target_preserves_preferred_runner():
+    actions = build_work_session_actions(
+        attention={"items": []},
+        runtime_work=None,
+        context_status=None,
+        local_runner={
+            "mode": "pending_local",
+            "status": "unavailable",
+            "eligible_live_count": 0,
+            "continuation": {
+                "enabled": True,
+                "fresh": True,
+                "preferred_runner_id": "runner-preferred-1",
+                "reason": "heartbeat_stale",
+            },
+        },
+    )
+
+    action = next(
+        item
+        for item in actions
+        if item["id"] == "runtime.local_strategic.continuation_runner"
+    )
+    assert action["target"] == {
+        "surface": "runtime",
+        "section": "devices",
+        "runner_id": "runner-preferred-1",
+    }
+    assert action["blocked_reason"] == "heartbeat_stale"
 
 
 def test_work_session_action_task_linked_alert_targets_task():

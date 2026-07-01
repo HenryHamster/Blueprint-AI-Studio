@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any, Dict
 
 from sqlalchemy import func
@@ -11,6 +12,7 @@ from sqlalchemy.sql.elements import ColumnElement
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
+from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
 from app.compute_jobs_aggregation import aggregate_compute_jobs_summary
 from app.models import (
     ComputeJob,
@@ -47,6 +49,7 @@ _PROBLEM_WAKE_STATES = (
     WakeDeliveryState.FAILED,
 )
 _RUNTIME_WORK_PREVIEW_LIMIT = 6
+_RUNNER_CANDIDATE_LIMIT = 8
 LOCAL_RUNNER_HOLD_CONTEXT_KEY = "awaiting_local_runner_since"
 _LOCAL_STRATEGIC_RUNNING_STATUSES = frozenset(
     {
@@ -209,6 +212,218 @@ def _runner_is_dispatch_eligible(
         return False
     available_slots = health.get("available_slots")
     return available_slots is None or int(available_slots) > 0
+
+
+def _int_capability(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value > 0 else None
+    if isinstance(value, float):
+        return int(value) if value.is_integer() and value > 0 else None
+    if isinstance(value, str):
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+        return parsed if parsed > 0 else None
+    return None
+
+
+def _runner_capabilities_view(capabilities: Dict[str, Any] | None) -> Dict[str, Any]:
+    caps = capabilities if isinstance(capabilities, dict) else {}
+    view: Dict[str, Any] = {}
+    for key in ("runner_preset", "workload"):
+        value = caps.get(key)
+        if isinstance(value, str):
+            compact = _compact_text(value, max_chars=120)
+            if compact:
+                view[key] = compact
+    if isinstance(caps.get("has_gpu"), bool):
+        view["has_gpu"] = caps["has_gpu"]
+    max_concurrent = _int_capability(caps.get("max_concurrent"))
+    if max_concurrent is not None:
+        view["max_concurrent"] = max_concurrent
+    if isinstance(caps.get("agent_available"), bool):
+        view["agent_available"] = caps["agent_available"]
+    task_types = caps.get("task_types")
+    if task_types == "all":
+        view["task_types"] = "all"
+    elif isinstance(task_types, list):
+        view["task_types"] = [
+            compact
+            for compact in (
+                _compact_text(task_type, max_chars=80)
+                for task_type in task_types[:24]
+                if isinstance(task_type, str)
+            )
+            if compact
+        ]
+    return view
+
+
+def _merge_compute_job_ids(
+    capabilities: Dict[str, Any],
+    active_compute_job_ids: list[str],
+) -> Dict[str, Any]:
+    if not active_compute_job_ids:
+        return capabilities
+    merged = dict(capabilities)
+    seen: set[str] = set()
+    job_ids: list[str] = []
+    for job_id in (
+        list(capabilities.get("active_compute_job_ids") or [])
+        + active_compute_job_ids
+    ):
+        if not isinstance(job_id, str) or job_id in seen:
+            continue
+        seen.add(job_id)
+        job_ids.append(job_id)
+    merged["active_compute_job_ids"] = job_ids
+    return merged
+
+
+def _runner_health_with_compute_assignments(
+    runner: LocalRunner,
+    active_compute_job_ids: list[str],
+) -> Dict[str, Any]:
+    if not active_compute_job_ids:
+        return _runner_health(runner)
+    capabilities = _merge_compute_job_ids(
+        dict(runner.capabilities or {}),
+        active_compute_job_ids,
+    )
+    return _runner_health(
+        SimpleNamespace(
+            status=runner.status,
+            last_seen_at=runner.last_seen_at,
+            capabilities=capabilities,
+        )
+    )
+
+
+async def _load_runner_compute_job_assignments(
+    session: AsyncSession,
+    runner_ids: list[uuid.UUID],
+) -> dict[str, list[str]]:
+    if not runner_ids:
+        return {}
+    runner_id_strings = [str(runner_id) for runner_id in runner_ids]
+    runner_target_expr = ComputeJob.polling_metadata["runner_target_id"].as_string()
+    rows = (
+        await session.execute(
+            select(ComputeJob.id, runner_target_expr)
+            .where(
+                ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
+                ComputeJob.status.in_(_ACTIVE_COMPUTE_JOB_STATUSES),
+                runner_target_expr.in_(runner_id_strings),
+            )
+            .order_by(ComputeJob.created_at.asc())
+        )
+    ).all()
+    by_runner: dict[str, list[str]] = {runner_id: [] for runner_id in runner_id_strings}
+    for job_id, raw_runner_id in rows:
+        runner_id = str(raw_runner_id)
+        if runner_id in by_runner:
+            by_runner[runner_id].append(str(job_id))
+    return by_runner
+
+
+def _runner_health_view(health: Dict[str, Any]) -> Dict[str, Any]:
+    view: Dict[str, Any] = {}
+    for key in ("device_status", "device_status_reason", "stale_reason"):
+        compact = _compact_text(health.get(key), max_chars=120)
+        if compact:
+            view[key] = compact
+    for key in ("is_live",):
+        if isinstance(health.get(key), bool):
+            view[key] = health[key]
+    for key in (
+        "seconds_since_last_seen",
+        "active_task_count",
+        "active_compute_job_count",
+        "active_work_count",
+        "max_concurrent",
+        "available_slots",
+        "liveness_window_seconds",
+    ):
+        value = health.get(key)
+        if value is None:
+            view[key] = None
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            view[key] = int(value)
+    agent_available = health.get("agent_available")
+    view["agent_available"] = (
+        agent_available if isinstance(agent_available, bool) else None
+    )
+    return view
+
+
+def _runner_blocked_reason(
+    runner: LocalRunner,
+    health: Dict[str, Any],
+    required_task_types: frozenset[str],
+) -> str | None:
+    if not _runner_handles_task_types(runner, required_task_types):
+        return "capability_mismatch"
+    if not health.get("is_live"):
+        return health.get("stale_reason") or "runner_offline"
+    if health.get("agent_available") is False:
+        return "agent_unavailable"
+    available_slots = health.get("available_slots")
+    if available_slots is not None and int(available_slots) <= 0:
+        return "at_capacity"
+    return None
+
+
+def _runner_candidate_view(
+    runner: LocalRunner,
+    health: Dict[str, Any],
+    required_task_types: frozenset[str],
+    *,
+    active_runner_id: str | None,
+    preferred_runner_id: str | None,
+) -> Dict[str, Any]:
+    eligible = _runner_is_dispatch_eligible(runner, health, required_task_types)
+    runner_id = str(runner.id)
+    return {
+        "id": runner_id,
+        "hostname": _compact_text(runner.hostname, max_chars=160),
+        "status": _compact_text(runner.status, max_chars=80),
+        "last_seen_at": _isoformat(runner.last_seen_at),
+        "created_at": _isoformat(runner.created_at),
+        "capabilities": _runner_capabilities_view(runner.capabilities),
+        "health": _runner_health_view(health),
+        "handles_active_task_type": _runner_handles_task_types(
+            runner,
+            required_task_types,
+        ),
+        "eligible_for_active_task": eligible,
+        "is_preferred": bool(preferred_runner_id and runner_id == preferred_runner_id),
+        "is_active_runner": bool(active_runner_id and runner_id == active_runner_id),
+        "blocked_reason": None
+        if eligible
+        else _runner_blocked_reason(runner, health, required_task_types),
+    }
+
+
+def _runner_candidate_sort_key(candidate: Dict[str, Any]) -> tuple[Any, ...]:
+    health = (
+        candidate.get("health")
+        if isinstance(candidate.get("health"), dict)
+        else {}
+    )
+    seconds = health.get("seconds_since_last_seen")
+    if not isinstance(seconds, (int, float)):
+        seconds = 10**9
+    return (
+        not bool(candidate.get("is_active_runner")),
+        not bool(candidate.get("is_preferred")),
+        not bool(candidate.get("eligible_for_active_task")),
+        not bool(health.get("is_live")),
+        seconds,
+        str(candidate.get("hostname") or ""),
+    )
 
 
 def _active_strategic_task_types(task: Task | None) -> frozenset[str]:
@@ -387,14 +602,23 @@ async def build_strategic_runtime_summary(
     strategic_runners = [
         runner for runner in runner_rows if _runner_handles_any_strategic_work(runner)
     ]
+    active_compute_jobs_by_runner = await _load_runner_compute_job_assignments(
+        session,
+        [runner.id for runner in strategic_runners],
+    )
     readiness_capable_runners = [
         runner
         for runner in strategic_runners
         if _runner_handles_task_types(runner, readiness_task_types)
     ]
     health_by_runner = {
-        str(runner.id): _runner_health(runner) for runner in strategic_runners
+        str(runner.id): _runner_health_with_compute_assignments(
+            runner,
+            active_compute_jobs_by_runner.get(str(runner.id), []),
+        )
+        for runner in strategic_runners
     }
+    runner_by_id = {str(runner.id): runner for runner in strategic_runners}
 
     live_runner_count = sum(
         1 for health in health_by_runner.values() if health.get("is_live")
@@ -442,6 +666,15 @@ async def build_strategic_runtime_summary(
         ),
         None,
     )
+
+    continuation_status = strategic_local_continuation_status_from_vision(
+        project_vision
+    )
+    preferred_runner_id = continuation_status.get("preferred_runner_id")
+    if not isinstance(preferred_runner_id, str) or not preferred_runner_id.strip():
+        preferred_runner_id = None
+    else:
+        preferred_runner_id = preferred_runner_id.strip()
 
     fallback_reason = None
     if active_task_pinned:
@@ -493,17 +726,21 @@ async def build_strategic_runtime_summary(
         mode = "pending_local"
         fallback_reason = "runner_unavailable"
     operator_status = _local_operator_status(mode, fallback_reason, active_task)
-    continuation_status = strategic_local_continuation_status_from_vision(
-        project_vision
-    )
     if continuation_status["enabled"] and continuation_status["fresh"]:
-        preferred_runner_id = continuation_status.get("preferred_runner_id")
         if preferred_runner_id:
             preferred_health = health_by_runner.get(preferred_runner_id)
+            preferred_runner = runner_by_id.get(preferred_runner_id)
             if preferred_health is None:
                 continuation_status["reason"] = "preferred_runner_missing"
-            elif preferred_health.get("is_live"):
-                continuation_status["reason"] = "preferred_runner_live"
+            elif preferred_runner is not None:
+                preferred_blocked_reason = _runner_blocked_reason(
+                    preferred_runner,
+                    preferred_health,
+                    readiness_task_types,
+                )
+                continuation_status["reason"] = (
+                    preferred_blocked_reason or "preferred_runner_live"
+                )
             else:
                 continuation_status["reason"] = (
                     preferred_health.get("stale_reason") or "preferred_runner_offline"
@@ -516,6 +753,20 @@ async def build_strategic_runtime_summary(
             continuation_status["reason"] = "runner_offline"
         else:
             continuation_status["reason"] = "no_runner"
+
+    runner_candidates = sorted(
+        (
+            _runner_candidate_view(
+                runner,
+                health_by_runner[str(runner.id)],
+                readiness_task_types,
+                active_runner_id=active_runner_id,
+                preferred_runner_id=preferred_runner_id,
+            )
+            for runner in strategic_runners
+        ),
+        key=_runner_candidate_sort_key,
+    )[:_RUNNER_CANDIDATE_LIMIT]
 
     return {
         "local_runner": {
@@ -535,6 +786,7 @@ async def build_strategic_runtime_summary(
             "fallback_reason": fallback_reason,
             "liveness_window_seconds": _RUNNER_LIVENESS_SECONDS,
             "continuation": continuation_status,
+            "runners": runner_candidates,
         },
         "work": await build_runtime_work_summary(session, project_id),
     }

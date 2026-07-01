@@ -78,6 +78,7 @@ export interface StrategicContextTarget {
   action?: string | null;
   document_id?: string | null;
   artifact_id?: string | null;
+  runner_id?: string | null;
 }
 
 export interface StrategicContextPackageDrilldown {
@@ -190,6 +191,41 @@ export interface StrategicLocalRunnerContinuation {
   ttl_seconds?: number | null;
 }
 
+export interface StrategicLocalRunnerCandidate {
+  id: string;
+  hostname?: string | null;
+  status?: string | null;
+  last_seen_at?: string | null;
+  created_at?: string | null;
+  capabilities?: {
+    runner_preset?: string | null;
+    workload?: string | null;
+    task_types?: string[] | 'all';
+    has_gpu?: boolean;
+    max_concurrent?: number;
+    agent_available?: boolean;
+  };
+  health?: {
+    device_status?: string | null;
+    device_status_reason?: string | null;
+    is_live?: boolean;
+    seconds_since_last_seen?: number | null;
+    active_task_count?: number;
+    active_compute_job_count?: number;
+    active_work_count?: number;
+    max_concurrent?: number | null;
+    available_slots?: number | null;
+    stale_reason?: string | null;
+    agent_available?: boolean | null;
+    liveness_window_seconds?: number;
+  };
+  handles_active_task_type: boolean;
+  eligible_for_active_task: boolean;
+  is_preferred: boolean;
+  is_active_runner: boolean;
+  blocked_reason?: string | null;
+}
+
 export interface StrategicLocalRunnerState {
   status?: string | null;
   location?: string | null;
@@ -205,6 +241,7 @@ export interface StrategicLocalRunnerState {
   active_runner_id?: string | null;
   active_task_pinned: boolean;
   active_task_runtime?: StrategicLocalRunnerRuntime | null;
+  runners?: StrategicLocalRunnerCandidate[];
   fallback_reason?:
     | 'no_runner'
     | 'runner_offline'

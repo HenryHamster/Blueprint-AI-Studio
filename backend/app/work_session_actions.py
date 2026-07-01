@@ -39,6 +39,7 @@ def _compact_action_target(target: dict[str, Any] | None) -> dict[str, Any] | No
         "document_id",
         "artifact_id",
         "cycle_id",
+        "runner_id",
     ):
         value = _compact_text(target.get(key), max_chars=160)
         if value:
@@ -309,6 +310,13 @@ def _local_runner_actions(
         or "runner_unavailable",
         max_chars=80,
     )
+    target = {"surface": "runtime", "section": "devices"}
+    preferred_runner_id = _compact_text(
+        continuation.get("preferred_runner_id"),
+        max_chars=160,
+    )
+    if preferred_runner_id:
+        target["runner_id"] = preferred_runner_id
     action = _action(
         "runtime.local_strategic.continuation_runner",
         "inspect",
@@ -316,7 +324,7 @@ def _local_runner_actions(
         "Workday mode is active but no eligible local Strategic runner is ready",
         priority="high",
         source="runtime",
-        target={"surface": "runtime", "section": "devices"},
+        target=target,
         blocked_reason=reason,
     )
     return [action] if action else []

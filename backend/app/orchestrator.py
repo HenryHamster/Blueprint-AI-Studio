@@ -1052,6 +1052,9 @@ async def _dispatch_compute_experiment_directly(
         "compute_experiment",
         accelerator,
         runner_pins_this_cycle,
+        preferred_runner_target_id=(task.context or {}).get(
+            "preferred_runner_target_id"
+        ),
     )
 
     project = await session.get(Project, task.project_id)

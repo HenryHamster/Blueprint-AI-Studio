@@ -2071,6 +2071,58 @@ class TestDirectComputeExperimentDispatch:
         assert (job.polling_metadata or {}).get("runner_target_id") == str(runner.id)
 
     @pytest.mark.asyncio
+    async def test_launch_prefers_requested_compute_runner_when_eligible(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        preferred, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 4,
+                "active_compute_job_ids": ["existing-job"],
+            },
+        )
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 4,
+                "active_compute_job_ids": [],
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+            context={"preferred_runner_target_id": str(preferred.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session,
+            task,
+            {project.id: [preferred, idle]},
+            {},
+        )
+
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.PARKED
+        assert task.context["runner_target_id"] == str(preferred.id)
+        job = await _compute_job_for_task(db_session, task.id)
+        assert job is not None
+        assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+        assert (job.polling_metadata or {}).get("runner_target_id") == str(
+            preferred.id
+        )
+
+    @pytest.mark.asyncio
     async def test_runner_subprocess_jobs_count_toward_next_cycle_capacity(
         self, db_session
     ):

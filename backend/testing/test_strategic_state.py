@@ -7,6 +7,7 @@ from httpx import AsyncClient
 from sqlalchemy import func
 from sqlmodel import select
 
+from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
 from app.models import (
     ReleaseVersion,
     Alert,
@@ -620,6 +621,187 @@ async def test_strategic_state_reports_active_local_strategic_runner(
     assert local_runner["liveness_window_seconds"] == 300
     assert data["work_session"]["status"] == "working"
     assert data["work_session"]["location"] == "locally"
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_reports_strategic_runner_candidates(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    runners = [
+        LocalRunner(
+            project_id=project.id,
+            token_hash="c" * 64,
+            hostname="eligible-desk",
+            status="active",
+            last_seen_at=_utcnow(),
+            capabilities={
+                "task_types": [
+                    "design_doc_update",
+                    "strategic_review",
+                    {"secret": "drop"},
+                ],
+                "has_gpu": "false",
+                "max_concurrent": "3",
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": "true",
+                "active_task_ids": [],
+            },
+        ),
+        LocalRunner(
+            project_id=project.id,
+            token_hash="d" * 64,
+            hostname="busy-desk",
+            status="active",
+            last_seen_at=_utcnow(),
+            capabilities={
+                "task_types": ["design_doc_update", "strategic_review"],
+                "has_gpu": False,
+                "max_concurrent": 1,
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+                "active_task_ids": ["existing-task"],
+            },
+        ),
+        LocalRunner(
+            project_id=project.id,
+            token_hash="e" * 64,
+            hostname="stale-desk",
+            status="active",
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={
+                "task_types": ["design_doc_update", "strategic_review"],
+                "has_gpu": False,
+                "max_concurrent": 2,
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        ),
+        LocalRunner(
+            project_id=project.id,
+            token_hash="f" * 64,
+            hostname="docs-only",
+            status="active",
+            last_seen_at=_utcnow(),
+            capabilities={
+                "task_types": ["design_doc_update"],
+                "has_gpu": False,
+                "max_concurrent": 2,
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        ),
+    ]
+    db_session.add_all(runners)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200, resp.text
+    local_runner = resp.json()["runtime"]["local_runner"]
+    by_host = {runner["hostname"]: runner for runner in local_runner["runners"]}
+
+    assert local_runner["strategic_runner_count"] == 4
+    assert local_runner["eligible_live_count"] == 1
+    assert set(by_host) == {"eligible-desk", "busy-desk", "stale-desk", "docs-only"}
+
+    eligible = by_host["eligible-desk"]
+    assert eligible["eligible_for_active_task"] is True
+    assert eligible["blocked_reason"] is None
+    assert eligible["capabilities"] == {
+        "runner_preset": "strategic_local",
+        "workload": "strategic",
+        "max_concurrent": 3,
+        "task_types": ["design_doc_update", "strategic_review"],
+    }
+    assert "active_task_ids" not in eligible["capabilities"]
+    assert "has_gpu" not in eligible["capabilities"]
+    assert "agent_available" not in eligible["capabilities"]
+    assert eligible["health"]["agent_available"] is None
+
+    busy = by_host["busy-desk"]
+    assert busy["handles_active_task_type"] is True
+    assert busy["eligible_for_active_task"] is False
+    assert busy["blocked_reason"] == "at_capacity"
+    assert busy["health"]["available_slots"] == 0
+
+    stale = by_host["stale-desk"]
+    assert stale["eligible_for_active_task"] is False
+    assert stale["blocked_reason"] == "heartbeat_stale"
+    assert stale["health"]["device_status"] == "stale"
+
+    docs_only = by_host["docs-only"]
+    assert docs_only["handles_active_task_type"] is False
+    assert docs_only["eligible_for_active_task"] is False
+    assert docs_only["blocked_reason"] == "capability_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_counts_assigned_compute_jobs_in_runner_capacity(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="g" * 64,
+        hostname="assigned-desk",
+        status="active",
+        last_seen_at=_utcnow(),
+        capabilities={
+            "task_types": ["design_doc_update", "strategic_review"],
+            "max_concurrent": 1,
+            "runner_preset": "strategic_local",
+            "workload": "strategic",
+            "agent_available": True,
+            "active_compute_job_ids": [],
+        },
+    )
+    db_session.add(runner)
+    await db_session.commit()
+    await db_session.refresh(runner)
+    db_session.add(
+        ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.QUEUED,
+            polling_metadata={"runner_target_id": str(runner.id)},
+            created_at=_utcnow(),
+            updated_at=_utcnow(),
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/strategic-session",
+        json={
+            "workbench": {
+                "interaction_mode": "continuous",
+                "preferred_runner_id": str(runner.id),
+            }
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    local_runner = data["runtime"]["local_runner"]
+    assert local_runner["eligible_live_count"] == 0
+    candidate = local_runner["runners"][0]
+    assert candidate["id"] == str(runner.id)
+    assert candidate["eligible_for_active_task"] is False
+    assert candidate["blocked_reason"] == "at_capacity"
+    assert candidate["health"]["active_compute_job_count"] == 1
+    assert candidate["health"]["available_slots"] == 0
+    actions = {entry["id"]: entry for entry in data["session"]["actions"]}
+    runner_action = actions["runtime.local_strategic.continuation_runner"]
+    assert runner_action["target"] == {
+        "surface": "runtime",
+        "section": "devices",
+        "runner_id": str(runner.id),
+    }
+    assert runner_action["blocked_reason"] == "at_capacity"
 
 
 @pytest.mark.asyncio
@@ -1891,34 +2073,46 @@ async def test_strategic_session_continuous_omits_runner_action_when_ready(
     client: AsyncClient, db_session
 ):
     project = await _make_project(db_session)
-    db_session.add(
-        LocalRunner(
-            project_id=project.id,
-            token_hash="r" * 64,
-            hostname="ready-desk",
-            status="active",
-            last_seen_at=_utcnow(),
-            capabilities={
-                "task_types": ["design_doc_update", "strategic_review"],
-                "has_gpu": False,
-                "max_concurrent": 1,
-                "runner_preset": "strategic_local",
-                "workload": "strategic",
-                "agent_available": True,
-                "active_task_ids": [],
-            },
-        )
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="r" * 64,
+        hostname="ready-desk",
+        status="active",
+        last_seen_at=_utcnow(),
+        capabilities={
+            "task_types": ["design_doc_update", "strategic_review"],
+            "has_gpu": False,
+            "max_concurrent": 1,
+            "runner_preset": "strategic_local",
+            "workload": "strategic",
+            "agent_available": True,
+            "active_task_ids": [],
+        },
     )
+    db_session.add(runner)
     await db_session.commit()
+    await db_session.refresh(runner)
 
     resp = await client.post(
         f"/api/admin/projects/{project.id}/strategic-session",
-        json={"workbench": {"interaction_mode": "continuous"}},
+        json={
+            "workbench": {
+                "interaction_mode": "continuous",
+                "preferred_runner_id": str(runner.id),
+            }
+        },
     )
 
     assert resp.status_code == 200, resp.text
     data = resp.json()
     assert data["runtime"]["local_runner"]["mode"] == "local_ready"
+    assert (
+        data["runtime"]["local_runner"]["continuation"]["reason"]
+        == "preferred_runner_live"
+    )
+    assert data["runtime"]["local_runner"]["runners"][0]["id"] == str(runner.id)
+    assert data["runtime"]["local_runner"]["runners"][0]["is_preferred"] is True
+    assert data["runtime"]["local_runner"]["runners"][0]["eligible_for_active_task"] is True
     metrics = {entry["id"]: entry for entry in data["session"]["curated_metrics"]}
     assert metrics["runtime.local_strategic_ready"]["value"] == 1
     assert metrics["runtime.local_strategic_ready"]["tone"] == "active"
