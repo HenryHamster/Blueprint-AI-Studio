@@ -21,7 +21,6 @@ import { NewTaskModal } from './components/NewTaskModal';
 import { NewProjectModal } from './components/NewProjectModal';
 import { ProjectManagementModal } from './components/ProjectManagementModal';
 import { HeaderBar, PrimaryTabNav } from './components/HeaderBar';
-import type { SectionId } from './components/SettingsDropdown';
 import { SearchFilterBar, SingleSelectDropdown } from './components/SearchFilterBar';
 import type { SettingsSectionRouterProps } from './components/SettingsSectionRouter';
 import { normalizePrimaryTab, resolvePrimaryTabTarget, type PrimaryTab } from './hooks/useUIState';
@@ -353,14 +352,6 @@ export default function App() {
     }
   }, [selectedProjectId]);
 
-  const [settingsInitialSection, setSettingsInitialSection] = useState<SectionId | null>(null);
-
-  // Clear the deep-link section once Settings closes, so a subsequent plain
-  // Settings open is not forced back to the build-config tab.
-  useEffect(() => {
-    if (!s.showSettings) setSettingsInitialSection(null);
-  }, [s.showSettings]);
-
   const zoneHealthAlerts = useMemo(() => {
     if (!s.zoneHealth) return [];
     const zones = Object.entries(s.zoneHealth);
@@ -411,8 +402,6 @@ export default function App() {
     : combinedAlerts.some(a => a.severity === 'WARNING') ? 'WARNING'
     : combinedAlerts.length > 0 ? 'INFO' : null;
 
-  const runningTasks = useMemo(() => s.tasks.filter(t => t.status === 'IN_PROGRESS' || t.status === 'PROVISIONING'), [s.tasks]);
-  const queuedTasks = useMemo(() => s.tasks.filter(t => t.status === 'QUEUED'), [s.tasks]);
   const strategicReadModel = useStrategicReadModel(s.selectedProjectId);
   useEffect(() => {
     refreshStrategicReadModelRef.current = () => {
@@ -725,6 +714,7 @@ export default function App() {
   useEffect(() => {
     setHealthCheckUrlsInput(s.healthCheckUrls.join('\n'));
   }, [s.healthCheckUrls]);
+  const ignoreEmbeddedSettingsClose = useCallback(() => {}, []);
   const settingsRouterProps: Omit<SettingsSectionRouterProps, 'activeSection'> = {
     isAdmin: s.userRole === 'admin',
     onNavigateToSection: (section) => {
@@ -734,7 +724,7 @@ export default function App() {
       }
     },
     closeOnExternalPanelOpen: false,
-    onToggleSettings: s.handleToggleSettings,
+    onToggleSettings: ignoreEmbeddedSettingsClose,
     allModelOptions,
     healthCheckUrlsInput,
     onHealthCheckUrlsInputChange: setHealthCheckUrlsInput,
@@ -912,9 +902,16 @@ export default function App() {
     handleTabChange('runtime');
   }, [handleTabChange]);
 
+  const openRuntimeSettings = useCallback((section: RuntimeSettingsSection = 'general') => {
+    void s.refreshSettings();
+    setRuntimeSection('settings');
+    setRuntimeConfigSection(section);
+    handleTabChange('runtime');
+    setCommandPaletteOpen(false);
+  }, [handleTabChange, s, setCommandPaletteOpen]);
+
   const openProjectManageWorkspace = useCallback((section: ProjectManageSection, projectId?: string) => {
     if (projectId && projectId !== s.selectedProjectId) s.setSelectedProjectId(projectId);
-    if (s.showSettings) s.handleToggleSettings();
     setProjectSection('manage');
     setProjectManageSection(section);
     handleTabChange('project');
@@ -992,15 +989,6 @@ export default function App() {
     s.setActiveTab('chat');
   }, [s, setStrategicInteractionMode]);
 
-  const openGlobalSettings = useCallback((section: SectionId | null = null) => {
-    setSettingsInitialSection(section);
-    if (!s.showSettings) s.handleToggleSettings();
-    setCommandPaletteOpen(false);
-  }, [s, setCommandPaletteOpen]);
-  const closeGlobalSettings = useCallback(() => {
-    if (s.showSettings) s.handleToggleSettings();
-  }, [s]);
-
   const workbenchCommands = useWorkbenchCommands({
     selectedProjectId: s.selectedProjectId,
     selectedProjectRepoLabel,
@@ -1038,8 +1026,7 @@ export default function App() {
     setShowResearchBrowser: s.setShowResearchBrowser,
     setShowKnowledgeBrowser: s.setShowKnowledgeBrowser,
     openNewTaskModal: s.openNewTaskModal,
-    openGlobalSettings,
-    closeGlobalSettings,
+    refreshSettings: s.refreshSettings,
     refreshWorkbench: () => {
       void s.fetchTasks();
       void strategicReadModel.refresh();
@@ -1067,7 +1054,7 @@ export default function App() {
     blockingModalOpen: operatorShortcutBlocked,
     commandPaletteShortcutBlocked: modalShortcutBlocked,
     commandPaletteOpen, commands: workbenchCommands, searchInputRef,
-    searchShortcutBlocked: Boolean(s.showNewTaskModal || s.logTask || s.showResearchBrowser || s.showSettings),
+    searchShortcutBlocked: Boolean(s.showNewTaskModal || s.logTask || s.showResearchBrowser),
     selectedTaskCount: s.selectedTaskIds.size, selectionMode: s.selectionMode, setCommandPaletteOpen,
     setKnowledgeBrowserDirectionId,
     setKnowledgeBrowserInitialDocId,
@@ -1076,7 +1063,6 @@ export default function App() {
     setShowAlertsPopover: s.setShowAlertsPopover,
     setShowKnowledgeBrowser: s.setShowKnowledgeBrowser,
     setShowResearchBrowser: s.setShowResearchBrowser,
-    showSettings: s.showSettings, toggleSettings: s.handleToggleSettings,
   });
 
   const pipelineSurfaceActions = (
@@ -1273,30 +1259,7 @@ export default function App() {
       )}
       <HeaderBar
         tasks={s.tasks}
-        runningTasks={runningTasks}
-        queuedTasks={queuedTasks}
-        globalActiveCount={s.globalActiveCount}
-        globalEvaluatingCount={s.globalEvaluatingCount}
-        globalQueuedCount={s.globalQueuedCount}
-        maxConcurrentVMs={s.maxConcurrentVMs}
-        lastRefresh={s.lastRefresh}
         onRefresh={s.fetchTasks}
-        viewMode={s.viewMode}
-        defaultTaskType={s.defaultTaskType}
-        onUpdateDefaultTaskType={s.setDefaultTaskType}
-        notifyOnComplete={s.notifyOnComplete}
-        onUpdateNotifyOnComplete={s.setNotifyOnComplete}
-        notifyOnFail={s.notifyOnFail}
-        onUpdateNotifyOnFail={s.setNotifyOnFail}
-        notifyOnApprovalNeeded={s.notifyOnApprovalNeeded}
-        onUpdateNotifyOnApprovalNeeded={s.setNotifyOnApprovalNeeded}
-        soundOnComplete={s.soundOnComplete}
-        onUpdateSoundOnComplete={s.setSoundOnComplete}
-        notifyOnHighSignalMessage={s.notifyOnHighSignalMessage}
-        onUpdateNotifyOnHighSignalMessage={s.setNotifyOnHighSignalMessage}
-        onSetViewMode={(mode) => {
-          s.setViewMode(mode);
-        }}
         showResearchBrowser={s.showResearchBrowser}
         onToggleResearchBrowser={() => s.setShowResearchBrowser(prev => !prev)}
         showKnowledgeBrowser={s.showKnowledgeBrowser}
@@ -1310,147 +1273,17 @@ export default function App() {
         newSinceLastVisitCount={newSinceLastVisit}
         needsAttentionCount={pipelineAttentionCount}
         onOpenNewTaskModal={s.openNewTaskModal}
+        onOpenSettings={() => openRuntimeSettings('general')}
         onNewProject={() => setShowNewProjectModal(true)}
         onManageProjects={() => setShowProjectManagement(true)}
         onSignOut={() => signOut(auth)}
         userEmail={s.user.email || ''}
         wsRef={s.wsRef}
-        showSettings={s.showSettings}
-        onToggleSettings={s.handleToggleSettings}
-        settingsRef={s.settingsRef}
-        settingsInitialSection={settingsInitialSection}
-        maxRetries={s.maxRetries}
-        maxAutonomousTasksPerHour={s.maxAutonomousTasksPerHour}
-        maxGlobalAutonomousTasksPerHour={s.maxGlobalAutonomousTasksPerHour}
-        onUpdateMaxGlobalAutonomousRate={s.updateMaxGlobalAutonomousRate}
-        maxPipelineSlots={s.maxPipelineSlots}
-        onUpdateMaxPipelineSlots={s.updateMaxPipelineSlots}
-        reservedSlotsForTypes={s.reservedSlotsForTypes}
-        onUpdateReservedSlotsForTypes={s.updateReservedSlotsForTypes}
-        evaluatingPipelineTimeoutMinutes={s.evaluatingPipelineTimeoutMinutes}
-        onUpdateEvaluatingPipelineTimeout={s.updateEvaluatingPipelineTimeout}
-        evaluatingFailHours={s.evaluatingFailHours}
-        onUpdateEvaluatingFailHours={s.updateEvaluatingFailHours}
-        ciBackstopTimeoutMinutes={s.ciBackstopTimeoutMinutes}
-        onUpdateCiBackstopTimeout={s.updateCiBackstopTimeout}
-        requireApprovalGates={s.requireApprovalGates}
-        autoArchiveEnabled={s.autoArchiveEnabled}
-        autoArchiveTerminalAfterDays={s.autoArchiveTerminalAfterDays}
-        autoArchiveMaxTerminalTasksPerProject={s.autoArchiveMaxTerminalTasksPerProject}
-        autoArchiveIntervalMinutes={s.autoArchiveIntervalMinutes}
-        onUpdateAutoArchiveEnabled={s.updateAutoArchiveEnabled}
-        onUpdateAutoArchiveTerminalAfterDays={s.updateAutoArchiveTerminalAfterDays}
-        onUpdateAutoArchiveMaxTerminalTasksPerProject={s.updateAutoArchiveMaxTerminalTasksPerProject}
-        onUpdateAutoArchiveIntervalMinutes={s.updateAutoArchiveIntervalMinutes}
-        onUpdateMaxVMs={s.updateMaxVMs}
-        onUpdateMaxRetries={s.updateMaxRetries}
-        onUpdateRequireApprovalGates={s.updateRequireApprovalGates}
-        onUpdateMaxAutonomousRate={s.handleUpdateMaxAutonomousRate}
-        autonomousResearchIntervalMinutes={s.autonomousResearchIntervalMinutes}
-        onUpdateAutonomousResearchInterval={s.handleUpdateAutonomousResearchInterval}
-        directionCooldownMinutes={s.directionCooldownMinutes}
-        onUpdateDirectionCooldownMinutes={s.handleUpdateDirectionCooldownMinutes}
-        strategicResearchFrequency={s.strategicResearchFrequency}
-        onUpdateStrategicResearchFrequency={s.handleUpdateStrategicResearchFrequency}
-        healthCheckUrls={s.healthCheckUrls}
-        onUpdateHealthCheckUrls={s.updateHealthCheckUrls}
-        githubAccount={s.githubAccount}
-        onConnectGitHub={s.connectGitHub}
-        maxPlanAccounts={s.maxPlanAccounts}
-        onToggleAccount={s.toggleMaxPlanAccount}
-        onRemoveAccount={s.removeMaxPlanAccount}
-        onResetRateLimits={s.resetAccountRateLimits}
-        onRefreshAccountModels={s.refreshAccountModels}
-        onUpdateAccount={s.updateMaxPlanAccount}
-        newAccountName={s.newAccountName}
-        setNewAccountName={s.setNewAccountName}
-        newAccountProvider={s.newAccountProvider}
-        setNewAccountProvider={s.setNewAccountProvider}
-        newAccountAuthMode={s.newAccountAuthMode}
-        setNewAccountAuthMode={s.setNewAccountAuthMode}
-        newAccountToken={s.newAccountToken}
-        setNewAccountToken={s.setNewAccountToken}
-        newAccountProviderMetadata={s.newAccountProviderMetadata}
-        setNewAccountProviderMetadata={s.setNewAccountProviderMetadata}
-        newAccountClaudeConfigJson={s.newAccountClaudeConfigJson}
-        setNewAccountClaudeConfigJson={s.setNewAccountClaudeConfigJson}
-        newAccountDailyTaskCap={s.newAccountDailyTaskCap}
-        setNewAccountDailyTaskCap={s.setNewAccountDailyTaskCap}
-        newAccountMaxConcurrentTasks={s.newAccountMaxConcurrentTasks}
-        setNewAccountMaxConcurrentTasks={s.setNewAccountMaxConcurrentTasks}
-        newAccountAutoDisableAfterRateLimits={s.newAccountAutoDisableAfterRateLimits}
-        setNewAccountAutoDisableAfterRateLimits={s.setNewAccountAutoDisableAfterRateLimits}
-        onAddAccount={s.addMaxPlanAccount}
-        onUpdateAccountCaps={s.updateAccountCaps}
-        providerTierModelMap={s.providerTierModelMap}
-        taskTypeModelPreferences={s.taskTypeModelPreferences}
-        providers={s.providers}
-        providerSettingsDefaults={s.providerSettingsDefaults}
-        taskTypeProviderOverrides={s.taskTypeProviderOverrides}
-        onUpdateProviderSettingsDefaults={s.updateProviderSettingsDefaults}
-        onUpdateTaskTypeProviderOverrides={s.updateTaskTypeProviderOverrides}
-        providerSelectionMode={s.providerSelectionMode}
-        onUpdateProviderSelectionMode={s.updateProviderSelectionMode}
-        taskTypeCategories={s.taskTypeCategories}
-        onUpdateTaskTypeCategories={s.updateTaskTypeCategories}
-        categoryRouting={s.categoryRouting}
-        onUpdateCategoryRouting={s.updateCategoryRouting}
-        taskTypeRouting={s.taskTypeRouting}
-        onUpdateTaskTypeRouting={s.updateTaskTypeRouting}
-        providerSettingsByEffort={s.providerSettingsByEffort}
-        onUpdateProviderSettingsByEffort={s.updateProviderSettingsByEffort}
-        refreshInterval={s.refreshInterval}
-        onUpdateRefreshInterval={s.setRefreshInterval}
-        pageSize={s.limit}
-        onUpdatePageSize={s.setLimit}
         apiHealthy={s.apiHealthy}
         wsConnected={s.wsConnected}
         lastFetchTime={s.lastFetchTime}
-        onRestartOrchestrator={s.handleRestartOrchestrator}
-        anyAutonomousEnabled={s.projects.some(p => p.autonomous_enabled)}
-        onPauseAllAutonomous={s.handlePauseAllAutonomous}
         deployState={s.deployState}
-        onPausePipeline={s.handlePausePipeline}
-        onResumePipeline={s.handleResumePipeline}
-        onResetHealth={s.handleResetHealth}
-        onRollback={s.handleRollback}
-        onMarkStable={s.handleMarkStable}
-        onRepairState={s.handleRepairState}
-        failedRollback={s.failedRollback}
-        zoneHealth={s.zoneHealth}
-        showUserManagement={s.showUserManagement}
-        onToggleUserManagement={() => s.setShowUserManagement(prev => !prev)}
-        showProjectMembers={showProjectMembers}
-        onToggleProjectMembers={() => setShowProjectMembers(prev => !prev)}
-        selectedProjectMyRole={selectedProject?.my_role ?? null}
-        userRole={s.userRole}
-        notificationConfig={s.notificationConfig}
-        onUpdateNotificationConfig={s.updateNotificationConfig}
-        dailyCostCeilingUsd={s.dailyCostCeilingUsd}
-        onUpdateDailyCostCeiling={s.updateDailyCostCeiling}
         selectedProjectId={s.selectedProjectId}
-        selectedProjectOwner={selectedProject?.github_owner ?? null}
-        selectedProjectRepo={selectedProject?.github_repo ?? null}
-        selectedProjectIsSelfRepo={selectedProject?.is_self_repo ?? false}
-        selectedProjectRole={selectedProject?.my_role ?? null}
-        buildConfig={s.buildConfig}
-        onUpdateBuildConfig={s.handleUpdateBuildConfig}
-        onDetectBuildConfig={s.handleDetectBuildConfig}
-        autoRemediationConfig={s.autoRemediationConfig}
-        autoRemediationStats={s.autoRemediationStats}
-        onUpdateAutoRemediationConfig={s.handleUpdateAutoRemediationConfig}
-        issueImplementationConfig={s.issueImplementationConfig}
-        onUpdateIssueImplementationConfig={s.handleUpdateIssueImplementationConfig}
-        autoReviewConfig={s.autoReviewConfig}
-        onUpdateAutoReviewConfig={s.handleUpdateAutoReviewConfig}
-        resourceEnvelopeData={s.resourceEnvelopeData}
-        resourceEnvelopeLoading={s.resourceEnvelopeLoading}
-        resourceEnvelopeError={s.resourceEnvelopeError}
-        onUpdateResourceEnvelope={s.handleUpdateResourceEnvelope}
-        integrationBranchData={s.integrationBranchData}
-        onUpdateIntegrationBranch={s.handleUpdateIntegrationBranch}
-        promotionTargetData={s.promotionTargetData}
-        onUpdatePromotionTarget={s.handleUpdatePromotionTarget}
         projects={s.projects}
         onSelectProject={s.setSelectedProjectId}
         activeTab={activeTab}

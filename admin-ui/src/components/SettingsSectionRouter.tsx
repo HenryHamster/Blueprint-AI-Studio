@@ -42,17 +42,17 @@ import type {
   TaskTypeProviderOverrides,
   TaskTypeRoutingEntry,
 } from '../types/settings';
-import type { SectionId } from './SettingsDropdown';
+import type { SectionId } from './settingsSections';
 
 /**
  * Props consumed by {@link SettingsSectionRouter}. These are exactly the
  * section-specific props that were previously threaded through every
- * `renderXxx()` helper inside `SettingsDropdown`. Extracting them here keeps
- * the dropdown's own surface limited to the modal shell + navigation state.
+ * `renderXxx()` helper inside the retired settings modal. Keeping them here
+ * lets Runtime and Project host the settings bodies directly.
  *
  * The shape is intentionally identical (same names, same types) to the
- * corresponding slice of `SettingsDropdownProps` so the behavior is preserved
- * exactly — the router just dispatches on `activeSection`.
+ * corresponding settings section props so the behavior is preserved exactly —
+ * the router just dispatches on `activeSection`.
  */
 export interface SettingsSectionRouterProps {
   activeSection: SectionId;
@@ -241,10 +241,9 @@ export interface SettingsSectionRouterProps {
 /**
  * Renders the body of the currently-active settings section.
  *
- * This was extracted verbatim from the `renderXxx()` helpers that previously
- * lived inside `SettingsDropdown`; each section delegates to its own focused
- * sub-component. Behavior is unchanged — only the location of the dispatch
- * moved, isolating the section-routing concern from the modal chrome.
+ * This was extracted from the `renderXxx()` helpers that previously lived
+ * inside the settings modal; each section delegates to its own focused
+ * sub-component. Runtime and Project now provide the surrounding navigation.
  */
 export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
   const closeExternalPanelHost = () => {

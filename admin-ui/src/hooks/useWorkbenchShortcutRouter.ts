@@ -10,7 +10,7 @@ export const WORKBENCH_SHORTCUT_COMMAND_ID_BY_KEY: Readonly<Record<string, strin
   a: 'pipeline.archive',
   n: 'task.new',
   r: 'workbench.refresh',
-  s: 'settings.general',
+  s: 'runtime.settings.general',
 };
 
 interface UseWorkbenchShortcutRouterOptions {

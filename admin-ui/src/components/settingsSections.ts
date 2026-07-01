@@ -1,0 +1,17 @@
+export type SectionId =
+  | 'general'
+  | 'provider-routing'
+  | 'provider-settings'
+  | 'orchestrator'
+  | 'deploy'
+  | 'accounts'
+  | 'notifications'
+  | 'advanced'
+  | 'build-config'
+  | 'alert-domains'
+  | 'auto-remediation'
+  | 'issue-implementation'
+  | 'auto-review'
+  | 'resource-envelope'
+  | 'branches'
+  | 'access';

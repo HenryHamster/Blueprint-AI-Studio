@@ -172,7 +172,7 @@ describe('useWorkbenchShortcutRouter', () => {
 
     expect(commands.find(command => command.id === 'task.new')?.run).not.toHaveBeenCalled();
     expect(commands.find(command => command.id === 'workbench.refresh')?.run).not.toHaveBeenCalled();
-    expect(commands.find(command => command.id === 'settings.general')?.run).not.toHaveBeenCalled();
+    expect(commands.find(command => command.id === 'runtime.settings.general')?.run).not.toHaveBeenCalled();
     expect(commands.find(command => command.id === 'pipeline.archive')?.run).not.toHaveBeenCalled();
     expect(inputEvent.defaultPrevented).toBe(false);
     expect(textareaEvent.defaultPrevented).toBe(false);
@@ -189,6 +189,6 @@ describe('useWorkbenchShortcutRouter', () => {
     dispatchShortcut('s', { metaKey: true });
 
     expect(commands.find(command => command.id === 'workbench.refresh')?.run).not.toHaveBeenCalled();
-    expect(commands.find(command => command.id === 'settings.general')?.run).not.toHaveBeenCalled();
+    expect(commands.find(command => command.id === 'runtime.settings.general')?.run).not.toHaveBeenCalled();
   });
 });

@@ -12,7 +12,7 @@ import {
   type LucideIcon,
 } from 'lucide-react';
 import type { DirectionsTab } from './DirectionsPanelHeader';
-import type { SectionId } from './SettingsDropdown';
+import type { SectionId } from './settingsSections';
 
 export type ProjectSection = DirectionsTab | 'manage';
 export type ProjectManageSection =

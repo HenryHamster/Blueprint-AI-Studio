@@ -106,11 +106,9 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
     showFleetDetail, setShowFleetDetail,
     showAlertsPopover, setShowAlertsPopover,
-    showSettings, setShowSettings,
     showDirections, setShowDirections,
     showMetrics, setShowMetrics,
     showUserManagement, setShowUserManagement,
-    settingsRef,
     selectionMode, setSelectionMode, selectedTaskIds, setSelectedTaskIds,
     toggleSelectionMode, toggleTaskSelection, bulkColumnToggle, shiftSelectRange,
     confirmDialog, setConfirmDialog,
@@ -412,7 +410,6 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
         if (showResearchBrowser) { setShowResearchBrowser(false); return; }
         if (showActivityFeed) { setShowActivityFeed(false); return; }
         if (showArchive) { setShowArchive(false); return; }
-        if (showSettings) { setShowSettings(false); return; }
         return;
       }
 
@@ -465,7 +462,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showArchive, showSettings, selectionMode, selectedTaskIds, tasks]);
+  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showArchive, selectionMode, selectedTaskIds, tasks]);
 
   // ── Cross-domain glue handlers ────────────────────────────────────────────
 
@@ -484,17 +481,12 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
     }
   };
 
-  const handleToggleSettings = () => {
-    setShowSettings(prev => {
-      if (!prev) {
-        fetchSettings();
-        // Refresh the authoritative roster every time the panel opens so a
-        // just-added/edited account is always present (fixes "new accounts
-        // don't appear") without waiting on the heavy settings payload.
-        fetchMaxPlanAccounts();
-      }
-      return !prev;
-    });
+  const refreshSettings = () => {
+    fetchSettings();
+    // Refresh the authoritative roster every time settings are entered so a
+    // just-added/edited account is always present without waiting on the heavy
+    // settings payload.
+    fetchMaxPlanAccounts();
   };
 
   const handleUpdateBuildConfig = async (config: import('./types/project').BuildConfig) => {
@@ -592,7 +584,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
     soundOnComplete, setSoundOnComplete,
     notifyOnHighSignalMessage, setNotifyOnHighSignalMessage,
     // Settings
-    showSettings, settingsRef, handleToggleSettings,
+    refreshSettings,
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour, usingMaxPlan,
     autonomousResearchIntervalMinutes, directionCooldownMinutes, strategicResearchFrequency,
     maxGlobalAutonomousTasksPerHour, maxPipelineSlots, reservedSlotsForTypes,

@@ -2,7 +2,6 @@ import { useMemo, useState } from 'react';
 import type { WorkbenchCommand } from '../components/CommandPalette';
 import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from '../components/OperatorWorkspaces';
 import type { StrategicInteractionMode } from '../components/StrategicSessionControl';
-import type { SectionId } from '../components/SettingsDropdown';
 import { executeStrategicWorkSessionCommand } from '../strategicStateApi';
 import type {
   StrategicContextArtifactEvidence,
@@ -71,7 +70,7 @@ interface UseWorkbenchCommandsOptions {
   setCommandPaletteOpen: (open: boolean) => void;
   setPipelineSection: (section: PipelineSection) => void;
   setProjectSection: (section: ProjectSection) => void;
-  setProjectManageSection?: (section: ProjectManageSection) => void;
+  setProjectManageSection: (section: ProjectManageSection) => void;
   setRuntimeSection: (section: RuntimeSection) => void;
   setRuntimeConfigSection: (section: RuntimeSettingsSection) => void;
   setViewMode: (mode: ViewMode) => void;
@@ -80,8 +79,7 @@ interface UseWorkbenchCommandsOptions {
   setShowResearchBrowser: (show: boolean) => void;
   setShowKnowledgeBrowser: (show: boolean) => void;
   openNewTaskModal: () => void;
-  openGlobalSettings: (section: SectionId | null) => void;
-  closeGlobalSettings?: () => void;
+  refreshSettings: () => void;
   refreshWorkbench: () => void;
   openProjectManagement: () => void;
   openProjectMembers: () => void;
@@ -478,8 +476,7 @@ export function useWorkbenchCommands({
   setShowResearchBrowser,
   setShowKnowledgeBrowser,
   openNewTaskModal,
-  openGlobalSettings,
-  closeGlobalSettings,
+  refreshSettings,
   refreshWorkbench,
   openProjectManagement,
   openProjectMembers,
@@ -500,26 +497,20 @@ export function useWorkbenchCommands({
     };
     const openProjectManageSection = (section: ProjectManageSection) => {
       setProjectSection('manage');
-      setProjectManageSection?.(section);
+      setProjectManageSection(section);
       handleTabChange('project');
-      if (setProjectManageSection) {
-        closeGlobalSettings?.();
-      } else if (section !== 'overview') {
-        openGlobalSettings(section);
-      }
       closePalette();
     };
     const openRuntimeSection = (section: RuntimeSection) => {
       setRuntimeSection(section);
       handleTabChange('runtime');
-      closeGlobalSettings?.();
       closePalette();
     };
     const openRuntimeSettingsSection = (section: RuntimeSettingsSection) => {
+      refreshSettings();
       setRuntimeSection('settings');
       setRuntimeConfigSection(section);
       handleTabChange('runtime');
-      closeGlobalSettings?.();
       closePalette();
     };
     const openPipelineSection = (section: PipelineSection) => {
@@ -1393,10 +1384,11 @@ export function useWorkbenchCommands({
       },
       {
         id: 'runtime.settings.general',
-        label: 'Runtime general settings',
+        label: 'Runtime settings',
         section: 'Runtime',
         detail: 'Defaults, refresh, and local UI behavior',
         keywords: ['settings', 'runtime', 'general', 'defaults', 'refresh', 'local'],
+        shortcut: 'S',
         run: () => openRuntimeSettingsSection('general'),
       },
       {
@@ -1490,19 +1482,9 @@ export function useWorkbenchCommands({
           closePalette();
         },
       },
-      {
-        id: 'settings.general',
-        label: 'Workbench settings',
-        section: 'Workbench',
-        detail: 'UI defaults and controls',
-        keywords: ['settings', 'preferences', 'config', 'workbench'],
-        shortcut: 'S',
-        run: () => runAndClose(() => openGlobalSettings('general')),
-      },
     ];
   }, [
     apiHealthy,
-    closeGlobalSettings,
     designRevision,
     directionsCount,
     filteredTaskCount,
@@ -1514,11 +1496,11 @@ export function useWorkbenchCommands({
     openStrategicContextWorkspace,
     openStrategicContextTarget,
     openStrategicMessageTarget,
-    openGlobalSettings,
     openNewTaskModal,
     openProjectManagement,
     openProjectMembers,
     problemModelRevision,
+    refreshSettings,
     refreshWorkbench,
     savingStrategicWorkbench,
     checkingInStrategicSession,

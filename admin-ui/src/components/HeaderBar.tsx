@@ -1,30 +1,18 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Microscope, BookOpen, MoreHorizontal, Settings, Bell, Plus } from 'lucide-react';
+import { Activity, Microscope, BookOpen, LogOut, MoreHorizontal, Settings, Bell, Plus } from 'lucide-react';
 import { AutonomousStatus } from './AutonomousStatus';
-import { SettingsDropdown, type MaxPlanAccount, type SectionId } from './SettingsDropdown';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
 import type { DetailedHealth, PipelineThrottle } from './OrchestratorHealthBar';
 import { ProjectSwitcherDropdown } from './ProjectSwitcherDropdown';
-import type { AccountMutationReturn, AccountUpdatePayload, AuthMode, CategoryRoutingEntry, DeployState, FailedRollbackInfo, ModelPreference, OrchestratorHealth, ProviderCatalogEntry, ProviderName, ProviderSettingsByEffort, ProviderSettingsDefaults, TaskTypeProviderOverrides, TaskTypeRoutingEntry } from '../types/settings';
+import type { DeployState, OrchestratorHealth } from '../types/settings';
 import type { Task } from '../types/task';
-import type { BuildConfig, AutoRemediationConfig, AutoRemediationStats, IssueImplementationConfig, IssueImplementationConfigUpdate, AutoReviewConfig, ProjectResourceEnvelopeResponse, ResourceEnvelopeConfig, Project } from '../types/project';
-import type { UserLaunchableTaskType } from '../taskCapabilities';
-import type { ViewMode } from '../hooks/useViewPreferences';
+import type { Project } from '../types/project';
 import type { PrimaryTab } from '../hooks/useUIState';
 
 export interface HeaderBarProps {
   tasks: Task[];
-  runningTasks: Task[];
-  queuedTasks: Task[];
-  globalActiveCount: number;
-  globalEvaluatingCount: number;
-  globalQueuedCount: number;
-  maxConcurrentVMs: number;
-  lastRefresh: Date | null;
   onRefresh: () => void;
-  viewMode: ViewMode;
-  onSetViewMode: (mode: ViewMode) => void;
   showResearchBrowser: boolean;
   onToggleResearchBrowser: () => void;
   showKnowledgeBrowser: boolean;
@@ -38,175 +26,21 @@ export interface HeaderBarProps {
   showAlertsPopover?: boolean;
   onToggleAlertsPopover?: () => void;
   onOpenNewTaskModal: () => void;
+  onOpenSettings: () => void;
   onSignOut: () => void;
   onNewProject?: () => void;
   userEmail: string;
   wsRef: RefObject<WebSocket | null>;
-  // SettingsDropdown props
-  showSettings: boolean;
-  onToggleSettings: () => void;
-  settingsRef: RefObject<HTMLDivElement | null>;
-  settingsInitialSection?: SectionId | null;
-  defaultTaskType: UserLaunchableTaskType;
-  onUpdateDefaultTaskType: (value: UserLaunchableTaskType) => void;
-  notifyOnComplete: boolean;
-  onUpdateNotifyOnComplete: (value: boolean) => void;
-  notifyOnFail: boolean;
-  onUpdateNotifyOnFail: (value: boolean) => void;
-  notifyOnApprovalNeeded: boolean;
-  onUpdateNotifyOnApprovalNeeded: (value: boolean) => void;
-  soundOnComplete: boolean;
-  onUpdateSoundOnComplete: (value: boolean) => void;
-  notifyOnHighSignalMessage: boolean;
-  onUpdateNotifyOnHighSignalMessage: (value: boolean) => void;
-  maxRetries: number;
-  maxAutonomousTasksPerHour: number;
-  maxGlobalAutonomousTasksPerHour: number;
-  onUpdateMaxGlobalAutonomousRate: (value: number) => void;
-  maxPipelineSlots: number;
-  onUpdateMaxPipelineSlots: (value: number) => void;
-  reservedSlotsForTypes: Record<string, number>;
-  onUpdateReservedSlotsForTypes: (value: Record<string, number>) => void;
-  evaluatingPipelineTimeoutMinutes: number;
-  onUpdateEvaluatingPipelineTimeout: (value: number) => void;
-  evaluatingFailHours: number;
-  onUpdateEvaluatingFailHours: (value: number) => void;
-  ciBackstopTimeoutMinutes: number;
-  onUpdateCiBackstopTimeout: (value: number) => void;
-  requireApprovalGates: boolean;
-  autoArchiveEnabled: boolean;
-  autoArchiveTerminalAfterDays: number;
-  autoArchiveMaxTerminalTasksPerProject: number;
-  autoArchiveIntervalMinutes: number;
-  onUpdateAutoArchiveEnabled: (value: boolean) => void;
-  onUpdateAutoArchiveTerminalAfterDays: (value: number) => void;
-  onUpdateAutoArchiveMaxTerminalTasksPerProject: (value: number) => void;
-  onUpdateAutoArchiveIntervalMinutes: (value: number) => void;
-  onUpdateMaxVMs: (value: number) => void;
-  onUpdateRequireApprovalGates: (value: boolean) => void;
-  onUpdateMaxRetries: (value: number) => void;
-  onUpdateMaxAutonomousRate: (value: number) => void;
-  autonomousResearchIntervalMinutes: number;
-  onUpdateAutonomousResearchInterval: (value: number) => void;
-  directionCooldownMinutes: number;
-  onUpdateDirectionCooldownMinutes: (value: number) => void;
-  strategicResearchFrequency: number;
-  onUpdateStrategicResearchFrequency: (value: number) => void;
-  healthCheckUrls: string[];
-  onUpdateHealthCheckUrls: (urls: string[]) => void;
-  githubAccount: string | null;
-  onConnectGitHub: () => void;
-  maxPlanAccounts: MaxPlanAccount[];
-  onToggleAccount: (id: string, enabled: boolean) => void;
-  onRemoveAccount: (id: string, force?: boolean) => AccountMutationReturn;
-  onResetRateLimits: (id: string) => void;
-  onRefreshAccountModels: (id: string) => void;
-  onUpdateAccount: (id: string, payload: AccountUpdatePayload) => AccountMutationReturn;
-  newAccountName: string;
-  setNewAccountName: (value: string) => void;
-  newAccountProvider: ProviderName;
-  setNewAccountProvider: (value: ProviderName) => void;
-  newAccountAuthMode: AuthMode;
-  setNewAccountAuthMode: (value: AuthMode) => void;
-  newAccountToken: string;
-  setNewAccountToken: (value: string) => void;
-  newAccountProviderMetadata: Record<string, string>;
-  setNewAccountProviderMetadata: (value: Record<string, string>) => void;
-  newAccountClaudeConfigJson: string;
-  setNewAccountClaudeConfigJson: (value: string) => void;
-  newAccountDailyTaskCap: number | null;
-  setNewAccountDailyTaskCap: (value: number | null) => void;
-  newAccountMaxConcurrentTasks: number | null;
-  setNewAccountMaxConcurrentTasks: (value: number | null) => void;
-  newAccountAutoDisableAfterRateLimits: number | null;
-  setNewAccountAutoDisableAfterRateLimits: (value: number | null) => void;
-  onAddAccount: () => void;
-  onUpdateAccountCaps: (id: string, caps: { daily_task_cap?: number | null; max_concurrent_tasks?: number | null; auto_disable_after_rate_limits?: number | null }) => void;
-  providerTierModelMap: Record<string, Record<string, string>>;
-  taskTypeModelPreferences: Record<string, ModelPreference[]>;
-  providers: Record<string, ProviderCatalogEntry>;
-  providerSettingsDefaults: ProviderSettingsDefaults;
-  taskTypeProviderOverrides: TaskTypeProviderOverrides;
-  onUpdateProviderSettingsDefaults: (value: ProviderSettingsDefaults) => Promise<void>;
-  onUpdateTaskTypeProviderOverrides: (value: TaskTypeProviderOverrides) => Promise<void>;
-  providerSelectionMode: 'balanced' | 'preferred' | 'exclusive';
-  onUpdateProviderSelectionMode: (mode: 'balanced' | 'preferred' | 'exclusive') => Promise<void>;
-  taskTypeCategories: Record<string, string[]>;
-  onUpdateTaskTypeCategories: (value: Record<string, string[]>) => Promise<void>;
-  categoryRouting: Record<string, CategoryRoutingEntry>;
-  onUpdateCategoryRouting: (value: Record<string, CategoryRoutingEntry>) => Promise<void>;
-  taskTypeRouting: Record<string, TaskTypeRoutingEntry>;
-  onUpdateTaskTypeRouting: (value: Record<string, TaskTypeRoutingEntry>) => Promise<void>;
-  providerSettingsByEffort: ProviderSettingsByEffort;
-  onUpdateProviderSettingsByEffort: (value: ProviderSettingsByEffort) => Promise<void>;
-  refreshInterval: number;
-  onUpdateRefreshInterval: (value: number) => void;
-  pageSize: number;
-  onUpdatePageSize: (value: number) => void;
   apiHealthy: boolean;
   wsConnected: boolean;
   lastFetchTime: number;
-  onRestartOrchestrator: () => Promise<void>;
-  anyAutonomousEnabled: boolean;
-  onPauseAllAutonomous: () => Promise<void>;
-  // Deploy state
   deployState: DeployState | null;
-  onPausePipeline: () => Promise<void>;
-  onResumePipeline: () => Promise<void>;
-  onResetHealth: () => Promise<void>;
-  onRollback: () => Promise<void>;
-  onMarkStable: () => Promise<void>;
-  onRepairState: () => Promise<void>;
-  // Standing client-side signal that the last manual rollback failed (the
-  // backend returned status='rollback_failed' and left state untouched). Null
-  // when there is no outstanding failed rollback. Threaded to the deploy panel
-  // so the affordance outlives the transient error toast.
-  failedRollback: FailedRollbackInfo | null;
-  zoneHealth: Record<string, { status: string; last_success: string | null; last_failure: string | null; last_failure_reason: string | null; consecutive_failures: number; cooldown_active: boolean }> | null;
-  showUserManagement: boolean;
-  onToggleUserManagement: () => void;
-  showProjectMembers: boolean;
-  onToggleProjectMembers: () => void;
-  selectedProjectMyRole: string | null;
-  userRole: 'admin' | 'user' | null;
-  notificationConfig: import('./SettingsNotificationsSection').NotificationConfig;
-  onUpdateNotificationConfig: (config: Partial<import('./SettingsNotificationsSection').NotificationConfig>) => void;
-  dailyCostCeilingUsd: number;
-  onUpdateDailyCostCeiling: (value: number) => void;
-  // Build config (project-scoped)
   selectedProjectId: string | null;
-  selectedProjectOwner: string | null;
-  selectedProjectRepo: string | null;
-  selectedProjectIsSelfRepo?: boolean;
-  selectedProjectRole?: 'owner' | 'member' | 'viewer' | null;
-  buildConfig: BuildConfig | null;
-  onUpdateBuildConfig: (config: BuildConfig) => Promise<void>;
-  onDetectBuildConfig: () => Promise<void>;
-  // Auto-remediation config (project-scoped)
-  autoRemediationConfig: AutoRemediationConfig | null;
-  autoRemediationStats: AutoRemediationStats | null;
-  onUpdateAutoRemediationConfig: (config: AutoRemediationConfig) => Promise<void>;
-  // Issue implementation config (project-scoped)
-  issueImplementationConfig: IssueImplementationConfig | null;
-  onUpdateIssueImplementationConfig: (config: IssueImplementationConfigUpdate) => Promise<void>;
-  autoReviewConfig: AutoReviewConfig | null;
-  onUpdateAutoReviewConfig: (patch: Partial<AutoReviewConfig>) => Promise<void>;
-  resourceEnvelopeData: ProjectResourceEnvelopeResponse | null;
-  resourceEnvelopeLoading: boolean;
-  resourceEnvelopeError: string | null;
-  onUpdateResourceEnvelope: (patch: Partial<ResourceEnvelopeConfig>) => Promise<void>;
-  integrationBranchData: { integration_branch: string; is_default: boolean } | null;
-  onUpdateIntegrationBranch: (branch: string | null) => Promise<void>;
-  promotionTargetData: { promotion_target: string; is_default: boolean } | null;
-  onUpdatePromotionTarget: (branch: string | null) => Promise<void>;
-  // Unified top bar — ProjectSwitcher
   projects: Project[];
   onSelectProject: (id: string | null) => void;
-  // Unified top bar — tab nav
   activeTab: PrimaryTab;
   onTabChange: (tab: PrimaryTab) => void;
   onOpenCommandPalette?: () => void;
-  // Unified top bar — HealthPill
   health: OrchestratorHealth | null;
   detailedHealth: DetailedHealth | null;
   pipelineThrottle?: PipelineThrottle | null;
@@ -289,123 +123,20 @@ export function PrimaryTabNav({
 export function HeaderBar(props: HeaderBarProps) {
   const {
     tasks,
-    maxConcurrentVMs,
     onRefresh,
-    viewMode,
-    onSetViewMode,
     showResearchBrowser,
     onToggleResearchBrowser,
     showKnowledgeBrowser,
     onToggleKnowledgeBrowser,
     onOpenActivityFeed,
     onOpenNewTaskModal,
+    onOpenSettings,
     openMessageCount,
     newSinceLastVisitCount,
     wsRef,
-    showSettings,
-    onToggleSettings,
-    settingsRef,
-    settingsInitialSection,
-    defaultTaskType,
-    onUpdateDefaultTaskType,
-    notifyOnComplete,
-    onUpdateNotifyOnComplete,
-    notifyOnFail,
-    onUpdateNotifyOnFail,
-    notifyOnApprovalNeeded,
-    onUpdateNotifyOnApprovalNeeded,
-    soundOnComplete,
-    onUpdateSoundOnComplete,
-    notifyOnHighSignalMessage,
-    onUpdateNotifyOnHighSignalMessage,
-    maxRetries,
-    maxAutonomousTasksPerHour,
-    maxGlobalAutonomousTasksPerHour,
-    onUpdateMaxGlobalAutonomousRate,
-    maxPipelineSlots,
-    onUpdateMaxPipelineSlots,
-    reservedSlotsForTypes,
-    onUpdateReservedSlotsForTypes,
-    evaluatingPipelineTimeoutMinutes,
-    onUpdateEvaluatingPipelineTimeout,
-    evaluatingFailHours,
-    onUpdateEvaluatingFailHours,
-    ciBackstopTimeoutMinutes,
-    onUpdateCiBackstopTimeout,
-    requireApprovalGates,
-    autoArchiveEnabled,
-    autoArchiveTerminalAfterDays,
-    autoArchiveMaxTerminalTasksPerProject,
-    autoArchiveIntervalMinutes,
-    onUpdateAutoArchiveEnabled,
-    onUpdateAutoArchiveTerminalAfterDays,
-    onUpdateAutoArchiveMaxTerminalTasksPerProject,
-    onUpdateAutoArchiveIntervalMinutes,
-    onUpdateMaxVMs,
-    onUpdateMaxRetries,
-    onUpdateRequireApprovalGates,
-    onUpdateMaxAutonomousRate,
-    autonomousResearchIntervalMinutes,
-    onUpdateAutonomousResearchInterval,
-    directionCooldownMinutes,
-    onUpdateDirectionCooldownMinutes,
-    strategicResearchFrequency,
-    onUpdateStrategicResearchFrequency,
-    githubAccount,
-    onConnectGitHub,
-    maxPlanAccounts,
-    onToggleAccount,
-    onRemoveAccount,
-    onResetRateLimits,
-    onRefreshAccountModels,
-    onUpdateAccount,
-    newAccountName,
-    setNewAccountName,
-    newAccountProvider,
-    setNewAccountProvider,
-    newAccountAuthMode,
-    setNewAccountAuthMode,
-    newAccountToken,
-    setNewAccountToken,
-    newAccountProviderMetadata,
-    setNewAccountProviderMetadata,
-    newAccountClaudeConfigJson,
-    setNewAccountClaudeConfigJson,
-    newAccountDailyTaskCap,
-    setNewAccountDailyTaskCap,
-    newAccountMaxConcurrentTasks,
-    setNewAccountMaxConcurrentTasks,
-    newAccountAutoDisableAfterRateLimits,
-    setNewAccountAutoDisableAfterRateLimits,
-    onAddAccount,
-    onUpdateAccountCaps,
-    providerTierModelMap,
-    taskTypeModelPreferences,
-    providers,
-    providerSettingsDefaults,
-    providerSelectionMode,
-    onUpdateProviderSelectionMode,
-    taskTypeCategories,
-    onUpdateTaskTypeCategories,
-    categoryRouting,
-    onUpdateCategoryRouting,
-    taskTypeRouting,
-    onUpdateTaskTypeRouting,
-    providerSettingsByEffort,
-    onUpdateProviderSettingsByEffort,
-    taskTypeProviderOverrides,
-    onUpdateProviderSettingsDefaults,
-    onUpdateTaskTypeProviderOverrides,
-    refreshInterval,
-    onUpdateRefreshInterval,
-    pageSize,
-    onUpdatePageSize,
     apiHealthy,
     wsConnected,
     lastFetchTime,
-    onRestartOrchestrator,
-    anyAutonomousEnabled,
-    onPauseAllAutonomous,
   } = props;
   const [showMobileMenu, setShowMobileMenu] = useState(false);
   const [showMobileShortcuts, setShowMobileShortcuts] = useState(false);
@@ -514,7 +245,7 @@ export function HeaderBar(props: HeaderBarProps) {
           needsAttentionCount={props.needsAttentionCount}
         />
 
-        {/* RIGHT: Icon cluster + SettingsDropdown + mobile controls + Launch Task */}
+        {/* RIGHT: Icon cluster + mobile controls + Launch Task */}
         <div className="ml-auto flex shrink-0 items-center gap-0.5">
 
           {/* Desktop icon cluster */}
@@ -599,164 +330,20 @@ export function HeaderBar(props: HeaderBarProps) {
             </button>
           </div>
 
-          {/* SettingsDropdown — always in DOM so its fixed overlay renders when triggered from mobile menu.
-              The trigger button is hidden on mobile via triggerClassName; the fixed panel bypasses parent display:none. */}
-          <SettingsDropdown
-            triggerClassName="hidden md:inline-flex h-7 w-7 items-center justify-center rounded border border-neutral-800/80 bg-[#070a0f] hover:bg-neutral-900"
-          showSettings={showSettings}
-          onToggleSettings={onToggleSettings}
-          settingsRef={settingsRef}
-          initialSection={settingsInitialSection ?? null}
-          defaultTaskType={defaultTaskType}
-          onUpdateDefaultTaskType={onUpdateDefaultTaskType}
-          viewMode={viewMode}
-          onSetViewMode={onSetViewMode}
-          notifyOnComplete={notifyOnComplete}
-          onUpdateNotifyOnComplete={onUpdateNotifyOnComplete}
-          notifyOnFail={notifyOnFail}
-          onUpdateNotifyOnFail={onUpdateNotifyOnFail}
-          notifyOnApprovalNeeded={notifyOnApprovalNeeded}
-          onUpdateNotifyOnApprovalNeeded={onUpdateNotifyOnApprovalNeeded}
-          soundOnComplete={soundOnComplete}
-          onUpdateSoundOnComplete={onUpdateSoundOnComplete}
-          notifyOnHighSignalMessage={notifyOnHighSignalMessage}
-          onUpdateNotifyOnHighSignalMessage={onUpdateNotifyOnHighSignalMessage}
-          maxConcurrentVMs={maxConcurrentVMs}
-          onUpdateMaxVMs={onUpdateMaxVMs}
-          maxRetries={maxRetries}
-          onUpdateMaxRetries={onUpdateMaxRetries}
-          requireApprovalGates={requireApprovalGates}
-          onUpdateRequireApprovalGates={onUpdateRequireApprovalGates}
-          autoArchiveEnabled={autoArchiveEnabled}
-          onUpdateAutoArchiveEnabled={onUpdateAutoArchiveEnabled}
-          autoArchiveTerminalAfterDays={autoArchiveTerminalAfterDays}
-          onUpdateAutoArchiveTerminalAfterDays={onUpdateAutoArchiveTerminalAfterDays}
-          autoArchiveMaxTerminalTasksPerProject={autoArchiveMaxTerminalTasksPerProject}
-          onUpdateAutoArchiveMaxTerminalTasksPerProject={onUpdateAutoArchiveMaxTerminalTasksPerProject}
-          autoArchiveIntervalMinutes={autoArchiveIntervalMinutes}
-          onUpdateAutoArchiveIntervalMinutes={onUpdateAutoArchiveIntervalMinutes}
-          maxAutonomousTasksPerHour={maxAutonomousTasksPerHour}
-          onUpdateMaxAutonomousRate={onUpdateMaxAutonomousRate}
-          maxGlobalAutonomousTasksPerHour={maxGlobalAutonomousTasksPerHour}
-          onUpdateMaxGlobalAutonomousRate={onUpdateMaxGlobalAutonomousRate}
-          maxPipelineSlots={maxPipelineSlots}
-          onUpdateMaxPipelineSlots={onUpdateMaxPipelineSlots}
-          reservedSlotsForTypes={reservedSlotsForTypes}
-          onUpdateReservedSlotsForTypes={onUpdateReservedSlotsForTypes}
-          evaluatingPipelineTimeoutMinutes={evaluatingPipelineTimeoutMinutes}
-          onUpdateEvaluatingPipelineTimeout={onUpdateEvaluatingPipelineTimeout}
-          evaluatingFailHours={evaluatingFailHours}
-          onUpdateEvaluatingFailHours={onUpdateEvaluatingFailHours}
-          ciBackstopTimeoutMinutes={ciBackstopTimeoutMinutes}
-          onUpdateCiBackstopTimeout={onUpdateCiBackstopTimeout}
-          autonomousResearchIntervalMinutes={autonomousResearchIntervalMinutes}
-          onUpdateAutonomousResearchInterval={onUpdateAutonomousResearchInterval}
-          directionCooldownMinutes={directionCooldownMinutes}
-          onUpdateDirectionCooldownMinutes={onUpdateDirectionCooldownMinutes}
-          strategicResearchFrequency={strategicResearchFrequency}
-          onUpdateStrategicResearchFrequency={onUpdateStrategicResearchFrequency}
-          healthCheckUrls={props.healthCheckUrls}
-          onUpdateHealthCheckUrls={props.onUpdateHealthCheckUrls}
-          githubAccount={githubAccount}
-          onConnectGitHub={onConnectGitHub}
-          maxPlanAccounts={maxPlanAccounts}
-          onToggleAccount={onToggleAccount}
-          onRemoveAccount={onRemoveAccount}
-          onResetRateLimits={onResetRateLimits}
-          onRefreshAccountModels={onRefreshAccountModels}
-          onUpdateAccount={onUpdateAccount}
-          newAccountName={newAccountName}
-          setNewAccountName={setNewAccountName}
-          newAccountProvider={newAccountProvider}
-          setNewAccountProvider={setNewAccountProvider}
-          newAccountAuthMode={newAccountAuthMode}
-          setNewAccountAuthMode={setNewAccountAuthMode}
-          newAccountToken={newAccountToken}
-          setNewAccountToken={setNewAccountToken}
-          newAccountProviderMetadata={newAccountProviderMetadata}
-          setNewAccountProviderMetadata={setNewAccountProviderMetadata}
-          newAccountClaudeConfigJson={newAccountClaudeConfigJson}
-          setNewAccountClaudeConfigJson={setNewAccountClaudeConfigJson}
-          newAccountDailyTaskCap={newAccountDailyTaskCap}
-          setNewAccountDailyTaskCap={setNewAccountDailyTaskCap}
-          newAccountMaxConcurrentTasks={newAccountMaxConcurrentTasks}
-          setNewAccountMaxConcurrentTasks={setNewAccountMaxConcurrentTasks}
-          newAccountAutoDisableAfterRateLimits={newAccountAutoDisableAfterRateLimits}
-          setNewAccountAutoDisableAfterRateLimits={setNewAccountAutoDisableAfterRateLimits}
-          onAddAccount={onAddAccount}
-          onUpdateAccountCaps={onUpdateAccountCaps}
-          providerTierModelMap={providerTierModelMap}
-          taskTypeModelPreferences={taskTypeModelPreferences}
-          providers={providers}
-          providerSettingsDefaults={providerSettingsDefaults}
-          providerSelectionMode={providerSelectionMode}
-          onUpdateProviderSelectionMode={onUpdateProviderSelectionMode}
-          taskTypeCategories={taskTypeCategories}
-          onUpdateTaskTypeCategories={onUpdateTaskTypeCategories}
-          categoryRouting={categoryRouting}
-          onUpdateCategoryRouting={onUpdateCategoryRouting}
-          taskTypeRouting={taskTypeRouting}
-          onUpdateTaskTypeRouting={onUpdateTaskTypeRouting}
-          providerSettingsByEffort={providerSettingsByEffort}
-          onUpdateProviderSettingsByEffort={onUpdateProviderSettingsByEffort}
-          taskTypeProviderOverrides={taskTypeProviderOverrides}
-          onUpdateProviderSettingsDefaults={onUpdateProviderSettingsDefaults}
-          onUpdateTaskTypeProviderOverrides={onUpdateTaskTypeProviderOverrides}
-          refreshInterval={refreshInterval}
-          onUpdateRefreshInterval={onUpdateRefreshInterval}
-          pageSize={pageSize}
-          onUpdatePageSize={onUpdatePageSize}
-          apiHealthy={apiHealthy}
-          wsConnected={wsConnected}
-          lastFetchTime={lastFetchTime}
-          onRestartOrchestrator={onRestartOrchestrator}
-          anyAutonomousEnabled={anyAutonomousEnabled}
-          onPauseAllAutonomous={onPauseAllAutonomous}
-          deployState={props.deployState}
-          onPausePipeline={props.onPausePipeline}
-          onResumePipeline={props.onResumePipeline}
-          onResetHealth={props.onResetHealth}
-          onRollback={props.onRollback}
-          onMarkStable={props.onMarkStable}
-          onRepairState={props.onRepairState}
-          failedRollback={props.failedRollback}
-          zoneHealth={props.zoneHealth}
-          userRole={props.userRole}
-          userEmail={props.userEmail}
-          onSignOut={props.onSignOut}
-          showUserManagement={props.showUserManagement}
-          onToggleUserManagement={props.onToggleUserManagement}
-          showProjectMembers={props.showProjectMembers}
-          onToggleProjectMembers={props.onToggleProjectMembers}
-          selectedProjectMyRole={props.selectedProjectMyRole}
-          notificationConfig={props.notificationConfig}
-          onUpdateNotificationConfig={props.onUpdateNotificationConfig}
-          dailyCostCeilingUsd={props.dailyCostCeilingUsd}
-          onUpdateDailyCostCeiling={props.onUpdateDailyCostCeiling}
-          selectedProjectId={props.selectedProjectId}
-          selectedProjectOwner={props.selectedProjectOwner}
-          selectedProjectRepo={props.selectedProjectRepo}
-          selectedProjectIsSelfRepo={props.selectedProjectIsSelfRepo}
-          selectedProjectRole={props.selectedProjectRole}
-          buildConfig={props.buildConfig}
-          onUpdateBuildConfig={props.onUpdateBuildConfig}
-          onDetectBuildConfig={props.onDetectBuildConfig}
-          autoRemediationConfig={props.autoRemediationConfig}
-          autoRemediationStats={props.autoRemediationStats}
-          onUpdateAutoRemediationConfig={props.onUpdateAutoRemediationConfig}
-          issueImplementationConfig={props.issueImplementationConfig}
-          onUpdateIssueImplementationConfig={props.onUpdateIssueImplementationConfig}
-          autoReviewConfig={props.autoReviewConfig}
-          onUpdateAutoReviewConfig={props.onUpdateAutoReviewConfig}
-          resourceEnvelopeData={props.resourceEnvelopeData}
-          resourceEnvelopeLoading={props.resourceEnvelopeLoading}
-          resourceEnvelopeError={props.resourceEnvelopeError}
-          onUpdateResourceEnvelope={props.onUpdateResourceEnvelope}
-          integrationBranchData={props.integrationBranchData}
-          onUpdateIntegrationBranch={props.onUpdateIntegrationBranch}
-          promotionTargetData={props.promotionTargetData}
-          onUpdatePromotionTarget={props.onUpdatePromotionTarget}
-        />
+          <button
+            onClick={onOpenSettings}
+            title="Runtime settings"
+            className="hidden h-7 w-7 items-center justify-center rounded border border-neutral-800/80 bg-[#070a0f] text-neutral-400 transition-colors hover:bg-neutral-900 hover:text-neutral-100 md:inline-flex"
+          >
+            <Settings className="h-3.5 w-3.5" />
+          </button>
+          <button
+            onClick={props.onSignOut}
+            title={props.userEmail ? `Sign out ${props.userEmail}` : 'Sign out'}
+            className="hidden h-7 w-7 items-center justify-center rounded border border-neutral-800/80 bg-[#070a0f] text-neutral-500 transition-colors hover:bg-red-950/20 hover:text-red-300 md:inline-flex"
+          >
+            <LogOut className="h-3.5 w-3.5" />
+          </button>
 
           {/* Mobile-only autonomy control */}
           <div className="md:hidden flex items-center mr-1">
@@ -847,7 +434,7 @@ export function HeaderBar(props: HeaderBarProps) {
                         ['2', 'Pipeline'],
                         ['3', 'Project update'],
                         ['4', 'Runtime'],
-                        ['S', 'Settings'],
+                        ['S', 'Runtime settings'],
                         ['A', 'Archive (pipeline)'],
                         ['Esc', 'Close panel/modal'],
                         ['Del', 'Cancel selected (selection mode)'],
@@ -864,11 +451,18 @@ export function HeaderBar(props: HeaderBarProps) {
                   </div>
                 )}
                 <button
-                  onClick={() => { onToggleSettings(); setShowMobileMenu(false); }}
+                  onClick={() => { onOpenSettings(); setShowMobileMenu(false); }}
                   className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
                 >
                   <Settings className="w-4 h-4 shrink-0" />
-                  <span>Settings</span>
+                  <span>Runtime settings</span>
+                </button>
+                <button
+                  onClick={() => { props.onSignOut(); setShowMobileMenu(false); }}
+                  className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-400 hover:bg-red-950/20 hover:text-red-300"
+                >
+                  <LogOut className="w-4 h-4 shrink-0" />
+                  <span>Sign out</span>
                 </button>
               </div>
             )}

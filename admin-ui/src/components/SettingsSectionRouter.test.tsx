@@ -53,4 +53,29 @@ describe('SettingsSectionRouter access actions', () => {
     expect(onToggleUserManagement).toHaveBeenCalledOnce();
     expect(onToggleSettings).not.toHaveBeenCalled();
   });
+
+  test('hides project member management when no project is selected', () => {
+    render(
+      <SettingsSectionRouter
+        {...accessProps({ selectedProjectId: null })}
+      />,
+    );
+
+    expect(screen.queryByTestId('toggle-project-members')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Manage Users' })).toBeInTheDocument();
+  });
+
+  test('hides project member management for non-owner project members', () => {
+    render(
+      <SettingsSectionRouter
+        {...accessProps({
+          isAdmin: false,
+          selectedProjectMyRole: 'member',
+        })}
+      />,
+    );
+
+    expect(screen.queryByTestId('toggle-project-members')).toBeNull();
+    expect(screen.getByText('No access management options are available for your current role.')).toBeInTheDocument();
+  });
 });

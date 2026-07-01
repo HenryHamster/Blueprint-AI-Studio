@@ -49,7 +49,7 @@ const REQUIRED_OPERATOR_ROUTE_COMMANDS = [
   { id: 'runtime.accounts', section: 'Runtime' },
   { id: 'runtime.compute', section: 'Runtime' },
   { id: 'runtime.settings', section: 'Runtime' },
-  { id: 'runtime.settings.general', section: 'Runtime' },
+  { id: 'runtime.settings.general', section: 'Runtime', shortcut: 'S' },
   { id: 'runtime.settings.deploy', section: 'Runtime' },
   { id: 'runtime.settings.provider-routing', section: 'Runtime' },
   { id: 'runtime.settings.provider-settings', section: 'Runtime' },
@@ -59,7 +59,6 @@ const REQUIRED_OPERATOR_ROUTE_COMMANDS = [
   { id: 'research.open', section: 'Workbench' },
   { id: 'knowledge.open', section: 'Workbench' },
   { id: 'task.new', section: 'Pipeline', shortcut: 'N' },
-  { id: 'settings.general', section: 'Workbench', shortcut: 'S' },
 ] as const;
 
 function jsonResponse(body: unknown, status = 200) {
@@ -128,8 +127,7 @@ function Harness(overrides: Partial<Parameters<typeof useWorkbenchCommands>[0]> 
     setShowResearchBrowser: vi.fn(),
     setShowKnowledgeBrowser: vi.fn(),
     openNewTaskModal: vi.fn(),
-    openGlobalSettings: vi.fn(),
-    closeGlobalSettings: vi.fn(),
+    refreshSettings: vi.fn(),
     refreshWorkbench: vi.fn(),
     openProjectManagement: vi.fn(),
     openProjectMembers: vi.fn(),
@@ -1436,9 +1434,7 @@ describe('useWorkbenchCommands', () => {
     const setProjectSection = vi.fn<(section: ProjectSection) => void>();
     const setProjectManageSection = vi.fn<(section: ProjectManageSection) => void>();
     const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
-    const openGlobalSettings = vi.fn();
-    const closeGlobalSettings = vi.fn();
-    mount({ handleTabChange, setProjectSection, setProjectManageSection, setCommandPaletteOpen, openGlobalSettings, closeGlobalSettings });
+    mount({ handleTabChange, setProjectSection, setProjectManageSection, setCommandPaletteOpen });
 
     captured.find(command => command.id === 'project.build')?.run();
     captured.find(command => command.id === 'project.branches')?.run();
@@ -1462,29 +1458,6 @@ describe('useWorkbenchCommands', () => {
       'access',
     ]);
     expect(handleTabChange).toHaveBeenCalledWith('project');
-    expect(openGlobalSettings).not.toHaveBeenCalled();
-    expect(closeGlobalSettings).toHaveBeenCalledTimes(8);
-    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
-  });
-
-  test('falls back to precise settings sections when project manage subsection setter is unavailable', () => {
-    const handleTabChange = vi.fn();
-    const setProjectSection = vi.fn<(section: ProjectSection) => void>();
-    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
-    const openGlobalSettings = vi.fn();
-    mount({
-      handleTabChange,
-      setProjectSection,
-      setProjectManageSection: undefined,
-      setCommandPaletteOpen,
-      openGlobalSettings,
-    });
-
-    captured.find(command => command.id === 'project.build')?.run();
-
-    expect(setProjectSection).toHaveBeenCalledWith('manage');
-    expect(handleTabChange).toHaveBeenCalledWith('project');
-    expect(openGlobalSettings).toHaveBeenCalledWith('build-config');
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
@@ -1702,8 +1675,8 @@ describe('useWorkbenchCommands', () => {
     const setViewMode = vi.fn<(mode: ViewMode) => void>();
     const setShowArchive = vi.fn<(show: boolean) => void>();
     const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
-    const closeGlobalSettings = vi.fn();
-    mount({ handleTabChange, setPipelineSection, setRuntimeSection, setRuntimeConfigSection, setViewMode, setShowArchive, setCommandPaletteOpen, closeGlobalSettings });
+    const refreshSettings = vi.fn();
+    mount({ handleTabChange, setPipelineSection, setRuntimeSection, setRuntimeConfigSection, setViewMode, setShowArchive, setCommandPaletteOpen, refreshSettings });
 
     captured.find(command => command.id === 'pipeline.board')?.run();
     captured.find(command => command.id === 'runtime.analytics')?.run();
@@ -1735,7 +1708,7 @@ describe('useWorkbenchCommands', () => {
     ]);
     expect(handleTabChange).toHaveBeenCalledWith('pipeline');
     expect(handleTabChange).toHaveBeenCalledWith('runtime');
-    expect(closeGlobalSettings).toHaveBeenCalledTimes(10);
+    expect(refreshSettings).toHaveBeenCalledTimes(7);
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
@@ -1780,9 +1753,10 @@ describe('useWorkbenchCommands', () => {
       label: 'Runtime orchestrator settings',
       detail: 'Orchestrator defaults',
     });
-    expect(captured.find(command => command.id === 'settings.general')).toMatchObject({
-      label: 'Workbench settings',
-      detail: 'UI defaults and controls',
+    expect(captured.find(command => command.id === 'runtime.settings.general')).toMatchObject({
+      label: 'Runtime settings',
+      detail: 'Defaults, refresh, and local UI behavior',
+      shortcut: 'S',
     });
   });
 
@@ -1860,31 +1834,40 @@ describe('useWorkbenchCommands', () => {
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
-  test('routes refresh, task launch, settings, and project management commands through existing callbacks', () => {
+  test('routes refresh, task launch, runtime settings, and project management commands through existing callbacks', () => {
     const refreshWorkbench = vi.fn();
     const openNewTaskModal = vi.fn();
-    const openGlobalSettings = vi.fn();
     const openProjectManagement = vi.fn();
     const openProjectMembers = vi.fn();
+    const handleTabChange = vi.fn();
+    const setRuntimeSection = vi.fn<(section: RuntimeSection) => void>();
+    const setRuntimeConfigSection = vi.fn<(section: RuntimeSettingsSection) => void>();
+    const refreshSettings = vi.fn();
     const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
     mount({
       refreshWorkbench,
       openNewTaskModal,
-      openGlobalSettings,
       openProjectManagement,
       openProjectMembers,
+      handleTabChange,
+      setRuntimeSection,
+      setRuntimeConfigSection,
+      refreshSettings,
       setCommandPaletteOpen,
     });
 
     captured.find(command => command.id === 'workbench.refresh')?.run();
     captured.find(command => command.id === 'task.new')?.run();
-    captured.find(command => command.id === 'settings.general')?.run();
+    captured.find(command => command.id === 'runtime.settings.general')?.run();
     captured.find(command => command.id === 'project.switcher')?.run();
     captured.find(command => command.id === 'project.members')?.run();
 
     expect(refreshWorkbench).toHaveBeenCalledTimes(1);
     expect(openNewTaskModal).toHaveBeenCalledTimes(1);
-    expect(openGlobalSettings).toHaveBeenCalledWith('general');
+    expect(refreshSettings).toHaveBeenCalledTimes(1);
+    expect(setRuntimeSection).toHaveBeenCalledWith('settings');
+    expect(setRuntimeConfigSection).toHaveBeenCalledWith('general');
+    expect(handleTabChange).toHaveBeenCalledWith('runtime');
     expect(openProjectManagement).toHaveBeenCalledTimes(1);
     expect(openProjectMembers).toHaveBeenCalledTimes(1);
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
@@ -1899,7 +1882,7 @@ describe('useWorkbenchCommands', () => {
     expect(captured.find(command => command.id === 'runtime.health')?.shortcut).toBe('4');
     expect(captured.find(command => command.id === 'task.new')?.shortcut).toBe('N');
     expect(captured.find(command => command.id === 'workbench.refresh')?.shortcut).toBe('R');
-    expect(captured.find(command => command.id === 'settings.general')?.shortcut).toBe('S');
+    expect(captured.find(command => command.id === 'runtime.settings.general')?.shortcut).toBe('S');
   });
 
   test('builds palette without throwing on non-numeric metric value', () => {

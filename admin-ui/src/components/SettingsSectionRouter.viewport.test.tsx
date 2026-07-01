@@ -2,7 +2,7 @@ import { afterEach, describe, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { SettingsSectionRouter, type SettingsSectionRouterProps } from './SettingsSectionRouter';
-import type { SectionId } from './SettingsDropdown';
+import type { SectionId } from './settingsSections';
 import { expectNoOverflowAt } from '../test/viewport';
 
 // Sections rendered by this router (e.g. 'deploy' → MergeGradeGateSettings,

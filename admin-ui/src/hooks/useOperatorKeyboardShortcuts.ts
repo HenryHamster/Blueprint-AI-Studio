@@ -23,8 +23,6 @@ interface UseOperatorKeyboardShortcutsOptions {
   setShowAlertsPopover: (show: boolean) => void;
   setShowKnowledgeBrowser: (show: boolean) => void;
   setShowResearchBrowser: (show: boolean) => void;
-  showSettings: boolean;
-  toggleSettings: () => void;
 }
 
 export function useOperatorKeyboardShortcuts({
@@ -45,8 +43,6 @@ export function useOperatorKeyboardShortcuts({
   setShowAlertsPopover,
   setShowKnowledgeBrowser,
   setShowResearchBrowser,
-  showSettings,
-  toggleSettings,
 }: UseOperatorKeyboardShortcutsOptions) {
   const closeTransientTargets = useCallback(() => {
     setShowResearchBrowser(false);
@@ -68,8 +64,7 @@ export function useOperatorKeyboardShortcuts({
 
   const closeTransientWorkbenchPanels = useCallback(() => {
     closeTransientTargets();
-    if (showSettings) toggleSettings();
-  }, [closeTransientTargets, showSettings, toggleSettings]);
+  }, [closeTransientTargets]);
 
   const openCommandPalette = useCallback(() => {
     if (commandPaletteOpen || commandPaletteShortcutBlocked) return;
@@ -93,40 +88,19 @@ export function useOperatorKeyboardShortcuts({
     return () => document.removeEventListener('keydown', handleSearchShortcut);
   }, [blockingModalOpen, searchInputRef, searchShortcutBlocked]);
 
-  useEffect(() => {
-    if (!showSettings || commandPaletteOpen) return;
-
-    function handleSettingsCloseShortcut(event: KeyboardEvent) {
-      if (event.defaultPrevented) return;
-      if (event.key.toLowerCase() !== 's') return;
-      if (event.ctrlKey || event.metaKey || event.altKey) return;
-      if (isEditableShortcutEvent(event)) return;
-      if (blockingModalOpen) return;
-
-      event.preventDefault();
-      closeTransientTargets();
-      toggleSettings();
-    }
-
-    document.addEventListener('keydown', handleSettingsCloseShortcut, true);
-    return () => document.removeEventListener('keydown', handleSettingsCloseShortcut, true);
-  }, [blockingModalOpen, closeTransientTargets, commandPaletteOpen, showSettings, toggleSettings]);
-
   const shouldHandleWorkbenchShortcut = useCallback((commandId: string) => {
     if (blockingModalOpen) return false;
     if (commandId === 'workbench.refresh') {
       if (selectionMode && selectedTaskCount > 0) return false;
-      return !showSettings;
+      return true;
     }
     if (commandId === 'pipeline.archive') return activeTab === 'pipeline';
-    if (commandId === 'settings.general') return !showSettings;
     return true;
   }, [
     activeTab,
     blockingModalOpen,
     selectedTaskCount,
     selectionMode,
-    showSettings,
   ]);
 
   useWorkbenchShortcutRouter(commands, {

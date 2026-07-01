@@ -83,12 +83,9 @@ export function useUIState() {
 
   const [showFleetDetail, setShowFleetDetail] = useState(false);
   const [showAlertsPopover, setShowAlertsPopover] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
   const [showDirections, setShowDirections] = useState(false);
   const [showMetrics, setShowMetrics] = useState(false);
   const [showUserManagement, setShowUserManagement] = useState(false);
-
-  const settingsRef = useRef<HTMLDivElement>(null);
 
   // Selection mode
   const [selectionMode, setSelectionMode] = useState(false);
@@ -167,11 +164,9 @@ export function useUIState() {
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
     showFleetDetail, setShowFleetDetail,
     showAlertsPopover, setShowAlertsPopover,
-    showSettings, setShowSettings,
     showDirections, setShowDirections,
     showMetrics, setShowMetrics,
     showUserManagement, setShowUserManagement,
-    settingsRef,
     selectionMode, setSelectionMode, selectedTaskIds, setSelectedTaskIds,
     toggleSelectionMode, toggleTaskSelection, bulkColumnToggle, shiftSelectRange,
     confirmDialog, setConfirmDialog,
