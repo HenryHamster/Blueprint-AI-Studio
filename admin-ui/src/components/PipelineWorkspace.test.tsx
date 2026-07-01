@@ -5,7 +5,11 @@ import type { Task } from './TaskCard';
 import type { TrackLogEntry } from '../types/task';
 
 vi.mock('./ArchiveView', () => ({
-  default: () => <div data-testid="archive-view" />,
+  default: ({ setShowArchive }: { setShowArchive: (show: boolean) => void }) => (
+    <div data-testid="archive-view">
+      <button type="button" onClick={() => setShowArchive(false)}>Close archive mock</button>
+    </div>
+  ),
 }));
 
 vi.mock('./PipelineView', () => ({
@@ -288,6 +292,28 @@ describe('PipelineWorkspace section routing', () => {
     expect(screen.getByTestId('archive-view')).toBeInTheDocument();
     expect(screen.queryByTestId('pipeline-view')).not.toBeInTheDocument();
     expect(screen.queryByTestId('kanban-board')).not.toBeInTheDocument();
+  });
+
+  test('archive close returns to task flow and synchronizes legacy view state', () => {
+    const onPipelineSectionChange = vi.fn();
+    const setShowArchive = vi.fn();
+    const setViewMode = vi.fn();
+    renderWorkspace({
+      surface: {
+        pipelineSection: 'archive',
+        onPipelineSectionChange,
+        showArchive: true,
+        setShowArchive,
+        viewMode: 'pipeline',
+        setViewMode,
+      },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Close archive mock' }));
+
+    expect(setShowArchive).toHaveBeenCalledWith(false);
+    expect(onPipelineSectionChange).toHaveBeenCalledWith('flow');
+    expect(setViewMode).toHaveBeenCalledWith('pipeline');
   });
 
   test('renders board from the selected section even when the legacy view mode is stale', () => {

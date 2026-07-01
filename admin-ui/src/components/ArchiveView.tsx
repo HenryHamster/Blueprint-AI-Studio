@@ -1,5 +1,17 @@
-import { X, Search, ExternalLink, Eye, Loader2, Archive, ArchiveRestore, ChevronLeft, ChevronRight, RefreshCw, Trash2 } from 'lucide-react';
-import { useState } from 'react';
+import {
+  Archive,
+  ArchiveRestore,
+  ChevronLeft,
+  ChevronRight,
+  ExternalLink,
+  Eye,
+  Loader2,
+  RefreshCw,
+  Search,
+  Trash2,
+  X,
+} from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
 import type { Task } from './TaskCard';
 import { TASK_TYPE_STYLES, isSafeUrl } from './TaskCard';
 import { timeAgo } from '../utils/time';
@@ -38,7 +50,7 @@ const STATUS_BORDER_COLORS: Record<string, string> = {
   COMPLETED: 'border-l-emerald-500',
   CANCELLED: 'border-l-neutral-500',
   FAILED: 'border-l-red-500',
-  all: 'border-l-blue-500',
+  all: 'border-l-cyan-500',
 };
 
 const STATUS_DOT_COLORS: Record<string, string> = {
@@ -51,7 +63,7 @@ const DATE_RANGES: { value: string; label: string }[] = [
   { value: '24h', label: 'Last 24h' },
   { value: '7d', label: '7d' },
   { value: '30d', label: '30d' },
-  { value: 'all', label: 'All Time' },
+  { value: 'all', label: 'All time' },
 ];
 
 const PURGE_AGE_OPTIONS: { label: string; days?: number }[] = [
@@ -59,6 +71,10 @@ const PURGE_AGE_OPTIONS: { label: string; days?: number }[] = [
   { label: 'Older than 90 days', days: 90 },
   { label: 'All archived tasks', days: undefined },
 ];
+
+function statusLabel(status: string): string {
+  return status.replace(/_/g, ' ');
+}
 
 export default function ArchiveView({
   archiveTasks,
@@ -84,13 +100,87 @@ export default function ArchiveView({
 }: ArchiveViewProps) {
   const [purgeConfirm, setPurgeConfirm] = useState<{ days?: number } | null>(null);
   const [purgeLoading, setPurgeLoading] = useState(false);
+  const [purgeMenuOpen, setPurgeMenuOpen] = useState(false);
+  const [pendingActionKey, setPendingActionKey] = useState<string | null>(null);
+  const purgeMenuRef = useRef<HTMLDivElement | null>(null);
+  const purgeTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const purgeDialogRef = useRef<HTMLDivElement | null>(null);
+  const cancelPurgeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const previousFocusRef = useRef<HTMLElement | null>(null);
+  const purgeLoadingRef = useRef(false);
+
+  useEffect(() => {
+    purgeLoadingRef.current = purgeLoading;
+  }, [purgeLoading]);
+
+  useEffect(() => {
+    if (!purgeMenuOpen) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setPurgeMenuOpen(false);
+    };
+    const onPointerDown = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && !purgeMenuRef.current?.contains(target)) {
+        setPurgeMenuOpen(false);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('pointerdown', onPointerDown, true);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('pointerdown', onPointerDown, true);
+    };
+  }, [purgeMenuOpen]);
+
+  useEffect(() => {
+    if (purgeConfirm === null) return undefined;
+    cancelPurgeButtonRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        if (!purgeLoadingRef.current) {
+          setPurgeConfirm(null);
+        }
+        return;
+      }
+      if (event.key !== 'Tab' || !purgeDialogRef.current) return;
+      const focusable = Array.from(
+        purgeDialogRef.current.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      const focusTarget = previousFocusRef.current;
+      if (focusTarget && document.contains(focusTarget)) {
+        focusTarget.focus();
+      } else {
+        purgeTriggerRef.current?.focus();
+      }
+      previousFocusRef.current = null;
+    };
+  }, [purgeConfirm]);
 
   const handlePurgeClick = (days?: number) => {
+    previousFocusRef.current = purgeTriggerRef.current;
+    setPurgeMenuOpen(false);
     setPurgeConfirm({ days });
   };
 
   const confirmPurge = async () => {
-    if (!onPurgeArchive || purgeConfirm === null) return;
+    if (!onPurgeArchive || purgeConfirm === null || purgeLoading) return;
     setPurgeLoading(true);
     try {
       await onPurgeArchive(purgeConfirm.days);
@@ -100,83 +190,138 @@ export default function ArchiveView({
     }
   };
 
-  const showingFrom = (archivePage - 1) * archivePageSize + 1;
-  const showingTo = showingFrom + archiveTasks.length - 1;
+  const clearFilters = () => {
+    setArchiveStatusFilter('all');
+    setArchiveSearchQuery('');
+    setArchiveDateRange('all');
+  };
+
+  const runRowAction = async (key: string, action: () => void | Promise<void>) => {
+    if (pendingActionKey === key) return;
+    setPendingActionKey(key);
+    try {
+      await action();
+    } finally {
+      setPendingActionKey(null);
+    }
+  };
+
+  const showingFrom = archiveTasks.length > 0 ? (archivePage - 1) * archivePageSize + 1 : 0;
+  const showingTo = archiveTasks.length > 0 ? showingFrom + archiveTasks.length - 1 : 0;
   const totalPages = Math.max(1, Math.ceil(archiveTotalTasks / archivePageSize));
   const hasNextPage = archivePage < totalPages;
 
   return (
-    <div className="flex-1 overflow-hidden flex flex-col bg-neutral-950 rounded-lg border border-neutral-800">
-      {/* Header */}
-      <div className="flex items-center justify-between px-6 py-4 border-b border-neutral-800 shrink-0">
-        <div className="flex items-center gap-3">
-          <Archive className="w-5 h-5 text-neutral-400" />
-          <h2 className="text-lg font-semibold text-neutral-100">Archive</h2>
-          {archiveLoading && (
-            <Loader2 className="w-4 h-4 text-neutral-500 animate-spin" />
-          )}
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden rounded-lg border border-neutral-800 bg-neutral-950">
+      <header className="flex shrink-0 flex-col gap-3 border-b border-neutral-800 px-3 py-3 md:flex-row md:items-center md:justify-between md:px-5">
+        <div className="flex min-w-0 items-center gap-3">
+          <Archive className="h-5 w-5 shrink-0 text-neutral-400" aria-hidden="true" />
+          <div className="min-w-0">
+            <h2 className="truncate text-lg font-semibold text-neutral-100">Archive</h2>
+            <p className="mt-0.5 text-xs text-neutral-500">
+              {archiveTotalTasks > 0 ? `${archiveTotalTasks} archived` : 'No archived tasks'}
+            </p>
+          </div>
+          {archiveLoading && <Loader2 className="h-4 w-4 shrink-0 animate-spin text-neutral-500" aria-hidden="true" />}
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center justify-between gap-2 md:justify-end">
           {onPurgeArchive && (
-            <div className="relative group">
-                  <button
-                className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium bg-neutral-800 text-red-400 hover:bg-red-900/30 hover:text-red-300 border border-neutral-700 hover:border-red-800 transition-colors"
+            <div
+              ref={purgeMenuRef}
+              className="relative min-w-0"
+              onBlur={(event) => {
+                const nextFocus = event.relatedTarget;
+                if (!(nextFocus instanceof Node) || !event.currentTarget.contains(nextFocus)) {
+                  setPurgeMenuOpen(false);
+                }
+              }}
+            >
+              <button
+                ref={purgeTriggerRef}
+                type="button"
+                onClick={() => setPurgeMenuOpen(open => !open)}
+                aria-haspopup="menu"
+                aria-expanded={purgeMenuOpen}
+                aria-controls="archive-purge-menu"
+                className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-900 px-3 text-sm font-semibold text-red-300 transition-colors hover:border-red-900 hover:bg-red-950/35 hover:text-red-200 md:min-h-9 md:text-xs"
                 title="Permanently delete archived tasks"
               >
-                <Trash2 className="w-3.5 h-3.5" />
-                Clear Archive
+                <Trash2 className="h-4 w-4 shrink-0" aria-hidden="true" />
+                Clear archive
               </button>
-              {/* Dropdown */}
-              <div className="absolute right-0 top-full mt-1 w-48 bg-neutral-900 border border-neutral-700 rounded-lg shadow-xl z-20 hidden group-focus-within:block group-hover:block">
-                {PURGE_AGE_OPTIONS.map((opt) => (
-                  <button
-                    key={opt.label}
-                    onClick={() => handlePurgeClick(opt.days)}
-                    className="w-full text-left px-3 py-2 text-xs text-neutral-300 hover:bg-neutral-800 hover:text-red-300 first:rounded-t-lg last:rounded-b-lg transition-colors"
-                  >
-                    {opt.label}
-                  </button>
-                ))}
-              </div>
+              {purgeMenuOpen && (
+                <div
+                  id="archive-purge-menu"
+                  role="menu"
+                  className="absolute right-0 top-full z-20 mt-1 w-56 overflow-hidden rounded-md border border-neutral-700 bg-neutral-900 shadow-xl"
+                >
+                  {PURGE_AGE_OPTIONS.map(option => (
+                    <button
+                      key={option.label}
+                      type="button"
+                      role="menuitem"
+                      onClick={() => handlePurgeClick(option.days)}
+                      className="flex min-h-11 w-full items-center px-3 text-left text-sm text-neutral-300 transition-colors hover:bg-neutral-800 hover:text-red-300 md:min-h-9 md:text-xs"
+                    >
+                      {option.label}
+                    </button>
+                  ))}
+                </div>
+              )}
             </div>
           )}
-          {/* eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction */}
           <button
+            type="button"
             onClick={() => setShowArchive(false)}
-            className="p-1.5 rounded-lg text-neutral-500 hover:text-neutral-300 hover:bg-neutral-800 transition-colors"
+            className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-md text-neutral-500 transition-colors hover:bg-neutral-900 hover:text-neutral-100 md:min-h-9 md:min-w-9"
+            title="Close archive"
+            aria-label="Close archive"
           >
-            <X className="w-5 h-5" />
+            <X className="h-5 w-5" aria-hidden="true" />
           </button>
         </div>
-      </div>
+      </header>
 
-      {/* Purge confirmation dialog */}
       {purgeConfirm !== null && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-          <div className="bg-neutral-900 border border-neutral-700 rounded-xl shadow-2xl p-6 max-w-sm w-full mx-4">
-            <div className="flex items-center gap-3 mb-3">
-              <Trash2 className="w-5 h-5 text-red-400 shrink-0" />
-              <h3 className="text-base font-semibold text-neutral-100">Permanently delete?</h3>
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4">
+          <div
+            ref={purgeDialogRef}
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="archive-purge-title"
+            aria-busy={purgeLoading}
+            className="w-full max-w-sm rounded-lg border border-neutral-700 bg-neutral-900 p-5 shadow-2xl"
+          >
+            <div className="flex items-center gap-3">
+              <Trash2 className="h-5 w-5 shrink-0 text-red-400" aria-hidden="true" />
+              <h3 id="archive-purge-title" className="text-base font-semibold text-neutral-100">
+                Permanently delete?
+              </h3>
             </div>
-            <p className="text-sm text-neutral-400 mb-5">
+            <p className="mt-3 text-sm leading-5 text-neutral-400">
               {purgeConfirm.days
-                ? `All archived tasks older than ${purgeConfirm.days} days will be permanently deleted. This cannot be undone.`
+                ? `Archived tasks older than ${purgeConfirm.days} days will be permanently deleted. This cannot be undone.`
                 : 'All archived tasks will be permanently deleted. This cannot be undone.'}
             </p>
-            <div className="flex justify-end gap-2">
+            <div className="mt-5 flex justify-end gap-2">
               <button
+                ref={cancelPurgeButtonRef}
+                type="button"
                 onClick={() => setPurgeConfirm(null)}
                 disabled={purgeLoading}
-                className="px-3 py-1.5 rounded-lg text-xs font-medium bg-neutral-800 text-neutral-300 hover:bg-neutral-700 border border-neutral-700 transition-colors disabled:opacity-50"
+                className="min-h-11 rounded-md border border-neutral-700 bg-neutral-800 px-4 text-sm font-semibold text-neutral-300 transition-colors hover:bg-neutral-700 disabled:cursor-not-allowed disabled:opacity-50 md:min-h-9"
               >
                 Cancel
               </button>
               <button
+                type="button"
                 onClick={confirmPurge}
-                disabled={purgeLoading}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-red-700 text-white hover:bg-red-600 transition-colors disabled:opacity-50"
+                aria-disabled={purgeLoading}
+                className={`inline-flex min-h-11 items-center gap-2 rounded-md bg-red-700 px-4 text-sm font-semibold text-white transition-colors md:min-h-9 ${
+                  purgeLoading ? 'cursor-not-allowed opacity-50' : 'hover:bg-red-600'
+                }`}
               >
-                {purgeLoading && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                {purgeLoading && <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />}
                 Delete permanently
               </button>
             </div>
@@ -184,229 +329,283 @@ export default function ArchiveView({
         </div>
       )}
 
-      {/* Filter bar */}
-      <div className="px-6 py-3 border-b border-neutral-800 flex flex-wrap items-center gap-3 shrink-0">
-        {/* Status filters */}
-        <div className="flex items-center gap-1.5">
-          {STATUS_FILTERS.map((sf) => (
-            <button
-              key={sf.value}
-              onClick={() => setArchiveStatusFilter(sf.value)}
-              className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all border ${
-                archiveStatusFilter === sf.value
-                  ? `bg-neutral-800 text-white border-l-2 ${STATUS_BORDER_COLORS[sf.value] || 'border-l-neutral-500'} border-t-neutral-700 border-r-neutral-700 border-b-neutral-700`
-                  : 'bg-neutral-950 border-neutral-800 text-neutral-500 hover:border-neutral-700'
-              }`}
-            >
-              {sf.label}
-            </button>
-          ))}
-        </div>
-
-        {/* Search input */}
-        <div className="relative flex-1 min-w-[200px] max-w-sm">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-neutral-600" />
-          <input
-            type="text"
-            value={archiveSearchQuery}
-            onChange={(e) => setArchiveSearchQuery(e.target.value)}
-            placeholder="Search by title or description..."
-            className="w-full bg-neutral-900/50 border border-neutral-800/50 rounded-lg pl-9 pr-3 py-1.5 text-sm text-neutral-100 placeholder-neutral-600 focus:ring-1 focus:ring-neutral-700 focus:outline-none"
-          />
-        </div>
-
-        {/* Date range filters */}
-        <div className="flex items-center gap-1.5">
-          {DATE_RANGES.map((dr) => (
-            <button
-              key={dr.value}
-              onClick={() => setArchiveDateRange(dr.value)}
-              className={`px-2.5 py-1 rounded-lg text-xs font-medium transition-all border ${
-                archiveDateRange === dr.value
-                  ? 'bg-neutral-800 text-white border-neutral-700'
-                  : 'bg-neutral-950 border-neutral-800 text-neutral-500 hover:border-neutral-700'
-              }`}
-            >
-              {dr.label}
-            </button>
-          ))}
-        </div>
-
-        {/* Sort order */}
-        <select
-          value={archiveSortOrder}
-          onChange={(e) => setArchiveSortOrder(e.target.value as 'desc' | 'asc')}
-          className="bg-neutral-900 border border-neutral-800 text-neutral-400 text-xs rounded-lg px-2.5 py-1 focus:outline-none focus:ring-1 focus:ring-neutral-700"
+      <div className="grid min-h-0 flex-1 grid-cols-1 overflow-hidden lg:grid-cols-[minmax(0,1fr)_18rem]">
+        <aside
+          data-testid="archive-actions-panel"
+          className="order-first min-h-0 border-b border-neutral-800 bg-[#0b1118] p-3 lg:col-start-2 lg:row-start-1 lg:border-b-0 lg:border-l"
         >
-          <option value="desc">Newest first</option>
-          <option value="asc">Oldest first</option>
-        </select>
-      </div>
-
-      {/* Results list */}
-      <div className="flex-1 overflow-y-auto px-6 py-4 relative">
-        {archiveLoading && (
-          <div className="absolute inset-0 bg-neutral-950/60 flex items-center justify-center z-10 rounded-b-lg">
-            <div className="flex items-center gap-2 px-4 py-2 rounded-lg bg-neutral-900 border border-neutral-800 shadow-lg">
-              <Loader2 className="w-4 h-4 text-neutral-400 animate-spin" />
-              <span className="text-xs text-neutral-400">Loading...</span>
-            </div>
-          </div>
-        )}
-        {archiveTasks.length === 0 && !archiveLoading ? (
-          <div className="flex flex-col items-center justify-center h-full text-neutral-500">
-            <Archive className="w-10 h-10 mb-3 text-neutral-700" />
-            <p className="text-sm">No archived tasks match your filters.</p>
-            <button
-              onClick={() => {
-                setArchiveStatusFilter('all');
-                setArchiveSearchQuery('');
-                setArchiveDateRange('all');
-              }}
-              className="mt-3 px-3 py-1.5 rounded-lg text-xs font-medium bg-neutral-800 text-neutral-300 hover:bg-neutral-700 transition-colors border border-neutral-700"
-            >
-              Clear filters
-            </button>
-          </div>
-        ) : (
-          <div className="flex flex-col gap-2">
-            {archiveTasks.map((task) => {
-              const typeStyle = task.task_type ? TASK_TYPE_STYLES[task.task_type] : null;
-              const TypeIcon = typeStyle?.icon;
-              const dotColor = STATUS_DOT_COLORS[task.status] || 'bg-neutral-600';
-
-              return (
-                <div
-                  key={task.id}
-                  className={`bg-neutral-900 border border-neutral-800 border-l-2 ${STATUS_BORDER_COLORS[task.status] || 'border-l-neutral-600'} rounded-lg px-4 py-3 hover:bg-neutral-800/50 transition-colors flex flex-wrap items-center gap-x-4 gap-y-2`}
-                >
-                  {/* Title & description */}
-                  <div className="flex-1 min-w-0 basis-full sm:basis-0">
-                    <p className="text-sm font-medium text-neutral-100 truncate">
-                      {task.title}
-                    </p>
-                    {task.description && (
-                      <p className="text-xs text-neutral-500 truncate mt-0.5">
-                        {task.description}
-                      </p>
-                    )}
-                  </div>
-
-                  {/* Task type badge */}
-                  {typeStyle && TypeIcon && (
-                    <span
-                      className={`inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium border ${typeStyle.bg} ${typeStyle.text} shrink-0`}
-                    >
-                      <TypeIcon className="w-3 h-3" />
-                      {typeStyle.label}
-                    </span>
-                  )}
-
-                  {/* Status badge */}
-                  <span className="inline-flex items-center gap-1.5 text-xs text-neutral-400 shrink-0">
-                    <span className={`w-2 h-2 rounded-full ${dotColor}`} />
-                    {task.status}
-                  </span>
-
-                  {/* Timestamp */}
-                  <span className="text-xs text-neutral-600 shrink-0 w-16 text-right">
-                    {timeAgo(task.created_at)}
-                  </span>
-
-                  {/* PR link */}
-                  {task.pr_url && isSafeUrl(task.pr_url) && (
-                    // eslint-disable-next-line viewport/min-touch-target -- pre-existing, dense UI; audit per rule introduction
-                    <a
-                      href={task.pr_url}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="p-1.5 rounded text-neutral-500 hover:text-neutral-300 hover:bg-neutral-700/50 transition-colors shrink-0"
-                      title="View PR"
-                    >
-                      <ExternalLink className="w-4 h-4" />
-                    </a>
-                  )}
-
-                  {/* View Details */}
-                  <button
-                    onClick={() => handleViewLogs(task)}
-                    className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium bg-neutral-800 text-neutral-300 hover:bg-neutral-700 transition-colors shrink-0"
-                  >
-                    <Eye className="w-3.5 h-3.5" />
-                    View Details
-                  </button>
-
-                  {/* Retry (FAILED only) */}
-                  {task.status === 'FAILED' && onRetryTask && (
-                    <button
-                      onClick={() => onRetryTask(task.id)}
-                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium bg-neutral-800 text-blue-400 hover:bg-neutral-700 transition-colors shrink-0"
-                      title="Retry task"
-                    >
-                      <RefreshCw className="w-3 h-3" />
-                      Retry
-                    </button>
-                  )}
-
-                  {/* Unarchive */}
-                  {onUnarchiveTask && (
-                    <button
-                      onClick={() => onUnarchiveTask(task.id)}
-                      className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-xs font-medium bg-neutral-800 text-neutral-300 hover:bg-neutral-700 transition-colors shrink-0"
-                      title="Unarchive task"
-                    >
-                      <ArchiveRestore className="w-3 h-3" />
-                      Unarchive
-                    </button>
-                  )}
+          <div className="grid gap-3">
+            <section className="rounded-md border border-neutral-800 bg-neutral-950/70 p-3">
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="text-sm font-semibold text-neutral-100">Archive actions</h3>
+                <span className="font-mono text-xs text-neutral-500">{archiveTasks.length}</span>
+              </div>
+              <dl className="mt-3 grid gap-2 text-xs">
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-neutral-500">Visible</dt>
+                  <dd className="font-mono text-neutral-300">{archiveTasks.length}</dd>
                 </div>
-              );
-            })}
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-neutral-500">Total</dt>
+                  <dd className="font-mono text-neutral-300">{archiveTotalTasks}</dd>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-neutral-500">Page</dt>
+                  <dd className="font-mono text-neutral-300">{archivePage}/{totalPages}</dd>
+                </div>
+              </dl>
+            </section>
+
+            <section className="rounded-md border border-neutral-800 bg-neutral-950/70 p-3">
+              <h3 className="text-sm font-semibold text-neutral-100">Filters</h3>
+              <dl className="mt-3 grid gap-2 text-xs">
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-neutral-500">Status</dt>
+                  <dd className="font-mono text-neutral-300">{archiveStatusFilter}</dd>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-neutral-500">Range</dt>
+                  <dd className="font-mono text-neutral-300">{archiveDateRange}</dd>
+                </div>
+                <div className="flex items-center justify-between gap-3">
+                  <dt className="text-neutral-500">Sort</dt>
+                  <dd className="font-mono text-neutral-300">{archiveSortOrder}</dd>
+                </div>
+              </dl>
+              <button
+                type="button"
+                onClick={clearFilters}
+                className="mt-3 inline-flex min-h-11 w-full items-center justify-center rounded-md border border-neutral-800 bg-neutral-900 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800"
+              >
+                Clear filters
+              </button>
+            </section>
           </div>
-        )}
+        </aside>
+
+        <main data-testid="archive-task-list" className="min-h-0 min-w-0 overflow-auto px-3 py-3 custom-scrollbar md:px-5 lg:col-start-1 lg:row-start-1">
+          <div className="grid gap-3">
+            <section className="grid gap-3 rounded-md border border-neutral-800 bg-[#0b1118] p-3">
+              <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto_auto] md:items-center">
+                <div className="relative min-w-0">
+                  <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-neutral-600" aria-hidden="true" />
+                  <input
+                    type="text"
+                    value={archiveSearchQuery}
+                    onChange={(event) => setArchiveSearchQuery(event.target.value)}
+                    placeholder="Search archived tasks"
+                    className="min-h-11 w-full rounded-md border border-neutral-800 bg-neutral-950 py-2 pl-9 pr-3 text-sm text-neutral-100 outline-none transition-colors placeholder:text-neutral-600 focus:border-neutral-600 focus:ring-1 focus:ring-neutral-700"
+                    aria-label="Search archived tasks"
+                  />
+                </div>
+                <select
+                  value={archiveSortOrder}
+                  onChange={(event) => setArchiveSortOrder(event.target.value as 'desc' | 'asc')}
+                  className="min-h-11 rounded-md border border-neutral-800 bg-neutral-950 px-3 text-sm text-neutral-300 outline-none focus:border-neutral-600 focus:ring-1 focus:ring-neutral-700"
+                  aria-label="Archive sort order"
+                >
+                  <option value="desc">Newest first</option>
+                  <option value="asc">Oldest first</option>
+                </select>
+                <select
+                  value={archivePageSize}
+                  onChange={(event) => setArchivePageSize(Number(event.target.value))}
+                  className="min-h-11 rounded-md border border-neutral-800 bg-neutral-950 px-3 text-sm text-neutral-300 outline-none focus:border-neutral-600 focus:ring-1 focus:ring-neutral-700"
+                  aria-label="Archived tasks per page"
+                >
+                  <option value={25}>25 per page</option>
+                  <option value={50}>50 per page</option>
+                  <option value={100}>100 per page</option>
+                </select>
+              </div>
+
+              <div className="flex min-w-0 flex-wrap gap-2">
+                {STATUS_FILTERS.map(filter => (
+                  <button
+                    key={filter.value}
+                    type="button"
+                    onClick={() => setArchiveStatusFilter(filter.value)}
+                    aria-pressed={archiveStatusFilter === filter.value}
+                    className={`min-h-11 min-w-11 rounded-md border px-3 text-sm font-semibold transition-colors ${
+                      archiveStatusFilter === filter.value
+                        ? `border-neutral-700 bg-neutral-800 text-neutral-100 border-l-2 ${STATUS_BORDER_COLORS[filter.value] || 'border-l-neutral-500'}`
+                        : 'border-neutral-800 bg-neutral-950 text-neutral-400 hover:border-neutral-700 hover:text-neutral-200'
+                    }`}
+                  >
+                    {filter.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex min-w-0 flex-wrap gap-2">
+                {DATE_RANGES.map(range => (
+                  <button
+                    key={range.value}
+                    type="button"
+                    onClick={() => setArchiveDateRange(range.value)}
+                    aria-pressed={archiveDateRange === range.value}
+                    className={`min-h-11 min-w-11 rounded-md border px-3 text-sm font-semibold transition-colors ${
+                      archiveDateRange === range.value
+                        ? 'border-neutral-700 bg-neutral-800 text-neutral-100'
+                        : 'border-neutral-800 bg-neutral-950 text-neutral-400 hover:border-neutral-700 hover:text-neutral-200'
+                    }`}
+                  >
+                    {range.label}
+                  </button>
+                ))}
+              </div>
+            </section>
+
+            <section className="relative min-h-[18rem]">
+              {archiveLoading && (
+                <div className="absolute inset-0 z-10 flex items-center justify-center rounded-md bg-neutral-950/70">
+                  <div className="flex items-center gap-2 rounded-md border border-neutral-800 bg-neutral-900 px-4 py-3 shadow-lg">
+                    <Loader2 className="h-4 w-4 animate-spin text-neutral-400" aria-hidden="true" />
+                    <span className="text-sm text-neutral-400">Loading</span>
+                  </div>
+                </div>
+              )}
+
+              {archiveTasks.length === 0 && !archiveLoading ? (
+                <div data-testid="archive-empty-state" className="flex min-h-[18rem] flex-col items-center justify-center rounded-md border border-neutral-800 bg-[#0b1118] px-4 text-center text-neutral-500">
+                  <Archive className="mb-3 h-10 w-10 text-neutral-700" aria-hidden="true" />
+                  <p className="text-sm">No archived tasks match your filters.</p>
+                  <button
+                    type="button"
+                    onClick={clearFilters}
+                    className="mt-3 min-h-11 rounded-md border border-neutral-800 bg-neutral-900 px-4 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800"
+                  >
+                    Clear filters
+                  </button>
+                </div>
+              ) : (
+                <div className="grid gap-2">
+                  {archiveTasks.map(task => {
+                    const typeStyle = task.task_type ? TASK_TYPE_STYLES[task.task_type] : null;
+                    const TypeIcon = typeStyle?.icon;
+                    const dotColor = STATUS_DOT_COLORS[task.status] || 'bg-neutral-600';
+
+                    return (
+                      <article
+                        key={task.id}
+                        className={`grid min-w-0 gap-3 rounded-md border border-l-2 border-neutral-800 ${STATUS_BORDER_COLORS[task.status] || 'border-l-neutral-600'} bg-neutral-900/70 p-3 transition-colors hover:bg-neutral-900 md:grid-cols-[minmax(0,1fr)_auto] md:items-center`}
+                      >
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-semibold text-neutral-100" data-viewport-allow-truncation>
+                            {task.title}
+                          </p>
+                          {task.description && (
+                            <p className="mt-1 truncate text-xs text-neutral-500" data-viewport-allow-truncation>
+                              {task.description}
+                            </p>
+                          )}
+                          <div className="mt-2 flex min-w-0 flex-wrap items-center gap-2">
+                            {typeStyle && TypeIcon && (
+                              <span className={`inline-flex min-h-7 items-center gap-1 rounded border px-2 text-xs font-semibold ${typeStyle.bg} ${typeStyle.text}`}>
+                                <TypeIcon className="h-3.5 w-3.5" aria-hidden="true" />
+                                {typeStyle.label}
+                              </span>
+                            )}
+                            <span className="inline-flex min-h-7 items-center gap-1.5 rounded border border-neutral-800 bg-neutral-950/60 px-2 text-xs font-semibold text-neutral-300">
+                              <span className={`h-2 w-2 rounded-full ${dotColor}`} aria-hidden="true" />
+                              {statusLabel(task.status)}
+                            </span>
+                            <span className="inline-flex min-h-7 items-center rounded border border-neutral-800 bg-neutral-950/60 px-2 font-mono text-xs text-neutral-500">
+                              {timeAgo(task.created_at)}
+                            </span>
+                          </div>
+                        </div>
+
+                        <div className="flex min-w-0 flex-wrap gap-2 md:justify-end">
+                          {task.pr_url && isSafeUrl(task.pr_url) && (
+                            <a
+                              href={task.pr_url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="inline-flex min-h-11 min-w-11 items-center justify-center rounded-md border border-neutral-800 bg-neutral-950 text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-neutral-800 hover:text-neutral-100"
+                              title="View pull request"
+                              aria-label={`View pull request for ${task.title}`}
+                            >
+                              <ExternalLink className="h-4 w-4" aria-hidden="true" />
+                            </a>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => handleViewLogs(task)}
+                            className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800"
+                          >
+                            <Eye className="h-4 w-4" aria-hidden="true" />
+                            Details
+                          </button>
+                          {task.status === 'FAILED' && onRetryTask && (
+                            <button
+                              type="button"
+                              onClick={() => { void runRowAction(`retry:${task.id}`, () => onRetryTask(task.id)); }}
+                              disabled={pendingActionKey === `retry:${task.id}`}
+                              className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950 px-3 text-sm font-semibold text-blue-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800"
+                              title="Retry task"
+                            >
+                              {pendingActionKey === `retry:${task.id}`
+                                ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                                : <RefreshCw className="h-4 w-4" aria-hidden="true" />}
+                              Retry
+                            </button>
+                          )}
+                          {onUnarchiveTask && (
+                            <button
+                              type="button"
+                              onClick={() => { void runRowAction(`unarchive:${task.id}`, () => onUnarchiveTask(task.id)); }}
+                              disabled={pendingActionKey === `unarchive:${task.id}`}
+                              className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800"
+                              title="Unarchive task"
+                            >
+                              {pendingActionKey === `unarchive:${task.id}`
+                                ? <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                                : <ArchiveRestore className="h-4 w-4" aria-hidden="true" />}
+                              Unarchive
+                            </button>
+                          )}
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          </div>
+        </main>
       </div>
 
-      {/* Pagination footer */}
-      <div className="flex flex-wrap items-center justify-between gap-2 px-6 py-2 border-t border-neutral-800 shrink-0">
-        <div className="flex items-center gap-2">
-          <label className="text-xs text-neutral-500">Per page</label>
-          <select
-            value={archivePageSize}
-            onChange={(e) => setArchivePageSize(Number(e.target.value))}
-            className="bg-neutral-800 border border-neutral-700 text-neutral-300 text-xs rounded px-2 py-1"
-          >
-            <option value={25}>25</option>
-            <option value={50}>50</option>
-            <option value={100}>100</option>
-          </select>
-        </div>
-
-        <span className="text-xs text-neutral-500">
+      <footer className="flex shrink-0 flex-col gap-3 border-t border-neutral-800 px-3 py-3 md:flex-row md:items-center md:justify-between md:px-5">
+        <span className="text-sm text-neutral-500">
           {archiveTasks.length > 0
             ? `Showing ${showingFrom}-${showingTo} of ${archiveTotalTasks}`
             : 'No results'}
         </span>
-
-        <div className="flex items-center gap-2">
+        <div className="flex min-w-0 items-center gap-2">
           <button
+            type="button"
             onClick={() => setArchivePage(archivePage - 1)}
             disabled={archivePage <= 1}
-            className="px-3 py-1 text-xs font-medium rounded-md bg-neutral-800 text-neutral-300 hover:bg-neutral-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors inline-flex items-center gap-1"
+            className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-900 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            <ChevronLeft className="w-3.5 h-3.5" />
+            <ChevronLeft className="h-4 w-4" aria-hidden="true" />
             Previous
           </button>
-          <span className="text-xs text-neutral-500 min-w-[80px] text-center">Page {archivePage} of {totalPages}</span>
+          <span className="min-w-16 text-center font-mono text-sm text-neutral-500">
+            {archivePage}/{totalPages}
+          </span>
           <button
+            type="button"
             onClick={() => setArchivePage(archivePage + 1)}
             disabled={!hasNextPage}
-            className="px-3 py-1 text-xs font-medium rounded-md bg-neutral-800 text-neutral-300 hover:bg-neutral-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors inline-flex items-center gap-1"
+            className="inline-flex min-h-11 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-900 px-3 text-sm font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
           >
             Next
-            <ChevronRight className="w-3.5 h-3.5" />
+            <ChevronRight className="h-4 w-4" aria-hidden="true" />
           </button>
         </div>
-      </div>
+      </footer>
     </div>
   );
 }
