@@ -1,96 +1,35 @@
 import type { ComponentProps, MutableRefObject, ReactNode } from 'react';
 import {
-  Activity,
-  Bell,
-  Gauge,
-  GitBranch,
   RotateCw,
-  Server,
-  Settings,
-  ShieldCheck,
-  SlidersHorizontal,
   Users,
   Wrench,
-  type LucideIcon,
 } from 'lucide-react';
 import { DirectionsPanel } from './DirectionsPanel';
-import type { DirectionsTab } from './DirectionsPanelHeader';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
 import { DashboardHome } from './DashboardHome';
 import { ConsoleHome } from './ConsoleHome';
 import { FleetRunnersPanel } from './FleetRunnersPanel';
 import { SettingsSectionRouter, type SettingsSectionRouterProps } from './SettingsSectionRouter';
-import type { SectionId } from './SettingsDropdown';
 import type { Task } from './TaskCard';
 import { WarmVmPanel } from './WarmVmPanel';
 import { WorkbenchPanel, WorkbenchSurface } from './WorkbenchLayout';
+import {
+  PROJECT_MANAGE_SECTIONS,
+  RUNTIME_SECTIONS,
+  resolveProjectManageItem,
+  resolveRuntimeItem,
+  resolveRuntimeSettingsItem,
+  visibleRuntimeSettingsSections,
+  type ProjectManageSection,
+  type ProjectSection,
+  type RuntimeSection,
+  type RuntimeSettingsSection,
+  type SectionNavItem,
+} from './OperatorWorkspaceSections';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import type { Project } from '../types/project';
 
-export type ProjectSection = DirectionsTab | 'manage';
-export type ProjectManageSection =
-  | 'overview'
-  | Extract<
-      SectionId,
-      | 'build-config'
-      | 'branches'
-      | 'auto-review'
-      | 'resource-envelope'
-      | 'auto-remediation'
-      | 'issue-implementation'
-      | 'alert-domains'
-      | 'access'
-    >;
-export type RuntimeSection = 'health' | 'devices' | 'compute' | 'accounts' | 'settings' | 'analytics';
-export type RuntimeSettingsSection = Extract<
-  SectionId,
-  | 'general'
-  | 'orchestrator'
-  | 'deploy'
-  | 'provider-routing'
-  | 'provider-settings'
-  | 'notifications'
-  | 'advanced'
->;
-
-type SectionNavItem<T extends string> = {
-  id: T;
-  label: string;
-  description: string;
-  icon: LucideIcon;
-  adminOnly?: boolean;
-};
-
-const PROJECT_MANAGE_SECTIONS: SectionNavItem<ProjectManageSection>[] = [
-  { id: 'overview', label: 'Overview', description: 'Repository, role, and project actions.', icon: Activity },
-  { id: 'build-config', label: 'Build', description: 'Detection, test, and install commands.', icon: Wrench },
-  { id: 'branches', label: 'Branches', description: 'Integration and promotion targets.', icon: GitBranch },
-  { id: 'auto-review', label: 'Auto-review', description: 'Review gates and autonomous decisions.', icon: Gauge },
-  { id: 'resource-envelope', label: 'Resources', description: 'Project runtime and budget envelope.', icon: Server },
-  { id: 'auto-remediation', label: 'Remediation', description: 'Failure recovery behavior.', icon: ShieldCheck },
-  { id: 'issue-implementation', label: 'Issues', description: 'Issue implementation policy.', icon: Settings },
-  { id: 'alert-domains', label: 'Alerts', description: 'Project alert domain routing.', icon: Bell },
-  { id: 'access', label: 'Access', description: 'Project members and user access.', icon: Users },
-];
-
-const RUNTIME_SETTINGS_SECTIONS: SectionNavItem<RuntimeSettingsSection>[] = [
-  { id: 'general', label: 'General', description: 'Defaults, refresh, and local UI behavior.', icon: SlidersHorizontal },
-  { id: 'orchestrator', label: 'Orchestrator', description: 'Global slots, retries, and automation limits.', icon: Server },
-  { id: 'deploy', label: 'Deploy', description: 'Pipeline health and deployment controls.', icon: ShieldCheck, adminOnly: true },
-  { id: 'provider-routing', label: 'Provider routing', description: 'Task and category routing policy.', icon: GitBranch, adminOnly: true },
-  { id: 'provider-settings', label: 'Provider settings', description: 'Model defaults and effort routing.', icon: Settings, adminOnly: true },
-  { id: 'notifications', label: 'Notifications', description: 'Webhook, event, and spend alerts.', icon: Bell },
-  { id: 'advanced', label: 'Advanced', description: 'Health-check endpoints and diagnostics.', icon: Wrench },
-];
-
-const RUNTIME_SECTIONS: SectionNavItem<RuntimeSection>[] = [
-  { id: 'health', label: 'Overview', description: 'Runtime health, task pressure, and fleet status at a glance.', icon: Activity },
-  { id: 'devices', label: 'Devices', description: 'Warm VMs, local runner hardware, and project-scoped device readiness.', icon: Server },
-  { id: 'compute', label: 'Compute', description: 'Running jobs, queued work, held approvals, and terminal run analysis.', icon: Gauge },
-  { id: 'accounts', label: 'Accounts', description: 'GitHub identity, LLM account roster, usage caps, and pool availability.', icon: Users },
-  { id: 'settings', label: 'Settings', description: 'Runtime defaults, automation limits, providers, deploy controls, and alerts.', icon: SlidersHorizontal },
-  { id: 'analytics', label: 'Analytics', description: 'Cost, account health, portfolio signals, and provider/model breakdowns.', icon: Activity },
-];
+export type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from './OperatorWorkspaceSections';
 
 function RuntimeSectionIntro<T extends string>({
   item,
@@ -188,8 +127,7 @@ export function ProjectWorkspace({
   onViewKnowledge,
   onNavigateToTask,
 }: ProjectWorkspaceProps) {
-  const activeProjectManageItem =
-    PROJECT_MANAGE_SECTIONS.find(item => item.id === projectManageSection) ?? PROJECT_MANAGE_SECTIONS[0]!;
+  const activeProjectManageItem = resolveProjectManageItem(projectManageSection);
   const ActiveProjectManageIcon = activeProjectManageItem.icon;
   const activeProjectSettingsSection = activeProjectManageItem.id === 'overview' ? null : activeProjectManageItem.id;
   const actionButtonClass = 'inline-flex min-h-9 items-center gap-1.5 rounded-md border border-neutral-800 bg-[#10151c] px-3 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-[#151c25] hover:text-neutral-100';
@@ -478,10 +416,9 @@ export function RuntimeWorkspace({
   onNavigateToKnowledge,
   onRestartOrchestrator,
 }: RuntimeWorkspaceProps) {
-  const runtimeSettingsSections = RUNTIME_SETTINGS_SECTIONS.filter(item => !item.adminOnly || userRole === 'admin');
-  const activeRuntimeItem = RUNTIME_SECTIONS.find(item => item.id === runtimeSection) ?? RUNTIME_SECTIONS[0]!;
-  const activeRuntimeSettingsItem =
-    runtimeSettingsSections.find(item => item.id === runtimeConfigSection) ?? runtimeSettingsSections[0]!;
+  const runtimeSettingsSections = visibleRuntimeSettingsSections(userRole);
+  const activeRuntimeItem = resolveRuntimeItem(runtimeSection);
+  const activeRuntimeSettingsItem = resolveRuntimeSettingsItem(runtimeConfigSection, userRole);
   const actionButtonClass = 'inline-flex min-h-11 min-w-11 items-center justify-center gap-1.5 rounded-md border border-neutral-800 bg-neutral-950/70 px-0 text-xs font-semibold text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 sm:min-h-9 sm:min-w-0 sm:px-3';
   const runtimeAccounts = settingsRouterProps.maxPlanAccounts ?? [];
   const accountTotal = runtimeAccounts.length;
