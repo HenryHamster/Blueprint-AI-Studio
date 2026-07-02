@@ -342,7 +342,8 @@ class TestComputeCompositeCiRequired:
         assert result["promote"] is True
         assert result["confidence"] >= _POLICY["threshold"]
 
-    def test_pending_still_blocks_when_ci_not_required(self):
+    @pytest.mark.parametrize("ci_state", ["pending", "api_error"])
+    def test_unresolved_still_blocks_when_ci_not_required(self, ci_state):
         """ci_required=False must not mask pending/API-error CI."""
         result = rq.compute_composite(
             ci_green=False,
@@ -350,7 +351,7 @@ class TestComputeCompositeCiRequired:
             test_erosion=1.0,
             smoketest_score=1.0,
             policy=_POLICY,
-            ci_state="pending",
+            ci_state=ci_state,
             ci_required=False,
         )
         assert result["confidence"] == 0.0

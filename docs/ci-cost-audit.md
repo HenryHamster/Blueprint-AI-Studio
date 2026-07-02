@@ -99,19 +99,25 @@ Each shard incurs a fixed startup overhead before any test runs:
 | `python -c 'from app.main import app...'` import check | ~5 s |
 | **Total fixed overhead per shard** | **~80–115 s ≈ 100 s** |
 
-The committed `backend/.test_durations` file shows the full suite at ~840 s of test
-time (9 200+ tests). GitHub Actions bills each job rounded up to the next whole minute.
+The committed `backend/.test_durations` file was refreshed from the successful
+2026-06-20 `main` CI run
+[`27864265710`](https://github.com/HenryHamster/BlueprintAIStudio/actions/runs/27864265710):
+16,012 backend pytest node timings, ~894 s (~14.9 min) serial. The refresh derived
+per-node durations from Actions timestamps in the eight green backend shard logs,
+without running the full backend suite on an agent VM. GitHub Actions bills each
+job rounded up to the next whole minute.
 
 | Shards | Tests/shard | Total/shard | Billed/shard | **Total billed** | Wall clock |
 |--------|------------|-------------|--------------|-----------------|------------|
-| 8 (current) | 105 s | 205 s → 3.4 min | **4 min** | **32 min** | ~3.5 min |
-| 6 | 140 s | 240 s → 4.0 min | **4 min** | **24 min** | ~4.0 min |
-| 4 | 210 s | 310 s → 5.2 min | **6 min** | **24 min** | ~5.2 min |
+| 8 (current) | 112 s | 212 s → 3.5 min | **4 min** | **32 min** | ~3.5 min |
+| 6 | 149 s | 249 s → 4.1 min | **5 min** | **30 min** | ~4.1 min |
+| 4 | 223 s | 323 s → 5.4 min | **6 min** | **24 min** | ~5.4 min |
 
-**6 shards saves 8 runner-minutes per run vs. 8 shards, with only ~30 s of added
-wall-clock latency.** 4 shards saves the same billed minutes but adds ~1.7 min wall
-time; present both as operator options. At ~20–30 main-targeting PRs per month, the
-monthly saving is 160–240 runner-minutes (~$1.30–$1.90/month at Linux rates).
+**6 shards saves about 2 runner-minutes per run vs. 8 shards, with only ~35 s of
+added wall-clock latency.** 4 shards saves about 8 billed minutes but adds ~1.9 min
+wall time; present both as operator options. At ~20–30 main-targeting PRs per
+month, the monthly saving is ~40–60 runner-minutes for 6 shards or ~160–240
+runner-minutes for 4 shards (~$0.30–$1.90/month at Linux rates).
 
 ### Apply-ready diff
 
@@ -119,7 +125,8 @@ monthly saving is 160–240 runner-minutes (~$1.30–$1.90/month at Linux rates)
 --- a/.github/workflows/ci.yml
 +++ b/.github/workflows/ci.yml
 @@ -337,11 +337,11 @@ jobs:
-     # Sharded: the suite (~7k tests, ~11.5 min serial) is split into 8 parallel
+-    # Sharded: the suite (~7k tests, ~11.5 min serial) is split into 8 parallel
++    # Sharded: the suite (~16k tests, ~15 min serial) is split into 8 parallel
 -    # legs via pytest-split (--splits 8 --group N). Each leg is an ordinary
 +    # legs via pytest-split (--splits 6 --group N). Each leg is an ordinary
      strategy:
@@ -154,10 +161,10 @@ Also update the display name in the `Run tests` step name (line ~451) for clarit
 - **Test distribution:** pytest-split auto-detects `backend/.test_durations` and rebalances
   by time. If that file becomes stale or is absent, it falls back to even count-based splits
   (graceful). No shard isolation problems — each shard runs its own postgres.
-- **Wall time:** 6 shards adds ~30 s to the critical path (4 min vs. 3.5 min). Unlikely
+- **Wall time:** 6 shards adds ~35 s to the critical path (4.1 min vs. 3.5 min). Unlikely
   to matter for the autonomous pipeline.
 - **The comment in the yml** currently says "~7k tests, ~11.5 min serial"; both numbers are
-  stale (9 200+ tests, ~14 min serial per `backend/.test_durations`). Update if you like.
+  stale (16,012 tests, ~15 min serial per `backend/.test_durations`). Update if you like.
 
 ---
 

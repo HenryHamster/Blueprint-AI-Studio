@@ -10,9 +10,10 @@ import json
 import logging
 import uuid
 from datetime import timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -46,6 +47,41 @@ _COMPUTE_JOB_TERMINAL_STATUSES = frozenset(
         ComputeJobStatus.TIMED_OUT,
     }
 )
+_ASK_HISTORY_MAX_TURNS = 6
+_ASK_HISTORY_TURN_MAX_CHARS = 1000
+
+
+class _ComputeJobAskHistoryTurn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    question: str = Field(..., min_length=1, max_length=_ASK_HISTORY_TURN_MAX_CHARS)
+    answer: str = Field(..., min_length=1, max_length=_ASK_HISTORY_TURN_MAX_CHARS)
+
+
+class _AskComputeJobRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    question: str = Field(..., min_length=1)
+    history: list[_ComputeJobAskHistoryTurn] = Field(default_factory=list)
+
+    @field_validator("history", mode="before")
+    @classmethod
+    def _sanitize_history(cls, value: Any) -> list[dict[str, str]]:
+        if not isinstance(value, list):
+            return []
+        turns: list[dict[str, str]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            question = item.get("question")
+            answer = item.get("answer")
+            if not isinstance(question, str) or not isinstance(answer, str):
+                continue
+            question = question[:_ASK_HISTORY_TURN_MAX_CHARS]
+            answer = answer[:_ASK_HISTORY_TURN_MAX_CHARS]
+            if question and answer:
+                turns.append({"question": question, "answer": answer})
+        return turns[-_ASK_HISTORY_MAX_TURNS:]
 
 router = APIRouter(
     prefix="/api/admin",
@@ -415,8 +451,7 @@ async def analyze_project_compute_job(
 @router.post("/compute-jobs/{job_id}/ask")
 async def ask_compute_job(
     job_id: uuid.UUID,
-    question: str = Body(..., embed=True),
-    history: List[Any] = Body(default=[]),
+    body: _AskComputeJobRequest,
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ):
@@ -456,12 +491,12 @@ async def ask_compute_job(
 
     return await answer_compute_experiment_question(
         task,
-        question=question,
+        question=body.question,
         outcome=outcome,
         cost=cost,
         criterion=criterion,
         result_reference=job.result_reference,
         session=session,
         logs=logs,
-        history=history or [],
+        history=[turn.model_dump() for turn in body.history],
     )

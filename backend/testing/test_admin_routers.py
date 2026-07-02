@@ -578,6 +578,9 @@ class TestGetAllProjects:
         assert "items" in data
         ids = [p["id"] for p in data["items"]]
         assert str(project.id) in ids
+        item = next(p for p in data["items"] if p["id"] == str(project.id))
+        assert item["name"] == "My Project"
+        assert "my_role" in item
 
     @pytest.mark.asyncio
     async def test_excludes_other_users_projects(self, client: AsyncClient, db_session):
@@ -6009,7 +6012,7 @@ class TestMessages:
         }
 
         with patch(
-            "app.routers.admin_projects.broadcast_to_project",
+            "app.routers.admin_project_strategic_session.broadcast_to_project",
             new_callable=AsyncMock,
         ) as broadcast:
             first = await client.post(

@@ -1806,23 +1806,23 @@ class TestChainInvariantSeedFixtures:
     def test_gapped_linear_chain_validates_clean(self):
         """A single-head chain with non-contiguous revision numbers (gap) is valid.
 
-        The v20 audit flagged the 0334->0347 Alembic numbering gap as suspicious.
+        The v20 audit flagged 0334->0347, and the v21 audit flagged
+        0354->0365, as suspicious Alembic numbering gaps.
         Gaps are a normal branch-cut artifact: tasks reserve numbers at cut time
         and merge-time reconciliation fills them.  validate_standalone_chain must
         accept a gapped-but-linear chain without error.
         """
         from app.migration_chain import validate_standalone_chain
 
-        # 0001 -> 0009 -> 0047: two deliberate gaps, but a single linear head.
+        # 0354 -> 0365: a deliberate branch-cut gap, but a single linear head.
         sources = {
-            "0001_root.py": self._src("0001", None),
-            "0009_mid.py": self._src("0009", "0001"),
-            "0047_tip.py": self._src("0047", "0009"),
+            "0354_acceptance_criteria.py": self._src("0354", None),
+            "0365_criterionevidence_unique.py": self._src("0365", "0354"),
         }
         errors = validate_standalone_chain(sources)
         assert not errors, (
             "validate_standalone_chain incorrectly rejected a gapped-but-linear "
-            f"chain (0001->0009->0047); errors: {errors}"
+            f"chain (0354->0365); errors: {errors}"
         )
 
     def test_validate_standalone_chain_aggregates_all_detectors(self):

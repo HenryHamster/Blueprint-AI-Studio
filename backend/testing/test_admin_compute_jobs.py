@@ -2012,33 +2012,15 @@ async def test_ask_compute_job_multi_turn_history_grounded(
 async def test_ask_compute_job_history_bounded_and_malformed_ignored(
     client: AsyncClient, db_session
 ):
-    """Oversized history is clamped server-side; malformed entries are ignored (no 500)."""
+    """Oversized history is clamped at the route boundary; malformed entries are ignored."""
     project = await _make_project(db_session, name="History Bounds Project")
     await _add_member(db_session, project.id, "member")
-    task, job = await _make_terminal_job_with_task(
+    _task, job = await _make_terminal_job_with_task(
         db_session,
         project,
         plan_output={"compute_result": {"outcome": "SUCCESS"}},
         polling_metadata={"result_metrics": {"score": 0.8}},
     )
-
-    captured_prompts: list[str] = []
-
-    class _FakeContent:
-        text = '{"answer": "The score was 0.8.", "citations": ["gs://bucket/jobs/job-1/result.json#metric:score=0.8"]}'
-
-    class _FakeResponse:
-        content = [_FakeContent()]
-
-    class _FakeMessages:
-        async def create(self, **kwargs):
-            captured_prompts.append(
-                (kwargs.get("messages") or [{}])[0].get("content", "")
-            )
-            return _FakeResponse()
-
-    class _FakeClient:
-        messages = _FakeMessages()
 
     # 10 valid turns (exceeds _QA_HISTORY_MAX_TURNS=6) plus 2 malformed entries
     oversized_history = [
@@ -2059,33 +2041,43 @@ async def test_ask_compute_job_history_bounded_and_malformed_ignored(
         {"bad_key": "no question or answer"},  # malformed — missing required fields
         "not a dict",  # malformed — wrong type entirely
     ]
+    long_question = "What did this very detailed compute run show? " + ("Q" * 600)
+    answer_mock = AsyncMock(
+        return_value={
+            "answer": "The score was 0.8.",
+            "citations": [],
+            "grounding_miss": False,
+            "fallback_reason": None,
+        }
+    )
 
-    with (
-        patch("anthropic.AsyncAnthropic", return_value=_FakeClient()),
-        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}),
+    with patch(
+        "app.knowledge_completion.answer_compute_experiment_question",
+        answer_mock,
     ):
         resp = await client.post(
             f"/api/admin/compute-jobs/{job.id}/ask",
-            json={"question": "What was the score?", "history": oversized_history},
+            json={"question": long_question, "history": oversized_history},
         )
 
     assert resp.status_code == 200
     body = resp.json()
     assert body["grounding_miss"] is False
 
-    assert captured_prompts
-    prompt_text = captured_prompts[0]
-    assert "Prior conversation" in prompt_text
-    assert all(f"history-question-{i}" not in prompt_text for i in range(4))
-    assert all(f"history-answer-{i}" not in prompt_text for i in range(4))
-    assert all(f"history-question-{i}" in prompt_text for i in range(4, 9))
-    assert all(f"history-answer-{i}" in prompt_text for i in range(4, 9))
-    assert "history-question-9-" in prompt_text
-    assert "history-answer-9-" in prompt_text
-    assert "-question-overflow" not in prompt_text
-    assert "-answer-overflow" not in prompt_text
-    assert "bad_key" not in prompt_text
-    assert "not a dict" not in prompt_text
+    assert answer_mock.await_count == 1
+    assert answer_mock.await_args.kwargs["question"] == long_question
+    forwarded_history = answer_mock.await_args.kwargs["history"]
+    assert forwarded_history == [
+        {"question": "history-question-4", "answer": "history-answer-4"},
+        {"question": "history-question-5", "answer": "history-answer-5"},
+        {"question": "history-question-6", "answer": "history-answer-6"},
+        {"question": "history-question-7", "answer": "history-answer-7"},
+        {"question": "history-question-8", "answer": "history-answer-8"},
+        {
+            "question": "history-question-9-" + ("Q" * 981),
+            "answer": "history-answer-9-" + ("A" * 983),
+        },
+    ]
 
 
 @pytest.mark.asyncio

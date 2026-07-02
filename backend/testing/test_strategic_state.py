@@ -2264,7 +2264,10 @@ async def test_strategic_session_command_executes_mode_and_records_receipt(
 ):
     project = await _make_project(db_session)
 
-    with patch("app.routers.admin_projects.emit_workbench_refetch", new=AsyncMock()) as bcast:
+    with patch(
+        "app.routers.admin_project_strategic_session.emit_workbench_refetch",
+        new=AsyncMock(),
+    ) as bcast:
         resp = await client.post(
             f"/api/admin/projects/{project.id}/strategic-session/commands/session.mode.continuous/execute",
             json={"idempotency_key": "cmd-mode-continuous-1"},
@@ -2452,7 +2455,10 @@ async def test_strategic_session_command_failed_receipt_refetches(
                 )
             ),
         ),
-        patch("app.routers.admin_projects.emit_workbench_refetch", new=AsyncMock()) as bcast,
+        patch(
+            "app.routers.admin_project_strategic_session.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as bcast,
     ):
         resp = await client.post(
             f"/api/admin/projects/{project.id}/strategic-session/commands/"
@@ -3064,7 +3070,7 @@ async def test_strategic_session_message_records_operator_message_and_snapshot(
         },
     }
     with patch(
-        "app.routers.admin_projects.broadcast_to_project",
+        "app.routers.admin_project_strategic_session.broadcast_to_project",
         new_callable=AsyncMock,
     ) as broadcast:
         first = await client.post(
