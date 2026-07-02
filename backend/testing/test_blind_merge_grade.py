@@ -409,6 +409,16 @@ async def test_finalize_blocks_failing_merge_grade(db_session, mocker):
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
+    # The merge-grade gate honours merge_grade_block_threshold (default 0.0 = off
+    # since #12457 / 74055c4f2); arm it so a failing grade actually blocks — this
+    # is the test's stated premise ("when the gate is armed").
+    mocker.patch.dict(
+        shared_state.runtime_config, {"merge_grade_block_threshold": 1.0}
+    )
+    # The armed + failing path consults the already-on-main ancestry exemption
+    # (finding 0); this candidate is NOT on the promotion target, so pin
+    # is_ancestor_of=False to keep the block load-bearing and the test hermetic.
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     promote_mock = mocker.patch(
         "app.release_qualifier.promote",
         new=AsyncMock(return_value={"status": "promoted", "confidence": 0.99}),

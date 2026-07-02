@@ -305,7 +305,13 @@ async def record_task_merge_evidence(
             if _open_ver is not None:
                 _release_version_id = _open_ver.id
         except Exception:
-            pass
+            logger.warning(
+                "record_task_merge_evidence: failed to resolve open version "
+                "for task %s (project %s); merge evidence not recorded",
+                getattr(task, "id", None),
+                project_id,
+                exc_info=True,
+            )
         if _release_version_id is None:
             return 0
         rows = await get_criteria_by_keys(

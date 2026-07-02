@@ -3,6 +3,7 @@ import { ArrowUpRight, BookmarkMinus, BookmarkPlus, GitPullRequest, ListTree, Ra
 import type { StrategicStateAttentionItem, StrategicWorkbenchState } from '../strategicStateApi';
 import type { Task } from '../types/task';
 import { timeAgo } from '../utils/time';
+import { safeExternalUrl } from '../utils/externalUrl';
 import { removeStrategicSelectedRef, upsertStrategicSelectedRef } from '../utils/strategicWorkbenchSession';
 import { WorkbenchPanel } from './WorkbenchLayout';
 import { StatusBadge, TaskTypeBadge } from './TaskCard';
@@ -268,7 +269,7 @@ function CurrentTaskCard({
   const parentTaskId = task.sideboard_context?.pipeline.parent_task_id ?? null;
   const blockedReason = task.sideboard_context?.pipeline.blocked_reason ?? null;
   const direction = task.sideboard_context?.strategic.direction;
-  const prUrl = task.pr_url ?? task.sideboard_context?.artifacts.primary_pr_url ?? null;
+  const prUrl = safeExternalUrl(task.pr_url ?? task.sideboard_context?.artifacts.primary_pr_url ?? null);
   const facts = taskRailFacts(task);
 
   return (

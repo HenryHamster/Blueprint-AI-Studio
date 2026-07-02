@@ -64,6 +64,31 @@ def test_workbench_event_envelope_is_v1_and_dedupes_refetch_surfaces():
     }
 
 
+@pytest.mark.parametrize(
+    "payloads,expected",
+    [
+        ([{"type": "create"}], "create"),
+        ([{"type": "  Refactor  "}], "Refactor"),
+        ([], None),
+        (None, None),
+        (["not-a-dict"], None),
+        ([{"no_type": "x"}], None),
+    ],
+)
+def test_payload_task_type_reads_first_payload(payloads, expected):
+    """_payload_task_type resolves the task type via the mandated
+    ``task.first_payload`` accessor (not a hand-rolled ``payloads[0]``)."""
+    from app.workbench_events import _payload_task_type
+
+    task = Task(
+        project_id=uuid.uuid4(),
+        title="task",
+        status=TaskStatus.QUEUED,
+        payloads=payloads,
+    )
+    assert _payload_task_type(task) == expected
+
+
 def test_build_workbench_event_payload_preserves_legacy_top_level_fields():
     project_id = uuid.uuid4()
 

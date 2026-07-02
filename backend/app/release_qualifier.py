@@ -2347,6 +2347,52 @@ async def _merged_pr_numbers_for_version(
     return sorted(pr_numbers)
 
 
+async def _candidate_already_on_main_at_finalize(
+    session: AsyncSession,
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+) -> bool:
+    """Best-effort: is ``candidate_sha`` already reachable from the promotion target?
+
+    A thin finalize-time wrapper over ``_candidate_already_on_main`` (resolves the
+    project's GitHub credentials first) used ONLY to exempt an already-landed
+    candidate from the restored hard merge-grade gate — see the exemption in
+    ``_finalize_qualification``.
+
+    Fail-CLOSED to ``False`` (keep the gate armed) on any credential / GitHub /
+    single-branch-repo condition: a transient failure must never wave a failing
+    merge-grade through, and a genuinely-landed candidate is re-detected on the
+    next finalize / sweep retry once GitHub is reachable.
+    """
+    if not candidate_sha:
+        return False
+    try:
+        project = await session.get(Project, version.project_id)
+        if project is None:
+            return False
+        integration_branch, promotion_target = _lts_branch_names(project)
+        if integration_branch == promotion_target:
+            # Single-branch repo (LTS inactive): "already on main" is not a
+            # meaningful distinction — nothing to exempt.
+            return False
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            return False
+        token, owner, repo = resolved
+        return await _candidate_already_on_main(
+            token, owner, repo, candidate_sha, version, project=project
+        )
+    except Exception as exc:  # noqa: BLE001 — a check failure keeps the gate armed
+        logger.warning(
+            "[RELEASE_QUALIFIER] merge-grade already-on-main exemption check "
+            "failed for v%d candidate %s (%s) — keeping the gate armed",
+            version.version_number,
+            (candidate_sha or "")[:8],
+            exc,
+        )
+        return False
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -3348,9 +3394,12 @@ async def _finalize_qualification(
 
     # --- Blind merge-grade artifact validation (dir d-c0fe439f) -------------
     # An uninvested release_merge_grade agent graded the merged diffs against the
-    # frozen version.goal (blind to running_update).  Read its verdict for
-    # observability and artifact integrity.  Canonical version acceptance
-    # criteria now drive the hard goal-coverage gate below.  Semantics:
+    # frozen version.goal (blind to running_update).  Since ae0664174 the grade
+    # is a HARD promotion blocker when armed: a "misses" verdict forces
+    # merge_grade_misses below (blocker="merge_grade_misses") whenever the
+    # operator has raised merge_grade_block_threshold above 0.0 — it is no longer
+    # observability-only.  The canonical version acceptance-criteria coverage
+    # gate is a separate, additional hard gate.  Semantics:
     #   * version.goal empty/unset → the gate is a no-op PASS (nothing to grade
     #     against); no child was spawned, merge_grade_task_id is None.
     #   * goal non-empty but the required grade is MISSING / UNPARSEABLE → HOLD
@@ -3412,6 +3461,33 @@ async def _finalize_qualification(
         },
         policy,
     )
+    # Already-on-main ancestry exemption (finding 0).  The restored hard
+    # merge-grade gate (ae0664174) can otherwise wedge an out-of-band
+    # force-promoted candidate: once it has landed on the promotion target
+    # directly, a "misses" verdict would keep producing not_promoted /
+    # merge_grade_misses every finalize, and NO reconciler clears that blocker
+    # (the prior_superseded exemption above is only set on the version-cut path,
+    # never on a bare force-merge).  A candidate already reachable from the
+    # promotion target is past the point where blocking promotion is meaningful,
+    # so exempt the grade.  Guarded by ``merge_grade_misses`` so the ancestry
+    # GitHub read only runs in the exact wedge case (armed gate + failing grade),
+    # never on the common unarmed / passing-grade paths.
+    if merge_grade_misses and await _candidate_already_on_main_at_finalize(
+        session, version, candidate_sha
+    ):
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s failed the blind merge-grade "
+            "but is already on the promotion target — exempting "
+            "merge_grade_misses to avoid a not_promoted wedge",
+            version.version_number,
+            (candidate_sha or "")[:8],
+        )
+        merge_grade_misses = False
+        merge_grade_cert = {
+            **merge_grade_cert,
+            "status": "already_on_main_exempt",
+            "blocked": False,
+        }
     composite = compute_composite(
         ci_green=ci_green,
         audit_score=audit_score,
@@ -3448,6 +3524,16 @@ async def _finalize_qualification(
         "threshold": policy.get("threshold"),
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
+        # One-shot keyless re-qualification marker (finding 1).  The sweep's
+        # same-SHA keyless re-drive (release_qualifier_sweep._redrive_not_promoted_
+        # qualification) bounds itself to exactly-once by checking this marker on
+        # the not_promoted record.  base_record REPLACES last_qualification, so it
+        # must carry the marker forward from the pending record (run_qualification
+        # seeds it from the prior verdict) — otherwise the exactly-once bound is
+        # lost and heavy re-qualification can loop on an unchanged HEAD.
+        "keyless_requalification_consumed_at": qual.get(
+            "keyless_requalification_consumed_at"
+        ),
         "audit_task_id": audit_task_id,
         "challenge_task_id": challenge_task_id,
         # Parsed challenge artifact — observable on last_qualification.

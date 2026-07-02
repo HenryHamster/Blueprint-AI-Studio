@@ -960,7 +960,15 @@ async def refresh_strategic_local_continuation_on_runner_heartbeat(
         skip_locked=False,
     )
     if not renewed_marker:
-        await session.rollback()
+        # Release the project row lock with a commit, not a rollback. A rollback
+        # expires every ORM instance in the shared session even under
+        # expire_on_commit=False (see database.py) — including the caller's
+        # `runner` row. The heartbeat handler reads runner attributes after this
+        # helper returns, so an expired instance would trigger a sync lazy-load
+        # -> MissingGreenlet (HTTP 500). `with_vision_locked` only wrote the
+        # vision dict back unchanged when the renewal was declined, so committing
+        # persists no marker change while keeping the caller's instances loaded.
+        await session.commit()
         return False
 
     next_workbench = dict(workbench)

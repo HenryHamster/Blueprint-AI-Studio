@@ -1340,6 +1340,75 @@ class TestRunnerEndpoints:
         assert runner.status == "active"
         assert runner.last_seen_at > _utcnow() - timedelta(minutes=1)
 
+    @pytest.mark.asyncio
+    async def test_heartbeat_survives_declined_continuation_renewal_race(
+        self, client: AsyncClient, db_session
+    ):
+        """Regression: the with_vision_locked decline branch must not 500.
+
+        When a concurrent heartbeat wins the renewal race, the in-lock
+        ``_renew_marker`` declines and ``renewed_marker`` stays False. That
+        branch must release the project row lock with a COMMIT, not a rollback:
+        a rollback expires every ORM instance in the shared session (even under
+        expire_on_commit=False), including the caller's ``runner`` row, so the
+        heartbeat handler's subsequent ``runner.status`` read would trigger a
+        sync lazy-load -> MissingGreenlet (HTTP 500).
+
+        Patching ``with_vision_locked`` to a no-op forces the decline branch
+        deterministically: every pre-lock guard passes (renewal IS due) but the
+        marker is never renewed, reproducing the race without real concurrency.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        # 2 minutes ago -> renewal IS due, so the helper reaches
+        # with_vision_locked before it can decline.
+        old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+        preferred_runner_id = str(runner.id)
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            runner_id=preferred_runner_id,
+        )
+
+        with patch(
+            "app.workbench_state.with_vision_locked",
+            new=AsyncMock(return_value=True),
+        ):
+            resp = await client.post(
+                "/api/runner/heartbeat",
+                json={},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # Before the fix this was a 500 (MissingGreenlet on the expired runner).
+        assert resp.status_code == 200
+        # Decline must still decline: the marker is left untouched.
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["last_seen_at"] == old_at
+        assert marker["updated_at"] == old_at
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                    MessagesNoisePrefs.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        assert (
+            prefs_row.prefs[WORKBENCH_STATE_KEY]["last_interaction_at"] == old_at
+        )
+
 
 # ── Durable artifact upload endpoint (FIX M1, backend side) ───────────────────
 

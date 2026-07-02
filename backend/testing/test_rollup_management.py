@@ -2893,6 +2893,75 @@ async def test_post_merge_housekeeping_refreshes_all_directions(mocker):
     assert child_a2 not in refreshed_children, "duplicate direction A child must not be refreshed"
 
 
+def test_check_and_trigger_rollup_refreshes_all_directions_at_every_landed_site():
+    """Every inline landed-rollup path in ``_check_and_trigger_rollup`` must
+    refresh EVERY member direction, not just a single representative child.
+
+    Regression guard for the audit finding: the multi-direction refresh fix was
+    originally applied only to the shared ``_do_rollup_post_merge_housekeeping``
+    helper (covered behaviorally by the test above), while the three inline
+    landed paths inside ``_check_and_trigger_rollup`` still selected one child
+    via ``_dir_child = next(...)`` and refreshed only that direction — leaving
+    the other directions' merged/outcome counts stale.
+
+    Driving those inline branches end-to-end is impractical (each sits behind a
+    large amount of GitHub I/O), so this asserts the structural invariant on the
+    function's AST: (1) the single-representative ``_dir_child`` pattern is gone,
+    and (2) every ``refresh_direction_outcomes_after_merge`` call in the function
+    is fed the per-direction loop variable ``_rep`` produced by iterating over
+    ``_dir_representatives.values()``.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from app import rollup_management
+
+    src = textwrap.dedent(
+        inspect.getsource(rollup_management._check_and_trigger_rollup)
+    )
+    func = ast.parse(src).body[0]
+
+    # (1) The single-representative selection pattern must no longer exist.
+    assert "_dir_child" not in src, (
+        "_check_and_trigger_rollup still contains a single-representative "
+        "`_dir_child = next(...)` refresh; every landed path must refresh all "
+        "directions via `_dir_representatives`."
+    )
+
+    # (2) Every direct refresh call must be driven by the per-direction loop var.
+    refresh_calls = [
+        node
+        for node in ast.walk(func)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "refresh_direction_outcomes_after_merge"
+    ]
+    assert len(refresh_calls) == 3, (
+        f"expected 3 inline refresh sites, found {len(refresh_calls)}"
+    )
+    for call in refresh_calls:
+        assert call.args and isinstance(call.args[0], ast.Name), (
+            "refresh_direction_outcomes_after_merge must take a name as its "
+            f"first arg, got {ast.dump(call)}"
+        )
+        assert call.args[0].id == "_rep", (
+            "refresh call must pass `_rep` (the per-direction representative), "
+            f"got `{call.args[0].id}`"
+        )
+
+    rep_loops = [
+        node
+        for node in ast.walk(func)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "_rep"
+    ]
+    assert len(rep_loops) == 3, (
+        f"expected 3 per-direction refresh loops, found {len(rep_loops)}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_record_completed_children_merge_evidence_records_every_child(mocker):
     """The landed-child evidence helper must touch every completed child."""

@@ -250,6 +250,19 @@ def compute_goal_coverage_drift(
             "detail": "Merge-grade was exempted as superseded; no coverage verdict available.",
         }
 
+    if merge_grade_status == "already_on_main_exempt":
+        return {
+            "signal": "superseded_exempt",
+            "coverage": coverage,
+            "biggest_gap": biggest_gap,
+            "merges_since_grade": merges_since_grade,
+            "stale": False,
+            "detail": (
+                "Merge-grade was exempted because the candidate is already on the "
+                "promotion target; no coverage verdict available."
+            ),
+        }
+
     if merge_grade_status not in ("pass", "fail"):
         return {
             "signal": "no_grade_yet",

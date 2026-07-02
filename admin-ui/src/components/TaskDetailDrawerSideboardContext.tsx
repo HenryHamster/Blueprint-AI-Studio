@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import { Activity, AlertTriangle, Box, Cpu, DollarSign, GitBranch, GitPullRequest, Link2, MessageSquare, Network, Route } from 'lucide-react';
 import type { Task } from '../types/task';
+import { safeExternalUrl } from '../utils/externalUrl';
 import { SectionHeader } from './TaskDetailDrawerPrimitives';
 
 type SideboardLink = NonNullable<Task['sideboard_context']>['links'][number];
@@ -17,16 +18,6 @@ function artifactSummary(byType: Record<string, number>): string {
 
 function pluralize(count: number, singular: string, plural = `${singular}s`): string {
   return `${count} ${count === 1 ? singular : plural}`;
-}
-
-function safeExternalUrl(value?: string | null): string | null {
-  if (!value) return null;
-  try {
-    const url = new URL(value);
-    return url.protocol === 'http:' || url.protocol === 'https:' ? url.href : null;
-  } catch {
-    return null;
-  }
 }
 
 function compactTargetId(value?: string | null): string | null {

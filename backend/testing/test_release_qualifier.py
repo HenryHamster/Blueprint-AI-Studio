@@ -10058,6 +10058,10 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
         shared_state.runtime_config,
         {"promotion_enabled": True, "merge_grade_block_threshold": 0.1},
     )
+    # An armed + failing merge-grade consults the already-on-main ancestry
+    # exemption (finding 0). This candidate is NOT on the promotion target, so
+    # the block persists — pin is_ancestor_of=False to keep the test hermetic.
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     project_d, version_d = await _make_project_and_version(db_session)
     await _seed_qualification_children(
         db_session,
@@ -10098,14 +10102,24 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
     is suppressed even when covers_goal=False.  A fresh version that never had
     qualification_superseded still blocks.
 
-    Scenarios:
+    Scenarios (with the merge-grade gate ARMED via merge_grade_block_threshold):
       (a) prior_superseded=True + failing merge-grade -> NOT blocked, promote proceeds
-      (b) prior_superseded absent/False + failing merge-grade -> hard block (gate
-          remains load-bearing for never-promoted versions)
+      (b) prior_superseded absent/False + failing merge-grade (candidate NOT on
+          main) -> hard block (gate remains load-bearing for never-promoted
+          versions)
     """
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
+    # Arm the merge-grade gate — since the gate honours merge_grade_block_threshold
+    # (default 0.0 = off), a failing grade only blocks when the threshold is raised.
+    mocker.patch.dict(
+        shared_state.runtime_config, {"merge_grade_block_threshold": 1.0}
+    )
+    # The armed + failing merge-grade path consults the already-on-main ancestry
+    # exemption (finding 0); these candidates are NOT on the promotion target, so
+    # pin is_ancestor_of=False to keep the block load-bearing and the test hermetic.
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
 
     clean_audit = {
         "audit_score": 1.0,
@@ -10188,6 +10202,177 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
     await db_session.refresh(version_b)
     assert version_b.last_qualification["blocker"] == "merge_grade_misses"
     assert version_b.last_qualification["merge_grade_status"] == "fail"
+
+
+@pytest.mark.asyncio
+async def test_finalize_merge_grade_exempts_candidate_already_on_main(
+    db_session, mocker
+):
+    """Finding 0: an armed + failing merge-grade must NOT wedge a candidate that
+    has already landed on the promotion target.
+
+    An out-of-band force-promoted candidate never gets the prior_superseded flag
+    (that is only set on the version-cut path), so without an ancestry exemption
+    the restored hard merge-grade gate would keep writing not_promoted /
+    merge_grade_misses forever with no reconciler to clear it. When the candidate
+    is already reachable from main, the grade is exempted and promotion proceeds.
+
+    Control: the SAME armed + failing grade with the candidate NOT on main still
+    hard-blocks (the exemption is scoped to already-landed candidates only).
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    # Arm the gate so a failing merge-grade is load-bearing.
+    mocker.patch.dict(
+        shared_state.runtime_config, {"merge_grade_block_threshold": 1.0}
+    )
+
+    clean_audit = {
+        "audit_score": 1.0,
+        "test_erosion": {
+            "deleted_test_files": [],
+            "assertion_delta": 5,
+            "test_count_delta": 2,
+        },
+    }
+    clean_smoke = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+    failing_merge_grade = {
+        "covers_goal": False,
+        "coverage_score": 0.05,
+        "biggest_gap": "Feature content already merged straight to main.",
+        "candidate_sha": "feed" * 10,
+    }
+    goal = "Deliver the already-on-main merge-grade exemption"
+
+    # --- Candidate ALREADY on main -> exempted, promote proceeds -------------
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    project_a, version_a = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_a,
+        version_a,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    promote_a = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+    result_a = await rq._finalize_qualification(db_session, version_a)
+    await db_session.commit()
+
+    # promote() is only reached because the failing grade was exempted; the
+    # base_record it receives records the exemption (provenance), not a pass.
+    promote_a.assert_called_once()
+    assert result_a == {"status": "promoted"}
+    _base_record_a = promote_a.call_args.kwargs["base_record"]
+    assert _base_record_a["merge_grade_status"] == "already_on_main_exempt"
+    assert _base_record_a["merge_grade_misses"] is False
+
+    # --- Control: candidate NOT on main -> the armed failing grade blocks ----
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    project_b, version_b = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_b,
+        version_b,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs=failing_merge_grade,
+    )
+    promote_b = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+    result_b = await rq._finalize_qualification(db_session, version_b)
+    await db_session.commit()
+
+    promote_b.assert_not_called()
+    assert result_b["status"] == "not_promoted"
+    assert result_b["blocker"] == "merge_grade_misses"
+
+
+@pytest.mark.asyncio
+async def test_finalize_not_promoted_carries_keyless_requalification_marker(
+    db_session, mocker
+):
+    """Finding 1: the not_promoted record must carry the one-shot
+    ``keyless_requalification_consumed_at`` marker forward from the prior
+    (pending) qualification.
+
+    The sweep's same-SHA keyless re-drive bounds itself to exactly-once by
+    checking this marker on the not_promoted record. Because base_record REPLACES
+    last_qualification wholesale, dropping the marker would break the exactly-once
+    bound and let heavy re-qualification loop on an unchanged HEAD.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    # A clean audit but a DELETED test file classified as genuine_erosion -> a
+    # deterministic test_file_deleted hard blocker, so finalize takes the
+    # not_promoted path without any merge-grade / GitHub ancestry interaction.
+    # (_score_audit reads the deleted set from test_erosion and the per-file
+    # classification from the report-level deleted_test_file_classifications.)
+    eroding_audit = {
+        "audit_score": 1.0,
+        "test_erosion": {
+            "deleted_test_files": ["backend/testing/test_gone.py"],
+        },
+        "deleted_test_file_classifications": [
+            {
+                "path": "backend/testing/test_gone.py",
+                "classification": "genuine_erosion",
+            }
+        ],
+    }
+    clean_smoke = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs=eroding_audit,
+        smoke_logs=clean_smoke,
+    )
+    # Stamp the one-shot keyless marker on the pending record, exactly as
+    # run_qualification carries it forward from the prior verdict.
+    marker = "2026-06-30T00:00:00+00:00"
+    version.last_qualification = {
+        **version.last_qualification,
+        "keyless_requalification_consumed_at": marker,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    promote = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    promote.assert_not_called()
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "test_file_deleted"
+    await db_session.refresh(version)
+    # The marker survives the base_record replacement (finding 1 fix).
+    assert (
+        version.last_qualification["keyless_requalification_consumed_at"] == marker
+    )
 
 
 @pytest.mark.asyncio

@@ -435,4 +435,35 @@ describe('TaskContextRail', () => {
     expect(screen.getByText('1,002 child tasks')).toBeInTheDocument();
     expect(screen.queryByText('1,000 child tasks')).not.toBeInTheDocument();
   });
+
+  test('renders a safe https pr_url as the PR action href', () => {
+    render(
+      <TaskContextRail
+        currentTask={makeTask({
+          pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/7',
+          sideboard_context: null,
+        })}
+        attentionTasks={[]}
+        onOpenTask={vi.fn()}
+      />,
+    );
+
+    const link = screen.getByRole('link', { name: /pr/i });
+    expect(link).toHaveAttribute('href', 'https://github.com/HenryHamster/BlueprintAIStudio/pull/7');
+  });
+
+  test('drops an unsafe-scheme pr_url instead of rendering it as an href', () => {
+    render(
+      <TaskContextRail
+        currentTask={makeTask({
+          pr_url: 'javascript:alert(document.cookie)',
+          sideboard_context: null,
+        })}
+        attentionTasks={[]}
+        onOpenTask={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole('link', { name: /pr/i })).not.toBeInTheDocument();
+  });
 });

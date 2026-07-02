@@ -70,8 +70,7 @@ def _parse_iso_datetime(value: Any) -> datetime | None:
 
 
 def _payload_task_type(task: Task) -> str | None:
-    payloads = task.payloads if isinstance(task.payloads, list) else []
-    first = payloads[0] if payloads and isinstance(payloads[0], dict) else {}
+    first = task.first_payload if isinstance(task.first_payload, dict) else {}
     return _compact_str(first.get("type"), max_chars=80)
 
 

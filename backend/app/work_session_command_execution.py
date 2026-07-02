@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import uuid
 from typing import Any
 
@@ -47,6 +48,8 @@ from app.workbench_state import (
     workbench_mode_should_arm_strategic_refresh,
     workbench_state_size_bytes,
 )
+
+logger = logging.getLogger(__name__)
 
 OPERATOR_COMMAND_EVENT_TYPE = "operator_command"
 WORK_SESSION_COMMAND_JOB_LIMIT = 8
@@ -398,6 +401,14 @@ async def _request_arming_after_receipt(
             await session.commit()
             return ARMING_STEERING
     except Exception:
+        # A refresh failure must not fail the already-persisted command receipt,
+        # but it must stay traceable: log with context so a real DB/trigger
+        # failure is distinguishable from a benign not-armed outcome.
+        logger.exception(
+            "[WORKBENCH] arming strategic refresh after command receipt failed "
+            "for project %s",
+            project_id,
+        )
         with contextlib.suppress(Exception):
             await session.rollback()
         return ARMING_NOT_ARMED
