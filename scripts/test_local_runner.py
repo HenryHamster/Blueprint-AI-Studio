@@ -13,6 +13,65 @@ from unittest.mock import MagicMock, patch
 # Add scripts dir to path so we can import local_runner directly
 sys.path.insert(0, str(Path(__file__).parent))
 import local_runner
+import runner_isolation as iso
+
+
+# ── Capability factories (isolation core) ─────────────────────────────────────
+
+def _bwrap_caps(gpu_indices=()):
+    """A host where a bwrap sandbox can be built (no container runtime)."""
+    return iso.Capabilities(
+        bwrap_path="/usr/bin/bwrap",
+        unshare_path="/usr/bin/unshare",
+        userns_ok=True,
+        gpu_indices=tuple(gpu_indices),
+        gpu_names=tuple(f"Tesla V100-{i}" for i in gpu_indices),
+    )
+
+
+def _docker_caps(gpu_indices=()):
+    """A host with usable docker (and optionally GPUs), no bwrap."""
+    return iso.Capabilities(
+        docker_usable=True,
+        gpu_indices=tuple(gpu_indices),
+        gpu_names=tuple(f"Tesla V100-{i}" for i in gpu_indices),
+    )
+
+
+def _gpu_state(indices):
+    return {
+        "allowed": list(indices),
+        "in_use": set(),
+        "per_job": 1,
+        "lock": threading.Lock(),
+    }
+
+
+def _bare_plan_factory(captured=None):
+    """Return a fake plan_compute_execution that substitutes a BARE argv.
+
+    The sandbox argv/env is exhaustively verified in test_runner_isolation.py;
+    substituting a bare plan here lets the exec/report/metrics/teardown loop run
+    against a REAL process (bwrap is not installed in CI) while still threading
+    BLUEPRINT_RESULT_FILE/ARTIFACT_DIR through exactly as the real plan would.
+    """
+    def _fake(**kw):
+        if captured is not None:
+            captured.update(kw)
+        # Test bypass: inherit the FULL host env so the real `bash` launch works
+        # cross-platform (Git Bash on Windows needs SYSTEMROOT/etc.). The env
+        # ALLOWLIST is verified separately in test_runner_isolation.py; here we
+        # only exercise the exec/report/metrics loop with a live process.
+        env = os.environ.copy()
+        env.update(kw.get("job_env") or {})
+        env["BLUEPRINT_RESULT_FILE"] = kw["result_file_host"]
+        env["BLUEPRINT_ARTIFACT_DIR"] = kw["artifact_dir_host"]
+        return iso.ExecutionPlan(
+            backend="bwrap",
+            argv=["bash", "-lc", kw["command"]],
+            env=env,
+        )
+    return _fake
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -569,6 +628,7 @@ class TestRunComputeJob(unittest.TestCase):
                 active_jobs,
                 lock,
                 capacity,
+                capabilities=_bwrap_caps(),
             )
 
         self.assertNotIn("test-job-001", active_jobs)
@@ -607,9 +667,10 @@ class TestRunComputeJob(unittest.TestCase):
         active_jobs: set = {"test-job-001"}
         lock = threading.Lock()
 
-        with patch.object(local_runner, "_report_compute_job", fake_report):
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(local_runner.iso, "plan_compute_execution", _bare_plan_factory()):
             local_runner._run_compute_job(job, "https://api.example.com", "tok",
-                                          active_jobs, lock)
+                                          active_jobs, lock, capabilities=_bwrap_caps())
 
         terminal = [r for r in reports if r["exec_status"] in ("succeeded", "failed")]
         self.assertTrue(terminal, "Expected a terminal report")
@@ -632,29 +693,29 @@ class TestRunComputeJob(unittest.TestCase):
         active_jobs: set = {"test-job-001"}
         lock = threading.Lock()
 
-        with patch.object(local_runner, "_report_compute_job", fake_report):
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(local_runner.iso, "plan_compute_execution", _bare_plan_factory()):
             local_runner._run_compute_job(job, "https://api.example.com", "tok",
-                                          active_jobs, lock)
+                                          active_jobs, lock, capabilities=_bwrap_caps())
 
         terminal = [r for r in reports if r["exec_status"] in ("succeeded", "failed")]
         self.assertTrue(terminal)
         self.assertEqual(terminal[-1]["exec_status"], "failed")
         self.assertNotEqual(terminal[-1]["exit_code"], 0)
 
-    def test_setup_step_nonzero_fails_immediately(self):
-        """A non-zero setup_step exit reports failed without running main command."""
+    def test_setup_step_folded_into_sandbox_and_aborts_on_failure(self):
+        """setup_step is folded into the sandboxed command (NOT run bare) and a
+        setup failure short-circuits the main command via `&&`.
+
+        BEHAVIOR CHANGE (fail-closed isolation): the old runner executed
+        setup_step as a bare `bash -lc` on the HOST before the container. That is
+        an unsandboxed execution path, so setup now runs INSIDE the same boundary
+        as the main command. `{ setup } && { main }` preserves the original
+        semantics: a non-zero setup aborts before main and the job fails with the
+        setup exit code.
+        """
         reports = []
-        commands_run = []
-
-        real_run = subprocess.run
-
-        def fake_run(args, **kwargs):
-            commands_run.append(args[2] if len(args) > 2 else args)
-            if len(args) >= 3 and args[2] == "exit 2":
-                mock = MagicMock()
-                mock.returncode = 2
-                return mock
-            return real_run(args, **kwargs)
+        captured: dict = {}
 
         def fake_report(orch_url, token, job_id, *, exec_status, exit_code=None,
                         result_metrics=None, command_log=None):
@@ -669,17 +730,19 @@ class TestRunComputeJob(unittest.TestCase):
         lock = threading.Lock()
 
         with patch.object(local_runner, "_report_compute_job", fake_report), \
-             patch("subprocess.run", side_effect=fake_run):
+             patch.object(local_runner.iso, "plan_compute_execution",
+                          _bare_plan_factory(captured)):
             local_runner._run_compute_job(job, "https://api.example.com", "tok",
-                                          active_jobs, lock)
+                                          active_jobs, lock, capabilities=_bwrap_caps())
 
-        # Should report failed with setup exit code
+        # setup + main folded into one sandboxed command, joined by `&&`.
+        self.assertIn("exit 2", captured["command"])
+        self.assertIn("echo main", captured["command"])
+        self.assertIn("&&", captured["command"])
+        # Real bash run: setup exit 2 short-circuits → job fails with exit 2.
         self.assertTrue(reports)
-        # Only the setup should have triggered a report
         self.assertEqual(reports[-1]["exec_status"], "failed")
         self.assertEqual(reports[-1]["exit_code"], 2)
-        # Main command (echo main) should NOT have been reached via Popen
-        # (only subprocess.run calls for setup_step, no Popen for main)
 
     def test_container_image_uses_docker_run(self):
         """When container_image is set, docker run args include volume mount and env vars."""
@@ -720,23 +783,29 @@ class TestRunComputeJob(unittest.TestCase):
         lock = threading.Lock()
 
         with patch.object(local_runner, "_report_compute_job", fake_report), \
-             patch("subprocess.Popen", side_effect=fake_popen), \
-             patch.object(local_runner, "_detect_runner_gpu", return_value=False):
+             patch("subprocess.Popen", side_effect=fake_popen):
             local_runner._run_compute_job(job, "https://api.example.com", "tok",
-                                          active_jobs, lock)
+                                          active_jobs, lock, capabilities=_docker_caps())
 
         self.assertTrue(popen_calls, "Expected Popen to be called for main command")
         docker_args = popen_calls[0]
         self.assertEqual(docker_args[0], "docker")
         self.assertEqual(docker_args[1], "run")
         self.assertIn("--rm", docker_args)
+        # Named for teardown-by-name.
+        self.assertIn("--name", docker_args)
         # Volume mount includes the container out dir
         v_idx = docker_args.index("-v")
         self.assertIn(local_runner._RUNNER_CONTAINER_OUT_DIR, docker_args[v_idx + 1])
         # Image appears before the command
         self.assertIn("nvcr.io/nvidia/pytorch:latest", docker_args)
-        # --gpus all NOT present when GPU not detected
+        # No GPUs on this host → no --gpus flag.
         self.assertNotIn("--gpus", docker_args)
+        # Env values are forwarded via `-e KEY` (no inlined KEY=VALUE on argv).
+        e_indices = [i for i, a in enumerate(docker_args) if a == "-e"]
+        for i in e_indices:
+            self.assertNotIn("=", docker_args[i + 1],
+                             "env must be `-e KEY` not `-e KEY=VALUE` (value off argv)")
 
     def test_container_image_with_gpu_adds_gpus_flag(self):
         """When GPU is detected, docker run includes --gpus all."""
@@ -770,15 +839,19 @@ class TestRunComputeJob(unittest.TestCase):
         lock = threading.Lock()
 
         with patch.object(local_runner, "_report_compute_job", fake_report), \
-             patch("subprocess.Popen", side_effect=fake_popen), \
-             patch.object(local_runner, "_detect_runner_gpu", return_value=True):
-            local_runner._run_compute_job(job, "https://api.example.com", "tok",
-                                          active_jobs, lock)
+             patch("subprocess.Popen", side_effect=fake_popen):
+            local_runner._run_compute_job(
+                job, "https://api.example.com", "tok",
+                active_jobs, lock,
+                capabilities=_docker_caps(gpu_indices=(0,)),
+                gpu_state=_gpu_state([0]),
+            )
 
         docker_args = popen_calls[0]
         self.assertIn("--gpus", docker_args)
         gpus_idx = docker_args.index("--gpus")
-        self.assertEqual(docker_args[gpus_idx + 1], "all")
+        # GPUs are scoped to the ASSIGNED device, not "all".
+        self.assertEqual(docker_args[gpus_idx + 1], "device=0")
 
     def test_cancel_requested_on_claim_skips_execution(self):
         """When cancel_requested is True on the job body, no subprocess is started."""
@@ -795,7 +868,7 @@ class TestRunComputeJob(unittest.TestCase):
         with patch.object(local_runner, "_report_compute_job", fake_report), \
              patch("subprocess.Popen") as mock_popen:
             local_runner._run_compute_job(job, "https://api.example.com", "tok",
-                                          active_jobs, lock)
+                                          active_jobs, lock, capabilities=_bwrap_caps())
 
         mock_popen.assert_not_called()
         self.assertIn("failed", reports)
@@ -816,11 +889,15 @@ class TestRunComputeJob(unittest.TestCase):
                     raise subprocess.TimeoutExpired(cmd="bash", timeout=30)
                 return 1
 
+            def poll(self):
+                # After teardown the process is gone (terminate_process_tree polls).
+                return 1 if proc_terminated else None
+
             def terminate(self):
                 proc_terminated.append(True)
 
             def kill(self):
-                pass
+                proc_terminated.append(True)
 
         fake_proc = FakeProc()
         fake_proc.stdout.read.return_value = b""
@@ -841,9 +918,9 @@ class TestRunComputeJob(unittest.TestCase):
         with patch.object(local_runner, "_report_compute_job", fake_report), \
              patch("subprocess.Popen", return_value=fake_proc):
             local_runner._run_compute_job(job, "https://api.example.com", "tok",
-                                          active_jobs, lock)
+                                          active_jobs, lock, capabilities=_bwrap_caps())
 
-        self.assertTrue(proc_terminated, "Expected proc.terminate() to be called")
+        self.assertTrue(proc_terminated, "Expected the process group to be torn down")
         self.assertIn("failed", report_statuses)
 
 
@@ -966,8 +1043,8 @@ class TestComputePollLoop(unittest.TestCase):
             return 204, None
 
         class FakeThread:
-            def __init__(self, target=None, args=(), daemon=False):
-                threads_started.append({"target": target, "args": args})
+            def __init__(self, target=None, args=(), kwargs=None, daemon=False):
+                threads_started.append({"target": target, "args": args, "kwargs": kwargs})
 
             def start(self):
                 pass
@@ -1013,7 +1090,7 @@ class TestComputePollLoop(unittest.TestCase):
             return False
 
         class FailingThread:
-            def __init__(self, target=None, args=(), daemon=False):
+            def __init__(self, target=None, args=(), kwargs=None, daemon=False):
                 pass
 
             def start(self):
@@ -1283,10 +1360,9 @@ class TestDockerLogin(unittest.TestCase):
 
         with patch.object(local_runner, "_report_compute_job", fake_report), \
              patch.object(local_runner, "_docker_login", fake_docker_login), \
-             patch("subprocess.Popen", side_effect=fake_popen), \
-             patch.object(local_runner, "_detect_runner_gpu", return_value=False):
+             patch("subprocess.Popen", side_effect=fake_popen):
             local_runner._run_compute_job(job, "https://api.example.com", "tok",
-                                          active_jobs, lock)
+                                          active_jobs, lock, capabilities=_docker_caps())
 
         self.assertEqual(len(login_calls), 1, "docker login must be called once")
         self.assertEqual(login_calls[0]["server"], "nvcr.io")
@@ -1336,7 +1412,7 @@ class TestDockerLogin(unittest.TestCase):
              patch.object(local_runner, "_docker_login", fake_docker_login), \
              patch("subprocess.Popen", side_effect=fake_popen):
             local_runner._run_compute_job(job, "https://api.example.com", "tok",
-                                          active_jobs, lock)
+                                          active_jobs, lock, capabilities=_docker_caps())
 
         self.assertIn("failed", reports)
         self.assertEqual(popen_calls, [], "docker run must not be called on login failure")

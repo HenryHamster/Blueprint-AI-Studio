@@ -16,6 +16,21 @@ Optional environment variables:
     BLUEPRINT_RUNNER_POLL_INTERVAL    Base poll interval in seconds (default: 2)
     BLUEPRINT_RUNNER_WORKSPACE_ROOT   Parent directory for per-task agent workspaces
                                       (default: <tmp>/blueprint-agent-workspaces)
+    BLUEPRINT_RUNNER_GPU_INDICES      Comma-separated GPU-index allowlist (default: all)
+    BLUEPRINT_RUNNER_GPUS_PER_JOB     GPUs assigned per compute job (default: 1)
+    BLUEPRINT_RUNNER_CPU_LIMIT        Best-effort CPU cap (cores) per task
+    BLUEPRINT_RUNNER_MEM_LIMIT        Best-effort memory cap per task (e.g. 8g)
+
+ISOLATION (fail-closed): every task — agent or compute — runs inside an isolation
+boundary or the runner declines it. There is NO bare/unsandboxed execution path.
+See ``scripts/runner_isolation.py`` for the capability detection + decision table.
+Run ``python3 scripts/local_runner.py --check`` to verify setup without claiming
+work.
+
+Flags:
+    --check   Print the preflight report and exit (claims no work). Exit code 0
+              iff the orchestrator is reachable, the token is valid, and at least
+              one task class is claimable.
 """
 
 import io
@@ -23,6 +38,8 @@ import json
 import os
 import shutil
 import signal
+import socket
+import stat
 import subprocess
 import sys
 import tarfile
@@ -32,6 +49,8 @@ import time
 import urllib.error
 import urllib.request
 from collections import deque
+
+import runner_isolation as iso
 
 
 # ── Configuration ────────────────────────────────────────────────────────────
@@ -373,6 +392,7 @@ def _heartbeat_loop(
     gpu_capabilities: dict,
     active_compute_jobs: set | None = None,
     compute_lock=None,
+    agent_sandbox_ok: bool = True,
 ) -> None:
     url = f"{orchestrator_url}/api/runner/heartbeat"
     while not _shutdown_event.is_set():
@@ -384,10 +404,14 @@ def _heartbeat_loop(
                     compute_job_ids = sorted(active_compute_jobs)
             else:
                 compute_job_ids = []
+            # FAIL-CLOSED advertisement: only advertise agent capability when an
+            # agent SANDBOX can be built (bwrap+userns) AND the binary exists. If
+            # not, agent_available=False and the orchestrator stops pinning agent
+            # tasks here — the runner never claims work it cannot isolate.
             body = {
                 "active_task_ids": task_ids,
                 "active_compute_job_ids": compute_job_ids,
-                "agent_available": _locate_agent_binary() is not None,
+                "agent_available": agent_sandbox_ok and _locate_agent_binary() is not None,
                 **gpu_capabilities,
             }
             status, _ = _post(url, token, body)
@@ -483,17 +507,125 @@ def _docker_login(auth: dict, container_image: str | None = None, *, _subprocess
         return False
 
 
-def _detect_runner_gpu() -> bool:
-    """Return True if a local NVIDIA GPU is present via nvidia-smi."""
+# ── Isolation capability cache + GPU scheduling ───────────────────────────────
+
+_CAPS_CACHE: "iso.Capabilities | None" = None
+
+
+def _get_capabilities() -> "iso.Capabilities":
+    """Detect (and cache) host isolation capabilities once for the process."""
+    global _CAPS_CACHE
+    if _CAPS_CACHE is None:
+        _CAPS_CACHE = iso.detect_capabilities()
+    return _CAPS_CACHE
+
+
+def _make_gpu_state(caps: "iso.Capabilities") -> dict:
+    """Build the shared GPU-scheduling state (allowlist + in-use set + lock)."""
+    allowed = iso.parse_gpu_allowlist(
+        os.environ.get("BLUEPRINT_RUNNER_GPU_INDICES"), caps.gpu_indices
+    )
+    try:
+        per_job = max(1, int(os.environ.get("BLUEPRINT_RUNNER_GPUS_PER_JOB", "1")))
+    except ValueError:
+        per_job = 1
+    return {
+        "allowed": allowed,
+        "in_use": set(),
+        "per_job": per_job,
+        "lock": threading.Lock(),
+    }
+
+
+def _assign_gpus(gpu_state: dict | None) -> list[int]:
+    """Reserve a disjoint GPU subset for a job; [] if none available/configured."""
+    if not gpu_state:
+        return []
+    with gpu_state["lock"]:
+        assigned = iso.assign_gpu_indices(
+            gpu_state["allowed"], gpu_state["in_use"], gpu_state["per_job"]
+        )
+        if not assigned:
+            return []
+        gpu_state["in_use"].update(assigned)
+        return assigned
+
+
+def _release_gpus(gpu_state: dict | None, indices: list[int]) -> None:
+    if not gpu_state or not indices:
+        return
+    with gpu_state["lock"]:
+        gpu_state["in_use"].difference_update(indices)
+
+
+def _read_ldconfig() -> str:
+    """Best-effort ``ldconfig -p`` output for locating driver libs outside /usr."""
     try:
         result = subprocess.run(
-            ["nvidia-smi", "-L"],
-            capture_output=True,
-            timeout=5,
+            ["ldconfig", "-p"], capture_output=True, text=True, timeout=5
         )
-        return result.returncode == 0
+        return result.stdout if result.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+# ── Git clone without the token on argv (GIT_ASKPASS) ─────────────────────────
+
+def _write_git_askpass(dirpath: str) -> str:
+    """Write a GIT_ASKPASS helper that reads the token from the environment.
+
+    Keeps the GitHub token OFF argv (it would otherwise be world-readable via
+    /proc/cmdline) and out of the persisted .git/config (the clone URL carries no
+    credentials). Git invokes the helper with the prompt as $1: 'Username'/
+    'Password'. The token is supplied via BLUEPRINT_GIT_TOKEN in the clone env.
+    """
+    path = os.path.join(dirpath, "git-askpass.sh")
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(
+            "#!/bin/sh\n"
+            'case "$1" in\n'
+            "  Username*) printf '%s' 'x-access-token' ;;\n"
+            '  *) printf %s "$BLUEPRINT_GIT_TOKEN" ;;\n'
+            "esac\n"
+        )
+    os.chmod(path, stat.S_IRWXU)
+    return path
+
+
+def _clone_repo(
+    tmpdir: str,
+    clone_dir: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    repo_token: str,
+) -> tuple[bool, int]:
+    """Clone owner/repo@ref into clone_dir. Returns (ok, exit_code).
+
+    The token never appears in argv or config — it is passed via a GIT_ASKPASS
+    helper reading BLUEPRINT_GIT_TOKEN from the child env.
+    """
+    askpass = _write_git_askpass(tmpdir)
+    clone_url = f"https://github.com/{owner}/{repo}.git"
+    clone_env = {
+        "PATH": os.environ.get("PATH", iso._DEFAULT_SANDBOX_PATH),
+        "HOME": tmpdir,
+        "GIT_ASKPASS": askpass,
+        "GIT_TERMINAL_PROMPT": "0",
+        "BLUEPRINT_GIT_TOKEN": repo_token,
+    }
+    try:
+        result = subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", ref, clone_url, clone_dir],
+            capture_output=True,
+            timeout=300,
+            env=clone_env,
+        )
+    except subprocess.TimeoutExpired:
+        return False, 124
     except Exception:
-        return False
+        return False, 1
+    return (result.returncode == 0, result.returncode)
 
 
 def _report_compute_job(
@@ -646,6 +778,23 @@ def _upload_artifact(orchestrator_url: str, token: str, job_id: str, artifact_di
         print(f"[compute] artifact upload unexpected error for job {job_id}: {exc}", flush=True)
 
 
+def _parse_result_metrics(result_file: str) -> dict | None:
+    """Read numeric metrics from a job's result.json (best-effort, tolerant)."""
+    try:
+        with open(result_file, encoding="utf-8") as fh:
+            parsed = json.loads(fh.read())
+    except (OSError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    filtered = {
+        k: v
+        for k, v in parsed.items()
+        if isinstance(v, (int, float)) and not isinstance(v, bool)
+    }
+    return filtered or None
+
+
 def _run_compute_job(
     job_body: dict,
     orchestrator_url: str,
@@ -653,8 +802,18 @@ def _run_compute_job(
     active_jobs: set,
     lock: threading.Lock,
     capacity: threading.Semaphore | None = None,
+    *,
+    capabilities: "iso.Capabilities | None" = None,
+    gpu_state: dict | None = None,
 ) -> None:
-    """Worker thread: execute a claimed compute job and report the result."""
+    """Worker thread: execute a claimed compute job INSIDE an isolation boundary.
+
+    FAIL-CLOSED. The job runs under a container backend (docker/podman/apptainer)
+    or a rootless bwrap sandbox, chosen by ``iso.decide_compute_backend``. If no
+    boundary can be built for this job it is DECLINED (reported failed) — the
+    command is NEVER executed bare on the host. ``setup_step`` is folded into the
+    sandboxed command so it, too, runs inside the boundary (not bare as before).
+    """
     job_id = job_body.get("job_id", "unknown")
     command = job_body.get("command", "")
     env_override = dict(job_body.get("env") or {})
@@ -667,153 +826,164 @@ def _run_compute_job(
     repo_clone = job_body.get("repo_clone") or None
     repo_token = job_body.get("repo_token") or None
 
-    tmpdir = tempfile.mkdtemp(prefix="bp_compute_")
-    artifact_dir: str | None = None  # referenced in finally for durable-artifact upload
-    try:
-        result_file = os.path.join(tmpdir, "result.json")
-        artifact_dir = os.path.join(tmpdir, "artifacts")
-        os.makedirs(artifact_dir, exist_ok=True)
+    caps = capabilities if capabilities is not None else _get_capabilities()
+    cpu_limit = os.environ.get("BLUEPRINT_RUNNER_CPU_LIMIT") or None
+    mem_limit = os.environ.get("BLUEPRINT_RUNNER_MEM_LIMIT") or None
+    has_image = bool(container_image)
 
-        # Build env for host-side commands (setup_step + non-containerized main)
-        env = os.environ.copy()
-        env.update(env_override)
-        env["BLUEPRINT_RESULT_FILE"] = result_file
-        env["BLUEPRINT_ARTIFACT_DIR"] = artifact_dir
+    tmpdir: str | None = None
+    artifact_dir: str | None = None
+    assigned_gpus: list[int] = []
+    plan = None
+    proc = None
+    try:
+        # ── Fail-closed gate: refuse anything we cannot sandbox, before any work.
+        if iso.decide_compute_backend(caps, has_image) == iso.DECLINE:
+            reason = iso.compute_decline_reason(caps, has_image) or "no isolation boundary"
+            print(f"[compute] DECLINED job {job_id} (fail-closed): {reason}", flush=True)
+            _report_compute_job(
+                orchestrator_url, token, job_id,
+                exec_status="failed", exit_code=1,
+                command_log={
+                    "text": f"Runner declined job (fail-closed isolation): {reason}",
+                    "truncated": False,
+                },
+            )
+            return
 
         if cancel_requested:
             _report_compute_job(orchestrator_url, token, job_id,
                                  exec_status="failed", exit_code=1)
             return
 
-        # Clone the project repo so compute commands can import project packages.
-        # Mirrors the git-clone step that GCP/local-subprocess backends embed in
-        # their startup scripts via _attach_repo_clone.
+        tmpdir = tempfile.mkdtemp(prefix="bp_compute_")
+        result_file = os.path.join(tmpdir, "result.json")
+        artifact_dir = os.path.join(tmpdir, "artifacts")
+        os.makedirs(artifact_dir, exist_ok=True)
+
+        # Reserve a disjoint GPU subset when the host has GPUs (16 GB V100 → 1/job).
+        if caps.has_gpu:
+            assigned_gpus = _assign_gpus(gpu_state)
+            if not assigned_gpus:
+                print(
+                    f"[compute] job {job_id}: no free GPU to assign; running without "
+                    "a fresh device",
+                    flush=True,
+                )
+
+        # Clone the project repo — token kept OFF argv/config via GIT_ASKPASS.
         clone_dir: str | None = None
         if repo_clone and repo_token:
             owner = str(repo_clone.get("owner") or "")
             repo = str(repo_clone.get("repo") or "")
             ref = str(repo_clone.get("ref") or "main")
             clone_dir = os.path.join(tmpdir, "repo")
-            clone_url = f"https://x-access-token:{repo_token}@github.com/{owner}/{repo}.git"
-            try:
-                clone_result = subprocess.run(
-                    ["git", "clone", "--depth", "1", "--branch", ref, clone_url, clone_dir],
-                    capture_output=True,
-                    timeout=300,
-                )
-            except subprocess.TimeoutExpired:
-                print(f"[compute] git clone timed out for job {job_id}", flush=True)
+            ok, clone_rc = _clone_repo(tmpdir, clone_dir, owner, repo, ref, repo_token)
+            if not ok:
+                print(f"[compute] git clone failed for job {job_id} (exit={clone_rc})", flush=True)
                 _report_compute_job(orchestrator_url, token, job_id,
-                                     exec_status="failed", exit_code=124)
+                                     exec_status="failed", exit_code=clone_rc)
                 return
-            except Exception as exc:
-                print(f"[compute] git clone error for job {job_id}: {exc}", flush=True)
-                _report_compute_job(orchestrator_url, token, job_id,
-                                     exec_status="failed", exit_code=1)
-                return
-            if clone_result.returncode != 0:
-                stderr_text = clone_result.stderr.decode("utf-8", "replace")[:500]
-                print(f"[compute] git clone failed for job {job_id}: {stderr_text}", flush=True)
-                _report_compute_job(orchestrator_url, token, job_id,
-                                     exec_status="failed",
-                                     exit_code=clone_result.returncode)
-                return
-            # Add the cloned repo root to PYTHONPATH so `import <package>` works.
-            existing_pythonpath = env.get("PYTHONPATH", "")
-            env["PYTHONPATH"] = (
-                f"{clone_dir}:{existing_pythonpath}" if existing_pythonpath else clone_dir
-            )
-            # Default cwd to clone root when not explicitly specified.
             if not cwd:
                 cwd = clone_dir
             print(f"[compute] cloned {owner}/{repo}@{ref} for job {job_id}", flush=True)
 
-        # Run setup_step (always bare bash, never containerized — mirrors GCP path)
+        # Registry auth for docker/podman backends only (trusted host `docker login`).
+        backend_pre = iso.decide_compute_backend(caps, has_image)
+        if (
+            backend_pre in (iso.BACKEND_DOCKER, iso.BACKEND_PODMAN)
+            and container_registry_auth.get("password")
+            and not _docker_login(container_registry_auth, container_image=container_image)
+        ):
+            _report_compute_job(orchestrator_url, token, job_id,
+                                 exec_status="failed", exit_code=1)
+            return
+
+        # Fold setup_step into the sandboxed command so it runs INSIDE the same
+        # boundary (never bare) and shares its environment. `&&` between brace
+        # groups preserves the original semantics: a setup failure aborts before
+        # the main command and the job fails with the setup exit code.
+        effective_command = command
         if setup_step:
-            try:
-                setup_result = subprocess.run(
-                    ["bash", "-lc", setup_step],
-                    env=env,
-                    cwd=cwd,
-                    capture_output=True,
-                    timeout=300,
-                )
-            except subprocess.TimeoutExpired:
-                _report_compute_job(orchestrator_url, token, job_id,
-                                     exec_status="failed", exit_code=124)
-                return
-            except Exception as exc:
-                print(f"[compute] setup_step error for job {job_id}: {exc}", flush=True)
-                _report_compute_job(orchestrator_url, token, job_id,
-                                     exec_status="failed", exit_code=1)
-                return
-            if setup_result.returncode != 0:
-                _report_compute_job(orchestrator_url, token, job_id,
-                                     exec_status="failed",
-                                     exit_code=setup_result.returncode)
-                return
+            effective_command = "{\n" + setup_step + "\n} && {\n" + command + "\n}"
 
-        # Build command args — containerized or bare
-        if container_image:
-            # Authenticate with the registry before pulling, if credentials provided.
-            # Pass container_image so the registry host can be derived when the
-            # auth payload omits an explicit server (e.g. NGC nvcr.io images).
-            if container_registry_auth.get("password"):
-                if not _docker_login(container_registry_auth, container_image=container_image):
-                    _report_compute_job(orchestrator_url, token, job_id,
-                                        exec_status="failed", exit_code=1)
-                    return
-
-            gpus = _detect_runner_gpu()
-            container_result_file = f"{_RUNNER_CONTAINER_OUT_DIR}/result.json"
-            container_artifact_dir = f"{_RUNNER_CONTAINER_OUT_DIR}/artifacts"
-
-            cmd_args: list = ["docker", "run", "--rm"]
-            if gpus:
-                cmd_args += ["--gpus", "all"]
-            cmd_args += [
-                "-v", f"{tmpdir}:{_RUNNER_CONTAINER_OUT_DIR}",
-                "-e", f"BLUEPRINT_RESULT_FILE={container_result_file}",
-                "-e", f"BLUEPRINT_ARTIFACT_DIR={container_artifact_dir}",
-            ]
-            for k, v in env_override.items():
-                cmd_args += ["-e", f"{k}={v}"]
-            if clone_dir:
-                # Bind-mount the cloned repo as /workspace and put it on PYTHONPATH
-                # inside the container — mirrors the local-subprocess container path.
-                cmd_args += ["-v", f"{clone_dir}:/workspace", "-e", "PYTHONPATH=/workspace"]
-            effective_cwd = "/workspace" if clone_dir else cwd
-            if effective_cwd:
-                cmd_args += ["-w", effective_cwd]
-            cmd_args += [container_image, "bash", "-lc", command]
-            proc_env = None  # docker runs in runner's inherited env
-            proc_cwd = None  # cwd is passed via -w into the container
-        else:
-            cmd_args = ["bash", "-lc", command]
-            proc_env = env
-            proc_cwd = cwd
-
-        try:
-            proc = subprocess.Popen(
-                cmd_args,
-                env=proc_env,
-                cwd=proc_cwd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+        container_name = f"bp-{str(job_id)[:12]}"
+        plan = iso.plan_compute_execution(
+            caps=caps,
+            command=effective_command,
+            image=container_image,
+            registry_auth=container_registry_auth or None,
+            workspace_host=tmpdir,
+            result_file_host=result_file,
+            artifact_dir_host=artifact_dir,
+            clone_dir_host=clone_dir,
+            cwd_host=cwd,
+            job_env=env_override,
+            gpu_indices=assigned_gpus,
+            container_name=container_name,
+            source_env=dict(os.environ),
+            # ldconfig is only consulted for the bwrap backend (to bind driver
+            # libs living outside /usr); container backends provide their own.
+            ldconfig_output=(
+                _read_ldconfig()
+                if (assigned_gpus and backend_pre == iso.BACKEND_BWRAP)
+                else ""
+            ),
+            cpu_limit=cpu_limit,
+            mem_limit=mem_limit,
+        )
+        if plan.declined:
+            print(f"[compute] DECLINED job {job_id} (fail-closed): {plan.decline_reason}", flush=True)
+            _report_compute_job(
+                orchestrator_url, token, job_id,
+                exec_status="failed", exit_code=1,
+                command_log={
+                    "text": f"Runner declined job (fail-closed isolation): {plan.decline_reason}",
+                    "truncated": False,
+                },
             )
+            return
+
+        # Optional best-effort resource scope (systemd-run --user --scope) for the
+        # NON-daemon backends (bwrap/apptainer). Container backends already carry
+        # --cpus/--memory in their argv, so a scope would double-apply. When
+        # systemd-run is unavailable, fall back to an RLIMIT_AS preexec for memory;
+        # if neither is available the cap is simply not applied (never fail-closed).
+        scope_prefix: list = []
+        if plan.backend in (iso.BACKEND_BWRAP, iso.BACKEND_APPTAINER, iso.BACKEND_ENROOT):
+            scope_prefix = iso.build_resource_scope_prefix(
+                caps, cpu_limit=cpu_limit, mem_limit=mem_limit, scope_name=container_name
+            )
+        run_argv = [*scope_prefix, *plan.argv]
+        preexec = None
+        if not scope_prefix and mem_limit:
+            preexec = iso.rlimit_preexec(mem_limit)
+
+        popen_kwargs: dict = {
+            "env": plan.env,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.STDOUT,
+        }
+        if hasattr(os, "setsid"):
+            popen_kwargs["start_new_session"] = True
+        if preexec is not None:
+            popen_kwargs["preexec_fn"] = preexec
+        try:
+            proc = subprocess.Popen(run_argv, **popen_kwargs)
         except Exception as exc:
             print(f"[compute] failed to start job {job_id}: {exc}", flush=True)
             _report_compute_job(orchestrator_url, token, job_id,
                                  exec_status="failed", exit_code=1)
             return
 
-        print(f"[compute] started job {job_id} pid={proc.pid}", flush=True)
+        print(
+            f"[compute] started job {job_id} pid={proc.pid} backend={plan.backend} "
+            f"gpus={assigned_gpus}",
+            flush=True,
+        )
         _report_compute_job(orchestrator_url, token, job_id, exec_status="running")
 
-        # Capture stdout in a background thread with consecutive-duplicate-line
-        # collapsing + a head+tail budget (see _BoundedDedupLog), so spammy
-        # repeated lines (e.g. CUDA ptx warnings) don't crowd out real output and
-        # the END of the log — where results/summaries live — always survives.
+        # Capture stdout with dedup + head/tail budget (see _BoundedDedupLog).
         log_capture = _BoundedDedupLog(
             _RUNNER_MAX_COMMAND_LOG_BYTES, _RUNNER_COMMAND_LOG_HEAD_BYTES
         )
@@ -829,13 +999,21 @@ def _run_compute_job(
         reader = threading.Thread(target=_read_stdout, daemon=True)
         reader.start()
 
-        # Main wait loop: send periodic heartbeats and handle deadline/cancel
         start_time = time.time()
         deadline = (
             start_time + float(runtime_deadline_seconds)
             if runtime_deadline_seconds is not None
             else None
         )
+
+        def _teardown() -> None:
+            iso.terminate_process_tree(
+                proc,
+                backend=plan.backend,
+                container_name=plan.container_name,
+                runtime_path=plan.backend,
+            )
+            reader.join(timeout=2)
 
         exit_code_val: int | None = None
         while True:
@@ -847,23 +1025,13 @@ def _run_compute_job(
 
             now = time.time()
             if deadline is not None and now >= deadline:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                reader.join(timeout=2)
+                _teardown()
                 _report_compute_job(orchestrator_url, token, job_id,
                                      exec_status="failed", exit_code=124)
                 return
 
             if _shutdown_event.is_set():
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                reader.join(timeout=2)
+                _teardown()
                 _report_compute_job(orchestrator_url, token, job_id,
                                      exec_status="failed", exit_code=1)
                 return
@@ -871,31 +1039,14 @@ def _run_compute_job(
             cancel = _report_compute_job(orchestrator_url, token, job_id,
                                           exec_status="running")
             if cancel:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                reader.join(timeout=2)
+                _teardown()
                 _report_compute_job(orchestrator_url, token, job_id,
                                      exec_status="failed", exit_code=1)
                 return
 
         reader.join(timeout=5)
 
-        # Read result.json for metrics (best-effort; tolerate missing/garbled)
-        result_metrics: dict | None = None
-        try:
-            with open(result_file, encoding="utf-8") as fh:
-                parsed = json.loads(fh.read())
-            if isinstance(parsed, dict):
-                filtered = {
-                    k: v for k, v in parsed.items()
-                    if isinstance(v, (int, float)) and not isinstance(v, bool)
-                }
-                result_metrics = filtered or None
-        except (OSError, json.JSONDecodeError, ValueError):
-            pass
+        result_metrics = _parse_result_metrics(result_file)
 
         log_text, truncated = log_capture.result()
         command_log: dict | None = None
@@ -925,15 +1076,15 @@ def _run_compute_job(
         except Exception:
             pass
     finally:
-        # Upload durable artifacts (checkpoints/plots) BEFORE tearing down tmpdir.
-        # Runs for every terminal path (success, fail, deadline, cancel) so a run
-        # that produced output is never discarded.  Strictly best-effort.
+        # Upload durable artifacts BEFORE tearing down tmpdir (every terminal path).
         if artifact_dir:
             _upload_artifact(orchestrator_url, token, job_id, artifact_dir)
+        _release_gpus(gpu_state, assigned_gpus)
         with lock:
             active_jobs.discard(job_id)
         _release_capacity(capacity)
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if tmpdir:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _compute_poll_loop(
@@ -944,6 +1095,8 @@ def _compute_poll_loop(
     max_concurrent: int,
     capacity: threading.Semaphore | None = None,
     base_poll_interval: float = 2.0,
+    capabilities: "iso.Capabilities | None" = None,
+    gpu_state: dict | None = None,
 ) -> None:
     """Background thread: poll for compute jobs and spawn a worker per claimed job."""
     url = f"{orchestrator_url}/api/runner/next-compute-job"
@@ -1012,6 +1165,7 @@ def _compute_poll_loop(
             worker = threading.Thread(
                 target=_run_compute_job,
                 args=(body, orchestrator_url, token, active_jobs, lock, capacity),
+                kwargs={"capabilities": capabilities, "gpu_state": gpu_state},
                 daemon=True,
             )
             worker.start()
@@ -1033,19 +1187,198 @@ def _compute_poll_loop(
                 pass
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Preflight + main ──────────────────────────────────────────────────────────
+
+def _workspace_root() -> str:
+    root = os.environ.get("BLUEPRINT_RUNNER_WORKSPACE_ROOT", "").strip()
+    if not root:
+        root = os.path.join(tempfile.gettempdir(), "blueprint-agent-workspaces")
+    return os.path.abspath(root)
+
+
+def _workspace_writable(root: str) -> bool:
+    try:
+        os.makedirs(root, exist_ok=True)
+        probe = os.path.join(root, ".bp_write_probe")
+        with open(probe, "w", encoding="utf-8") as fh:
+            fh.write("ok")
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _compute_backend_summary(caps: "iso.Capabilities") -> str:
+    """Human summary of which compute backends this host can build."""
+    parts: list[str] = []
+    container = caps.preferred_container()
+    if container:
+        parts.append(f"{container} (image jobs, --nv/--gpus)")
+    if caps.bwrap_ok:
+        parts.append("bwrap (imageless + image-downgrade)")
+    return ", ".join(parts) if parts else "none"
+
+
+def _preflight(
+    orchestrator_url: str,
+    token: str,
+    agent_binary: str | None,
+    caps: "iso.Capabilities",
+    gpu_state: dict,
+    max_concurrent: int,
+    max_concurrent_compute: int,
+) -> dict:
+    """Print the aligned preflight block; return a dict of the decisions.
+
+    Performs the single authoritative orchestrator/token ping (a real heartbeat)
+    so ``--check`` and normal boot share one code path.
+    """
+    hostname = socket.gethostname()
+    token_prefix = token[:8] + "..." if len(token) >= 8 else token
+    workspace_root = _workspace_root()
+    ws_writable = _workspace_writable(workspace_root)
+
+    gpu_indices_str = ",".join(str(i) for i in caps.gpu_indices) or "none"
+    allowlist = gpu_state.get("allowed") or []
+    allowlist_str = ",".join(str(i) for i in allowlist) or "none"
+
+    claimable = iso.claimable_classes(caps, agent_binary is not None)
+    agent_reason = iso.agent_decline_reason(caps, agent_binary is not None)
+    compute_reason = None
+    if not claimable[iso.CLASS_COMPUTE]:
+        compute_reason = "no bwrap sandbox and no usable container runtime"
+
+    gpu_caps = _detect_gpu()
+
+    # Orchestrator / token ping (the token validation).
+    orchestrator_ok = False
+    token_valid = False
+    token_401 = False
+    ping_error: str | None = None
+    try:
+        status, _ = _post(
+            f"{orchestrator_url}/api/runner/heartbeat",
+            token,
+            {
+                "active_task_ids": [],
+                "active_compute_job_ids": [],
+                "agent_available": claimable[iso.CLASS_AGENT],
+                **gpu_caps,
+            },
+        )
+        orchestrator_ok = True
+        if status in (200, 204):
+            token_valid = True
+        elif status == 401:
+            token_401 = True
+    except Exception as exc:
+        ping_error = str(exc)
+
+    def _fmt(label: str, value: str) -> None:
+        print(f"  {label:<16}: {value}", flush=True)
+
+    print("Blueprint local fleet runner — preflight", flush=True)
+    _fmt("runner host", hostname)
+    if ping_error:
+        _fmt("orchestrator", f"{orchestrator_url}   [UNREACHABLE: {ping_error}]")
+    else:
+        _fmt("orchestrator", f"{orchestrator_url}   [reachable]")
+    if token_valid:
+        token_state = "valid"
+    elif token_401:
+        token_state = "401 — inactive/stale row (heartbeat re-arms)"
+    elif ping_error:
+        token_state = "unknown (orchestrator unreachable)"
+    else:
+        token_state = "rejected"
+    _fmt("runner token", f"{token_prefix}   [{token_state}]")
+    _fmt("python", sys.version.split()[0])
+    _fmt(
+        "workspace",
+        f"{workspace_root}   [{'writable' if ws_writable else 'NOT WRITABLE'}]",
+    )
+    _fmt("concurrency", f"agents={max_concurrent}  compute={max_concurrent_compute}")
+
+    print("  isolation boundaries:", flush=True)
+    bwrap_state = "not installed"
+    if caps.bwrap_path:
+        bwrap_state = f"{caps.bwrap_path}  [userns: {'yes' if caps.userns_ok else 'NO'}]  -> {'usable' if caps.bwrap_ok else 'UNUSABLE'}"
+    print(f"    bwrap        : {bwrap_state}", flush=True)
+    print(
+        f"    apptainer    : {caps.apptainer_path or 'not installed'}",
+        flush=True,
+    )
+    if not shutil.which("docker"):
+        docker_state = "not installed"
+    elif caps.docker_usable:
+        docker_state = "usable"
+    else:
+        docker_state = "present but UNUSABLE (socket denied?)"
+    print(f"    docker       : {docker_state}", flush=True)
+    print(
+        f"    podman       : {'usable' if caps.podman_usable else ('present but unusable' if shutil.which('podman') else 'not installed')}",
+        flush=True,
+    )
+    caps_state = (
+        f"{caps.systemd_run_path} (resource caps available)"
+        if caps.systemd_run_path
+        else "none (resource caps best-effort via rlimit only)"
+    )
+    print(f"    resource cap : {caps_state}", flush=True)
+
+    _fmt("gpus", f"{len(caps.gpu_indices)}x [{gpu_indices_str}]")
+    _fmt(
+        "gpu policy",
+        f"allowlist=[{allowlist_str}]  per_job={gpu_state.get('per_job')}",
+    )
+    for note in caps.notes:
+        print(f"    note         : {note}", flush=True)
+
+    print("  task classes:", flush=True)
+    if claimable[iso.CLASS_AGENT]:
+        print("    agent        : CLAIMED via bwrap", flush=True)
+    else:
+        print(f"    agent        : DECLINED — {agent_reason}", flush=True)
+    if claimable[iso.CLASS_COMPUTE]:
+        print(
+            f"    compute      : CLAIMED via {_compute_backend_summary(caps)}",
+            flush=True,
+        )
+    else:
+        print(f"    compute      : DECLINED — {compute_reason}", flush=True)
+
+    if not (claimable[iso.CLASS_AGENT] or claimable[iso.CLASS_COMPUTE]):
+        print(
+            "  No isolation boundary available — install bubblewrap (or apptainer) "
+            "to enable work.",
+            flush=True,
+        )
+
+    setup_ok = (
+        (token_valid or token_401)
+        and ws_writable
+        and (claimable[iso.CLASS_AGENT] or claimable[iso.CLASS_COMPUTE])
+    )
+    return {
+        "orchestrator_ok": orchestrator_ok,
+        "token_valid": token_valid,
+        "token_401": token_401,
+        "ping_error": ping_error,
+        "claimable": claimable,
+        "gpu_caps": gpu_caps,
+        "workspace_writable": ws_writable,
+        "setup_ok": setup_ok,
+    }
+
 
 def main() -> None:
+    check_mode = "--check" in sys.argv[1:]
+
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    # Config
     token = _require_env("BLUEPRINT_RUNNER_TOKEN")
     orchestrator_url = _require_env("BLUEPRINT_ORCHESTRATOR_URL").rstrip("/")
-    # Resolve the agent binary LAZILY (compute/GPU-only runners must boot without
-    # a built agent).  This non-fatal probe is for the startup summary only; the
-    # poll loop re-resolves per agent task and fails THAT task (not the process)
-    # if the binary is still missing when an agent task arrives.
     agent_binary = _locate_agent_binary()
 
     max_concurrent = int(os.environ.get("BLUEPRINT_RUNNER_MAX_CONCURRENT", "2"))
@@ -1054,56 +1387,50 @@ def main() -> None:
     )
     base_poll_interval = float(os.environ.get("BLUEPRINT_RUNNER_POLL_INTERVAL", "2"))
 
-    # Startup summary
-    token_prefix = token[:8] + "..." if len(token) >= 8 else token
-    print("Blueprint local fleet runner starting", flush=True)
-    print(f"  orchestrator : {orchestrator_url}", flush=True)
-    print(
-        f"  agent binary : {agent_binary or '(not built — compute-only mode; resolved lazily per agent task)'}",
-        flush=True,
+    caps = _get_capabilities()
+    gpu_state = _make_gpu_state(caps)
+
+    # Best-effort startup sweep of any stray tagged containers from a prior crash.
+    iso.sweep_stale_containers(caps)
+
+    result = _preflight(
+        orchestrator_url, token, agent_binary, caps, gpu_state,
+        max_concurrent, max_concurrent_compute,
     )
-    print(f"  max concurrent: {max_concurrent}", flush=True)
-    print(f"  max compute jobs: {max_concurrent_compute}", flush=True)
-    print(f"  runner token : {token_prefix}", flush=True)
+    claimable = result["claimable"]
+    gpu_capabilities = result["gpu_caps"]
+    agent_claimable = claimable[iso.CLASS_AGENT]
+    compute_claimable = claimable[iso.CLASS_COMPUTE]
 
-    # Detect GPU hardware once at startup
-    gpu_capabilities = _detect_gpu()
-    if gpu_capabilities.get("has_gpu"):
-        print(f"  gpu detected : {gpu_capabilities['gpu_count']}x {gpu_capabilities['gpu_names']}", flush=True)
-    else:
-        print("  gpu detected : none", flush=True)
+    if check_mode:
+        # Claim no work; exit reflects whether the box is ready.
+        sys.exit(0 if result["setup_ok"] else 1)
 
-    # Initial heartbeat to validate token (includes gpu capabilities)
-    try:
-        status, body = _post(
-            f"{orchestrator_url}/api/runner/heartbeat",
-            token,
-            {
-                "active_task_ids": [],
-                "active_compute_job_ids": [],
-                "agent_available": agent_binary is not None,
-                **gpu_capabilities,
-            },
+    # Hard prereq: orchestrator must be reachable. A 401 is NOT fatal (the row may
+    # be inactive and the heartbeat re-arms it) — mirrors the prior behavior.
+    if not result["orchestrator_ok"]:
+        print(
+            f"ERROR: orchestrator unreachable at boot: {result['ping_error']}",
+            file=sys.stderr,
         )
-    except Exception as exc:
-        print(f"ERROR: initial heartbeat failed: {exc}", file=sys.stderr)
         sys.exit(1)
-    if status == 401:
-        # NOT fatal: the runner row may simply be inactive after a missed
-        # heartbeat (slept/network-dropped host).  Enter the loop anyway — the
-        # background heartbeat re-arms the row (status->active) and the poll
-        # loops retry with backoff.  (A truly revoked/deleted token will keep
-        # 401-ing harmlessly until the operator re-registers.)
+    if result["token_401"]:
         print(
             "[runner] WARNING: initial heartbeat returned 401 — token may be stale or "
             "the runner row inactive; entering poll loop and retrying (heartbeat re-arms it).",
             flush=True,
         )
-    elif status not in (200, 204):
-        print(f"ERROR: initial heartbeat returned HTTP {status}: {body}", file=sys.stderr)
+    elif not result["token_valid"]:
+        print("ERROR: initial heartbeat rejected the runner token.", file=sys.stderr)
         sys.exit(1)
-    else:
-        print("[runner] Token validated. Entering poll loop.", flush=True)
+
+    if not (agent_claimable or compute_claimable):
+        print(
+            "[runner] No task class is claimable on this host (no isolation boundary). "
+            "Staying online (heartbeat only) — install bubblewrap/apptainer and restart "
+            "to enable work.",
+            flush=True,
+        )
 
     # Shared state
     active_tasks: dict[str, subprocess.Popen] = {}
@@ -1113,7 +1440,6 @@ def main() -> None:
     active_compute_jobs: set[str] = set()
     compute_lock = threading.Lock()
 
-    # Background threads
     reaper = threading.Thread(
         target=_reap_loop,
         args=(active_tasks, lock, runner_capacity),
@@ -1131,30 +1457,43 @@ def main() -> None:
             gpu_capabilities,
             active_compute_jobs,
             compute_lock,
+            caps.bwrap_ok,  # agent_sandbox_ok — gates advertised agent_available
         ),
         daemon=True,
     )
     heartbeat.start()
 
-    compute_poll = threading.Thread(
-        target=_compute_poll_loop,
-        args=(
-            orchestrator_url,
-            token,
-            active_compute_jobs,
-            compute_lock,
-            max_concurrent_compute,
-            runner_capacity,
-        ),
-        daemon=True,
-    )
-    compute_poll.start()
+    # Only poll for compute jobs when a compute boundary can be built. Per-job
+    # DECLINE (e.g. imageless on a container-only box) is still enforced in
+    # _run_compute_job; this avoids pulling work we plainly cannot sandbox.
+    if compute_claimable:
+        compute_poll = threading.Thread(
+            target=_compute_poll_loop,
+            args=(
+                orchestrator_url,
+                token,
+                active_compute_jobs,
+                compute_lock,
+                max_concurrent_compute,
+                runner_capacity,
+            ),
+            kwargs={"base_poll_interval": base_poll_interval, "capabilities": caps,
+                    "gpu_state": gpu_state},
+            daemon=True,
+        )
+        compute_poll.start()
 
     poll_interval = base_poll_interval
     next_task_url = f"{orchestrator_url}/api/runner/next-task"
 
-    # Poll loop
+    # Agent poll loop — only runs when an agent sandbox can be built (fail-closed).
+    # Otherwise we idle on the shutdown event while compute/heartbeat continue.
     while not _shutdown_event.is_set():
+        if not caps.bwrap_ok:
+            # No agent sandbox — never claim agent work. Wait for shutdown.
+            time.sleep(1)
+            continue
+
         with lock:
             active_count = len(active_tasks)
 
@@ -1175,9 +1514,6 @@ def main() -> None:
             continue
 
         if status == 401:
-            # NOT fatal (see compute poll loop): an inactive runner row 401s
-            # until the heartbeat re-arms it.  Back off and retry instead of
-            # exiting so a slept/network-dropped host self-heals on reconnect.
             print(
                 "[runner] poll 401 — runner token rejected; backing off and retrying "
                 "(row may be reactivating via heartbeat).",
@@ -1189,7 +1525,6 @@ def main() -> None:
             continue
 
         if status == 204 or body is None:
-            # No task available — backoff
             _release_capacity(runner_capacity)
             poll_interval = min(poll_interval * 2, 30.0)
             time.sleep(poll_interval)
@@ -1201,7 +1536,6 @@ def main() -> None:
             time.sleep(5)
             continue
 
-        # Task claimed — reset backoff
         poll_interval = base_poll_interval
 
         task_id = body.get("task_id") or body.get("id", "unknown")
@@ -1209,8 +1543,6 @@ def main() -> None:
         task_type = body.get("task_type", "unknown")
         vm_instance_id = body.get("vm_instance_id") or "runner:local"
 
-        # Defense-in-depth: skip if this task is already tracked (e.g. server
-        # returned the same task before started_at was visible to this poll).
         with lock:
             already_active = task_id in active_tasks
         if already_active:
@@ -1219,11 +1551,6 @@ def main() -> None:
             time.sleep(poll_interval)
             continue
 
-        # Lazily resolve the agent binary now that an AGENT task is actually here.
-        # A compute-only runner gets this far without a built agent; if the binary
-        # is missing we fail THIS task gracefully (log + skip) rather than killing
-        # the whole process — the compute poll loop keeps running.  Re-resolve each
-        # time so a binary built after startup is picked up; cache once found.
         if not agent_binary:
             agent_binary = _locate_agent_binary()
         if not agent_binary:
@@ -1237,7 +1564,6 @@ def main() -> None:
             time.sleep(poll_interval)
             continue
 
-        # Build subprocess environment
         try:
             workspace = _agent_workspace_for_task(task_id)
         except Exception as exc:
@@ -1246,21 +1572,35 @@ def main() -> None:
             time.sleep(poll_interval)
             continue
 
-        env = os.environ.copy()
-        env["AGENT_SECRET_TOKEN"] = agent_token
-        env["ORCHESTRATOR_URL"] = orchestrator_url
-        env["TASK_ID"] = task_id
-        env["VM_INSTANCE_ID"] = vm_instance_id
-        env["AGENT_WORKSPACE"] = workspace
-
-        # Spawn agent
-        try:
-            proc = subprocess.Popen(
-                ["node", agent_binary],
-                env=env,
-                stdout=sys.stdout,
-                stderr=sys.stderr,
+        # Build the FAIL-CLOSED sandbox plan. The env is assembled from an explicit
+        # allowlist (never os.environ.copy) and NEVER carries BLUEPRINT_RUNNER_TOKEN
+        # / BLUEPRINT_ORCHESTRATOR_URL into the task.
+        plan = iso.plan_agent_execution(
+            caps=caps,
+            agent_binary=agent_binary,
+            workspace_host=workspace,
+            injected_env={
+                "AGENT_SECRET_TOKEN": agent_token,
+                "ORCHESTRATOR_URL": orchestrator_url,
+                "TASK_ID": task_id,
+                "VM_INSTANCE_ID": vm_instance_id,
+            },
+            source_env=dict(os.environ),
+        )
+        if plan.declined:
+            print(
+                f"[runner] DECLINED agent task {task_id} (fail-closed): {plan.decline_reason}",
+                flush=True,
             )
+            _release_capacity(runner_capacity)
+            time.sleep(poll_interval)
+            continue
+
+        popen_kwargs: dict = {"env": plan.env, "stdout": sys.stdout, "stderr": sys.stderr}
+        if hasattr(os, "setsid"):
+            popen_kwargs["start_new_session"] = True
+        try:
+            proc = subprocess.Popen(plan.argv, **popen_kwargs)
         except Exception as exc:
             print(f"[runner] failed to spawn agent for task {task_id}: {exc}", flush=True)
             _release_capacity(runner_capacity)
@@ -1270,7 +1610,7 @@ def main() -> None:
             active_tasks[task_id] = proc
         print(
             f"[START] task_id={task_id} type={task_type} vm={vm_instance_id} "
-            f"workspace={workspace} pid={proc.pid}",
+            f"workspace={workspace} pid={proc.pid} sandbox={plan.backend}",
             flush=True,
         )
 
@@ -1286,11 +1626,8 @@ def main() -> None:
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                print(f"[runner] timeout waiting for task {tid} (pid={proc.pid}) — sending SIGTERM", flush=True)
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
+                print(f"[runner] timeout waiting for task {tid} (pid={proc.pid}) — tearing down group", flush=True)
+                iso.terminate_process_tree(proc)
 
     print("[runner] Exiting.", flush=True)
 
