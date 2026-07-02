@@ -1769,7 +1769,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
       {showStrategicStatusStrip && (
         <div className="shrink-0 border-b border-workbench-border bg-workbench-base px-3 py-1.5 md:px-4" data-testid="strategic-context-package-strip">
-          <div className="mx-auto flex w-full max-w-[900px] min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500" aria-label="Strategic chat status">
+          <div className="mx-auto flex w-full max-w-[940px] min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500" aria-label="Strategic chat status">
             <span className="shrink-0 font-semibold text-neutral-200">Strategic</span>
             <span className="shrink-0 text-neutral-400">{workbenchModeLabel(workbenchState?.interaction_mode)}</span>
             {strategistActive && (

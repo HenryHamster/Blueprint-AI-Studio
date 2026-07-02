@@ -66,7 +66,7 @@ export function MessagesComposer({
   // and, when the strategist is mid-cycle, flagging that a steer is queued rather
   // than acting immediately.
   const minimal = chrome === 'minimal';
-  const minimalColumnClass = 'mx-auto w-full max-w-[900px]';
+  const minimalColumnClass = 'mx-auto w-full max-w-[940px]';
   const composerDisabled = Boolean(disabledReason);
   const hintArming = minimal && strategistBusy && lastArming !== 'not_armed' ? null : lastArming;
   const hintText = composerHintCopy(newType, hintArming, strategistBusy);

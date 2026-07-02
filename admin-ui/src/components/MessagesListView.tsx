@@ -137,7 +137,7 @@ export function MessagesListView({
   if (presentation === 'conversation') {
     return (
       <div ref={scrollRef} className="relative flex-1 overflow-y-auto bg-workbench-base px-2 py-3 custom-scrollbar md:px-2.5 md:py-4">
-        <div data-testid="strategic-conversation-column" className="mx-auto flex w-full max-w-[900px] flex-col gap-3">
+        <div data-testid="strategic-conversation-column" className="mx-auto flex w-full max-w-[940px] flex-col gap-3">
           {loading ? (
             <p className="py-8 text-center text-xs text-neutral-500">Loading...</p>
           ) : messages.length === 0 ? (
