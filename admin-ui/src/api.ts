@@ -4194,12 +4194,18 @@ export interface FleetRunner {
     workload?: string;
     gpu_count?: number;
     gpu_names?: string[];
+    // Display-only trust telemetry stashed on capabilities at heartbeat.
+    disk_free_bytes?: number;
+    gpu_utilization_pct?: number;
     [key: string]: unknown;
   };
   health?: {
-    device_status?: 'connected' | 'stale' | 'offline' | string;
+    device_status?: 'connected' | 'degraded' | 'stale' | 'offline' | string;
     device_status_reason?: string | null;
     is_live: boolean;
+    // "connected but failing": live (recent heartbeat) but its jobs are failing.
+    degraded?: boolean;
+    degraded_reason?: 'job_failure_streak' | 'success_stale' | string | null;
     seconds_since_last_seen: number | null;
     active_task_count: number;
     active_compute_job_count?: number;
@@ -4209,6 +4215,14 @@ export interface FleetRunner {
     stale_reason: string | null;
     agent_available?: boolean | null;
     liveness_window_seconds: number;
+    // Trust telemetry surfaced from the backend health computation.
+    last_successful_job_at?: string | null;
+    seconds_since_last_success?: number | null;
+    consecutive_job_failures?: number;
+    disk_free_bytes?: number | null;
+    disk_low?: boolean;
+    gpu_utilization_pct?: number | null;
+    failure_streak_threshold?: number;
   };
   last_seen_at: string | null;
   created_at: string | null;

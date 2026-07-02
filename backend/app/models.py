@@ -5171,8 +5171,11 @@ class LocalRunner(SQLModel, table=True):
         sa_column=Column(String(16), nullable=False, server_default=text("'active'")),
     )
     # {"task_types": "all" | [str], "has_gpu": bool (heartbeat-reported ground truth),
-    #  "gpu_count": int, "gpu_names": [str], "max_concurrent": int,
-    #  "active_task_ids": [str]}  — has_gpu et al. are overwritten at first heartbeat.
+    #  "gpu_count": int, "gpu_names": [str], "gpu_utilization_pct": int (0-100),
+    #  "disk_free_bytes": int, "max_concurrent": int, "active_task_ids": [str]}
+    #  — has_gpu et al. are overwritten at first heartbeat. gpu_utilization_pct and
+    #  disk_free_bytes are display-only trust telemetry, stashed here alongside the
+    #  other heartbeat-reported hardware fields rather than as dedicated columns.
     capabilities: Dict[str, Any] = Field(
         default_factory=lambda: {
             "task_types": "all",
@@ -5184,6 +5187,20 @@ class LocalRunner(SQLModel, table=True):
     last_seen_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    # Trust telemetry (heartbeat-reported): the last time this runner reported a
+    # job succeeding, and the count of job failures since its last success. First-
+    # class columns because the "connected but failing" degraded state and the
+    # Fleet Runners panel key on them — a runner can heartbeat fine while every job
+    # fails (false-green), and these two fields are what distinguishes "healthy"
+    # from "healthy AND working".
+    last_successful_job_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    consecutive_job_failures: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
     )
     created_at: datetime = Field(
         default_factory=_utcnow,

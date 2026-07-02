@@ -36,7 +36,8 @@ from app.models import (
     _utcnow,
 )
 from app.messages_noise_prefs_store import get_messages_noise_prefs_row
-from app.routers.runner import _parse_multipart_form
+from app.routers.admin_runners import _runner_health
+from app.routers.runner import _parse_heartbeat_timestamp, _parse_multipart_form
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
@@ -224,6 +225,139 @@ async def test_locked_noise_prefs_read_refreshes_identity_mapped_row(db_session)
     assert refreshed is not None
     assert refreshed is first
     assert refreshed.prefs[WORKBENCH_STATE_KEY]["interaction_mode"] == "chat"
+
+
+# ── Runner health / trust telemetry (pure, no DB) ────────────────────────────
+
+
+def _health_runner(**kwargs) -> LocalRunner:
+    """In-memory LocalRunner for exercising _runner_health without a session."""
+    now = _utcnow()
+    caps = kwargs.pop("capabilities", {"task_types": "all", "max_concurrent": 2})
+    return LocalRunner(
+        project_id=uuid.uuid4(),
+        token_hash="x",
+        last_seen_at=kwargs.pop("last_seen_at", now - timedelta(seconds=30)),
+        capabilities=caps,
+        **kwargs,
+    )
+
+
+class TestRunnerHealthTrustTelemetry:
+    """The 'connected but failing' (degraded) false-green guard is pure logic."""
+
+    def test_healthy_live_runner_is_connected_not_degraded(self):
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=_utcnow() - timedelta(seconds=60),
+                consecutive_job_failures=0,
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "disk_free_bytes": 50 * 1024**3,
+                    "gpu_utilization_pct": 42,
+                },
+            )
+        )
+        assert h["device_status"] == "connected"
+        assert h["degraded"] is False
+        assert h["degraded_reason"] is None
+        assert h["consecutive_job_failures"] == 0
+        assert h["gpu_utilization_pct"] == 42
+        assert h["disk_low"] is False
+        assert h["seconds_since_last_success"] == 60
+
+    def test_failure_streak_marks_runner_degraded_but_still_live(self):
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=_utcnow() - timedelta(seconds=60),
+                consecutive_job_failures=3,
+            )
+        )
+        assert h["device_status"] == "degraded"
+        assert h["degraded"] is True
+        assert h["degraded_reason"] == "job_failure_streak"
+        # A degraded runner is still connected/live — slot accounting is unaffected.
+        assert h["is_live"] is True
+
+    def test_recent_success_resets_to_ready(self):
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=_utcnow(),
+                consecutive_job_failures=0,
+            )
+        )
+        assert h["device_status"] == "connected"
+        assert h["degraded"] is False
+
+    def test_stale_success_while_working_is_degraded(self):
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=_utcnow() - timedelta(seconds=4000),
+                consecutive_job_failures=1,
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "active_task_ids": ["t1"],
+                },
+            )
+        )
+        assert h["device_status"] == "degraded"
+        assert h["degraded_reason"] == "success_stale"
+
+    def test_fresh_runner_on_first_job_is_not_degraded(self):
+        # Active work, never succeeded, zero failures — legitimately churning,
+        # must NOT be mislabelled as failing.
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=None,
+                consecutive_job_failures=0,
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "active_task_ids": ["t1"],
+                },
+            )
+        )
+        assert h["device_status"] == "connected"
+        assert h["degraded"] is False
+
+    def test_failure_streak_on_stale_runner_stays_stale_not_degraded(self):
+        # Degraded is only computed for a LIVE runner; a stale heartbeat wins.
+        h = _runner_health(
+            _health_runner(
+                last_seen_at=_utcnow() - timedelta(minutes=9),
+                last_successful_job_at=None,
+                consecutive_job_failures=5,
+            )
+        )
+        assert h["device_status"] == "stale"
+        assert h["degraded"] is False
+
+    def test_low_disk_flagged_without_degrading(self):
+        h = _runner_health(
+            _health_runner(
+                consecutive_job_failures=0,
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "disk_free_bytes": 1 * 1024**3,
+                },
+            )
+        )
+        assert h["disk_low"] is True
+        assert h["disk_free_bytes"] == 1 * 1024**3
+        assert h["degraded"] is False
+
+
+def test_parse_heartbeat_timestamp_tolerates_bad_input():
+    assert _parse_heartbeat_timestamp(None) is None
+    assert _parse_heartbeat_timestamp("") is None
+    assert _parse_heartbeat_timestamp("not-a-date") is None
+    parsed = _parse_heartbeat_timestamp("2026-07-02T10:00:00Z")
+    assert parsed is not None and parsed.tzinfo is None  # normalized to naive UTC
+    # Offset is normalized to UTC (12:00+02:00 -> 10:00 naive UTC).
+    assert _parse_heartbeat_timestamp("2026-07-02T12:00:00+02:00") == parsed
 
 
 # ── Admin endpoints ──────────────────────────────────────────────────────────
@@ -773,6 +907,75 @@ class TestRunnerEndpoints:
         await db_session.refresh(runner)
         assert runner.last_seen_at > old_seen
         assert runner.capabilities["active_task_ids"] == ["abc", "def"]
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_persists_trust_telemetry(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        success_at = (_utcnow() - timedelta(minutes=1)).replace(microsecond=0)
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "last_successful_job_at": success_at.isoformat(),
+                "consecutive_job_failures": 4,
+                "disk_free_bytes": 12345678,
+                "gpu_utilization_pct": 77,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        # First-class columns.
+        assert runner.last_successful_job_at == success_at
+        assert runner.consecutive_job_failures == 4
+        # Display-only telemetry rides on capabilities.
+        assert runner.capabilities["disk_free_bytes"] == 12345678
+        assert runner.capabilities["gpu_utilization_pct"] == 77
+
+        # The runner is live but has a >= 3 failure streak -> degraded false-green.
+        list_resp = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert list_resp.status_code == 200
+        health = list_resp.json()[0]["health"]
+        assert health["device_status"] == "degraded"
+        assert health["degraded"] is True
+        assert health["consecutive_job_failures"] == 4
+        assert health["gpu_utilization_pct"] == 77
+
+        # A subsequent success (failures reset to 0) clears the degraded state.
+        resp2 = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "last_successful_job_at": _utcnow().isoformat(),
+                "consecutive_job_failures": 0,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp2.status_code == 200
+        list_resp2 = await client.get(f"/api/admin/projects/{project.id}/runners")
+        health2 = list_resp2.json()[0]["health"]
+        assert health2["device_status"] == "connected"
+        assert health2["degraded"] is False
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_tolerates_missing_trust_telemetry(
+        self, client: AsyncClient, db_session
+    ):
+        # Old runners omit the trust fields entirely — heartbeat must still succeed
+        # and leave the columns at their defaults.
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert runner.last_successful_job_at is None
+        assert runner.consecutive_job_failures == 0
 
     @pytest.mark.asyncio
     async def test_heartbeat_renews_pinned_strategic_continuation(

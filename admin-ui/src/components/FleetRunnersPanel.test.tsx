@@ -720,6 +720,102 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(host.textContent).toContain('wait until a connected compute-capable runner is available');
   });
 
+  // ── Trust telemetry / "connected but failing" ────────────────────────────────
+
+  test('degraded runner renders "connected but failing" amber state, not ready', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        id: 'runner-failing',
+        hostname: 'failing-host',
+        capabilities: { task_types: ['compute_experiment'], has_gpu: true, max_concurrent: 2 },
+        health: {
+          device_status: 'degraded',
+          device_status_reason: 'job_failure_streak',
+          is_live: true,
+          degraded: true,
+          degraded_reason: 'job_failure_streak',
+          seconds_since_last_seen: 12,
+          active_task_count: 1,
+          active_compute_job_count: 0,
+          active_work_count: 1,
+          max_concurrent: 2,
+          available_slots: 1,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+          last_successful_job_at: new Date(Date.now() - 3_600_000).toISOString(),
+          seconds_since_last_success: 3600,
+          consecutive_job_failures: 4,
+          disk_free_bytes: 1610612736, // 1.5 GiB
+          disk_low: true,
+          gpu_utilization_pct: 88,
+          failure_streak_threshold: 3,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    // Row shows the amber "connected but failing" readiness + "failing" device label.
+    expect(el.textContent).toContain('connected but failing');
+    expect(el.textContent).toContain('failing');
+    // Not counted as ready (degraded is live but failing).
+    expect(el.textContent).toContain('0/1 ready');
+    // Failing count surfaced in the readiness summary tile.
+    expect(el.querySelector('[data-testid="fleet-runner-connected-summary"]')?.textContent).toContain('1 failing');
+    // Telemetry line renders GPU util, disk free, and the failure streak.
+    const telemetry = el.querySelector('[data-testid="fleet-runner-telemetry"]')?.textContent ?? '';
+    expect(telemetry).toContain('GPU 88%');
+    expect(telemetry).toContain('1.5 GiB disk');
+    expect(telemetry).toContain('4 fail streak');
+    // Next action points the operator at the failing host.
+    expect(el.querySelector('[data-testid="fleet-next-action"]')?.textContent).toContain('failing its jobs');
+    // A degraded runner still counts as live capacity (slots accounting intact).
+    expect(el.querySelector('[data-testid="fleet-runner-work-capacity"]')?.textContent).toBe('1/2');
+  });
+
+  test('healthy runner shows telemetry and is ready (no degraded state)', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: true, max_concurrent: 2 },
+        health: {
+          device_status: 'connected',
+          device_status_reason: null,
+          is_live: true,
+          degraded: false,
+          degraded_reason: null,
+          seconds_since_last_seen: 10,
+          active_task_count: 0,
+          active_compute_job_count: 0,
+          active_work_count: 0,
+          max_concurrent: 2,
+          available_slots: 2,
+          stale_reason: null,
+          agent_available: true,
+          liveness_window_seconds: 300,
+          last_successful_job_at: new Date(Date.now() - 90_000).toISOString(),
+          seconds_since_last_success: 90,
+          consecutive_job_failures: 0,
+          disk_free_bytes: 53687091200, // 50 GiB
+          disk_low: false,
+          gpu_utilization_pct: 12,
+          failure_streak_threshold: 3,
+        },
+      },
+    ]);
+    const el = await mount();
+
+    expect(el.textContent).not.toContain('connected but failing');
+    expect(el.textContent).toContain('1/1 ready');
+    const telemetry = el.querySelector('[data-testid="fleet-runner-telemetry"]')?.textContent ?? '';
+    expect(telemetry).toContain('last success');
+    expect(telemetry).toContain('GPU 12%');
+    expect(telemetry).toContain('50 GiB disk');
+    expect(telemetry).not.toContain('fail streak');
+    expect(el.querySelector('[data-testid="fleet-runner-connected-summary"]')?.textContent).toBe('1 connected');
+  });
+
   test('empty state renders when no runners enrolled', async () => {
     vi.mocked(listFleetRunners).mockResolvedValueOnce([]);
     const el = await mount();

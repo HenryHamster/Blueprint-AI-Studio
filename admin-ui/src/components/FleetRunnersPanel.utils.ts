@@ -1,5 +1,20 @@
 export type RunnerSetupPreset = 'default' | 'strategic_local';
 
+/** Human-readable binary byte size: 1536 → "1.5 KiB", 2147483648 → "2 GiB". */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '—';
+  if (bytes < 1024) return `${Math.round(bytes)} B`;
+  const units = ['KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const rounded = value >= 100 || Number.isInteger(value) ? Math.round(value) : Number(value.toFixed(1));
+  return `${rounded} ${units[unitIndex]}`;
+}
+
 export interface RunnerSetupSnippetCommands {
   windowsPowerShell: string;
   macosLinux: string;

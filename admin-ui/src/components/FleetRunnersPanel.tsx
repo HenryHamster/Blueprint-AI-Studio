@@ -4,6 +4,7 @@ import { listFleetRunners, registerFleetRunner, revokeFleetRunner } from '../api
 import type { FleetRunner, FleetRunnerRegistrationResult } from '../api';
 import { timeAgo, parseTimestamp, formatAbsolute, formatDurationSec } from '../utils/time';
 import {
+  formatBytes,
   runnerSetupSnippets,
   type RunnerSetupPreset,
   type RunnerSetupSnippetCommands,
@@ -25,9 +26,17 @@ function fallbackLivenessLabel(lastSeenAt: string | null): { label: string; cls:
 
 function deviceStatusLabel(status: string): { label: string; cls: string } {
   if (status === 'connected') return { label: 'connected', cls: 'text-emerald-400' };
+  // "degraded" = live but its jobs are failing — amber, distinct from healthy green.
+  if (status === 'degraded') return { label: 'failing', cls: 'text-amber-400' };
   if (status === 'stale') return { label: 'stale', cls: 'text-amber-400' };
   if (status === 'offline') return { label: 'offline', cls: 'text-neutral-500' };
   return { label: status.replace(/_/g, ' '), cls: 'text-neutral-500' };
+}
+
+/** True when the runner is live (recent heartbeat) but its jobs are failing —
+ *  the "connected but failing" false-green the trust telemetry exists to catch. */
+function isRunnerDegraded(runner: FleetRunner): boolean {
+  return runner.health?.degraded === true || runner.health?.device_status === 'degraded';
 }
 
 function livenessLabel(runner: FleetRunner): { label: string; cls: string } {
@@ -42,7 +51,11 @@ function livenessLabel(runner: FleetRunner): { label: string; cls: string } {
 }
 
 function isRunnerLive(runner: FleetRunner): boolean {
-  if (runner.health?.device_status) return runner.health.device_status === 'connected';
+  const deviceStatus = runner.health?.device_status;
+  // A degraded runner is still connected/live (it heartbeats) — it just fails its
+  // jobs. Keep it in the live set so capacity accounting is unaffected; readiness
+  // (below) is what flags it as not-ready.
+  if (deviceStatus) return deviceStatus === 'connected' || deviceStatus === 'degraded';
   if (runner.status !== 'active') return false;
   if (runner.health) return runner.health.is_live;
   return fallbackLivenessLabel(runner.last_seen_at).label === 'live';
@@ -121,6 +134,38 @@ function heartbeatLabel(runner: FleetRunner): string {
   return 'no heartbeat yet';
 }
 
+/** Relative "last successful job" label — the trust signal that a runner is not
+ *  just connected but actually completing work. */
+function lastSuccessLabel(runner: FleetRunner): string | null {
+  const health = runner.health;
+  if (!health) return null;
+  const secs = health.seconds_since_last_success;
+  if (typeof secs === 'number' && Number.isFinite(secs)) {
+    return `last success ${formatDurationSec(Math.max(0, secs))} ago`;
+  }
+  if (health.last_successful_job_at) return `last success ${timeAgo(health.last_successful_job_at)}`;
+  // Health present but no success recorded — only meaningful once telemetry exists.
+  if (typeof health.consecutive_job_failures === 'number') return 'no successful job yet';
+  return null;
+}
+
+/** Trust telemetry one-liner for a runner row: last successful job, GPU util,
+ *  disk free. Returns null when the runner reported no telemetry (old runners). */
+function telemetrySummary(runner: FleetRunner): { text: string; warn: boolean } | null {
+  const health = runner.health;
+  const parts: string[] = [];
+  const success = lastSuccessLabel(runner);
+  if (success) parts.push(success);
+  const failures = health?.consecutive_job_failures;
+  if (typeof failures === 'number' && failures > 0) parts.push(`${failures} fail streak`);
+  const gpuUtil = health?.gpu_utilization_pct ?? runner.capabilities.gpu_utilization_pct;
+  if (typeof gpuUtil === 'number') parts.push(`GPU ${gpuUtil}%`);
+  const diskFree = health?.disk_free_bytes ?? runner.capabilities.disk_free_bytes;
+  if (typeof diskFree === 'number') parts.push(`${formatBytes(diskFree)} disk`);
+  if (parts.length === 0) return null;
+  return { text: parts.join(' · '), warn: isRunnerDegraded(runner) || health?.disk_low === true };
+}
+
 function runnerReadinessDetail(runner: FleetRunner, runnerLive: boolean, slots: number | null): string {
   const heartbeat = heartbeatLabel(runner);
   if (runner.status !== 'active') return `${heartbeat}; inactive`;
@@ -162,6 +207,23 @@ function runnerReadiness(runner: FleetRunner, runnerLive: boolean, slots: number
   }
   if (runner.health?.agent_available === false) {
     return { label: 'agent unavailable', detail, nextAction: 'Restart or inspect the local agent', tone: 'bad', ready: false };
+  }
+  if (isRunnerDegraded(runner)) {
+    // The payoff: live + heartbeating, but jobs are failing. Amber, NOT ready —
+    // this is the false-green the trust telemetry kills.
+    const heartbeat = heartbeatLabel(runner);
+    const failures = runner.health?.consecutive_job_failures ?? 0;
+    const detailText =
+      runner.health?.degraded_reason === 'success_stale'
+        ? `${heartbeat}; no recent successful job`
+        : `${heartbeat}; ${failures} consecutive job failure${failures === 1 ? '' : 's'}`;
+    return {
+      label: 'connected but failing',
+      detail: detailText,
+      nextAction: 'Inspect the runner host — jobs are failing despite a healthy heartbeat',
+      tone: 'warn',
+      ready: false,
+    };
   }
   if (slots == null) {
     return { label: 'slots unknown', detail, nextAction: 'Confirm runner slot telemetry', tone: 'warn', ready: false };
@@ -364,6 +426,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
   const liveStrategicRunnerReadiness = liveStrategicRunners.map(runner => runnerReadiness(runner, true, availableSlots(runner)));
   const readyRunners = liveRunnerReadiness.filter(readiness => readiness.ready).length;
   const eligibleStrategicRunners = liveStrategicRunnerReadiness.filter(readiness => readiness.ready).length;
+  const failingRunners = liveRunners.filter(isRunnerDegraded).length;
   const agentUnavailable = liveRunners.filter(runner => runner.health?.agent_available === false).length;
   const strategicAgentUnavailable = liveStrategicRunners.filter(runner => runner.health?.agent_available === false).length;
   const busyWork = liveRunners.reduce((sum, runner) => sum + activeWorkCount(runner), 0);
@@ -386,6 +449,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
     if (runners.length === 0) return 'Enroll a runner, then start it to send the first heartbeat.';
     if (localOnlyBlocked) return 'Start or enroll a connected compute-capable local runner.';
     if (agentUnavailable > 0) return 'Inspect agent availability on the affected runner host.';
+    if (failingRunners > 0) return 'A connected runner is failing its jobs; inspect the host logs before relying on it.';
     if (liveRunners.length === 0) return 'Check runner hosts; no active runner is connected.';
     if (!hasUnknownSlots && knownFreeSlots === 0) return 'Capacity is full; wait for work to finish or enroll another runner.';
     if (hasUnknownSlots && knownFreeSlots === 0) return 'Confirm runner slot telemetry; connected capacity is not reporting slots.';
@@ -439,7 +503,11 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
             <div className={`mt-0.5 font-mono ${readyRunners > 0 ? 'text-emerald-300' : 'text-amber-300'}`}>
               {readyRunners}/{runners.length} ready
             </div>
-            <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{liveRunners.length} connected</div>
+            <div className={`mt-0.5 truncate text-ui-sm ${failingRunners > 0 ? 'text-amber-300' : 'text-neutral-600'}`} data-testid="fleet-runner-connected-summary">
+              {failingRunners > 0
+                ? `${liveRunners.length} connected · ${failingRunners} failing`
+                : `${liveRunners.length} connected`}
+            </div>
           </div>
           <div className="rounded-md border border-neutral-800 bg-[#0d1218] px-2.5 py-2">
             <div className="text-ui-md uppercase tracking-wide text-neutral-500">slots</div>
@@ -504,6 +572,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
             const slots = runnerLive ? availableSlots(runner) : null;
             const strategicRunner = isStrategicRunner(runner);
             const readiness = runnerReadiness(runner, runnerLive, slots);
+            const telemetry = telemetrySummary(runner);
             return (
               <div
                 key={runner.id}
@@ -553,6 +622,14 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
                     </span>
                   </div>
                   <div className="mt-1 text-xs text-neutral-500">{capsSummary(runner.capabilities)}</div>
+                  {telemetry && (
+                    <div
+                      className={`mt-0.5 text-ui-md ${telemetry.warn ? 'text-amber-300/90' : 'text-neutral-500'}`}
+                      data-testid="fleet-runner-telemetry"
+                    >
+                      {telemetry.text}
+                    </div>
+                  )}
                   <div className="mt-0.5 text-ui-md text-neutral-600">{readiness.detail}</div>
                   <div className={`mt-0.5 text-ui-md ${readiness.ready ? 'text-emerald-400/80' : 'text-amber-300/90'}`}>
                     Next: {readiness.nextAction}
