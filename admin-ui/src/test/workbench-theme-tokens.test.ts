@@ -4,10 +4,15 @@ import { describe, expect, test } from 'vitest';
 
 const WORKBENCH_THEME_FILES = [
   'src/components/HeaderBar.tsx',
+  'src/components/CommandPalette.tsx',
+  'src/components/MessagesComposer.tsx',
+  'src/components/MessagesListView.tsx',
   'src/components/MessagesPanel.tsx',
   'src/components/OperatorWorkspaces.tsx',
   'src/components/PipelineWorkspace.tsx',
   'src/components/RuntimeAccountsPanel.tsx',
+  'src/components/StrategicContextArtifactSlot.tsx',
+  'src/components/StrategicContextWorkspace.tsx',
   'src/components/WorkbenchLayout.tsx',
 ];
 

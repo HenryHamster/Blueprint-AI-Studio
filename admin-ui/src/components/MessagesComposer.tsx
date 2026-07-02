@@ -74,7 +74,7 @@ export function MessagesComposer({
 
   return (
     <div className={minimal
-      ? 'shrink-0 border-t border-neutral-800 bg-[#03060a] px-2 pb-2 pt-1.5 md:px-2.5'
+      ? 'shrink-0 border-t border-workbench-border bg-workbench-base px-2 pb-2 pt-1.5 md:px-2.5'
       : 'px-4 md:px-6 py-3 border-t border-neutral-800 shrink-0 bg-neutral-950/50'
     }>
       {minimal && strategicContext && (
@@ -95,7 +95,7 @@ export function MessagesComposer({
       <div
         data-testid={minimal ? 'strategic-composer-box' : undefined}
         className={minimal
-        ? `${minimalColumnClass} flex items-end gap-1 rounded-md border border-neutral-700/80 bg-[#0a0f15] p-1 shadow-[0_10px_28px_rgba(0,0,0,0.20),inset_0_1px_0_rgba(255,255,255,0.035)]`
+        ? `${minimalColumnClass} flex items-end gap-1 rounded-md border border-workbench-border-strong/80 bg-workbench-card p-1 shadow-[0_10px_28px_rgba(0,0,0,0.20),inset_0_1px_0_rgba(255,255,255,0.035)]`
         : 'flex gap-2 items-end'
       }>
         {!minimal && (

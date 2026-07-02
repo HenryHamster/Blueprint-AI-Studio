@@ -219,10 +219,10 @@ export function CommandPalette({
         role="dialog"
         aria-modal="true"
         aria-labelledby="command-palette-title"
-        className="grid max-h-[calc(100vh-24px)] w-[min(680px,calc(100vw-24px))] min-w-0 grid-rows-[auto_auto_minmax(0,1fr)] overflow-hidden rounded-md border border-neutral-800 bg-[#10151c] shadow-2xl shadow-black/40 sm:max-h-[calc(100vh-40px)]"
+        className="grid max-h-[calc(100vh-24px)] w-[min(680px,calc(100vw-24px))] min-w-0 grid-rows-[auto_auto_minmax(0,1fr)] overflow-hidden rounded-md border border-workbench-border bg-workbench-panel shadow-2xl shadow-black/40 sm:max-h-[calc(100vh-40px)]"
         onKeyDown={handleKeyDown}
       >
-        <header className="flex min-w-0 items-center justify-between gap-2.5 border-b border-neutral-800 bg-[#05070a] px-3 py-2">
+        <header className="flex min-w-0 items-center justify-between gap-2.5 border-b border-workbench-border bg-workbench-shell px-3 py-2">
           <div className="flex min-w-0 items-center gap-2">
             <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-neutral-800 bg-neutral-950 text-neutral-300">
               <Command className="h-4 w-4" aria-hidden="true" />
@@ -247,7 +247,7 @@ export function CommandPalette({
           </button>
         </header>
 
-        <div className="flex min-w-0 items-center gap-2 border-b border-neutral-800 bg-[#05080c] px-3 py-1.5">
+        <div className="flex min-w-0 items-center gap-2 border-b border-workbench-border bg-workbench-base px-3 py-1.5">
           <Search className="h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
           <input
             ref={inputRef}
@@ -271,7 +271,7 @@ export function CommandPalette({
           )}
         </div>
 
-        <div className="min-h-0 overflow-y-auto bg-[#10151c] p-1 custom-scrollbar">
+        <div className="min-h-0 overflow-y-auto bg-workbench-panel p-1 custom-scrollbar">
           {filteredCommands.length === 0 ? (
             <div className="px-3 py-8 text-center text-sm text-neutral-500">
               No commands found

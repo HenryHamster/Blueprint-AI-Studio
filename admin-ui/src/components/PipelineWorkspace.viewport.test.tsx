@@ -6,6 +6,7 @@ import { PipelineWorkspace, type PipelineWorkspaceProps } from './PipelineWorksp
 import type { Task } from './TaskCard';
 import type { TrackLogEntry } from '../types/task';
 import { expectMinTouchTargetAt, expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
+import { COLUMNS } from '../appWorkbenchConstants';
 
 function makeTask(overrides: Partial<Task> = {}): Task {
   return {
@@ -91,7 +92,7 @@ function workspaceProps(): PipelineWorkspaceProps {
     },
     board: {
       tasks,
-      columns: [],
+      columns: COLUMNS,
       loading: false,
       maxRetries: 3,
       actionLoadingMap: {},
@@ -175,6 +176,39 @@ describe('PipelineWorkspace viewport regression', () => {
     });
   }
 
+  async function expectTaskContextReachable(sideboard: HTMLElement, aside: HTMLElement) {
+    const taskContext = sideboard.querySelector<HTMLElement>('[data-testid="pipeline-task-context"]');
+    if (!taskContext) {
+      throw new Error('Expected Pipeline sideboard task context to render');
+    }
+    expect(taskContext.textContent).toContain('Task context');
+    expect(taskContext.textContent).toContain(trackedTask.title);
+    await act(async () => {
+      taskContext.scrollIntoView({ block: 'nearest' });
+    });
+    const asideRect = aside.getBoundingClientRect();
+    const contextRect = taskContext.getBoundingClientRect();
+    expect(contextRect.top).toBeLessThanOrEqual(asideRect.bottom - 44);
+    expect(contextRect.bottom).toBeGreaterThanOrEqual(asideRect.top + 44);
+  }
+
+  async function expectTaskStreamReachable(sideboard: HTMLElement, aside: HTMLElement) {
+    const stream = sideboard.querySelector<HTMLElement>('[data-testid="task-stream-panel"]');
+    if (!stream) {
+      throw new Error('Expected embedded task stream to render');
+    }
+    expect(stream.dataset.variant).toBe('embedded');
+    expect(stream.textContent).toContain('Task stream');
+    expect(stream.textContent).toContain('3 entries');
+    await act(async () => {
+      stream.scrollIntoView({ block: 'nearest' });
+    });
+    const asideRect = aside.getBoundingClientRect();
+    const streamRect = stream.getBoundingClientRect();
+    expect(streamRect.top).toBeLessThanOrEqual(asideRect.bottom - 44);
+    expect(streamRect.bottom).toBeGreaterThanOrEqual(asideRect.top + 44);
+  }
+
   test('mobile flow exposes monitoring sideboard without horizontal overflow at 375px', async () => {
     await expectNoOverflowAt(375, renderWorkspace, { height: 720 });
 
@@ -207,6 +241,9 @@ describe('PipelineWorkspace viewport regression', () => {
     const detailsButtonRect = detailsButton?.getBoundingClientRect();
     expect(detailsButtonRect?.width).toBeGreaterThanOrEqual(44);
     expect(detailsButtonRect?.height).toBeGreaterThanOrEqual(44);
+
+    await expectTaskContextReachable(sideboard, aside);
+    await expectTaskStreamReachable(sideboard, aside);
   });
 
   test('mobile flow has no silent text truncation at 375px', async () => {
@@ -221,6 +258,37 @@ describe('PipelineWorkspace viewport regression', () => {
       height: 720,
       selector: '[data-testid="pipeline-now-panel"] button, button[aria-controls="pipeline-status-details"]',
     });
+  });
+
+  test('mobile board keeps monitoring sideboard reachable above the board at 375px', async () => {
+    await expectNoOverflowAt(375, () => renderWorkspace('board'), { height: 720 });
+
+    if (!host) throw new Error('Expected viewport test host to be mounted');
+    const sideboard = host.querySelector<HTMLElement>('[data-testid="pipeline-sideboard"]');
+    const aside = sideboard?.closest('aside') as HTMLElement | null;
+    const main = host.querySelector<HTMLElement>('[data-testid="pipeline-board-main"]');
+    if (!sideboard || !aside || !main) {
+      throw new Error('Expected Pipeline board sideboard and main region to render');
+    }
+    expect(sideboard.textContent).toContain('Now');
+    expect(sideboard.textContent).toContain('Task health');
+    expect(sideboard.textContent).toContain('Task context');
+    expect(sideboard.textContent).toContain(trackedTask.title);
+    expect(Boolean(aside.compareDocumentPosition(main) & Node.DOCUMENT_POSITION_FOLLOWING)).toBe(true);
+    expect(aside.getBoundingClientRect().right).toBeLessThanOrEqual(376);
+    expect(aside.getBoundingClientRect().bottom).toBeLessThanOrEqual(main.getBoundingClientRect().top + 1);
+    expect(main.textContent).toContain('In Progress');
+    expect(main.textContent).toContain(trackedTask.title);
+    const nowButtons = Array.from(sideboard.querySelectorAll<HTMLButtonElement>('[data-testid="pipeline-now-panel"] button'));
+    expect(nowButtons.length).toBeGreaterThan(0);
+    for (const button of nowButtons) {
+      const rect = button.getBoundingClientRect();
+      expect(rect.width).toBeGreaterThanOrEqual(44);
+      expect(rect.height).toBeGreaterThanOrEqual(44);
+    }
+
+    await expectTaskContextReachable(sideboard, aside);
+    await expectTaskStreamReachable(sideboard, aside);
   });
 
   test('desktop flow keeps sideboard in the right column with embedded monitoring', async () => {

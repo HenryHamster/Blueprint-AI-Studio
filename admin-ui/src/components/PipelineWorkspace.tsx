@@ -559,23 +559,25 @@ function PipelineSideboard({ flow, rail, metrics, stream }: PipelineSideboardPro
         </dl>
       </section>
 
+      <div data-testid="pipeline-task-context" className="min-w-0">
+        <TaskContextRail
+          currentTask={rail.currentTask}
+          attentionTasks={rail.attentionTasks}
+          localFallbackTasks={rail.localFallbackTasks}
+          trackedTaskIds={rail.trackedTaskIds}
+          {...rail.taskContextSessionProps}
+          onOpenTask={rail.onOpenTask}
+          onOpenPipeline={rail.onOpenPipeline}
+          onTrackTask={rail.onTrackTask}
+        />
+      </div>
+
       {stream && stream.trackedTaskIds.size > 0 && (
         <TaskStreamPanel
           {...stream}
           variant="embedded"
         />
       )}
-
-      <TaskContextRail
-        currentTask={rail.currentTask}
-        attentionTasks={rail.attentionTasks}
-        localFallbackTasks={rail.localFallbackTasks}
-        trackedTaskIds={rail.trackedTaskIds}
-        {...rail.taskContextSessionProps}
-        onOpenTask={rail.onOpenTask}
-        onOpenPipeline={rail.onOpenPipeline}
-        onTrackTask={rail.onTrackTask}
-      />
     </div>
   );
 }

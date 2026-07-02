@@ -125,7 +125,7 @@ function DescriptorCard({
 
   return (
     <section
-      className="min-w-0 rounded-md border border-neutral-800 bg-[#0b1118] p-2"
+      className="min-w-0 rounded-md border border-workbench-border bg-workbench-card p-2"
       data-testid={`strategic-context-descriptor-${descriptor.kind}`}
     >
       <div className="flex min-w-0 items-start gap-2">
@@ -210,7 +210,7 @@ function DescriptorCard({
 
       {(descriptor.kind === 'markdown' || descriptor.kind === 'text') && (
         <pre className="mt-2 max-h-48 min-w-0 overflow-auto whitespace-pre-wrap break-words rounded border border-neutral-800 bg-neutral-950/45 px-2 py-1.5 text-xs leading-relaxed text-neutral-300 custom-scrollbar">
-          {descriptor.body || descriptor.summary || 'No read-only preview is available yet.'}
+          {descriptor.body || descriptor.summary || 'No preview available yet.'}
         </pre>
       )}
 
@@ -297,13 +297,13 @@ export function StrategicContextArtifactSlot({
 
       {!hasRenderable && (
         <div className="rounded-md border border-dashed border-neutral-800 bg-neutral-950/35 px-3 py-3 text-xs leading-relaxed text-neutral-500">
-          No canvas or artifact descriptors are attached to this context package yet.
+          No canvas or artifacts yet.
         </div>
       )}
 
       {(mapDescriptor || canvas) && (
         <section
-          className="min-w-0 rounded-md border border-neutral-800 bg-[#0b1118] p-2"
+          className="min-w-0 rounded-md border border-workbench-border bg-workbench-card p-2"
           data-testid="strategic-context-descriptor-context_map"
         >
           <div className="flex min-w-0 items-start gap-2">
@@ -340,7 +340,7 @@ export function StrategicContextArtifactSlot({
             </div>
           ) : (
             <div className="mt-2 rounded border border-dashed border-neutral-800 bg-neutral-950/35 px-3 py-3 text-xs text-neutral-500">
-              The map descriptor is available, but no map nodes are loaded yet.
+              Map data is not loaded yet.
             </div>
           )}
         </section>

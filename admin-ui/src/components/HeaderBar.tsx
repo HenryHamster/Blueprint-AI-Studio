@@ -138,7 +138,6 @@ export function HeaderBar(props: HeaderBarProps) {
     lastFetchTime,
   } = props;
   const [showMobileMenu, setShowMobileMenu] = useState(false);
-  const [showMobileShortcuts, setShowMobileShortcuts] = useState(false);
   const [healthExpanded, setHealthExpanded] = useState(false);
   const mobileMenuRef = useRef<HTMLDivElement>(null);
 
@@ -147,7 +146,6 @@ export function HeaderBar(props: HeaderBarProps) {
     function handleClickOutside(e: MouseEvent) {
       if (mobileMenuRef.current && !mobileMenuRef.current.contains(e.target as Node)) {
         setShowMobileMenu(false);
-        setShowMobileShortcuts(false);
       }
     }
     document.addEventListener('mousedown', handleClickOutside);
@@ -358,7 +356,6 @@ export function HeaderBar(props: HeaderBarProps) {
                     onClick={() => {
                       props.onOpenCommandPalette?.();
                       setShowMobileMenu(false);
-                      setShowMobileShortcuts(false);
                     }}
                     className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
                   >
@@ -399,7 +396,6 @@ export function HeaderBar(props: HeaderBarProps) {
                   onClick={() => {
                     setHealthExpanded(prev => !prev);
                     setShowMobileMenu(false);
-                    setShowMobileShortcuts(false);
                   }}
                   className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${
                     healthExpanded ? 'bg-neutral-800/90 text-neutral-100' : 'text-neutral-300 hover:bg-neutral-800'
@@ -408,40 +404,6 @@ export function HeaderBar(props: HeaderBarProps) {
                   <span className={`h-2 w-2 rounded-full shrink-0 ${healthDotColor}`} />
                   <span>{healthExpanded ? 'Hide health panel' : 'Health panel'}</span>
                 </button>
-                <button
-                  onClick={() => setShowMobileShortcuts(prev => !prev)}
-                  className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"
-                >
-                  <span className="w-4 h-4 flex items-center justify-center font-mono shrink-0">?</span>
-                  <span>Keyboard Shortcuts</span>
-                  <span className="ml-auto text-neutral-500 text-xs">{showMobileShortcuts ? '▴' : '▾'}</span>
-                </button>
-                {showMobileShortcuts && (
-                  <div className="mx-2 mb-1 bg-neutral-800/50 rounded p-2">
-                    <div className="space-y-1.5 text-xs">
-                      {[
-                        ['Ctrl+K', 'Command palette'],
-                        ['R', 'Refresh'],
-                        ['1', 'Chat'],
-                        ['2', 'Pipeline'],
-                        ['3', 'Project update'],
-                        ['4', 'Runtime'],
-                        ['S', 'Runtime settings'],
-                        ['A', 'Archive (pipeline)'],
-                        ['Esc', 'Close panel/modal'],
-                        ['Del', 'Cancel selected (selection mode)'],
-                        ['R*', 'Retry selected (selection mode)'],
-                        ['Enter', 'Open selected task (selection mode)'],
-                        ['Esc*', 'Clear selection / exit mode'],
-                      ].map(([key, desc]) => (
-                        <div key={key} className="flex items-center justify-between">
-                          <span className="text-neutral-400">{desc}</span>
-                          <kbd className="bg-neutral-800 border border-neutral-700 text-neutral-300 px-1.5 py-0.5 rounded text-ui-sm font-mono min-w-[24px] text-center">{key}</kbd>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
                 <button
                   onClick={() => { onOpenSettings(); setShowMobileMenu(false); }}
                   className="w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left text-neutral-300 hover:bg-neutral-800"

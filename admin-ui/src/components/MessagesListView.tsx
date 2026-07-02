@@ -136,7 +136,7 @@ export function MessagesListView({
 }: MessagesListViewProps) {
   if (presentation === 'conversation') {
     return (
-      <div ref={scrollRef} className="relative flex-1 overflow-y-auto bg-[#03060a] px-2 py-3 custom-scrollbar md:px-2.5 md:py-4">
+      <div ref={scrollRef} className="relative flex-1 overflow-y-auto bg-workbench-base px-2 py-3 custom-scrollbar md:px-2.5 md:py-4">
         <div data-testid="strategic-conversation-column" className="mx-auto flex w-full max-w-[900px] flex-col gap-3">
           {loading ? (
             <p className="py-8 text-center text-xs text-neutral-500">Loading...</p>
@@ -177,10 +177,10 @@ export function MessagesListView({
   }
 
   return (
-    <div ref={scrollRef} className="relative flex-1 space-y-2.5 overflow-y-auto bg-[#05080c] px-3 py-3 custom-scrollbar md:px-4">
+    <div ref={scrollRef} className="relative flex-1 space-y-2.5 overflow-y-auto bg-workbench-surface px-3 py-3 custom-scrollbar md:px-4">
       {/* Prominent banner: X new since {time} with action buttons */}
       {dividerTime && totalNewCount > 0 && !dividerDismissedRef.current && (
-        <div className="mb-2.5 flex flex-col gap-3 rounded-md border border-blue-500/40 bg-[#10151c] p-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="mb-2.5 flex flex-col gap-3 rounded-md border border-blue-500/40 bg-workbench-layer p-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex-1 min-w-0">
             <div className="text-sm font-semibold text-blue-300 truncate">
               {totalNewCount} new since {formatSinceTimestamp(dividerTime)}
@@ -205,7 +205,7 @@ export function MessagesListView({
 
       {/* Caught-up indicator: when divider is set, not dismissed, and zero new messages of any kind */}
       {dividerTime && !dividerDismissedRef.current && totalNewCount === 0 && !showOnlyNew && (
-        <div className="mb-2.5 flex flex-col gap-3 rounded-md border border-emerald-500/40 bg-[#10151c] p-3 sm:flex-row sm:items-center sm:justify-between">
+        <div className="mb-2.5 flex flex-col gap-3 rounded-md border border-emerald-500/40 bg-workbench-layer p-3 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex-1 min-w-0">
             <div className="text-sm font-semibold text-emerald-300 truncate">
               No new since {formatSinceTimestamp(dividerTime)}
@@ -361,8 +361,8 @@ export function MessagesListView({
 
           {/* Routine ops group — collapsed by default */}
           {routineOpen.length > 0 && (
-            <div ref={routineRefEl} className="overflow-hidden rounded-md border border-neutral-800 bg-[#10151c]">
-              <div className="flex min-h-[44px] items-center bg-[#10151c] transition-colors hover:bg-neutral-900/70">
+            <div ref={routineRefEl} className="overflow-hidden rounded-md border border-neutral-800 bg-workbench-layer">
+              <div className="flex min-h-[44px] items-center bg-workbench-layer transition-colors hover:bg-neutral-900/70">
                 <button
                   onClick={() => setRoutineExpanded(e => !e)}
                   className="flex-1 flex items-center gap-2 px-4 py-2.5 text-left"
@@ -385,7 +385,7 @@ export function MessagesListView({
                   {showTempMuteMenu && (
                     <>
                       <div className="fixed inset-0 z-40" onClick={() => setShowTempMuteMenu(false)} />
-                      <div className="absolute right-0 top-full z-50 mt-1 min-w-48 space-y-1 rounded-md border border-neutral-700 bg-[#10151c] p-2 shadow-xl">
+                      <div className="absolute right-0 top-full z-50 mt-1 min-w-48 space-y-1 rounded-md border border-neutral-700 bg-workbench-layer p-2 shadow-xl">
                         {getTop3NoisyEventTypes().length > 0 ? (
                           <>
                             <p className="text-ui-sm text-neutral-500 px-2 py-1">Mute for</p>
@@ -472,7 +472,7 @@ export function MessagesListView({
                             {hasDividerBefore && dividerLabel && (
                               <TimeDividerRow label={dividerLabel} className="mb-2" />
                             )}
-                            <div className="overflow-hidden rounded-md border border-neutral-800/60 bg-[#10151c]">
+                            <div className="overflow-hidden rounded-md border border-neutral-800/60 bg-workbench-layer">
                               <div className="flex items-center gap-2 bg-neutral-900/30 px-3 py-2">
                                 <button
                                   onClick={() => setExpandedGroupKeys(prev => {
@@ -512,7 +512,7 @@ export function MessagesListView({
                             {hasDividerBefore && dividerLabel && (
                               <TimeDividerRow label={dividerLabel} className="mb-2" />
                             )}
-                            <div className="overflow-hidden rounded-md border border-neutral-800/60 bg-[#10151c] opacity-60">
+                            <div className="overflow-hidden rounded-md border border-neutral-800/60 bg-workbench-layer opacity-60">
                               <button
                                 onClick={() => setExpandedGroupKeys(prev => { const next = new Set(prev); if (next.has(digestKey)) next.delete(digestKey); else next.add(digestKey); return next; })}
                                 className="w-full flex items-center gap-2 px-3 py-2 bg-neutral-900/30 text-left"

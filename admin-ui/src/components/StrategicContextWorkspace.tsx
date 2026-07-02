@@ -283,7 +283,7 @@ function Section({
   testId?: string;
 }) {
   return (
-    <section className="min-w-0 overflow-hidden rounded-md border border-neutral-800 bg-[#10151c]" data-testid={testId}>
+    <section className="min-w-0 overflow-hidden rounded-md border border-workbench-border bg-workbench-layer" data-testid={testId}>
       <div className="flex min-w-0 items-center justify-between gap-3 border-b border-neutral-800 px-3 py-2.5">
         <h3 className="truncate text-sm font-semibold text-neutral-100">{title}</h3>
         {meta && <span className="shrink-0 text-xs text-neutral-500">{meta}</span>}
@@ -716,8 +716,8 @@ export function StrategicContextWorkspace({
         aria-label="Close Strategic context"
         onClick={onClose}
       />
-      <div className="relative flex h-full w-full max-w-full flex-col overflow-hidden border-l border-neutral-800 bg-[#05080c] shadow-2xl md:max-w-3xl">
-        <header className="flex min-w-0 shrink-0 items-center justify-between gap-3 border-b border-neutral-800 bg-[#05070a] px-3 py-2.5 md:px-4">
+      <div className="relative flex h-full w-full max-w-full flex-col overflow-hidden border-l border-workbench-border bg-workbench-base shadow-2xl md:max-w-3xl">
+        <header className="flex min-w-0 shrink-0 items-center justify-between gap-3 border-b border-workbench-border bg-workbench-shell px-3 py-2.5 md:px-4">
           <div className="min-w-0">
             <div className="flex min-w-0 items-center gap-2">
               <Network className="h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
