@@ -2,6 +2,7 @@ import { spawn, execFileSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
 import WebSocket from 'ws';
 import { getLastWorkspacePrepOutcome, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { handlers, resolveHandler } from './handlers/index.js';
@@ -441,12 +442,39 @@ const IDENTITY_ENV_KEYS = new Set([
   'PROJECT_ID',
   'BLUEPRINT_POOL_MODE',
 ]);
-const KNOWN_MANAGED_CREDENTIAL_FILE_PATHS = [
-  '/home/agent/.claude.json',
-  '/home/agent/.gemini/settings.json',
-  '/opt/agent/openai/auth.json',
-  '/opt/agent/gemini/sa.json',
-];
+// Resolve the agent's HOME exactly the way the spawned provider CLI does
+// (runners.ts:buildBaseCliEnv → `process.env.HOME || os.homedir()`), so every
+// credential/config file we materialize lands where the CLI actually reads it.
+// On the cloud VM HOME=/home/agent → reproduces the historical hardcoded paths;
+// inside the self-hosted fleet-runner bwrap sandbox HOME=/home (fresh tmpfs, NO
+// host $HOME bind) → creds materialize under /home. Read at CALL time (never
+// cached) so it tracks a late-set HOME and so tests that stub process.env.HOME
+// observe the right paths.
+function agentHome(): string {
+  return process.env.HOME || os.homedir();
+}
+
+// Managed provider credential/config files, under two distinct anchoring
+// regimes:
+//   - $HOME-relative — the provider CLI reads these from $HOME, so the WRITE
+//     path MUST follow HOME: ~/.claude.json (Claude Code onboarding-bypass file,
+//     without which the CLI dies in seconds) and ~/.gemini/settings.json.
+//   - install-dir-anchored — /opt/agent/openai/auth.json (pointed at by
+//     CODEX_HOME) and /opt/agent/gemini/sa.json (pointed at by
+//     GOOGLE_APPLICATION_CREDENTIALS). The backend manifest
+//     (build_agent_secret_manifest → providers/{openai,gemini}.py) sets BOTH the
+//     file path AND its pointing env var to these absolute /opt/agent paths, so
+//     they are NOT HOME-relative; this client-side list must mirror the server
+//     paths verbatim or the boot-credential snapshot would miss them.
+function knownManagedCredentialFilePaths(): string[] {
+  const home = agentHome();
+  return [
+    `${home}/.claude.json`,
+    `${home}/.gemini/settings.json`,
+    '/opt/agent/openai/auth.json',
+    '/opt/agent/gemini/sa.json',
+  ];
+}
 
 let bootCredentialSnapshot: MaterializedCredentialState | null = null;
 let lastMaterializedCredentialPaths = new Set<string>();
@@ -479,7 +507,7 @@ function clearManagedCredentialState(): void {
     Reflect.deleteProperty(process.env, key);
   }
   const paths = new Set<string>([
-    ...KNOWN_MANAGED_CREDENTIAL_FILE_PATHS,
+    ...knownManagedCredentialFilePaths(),
     ...lastMaterializedCredentialPaths,
   ]);
   for (const filePath of paths) {
@@ -495,7 +523,7 @@ function snapshotManagedCredentialState(): MaterializedCredentialState {
     if (value !== undefined) env[key] = value;
   }
   const files: SecretManifestFile[] = [];
-  for (const filePath of KNOWN_MANAGED_CREDENTIAL_FILE_PATHS) {
+  for (const filePath of knownManagedCredentialFilePaths()) {
     try {
       const content = fs.readFileSync(filePath, 'utf-8');
       files.push({ path: filePath, content, mode: 0o600 });
@@ -601,7 +629,7 @@ function captureBootCredentialSnapshot(): void {
 function captureBootProviderConfigPresence(): void {
   if (bootProviderConfigPathsPresent !== null) return;
   const candidates = new Set<string>([
-    ...KNOWN_MANAGED_CREDENTIAL_FILE_PATHS,
+    ...knownManagedCredentialFilePaths(),
     ...requiredProviderConfigFiles(PROVIDER),
   ]);
   bootProviderConfigPathsPresent = new Set([...candidates].filter(p => {
