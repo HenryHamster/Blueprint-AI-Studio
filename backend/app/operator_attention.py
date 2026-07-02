@@ -69,18 +69,21 @@ _MESSAGE_QUESTION_PREVIEW_LIMIT = 8
 _MESSAGE_WATCH_PREVIEW_LIMIT = 24
 _ALERT_ERROR_PREVIEW_LIMIT = 4
 _ALERT_WARNING_PREVIEW_LIMIT = 4
+_DEAD_RUNNER_PREVIEW_LIMIT = 4
 
 _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "approval_required"): 10,
     ("needs_operator", "alert"): 20,
     ("needs_operator", "local_runner_hold"): 30,
     ("needs_operator", "stale_runner_pin"): 40,
+    ("needs_operator", "dead_runner"): 45,
     ("needs_operator", "stale_provisioning_task"): 50,
     ("needs_operator", "stale_queued_task"): 60,
     ("needs_operator", "manual_intervention"): 70,
     ("needs_operator", "blocker"): 80,
     ("needs_operator", "question"): 90,
     ("watch", "alert"): 200,
+    ("watch", "dead_runner"): 205,
     ("watch", "failed_task"): 210,
     ("watch", "blocked_task"): 220,
     ("watch", "parked_task"): 230,
@@ -137,6 +140,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "mode": "runtime_lifecycle",
         "clears_when": "runner_recovers_task_unpins_dispatches_terminal_or_archived",
         "operator_action": "recover_runner_or_retarget_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "dead_runner": {
+        "mode": "runtime_lifecycle",
+        "clears_when": "runner_heartbeats_back_to_live_or_is_deleted",
+        "operator_action": "recover_or_remove_runner",
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
@@ -582,6 +592,163 @@ async def _load_stale_runner_pins(
     return len(stale), stale[:_STALE_TASK_PREVIEW_LIMIT]
 
 
+def _runner_is_dead(runner: LocalRunner) -> bool:
+    """A registered runner that WAS live but is now offline/stale.
+
+    True when the runner is not live AND either it has been swept ``inactive`` or
+    it heartbeated at least once before going stale. A never-heartbeated ``active``
+    runner is excluded — that is a booting/just-registered runner, not a death, so
+    surfacing it would be a false positive (the stale-runner sweep will flip it to
+    ``inactive`` after the liveness window if it never comes up, and it surfaces
+    then via its runner-deactivated alert).
+    """
+    if bool(_runner_health(runner).get("is_live")):
+        return False
+    return runner.status != "active" or runner.last_seen_at is not None
+
+
+async def _load_dead_runners(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> tuple[int, int, list[LocalRunner]]:
+    """Registered runners that have died/stalled, independent of any pinned task.
+
+    Fills the gap where an IDLE registered runner (or one running a pulled,
+    mid-job task) could go offline and surface nothing in the attention feed:
+    the only prior runner signal, :func:`_stale_runner_pin_attention_item`,
+    required a PROVISIONING task pinned-but-UNPULLED on it, so an idle runner or
+    one whose task the runner already pulled produced nothing. Two exclusions
+    keep it non-redundant:
+
+    * runners already surfaced by a stale unpulled-pin item (they carry an
+      ``_runner_pin_filter`` pin) — the task-centric item covers them; and
+    * runners with an OPEN runner-deactivated alert — that alert already appears
+      via :func:`_alert_attention_item` (routed to the ``devices`` section).
+
+    Returns ``(needs_operator_count, watch_count, preview_runners)``: a dead
+    runner that had active work in flight is a ``needs_operator`` item (its work
+    may be interrupted), an idle one is a ``watch`` item — mirroring the
+    ERROR/WARNING split of the runner-deactivated alert.
+    """
+    runners = list(
+        (
+            await session.execute(
+                select(LocalRunner).where(
+                    LocalRunner.project_id == project_id,
+                    LocalRunner.status != "deleted",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    dead = [runner for runner in runners if _runner_is_dead(runner)]
+    if not dead:
+        return 0, 0, []
+    # Exclude runners already surfaced by an unpulled-pin (stale_runner_pin) item.
+    pin_vm_ids = (
+        await session.execute(
+            select(Task.vm_instance_id).where(*_runner_pin_filter(project_id))
+        )
+    ).scalars().all()
+    pinned_runner_ids = {
+        vm.removeprefix("runner:")
+        for vm in pin_vm_ids
+        if isinstance(vm, str) and vm.startswith("runner:")
+    }
+    dead = [runner for runner in dead if str(runner.id) not in pinned_runner_ids]
+    if not dead:
+        return 0, 0, []
+    from app.alert_dispatch import _runner_deactivated_dedupe_key
+
+    dedupe_keys = {_runner_deactivated_dedupe_key(runner.id) for runner in dead}
+    alerted_keys = set(
+        (
+            await session.execute(
+                select(Alert.dedupe_key).where(
+                    Alert.project_id == project_id,
+                    Alert.dismissed_at.is_(None),
+                    Alert.dedupe_key.in_(dedupe_keys),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    uncovered = [
+        runner
+        for runner in dead
+        if _runner_deactivated_dedupe_key(runner.id) not in alerted_keys
+    ]
+    if not uncovered:
+        return 0, 0, []
+    uncovered.sort(key=lambda runner: runner.last_seen_at or runner.created_at or _utcnow())
+    needs_operator_count = sum(
+        1
+        for runner in uncovered
+        if int(_runner_health(runner).get("active_work_count") or 0) > 0
+    )
+    watch_count = len(uncovered) - needs_operator_count
+    return needs_operator_count, watch_count, uncovered[:_DEAD_RUNNER_PREVIEW_LIMIT]
+
+
+def _dead_runner_attention_item(runner: LocalRunner) -> dict[str, Any]:
+    health = _runner_health(runner)
+    active_work = int(health.get("active_work_count") or 0)
+    had_active_work = active_work > 0
+    device_status = health.get("device_status") or "offline"
+    reason_text = (
+        health.get("stale_reason") or health.get("device_status_reason") or "offline"
+    )
+    seconds = health.get("seconds_since_last_seen")
+    label = runner.hostname or f"Runner {str(runner.id)[:8]}"
+    if had_active_work:
+        plural = "s" if active_work != 1 else ""
+        detail = (
+            f"Runner '{label}' is {device_status} ({reason_text}) with "
+            f"{active_work} active task{plural} — the work may be interrupted."
+        )
+    elif isinstance(seconds, int):
+        detail = (
+            f"Runner '{label}' is {device_status} — last heartbeat {seconds}s ago "
+            f"({reason_text})."
+        )
+    else:
+        detail = f"Runner '{label}' is {device_status} ({reason_text})."
+    item: dict[str, Any] = {
+        "id": f"runner:{runner.id}:offline",
+        "kind": "runner",
+        "severity": "needs_operator" if had_active_work else "watch",
+        "reason": "dead_runner",
+        "label": (
+            "Fleet runner offline mid-job"
+            if had_active_work
+            else "Fleet runner offline"
+        ),
+        "detail": _compact_text(detail, max_chars=180),
+        "status": device_status,
+        "created_at": runner.created_at.isoformat() if runner.created_at else None,
+        "updated_at": (
+            runner.last_seen_at.isoformat() if runner.last_seen_at else None
+        ),
+        "runner_id": str(runner.id),
+        "ref": {
+            "kind": "runner",
+            "id": str(runner.id),
+            "project_id": str(runner.project_id),
+        },
+        "target": _attention_target(
+            {
+                "surface": "runtime",
+                "project_id": str(runner.project_id),
+                "section": "devices",
+                "runner_id": str(runner.id),
+            }
+        ),
+    }
+    return item
+
+
 async def _load_stale_provisioning_tasks(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -992,6 +1159,11 @@ async def build_operator_attention(
         project.id,
     )
     (
+        dead_runner_needs_operator_count,
+        dead_runner_watch_count,
+        dead_runners,
+    ) = await _load_dead_runners(session, project.id)
+    (
         stale_provisioning_count,
         stale_provisioning_tasks,
     ) = await _load_stale_provisioning_tasks(session, project.id)
@@ -1137,6 +1309,8 @@ async def build_operator_attention(
         add_candidate(_local_runner_hold_attention_item(task))
     for task, runner in stale_runner_pin_tasks:
         add_candidate(_stale_runner_pin_attention_item(task, runner=runner))
+    for runner in dead_runners:
+        add_candidate(_dead_runner_attention_item(runner))
     for task in stale_provisioning_tasks:
         add_candidate(
             _stale_task_attention_item(task, reason="stale_provisioning_task")
@@ -1175,6 +1349,7 @@ async def build_operator_attention(
         + approval_count
         + total_local_runner_hold_count
         + stale_runner_pin_count
+        + dead_runner_needs_operator_count
         + stale_provisioning_count
         + stale_queued_count
         + len(manual_directions)
@@ -1185,6 +1360,7 @@ async def build_operator_attention(
         + blocked_count
         + parked_count
         + warning_alert_count
+        + dead_runner_watch_count
         + bug_report_count
         + feedback_count
     )
@@ -1234,6 +1410,7 @@ async def build_operator_attention(
             "compute_local_runner_holds": local_runner_hold_count,
             "strategic_local_runner_holds": strategic_local_runner_hold_count,
             "stale_runner_pins": stale_runner_pin_count,
+            "dead_runners": dead_runner_needs_operator_count + dead_runner_watch_count,
             "stale_provisioning_tasks": stale_provisioning_count,
             "stale_queued_tasks": stale_queued_count,
             "manual_directions": len(manual_directions),

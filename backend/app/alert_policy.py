@@ -113,6 +113,11 @@ ALERT_EVENT_POLICIES: dict[str, AlertEventPolicy] = {
     "cost.spend_hold": AlertEventPolicy("cost.spend_hold"),
     "capacity.quota_exhausted": AlertEventPolicy("capacity.quota_exhausted"),
     "capacity.all_accounts_blocked": AlertEventPolicy("capacity.all_accounts_blocked"),
+    # A self-hosted fleet runner missing its heartbeat window is a portable
+    # operator incident (any project can enroll operator hardware), so it lives
+    # in the always-on ``core`` domain — no per-project opt-in — and pushes the
+    # webhook like PIPELINE_HALTED / CIRCUIT_BREAKER_OPEN.
+    "runner.deactivated": AlertEventPolicy("runner.deactivated"),
     "deployment.halted": AlertEventPolicy("deployment.halted"),
     "deployment.rollback_recommended": AlertEventPolicy(
         "deployment.rollback_recommended"

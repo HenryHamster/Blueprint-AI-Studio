@@ -319,6 +319,24 @@ async def heartbeat(
                 "agent_available": caps.get("agent_available"),
             },
         )
+    # Recovery: this heartbeat re-armed a previously-inactive runner (the sweep
+    # flips active->inactive and raises a runner-deactivated alert). Resolve that
+    # open alert so it does not linger falsely now that the runner is live again.
+    # Gated on the re-arm transition so a healthy runner's heartbeat never runs
+    # the resolve query. Best-effort — a resolve failure must not fail the
+    # heartbeat.
+    if previous_status != "active":
+        try:
+            from app.alert_dispatch import _resolve_runner_deactivated_alert
+
+            await _resolve_runner_deactivated_alert(
+                session, runner_project_id, runner_id
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to resolve runner-deactivated alert for %s",
+                runner_id,
+            )
     return {"ok": True, "last_seen_at": runner.last_seen_at.isoformat()}
 
 
