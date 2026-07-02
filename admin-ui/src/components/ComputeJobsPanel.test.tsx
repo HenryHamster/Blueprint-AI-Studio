@@ -25,22 +25,25 @@ const fetchComputeSweepGroups = vi.fn();
 const rerunComputeExperiment = vi.fn();
 const askComputeJob = vi.fn();
 
-vi.mock('../api', () => ({
-  fetchComputeJobs: (...args: unknown[]) => fetchComputeJobs(...args),
-  fetchComputeJobsPaged: async (...args: unknown[]) => {
-    const r = await fetchComputeJobs(...args);
-    return Array.isArray(r) ? { jobs: r, hasMore: false } : r;
-  },
-  killComputeJob: (...args: unknown[]) => killComputeJob(...args),
-  analyzeComputeJob: (...args: unknown[]) => analyzeComputeJob(...args),
-  fetchKnowledgeDocument: (...args: unknown[]) => fetchKnowledgeDocument(...args),
-  resolveArtifactDownloadUrl: (...args: unknown[]) => resolveArtifactDownloadUrl(...args),
-  fetchComputeJobsAggregateSummary: (...args: unknown[]) => fetchComputeJobsAggregateSummary(...args),
-  fetchHeldComputeExperiments: (...args: unknown[]) => fetchHeldComputeExperiments(...args),
-  fetchComputeSweepGroups: (...args: unknown[]) => fetchComputeSweepGroups(...args),
-  rerunComputeExperiment: (...args: unknown[]) => rerunComputeExperiment(...args),
-  askComputeJob: (...args: unknown[]) => askComputeJob(...args),
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    fetchComputeJobs: (...args: unknown[]) => fetchComputeJobs(...args),
+    fetchComputeJobsPaged: async (...args: unknown[]) => {
+      const r = await fetchComputeJobs(...args);
+      return Array.isArray(r) ? { jobs: r, hasMore: false } : r;
+    },
+    killComputeJob: (...args: unknown[]) => killComputeJob(...args),
+    analyzeComputeJob: (...args: unknown[]) => analyzeComputeJob(...args),
+    fetchKnowledgeDocument: (...args: unknown[]) => fetchKnowledgeDocument(...args),
+    resolveArtifactDownloadUrl: (...args: unknown[]) => resolveArtifactDownloadUrl(...args),
+    fetchComputeJobsAggregateSummary: (...args: unknown[]) => fetchComputeJobsAggregateSummary(...args),
+    fetchHeldComputeExperiments: (...args: unknown[]) => fetchHeldComputeExperiments(...args),
+    fetchComputeSweepGroups: (...args: unknown[]) => fetchComputeSweepGroups(...args),
+    rerunComputeExperiment: (...args: unknown[]) => rerunComputeExperiment(...args),
+    askComputeJob: (...args: unknown[]) => askComputeJob(...args),
+  });
+});
 
 function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
   return {

@@ -36,6 +36,7 @@ vi.mock('./TaskCard', () => ({
     <div data-testid="task-card">{task.title}</div>
   ),
   TASK_TYPE_STYLES: {},
+  FAILURE_CLASS_CONFIG: {},
 }));
 
 const testColumns: KanbanColumn[] = [

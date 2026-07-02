@@ -49,10 +49,10 @@ import {
   fetchBackendLastSeen,
 } from './MessagesPanel.utils';
 
-vi.mock('../api', () => ({
-  apiFetch: vi.fn(),
-  API_BASE_URL: '',
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock();
+});
 
 import { apiFetch } from '../api';
 

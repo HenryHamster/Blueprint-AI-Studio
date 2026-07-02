@@ -19,7 +19,11 @@ import {
 import type { WorkbenchEventEnvelopeV1 } from './types/workbenchEvents';
 
 vi.mock('./firebase', () => ({
+  auth: { currentUser: null, onAuthStateChanged: () => () => {} },
+  signInWithGoogle: vi.fn(),
   getIdToken: vi.fn(async () => 'test-token'),
+  onAuthChange: vi.fn(() => () => {}),
+  signOut: vi.fn(),
 }));
 
 const OPERATOR_WORKBENCH_FIXTURE_RELATIVE_PATH = 'backend/testing/__fixtures__/operator_workbench_contracts.json';

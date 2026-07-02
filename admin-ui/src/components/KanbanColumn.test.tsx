@@ -30,6 +30,7 @@ vi.mock('@dnd-kit/utilities', () => ({
 vi.mock('./TaskCard', () => ({
   TaskCard: () => <div data-testid="task-card" />,
   TASK_TYPE_STYLES: {},
+  FAILURE_CLASS_CONFIG: {},
 }));
 
 afterEach(() => {

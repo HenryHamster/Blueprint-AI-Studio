@@ -6,8 +6,9 @@ import { DEFAULT_POLL_MS, __pollerInternals } from '../hooks/usePoller';
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
   signInWithGoogle: vi.fn(),
-  signOut: vi.fn(),
   getIdToken: vi.fn().mockResolvedValue('test-token'),
+  onAuthChange: vi.fn(() => () => {}),
+  signOut: vi.fn(),
 }));
 
 const { apiFetchMock } = vi.hoisted(() => ({

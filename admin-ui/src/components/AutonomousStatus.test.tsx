@@ -8,15 +8,20 @@ const { apiFetchMock, authHeadersMock } = vi.hoisted(() => ({
   authHeadersMock: vi.fn(),
 }));
 
-vi.mock('../api', () => ({
-  apiFetch: apiFetchMock,
-  authHeaders: authHeadersMock,
-  API_BASE_URL: 'http://test',
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    apiFetch: apiFetchMock,
+    authHeaders: authHeadersMock,
+    API_BASE_URL: 'http://test',
+  });
+});
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
   signInWithGoogle: vi.fn(),
+  getIdToken: vi.fn(async () => 'test-token'),
+  onAuthChange: vi.fn(() => () => {}),
   signOut: vi.fn(),
 }));
 

@@ -7,9 +7,10 @@ import {
   type StrategicWorkbenchState,
 } from './strategicStateApi';
 
-vi.mock('./api', () => ({
-  apiFetch: vi.fn(),
-}));
+vi.mock('./api', async () => {
+  const { createApiMock } = await import('./test/api-mock-complete');
+  return createApiMock();
+});
 
 const apiFetchMock = vi.mocked(apiFetch);
 

@@ -26,11 +26,14 @@ const SAMPLE_RUNNERS: FleetRunner[] = [
   },
 ];
 
-vi.mock('../api', () => ({
-  listFleetRunners: vi.fn(async () => SAMPLE_RUNNERS),
-  registerFleetRunner: vi.fn(async () => ({ runner_id: 'runner-new', token: 'tok-secret-xyz' })),
-  revokeFleetRunner: vi.fn(async () => {}),
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    listFleetRunners: vi.fn(async () => SAMPLE_RUNNERS),
+    registerFleetRunner: vi.fn(async () => ({ runner_id: 'runner-new', token: 'tok-secret-xyz' })),
+    revokeFleetRunner: vi.fn(async () => {}),
+  });
+});
 
 import { listFleetRunners, registerFleetRunner, revokeFleetRunner } from '../api';
 

@@ -3,14 +3,13 @@ import { renderHook, act, cleanup } from '@testing-library/react';
 import { useTasksState } from './useTasksState';
 import type { Task } from '../types/task';
 
-vi.mock('../api', () => ({
-  authHeaders: vi.fn().mockResolvedValue({ Authorization: 'Bearer ***', 'Content-Type': 'application/json' }),
-  authGet: vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ tasks: [], total: 0 }) }),
-  apiFetch: vi.fn(),
-  resetTaskIterationCap: vi.fn(),
-  triggerTaskRollup: vi.fn(),
-  API_BASE_URL: '',
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    authHeaders: vi.fn().mockResolvedValue({ Authorization: 'Bearer ***', 'Content-Type': 'application/json' }),
+    authGet: vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ tasks: [], total: 0 }) }),
+  });
+});
 
 vi.mock('./usePersistedState', () => ({
   usePersistedState: (key: string, init: unknown) => [init, vi.fn()],

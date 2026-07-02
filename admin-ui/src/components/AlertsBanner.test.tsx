@@ -3,9 +3,10 @@ import { render, screen } from '@testing-library/react';
 import { AlertsBanner } from './AlertsBanner';
 import type { Alert } from '../types/alert';
 
-vi.mock('../api', () => ({
-  apiFetch: vi.fn(),
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock();
+});
 
 const alert: Alert = {
   id: 'alert-1',

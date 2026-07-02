@@ -3,10 +3,10 @@ import { renderHook, act, waitFor, cleanup } from '@testing-library/react';
 import { useDirectionsData } from './useDirectionsData';
 import { apiFetch, fetchVersionLifecycle } from '../api';
 
-vi.mock('../api', () => ({
-  apiFetch: vi.fn(),
-  fetchVersionLifecycle: vi.fn(),
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock();
+});
 
 vi.mock('./useAutonomousConfig', () => ({
   useAutonomousConfig: () => ({
@@ -31,7 +31,9 @@ vi.mock('./useAutonomousConfig', () => ({
 }));
 
 vi.mock('./usePoller', () => ({
+  DEFAULT_POLL_MS: 30_000,
   usePoller: vi.fn(),
+  __pollerInternals: { reset: vi.fn(), hasActiveTimers: vi.fn(), subscriberCount: vi.fn() },
 }));
 
 const mockApiFetch = vi.mocked(apiFetch);

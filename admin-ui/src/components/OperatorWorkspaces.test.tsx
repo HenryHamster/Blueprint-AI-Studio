@@ -36,6 +36,7 @@ vi.mock('./FleetRunnersPanel', () => ({
 
 vi.mock('./ComputeJobsPanel', () => ({
   ComputeJobsPanel: () => <div>Compute jobs</div>,
+  default: () => <div>Compute jobs</div>,
 }));
 
 vi.mock('./DashboardHome', () => ({

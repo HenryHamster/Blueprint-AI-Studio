@@ -2,16 +2,19 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import { EvergreenBacklogPanel } from './EvergreenBacklogPanel';
 import { __pollerInternals } from '../hooks/usePoller';
-
 const mockFetchEvergreenBacklog = vi.fn();
 const mockFetchEvergreenBacklogSummary = vi.fn();
 
-vi.mock('../api', () => ({
-  fetchEvergreenBacklog: (...args: unknown[]) => mockFetchEvergreenBacklog(...args),
-  fetchEvergreenBacklogSummary: (...args: unknown[]) => mockFetchEvergreenBacklogSummary(...args),
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    fetchEvergreenBacklog: (...args: unknown[]) => mockFetchEvergreenBacklog(...args),
+    fetchEvergreenBacklogSummary: (...args: unknown[]) => mockFetchEvergreenBacklogSummary(...args),
+  });
+});
 
-vi.mock('../utils/time', () => ({
+vi.mock('../utils/time', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../utils/time')>()),
   formatAbsolute: (v: string) => `abs:${v}`,
 }));
 

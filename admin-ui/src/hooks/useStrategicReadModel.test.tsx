@@ -6,6 +6,12 @@ import type { StrategicSessionResponse, StrategicStateResponse } from '../strate
 
 vi.mock('../strategicStateApi', () => ({
   fetchStrategicState: vi.fn(),
+  fetchStrategicWorkbenchState: vi.fn(),
+  updateStrategicWorkbenchState: vi.fn(),
+  fetchStrategicSession: vi.fn(),
+  createStrategicSessionMessage: vi.fn(),
+  checkInStrategicSession: vi.fn(),
+  executeStrategicWorkSessionCommand: vi.fn(),
 }));
 
 // Disable the poller so tests drive fetches via result.current.refresh().
@@ -13,6 +19,7 @@ vi.mock('../strategicStateApi', () => ({
 vi.mock('./usePoller', () => ({
   DEFAULT_POLL_MS: 30_000,
   usePoller: vi.fn(),
+  __pollerInternals: { reset: vi.fn(), hasActiveTimers: vi.fn(), subscriberCount: vi.fn() },
 }));
 
 const mockFetch = vi.mocked(fetchStrategicState);

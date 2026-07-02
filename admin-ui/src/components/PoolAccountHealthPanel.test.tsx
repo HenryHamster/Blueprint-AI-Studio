@@ -5,8 +5,9 @@ import { render, screen, fireEvent } from '@testing-library/react';
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
   signInWithGoogle: vi.fn(),
-  signOut: vi.fn(),
   getIdToken: vi.fn().mockResolvedValue('test-token'),
+  onAuthChange: vi.fn(() => () => {}),
+  signOut: vi.fn(),
 }));
 
 vi.mock('recharts', () => ({

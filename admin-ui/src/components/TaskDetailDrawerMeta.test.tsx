@@ -14,17 +14,20 @@ vi.mock('../firebase', () => ({
   onAuthChange: vi.fn(() => () => {}),
 }));
 
-vi.mock('../api', () => ({
-  authGet: vi.fn(async () => new Response(JSON.stringify({ stats: {} }), { status: 200 })),
-  apiFetch: vi.fn(async () => new Response(JSON.stringify({ task_id: 'task-1', fix_loop_history: {}, summary: {} }), { status: 200 })),
-  API_BASE_URL: 'http://localhost:8000',
-  fetchComputeJobs: vi.fn(async () => ({ jobs: [], hasMore: false, summary: { total_jobs: 0, active_jobs: 0, terminal_jobs: 0, total_spend_usd: 0, outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0 }, limit: 50, offset: 0 })),
-  fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' })),
-  resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/tasks/task-1/result.json'),
-  resolveViewportFailureDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport/screenshot.png'),
-  resolveViewportShotDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport-shots/shot.png'),
-  fetchTaskSerialConsole: vi.fn(async () => ({ serial_log: '', source: 'cached', vm_status: 'TERMINATED', vm_instance_id: 'test' })),
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    authGet: vi.fn(async () => new Response(JSON.stringify({ stats: {} }), { status: 200 })),
+    apiFetch: vi.fn(async () => new Response(JSON.stringify({ task_id: 'task-1', fix_loop_history: {}, summary: {} }), { status: 200 })),
+    API_BASE_URL: 'http://localhost:8000',
+    fetchComputeJobs: vi.fn(async () => ({ jobs: [], hasMore: false, summary: { total_jobs: 0, active_jobs: 0, terminal_jobs: 0, total_spend_usd: 0, outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0 }, limit: 50, offset: 0 })),
+    fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' })),
+    resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/tasks/task-1/result.json'),
+    resolveViewportFailureDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport/screenshot.png'),
+    resolveViewportShotDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport-shots/shot.png'),
+    fetchTaskSerialConsole: vi.fn(async () => ({ serial_log: '', source: 'cached', vm_status: 'TERMINATED', vm_instance_id: 'test' })),
+  });
+});
 
 function wrapJobs(jobs: ComputeJob[], hasMore = false): ComputeJobsListResponse {
   return {

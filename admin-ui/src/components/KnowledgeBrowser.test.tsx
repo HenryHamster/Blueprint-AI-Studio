@@ -103,18 +103,20 @@ const webResearchDoc = {
   },
 };
 
-vi.mock('../api', () => ({
-  API_BASE_URL: '',
-  authGet: vi.fn(() => Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({}) })),
-  authHeaders: vi.fn(() => Promise.resolve({})),
-  fetchKnowledgeDocuments: vi.fn(() =>
-    Promise.resolve({ documents: [computeDoc, webResearchDoc], total: 2, limit: 50, offset: 0 }),
-  ),
-  fetchKnowledgeDocument: vi.fn(() =>
-    Promise.resolve({ ...webResearchDoc, body: '# Body\n\nMarkdown body.' }),
-  ),
-  resolveArtifactDownloadUrl: vi.fn(() => Promise.resolve('https://signed.example.com/knowledge/doc-web-research-grounded')),
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    authGet: vi.fn(() => Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({}) })),
+    authHeaders: vi.fn(() => Promise.resolve({})),
+    fetchKnowledgeDocuments: vi.fn(() =>
+      Promise.resolve({ documents: [computeDoc, webResearchDoc], total: 2, limit: 50, offset: 0 }),
+    ),
+    fetchKnowledgeDocument: vi.fn(() =>
+      Promise.resolve({ ...webResearchDoc, body: '# Body\n\nMarkdown body.' }),
+    ),
+    resolveArtifactDownloadUrl: vi.fn(() => Promise.resolve('https://signed.example.com/knowledge/doc-web-research-grounded')),
+  });
+});
 
 describe('KnowledgeBrowser — routed direction filter', () => {
   let root: Root | null = null;

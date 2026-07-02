@@ -12,7 +12,13 @@ vi.mock('../api', () => ({
   API_BASE_URL: '',
 }));
 
-vi.mock('../firebase', () => ({ getIdToken: vi.fn().mockResolvedValue('tok') }));
+vi.mock('../firebase', () => ({
+  auth: { currentUser: null, onAuthStateChanged: () => () => {} },
+  signInWithGoogle: vi.fn(),
+  getIdToken: vi.fn().mockResolvedValue('tok'),
+  onAuthChange: vi.fn(() => () => {}),
+  signOut: vi.fn(),
+}));
 
 const baseProps = {
   newTaskRepo: 'owner/repo',

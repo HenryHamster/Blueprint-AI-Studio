@@ -15,7 +15,10 @@ import type { StrategicStateResponse } from '../strategicStateApi';
 // preserve here, and the only export this suite reads is `auth.currentUser`.
 vi.mock('../firebase', () => ({
   auth: { currentUser: { email: 'test-user@example.com' } },
+  signInWithGoogle: vi.fn(),
   getIdToken: vi.fn(async () => 'test-token'),
+  onAuthChange: vi.fn(() => () => {}),
+  signOut: vi.fn(),
 }));
 
 // Partial mock — `MessagesPanel.tsx` imports `authHeaders` (and `API_BASE_URL`)
