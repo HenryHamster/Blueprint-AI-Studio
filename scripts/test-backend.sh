@@ -412,7 +412,17 @@ _run python3 -c "from app.main import app; print(f'OK: {len(app.routes)} routes'
 
 if [ "${1:-}" = "--standalone" ]; then
   echo "=== Standalone tests (no DB) ==="
-  STANDALONE_ARGS=(testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_admin_auth_invariant.py testing/test_panel_review_metric_manifest.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py)
+  STANDALONE_ARGS=(
+    testing/test_security.py
+    testing/test_pipeline.py
+    testing/test_invariants.py
+    testing/test_admin_auth_invariant.py
+    testing/test_panel_review_metric_manifest.py
+    testing/test_release_promotion_metric_manifest.py
+    testing/test_dependency_deprecations.py
+    testing/test_websocket_emitter_inventory.py
+    testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters
+  )
   # /repo is a Docker bind-mount; skip on Docker-less VMs where it does not exist.
   [ -f /repo/scripts/test_blueprint_cli.py ] && STANDALONE_ARGS+=(/repo/scripts/test_blueprint_cli.py)
   _run python3 -m pytest "${STANDALONE_ARGS[@]}" -v --noconftest
@@ -426,7 +436,7 @@ if [ $# -gt 0 ]; then
 fi
 
 echo "=== Standalone tests ==="
-_run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_admin_auth_invariant.py testing/test_panel_review_metric_manifest.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py /repo/scripts/test_blueprint_cli.py -v --noconftest
+_run python3 -m pytest testing/test_security.py testing/test_pipeline.py testing/test_invariants.py testing/test_admin_auth_invariant.py testing/test_panel_review_metric_manifest.py testing/test_release_promotion_metric_manifest.py testing/test_dependency_deprecations.py testing/test_websocket_emitter_inventory.py testing/test_operator_workbench_contracts.py::test_websocket_emitter_inventory_covers_current_emitters /repo/scripts/test_blueprint_cli.py -v --noconftest
 
 echo "=== Full test suite ==="
 if [ "${#TESTMON_ARGS[@]}" -gt 0 ]; then
