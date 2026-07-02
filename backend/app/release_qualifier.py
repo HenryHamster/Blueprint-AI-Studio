@@ -111,6 +111,7 @@ from app.release_promotion import (
     _candidate_already_on_main,
     _idempotent_pr_url,
     _lts_branch_names,
+    _merge_grade_misses_armed,
     _notify_operator,
     _record_promotion_failure,  # noqa: F401 — tests access via rq.*
     _record_promotion_success,
@@ -3404,6 +3405,13 @@ async def _finalize_qualification(
         _proj_for_ci_gate = await session.get(Project, version.project_id)
         ci_required = _ci_required_for_finalize(_proj_for_ci_gate, ci_resolution)
     criterion_coverage = await get_version_coverage_summary(session, version.id)
+    merge_grade_misses = _merge_grade_misses_armed(
+        {
+            "merge_grade_status": merge_grade_cert["status"],
+            "merge_grade": merge_grade_cert,
+        },
+        policy,
+    )
     composite = compute_composite(
         ci_green=ci_green,
         audit_score=audit_score,
@@ -3416,7 +3424,7 @@ async def _finalize_qualification(
         migration_collision=migration_collision,
         migration_apply_blocked=migration_apply_blocked,
         criterion_coverage=criterion_coverage,
-        merge_grade_misses=bool(merge_grade_cert.get("blocked")),
+        merge_grade_misses=merge_grade_misses,
     )
 
     # --- Acceptance-window counts (additive evidence, no score impact) -----
@@ -3482,6 +3490,7 @@ async def _finalize_qualification(
         "merge_grade_coverage": merge_grade_cert["coverage"],
         "merge_grade_biggest_gap": merge_grade_cert["biggest_gap"],
         "merge_grade": merge_grade_cert,
+        "merge_grade_misses": merge_grade_misses,
         # Goal-alignment grade emitted by the release_audit agent when
         # version.goal is set. None when no goal is configured or the audit
         # predates this field.

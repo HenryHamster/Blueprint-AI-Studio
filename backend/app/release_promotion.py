@@ -295,8 +295,10 @@ def _recover_confidence_from_ci_unresolved(
         smoketest_score=smoketest_score,
         policy=_policy,
         smoketest_enabled=smoketest_enabled,
+        migration_collision=base_record.get("migration_safety") == "block",
+        migration_apply_blocked=base_record.get("migration_apply_safety") == "block",
         criterion_coverage=base_record.get("criterion_coverage"),
-        merge_grade_misses=_merge_grade_misses_from_record(base_record),
+        merge_grade_misses=_merge_grade_misses_armed(base_record, _policy),
     )
 
     return {
@@ -307,18 +309,22 @@ def _recover_confidence_from_ci_unresolved(
     }
 
 
-def _merge_grade_misses_from_record(base_record: dict[str, Any]) -> bool:
-    """Return whether a durable qualification record carries a failing merge grade."""
-    if base_record.get("merge_grade_status") == "fail":
+def _merge_grade_misses_armed(
+    base_record: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+) -> bool:
+    if bool(base_record.get("merge_grade_misses")):
         return True
+    try:
+        armed = float((policy or {}).get("merge_grade_block_threshold") or 0.0) > 0.0
+    except (TypeError, ValueError):
+        armed = False
+    if not armed:
+        return False
     merge_grade = base_record.get("merge_grade")
-    if not isinstance(merge_grade, dict):
-        return False
-    if merge_grade.get("status") == "fail":
-        return True
-    if base_record.get("merge_grade_status") in {"pass", "not_applicable", "superseded_exempt"}:
-        return False
-    return merge_grade.get("blocked") is True
+    return base_record.get("merge_grade_status") == "fail" or (
+        isinstance(merge_grade, dict) and bool(merge_grade.get("blocked"))
+    )
 
 
 async def _record_qualification_verdict(
