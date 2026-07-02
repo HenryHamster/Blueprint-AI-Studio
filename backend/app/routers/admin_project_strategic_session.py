@@ -1,8 +1,9 @@
 """Strategic session and workbench helper endpoints for admin projects.
 
-This router contains the strategic-state read model, strategic-session
-CRUD endpoints, and all private helpers that back them. It is registered
-in main.py alongside admin_projects_router under the same /api/admin prefix.
+This router contains the strategic-session CRUD endpoints and the private
+helpers that back them. Read-model helpers live in strategic_state_read_model
+and work_session_check_in. It is registered in main.py alongside
+admin_projects_router under the same /api/admin prefix.
 """
 
 import logging
@@ -11,22 +12,16 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
-from sqlalchemy import and_, case, func, or_
+from sqlalchemy import func, or_, and_
 from typing import Dict, Any
 import uuid
-from datetime import datetime
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
 from app.broadcast import broadcast_to_project
-from app.messages_noise_prefs_store import (
-    get_messages_noise_prefs_row,
-    mutate_messages_noise_prefs,
-)
 from app.shared_state import limiter
 from app.models import (
-    Alert,
     MESSAGE_CONTENT_MAX,
     ProjectMessage,
     MessageType,
@@ -52,7 +47,6 @@ from app.project_message_projection import (
     MESSAGE_EVENT_REFETCH_SURFACES,
     message_preview_dict,
 )
-from app.task_movement import build_task_movement_explanation
 from app.strategic_context_package import (
     build_strategic_context_package_summary,
     load_strategic_context_evidence,
@@ -85,6 +79,25 @@ from app.workbench_events import (
     build_workbench_event_feed,
     emit_workbench_refetch,
 )
+from app.strategic_state_read_model import (
+    _collect_selected_refs_for_resolution,
+    _compact_text,
+    _cycle_summary,
+    _dedupe_workbench_refs,
+    _direction_summary,
+    _is_live_strategic_task,
+    _problem_model_summary,
+    _running_update_summary,
+    _strategic_refresh_summary,
+    _task_summary,
+    _build_task_focus,
+)
+from app.work_session_check_in import (
+    _CHECK_IN_EVENT_TYPE,
+    _build_work_session_check_in_projection,
+    _message_is_operator_check_in,
+    _persist_strategic_check_in_marker,
+)
 
 router = APIRouter(
     prefix="/api/admin",
@@ -92,73 +105,7 @@ router = APIRouter(
     dependencies=[Depends(get_current_user)],
 )
 
-TASK_FOCUS_BUCKET_LIMIT = 8
-_CHECK_IN_EVENT_TYPE = "strategic_check_in"
-_CHECK_IN_PREFS_KEY = "_strategic_check_in"
-
 logger = logging.getLogger(__name__)
-
-
-def _enum_value(value: Any) -> str:
-    return value.value if hasattr(value, "value") else str(value)
-
-
-def _compact_text(value: Any, *, max_chars: int = 360) -> str | None:
-    if value is None:
-        return None
-    text = " ".join(str(value).strip().split())
-    if not text:
-        return None
-    if len(text) <= max_chars:
-        return text
-    return f"{text[: max_chars - 1]}…"
-
-
-def _dedupe_workbench_refs(refs: Any, *, limit: int = 12) -> list[Dict[str, Any]]:
-    if not isinstance(refs, list):
-        return []
-    seen: set[tuple[str, str]] = set()
-    deduped: list[Dict[str, Any]] = []
-    for ref in refs:
-        if not isinstance(ref, dict):
-            continue
-        kind = _compact_text(ref.get("kind"), max_chars=40)
-        ref_id = _compact_text(ref.get("id"), max_chars=160)
-        if not kind or not ref_id:
-            continue
-        key = (kind, ref_id)
-        if key in seen:
-            continue
-        seen.add(key)
-        item: Dict[str, Any] = {"kind": kind, "id": ref_id}
-        label = _compact_text(ref.get("label"), max_chars=180)
-        if label:
-            item["label"] = label
-        deduped.append(item)
-        if len(deduped) >= limit:
-            break
-    return deduped
-
-
-def _message_selected_refs(message: ProjectMessage) -> list[Dict[str, Any]]:
-    context = message.context if isinstance(message.context, dict) else {}
-    strategic_session = context.get("strategic_session")
-    if not isinstance(strategic_session, dict):
-        return []
-    return _dedupe_workbench_refs(strategic_session.get("selected_refs"))
-
-
-def _collect_selected_refs_for_resolution(
-    *ref_groups: Any,
-    limit: int = 48,
-) -> list[Dict[str, Any]]:
-    selected_refs: list[Dict[str, Any]] = []
-    for refs in ref_groups:
-        if isinstance(refs, ProjectMessage):
-            selected_refs.extend(_message_selected_refs(refs))
-        elif isinstance(refs, list):
-            selected_refs.extend(_dedupe_workbench_refs(refs, limit=limit))
-    return _dedupe_workbench_refs(selected_refs, limit=limit)
 
 
 def _build_work_session_summary(
@@ -418,314 +365,6 @@ def _build_work_session_summary(
     }
 
 
-async def _latest_strategic_check_in(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    user_id: str,
-) -> ProjectMessage | None:
-    prefs_row = await get_messages_noise_prefs_row(session, user_id, project_id)
-    marker = (
-        (prefs_row.prefs or {}).get(_CHECK_IN_PREFS_KEY)
-        if prefs_row is not None
-        else None
-    )
-    message_id = marker.get("message_id") if isinstance(marker, dict) else None
-    if not isinstance(message_id, str):
-        return None
-    try:
-        parsed_message_id = uuid.UUID(message_id)
-    except ValueError:
-        return None
-    message = await session.get(ProjectMessage, parsed_message_id)
-    if message is None or message.project_id != project_id:
-        return None
-    return message if _message_is_operator_check_in(message, user_id) else None
-
-
-async def _count_rows(session: AsyncSession, statement: Any) -> int:
-    return int((await session.scalar(statement)) or 0)
-
-
-def _sum_case(condition: Any) -> Any:
-    return func.coalesce(func.sum(case((condition, 1), else_=0)), 0)
-
-
-def _parse_iso_datetime(value: Any) -> datetime | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    try:
-        return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).replace(
-            tzinfo=None
-        )
-    except ValueError:
-        return None
-
-
-def _work_session_last_check_in(message: ProjectMessage) -> Dict[str, Any]:
-    context = message.context if isinstance(message.context, dict) else {}
-    check_in = context.get("check_in") if isinstance(context, dict) else {}
-    kind = check_in.get("kind") if isinstance(check_in, dict) else None
-    return {
-        "message_id": str(message.id),
-        "created_at": message.created_at.isoformat() if message.created_at else None,
-        "content": message.content,
-        "kind": _compact_text(kind, max_chars=40) or "manual",
-    }
-
-
-def _message_is_operator_check_in(message: ProjectMessage, user_id: str) -> bool:
-    context = message.context if isinstance(message.context, dict) else {}
-    check_in = context.get("check_in") if isinstance(context, dict) else {}
-    return (
-        context.get("event_type") == _CHECK_IN_EVENT_TYPE
-        and isinstance(check_in, dict)
-        and check_in.get("operator_user_id") == user_id
-    )
-
-
-async def _persist_strategic_check_in_marker(
-    session: AsyncSession,
-    *,
-    user_id: str,
-    project_id: uuid.UUID,
-    message: ProjectMessage,
-) -> None:
-    context = message.context if isinstance(message.context, dict) else {}
-    check_in = context.get("check_in") if isinstance(context, dict) else {}
-    marker = {
-        "version": 1,
-        "message_id": str(message.id),
-        "operator_user_id": user_id,
-        "created_at": message.created_at.isoformat() if message.created_at else None,
-        "kind": _compact_text(
-            check_in.get("kind") if isinstance(check_in, dict) else None,
-            max_chars=40,
-        )
-        or "manual",
-    }
-
-    def merge(existing_prefs: dict[str, Any]) -> dict[str, Any]:
-        prefs = dict(existing_prefs)
-        existing_marker = prefs.get(_CHECK_IN_PREFS_KEY)
-        if isinstance(existing_marker, dict):
-            existing_created_at = _parse_iso_datetime(existing_marker.get("created_at"))
-            marker_created_at = _parse_iso_datetime(marker.get("created_at"))
-            if (
-                existing_created_at is not None
-                and marker_created_at is not None
-                and existing_created_at > marker_created_at
-            ):
-                return prefs
-        prefs[_CHECK_IN_PREFS_KEY] = marker
-        return prefs
-
-    await mutate_messages_noise_prefs(session, user_id, project_id, merge)
-    await session.commit()
-
-
-async def _work_session_since_last_check_in(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    since: Any,
-    until: Any,
-) -> Dict[str, Any]:
-    message_event_type = ProjectMessage.context["event_type"].as_string()
-    message_since_filter = [
-        ProjectMessage.project_id == project_id,
-        ProjectMessage.created_at > since,
-        ProjectMessage.created_at <= until,
-        or_(
-            message_event_type.is_(None),
-            message_event_type.notin_(
-                [_CHECK_IN_EVENT_TYPE, OPERATOR_COMMAND_EVENT_TYPE]
-            ),
-        ),
-    ]
-    task_since_filter = [
-        Task.project_id == project_id,
-        Task.archived.is_(False),
-    ]
-    alert_since_filter = [
-        Alert.project_id == project_id,
-        Alert.created_at > since,
-        Alert.created_at <= until,
-    ]
-    completed_cycle_at = func.coalesce(
-        StrategicCycle.phase2_completed_at,
-        StrategicCycle.phase1_completed_at,
-        StrategicCycle.updated_at,
-    )
-    completed_cycle_filter = [
-        StrategicCycle.project_id == project_id,
-        StrategicCycle.outcome == "completed",
-        completed_cycle_at > since,
-        completed_cycle_at <= until,
-    ]
-    message_counts = (
-        await session.execute(
-            select(
-                func.count(),
-                _sum_case(ProjectMessage.from_type.in_(["user", "operator"])),
-                _sum_case(
-                    ProjectMessage.from_type.in_(
-                        ["strategic", "strategist", "system"]
-                    )
-                ),
-                _sum_case(
-                    and_(
-                        ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
-                        ProjectMessage.message_type.in_(
-                            [
-                                MessageType.QUESTION,
-                                MessageType.BLOCKER,
-                                MessageType.BUG_REPORT,
-                            ]
-                        ),
-                    )
-                ),
-                _sum_case(
-                    and_(
-                        ProjectMessage.status.in_([OPEN_STATUS, LINKED_STATUS]),
-                        ProjectMessage.message_type == MessageType.FEEDBACK,
-                    )
-                ),
-            ).where(*message_since_filter)
-        )
-    ).one()
-    task_window_filter = or_(
-        and_(Task.created_at > since, Task.created_at <= until),
-        and_(Task.updated_at > since, Task.updated_at <= until),
-        and_(Task.completed_at > since, Task.completed_at <= until),
-    )
-    task_counts = (
-        await session.execute(
-            select(
-                _sum_case(and_(Task.created_at > since, Task.created_at <= until)),
-                _sum_case(and_(Task.updated_at > since, Task.updated_at <= until)),
-                _sum_case(
-                    and_(Task.completed_at > since, Task.completed_at <= until)
-                ),
-                _sum_case(
-                    and_(
-                        Task.updated_at > since,
-                        Task.updated_at <= until,
-                        Task.status == TaskStatus.FAILED,
-                    )
-                ),
-                _sum_case(
-                    and_(
-                        Task.updated_at > since,
-                        Task.updated_at <= until,
-                        Task.status == TaskStatus.BLOCKED,
-                    )
-                ),
-                _sum_case(
-                    and_(
-                        Task.updated_at > since,
-                        Task.updated_at <= until,
-                        Task.status == TaskStatus.PARKED,
-                    )
-                ),
-            ).where(*task_since_filter, task_window_filter)
-        )
-    ).one()
-    alert_counts = (
-        await session.execute(
-            select(
-                func.count(),
-                _sum_case(Alert.dismissed_at.is_(None)),
-                _sum_case(Alert.severity == "ERROR"),
-                _sum_case(Alert.severity == "WARNING"),
-            ).where(*alert_since_filter)
-        )
-    ).one()
-    strategic_count = await _count_rows(
-        session,
-        select(func.count()).select_from(StrategicCycle).where(*completed_cycle_filter),
-    )
-    latest_cycle = (
-        await session.execute(
-            select(StrategicCycle)
-            .where(*completed_cycle_filter)
-            .order_by(completed_cycle_at.desc())
-            .limit(1)
-        )
-    ).scalars().first()
-    return {
-        "version": 1,
-        "available": True,
-        "since": since.isoformat() if since else None,
-        "until": until.isoformat() if until else None,
-        "messages": {
-            "total": int(message_counts[0] or 0),
-            "operator": int(message_counts[1] or 0),
-            "strategic": int(message_counts[2] or 0),
-            "needs_operator": int(message_counts[3] or 0),
-            "watch": int(message_counts[4] or 0),
-        },
-        "tasks": {
-            "created": int(task_counts[0] or 0),
-            "updated": int(task_counts[1] or 0),
-            "completed": int(task_counts[2] or 0),
-            "failed": int(task_counts[3] or 0),
-            "blocked": int(task_counts[4] or 0),
-            "parked": int(task_counts[5] or 0),
-        },
-        "alerts": {
-            "raised": int(alert_counts[0] or 0),
-            "active": int(alert_counts[1] or 0),
-            "errors": int(alert_counts[2] or 0),
-            "warnings": int(alert_counts[3] or 0),
-        },
-        "strategic": {
-            "cycles_completed": strategic_count,
-            "latest_cycle": _cycle_summary(latest_cycle),
-        },
-    }
-
-
-async def _build_work_session_check_in_projection(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    user_id: str,
-) -> Dict[str, Any]:
-    now = _utcnow()
-    latest = await _latest_strategic_check_in(session, project_id, user_id)
-    if latest is None:
-        return {
-            "last_check_in": None,
-            "since_last_check_in": {
-                "version": 1,
-                "available": False,
-                "reason": "no_prior_check_in",
-                "since": None,
-                "until": now.isoformat(),
-            },
-        }
-    return {
-        "last_check_in": _work_session_last_check_in(latest),
-        "since_last_check_in": await _work_session_since_last_check_in(
-            session,
-            project_id,
-            since=latest.created_at,
-            until=now,
-        ),
-    }
-
-
-_LIVE_STRATEGIC_TASK_STATUSES = frozenset(
-    {
-        TaskStatus.QUEUED,
-        TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS,
-        TaskStatus.EVALUATING,
-        TaskStatus.BLOCKED,
-        TaskStatus.PARKED,
-    }
-)
-
-
 class StrategicSessionUpdate(BaseModel):
     workbench: Dict[str, Any] = Field(default_factory=dict)
 
@@ -793,10 +432,6 @@ def _session_conversation_predicate():
             .in_(list(_SESSION_CONVERSATION_EVENT_TYPES)),
         ),
     )
-
-
-def _is_live_strategic_task(task: Task | None) -> bool:
-    return bool(task is not None and task.status in _LIVE_STRATEGIC_TASK_STATUSES)
 
 
 def _message_preview(
@@ -1242,399 +877,6 @@ async def _persist_message_preview_strategic_session_descriptors(
     session.add(message)
     await session.commit()
     await session.refresh(message)
-
-
-def _task_summary(task: Task | None) -> Dict[str, Any] | None:
-    if task is None:
-        return None
-    payload = task.first_payload or {}
-    return {
-        "id": str(task.id),
-        "status": _enum_value(task.status),
-        "title": task.title,
-        "task_type": payload.get("type"),
-        "latest_status_message": task.latest_status_message,
-        "started_at": task.started_at.isoformat() if task.started_at else None,
-        "created_at": task.created_at.isoformat() if task.created_at else None,
-    }
-
-
-def _task_focus_reasons(task: Task) -> list[str]:
-    reasons: list[str] = []
-    status = task.status
-    if task.requires_approval and status not in (
-        TaskStatus.COMPLETED,
-        TaskStatus.FAILED,
-        TaskStatus.CANCELLED,
-    ):
-        reasons.append("approval")
-    if status == TaskStatus.BLOCKED:
-        reasons.append("blocked")
-    elif status == TaskStatus.PARKED:
-        reasons.append("parked")
-    elif status == TaskStatus.FAILED:
-        reasons.append("failed")
-    elif status == TaskStatus.EVALUATING:
-        reasons.append("evaluating")
-    elif status in (TaskStatus.IN_PROGRESS, TaskStatus.PROVISIONING):
-        reasons.append("active")
-    elif status == TaskStatus.QUEUED:
-        reasons.append("queued")
-    return reasons
-
-
-def _task_focus_item(
-    task: Task,
-    *,
-    bucket: str,
-    task_type: str | None = None,
-    direction_id: str | None = None,
-) -> Dict[str, Any]:
-    status = _enum_value(task.status)
-    detail = (
-        task.blocked_reason
-        or task.park_reason
-        or task.latest_status_message
-    )
-    movement_explanation = build_task_movement_explanation(task)
-    return {
-        "id": str(task.id),
-        "bucket": bucket,
-        "status": status,
-        "title": _compact_text(task.title, max_chars=180),
-        "task_type": _compact_text(task_type, max_chars=80),
-        "latest_status_message": _compact_text(task.latest_status_message, max_chars=180),
-        "detail": _compact_text(detail, max_chars=220),
-        "movement_explanation": _compact_text(movement_explanation, max_chars=220),
-        "requires_approval": bool(task.requires_approval),
-        "reasons": _task_focus_reasons(task),
-        "direction_id": direction_id,
-        "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
-        "blocker_kind": _compact_text(task.blocker_kind, max_chars=80),
-        "blocked_reason": _compact_text(task.blocked_reason, max_chars=180),
-        "blocked_at": task.blocked_at.isoformat() if task.blocked_at else None,
-        "recheck_after": task.recheck_after.isoformat() if task.recheck_after else None,
-        "park_reason": _compact_text(task.park_reason, max_chars=180),
-        "parked_at": task.parked_at.isoformat() if task.parked_at else None,
-        "created_at": task.created_at.isoformat() if task.created_at else None,
-        "started_at": task.started_at.isoformat() if task.started_at else None,
-        "completed_at": task.completed_at.isoformat() if task.completed_at else None,
-    }
-
-
-async def _task_focus_bucket(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    bucket: str,
-    filters: list[Any],
-    order_by: list[Any],
-    limit: int = TASK_FOCUS_BUCKET_LIMIT,
-) -> Dict[str, Any]:
-    base_filters = [
-        Task.project_id == project_id,
-        Task.archived.is_(False),
-        *filters,
-    ]
-    total = (
-        await session.execute(
-            select(func.count()).select_from(Task).where(*base_filters)
-        )
-    ).scalar() or 0
-    direction_id_expr = func.coalesce(
-        Task.context["direction_id"].as_string(),
-        Task.context["current_direction_id"].as_string(),
-        Task.payloads[0]["direction_id"].as_string(),
-        Task.payloads[0]["current_direction_id"].as_string(),
-        Task.payloads[0]["source_direction_id"].as_string(),
-        Task.payloads[0]["target_direction_id"].as_string(),
-    ).label("direction_id")
-    task_type_expr = Task.payloads[0]["type"].as_string().label("task_type")
-    rows = (
-        await session.execute(
-            select(Task, task_type_expr, direction_id_expr)
-            .where(*base_filters)
-            .options(
-                load_only(
-                    Task.id,
-                    Task.status,
-                    Task.title,
-                    Task.latest_status_message,
-                    Task.requires_approval,
-                    Task.parent_task_id,
-                    Task.created_at,
-                    Task.started_at,
-                    Task.completed_at,
-                    Task.depends_on,
-                    Task.blocker_kind,
-                    Task.blocked_reason,
-                    Task.blocked_at,
-                    Task.recheck_after,
-                    Task.park_reason,
-                    Task.parked_at,
-                    raiseload=True,
-                )
-            )
-            .order_by(*order_by)
-            .limit(limit)
-        )
-    ).all()
-    return {
-        "total": int(total),
-        "limit": limit,
-        "has_more": int(total) > limit,
-        "items": [
-            _task_focus_item(
-                task,
-                bucket=bucket,
-                task_type=task_type,
-                direction_id=direction_id,
-            )
-            for task, task_type, direction_id in rows
-        ],
-    }
-
-
-async def _build_task_focus(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-) -> Dict[str, Any]:
-    nonterminal = (
-        TaskStatus.QUEUED,
-        TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS,
-        TaskStatus.EVALUATING,
-        TaskStatus.BLOCKED,
-        TaskStatus.PARKED,
-    )
-    buckets = {
-        "needs_judgment": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="needs_judgment",
-            filters=[
-                Task.requires_approval.is_(True),
-                Task.status.in_(nonterminal),
-            ],
-            order_by=[Task.created_at.asc(), Task.id.asc()],
-        ),
-        "active": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="active",
-            filters=[
-                Task.status.in_(
-                    [
-                        TaskStatus.PROVISIONING,
-                        TaskStatus.IN_PROGRESS,
-                        TaskStatus.EVALUATING,
-                    ]
-                )
-            ],
-            order_by=[Task.started_at.desc().nullslast(), Task.created_at.desc(), Task.id.desc()],
-        ),
-        "friction": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="friction",
-            filters=[
-                Task.status.in_(
-                    [TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.PARKED]
-                )
-            ],
-            order_by=[Task.created_at.desc(), Task.id.desc()],
-        ),
-        "queued": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="queued",
-            filters=[Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False)],
-            order_by=[Task.created_at.asc(), Task.id.asc()],
-        ),
-        "recent_completed": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="recent_completed",
-            filters=[Task.status == TaskStatus.COMPLETED],
-            order_by=[Task.completed_at.desc().nullslast(), Task.created_at.desc(), Task.id.desc()],
-        ),
-    }
-    return {
-        "version": 1,
-        "bucket_limit": TASK_FOCUS_BUCKET_LIMIT,
-        "buckets": buckets,
-        "has_more": any(bucket["has_more"] for bucket in buckets.values()),
-    }
-
-
-def _cycle_summary(
-    cycle: StrategicCycle | None,
-    *,
-    active_task: Task | None = None,
-) -> Dict[str, Any] | None:
-    if cycle is None:
-        return None
-    metadata = cycle.cycle_metadata or {}
-    has_active_task = _is_live_strategic_task(active_task)
-    return {
-        "id": cycle.id,
-        "outcome": cycle.outcome,
-        "has_active_task": bool(has_active_task),
-        "stale": cycle.outcome in strategic_cycle.ACTIVE_OUTCOMES
-        and not has_active_task,
-        "phase1_task_id": str(cycle.phase1_task_id) if cycle.phase1_task_id else None,
-        "phase2_task_id": str(cycle.phase2_task_id) if cycle.phase2_task_id else None,
-        "phase1_started_at": (
-            cycle.phase1_started_at.isoformat() if cycle.phase1_started_at else None
-        ),
-        "phase1_completed_at": (
-            cycle.phase1_completed_at.isoformat()
-            if cycle.phase1_completed_at
-            else None
-        ),
-        "phase2_started_at": (
-            cycle.phase2_started_at.isoformat() if cycle.phase2_started_at else None
-        ),
-        "phase2_completed_at": (
-            cycle.phase2_completed_at.isoformat()
-            if cycle.phase2_completed_at
-            else None
-        ),
-        "summary_text": _compact_text(cycle.summary_text, max_chars=300),
-        "failure_reason": _compact_text(cycle.failure_reason, max_chars=240),
-        "directions_created": cycle.directions_created,
-        "directions_retired": cycle.directions_retired,
-        "tasks_spawned": cycle.tasks_spawned,
-        "vision_updated": cycle.vision_updated,
-        "problem_model_changed": bool(metadata.get("problem_model_changed")),
-        "running_update_changed": bool(metadata.get("running_update_changed")),
-    }
-
-
-def _direction_summary(directions: Any) -> Dict[str, Any]:
-    rows = directions if isinstance(directions, list) else []
-    active = [
-        d
-        for d in rows
-        if isinstance(d, dict) and (d.get("status") or "active") == "active"
-    ]
-    paused = [
-        d
-        for d in rows
-        if isinstance(d, dict) and (d.get("status") or "active") == "paused"
-    ]
-    priority_rank = {"high": 0, "medium": 1, "low": 2}
-    primary = None
-    if active:
-        primary = sorted(
-            active,
-            key=lambda d: (
-                priority_rank.get(str(d.get("priority") or "medium"), 1),
-                str(d.get("id") or ""),
-            ),
-        )[0]
-    return {
-        "total_count": len([d for d in rows if isinstance(d, dict)]),
-        "active_count": len(active),
-        "paused_count": len(paused),
-        "primary": {
-            "id": str(primary.get("id") or ""),
-            "text": _compact_text(primary.get("text"), max_chars=220),
-            "priority": primary.get("priority") or "medium",
-            "status": primary.get("status") or "active",
-            "mode": primary.get("recommended_mode") or primary.get("mode"),
-        }
-        if primary
-        else None,
-    }
-
-
-def _problem_model_summary(model: Any) -> Dict[str, Any]:
-    data = model if isinstance(model, dict) else {}
-    intent = data.get("intent") if isinstance(data.get("intent"), dict) else {}
-    gaps = data.get("gaps") if isinstance(data.get("gaps"), list) else []
-    capabilities = (
-        data.get("capabilities") if isinstance(data.get("capabilities"), list) else []
-    )
-    pending = (
-        data.get("pending_user_confirmation")
-        if isinstance(data.get("pending_user_confirmation"), list)
-        else []
-    )
-    active_gaps = [
-        g
-        for g in gaps
-        if isinstance(g, dict) and str(g.get("status") or "active") == "active"
-    ]
-    priority_rank = {"high": 0, "medium": 1, "low": 2}
-    top_gap = None
-    if active_gaps:
-        top_gap = sorted(
-            active_gaps,
-            key=lambda g: (
-                priority_rank.get(str(g.get("priority") or "medium"), 1),
-                str(g.get("id") or ""),
-            ),
-        )[0]
-    return {
-        "revision": data.get("revision"),
-        "last_updated": data.get("last_updated"),
-        "current_focus": _compact_text(intent.get("current_focus"), max_chars=260),
-        "purpose": _compact_text(intent.get("purpose"), max_chars=260),
-        "active_gap_count": len(active_gaps),
-        "capability_count": len([c for c in capabilities if isinstance(c, dict)]),
-        "pending_confirmation_count": len([p for p in pending if isinstance(p, dict)]),
-        "top_gap": {
-            "id": str(top_gap.get("id") or ""),
-            "name": _compact_text(top_gap.get("name"), max_chars=160),
-            "priority": top_gap.get("priority") or "medium",
-            "status": top_gap.get("status") or "active",
-        }
-        if top_gap
-        else None,
-    }
-
-
-def _running_update_summary(project: Project) -> Dict[str, Any]:
-    body = project.running_update or ""
-    return {
-        "excerpt": _compact_text(body, max_chars=420),
-        "char_count": len(body),
-        "acknowledged_at": (
-            project.running_update_acknowledged_at.isoformat()
-            if project.running_update_acknowledged_at
-            else None
-        ),
-    }
-
-def _strategic_refresh_summary(vision: Dict[str, Any] | None) -> Dict[str, Any]:
-    vision = vision or {}
-    marker = vision.get("_strategic_refresh")
-    pending = None
-    if isinstance(marker, dict):
-        pending = {
-            "requested_at": _compact_text(marker.get("requested_at"), max_chars=80),
-            "reason": _compact_text(marker.get("reason"), max_chars=80),
-            "origin": _compact_text(marker.get("origin"), max_chars=40),
-            "count": int(marker.get("count") or 0)
-            if isinstance(marker.get("count"), (int, float, str))
-            and str(marker.get("count")).strip().isdigit()
-            else 0,
-            "operator_count": int(marker.get("operator_count") or 0)
-            if isinstance(marker.get("operator_count"), (int, float, str))
-            and str(marker.get("operator_count")).strip().isdigit()
-            else 0,
-            "excerpt": _compact_text(marker.get("excerpt"), max_chars=280),
-        }
-    return {
-        "pending": pending,
-        "last_fired_at": _compact_text(
-            vision.get("_strategic_refresh_last_fired_at"), max_chars=80
-        ),
-        "last_fired_origin": _compact_text(
-            vision.get("_strategic_refresh_last_fired_origin"), max_chars=40
-        ),
-    }
 
 
 @router.get("/projects/{project_id}/strategic-state")

@@ -117,7 +117,9 @@
     "routers/admin_project_config.py": 1800,
     "compute_backends.py": 2350,
     "direction_lifecycle.py": 1750,
-    "routers/admin_notifications.py": 1850
+    "routers/admin_notifications.py": 1850,
+    "strategic_state_read_model.py": 600,
+    "work_session_check_in.py": 400
   },
   "agent": {
     "index.ts": 4600,
