@@ -361,6 +361,7 @@ describe('WorkbenchComposition viewport regression', () => {
                     onOpenCompute={options.onOpenCompute ?? vi.fn()}
                     onOpenAccounts={options.onOpenAccounts ?? vi.fn()}
                     showMonitoringControls={false}
+                    density="compact"
                     className="hidden md:flex"
                   />
                 </>
@@ -472,6 +473,9 @@ describe('WorkbenchComposition viewport regression', () => {
 
     expect(sessionControl).toBeTruthy();
     expect(getComputedStyle(sessionControl as Element).display).not.toBe('none');
+    expect(sessionControl?.textContent).not.toContain('Mark checked');
+    expect(sessionControl?.querySelector('button[aria-label="Switch Strategic mode to Workday"]')).toBeTruthy();
+    expect(sessionControl?.querySelector('button[aria-label^="Mark Strategic session checked:"]')).toBeTruthy();
     expect(sessionControl?.querySelector('button[aria-label^="Open devices: runner"]')).toBeNull();
     expect(sessionControl?.querySelector('button[aria-label^="Open accounts:"]')).toBeNull();
     const devicesButton = railButtons.find(button => button.textContent?.trim() === 'Devices');

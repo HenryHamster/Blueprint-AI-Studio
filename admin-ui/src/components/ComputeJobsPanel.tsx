@@ -1419,7 +1419,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                               type="button"
                               onClick={() => onNavigateToKnowledge(doc.id)}
                               className="min-h-[44px] shrink-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-ui-xs font-semibold text-sky-400 hover:text-sky-200 hover:bg-sky-500/15 transition-colors"
-                              title="View in Knowledge Library"
+                              title="View in Knowledge library"
                               data-testid="compute-knowledge-doc-library-link"
                             >
                               <BookOpen className="w-3 h-3" />

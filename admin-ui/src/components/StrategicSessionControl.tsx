@@ -139,6 +139,7 @@ export interface StrategicSessionControlProps {
   onOpenAccounts?: () => void;
   onOpenSpend?: () => void;
   showMonitoringControls?: boolean;
+  density?: 'default' | 'compact';
   className?: string;
 }
 
@@ -651,8 +652,10 @@ export function StrategicSessionControl({
   onOpenAccounts,
   onOpenSpend,
   showMonitoringControls = true,
+  density = 'default',
   className = '',
 }: StrategicSessionControlProps) {
+  const compact = density === 'compact';
   const selectedMode = currentMode ?? mode ?? 'chat';
   const runnerStatus = localRunnerStatus ?? localRunner;
   const workStatus = runtimeWorkStatus ?? runtimeWork;
@@ -692,11 +695,11 @@ export function StrategicSessionControl({
 
   return (
     <div
-      className={`flex min-w-0 flex-col gap-1.5 text-neutral-100 sm:flex-row sm:items-center sm:justify-end ${className}`}
+      className={`flex min-w-0 text-neutral-100 ${compact ? 'flex-row items-center justify-end gap-1' : 'flex-col gap-1.5 sm:flex-row sm:items-center sm:justify-end'} ${className}`}
       data-testid="strategic-session-control"
     >
       <div
-        className="grid min-w-0 grid-cols-2 gap-0.5 rounded border border-neutral-800 bg-neutral-950/80 p-0.5 sm:flex sm:w-auto"
+        className={`${compact ? 'flex w-auto' : 'grid min-w-0 grid-cols-2 sm:flex sm:w-auto'} gap-0.5 rounded border border-neutral-800 bg-neutral-950/80 p-0.5`}
         role="group"
         aria-label="Strategic interaction mode"
       >
@@ -714,29 +717,33 @@ export function StrategicSessionControl({
               onClick={() => {
                 if (!selected) onModeChange?.(option.value);
               }}
-              className={`inline-flex min-h-11 min-w-0 items-center justify-center gap-1.5 rounded px-2 py-1.5 text-xs font-semibold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 sm:min-h-8 sm:px-2 ${
+              className={`inline-flex min-w-0 items-center justify-center gap-1.5 rounded text-xs font-semibold transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 ${
+                compact ? 'h-7 w-7 px-0 py-0' : 'min-h-11 px-2 py-1.5 sm:min-h-8 sm:px-2'
+              } ${
                 selected
                   ? 'bg-neutral-800 text-neutral-100 ring-1 ring-neutral-700'
                   : 'text-neutral-400 hover:bg-neutral-900 hover:text-neutral-100'
               } disabled:cursor-not-allowed disabled:opacity-50`}
             >
               <Icon className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
-              <span className="truncate">{option.label}</span>
+              <span className={compact ? 'sr-only' : 'truncate'}>{option.label}</span>
             </button>
           );
         })}
       </div>
 
-      <div className="flex min-w-0 flex-col gap-1.5 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end">
+      <div className={`${compact ? 'flex flex-row items-center justify-end gap-1' : 'flex min-w-0 flex-col gap-1.5 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end'}`}>
         {saving && (
           <span
-            className="inline-flex min-h-11 min-w-0 items-center gap-2 rounded border border-cyan-500/25 bg-neutral-950/70 px-2 py-1.5 font-mono text-ui-sm font-semibold uppercase text-cyan-300 sm:min-h-8"
+            className={`inline-flex min-w-0 items-center gap-2 rounded border border-cyan-500/25 bg-neutral-950/70 font-mono text-ui-sm font-semibold uppercase text-cyan-300 ${
+              compact ? 'h-7 px-2 py-0' : 'min-h-11 px-2 py-1.5 sm:min-h-8'
+            }`}
             role="status"
             aria-label="Saving Strategic session mode"
             title="Saving Strategic session mode"
           >
             <LoaderCircle className="h-3.5 w-3.5 shrink-0 animate-spin" aria-hidden="true" />
-            Saving
+            <span className={compact ? 'sr-only' : undefined}>Saving</span>
           </span>
         )}
 
@@ -744,7 +751,11 @@ export function StrategicSessionControl({
           type="button"
           onClick={onCheckIn}
           disabled={!onCheckIn || checkingIn}
-          className="group inline-grid min-h-11 w-full min-w-0 grid-cols-[auto,minmax(0,1fr),auto] items-center gap-2 rounded border border-neutral-800 bg-neutral-950/70 px-2 py-1.5 text-left transition-colors hover:border-neutral-600 hover:bg-neutral-900/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 disabled:cursor-not-allowed disabled:opacity-60 sm:min-h-8 sm:w-auto sm:max-w-[16rem]"
+          className={`group min-w-0 items-center gap-2 rounded border border-neutral-800 bg-neutral-950/70 text-left transition-colors hover:border-neutral-600 hover:bg-neutral-900/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 disabled:cursor-not-allowed disabled:opacity-60 ${
+            compact
+              ? 'inline-flex h-7 shrink-0 px-2 py-0'
+              : 'inline-grid min-h-11 w-full grid-cols-[auto,minmax(0,1fr),auto] px-2 py-1.5 sm:min-h-8 sm:w-auto sm:max-w-[16rem]'
+          }`}
           aria-label={`Mark Strategic session checked: ${checkInSummary}`}
           title={`Mark Strategic session checked: ${checkInSummary}`}
         >
@@ -753,10 +764,12 @@ export function StrategicSessionControl({
           ) : (
             <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-neutral-500 transition-colors group-hover:text-neutral-200" aria-hidden="true" />
           )}
-          <span className="min-w-0 flex-1">
-            <span className="block truncate text-xs font-semibold text-neutral-200">Mark checked</span>
-            <span className="block truncate text-ui-sm text-neutral-400">{checkInSummary}</span>
-          </span>
+          {!compact && (
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-xs font-semibold text-neutral-200">Mark checked</span>
+              <span className="block truncate text-ui-sm text-neutral-400">{checkInSummary}</span>
+            </span>
+          )}
           {checkInChanges != null && checkInChanges > 0 && (
             <span className="shrink-0 rounded border border-cyan-500/25 bg-cyan-500/10 px-1.5 py-0.5 font-mono text-ui-sm font-semibold text-cyan-300">
               {checkInChanges}

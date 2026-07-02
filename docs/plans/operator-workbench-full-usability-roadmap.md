@@ -1,6 +1,6 @@
 # Operator Workbench Full Usability Roadmap
 
-Last updated: 2026-07-01
+Last updated: 2026-07-02
 
 This is the execution roadmap for making the operator workbench fully usable across backend and frontend. It turns the operating model in `docs/operator-experience-operating-model.md` and the UI mapping in `admin-ui/mockups/operator-ui-mapping.md` into implementation milestones.
 
@@ -8,7 +8,7 @@ The rule for this file: after every major batch, update the status ledger, miles
 
 ## Status Ledger
 
-Overall implementation estimate: 94%.
+Overall implementation estimate: 95%.
 
 Legend:
 - Done: implemented, reviewed, tested, and pushed.
@@ -29,9 +29,9 @@ Legend:
 | M7. Runtime, devices, accounts, settings, project management | Done | Canonical Project/Runtime settings homes, workspace-hosted settings router semantics, command/context routing to Project Manage and Runtime Settings/Accounts, reachability and viewport tests. | Keep regression coverage while remaining project/runtime policy work lands. |
 | M8. Operator attention and work-session read model | Done | Derived attention state, lifecycle metadata across common and rare reasons, prioritized bounded attention candidates with newest tie-breaks, registry-backed curated metric metadata, actions, events, jobs, command receipts, and command receipts excluded from check-in deltas. | Keep lifecycle/count regressions current as new attention reasons are added. |
 | M9. Unified event and message contracts | Done | Workbench event v1 envelope, websocket emitter/v1-producer inventory guards, backend-owned operator workbench fixture, frontend fixture consumption, canonical target/refetch vocabulary. | Keep fixtures and emitter inventory updated as read models evolve. |
-| M10. Visual system and UI polish | Done | Workbench theme tokens, shell/header/workspace token migration, lower-level token guard expansion, Pipeline duplicate task-open cleanup, mobile sideboard reachability coverage, and focused viewport assertions/capture review. | Keep token coverage current as lower-level panels are touched. |
+| M10. Visual system and UI polish | Done | Workbench theme tokens, shell/header/workspace token migration, compact Chat session control, lower-level token guard expansion, Pipeline duplicate task-open cleanup, mobile sideboard reachability coverage, and focused viewport assertions/capture review. | Keep token coverage current as lower-level panels are touched. |
 | M11. Background operator jobs | Planned | Existing compute jobs, runner jobs, orchestrator loops, command receipts. | Only build a real operator-job table if a concrete async operator command needs it. |
-| M12. Completion audit and hardening | Partial | Backend/frontend audit wave fixed Pipeline board sideboard loss, mobile sideboard context reachability, duplicate context/global task chrome, stale command affordances, contract shape drift, malformed payload crashes, attention ordering, local continuation privacy, and lower-level visual token drift. Focused backend, frontend, viewport, and typecheck gates are green. | Stop after this polish push to discuss remaining medium IA choices: compact Strategic session control, Research/Knowledge placement, and context workspace hierarchy. |
+| M12. Completion audit and hardening | Partial | Backend/frontend audit wave fixed Pipeline board sideboard loss, mobile sideboard context reachability, duplicate context/global task chrome, compact Chat Strategic controls, stale command affordances, browser rerouting, contract shape drift, malformed payload crashes, attention ordering, local continuation privacy, and lower-level visual token drift. Focused backend, frontend, viewport, and typecheck gates are green. | Run final localhost acceptance/capture pass; keep Research/Knowledge header placement until Project/contextual homes replace the visible findings badge. |
 
 ## Operating Principles
 
@@ -538,6 +538,11 @@ Completed in current audit batch:
 - Kept task archive rendering scoped to Pipeline instead of leaking into other workspaces.
 - Expanded workbench token migration/guard coverage to Command palette, message composer/list, Strategic context workspace, and Chat artifact slots.
 - Replaced backend-ish artifact empty-state text with operator-facing copy.
+- Compacted the primary Chat Strategic session controls while keeping full controls in the context workspace and runtime/context rail surfaces.
+- Kept Findings journal and Knowledge library in HeaderBar for now because Project/contextual homes do not yet replace the pending-findings badge; command palette entries remain covered.
+- Suppressed duplicate context-map rendering inside the context workspace artifact slot; the full map section owns canvas/resources/edges there.
+- Synced Findings journal and Knowledge library route props while overlays are already open, so deep links retarget without close/reopen.
+- Fixed invalid nested-button markup in Findings journal result rows while preserving row expansion and task navigation.
 - Updated backend-owned workbench fixture and frontend types for live Strategic-state shape: task cancelled counts, expanded attention counts, local runner continuation, active-task fields, local-runner hold split counts, and non-null SHA freshness.
 - Hardened malformed `Task.first_payload` reads in task detail/admin runtime paths and shared task outcome helpers.
 - Added attention lifecycle and newest tie-break coverage across local-runner holds, stale task reasons, bug/feedback watch items, failed tasks, and manual direction intervention.
@@ -605,18 +610,20 @@ Latest frontend audit gates:
 - `npm --prefix admin-ui test -- --run src/components/MessagesPanel.test.tsx src/components/PipelineWorkspace.test.tsx src/components/StrategicContextRail.test.tsx src/test/workbench-theme-tokens.test.ts` -> 349 tests passed.
 - `..\node_modules\.bin\vitest.cmd run --config vitest.viewport.config.ts src/components/HeaderBar.viewport.test.tsx src/components/PipelineWorkspace.viewport.test.tsx src/components/MessagesPanel.viewport.test.tsx src/components/WorkbenchComposition.viewport.test.tsx src/components/StrategicContextRail.viewport.test.tsx` -> 51 viewport tests passed.
 - `npm --prefix admin-ui test -- --run src/strategicStateApi.test.ts src/operatorWorkbenchContracts.test.ts src/types/workbenchEvents.test.ts src/types/workbenchTargets.test.ts src/hooks/useWorkbenchCommands.test.tsx src/hooks/useStrategicContextNavigation.test.tsx src/components/MessagesPanel.test.tsx src/components/PipelineWorkspace.test.tsx src/components/TaskContextRail.test.tsx src/components/StrategicContextRail.test.tsx src/App.wiring.test.ts src/test/workbench-theme-tokens.test.ts` -> 440 tests passed.
+- `npm --prefix admin-ui test -- --run src/components/StrategicSessionControl.test.tsx src/components/StrategicContextWorkspace.test.tsx src/components/StrategicContextRail.test.tsx src/components/ResearchBrowser.test.tsx src/components/KnowledgeBrowser.test.tsx src/hooks/useWorkbenchCommands.test.tsx` -> 173 tests passed.
+- `..\node_modules\.bin\vitest.cmd run --config vitest.viewport.config.ts src/components/StrategicSessionControl.viewport.test.tsx src/components/WorkbenchComposition.viewport.test.tsx src/components/StrategicContextWorkspace.viewport.test.tsx src/components/StrategicContextRail.viewport.test.tsx src/components/HeaderBar.viewport.test.tsx src/components/ResearchBrowser.viewport.test.tsx src/components/KnowledgeBrowser.viewport.test.tsx` -> 47 viewport tests passed.
+- `npm --prefix admin-ui test -- --run src/strategicStateApi.test.ts src/operatorWorkbenchContracts.test.ts src/types/workbenchEvents.test.ts src/types/workbenchTargets.test.ts src/hooks/useWorkbenchCommands.test.tsx src/hooks/useStrategicContextNavigation.test.tsx src/components/MessagesPanel.test.tsx src/components/PipelineWorkspace.test.tsx src/components/TaskContextRail.test.tsx src/components/StrategicContextRail.test.tsx src/components/StrategicContextWorkspace.test.tsx src/components/StrategicSessionControl.test.tsx src/components/ResearchBrowser.test.tsx src/components/KnowledgeBrowser.test.tsx src/App.wiring.test.ts src/test/workbench-theme-tokens.test.ts` -> 531 tests passed.
 - `npm --prefix admin-ui run typecheck` -> passed.
 
 ## Next Batch Recommendation
 
-Recommended next implementation batches: discuss the remaining medium IA choices, then either compact those surfaces or stop feature work and do a live localhost acceptance pass.
+Recommended next implementation batch: run a final live localhost acceptance/capture pass, then fix only concrete issues found there.
 
 Scope:
-1. Decide whether to compact `StrategicSessionControl` in primary Chat and move full controls to Runtime/Project context.
-2. Decide whether Research Browser and Knowledge Library should remain HeaderBar utilities or move behind command/context surfaces.
-3. Reduce `StrategicContextWorkspace` hierarchy if it still feels card-heavy after real usage.
-4. Run a final visual/UX pass on the live workbench: spacing, header weight, token consistency, mobile composer reachability, and non-placeholder lower-level panels.
-5. Keep M7/M10 token and settings-home regression coverage current while lower-level panels change.
+1. Start the local workbench and capture/review the real Chat, Pipeline, Project, Runtime, context workspace, Findings journal, and Knowledge library surfaces.
+2. Fix only concrete acceptance findings: hidden composer, broken routing, duplicate controls, excessive header weight, unreadable mobile layouts, or invalid markup.
+3. Keep Findings journal and Knowledge library in HeaderBar until Project/contextual homes replace the visible pending-findings badge.
+4. Keep M7/M10 token and settings-home regression coverage current while lower-level panels change.
 
 Reason: the highest-risk backend reliability gaps are now covered by contract and route regressions; remaining material progress is targeted IA/visual polish and any concrete issues surfaced by localhost usage.
 
@@ -635,3 +642,4 @@ Reason: the highest-risk backend reliability gaps are now covered by contract an
 | 2026-07-01 | M8 attention lifecycle/caps | Added lifecycle metadata, bounded priority selection for attention items, split message/alert previews, `has_more`/limit contract fields, command-housekeeping regressions, fixture invariants, and focused backend/frontend tests. |
 | 2026-07-01 | M12 audit hardening | Fixed audit findings across Pipeline board monitoring, HeaderBar command/global-task affordances, context launcher duplication, archive scoping, backend contract drift, malformed payload handling, attention ordering/lifecycle coverage, continuation privacy, and sideboard target canonicalization. Gates: 133 backend tests, 440 frontend tests, 59 viewport tests, and `npm run typecheck`. |
 | 2026-07-01 | M12 visual/mobile polish | Expanded semantic token coverage, removed duplicate mobile shortcut drawer, prioritized Pipeline task context before stream details, added real-column mobile Board reachability coverage, cleaned artifact empty-state copy, and documented remaining medium IA decisions. Gates: 349 focused frontend tests, 51 viewport tests, 440 broader frontend tests, and `npm run typecheck`. |
+| 2026-07-02 | M12 IA polish | Compacted primary Chat Strategic controls, suppressed duplicate context-map artifact rendering in the workspace while preserving descriptor-only maps, flattened context list chrome, kept Findings/Knowledge header placement with command coverage, synced already-open browser route props, and fixed invalid nested Findings-row buttons. Gates: 173 focused tests, 47 viewport tests, 531 broader frontend tests, and `npm run typecheck`. |

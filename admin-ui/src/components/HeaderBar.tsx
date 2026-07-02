@@ -271,7 +271,7 @@ export function HeaderBar(props: HeaderBarProps) {
             )}
             <button
               onClick={onToggleResearchBrowser}
-              title="Research findings"
+              title="Findings journal"
               aria-pressed={showResearchBrowser}
               className={`relative flex h-7 w-7 items-center justify-center rounded text-xs transition-colors ${
                 showResearchBrowser ? 'bg-cyan-500/10 text-cyan-300' : 'text-neutral-400 hover:bg-workbench-layer hover:text-neutral-200'
@@ -369,7 +369,7 @@ export function HeaderBar(props: HeaderBarProps) {
                   className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showResearchBrowser ? 'text-cyan-400 bg-cyan-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
                 >
                   <Microscope className="w-4 h-4 shrink-0" />
-                  <span>Research Browser</span>
+                  <span>Findings journal</span>
                   {pendingFindingsCount > 0 && (
                     <span className="ml-auto bg-cyan-500 text-black text-ui-xs font-bold px-1.5 py-0.5 rounded-full leading-none">
                       {pendingFindingsCount}
@@ -381,7 +381,7 @@ export function HeaderBar(props: HeaderBarProps) {
                   className={`w-full flex items-center gap-3 px-3 py-2.5 min-h-[44px] rounded text-sm transition-colors text-left ${showKnowledgeBrowser ? 'text-violet-400 bg-violet-500/10' : 'text-neutral-300 hover:bg-neutral-800'}`}
                 >
                   <BookOpen className="w-4 h-4 shrink-0" />
-                  <span>Knowledge Library</span>
+                  <span>Knowledge library</span>
                 </button>
                 {onOpenActivityFeed && (
                   <button

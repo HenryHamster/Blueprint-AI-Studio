@@ -375,6 +375,14 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<KnowledgeDocument | null>(null);
 
+  useEffect(() => {
+    setQuery(prev => {
+      const nextDirection = initialDirectionId ?? null;
+      if (prev.directionFilter === nextDirection) return prev;
+      return { ...prev, directionFilter: nextDirection, offset: 0 };
+    });
+  }, [initialDirectionId]);
+
   const setFilter = useCallback(<K extends 'search' | 'topicFilter' | 'tagFilter' | 'directionFilter' | 'sourceKindFilter' | 'challengeStateFilter' | 'sweepFilter'>(
     key: K,
     value: typeof query[K],
@@ -459,7 +467,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
             <div className="min-w-0">
               <h3 className="text-sm font-semibold text-neutral-100 flex items-center gap-2">
                 <BookOpen className="w-4 h-4 text-violet-400 shrink-0" />
-                Knowledge Library
+                Knowledge library
               </h3>
               {!selected && (
                 <p className="text-ui-sm text-neutral-500 mt-0.5">

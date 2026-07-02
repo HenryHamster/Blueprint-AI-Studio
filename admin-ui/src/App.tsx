@@ -313,7 +313,7 @@ export default function App() {
   const [knowledgeBrowserDirectionId, setKnowledgeBrowserDirectionId] = useState<string | null>(null);
   const [knowledgeBrowserInitialDocId, setKnowledgeBrowserInitialDocId] = useState<string | null>(null);
   const [researchFeed, setResearchFeed] = useState<Task[]>([]);
-  // Fetch project tasks when the Findings Journal opens so findings and implementation child
+  // Fetch project tasks when the Findings journal opens so findings and implementation child
   // outcomes are independent of the main paginated table state.
   useEffect(() => {
     if (!s.showResearchBrowser || !selectedProjectId) { setResearchFeed([]); return; }
@@ -1450,6 +1450,7 @@ export default function App() {
                 onOpenAccounts={openRuntimeAccounts}
                 onOpenSpend={openRuntimeAnalytics}
                 showMonitoringControls={false}
+                density="compact"
                 className="hidden md:flex"
               />
               {!chatComposerContextDescriptor && (

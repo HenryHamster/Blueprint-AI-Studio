@@ -304,6 +304,10 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
   const [qualityCardCollapsed, setQualityCardCollapsed] = useState(false);
   const [gradeFilter, setGradeFilter] = useState<'HIGH' | 'MEDIUM' | 'LOW' | null>(null);
 
+  useEffect(() => {
+    setDirectionFilter(initialDirectionId ?? null);
+  }, [initialDirectionId]);
+
   // Fetch recent findings with actionability grades for the quality card
   useEffect(() => {
     if (!selectedProjectId) return;
@@ -531,7 +535,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
           <div>
             <h3 className="text-sm font-semibold text-neutral-100 flex items-center gap-2">
               <Compass className="w-4 h-4 text-cyan-400" />
-              Findings Journal
+              Findings journal
             </h3>
             <p className="text-ui-sm text-neutral-500 mt-0.5">
               {totalFindings} finding{totalFindings !== 1 ? 's' : ''} across {filteredGroups.length} direction{filteredGroups.length !== 1 ? 's' : ''}
@@ -761,12 +765,21 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                       const outcomeTaskId = ef.outcome?.taskId;
                       const fKey = `${ef.taskId}-${ef.findingIndex}`;
                       const isDetailOpen = expandedFinding === fKey;
+                      const toggleFindingDetail = () => setExpandedFinding(isDetailOpen ? null : fKey);
                       return (
                         // reason: finding expand row in research results; px-4 py-2 matches compact finding list density
-                        <button
+                        <div
                           data-viewport-allow-small-target
+                          role="button"
+                          tabIndex={0}
                           key={fKey}
-                          onClick={() => setExpandedFinding(isDetailOpen ? null : fKey)}
+                          onClick={toggleFindingDetail}
+                          onKeyDown={(event) => {
+                            if (event.currentTarget !== event.target) return;
+                            if (event.key !== 'Enter' && event.key !== ' ') return;
+                            event.preventDefault();
+                            toggleFindingDetail();
+                          }}
                           className="w-full text-left px-4 py-2 hover:bg-neutral-800/20 transition-colors"
                         >
                           <div className="flex items-center gap-2">
@@ -914,7 +927,7 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
                               )}
                             </div>
                           )}
-                        </button>
+                        </div>
                       );
                     })}
                   </div>

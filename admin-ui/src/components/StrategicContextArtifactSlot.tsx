@@ -13,6 +13,7 @@ interface StrategicContextArtifactSlotProps {
   contextPackage?: StrategicContextPackageDescriptor | null;
   onOpenTarget?: (target?: StrategicContextTarget | null) => void;
   showHeader?: boolean;
+  showMapDescriptor?: boolean;
 }
 
 function formatCompactNumber(value: number | string | null | undefined): string {
@@ -78,6 +79,14 @@ function safeImageUrl(value?: string | null): string | null {
   } catch {
     return null;
   }
+}
+
+function MutedStatus({ children }: { children: ReactNode }) {
+  return (
+    <div className="mt-2 px-1 py-1.5 text-xs text-neutral-500">
+      {children}
+    </div>
+  );
 }
 
 function DetailValue({
@@ -203,15 +212,19 @@ function DescriptorCard({
             </tbody>
           </table>
           {rows.length === 0 && (
-            <div className="px-2 py-2 text-xs text-neutral-600">No rows in this table yet.</div>
+            <div className="px-2 py-2 text-xs text-neutral-600">No table rows yet.</div>
           )}
         </div>
       )}
 
       {(descriptor.kind === 'markdown' || descriptor.kind === 'text') && (
-        <pre className="mt-2 max-h-48 min-w-0 overflow-auto whitespace-pre-wrap break-words rounded border border-neutral-800 bg-neutral-950/45 px-2 py-1.5 text-xs leading-relaxed text-neutral-300 custom-scrollbar">
-          {descriptor.body || descriptor.summary || 'No preview available yet.'}
-        </pre>
+        descriptor.body || descriptor.summary ? (
+          <pre className="mt-2 max-h-48 min-w-0 overflow-auto whitespace-pre-wrap break-words rounded border border-neutral-800 bg-neutral-950/45 px-2 py-1.5 text-xs leading-relaxed text-neutral-300 custom-scrollbar">
+            {descriptor.body || descriptor.summary}
+          </pre>
+        ) : (
+          <MutedStatus>No preview available yet.</MutedStatus>
+        )
       )}
 
       {descriptor.kind === 'image' && (
@@ -223,7 +236,7 @@ function DescriptorCard({
               className="max-h-48 w-full object-contain"
             />
           ) : (
-            <div className="px-3 py-6 text-center text-xs text-neutral-500">
+            <div className="px-2 py-2 text-xs text-neutral-500">
               Image preview unavailable. Open the artifact for the source.
             </div>
           )}
@@ -244,7 +257,7 @@ function DescriptorCard({
               </div>
             );
           }) : (
-            <div className="text-xs text-neutral-500">No chart points are available yet.</div>
+            <div className="text-xs text-neutral-500">No chart points yet.</div>
           )}
         </div>
       )}
@@ -271,6 +284,7 @@ export function StrategicContextArtifactSlot({
   contextPackage,
   onOpenTarget,
   showHeader = true,
+  showMapDescriptor = true,
 }: StrategicContextArtifactSlotProps) {
   if (!contextPackage) return null;
 
@@ -279,7 +293,8 @@ export function StrategicContextArtifactSlot({
   const renderableDescriptors = descriptors.filter(descriptor => descriptor.kind !== 'context_map');
   const canvas = contextPackage.canvas ?? null;
   const hasCanvas = Boolean(canvas && (canvas.nodes?.length ?? 0) > 0);
-  const hasRenderable = hasCanvas || renderableDescriptors.length > 0 || mapDescriptor;
+  const shouldShowMapDescriptor = showMapDescriptor && Boolean(mapDescriptor || canvas);
+  const hasRenderable = renderableDescriptors.length > 0 || shouldShowMapDescriptor;
 
   return (
     <div className="mt-2 space-y-2" data-testid="strategic-chat-artifact-slot">
@@ -296,12 +311,12 @@ export function StrategicContextArtifactSlot({
       )}
 
       {!hasRenderable && (
-        <div className="rounded-md border border-dashed border-neutral-800 bg-neutral-950/35 px-3 py-3 text-xs leading-relaxed text-neutral-500">
+        <div className="px-1 py-1.5 text-xs leading-relaxed text-neutral-500">
           No canvas or artifacts yet.
         </div>
       )}
 
-      {(mapDescriptor || canvas) && (
+      {shouldShowMapDescriptor && (
         <section
           className="min-w-0 rounded-md border border-workbench-border bg-workbench-card p-2"
           data-testid="strategic-context-descriptor-context_map"
@@ -339,7 +354,7 @@ export function StrategicContextArtifactSlot({
               <StrategicContextMap canvas={canvas} onOpenTarget={onOpenTarget} />
             </div>
           ) : (
-            <div className="mt-2 rounded border border-dashed border-neutral-800 bg-neutral-950/35 px-3 py-3 text-xs text-neutral-500">
+            <div className="mt-2 px-1 py-1.5 text-xs text-neutral-500">
               Map data is not loaded yet.
             </div>
           )}

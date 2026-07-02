@@ -931,7 +931,7 @@ function DirectionCardImpl({
                 <button
                   data-viewport-allow-small-target
                   onClick={() => onViewKnowledge(d.id)}
-                  title="Open Knowledge Library filtered to this direction's documents"
+                  title="Open Knowledge library filtered to this direction's documents"
                   className="text-ui-sm px-1.5 py-0.5 rounded border font-medium bg-blue-950/40 border-blue-900/50 text-blue-300 hover:bg-blue-900/40 transition-colors cursor-pointer"
                 >
                   {d.knowledge_document_count} doc{d.knowledge_document_count !== 1 ? 's' : ''}

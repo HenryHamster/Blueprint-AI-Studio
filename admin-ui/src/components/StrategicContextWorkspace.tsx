@@ -34,6 +34,7 @@ import {
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
 type StrategicContextCanvas = NonNullable<StrategicContextPackageDescriptor['canvas']>;
+const CONTEXT_LIST_CLASS = 'divide-y divide-neutral-800/70 border-y border-neutral-800/70';
 
 interface StrategicContextWorkspaceProps {
   open: boolean;
@@ -608,6 +609,8 @@ export function StrategicContextWorkspace({
   const nodeLabelById = new Map((canvas?.nodes ?? []).map(node => [node.id, node.label]));
   const tone = contextStatusTone(contextPackage?.status);
   const resources = contextPackage?.resources ?? [];
+  const contextMapDescriptor = (contextPackage?.descriptors ?? []).find(descriptor => descriptor.kind === 'context_map') ?? null;
+  const artifactDescriptors = (contextPackage?.descriptors ?? []).filter(descriptor => descriptor.kind !== 'context_map');
   const nodes = canvas?.nodes ?? [];
   const edges = canvas?.edges ?? [];
   const canvasResources = resources.filter(resource => resource.kind === 'canvas');
@@ -642,6 +645,7 @@ export function StrategicContextWorkspace({
   const workSessionActions = (workSession?.actions ?? []).slice(0, 4);
   const workSessionMetrics = rankStrategicWorkSessionMetrics(workSession?.curated_metrics ?? [], 6);
   const workSessionEvents = workSession?.events?.items ?? [];
+  const showDescriptorOnlyContextMap = Boolean(contextMapDescriptor && !canvas);
   const attentionCounts = state?.attention?.counts ?? null;
   const attentionPills = attentionCounts ? [
     { label: 'needs', value: attentionCounts.needs_operator },
@@ -865,7 +869,7 @@ export function StrategicContextWorkspace({
               testId="strategic-context-workspace-kept"
             >
               {selectedRefDescriptors.length > 0 ? (
-                <div className="rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5">
+                <div className={CONTEXT_LIST_CLASS}>
                   {selectedRefDescriptors.map(ref => (
                     <ContextRow
                       key={contextRefKey(ref)}
@@ -909,16 +913,17 @@ export function StrategicContextWorkspace({
               </Section>
             )}
 
-            {contextPackage && (
+            {contextPackage && (artifactDescriptors.length > 0 || showDescriptorOnlyContextMap) && (
               <Section
-                title="Canvas and artifacts"
-                meta={`${formatCompactNumber((contextPackage.descriptors?.length ?? 0) + (canvas ? 1 : 0))}`}
+                title={artifactDescriptors.length > 0 ? 'Artifacts' : 'Context map'}
+                meta={`${formatCompactNumber(artifactDescriptors.length + (showDescriptorOnlyContextMap ? 1 : 0))}`}
                 testId="strategic-context-workspace-artifacts"
               >
                 <StrategicContextArtifactSlot
                   contextPackage={contextPackage}
                   onOpenTarget={handleOpenTarget}
                   showHeader={false}
+                  showMapDescriptor={showDescriptorOnlyContextMap}
                 />
               </Section>
             )}
@@ -930,7 +935,7 @@ export function StrategicContextWorkspace({
             >
               <StrategicContextMap canvas={canvas} onOpenTarget={handleOpenTarget} />
               {canvasResourceRows.length > 0 && (
-                <div className="mt-3 rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5" data-testid="strategic-context-workspace-map-resource">
+                <div className={`mt-3 ${CONTEXT_LIST_CLASS}`} data-testid="strategic-context-workspace-map-resource">
                   {canvasResourceRows.map(resource => renderKeepableRow({
                     key: `${resource.kind}:${resource.id}`,
                     label: resource.label,
@@ -942,7 +947,7 @@ export function StrategicContextWorkspace({
                 </div>
               )}
               {nodes.length > 0 && (
-                <div className="mt-3 rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5">
+                <div className={`mt-3 ${CONTEXT_LIST_CLASS}`}>
                   {nodes.map(node => renderKeepableRow({
                     key: node.id,
                     label: node.label,
@@ -964,7 +969,7 @@ export function StrategicContextWorkspace({
                 </div>
               )}
               {edges.length > 0 && (
-                <div className="mt-3 rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5" data-testid="strategic-context-workspace-edges">
+                <div className={`mt-3 ${CONTEXT_LIST_CLASS}`} data-testid="strategic-context-workspace-edges">
                   {edges.map((edge, index) => (
                     <EdgeRow
                       key={`${edge.source}:${edge.target}:${edge.label ?? 'link'}:${index}`}
@@ -979,7 +984,7 @@ export function StrategicContextWorkspace({
 
             <Section title="Resources" meta={`${listedResources.length}`} testId="strategic-context-workspace-resources">
               {listedResources.length > 0 ? (
-                <div className="rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5">
+                <div className={CONTEXT_LIST_CLASS}>
                   {listedResources.map(resource => renderKeepableRow({
                     key: `${resource.kind}:${resource.id}`,
                     label: resource.label,
@@ -1008,7 +1013,7 @@ export function StrategicContextWorkspace({
               ) : (
                 <div className="grid gap-3 lg:grid-cols-2">
                   {knowledgeEvidence.length > 0 && (
-                    <div className="rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5">
+                    <div className={CONTEXT_LIST_CLASS}>
                       {knowledgeEvidence.map(item => {
                         const ref = selectedRefFromKnowledgeEvidence(item);
                         return renderKeepableRow({
@@ -1023,7 +1028,7 @@ export function StrategicContextWorkspace({
                     </div>
                   )}
                   {artifactEvidence.length > 0 && (
-                    <div className="rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5">
+                    <div className={CONTEXT_LIST_CLASS}>
                       {artifactEvidence.map(item => {
                         const ref = selectedRefFromArtifactEvidence(item);
                         return renderKeepableRow({

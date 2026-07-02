@@ -12,6 +12,33 @@ describe('StrategicSessionControl', () => {
     expect(screen.getByRole('button', { name: /switch strategic mode to chat/i })).toHaveAttribute('aria-pressed', 'false');
   });
 
+  it('renders a compact header control without check-in prose', () => {
+    const { container } = render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        density="compact"
+        showMonitoringControls={false}
+        onModeChange={vi.fn()}
+        onCheckIn={vi.fn()}
+        sinceLastCheckIn={{
+          version: 1,
+          available: true,
+          since: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+          until: new Date().toISOString(),
+          messages: { total: 1 },
+          tasks: { created: 0, updated: 1 },
+          alerts: { raised: 0 },
+          strategic: { cycles_completed: 0 },
+        }}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /switch strategic mode to workday/i })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: /mark strategic session checked/i })).toBeInTheDocument();
+    expect(container.querySelector('[data-testid="strategic-session-control"]')?.textContent).not.toContain('Mark checked');
+    expect(screen.queryByRole('button', { name: /open devices/i })).toBeNull();
+  });
+
   it('calls onModeChange with backend mode values', async () => {
     const onModeChange = vi.fn();
     const user = userEvent.setup();

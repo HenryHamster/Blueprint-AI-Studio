@@ -204,6 +204,26 @@ describe('ResearchBrowser evidence panel', () => {
     expect(screen.getByText(/full suite green/)).toBeInTheDocument();
   });
 
+  it('does not let keyboard events from nested task actions toggle the finding row', async () => {
+    const user = userEvent.setup();
+    const onNavigateToTask = vi.fn();
+    render(
+      <ResearchBrowser
+        tasks={[makeResearchTask([makeFinding({ title: 'Keyboard-safe finding' })]), makeImplementationTask()]}
+        selectedProjectId={null}
+        onClose={() => {}}
+        onNavigateToTask={onNavigateToTask}
+      />,
+    );
+
+    const taskButton = screen.getByTitle('View task (Merged)');
+    taskButton.focus();
+    await user.keyboard('{Enter}');
+
+    expect(onNavigateToTask).toHaveBeenCalledWith('impl-1');
+    expect(screen.queryByText('evidence-bearing finding')).not.toBeInTheDocument();
+  });
+
   it('renders a request_changes verdict as a humanized blocking pill', async () => {
     const user = userEvent.setup();
     const implementation = makeImplementationTask({
@@ -788,5 +808,32 @@ describe('ResearchBrowser researchFeed prop', () => {
 
     await user.click(screen.getByRole('button', { name: 'Proposed' }));
     expect(screen.queryByText('Implemented from off-page task')).not.toBeInTheDocument();
+  });
+});
+
+describe('ResearchBrowser routed direction filter', () => {
+  it('updates the visible direction filter when the routed prop changes while open', () => {
+    const { rerender } = render(
+      <ResearchBrowser
+        tasks={[]}
+        selectedProjectId={null}
+        initialDirectionId="alpha-route"
+        onClose={() => {}}
+      />,
+    );
+
+    expect(screen.getByText('Direction alpha-ro')).toBeInTheDocument();
+
+    rerender(
+      <ResearchBrowser
+        tasks={[]}
+        selectedProjectId={null}
+        initialDirectionId="beta-route"
+        onClose={() => {}}
+      />,
+    );
+
+    expect(screen.getByText('Direction beta-rou')).toBeInTheDocument();
+    expect(screen.queryByText('Direction alpha-ro')).not.toBeInTheDocument();
   });
 });

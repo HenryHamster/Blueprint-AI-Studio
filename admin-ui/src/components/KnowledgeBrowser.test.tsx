@@ -116,6 +116,53 @@ vi.mock('../api', () => ({
   resolveArtifactDownloadUrl: vi.fn(() => Promise.resolve('https://signed.example.com/knowledge/doc-web-research-grounded')),
 }));
 
+describe('KnowledgeBrowser — routed direction filter', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+  });
+
+  test('updates the visible direction filter when the routed prop changes while open', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          initialDirectionId="direction-alpha"
+          onClose={() => {}}
+          onNavigateToTask={() => {}}
+        />,
+      );
+    });
+    expect(host.textContent).toContain('direction: direction-alpha');
+
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          initialDirectionId="direction-beta"
+          onClose={() => {}}
+          onNavigateToTask={() => {}}
+        />,
+      );
+    });
+
+    expect(host.textContent).toContain('direction: direction-beta');
+    expect(host.textContent).not.toContain('direction: direction-alpha');
+  });
+});
+
 describe('KnowledgeBrowser — acceptance-probe grounding wording', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;

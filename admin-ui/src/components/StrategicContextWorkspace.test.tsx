@@ -352,6 +352,10 @@ describe('StrategicContextWorkspace', () => {
     expect(host.textContent).toContain('Operator context brief');
     expect(host.textContent).toContain('Latest pull request');
     expect(host.textContent).toContain('running update 1');
+    expect(host.querySelector(
+      '[data-testid="strategic-context-workspace-artifacts"] [data-testid="strategic-context-descriptor-context_map"]',
+    )).toBeNull();
+    expect(host.querySelector('[data-testid="strategic-context-workspace-map"]')).not.toBeNull();
   });
 
   test('exposes Strategic mode, check-in, and account controls from the drawer', () => {
@@ -438,6 +442,33 @@ describe('StrategicContextWorkspace', () => {
     expect(updater([])).toEqual([
       { kind: 'canvas', id: 'canvas:proj-1', label: 'Strategic map resource' },
     ]);
+  });
+
+  test('preserves descriptor-only context map metadata when canvas data is not loaded', () => {
+    const state = {
+      ...STATE,
+      context_package: {
+        ...STATE.context_package,
+        canvas: null,
+        descriptors: [
+          {
+            id: 'context-map-descriptor',
+            kind: 'context_map',
+            title: 'Descriptor-only strategic map',
+            summary: 'Map is still being prepared.',
+            status: 'building',
+            target: { surface: 'project', section: 'problem-model' },
+          },
+        ],
+      },
+    } as StrategicStateResponse;
+
+    const { host } = mount({ state });
+    const artifactsSection = host.querySelector('[data-testid="strategic-context-workspace-artifacts"]');
+
+    expect(artifactsSection?.textContent).toContain('Descriptor-only strategic map');
+    expect(artifactsSection?.textContent).toContain('Map is still being prepared.');
+    expect(artifactsSection?.querySelector('[data-testid="strategic-context-descriptor-context_map"]')).not.toBeNull();
   });
 
   test('renders parallel map edges in the fallback list without duplicate key warnings', () => {

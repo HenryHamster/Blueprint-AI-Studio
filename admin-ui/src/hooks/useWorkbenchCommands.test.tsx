@@ -1967,6 +1967,21 @@ describe('useWorkbenchCommands', () => {
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
   });
 
+  test('opens research and knowledge overlays from command palette entries', () => {
+    const setShowResearchBrowser = vi.fn<(show: boolean) => void>();
+    const setShowKnowledgeBrowser = vi.fn<(show: boolean) => void>();
+    const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
+    mount({ setShowResearchBrowser, setShowKnowledgeBrowser, setCommandPaletteOpen });
+
+    captured.find(command => command.id === 'research.open')?.run();
+    captured.find(command => command.id === 'knowledge.open')?.run();
+
+    expect(setShowResearchBrowser).toHaveBeenCalledWith(true);
+    expect(setShowKnowledgeBrowser).toHaveBeenCalledWith(true);
+    expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
+    expect(setCommandPaletteOpen).toHaveBeenCalledTimes(2);
+  });
+
   test('routes refresh, task launch, runtime settings, and project management commands through existing callbacks', () => {
     const refreshWorkbench = vi.fn();
     const openNewTaskModal = vi.fn();
