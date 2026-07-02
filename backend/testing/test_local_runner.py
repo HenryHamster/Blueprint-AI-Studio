@@ -16,11 +16,14 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import select
 
+from app import alert_dispatch
 from app import auth as auth_mod
 from app import compute_backends as compute_backends_mod
 from app import orchestrator as orch
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
 from app.models import (
+    Alert,
+    AlertSeverity,
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
@@ -2458,6 +2461,273 @@ class TestOrchestratorRunnerRouting:
         await db_session.refresh(running)
         assert running.status == TaskStatus.PROVISIONING
         assert running.vm_instance_id == f"runner:{stale.id}"
+
+
+class TestRunnerDeathAlert:
+    """Runner-death alerting: the stale-runner sweep raises a deduplicated,
+    push-notified operator alert on active->inactive, and a heartbeat that
+    re-arms the runner resolves it. See app.alert_dispatch._maybe_create_
+    runner_deactivated_alert / _resolve_runner_deactivated_alert."""
+
+    async def _runner_alerts(self, db_session, project_id):
+        rows = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.event_type == "runner.deactivated",
+                )
+            )
+        ).scalars().all()
+        return list(rows)
+
+    @pytest.mark.asyncio
+    async def test_sweep_creates_warning_alert_for_idle_runner(self, db_session):
+        project = await _make_project(db_session)
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={"task_types": "all", "active_task_ids": []},
+        )
+        with patch(
+            "app.alert_dispatch.broadcast_to_project", new=AsyncMock()
+        ), patch(
+            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+        ) as webhook:
+            await orch._deactivate_stale_runners(db_session)
+
+        alerts = await self._runner_alerts(db_session, project.id)
+        assert len(alerts) == 1
+        alert = alerts[0]
+        assert alert.severity == AlertSeverity.WARNING
+        assert alert.domain == "core"
+        assert alert.dedupe_key == f"runner.deactivated:{idle.id}"
+        assert alert.dismissed_at is None
+        assert "went offline" in alert.title
+        # Webhook is pushed for the newly-created alert.
+        webhook.assert_awaited_once()
+        assert webhook.await_args.args[0] == "RUNNER_DEACTIVATED"
+
+    @pytest.mark.asyncio
+    async def test_sweep_creates_error_alert_for_runner_with_active_work(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        busy, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": ["a", "b"],
+                "active_compute_job_ids": ["j1"],
+            },
+        )
+        with patch(
+            "app.alert_dispatch.broadcast_to_project", new=AsyncMock()
+        ), patch("app.alert_dispatch._send_webhook_notification", new=AsyncMock()):
+            await orch._deactivate_stale_runners(db_session)
+
+        alerts = await self._runner_alerts(db_session, project.id)
+        assert len(alerts) == 1
+        alert = alerts[0]
+        assert alert.severity == AlertSeverity.ERROR
+        assert "mid-job" in alert.title
+        # 3 active work items (2 tasks + 1 compute job) reported in the message.
+        assert "3 active" in alert.message
+        assert str(busy.id)[:8] in alert.message
+
+    @pytest.mark.asyncio
+    async def test_sweep_alert_is_deduplicated(self, db_session):
+        # A repeated sweep over a still-dead runner must NOT create a second
+        # alert (dedupe_key upsert). We reset the runner to active+stale to force
+        # the sweep to re-select it, simulating re-entry without a recovery.
+        project = await _make_project(db_session)
+        stale, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+        )
+        with patch(
+            "app.alert_dispatch.broadcast_to_project", new=AsyncMock()
+        ), patch(
+            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+        ) as webhook:
+            await orch._deactivate_stale_runners(db_session)
+            # Force a re-selection: flip back to active but keep the heartbeat stale.
+            stale.status = "active"
+            stale.last_seen_at = _utcnow() - timedelta(minutes=10)
+            db_session.add(stale)
+            await db_session.commit()
+            await orch._deactivate_stale_runners(db_session)
+
+        alerts = await self._runner_alerts(db_session, project.id)
+        assert len(alerts) == 1
+        # Webhook pushed once (first creation only), not on the dedup re-entry.
+        webhook.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_resolves_open_alert(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            status="inactive",
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+        )
+        # Seed an open runner-death alert as the sweep would have.
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.WARNING,
+            title="Fleet runner went offline: runner x",
+            message="dead",
+            domain="core",
+            event_type="runner.deactivated",
+            dedupe_key=f"runner.deactivated:{runner.id}",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+
+        with patch("app.alert_dispatch.broadcast_to_project", new=AsyncMock()):
+            resp = await client.post(
+                "/api/runner/heartbeat",
+                json={"active_task_ids": []},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp.status_code == 200
+
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is not None
+        await db_session.refresh(runner)
+        assert runner.status == "active"
+
+    @pytest.mark.asyncio
+    async def test_resolve_is_noop_without_open_alert(self, db_session):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+        with patch("app.alert_dispatch.broadcast_to_project", new=AsyncMock()):
+            dismissed = await alert_dispatch._resolve_runner_deactivated_alert(
+                db_session, project.id, runner.id
+            )
+        assert dismissed == 0
+
+
+class TestDeadRunnerAttention:
+    """Item 4: a registered runner that is not-live surfaces in the operator
+    attention feed directly, independent of a pinned task. See
+    app.operator_attention._load_dead_runners / _dead_runner_attention_item."""
+
+    @pytest.mark.asyncio
+    async def test_idle_dead_runner_surfaces_as_watch(self, db_session):
+        from app.operator_attention import (
+            _dead_runner_attention_item,
+            _load_dead_runners,
+        )
+
+        project = await _make_project(db_session)
+        dead, _ = await _make_runner(
+            db_session,
+            project.id,
+            hostname="workstation",
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={"task_types": "all", "active_task_ids": []},
+        )
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        assert needs_op == 0
+        assert watch == 1
+        assert [r.id for r in runners] == [dead.id]
+        item = _dead_runner_attention_item(runners[0])
+        assert item["reason"] == "dead_runner"
+        assert item["severity"] == "watch"
+        assert item["runner_id"] == str(dead.id)
+        assert item["target"]["section"] == "devices"
+        assert item["target"]["runner_id"] == str(dead.id)
+
+    @pytest.mark.asyncio
+    async def test_midjob_dead_runner_surfaces_as_needs_operator(self, db_session):
+        from app.operator_attention import (
+            _dead_runner_attention_item,
+            _load_dead_runners,
+        )
+
+        project = await _make_project(db_session)
+        await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={"task_types": "all", "active_task_ids": ["running-task"]},
+        )
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        assert needs_op == 1
+        assert watch == 0
+        item = _dead_runner_attention_item(runners[0])
+        assert item["severity"] == "needs_operator"
+        assert item["label"] == "Fleet runner offline mid-job"
+
+    @pytest.mark.asyncio
+    async def test_live_and_booting_runners_excluded(self, db_session):
+        from app.operator_attention import _load_dead_runners
+
+        project = await _make_project(db_session)
+        await _make_runner(db_session, project.id, last_seen_at=_utcnow())  # live
+        # Never-heartbeated active runner: booting/just-registered, not a death.
+        await _make_runner(db_session, project.id, status="active", last_seen_at=None)
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        assert (needs_op, watch, runners) == (0, 0, [])
+
+    @pytest.mark.asyncio
+    async def test_runner_with_open_alert_is_excluded(self, db_session):
+        from app.operator_attention import _load_dead_runners
+
+        project = await _make_project(db_session)
+        dead, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+        )
+        db_session.add(
+            Alert(
+                project_id=project.id,
+                severity=AlertSeverity.WARNING,
+                title="Fleet runner went offline: x",
+                message="dead",
+                domain="core",
+                event_type="runner.deactivated",
+                dedupe_key=f"runner.deactivated:{dead.id}",
+            )
+        )
+        await db_session.commit()
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        # Covered by its open alert (which surfaces via the alert path) → excluded.
+        assert (needs_op, watch, runners) == (0, 0, [])
+
+    @pytest.mark.asyncio
+    async def test_runner_with_unpulled_pin_is_excluded(self, db_session):
+        from app.operator_attention import _load_dead_runners
+
+        project = await _make_project(db_session)
+        dead, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+        )
+        # Unpulled pin → covered by the stale_runner_pin item, not dead_runner.
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "compute_experiment"}],
+                status=TaskStatus.PROVISIONING,
+                started_at=None,
+                vm_instance_id=f"runner:{dead.id}",
+                vm_provisioned_at=_utcnow(),
+                context={"runner_target_id": str(dead.id)},
+            )
+        )
+        await db_session.commit()
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        assert (needs_op, watch, runners) == (0, 0, [])
 
 
 # ── Strategic-spawning local-runner availability signal ──────────────────────

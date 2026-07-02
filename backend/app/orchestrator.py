@@ -1345,10 +1345,17 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
     """
     from sqlalchemy import or_, update as _sa_update
 
-    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    now = _utcnow()
+    cutoff = now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
     stale_rows = (
         await session.execute(
-            select(LocalRunner.id, LocalRunner.project_id).where(
+            select(
+                LocalRunner.id,
+                LocalRunner.project_id,
+                LocalRunner.hostname,
+                LocalRunner.capabilities,
+                LocalRunner.last_seen_at,
+            ).where(
                 LocalRunner.status == "active",
                 or_(
                     LocalRunner.last_seen_at.is_(None),
@@ -1357,11 +1364,12 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
             )
         )
     ).all()
-    stale_ids = [runner_id for runner_id, _project_id in stale_rows]
+    stale_ids = [row[0] for row in stale_rows]
     if not stale_ids:
         return
     stale_counts_by_project: dict[uuid.UUID, int] = {}
-    for _runner_id, project_id in stale_rows:
+    for row in stale_rows:
+        project_id = row[1]
         stale_counts_by_project[project_id] = (
             stale_counts_by_project.get(project_id, 0) + 1
         )
@@ -1405,6 +1413,48 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
         )
 
     await session.commit()
+    # Alert the operator on each newly-dead runner (the status flip above is the
+    # active->inactive transition, so this fires exactly once per death; the
+    # dedupe_key upsert is a second guard). Runs AFTER the commit so the alert /
+    # webhook only announce a durably-recorded deactivation. Best-effort per
+    # runner so an alert failure never aborts the sweep. Runner counts are tiny
+    # (operator hardware), so the per-runner commit inside the helper is cheap.
+    from app.alert_dispatch import _maybe_create_runner_deactivated_alert
+
+    for row in stale_rows:
+        runner_id, project_id, hostname, capabilities, last_seen_at = row
+        caps = capabilities or {}
+        active_work_count = 0
+        for _work_key in ("active_task_ids", "active_compute_job_ids"):
+            _ids = caps.get(_work_key)
+            if isinstance(_ids, list):
+                active_work_count += len(_ids)
+        seconds_since_last_seen = (
+            max(0, int((now - last_seen_at).total_seconds()))
+            if last_seen_at is not None
+            else None
+        )
+        try:
+            await _maybe_create_runner_deactivated_alert(
+                session,
+                project_id=project_id,
+                runner_id=runner_id,
+                hostname=hostname,
+                had_active_work=active_work_count > 0,
+                active_work_count=active_work_count,
+                seconds_since_last_seen=seconds_since_last_seen,
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to create runner-deactivated alert for %s",
+                runner_id,
+            )
+            # Clear any half-staged alert so the next runner's creation starts
+            # from a clean transaction (each helper call commits its own row).
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception("[RUNNERS] rollback after alert failure failed")
     for project_id, deactivated_count in stale_counts_by_project.items():
         try:
             await emit_workbench_refetch(
