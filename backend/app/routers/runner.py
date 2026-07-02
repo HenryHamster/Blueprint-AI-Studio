@@ -25,7 +25,7 @@ and this endpoint hands those pinned tasks to the polling runner.
 import logging
 import math
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
@@ -134,6 +134,25 @@ def _runner_liveness_health(
     }
 
 
+def _parse_heartbeat_timestamp(raw: str | None) -> datetime | None:
+    """Parse a runner-reported ISO-8601 timestamp to a naive-UTC datetime.
+
+    Tolerant of a trailing ``Z`` and of tz offsets (normalized to UTC then
+    stripped, matching the NaiveUTCDateTime column convention). Returns ``None``
+    for missing/blank/unparseable values so an old or misbehaving runner never
+    fails its heartbeat over a bad timestamp.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 class HeartbeatRequest(BaseModel):
     active_task_ids: List[str] = []
     active_compute_job_ids: List[str] = []
@@ -144,6 +163,14 @@ class HeartbeatRequest(BaseModel):
     has_gpu: Optional[StrictBool] = None
     gpu_count: Optional[int] = None
     gpu_names: Optional[List[str]] = None
+    # Trust telemetry (optional; old runners omit these). last_successful_job_at
+    # is ISO-8601; consecutive_job_failures/disk_free_bytes/gpu_utilization_pct are
+    # ints. These drive the "connected but failing" degraded state so the operator
+    # console can tell a healthy runner from one heartbeating while every job fails.
+    last_successful_job_at: str | None = None
+    consecutive_job_failures: int | None = None
+    disk_free_bytes: int | None = None
+    gpu_utilization_pct: int | None = None
 
 
 @router.post("/next-task")
@@ -236,6 +263,8 @@ async def heartbeat(
     previous_hostname = runner.hostname
     previous_version = runner.version
     previous_last_seen_at = runner.last_seen_at
+    previous_last_successful_job_at = runner.last_successful_job_at
+    previous_consecutive_job_failures = runner.consecutive_job_failures
     previous_caps = dict(runner.capabilities or {})
     runner_id = runner.id
     runner_project_id = runner.project_id
@@ -268,6 +297,20 @@ async def heartbeat(
         caps["gpu_count"] = payload.gpu_count
     if payload.gpu_names is not None:
         caps["gpu_names"] = payload.gpu_names
+    # Trust telemetry. last_successful_job_at / consecutive_job_failures are
+    # first-class columns (the degraded-state logic and panel key on them);
+    # disk_free_bytes / gpu_utilization_pct are display-only and ride in caps
+    # alongside the other heartbeat-reported hardware fields. All optional and
+    # tolerated as missing/null so older runners keep heartbeating.
+    parsed_last_success = _parse_heartbeat_timestamp(payload.last_successful_job_at)
+    if parsed_last_success is not None:
+        runner.last_successful_job_at = parsed_last_success
+    if payload.consecutive_job_failures is not None:
+        runner.consecutive_job_failures = max(0, int(payload.consecutive_job_failures))
+    if payload.disk_free_bytes is not None:
+        caps["disk_free_bytes"] = max(0, int(payload.disk_free_bytes))
+    if payload.gpu_utilization_pct is not None:
+        caps["gpu_utilization_pct"] = max(0, min(100, int(payload.gpu_utilization_pct)))
     if payload.hostname:
         runner.hostname = payload.hostname[:255]
     if payload.version:
@@ -303,6 +346,12 @@ async def heartbeat(
         or previous_caps.get("has_gpu") != caps.get("has_gpu")
         or previous_caps.get("gpu_count") != caps.get("gpu_count")
         or previous_caps.get("gpu_names") != caps.get("gpu_names")
+        # Trust-telemetry transitions matter (a runner tipping into/out of the
+        # "connected but failing" state), so refetch the panel. gpu_utilization_pct
+        # and disk_free_bytes are deliberately excluded — they churn every
+        # heartbeat and would defeat the change-gated refetch.
+        or previous_last_successful_job_at != runner.last_successful_job_at
+        or previous_consecutive_job_failures != runner.consecutive_job_failures
     )
     if runtime_state_changed:
         await emit_workbench_refetch(

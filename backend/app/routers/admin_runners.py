@@ -46,6 +46,19 @@ _DEFAULT_CAPABILITIES: Dict[str, Any] = {
 }
 
 _RUNNER_LIVENESS_SECONDS = 300
+# Trust-telemetry thresholds for the "connected but failing" (degraded) state.
+# A runner can heartbeat perfectly while every job it is handed fails — the
+# false-green these guard against. A live runner is degraded when either:
+#   * it has failed >= _FAILURE_STREAK_DEGRADED_THRESHOLD jobs in a row, or
+#   * it currently carries active work, has recorded at least one failure, and
+#     has no recent success (last_successful_job_at stale beyond
+#     _SUCCESS_STALE_SECONDS or never set) — "working but not succeeding".
+# The second branch requires >= 1 recorded failure so a freshly-enrolled runner
+# legitimately churning on its first job is never mislabelled as failing.
+_FAILURE_STREAK_DEGRADED_THRESHOLD = 3
+_SUCCESS_STALE_SECONDS = 1800  # 30 min
+# Advisory low-disk flag (does not by itself degrade a runner).
+_LOW_DISK_FREE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 _STRATEGIC_LOCAL_TASK_TYPES = sorted(STRATEGIC_TASK_TYPES)
 _KNOWN_TASK_TYPES = {task_type.value for task_type in TaskType}
 
@@ -137,6 +150,25 @@ def _runner_active_compute_job_count(capabilities: Dict[str, Any] | None) -> int
     return len(active) if isinstance(active, list) else 0
 
 
+def _runner_int_telemetry(
+    capabilities: Dict[str, Any] | None, key: str
+) -> int | None:
+    """Read a non-negative int telemetry value stashed on capabilities.
+
+    Used for the display-only trust telemetry (``disk_free_bytes``,
+    ``gpu_utilization_pct``) the runner reports on each heartbeat. Tolerant of
+    absent/None/malformed values (old runners omit them).
+    """
+    raw = (capabilities or {}).get(key)
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    if isinstance(raw, float) and raw.is_integer():
+        return int(raw) if raw >= 0 else None
+    return None
+
+
 def _runner_max_concurrent(capabilities: Dict[str, Any] | None) -> int | None:
     raw = (capabilities or {}).get("max_concurrent")
     if isinstance(raw, bool):
@@ -184,7 +216,48 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         stale_reason = "never_seen"
     elif seconds_since_last_seen >= _RUNNER_LIVENESS_SECONDS:
         stale_reason = "heartbeat_stale"
-    if is_live:
+
+    # Trust telemetry: a live runner can still be failing every job it is handed.
+    consecutive_job_failures = runner.consecutive_job_failures or 0
+    if runner.last_successful_job_at is None:
+        seconds_since_last_success = None
+    else:
+        seconds_since_last_success = max(
+            0, int((now - runner.last_successful_job_at).total_seconds())
+        )
+    success_is_stale = (
+        seconds_since_last_success is None
+        or seconds_since_last_success >= _SUCCESS_STALE_SECONDS
+    )
+    failure_streak_degraded = (
+        consecutive_job_failures >= _FAILURE_STREAK_DEGRADED_THRESHOLD
+    )
+    success_stale_while_working = (
+        active_work_count > 0
+        and consecutive_job_failures > 0
+        and success_is_stale
+    )
+    degraded = is_live and (failure_streak_degraded or success_stale_while_working)
+    degraded_reason = None
+    if degraded:
+        degraded_reason = (
+            "job_failure_streak" if failure_streak_degraded else "success_stale"
+        )
+
+    disk_free_bytes = _runner_int_telemetry(runner.capabilities, "disk_free_bytes")
+    gpu_utilization_pct = _runner_int_telemetry(
+        runner.capabilities, "gpu_utilization_pct"
+    )
+    disk_low = disk_free_bytes is not None and disk_free_bytes < _LOW_DISK_FREE_BYTES
+
+    # device_status is the operator-facing tone. "degraded" is distinct from
+    # "connected": the runner is live (recent heartbeat) but its jobs are failing,
+    # so the console must NOT read it as ready. is_live stays true — a degraded
+    # runner is still connected — so slot/capacity accounting is unaffected.
+    if is_live and degraded:
+        device_status = "degraded"
+        device_status_reason = degraded_reason
+    elif is_live:
         device_status = "connected"
         device_status_reason = None
     elif runner.status != "active":
@@ -197,6 +270,8 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         "device_status": device_status,
         "device_status_reason": device_status_reason,
         "is_live": is_live,
+        "degraded": degraded,
+        "degraded_reason": degraded_reason,
         "seconds_since_last_seen": seconds_since_last_seen,
         "active_task_count": active_task_count,
         "active_compute_job_count": active_compute_job_count,
@@ -206,6 +281,18 @@ def _runner_health(runner: LocalRunner) -> Dict[str, Any]:
         "stale_reason": stale_reason,
         "agent_available": (runner.capabilities or {}).get("agent_available"),
         "liveness_window_seconds": _RUNNER_LIVENESS_SECONDS,
+        # Trust telemetry surfaced to the panel.
+        "last_successful_job_at": (
+            runner.last_successful_job_at.isoformat()
+            if runner.last_successful_job_at
+            else None
+        ),
+        "seconds_since_last_success": seconds_since_last_success,
+        "consecutive_job_failures": consecutive_job_failures,
+        "disk_free_bytes": disk_free_bytes,
+        "disk_low": disk_low,
+        "gpu_utilization_pct": gpu_utilization_pct,
+        "failure_streak_threshold": _FAILURE_STREAK_DEGRADED_THRESHOLD,
     }
 
 
