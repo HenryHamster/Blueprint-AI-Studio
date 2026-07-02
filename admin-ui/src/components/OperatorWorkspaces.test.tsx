@@ -320,6 +320,35 @@ describe('Operator workspaces', () => {
     expect(screen.getByTestId('settings-section')).toHaveTextContent('notifications');
   });
 
+  test('swallows rejected onRestartOrchestrator without emitting unhandledrejection', async () => {
+    const user = userEvent.setup();
+    const unhandledRejections: PromiseRejectionEvent[] = [];
+    const onUnhandledRejection = (e: PromiseRejectionEvent) => {
+      e.preventDefault();
+      unhandledRejections.push(e);
+    };
+    window.addEventListener('unhandledrejection', onUnhandledRejection);
+
+    const error = new Error('restart failed');
+    const onRestartOrchestrator = vi.fn().mockRejectedValue(error);
+
+    render(
+      <RuntimeWorkspace
+        {...runtimeProps({ userRole: 'admin', runtimeSection: 'health' })}
+        onRestartOrchestrator={onRestartOrchestrator}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Restart orchestrator' }));
+    // Flush microtask queue so the rejected promise settles
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    expect(onRestartOrchestrator).toHaveBeenCalledTimes(1);
+    expect(unhandledRejections).toHaveLength(0);
+
+    window.removeEventListener('unhandledrejection', onUnhandledRejection);
+  });
+
   test('surfaces API and WebSocket state inside the runtime overview workspace', () => {
     render(
       <RuntimeWorkspace

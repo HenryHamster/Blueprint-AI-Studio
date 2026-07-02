@@ -377,6 +377,30 @@ describe('CommandPalette', () => {
     expect(input).toHaveFocus();
   });
 
+  test('no-op boundary: pressing End at last command keeps focus on command', async () => {
+    const user = userEvent.setup();
+    render(
+      <CommandPalette
+        open
+        commands={makeCommands()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const input = screen.getByLabelText('Search commands');
+    await waitFor(() => expect(input).toHaveFocus());
+
+    // Navigate to last command
+    await user.tab();
+    await user.keyboard('{End}');
+    const lastCommand = screen.getByRole('button', { name: /Switch Strategic to Workday/i });
+    expect(lastCommand).toHaveFocus();
+
+    // Press End again — already at last command, no-op boundary
+    await user.keyboard('{End}');
+    expect(lastCommand).toHaveFocus();
+  });
+
   test('contains key events so document shortcuts do not run behind the palette', async () => {
     const user = userEvent.setup();
     const onDocumentKeyDown = vi.fn();
