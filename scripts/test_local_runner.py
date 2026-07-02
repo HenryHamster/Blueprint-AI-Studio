@@ -298,7 +298,7 @@ class TestMaxConcurrentCap(unittest.TestCase):
 
         call_count = {"n": 0}
 
-        def fake_post(url, token, body):
+        def fake_post(url, token, body, **kwargs):
             call_count["n"] += 1
             return 204, None
 
@@ -526,7 +526,7 @@ class TestComputeJobReport(unittest.TestCase):
         """_report_compute_job POSTs exec_status/exit_code and returns cancel_requested."""
         captured = {}
 
-        def fake_post(url, token, body):
+        def fake_post(url, token, body, **kwargs):
             captured["url"] = url
             captured["body"] = body
             return 200, {"ok": True, "cancel_requested": True}
@@ -545,7 +545,7 @@ class TestComputeJobReport(unittest.TestCase):
         self.assertEqual(captured["body"]["result_metrics"], {"loss": 0.5})
 
     def test_cancel_not_requested_returns_false(self):
-        def fake_post(url, token, body):
+        def fake_post(url, token, body, **kwargs):
             return 200, {"ok": True, "cancel_requested": False}
 
         with patch.object(local_runner, "_post", fake_post):
@@ -558,7 +558,7 @@ class TestComputeJobReport(unittest.TestCase):
 
     def test_404_returns_true(self):
         """A 404 response means the job is gone — treat as cancel_requested."""
-        def fake_post(url, token, body):
+        def fake_post(url, token, body, **kwargs):
             return 404, None
 
         with patch.object(local_runner, "_post", fake_post):
@@ -570,7 +570,7 @@ class TestComputeJobReport(unittest.TestCase):
         self.assertTrue(result)
 
     def test_network_error_returns_false(self):
-        def fake_post(url, token, body):
+        def fake_post(url, token, body, **kwargs):
             raise RuntimeError("network error")
 
         with patch.object(local_runner, "_post", fake_post):
@@ -938,7 +938,7 @@ class TestComputePollLoop(unittest.TestCase):
         sleep_calls = []
         iterations = [0]
 
-        def fake_post(url, token, body):
+        def fake_post(url, token, body, **kwargs):
             return 204, None
 
         def fake_sleep(secs):
@@ -967,7 +967,7 @@ class TestComputePollLoop(unittest.TestCase):
         post_calls = []
         sleep_iterations = [0]
 
-        def fake_post(url, token, body):
+        def fake_post(url, token, body, **kwargs):
             post_calls.append(url)
             return 204, None
 
@@ -992,7 +992,7 @@ class TestComputePollLoop(unittest.TestCase):
         post_calls = []
         sleep_iterations = [0]
 
-        def fake_post(url, token, body):
+        def fake_post(url, token, body, **kwargs):
             post_calls.append(url)
             return 204, None
 
@@ -1024,7 +1024,7 @@ class TestComputePollLoop(unittest.TestCase):
         call_count = [0]
         threads_started = []
 
-        def fake_post(url, token, body):
+        def fake_post(url, token, body, **kwargs):
             call_count[0] += 1
             if call_count[0] == 1:
                 return 200, {
@@ -1066,7 +1066,7 @@ class TestComputePollLoop(unittest.TestCase):
         """A claimed job must not wedge local capacity if the worker fails to start."""
         reports = []
 
-        def fake_post(url, token, body):
+        def fake_post(url, token, body, **kwargs):
             return 200, {
                 "job_id": "job-xyz",
                 "command": "echo hi",
@@ -1176,7 +1176,7 @@ class TestGpuDetection(unittest.TestCase):
         """Heartbeat body includes GPU fields detected at startup."""
         posted_bodies = []
 
-        def fake_post(url, token, body):
+        def fake_post(url, token, body, **kwargs):
             posted_bodies.append(body)
             # Stop the loop after the first heartbeat so the test doesn't block.
             local_runner._shutdown_event.set()
@@ -1188,8 +1188,12 @@ class TestGpuDetection(unittest.TestCase):
         local_runner._shutdown_event.clear()
 
         try:
+            # agent_available now also requires a working node runtime (I11); patch
+            # the functional probe so the assertion is hermetic on a nodeless CI.
             with patch.object(local_runner, "_post", fake_post), \
-                 patch.object(local_runner, "_locate_agent_binary", return_value="/agent/dist/index.js"):
+                 patch.object(local_runner, "_locate_agent_binary", return_value="/agent/dist/index.js"), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True), \
+                 patch.object(local_runner, "_gpu_utilization_pct", return_value=42):
                 local_runner._heartbeat_loop(
                     "https://api", "tok", active_tasks, lock, gpu_caps
                 )
@@ -1207,7 +1211,7 @@ class TestGpuDetection(unittest.TestCase):
     def test_heartbeat_includes_active_compute_job_ids(self):
         posted_bodies = []
 
-        def fake_post(url, token, body):
+        def fake_post(url, token, body, **kwargs):
             posted_bodies.append(body)
             local_runner._shutdown_event.set()
             return 200, {"ok": True}
@@ -1680,6 +1684,492 @@ class TestBoundedDedupLog(unittest.TestCase):
         self.assertTrue(truncated)
         self.assertLessEqual(len(text.encode("utf-8")), 4096)
         self.assertIn("elided", text)
+
+
+# ── Robustness hardening (I3–I6, N1–N4) + heartbeat telemetry (I11) ────────────
+
+class TestParseRetryAfter(unittest.TestCase):
+    def test_delta_seconds(self):
+        self.assertEqual(local_runner._parse_retry_after("120"), 120.0)
+        self.assertEqual(local_runner._parse_retry_after("2.5"), 2.5)
+        self.assertEqual(local_runner._parse_retry_after("0"), 0.0)
+
+    def test_negative_clamps_to_zero(self):
+        self.assertEqual(local_runner._parse_retry_after("-5"), 0.0)
+
+    def test_none_and_blank_return_none(self):
+        self.assertIsNone(local_runner._parse_retry_after(None))
+        self.assertIsNone(local_runner._parse_retry_after(""))
+        self.assertIsNone(local_runner._parse_retry_after("   "))
+
+    def test_garbage_returns_none(self):
+        self.assertIsNone(local_runner._parse_retry_after("soon-ish"))
+
+    def test_http_date_future(self):
+        from email.utils import formatdate
+        future = formatdate(time.time() + 100, usegmt=True)
+        val = local_runner._parse_retry_after(future)
+        self.assertIsNotNone(val)
+        self.assertGreater(val, 0)
+        self.assertLessEqual(val, 100)
+
+    def test_http_date_past_clamps_to_zero(self):
+        from email.utils import formatdate
+        past = formatdate(time.time() - 100, usegmt=True)
+        self.assertEqual(local_runner._parse_retry_after(past), 0.0)
+
+
+class TestEnvParseGuards(unittest.TestCase):
+    def test_int_valid(self):
+        with patch.dict(os.environ, {"BP_X": "5"}):
+            self.assertEqual(local_runner._env_int("BP_X", 2), 5)
+
+    def test_int_garbage_falls_back_to_default(self):
+        with patch.dict(os.environ, {"BP_X": "abc"}):
+            self.assertEqual(local_runner._env_int("BP_X", 2), 2)
+
+    def test_int_clamps_to_minimum(self):
+        with patch.dict(os.environ, {"BP_X": "0"}):
+            self.assertEqual(local_runner._env_int("BP_X", 2, minimum=1), 1)
+        with patch.dict(os.environ, {"BP_X": "-4"}):
+            self.assertEqual(local_runner._env_int("BP_X", 2, minimum=1), 1)
+
+    def test_int_missing_uses_default(self):
+        env = {k: v for k, v in os.environ.items() if k != "BP_X"}
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(local_runner._env_int("BP_X", 7), 7)
+
+    def test_float_garbage_falls_back(self):
+        with patch.dict(os.environ, {"BP_F": "notnum"}):
+            self.assertEqual(local_runner._env_float("BP_F", 2.0), 2.0)
+
+    def test_float_clamps_to_minimum(self):
+        with patch.dict(os.environ, {"BP_F": "0.1"}):
+            self.assertEqual(local_runner._env_float("BP_F", 2.0, minimum=0.5), 0.5)
+
+
+class TestTelemetryState(unittest.TestCase):
+    def test_counter_and_timestamp(self):
+        t = local_runner._TelemetryState()
+        self.assertIsNone(t.snapshot()[0])
+        self.assertEqual(t.snapshot()[1], 0)
+        t.record_failure()
+        t.record_failure()
+        self.assertEqual(t.snapshot()[1], 2)
+        t.record_success()
+        ts, fails = t.snapshot()
+        self.assertEqual(fails, 0)
+        self.assertIsInstance(ts, str)
+        self.assertRegex(ts, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}")
+        # A failure increments but must NOT wipe the last-success timestamp.
+        t.record_failure()
+        self.assertEqual(t.snapshot()[1], 1)
+        self.assertEqual(t.snapshot()[0], ts)
+
+
+class TestFunctionalProbes(unittest.TestCase):
+    def test_node_ok_on_zero_exit(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        with patch("subprocess.run", return_value=fake):
+            self.assertTrue(local_runner._node_runtime_ok())
+
+    def test_node_not_ok_when_absent(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertFalse(local_runner._node_runtime_ok())
+
+    def test_node_not_ok_on_nonzero(self):
+        fake = MagicMock()
+        fake.returncode = 1
+        with patch("subprocess.run", return_value=fake):
+            self.assertFalse(local_runner._node_runtime_ok())
+
+    def test_disk_free_none_for_none_root(self):
+        self.assertIsNone(local_runner._disk_free_bytes(None))
+
+    def test_disk_free_real_dir_is_int(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            self.assertIsInstance(local_runner._disk_free_bytes(d), int)
+
+    def test_gpu_util_absent_returns_none(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertIsNone(local_runner._gpu_utilization_pct())
+
+    def test_gpu_util_parses_max_across_gpus(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "15\n83\n7\n"
+        with patch("subprocess.run", return_value=fake):
+            self.assertEqual(local_runner._gpu_utilization_pct(), 83)
+
+    def test_gpu_util_clamps_to_100(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "250\n"
+        with patch("subprocess.run", return_value=fake):
+            self.assertEqual(local_runner._gpu_utilization_pct(), 100)
+
+
+class TestAgentWallClockDeadline(unittest.TestCase):
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_reaper_terminates_agent_past_deadline(self):
+        """An agent past its wall-clock deadline is torn down, its permit released,
+        and a telemetry failure recorded."""
+        proc = MagicMock()
+        proc.poll.return_value = None  # still running (not a normal reap)
+
+        active_tasks = {"t1": proc}
+        agent_started_at = {"t1": time.monotonic() - 100.0}
+        lock = threading.Lock()
+        capacity = threading.BoundedSemaphore(1)
+        self.assertTrue(capacity.acquire(blocking=False))  # permit held by the task
+        telemetry = local_runner._TelemetryState()
+
+        terminated = []
+
+        def fake_term(p, **kw):
+            terminated.append(p)
+
+        def stop_sleep(_secs):
+            local_runner._shutdown_event.set()
+
+        with patch.object(local_runner.iso, "terminate_process_tree", fake_term), \
+             patch("time.sleep", stop_sleep):
+            local_runner._reap_loop(
+                active_tasks, lock, capacity,
+                agent_started_at=agent_started_at,
+                agent_max_seconds=10,
+                telemetry=telemetry,
+            )
+
+        self.assertEqual(terminated, [proc])
+        self.assertNotIn("t1", active_tasks)
+        self.assertNotIn("t1", agent_started_at)
+        self.assertTrue(capacity.acquire(blocking=False))  # permit released
+        _, fails = telemetry.snapshot()
+        self.assertEqual(fails, 1)
+
+    def test_reaper_leaves_young_agent_alone(self):
+        proc = MagicMock()
+        proc.poll.return_value = None
+
+        active_tasks = {"t1": proc}
+        agent_started_at = {"t1": time.monotonic()}  # just started
+        lock = threading.Lock()
+
+        def stop_sleep(_secs):
+            local_runner._shutdown_event.set()
+
+        with patch.object(local_runner.iso, "terminate_process_tree") as term, \
+             patch("time.sleep", stop_sleep):
+            local_runner._reap_loop(
+                active_tasks, lock, None,
+                agent_started_at=agent_started_at,
+                agent_max_seconds=3600,
+            )
+
+        term.assert_not_called()
+        self.assertIn("t1", active_tasks)
+
+
+class TestComputeJobTelemetry(unittest.TestCase):
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def _make_job(self, **kwargs):
+        base = {
+            "job_id": "test-job-001",
+            "command": "echo hello",
+            "env": {},
+            "cwd": None,
+            "setup_step": None,
+            "container_image": None,
+            "container_registry_auth": {},
+            "runtime_deadline_seconds": None,
+            "cancel_requested": False,
+        }
+        base.update(kwargs)
+        return base
+
+    def test_success_records_success(self):
+        telem = local_runner._TelemetryState()
+        job = self._make_job(command="exit 0")
+        active_jobs, lock = {"test-job-001"}, threading.Lock()
+        with patch.object(local_runner, "_report_compute_job", lambda *a, **k: False), \
+             patch.object(local_runner.iso, "plan_compute_execution", _bare_plan_factory()):
+            local_runner._run_compute_job(job, "https://api", "tok", active_jobs, lock,
+                                          capabilities=_bwrap_caps(), telemetry=telem)
+        ts, fails = telem.snapshot()
+        self.assertIsInstance(ts, str)
+        self.assertEqual(fails, 0)
+
+    def test_failure_records_failure(self):
+        telem = local_runner._TelemetryState()
+        job = self._make_job(command="exit 3")
+        active_jobs, lock = {"test-job-001"}, threading.Lock()
+        with patch.object(local_runner, "_report_compute_job", lambda *a, **k: False), \
+             patch.object(local_runner.iso, "plan_compute_execution", _bare_plan_factory()):
+            local_runner._run_compute_job(job, "https://api", "tok", active_jobs, lock,
+                                          capabilities=_bwrap_caps(), telemetry=telem)
+        ts, fails = telem.snapshot()
+        self.assertIsNone(ts)
+        self.assertEqual(fails, 1)
+
+    def test_cancel_is_telemetry_neutral(self):
+        telem = local_runner._TelemetryState()
+        job = self._make_job(cancel_requested=True)
+        active_jobs, lock = {"test-job-001"}, threading.Lock()
+        with patch.object(local_runner, "_report_compute_job", lambda *a, **k: False):
+            local_runner._run_compute_job(job, "https://api", "tok", active_jobs, lock,
+                                          capabilities=_bwrap_caps(), telemetry=telem)
+        ts, fails = telem.snapshot()
+        self.assertIsNone(ts)
+        self.assertEqual(fails, 0)
+
+    def test_image_downgrade_note_written_to_command_log(self):
+        """A container_image job that runs image-less under bwrap gets a diagnostic
+        NOTE in its OWN command_log (I10)."""
+        reports = []
+
+        def fake_report(orch, token, job_id, *, exec_status, exit_code=None,
+                        result_metrics=None, command_log=None):
+            reports.append({"exec_status": exec_status, "command_log": command_log})
+            return False
+
+        job = self._make_job(command="exit 0",
+                             container_image="nvcr.io/nvidia/pytorch:24.01")
+        active_jobs, lock = {"test-job-001"}, threading.Lock()
+        with patch.object(local_runner, "_report_compute_job", fake_report), \
+             patch.object(local_runner.iso, "plan_compute_execution", _bare_plan_factory()):
+            local_runner._run_compute_job(job, "https://api", "tok", active_jobs, lock,
+                                          capabilities=_bwrap_caps())
+
+        terminal = [r for r in reports if r["exec_status"] in ("succeeded", "failed")]
+        self.assertTrue(terminal)
+        self.assertEqual(terminal[-1]["exec_status"], "succeeded")
+        cl = terminal[-1]["command_log"]
+        self.assertIsNotNone(cl)
+        self.assertIn("nvcr.io/nvidia/pytorch:24.01", cl["text"])
+        self.assertIn("image-less on host toolchain", cl["text"])
+
+
+class TestHeartbeatTelemetryPayload(unittest.TestCase):
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_emits_all_four_telemetry_fields(self):
+        posted = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        telem = local_runner._TelemetryState()
+        telem.record_success()   # sets last_successful_job_at, failures=0
+        telem.record_failure()   # failures=1, timestamp preserved
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as ws:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value="/x/index.js"):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    telemetry=telem, workspace_root=ws,
+                )
+
+        body = posted[0]
+        # EXACT field names consumed by the parallel backend PR.
+        self.assertIn("last_successful_job_at", body)
+        self.assertIsInstance(body["last_successful_job_at"], str)
+        self.assertEqual(body["consecutive_job_failures"], 1)
+        self.assertIn("disk_free_bytes", body)
+        self.assertIsInstance(body["disk_free_bytes"], int)
+        self.assertIn("gpu_utilization_pct", body)
+        self.assertIsNone(body["gpu_utilization_pct"])  # has_gpu False → skipped/None
+
+    def test_defaults_when_no_telemetry(self):
+        posted = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False):
+            local_runner._heartbeat_loop(
+                "https://api", "tok", {}, threading.Lock(),
+                {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+            )
+
+        body = posted[0]
+        self.assertIsNone(body["last_successful_job_at"])
+        self.assertEqual(body["consecutive_job_failures"], 0)
+        self.assertIsNone(body["disk_free_bytes"])  # workspace_root None
+        self.assertIsNone(body["gpu_utilization_pct"])
+
+
+class TestHeartbeat401Streak(unittest.TestCase):
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_exits_after_consecutive_401_streak(self):
+        """A sustained 401 streak (revoked token) exits the process non-zero (N4)."""
+        exits = []
+
+        def fake_post(url, token, body, **kwargs):
+            return 401, None
+
+        # Patch os._exit so the streak detector doesn't kill the test process.
+        def fake_exit(code):
+            exits.append(code)
+            local_runner._shutdown_event.set()
+            raise SystemExit(code)  # unwind out of the loop in-test
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+             patch("os._exit", fake_exit), \
+             patch("time.sleep", lambda s: None):
+            with self.assertRaises(SystemExit):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", {}, threading.Lock(),
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    max_auth_failures=3,
+                )
+
+        self.assertEqual(exits, [1])
+
+    def test_no_exit_when_streak_resets(self):
+        """A 200 between 401s resets the streak — no exit."""
+        statuses = iter([401, 401, 200, 401])
+        exits = []
+
+        def fake_post(url, token, body, **kwargs):
+            try:
+                return next(statuses), None
+            except StopIteration:
+                local_runner._shutdown_event.set()
+                return 204, None
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False), \
+             patch("os._exit", lambda c: exits.append(c)), \
+             patch("time.sleep", lambda s: None):
+            local_runner._heartbeat_loop(
+                "https://api", "tok", {}, threading.Lock(),
+                {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                max_auth_failures=3,
+            )
+
+        self.assertEqual(exits, [], "streak reset by the 200 must not trigger an exit")
+
+
+class TestComputePollRetryAfter(unittest.TestCase):
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def test_429_honors_retry_after_header(self):
+        sleeps = []
+        calls = [0]
+
+        def fake_post(url, token, body, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                return 429, None, 7.0  # (status, body, retry_after)
+            local_runner._shutdown_event.set()
+            return 204, None, None
+
+        active_jobs, lock = set(), threading.Lock()
+        with patch.object(local_runner, "_post", fake_post), \
+             patch("time.sleep", lambda s: sleeps.append(s)):
+            local_runner._compute_poll_loop(
+                "https://api", "tok", active_jobs, lock, max_concurrent=2
+            )
+
+        self.assertIn(7.0, sleeps)
+
+    def test_429_without_header_uses_default_backoff(self):
+        sleeps = []
+        calls = [0]
+
+        def fake_post(url, token, body, **kwargs):
+            calls[0] += 1
+            if calls[0] == 1:
+                return 429, None, None  # no Retry-After
+            local_runner._shutdown_event.set()
+            return 204, None, None
+
+        active_jobs, lock = set(), threading.Lock()
+        with patch.object(local_runner, "_post", fake_post), \
+             patch("time.sleep", lambda s: sleeps.append(s)):
+            local_runner._compute_poll_loop(
+                "https://api", "tok", active_jobs, lock, max_concurrent=2
+            )
+
+        self.assertTrue(sleeps)  # backed off with a positive default
+        self.assertGreater(sleeps[0], 0)
+
+
+class TestPostRetryAfterHeader(unittest.TestCase):
+    def test_return_headers_parses_retry_after(self):
+        class _Resp:
+            status = 429
+            headers = {"Retry-After": "12"}
+
+            def read(self):
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        with patch("urllib.request.urlopen", return_value=_Resp()):
+            status, body, retry_after = local_runner._post(
+                "https://api/x", "tok", {}, return_headers=True
+            )
+        self.assertEqual(status, 429)
+        self.assertEqual(retry_after, 12.0)
+
+    def test_default_form_still_two_tuple(self):
+        class _Resp:
+            status = 200
+
+            def read(self):
+                return b"{}"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        with patch("urllib.request.urlopen", return_value=_Resp()):
+            result = local_runner._post("https://api/x", "tok", {})
+        self.assertEqual(len(result), 2)
+        self.assertEqual(result[0], 200)
 
 
 if __name__ == "__main__":
