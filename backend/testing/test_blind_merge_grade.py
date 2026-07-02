@@ -404,10 +404,8 @@ async def test_run_qualification_skips_merge_grade_when_goal_empty(db_session, m
 
 
 @pytest.mark.asyncio
-async def test_finalize_records_failing_merge_grade_without_blocking(
-    db_session, mocker
-):
-    """A failing merge-grade verdict is diagnostic only and does not block."""
+async def test_finalize_blocks_failing_merge_grade(db_session, mocker):
+    """A failing merge-grade verdict blocks promotion when the gate is armed."""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
@@ -432,11 +430,12 @@ async def test_finalize_records_failing_merge_grade_without_blocking(
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    assert result["status"] == "promoted"
-    promote_mock.assert_awaited_once()
-    call_kwargs = promote_mock.await_args.kwargs
-    assert call_kwargs["base_record"]["merge_grade_status"] == "fail"
-    assert call_kwargs["composite"]["blocker"] is None
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "merge_grade_misses"
+    promote_mock.assert_not_awaited()
+    lq = version.last_qualification
+    assert lq["merge_grade_status"] == "fail"
+    assert lq["blocker"] == "merge_grade_misses"
 
 
 @pytest.mark.asyncio
