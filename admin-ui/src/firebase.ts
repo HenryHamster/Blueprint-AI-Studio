@@ -106,7 +106,8 @@ export function onAuthChange(
   );
 }
 
-export async function signOut(_authArg?: Auth | null) {
+export async function signOut(authArg?: Auth | null) {
+  void authArg;
   if (!initializedAuth) return;
   return firebaseSignOut(initializedAuth);
 }

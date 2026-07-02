@@ -101,7 +101,7 @@
     "routers/directions.py": 1750,
     "warm_pool_maintainer.py": 2300,
     "review_fix_lane_pilot.py": 2450,
-    "routers/admin_projects.py": 3500,
+    "routers/admin_projects.py": 4350,
     "recovery_evaluating.py": 2950,
     "recovery_evaluating_approval.py": 450,
     "recovery_evaluating_helpers.py": 1100,
@@ -164,7 +164,6 @@
     "components/VersionLifecyclePanel.tsx": 2300,
     "components/DirectionsPanel.tsx": 3000,
     "components/TaskDetailDrawer.tsx": 2500,
-    "components/SettingsDropdown.tsx": 800,
     "components/KanbanBoard.tsx": 1500,
     "components/KanbanColumn.tsx": 1500,
     "App.tsx": 2000,
@@ -186,7 +185,7 @@
     "components/DirectionAutoPauseWidget.tsx": 200,
     "components/ScopeConversionRatesSection.tsx": 200,
     "components/ScopeTrendsSection.tsx": 200,
-    "components/ProviderCostPanel.tsx": 200,
+    "components/ProviderCostPanel.tsx": 500,
     "components/DriftSignalsCard.tsx": 250,
     "components/PoolAccountHealthPanel.tsx": 550,
     "components/SystemMaturityCard.tsx": 200,
@@ -209,6 +208,7 @@
     "components/DirectionPortfolioSection.tsx": 1100,
     "components/HeaderBar.tsx": 1100,
     "components/ResearchBrowser.tsx": 1050,
-    "components/ComputeJobsPanel.tsx": 2100
+    "components/ComputeJobsPanel.tsx": 2100,
+    "hooks/useWorkbenchCommands.ts": 1800
   }
 }

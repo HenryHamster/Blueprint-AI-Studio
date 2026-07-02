@@ -5,7 +5,7 @@ import {
   CreditCard,
   Cpu,
   Eye,
-  Infinity,
+  Infinity as InfinityIcon,
   LoaderCircle,
   MessageSquare,
   MonitorCog,
@@ -149,7 +149,7 @@ const MODE_OPTIONS: Array<{ value: StrategicInteractionMode; label: string; Icon
   { value: 'chat', label: 'Chat', Icon: MessageSquare },
   { value: 'check_in', label: 'Check-in', Icon: Clock3 },
   { value: 'monitor', label: 'Monitor', Icon: Eye },
-  { value: 'continuous', label: 'Workday', Icon: Infinity },
+  { value: 'continuous', label: 'Workday', Icon: InfinityIcon },
 ];
 
 const toneClasses: Record<Tone, { border: string; bg: string; icon: string; text: string; dot: string }> = {

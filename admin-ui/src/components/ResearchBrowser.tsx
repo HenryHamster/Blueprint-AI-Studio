@@ -299,14 +299,20 @@ export function ResearchBrowser({ tasks, selectedProjectId, onClose, onNavigateT
   const [expandedGroups, setExpandedGroups] = useState<Set<string> | null>(null);
   const [expandedFinding, setExpandedFinding] = useState<string | null>(null);
   const [directions, setDirections] = useState<Direction[]>([]);
-  const [directionFilter, setDirectionFilter] = useState<string | null>(initialDirectionId ?? null);
+  const routedDirectionId = initialDirectionId ?? null;
+  const [directionFilterState, setDirectionFilterState] = useState({
+    routedDirectionId,
+    value: routedDirectionId as string | null,
+  });
+  const directionFilter = directionFilterState.routedDirectionId === routedDirectionId
+    ? directionFilterState.value
+    : routedDirectionId;
+  const setDirectionFilter = useCallback((value: string | null) => {
+    setDirectionFilterState({ routedDirectionId, value });
+  }, [routedDirectionId]);
   const [recentFindings, setRecentFindings] = useState<RecentFindingsResponse | null>(null);
   const [qualityCardCollapsed, setQualityCardCollapsed] = useState(false);
   const [gradeFilter, setGradeFilter] = useState<'HIGH' | 'MEDIUM' | 'LOW' | null>(null);
-
-  useEffect(() => {
-    setDirectionFilter(initialDirectionId ?? null);
-  }, [initialDirectionId]);
 
   // Fetch recent findings with actionability grades for the quality card
   useEffect(() => {

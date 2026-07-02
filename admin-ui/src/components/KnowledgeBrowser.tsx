@@ -23,6 +23,18 @@ interface KnowledgeBrowserProps {
   initialDocumentId?: string;
 }
 
+interface KnowledgeQuery {
+  search: string;
+  topicFilter: string | null;
+  tagFilter: string | null;
+  directionFilter: string | null;
+  sourceKindFilter: string | null;
+  challengeStateFilter: string | null;
+  sweepFilter: string | null;
+  offset: number;
+  routedDirectionId: string | null;
+}
+
 function relativeDate(dateStr: string | null): string {
   if (!dateStr) return '';
   const diffMs = Date.now() - parseTimestamp(dateStr).getTime();
@@ -357,17 +369,22 @@ function ExportMarkdown({ body }: { body?: string }) {
 const PAGE_SIZE = 50;
 
 export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask, onLaunchWebResearchTask, initialDirectionId, initialDocumentId }: KnowledgeBrowserProps) {
-  const [query, setQuery] = useState({
+  const routedDirectionId = initialDirectionId ?? null;
+  const [query, setQuery] = useState<KnowledgeQuery>({
     search: '',
-    topicFilter: null as string | null,
-    tagFilter: null as string | null,
-    directionFilter: (initialDirectionId ?? null) as string | null,
-    sourceKindFilter: null as string | null,
-    challengeStateFilter: null as string | null,
-    sweepFilter: null as string | null,
+    topicFilter: null,
+    tagFilter: null,
+    directionFilter: routedDirectionId,
+    sourceKindFilter: null,
+    challengeStateFilter: null,
+    sweepFilter: null,
     offset: 0,
+    routedDirectionId,
   });
-  const { search, topicFilter, tagFilter, directionFilter, sourceKindFilter, challengeStateFilter, sweepFilter, offset } = query;
+  const effectiveQuery = query.routedDirectionId === routedDirectionId
+    ? query
+    : { ...query, directionFilter: routedDirectionId, offset: 0, routedDirectionId };
+  const { search, topicFilter, tagFilter, directionFilter, sourceKindFilter, challengeStateFilter, sweepFilter, offset } = effectiveQuery;
 
   const [docs, setDocs] = useState<KnowledgeDocument[]>([]);
   const [total, setTotal] = useState(0);
@@ -375,24 +392,25 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<KnowledgeDocument | null>(null);
 
-  useEffect(() => {
-    setQuery(prev => {
-      const nextDirection = initialDirectionId ?? null;
-      if (prev.directionFilter === nextDirection) return prev;
-      return { ...prev, directionFilter: nextDirection, offset: 0 };
-    });
-  }, [initialDirectionId]);
+  const syncRoute = useCallback((prev: KnowledgeQuery): KnowledgeQuery => (
+    prev.routedDirectionId === routedDirectionId
+      ? prev
+      : { ...prev, directionFilter: routedDirectionId, offset: 0, routedDirectionId }
+  ), [routedDirectionId]);
 
   const setFilter = useCallback(<K extends 'search' | 'topicFilter' | 'tagFilter' | 'directionFilter' | 'sourceKindFilter' | 'challengeStateFilter' | 'sweepFilter'>(
     key: K,
-    value: typeof query[K],
+    value: KnowledgeQuery[K],
   ) => {
-    setQuery(prev => ({ ...prev, [key]: value, offset: 0 }));
-  }, []);
+    setQuery(prev => ({ ...syncRoute(prev), [key]: value, offset: 0 }));
+  }, [syncRoute]);
 
   const loadMore = useCallback(() => {
-    setQuery(prev => ({ ...prev, offset: prev.offset + PAGE_SIZE }));
-  }, []);
+    setQuery(prev => {
+      const current = syncRoute(prev);
+      return { ...current, offset: current.offset + PAGE_SIZE };
+    });
+  }, [syncRoute]);
 
   // Debounced list/search fetch driven by backend full-text/tag/topic search.
   useEffect(() => {

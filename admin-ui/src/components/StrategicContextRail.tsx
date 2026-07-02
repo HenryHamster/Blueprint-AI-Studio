@@ -543,10 +543,58 @@ const TASK_FOCUS_SECTIONS: Array<{
   { key: 'recent_completed', label: 'Recent result', dot: 'bg-emerald-400', text: 'text-emerald-300', limit: 1 },
 ];
 
+type TaskFocusSectionConfig = (typeof TASK_FOCUS_SECTIONS)[number];
+
+interface RenderedTaskFocusSection {
+  section: TaskFocusSectionConfig;
+  bucket: StrategicStateTaskFocusBucket;
+  items: StrategicStateTaskFocusItem[];
+}
+
 function taskFocusBucket(focus: StrategicStateTaskFocus | null | undefined, key: TaskFocusBucketKey): StrategicStateTaskFocusBucket | null {
   const bucket = focus?.buckets?.[key];
   if (!bucket || bucket.total <= 0) return null;
   return bucket;
+}
+
+function buildTaskFocusSections(focus: StrategicStateTaskFocus | null | undefined): RenderedTaskFocusSection[] {
+  const renderedIds = new Set<string>();
+  let remainingRows = 4;
+  const takeItems = (bucket: StrategicStateTaskFocusBucket, limit: number): StrategicStateTaskFocusItem[] => {
+    if (remainingRows <= 0) return [];
+    const items = (bucket.items ?? [])
+      .filter(item => !renderedIds.has(item.id))
+      .slice(0, Math.min(limit, remainingRows));
+    items.forEach(item => renderedIds.add(item.id));
+    remainingRows -= items.length;
+    return items;
+  };
+
+  const liveSections = TASK_FOCUS_SECTIONS
+    .filter(section => section.key !== 'queued' && section.key !== 'recent_completed')
+    .map(section => {
+      const bucket = taskFocusBucket(focus, section.key);
+      if (!bucket) return null;
+      const items = takeItems(bucket, section.limit);
+      return { section, bucket, items };
+    })
+    .filter((entry): entry is RenderedTaskFocusSection => Boolean(entry && entry.items.length > 0));
+
+  if (liveSections.length > 0) return liveSections;
+
+  const queuedBucket = taskFocusBucket(focus, 'queued');
+  const queuedItems = queuedBucket ? takeItems(queuedBucket, 1) : [];
+  if (queuedBucket && queuedItems.length > 0) {
+    return [{ section: TASK_FOCUS_SECTIONS.find(section => section.key === 'queued')!, bucket: queuedBucket, items: queuedItems }];
+  }
+
+  const completedBucket = taskFocusBucket(focus, 'recent_completed');
+  const completedItems = completedBucket ? takeItems(completedBucket, 1) : [];
+  if (completedBucket && completedItems.length > 0) {
+    return [{ section: TASK_FOCUS_SECTIONS[TASK_FOCUS_SECTIONS.length - 1], bucket: completedBucket, items: completedItems }];
+  }
+
+  return [];
 }
 
 function taskFocusDetail(item: StrategicStateTaskFocusItem): string {
@@ -611,39 +659,7 @@ function TaskFocusBlock({
   focus?: StrategicStateTaskFocus | null;
   onOpenTask?: (taskId: string) => void;
 }) {
-  const renderedIds = new Set<string>();
-  let remainingRows = 4;
-  const takeItems = (bucket: StrategicStateTaskFocusBucket, limit: number): StrategicStateTaskFocusItem[] => {
-    if (remainingRows <= 0) return [];
-    const items = (bucket.items ?? [])
-      .filter(item => !renderedIds.has(item.id))
-      .slice(0, Math.min(limit, remainingRows));
-    items.forEach(item => renderedIds.add(item.id));
-    remainingRows -= items.length;
-    return items;
-  };
-  const liveSections = TASK_FOCUS_SECTIONS
-    .filter(section => section.key !== 'queued' && section.key !== 'recent_completed')
-    .map(section => {
-      const bucket = taskFocusBucket(focus, section.key);
-      if (!bucket) return null;
-      const items = takeItems(bucket, section.limit);
-      return { section, bucket, items };
-    })
-    .filter((entry): entry is { section: (typeof TASK_FOCUS_SECTIONS)[number]; bucket: StrategicStateTaskFocusBucket; items: StrategicStateTaskFocusItem[] } => Boolean(entry && entry.items.length > 0));
-  const queuedBucket = taskFocusBucket(focus, 'queued');
-  const queuedItems = queuedBucket && liveSections.length === 0 ? takeItems(queuedBucket, 1) : [];
-  const completedBucket = taskFocusBucket(focus, 'recent_completed');
-  const completedItems = completedBucket && liveSections.length === 0 && queuedItems.length === 0
-    ? takeItems(completedBucket, 1)
-    : [];
-  const sections = liveSections.length > 0
-    ? liveSections
-    : queuedBucket && queuedItems.length > 0
-      ? [{ section: TASK_FOCUS_SECTIONS.find(section => section.key === 'queued')!, bucket: queuedBucket, items: queuedItems }]
-    : completedBucket && completedItems.length > 0
-      ? [{ section: TASK_FOCUS_SECTIONS[TASK_FOCUS_SECTIONS.length - 1], bucket: completedBucket, items: completedItems }]
-      : [];
+  const sections = buildTaskFocusSections(focus);
   const visibleTotal = sections.reduce((sum, entry) => sum + entry.items.length, 0);
 
   if (sections.length === 0) return null;

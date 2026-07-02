@@ -11287,10 +11287,13 @@ class TestAcceptanceCriteriaRouter:
         assert list_resp.status_code == 200, list_resp.text
         summary = list_resp.json()
         assert summary == {
+            "release_version_id": summary["release_version_id"],
+            "version_number": 1,
             "total": 0,
             "covered": 0,
             "partial": 0,
             "uncovered": 0,
+            "stuck_count": 0,
             "criteria": [],
         }
 
@@ -11314,12 +11317,13 @@ class TestAcceptanceCriteriaRouter:
         assert summary["criteria"][0]["criterion_key"] == criterion_key
         assert summary["criteria"][0]["text"] == "Ship with zero P0 bugs"
 
-        patch_resp = await client.patch(
-            f"/api/admin/projects/{project.id}/directions/d-criteria/criterion-keys",
-            json={"criterion_keys": [criterion_key]},
+        patch_resp = await client.post(
+            f"/api/admin/projects/{project.id}/acceptance-criteria/link-direction",
+            json={"direction_key": "d-criteria", "criterion_keys": [criterion_key]},
         )
         assert patch_resp.status_code == 200, patch_resp.text
         assert patch_resp.json() == {
+            "status": "ok",
             "direction_key": "d-criteria",
             "criterion_keys": [criterion_key],
         }
@@ -11355,15 +11359,18 @@ class TestAcceptanceCriteriaRouter:
             f"/api/admin/projects/{project.id}/acceptance-criteria",
             json={"text": "   "},
         )
-        assert empty_resp.status_code == 400
+        assert empty_resp.status_code == 422
         assert "must not be empty" in empty_resp.text
 
-        bad_patch = await client.patch(
-            f"/api/admin/projects/{project.id}/directions/d-criteria-guards/criterion-keys",
-            json={"criterion_keys": ["c-not-a-real-key"]},
+        bad_patch = await client.post(
+            f"/api/admin/projects/{project.id}/acceptance-criteria/link-direction",
+            json={
+                "direction_key": "d-criteria-guards",
+                "criterion_keys": ["c-not-a-real-key"],
+            },
         )
-        assert bad_patch.status_code == 422
-        assert "Unknown criterion_key" in bad_patch.text
+        assert bad_patch.status_code == 400
+        assert "Unknown criterion keys" in bad_patch.text
 
         viewer_id = "viewer-ac-guard"
 
@@ -11386,9 +11393,9 @@ class TestAcceptanceCriteriaRouter:
             )
             assert forbidden_create.status_code == 403
 
-            forbidden_patch = await client.patch(
-                f"/api/admin/projects/{project.id}/directions/d-criteria-guards/criterion-keys",
-                json={"criterion_keys": []},
+            forbidden_patch = await client.post(
+                f"/api/admin/projects/{project.id}/acceptance-criteria/link-direction",
+                json={"direction_key": "d-criteria-guards", "criterion_keys": []},
             )
             assert forbidden_patch.status_code == 403
         finally:

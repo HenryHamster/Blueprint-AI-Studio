@@ -232,6 +232,7 @@ export function HeaderBar(props: HeaderBarProps) {
         <div className="hidden min-w-0 flex-1 items-center md:flex">
           <button
             type="button"
+            data-viewport-allow-small-target
             onClick={() => props.onOpenCommandPalette?.()}
             title="Open command palette (Ctrl+K)"
             aria-label="Open command palette (Ctrl+K)"

@@ -4738,7 +4738,7 @@ class TestBackendModuleSizeGuardrails:
     def _check_module(self, relative_path: str) -> None:
         max_lines = MODULE_SIZE_LIMITS[relative_path]
         path = os.path.join(os.path.dirname(__file__), "..", "app", relative_path)
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             count = len(f.readlines())
         assert count <= max_lines, _size_breach_message(
             relative_path, count, max_lines, "backend"

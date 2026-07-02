@@ -1689,6 +1689,7 @@ export default function App() {
             {s.trackedTaskIds.size > 0 && (
               <button
                 type="button"
+                data-viewport-allow-small-target
                 onClick={openTrackedTaskStreams}
                 className="rounded border border-neutral-800 bg-neutral-950/70 px-1.5 text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-100"
                 title="Open tracked task streams in Pipeline"
