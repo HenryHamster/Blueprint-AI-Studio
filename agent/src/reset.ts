@@ -13,8 +13,8 @@
 // Evidence in this repo:
 //   1. agent/src/index.ts:2299  — Claude Code is invoked as the bare CLI
 //      `command: 'claude'` (no CLAUDE_HOME / no --config-dir flag).
-//   2. agent/src/index.ts:2102  — `buildBaseCliEnv()` sets
-//      `HOME: process.env.HOME || '/home/agent'` for the subprocess; that
+//   2. providers/runners.ts:buildBaseCliEnv() sets
+//      `HOME: process.env.HOME || os.homedir()` for the subprocess; that
 //      is the home Claude Code resolves `~/.claude` against.
 //   3. agent/src/prompt.ts:34   — workspace-scoped settings live at
 //      `<WORKSPACE>/.claude/settings.json` (per-task tool restrictions).
@@ -248,7 +248,7 @@ export async function resetForNextRole(opts: ResetOptions): Promise<void> {
   // comment at top of file for path provenance.
   //
   // The wipe target MUST match the HOME the spawned Claude Code subprocess
-  // sees (index.ts:buildBaseCliEnv → `HOME: process.env.HOME || '/home/agent'`).
+  // sees (runners.ts:buildBaseCliEnv → `HOME: process.env.HOME || os.homedir()`).
   // os.homedir() can resolve via getpwuid() and disagree with the env-set
   // HOME (containers, sudo invocations, /etc/passwd mismatches), which would
   // mean we wipe the wrong directory and the next role inherits the prior

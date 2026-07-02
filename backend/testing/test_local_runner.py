@@ -16,11 +16,14 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlmodel import select
 
+from app import alert_dispatch
 from app import auth as auth_mod
 from app import compute_backends as compute_backends_mod
 from app import orchestrator as orch
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
 from app.models import (
+    Alert,
+    AlertSeverity,
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
@@ -33,7 +36,8 @@ from app.models import (
     _utcnow,
 )
 from app.messages_noise_prefs_store import get_messages_noise_prefs_row
-from app.routers.runner import _parse_multipart_form
+from app.routers.admin_runners import _runner_health
+from app.routers.runner import _parse_heartbeat_timestamp, _parse_multipart_form
 from app.task_capabilities import STRATEGIC_TASK_TYPES
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
@@ -221,6 +225,139 @@ async def test_locked_noise_prefs_read_refreshes_identity_mapped_row(db_session)
     assert refreshed is not None
     assert refreshed is first
     assert refreshed.prefs[WORKBENCH_STATE_KEY]["interaction_mode"] == "chat"
+
+
+# ── Runner health / trust telemetry (pure, no DB) ────────────────────────────
+
+
+def _health_runner(**kwargs) -> LocalRunner:
+    """In-memory LocalRunner for exercising _runner_health without a session."""
+    now = _utcnow()
+    caps = kwargs.pop("capabilities", {"task_types": "all", "max_concurrent": 2})
+    return LocalRunner(
+        project_id=uuid.uuid4(),
+        token_hash="x",
+        last_seen_at=kwargs.pop("last_seen_at", now - timedelta(seconds=30)),
+        capabilities=caps,
+        **kwargs,
+    )
+
+
+class TestRunnerHealthTrustTelemetry:
+    """The 'connected but failing' (degraded) false-green guard is pure logic."""
+
+    def test_healthy_live_runner_is_connected_not_degraded(self):
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=_utcnow() - timedelta(seconds=60),
+                consecutive_job_failures=0,
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "disk_free_bytes": 50 * 1024**3,
+                    "gpu_utilization_pct": 42,
+                },
+            )
+        )
+        assert h["device_status"] == "connected"
+        assert h["degraded"] is False
+        assert h["degraded_reason"] is None
+        assert h["consecutive_job_failures"] == 0
+        assert h["gpu_utilization_pct"] == 42
+        assert h["disk_low"] is False
+        assert h["seconds_since_last_success"] == 60
+
+    def test_failure_streak_marks_runner_degraded_but_still_live(self):
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=_utcnow() - timedelta(seconds=60),
+                consecutive_job_failures=3,
+            )
+        )
+        assert h["device_status"] == "degraded"
+        assert h["degraded"] is True
+        assert h["degraded_reason"] == "job_failure_streak"
+        # A degraded runner is still connected/live — slot accounting is unaffected.
+        assert h["is_live"] is True
+
+    def test_recent_success_resets_to_ready(self):
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=_utcnow(),
+                consecutive_job_failures=0,
+            )
+        )
+        assert h["device_status"] == "connected"
+        assert h["degraded"] is False
+
+    def test_stale_success_while_working_is_degraded(self):
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=_utcnow() - timedelta(seconds=4000),
+                consecutive_job_failures=1,
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "active_task_ids": ["t1"],
+                },
+            )
+        )
+        assert h["device_status"] == "degraded"
+        assert h["degraded_reason"] == "success_stale"
+
+    def test_fresh_runner_on_first_job_is_not_degraded(self):
+        # Active work, never succeeded, zero failures — legitimately churning,
+        # must NOT be mislabelled as failing.
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=None,
+                consecutive_job_failures=0,
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "active_task_ids": ["t1"],
+                },
+            )
+        )
+        assert h["device_status"] == "connected"
+        assert h["degraded"] is False
+
+    def test_failure_streak_on_stale_runner_stays_stale_not_degraded(self):
+        # Degraded is only computed for a LIVE runner; a stale heartbeat wins.
+        h = _runner_health(
+            _health_runner(
+                last_seen_at=_utcnow() - timedelta(minutes=9),
+                last_successful_job_at=None,
+                consecutive_job_failures=5,
+            )
+        )
+        assert h["device_status"] == "stale"
+        assert h["degraded"] is False
+
+    def test_low_disk_flagged_without_degrading(self):
+        h = _runner_health(
+            _health_runner(
+                consecutive_job_failures=0,
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "disk_free_bytes": 1 * 1024**3,
+                },
+            )
+        )
+        assert h["disk_low"] is True
+        assert h["disk_free_bytes"] == 1 * 1024**3
+        assert h["degraded"] is False
+
+
+def test_parse_heartbeat_timestamp_tolerates_bad_input():
+    assert _parse_heartbeat_timestamp(None) is None
+    assert _parse_heartbeat_timestamp("") is None
+    assert _parse_heartbeat_timestamp("not-a-date") is None
+    parsed = _parse_heartbeat_timestamp("2026-07-02T10:00:00Z")
+    assert parsed is not None and parsed.tzinfo is None  # normalized to naive UTC
+    # Offset is normalized to UTC (12:00+02:00 -> 10:00 naive UTC).
+    assert _parse_heartbeat_timestamp("2026-07-02T12:00:00+02:00") == parsed
 
 
 # ── Admin endpoints ──────────────────────────────────────────────────────────
@@ -770,6 +907,75 @@ class TestRunnerEndpoints:
         await db_session.refresh(runner)
         assert runner.last_seen_at > old_seen
         assert runner.capabilities["active_task_ids"] == ["abc", "def"]
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_persists_trust_telemetry(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        success_at = (_utcnow() - timedelta(minutes=1)).replace(microsecond=0)
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "last_successful_job_at": success_at.isoformat(),
+                "consecutive_job_failures": 4,
+                "disk_free_bytes": 12345678,
+                "gpu_utilization_pct": 77,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        # First-class columns.
+        assert runner.last_successful_job_at == success_at
+        assert runner.consecutive_job_failures == 4
+        # Display-only telemetry rides on capabilities.
+        assert runner.capabilities["disk_free_bytes"] == 12345678
+        assert runner.capabilities["gpu_utilization_pct"] == 77
+
+        # The runner is live but has a >= 3 failure streak -> degraded false-green.
+        list_resp = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert list_resp.status_code == 200
+        health = list_resp.json()[0]["health"]
+        assert health["device_status"] == "degraded"
+        assert health["degraded"] is True
+        assert health["consecutive_job_failures"] == 4
+        assert health["gpu_utilization_pct"] == 77
+
+        # A subsequent success (failures reset to 0) clears the degraded state.
+        resp2 = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "last_successful_job_at": _utcnow().isoformat(),
+                "consecutive_job_failures": 0,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp2.status_code == 200
+        list_resp2 = await client.get(f"/api/admin/projects/{project.id}/runners")
+        health2 = list_resp2.json()[0]["health"]
+        assert health2["device_status"] == "connected"
+        assert health2["degraded"] is False
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_tolerates_missing_trust_telemetry(
+        self, client: AsyncClient, db_session
+    ):
+        # Old runners omit the trust fields entirely — heartbeat must still succeed
+        # and leave the columns at their defaults.
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert runner.last_successful_job_at is None
+        assert runner.consecutive_job_failures == 0
 
     @pytest.mark.asyncio
     async def test_heartbeat_renews_pinned_strategic_continuation(
@@ -2458,6 +2664,273 @@ class TestOrchestratorRunnerRouting:
         await db_session.refresh(running)
         assert running.status == TaskStatus.PROVISIONING
         assert running.vm_instance_id == f"runner:{stale.id}"
+
+
+class TestRunnerDeathAlert:
+    """Runner-death alerting: the stale-runner sweep raises a deduplicated,
+    push-notified operator alert on active->inactive, and a heartbeat that
+    re-arms the runner resolves it. See app.alert_dispatch._maybe_create_
+    runner_deactivated_alert / _resolve_runner_deactivated_alert."""
+
+    async def _runner_alerts(self, db_session, project_id):
+        rows = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.event_type == "runner.deactivated",
+                )
+            )
+        ).scalars().all()
+        return list(rows)
+
+    @pytest.mark.asyncio
+    async def test_sweep_creates_warning_alert_for_idle_runner(self, db_session):
+        project = await _make_project(db_session)
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={"task_types": "all", "active_task_ids": []},
+        )
+        with patch(
+            "app.alert_dispatch.broadcast_to_project", new=AsyncMock()
+        ), patch(
+            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+        ) as webhook:
+            await orch._deactivate_stale_runners(db_session)
+
+        alerts = await self._runner_alerts(db_session, project.id)
+        assert len(alerts) == 1
+        alert = alerts[0]
+        assert alert.severity == AlertSeverity.WARNING
+        assert alert.domain == "core"
+        assert alert.dedupe_key == f"runner.deactivated:{idle.id}"
+        assert alert.dismissed_at is None
+        assert "went offline" in alert.title
+        # Webhook is pushed for the newly-created alert.
+        webhook.assert_awaited_once()
+        assert webhook.await_args.args[0] == "RUNNER_DEACTIVATED"
+
+    @pytest.mark.asyncio
+    async def test_sweep_creates_error_alert_for_runner_with_active_work(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        busy, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": ["a", "b"],
+                "active_compute_job_ids": ["j1"],
+            },
+        )
+        with patch(
+            "app.alert_dispatch.broadcast_to_project", new=AsyncMock()
+        ), patch("app.alert_dispatch._send_webhook_notification", new=AsyncMock()):
+            await orch._deactivate_stale_runners(db_session)
+
+        alerts = await self._runner_alerts(db_session, project.id)
+        assert len(alerts) == 1
+        alert = alerts[0]
+        assert alert.severity == AlertSeverity.ERROR
+        assert "mid-job" in alert.title
+        # 3 active work items (2 tasks + 1 compute job) reported in the message.
+        assert "3 active" in alert.message
+        assert str(busy.id)[:8] in alert.message
+
+    @pytest.mark.asyncio
+    async def test_sweep_alert_is_deduplicated(self, db_session):
+        # A repeated sweep over a still-dead runner must NOT create a second
+        # alert (dedupe_key upsert). We reset the runner to active+stale to force
+        # the sweep to re-select it, simulating re-entry without a recovery.
+        project = await _make_project(db_session)
+        stale, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+        )
+        with patch(
+            "app.alert_dispatch.broadcast_to_project", new=AsyncMock()
+        ), patch(
+            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+        ) as webhook:
+            await orch._deactivate_stale_runners(db_session)
+            # Force a re-selection: flip back to active but keep the heartbeat stale.
+            stale.status = "active"
+            stale.last_seen_at = _utcnow() - timedelta(minutes=10)
+            db_session.add(stale)
+            await db_session.commit()
+            await orch._deactivate_stale_runners(db_session)
+
+        alerts = await self._runner_alerts(db_session, project.id)
+        assert len(alerts) == 1
+        # Webhook pushed once (first creation only), not on the dedup re-entry.
+        webhook.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_resolves_open_alert(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            status="inactive",
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+        )
+        # Seed an open runner-death alert as the sweep would have.
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.WARNING,
+            title="Fleet runner went offline: runner x",
+            message="dead",
+            domain="core",
+            event_type="runner.deactivated",
+            dedupe_key=f"runner.deactivated:{runner.id}",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+
+        with patch("app.alert_dispatch.broadcast_to_project", new=AsyncMock()):
+            resp = await client.post(
+                "/api/runner/heartbeat",
+                json={"active_task_ids": []},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp.status_code == 200
+
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is not None
+        await db_session.refresh(runner)
+        assert runner.status == "active"
+
+    @pytest.mark.asyncio
+    async def test_resolve_is_noop_without_open_alert(self, db_session):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+        with patch("app.alert_dispatch.broadcast_to_project", new=AsyncMock()):
+            dismissed = await alert_dispatch._resolve_runner_deactivated_alert(
+                db_session, project.id, runner.id
+            )
+        assert dismissed == 0
+
+
+class TestDeadRunnerAttention:
+    """Item 4: a registered runner that is not-live surfaces in the operator
+    attention feed directly, independent of a pinned task. See
+    app.operator_attention._load_dead_runners / _dead_runner_attention_item."""
+
+    @pytest.mark.asyncio
+    async def test_idle_dead_runner_surfaces_as_watch(self, db_session):
+        from app.operator_attention import (
+            _dead_runner_attention_item,
+            _load_dead_runners,
+        )
+
+        project = await _make_project(db_session)
+        dead, _ = await _make_runner(
+            db_session,
+            project.id,
+            hostname="workstation",
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={"task_types": "all", "active_task_ids": []},
+        )
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        assert needs_op == 0
+        assert watch == 1
+        assert [r.id for r in runners] == [dead.id]
+        item = _dead_runner_attention_item(runners[0])
+        assert item["reason"] == "dead_runner"
+        assert item["severity"] == "watch"
+        assert item["runner_id"] == str(dead.id)
+        assert item["target"]["section"] == "devices"
+        assert item["target"]["runner_id"] == str(dead.id)
+
+    @pytest.mark.asyncio
+    async def test_midjob_dead_runner_surfaces_as_needs_operator(self, db_session):
+        from app.operator_attention import (
+            _dead_runner_attention_item,
+            _load_dead_runners,
+        )
+
+        project = await _make_project(db_session)
+        await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={"task_types": "all", "active_task_ids": ["running-task"]},
+        )
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        assert needs_op == 1
+        assert watch == 0
+        item = _dead_runner_attention_item(runners[0])
+        assert item["severity"] == "needs_operator"
+        assert item["label"] == "Fleet runner offline mid-job"
+
+    @pytest.mark.asyncio
+    async def test_live_and_booting_runners_excluded(self, db_session):
+        from app.operator_attention import _load_dead_runners
+
+        project = await _make_project(db_session)
+        await _make_runner(db_session, project.id, last_seen_at=_utcnow())  # live
+        # Never-heartbeated active runner: booting/just-registered, not a death.
+        await _make_runner(db_session, project.id, status="active", last_seen_at=None)
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        assert (needs_op, watch, runners) == (0, 0, [])
+
+    @pytest.mark.asyncio
+    async def test_runner_with_open_alert_is_excluded(self, db_session):
+        from app.operator_attention import _load_dead_runners
+
+        project = await _make_project(db_session)
+        dead, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+        )
+        db_session.add(
+            Alert(
+                project_id=project.id,
+                severity=AlertSeverity.WARNING,
+                title="Fleet runner went offline: x",
+                message="dead",
+                domain="core",
+                event_type="runner.deactivated",
+                dedupe_key=f"runner.deactivated:{dead.id}",
+            )
+        )
+        await db_session.commit()
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        # Covered by its open alert (which surfaces via the alert path) → excluded.
+        assert (needs_op, watch, runners) == (0, 0, [])
+
+    @pytest.mark.asyncio
+    async def test_runner_with_unpulled_pin_is_excluded(self, db_session):
+        from app.operator_attention import _load_dead_runners
+
+        project = await _make_project(db_session)
+        dead, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+        )
+        # Unpulled pin → covered by the stale_runner_pin item, not dead_runner.
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "compute_experiment"}],
+                status=TaskStatus.PROVISIONING,
+                started_at=None,
+                vm_instance_id=f"runner:{dead.id}",
+                vm_provisioned_at=_utcnow(),
+                context={"runner_target_id": str(dead.id)},
+            )
+        )
+        await db_session.commit()
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        assert (needs_op, watch, runners) == (0, 0, [])
 
 
 # ── Strategic-spawning local-runner availability signal ──────────────────────

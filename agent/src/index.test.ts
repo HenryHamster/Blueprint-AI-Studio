@@ -4221,6 +4221,81 @@ describe('bootstrapPoolMode', () => {
     expect(_getActiveCredentialStateSourceForTesting()).toBe('boot');
   });
 
+  it('re-anchors a backend-supplied ~/.claude.json under the ACTUAL $HOME (sandbox HOME=/home)', () => {
+    // Fleet-runner bwrap sandbox: fresh tmpfs HOME=/home, no host $HOME bind.
+    // The backend manifest still hardcodes the cloud-VM path
+    // /home/agent/.claude.json, but the Claude CLI reads ~/.claude.json from the
+    // live HOME (=/home). The write MUST be re-anchored to /home/.claude.json or
+    // auth fails.
+    const savedHome = process.env.HOME;
+    const savedVmId = process.env.VM_INSTANCE_ID;
+    try {
+      _resetCredentialStateForTesting();
+      process.env.HOME = '/home';
+      // Real (non-'local') VM id → the poisoned-VM presence guard is active; it
+      // must validate the RESOLVED location, so mark /home/.claude.json present.
+      process.env.VM_INSTANCE_ID = 'sandbox-vm';
+      vi.mocked(fs.existsSync).mockImplementation((p) => p === '/home/.claude.json');
+      vi.mocked(fs.writeFileSync).mockClear();
+
+      _materializeClaimCredentialStateForTesting({
+        env: {
+          PROVIDER: 'anthropic',
+          AUTH_MODE: 'oauth',
+          CLAUDE_CODE_OAUTH_TOKEN: 'sandbox-claude-token',
+        },
+        files: [
+          { path: '/home/agent/.claude.json', content: '{"hasCompletedOnboarding":true}', mode: '0600' },
+        ],
+        metadata: { retarget: true, provider: 'anthropic', auth_mode: 'oauth' },
+      }, 'test: sandbox-reanchor');
+
+      const writePaths = vi.mocked(fs.writeFileSync).mock.calls.map(c => c[0]);
+      // Written where the CLI actually reads it…
+      expect(vi.mocked(fs.writeFileSync).mock.calls).toEqual(expect.arrayContaining([
+        ['/home/.claude.json', '{"hasCompletedOnboarding":true}', expect.objectContaining({ mode: 0o600 })],
+      ]));
+      // …and NOT at the backend's hardcoded /home/agent path.
+      expect(writePaths).not.toContain('/home/agent/.claude.json');
+    } finally {
+      if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
+      if (savedVmId !== undefined) process.env.VM_INSTANCE_ID = savedVmId; else delete process.env.VM_INSTANCE_ID;
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      _resetCredentialStateForTesting();
+    }
+  });
+
+  it('keeps the cloud-VM path byte-identical when HOME=/home/agent (re-anchor is a no-op)', () => {
+    const savedHome = process.env.HOME;
+    const savedVmId = process.env.VM_INSTANCE_ID;
+    try {
+      _resetCredentialStateForTesting();
+      process.env.HOME = '/home/agent';
+      process.env.VM_INSTANCE_ID = 'local'; // bypass the presence guard; assert the write path only
+      vi.mocked(fs.writeFileSync).mockClear();
+
+      _materializeClaimCredentialStateForTesting({
+        env: {
+          PROVIDER: 'anthropic',
+          AUTH_MODE: 'oauth',
+          CLAUDE_CODE_OAUTH_TOKEN: 'vm-claude-token',
+        },
+        files: [
+          { path: '/home/agent/.claude.json', content: '{"hasCompletedOnboarding":true}', mode: '0600' },
+        ],
+        metadata: { retarget: true, provider: 'anthropic', auth_mode: 'oauth' },
+      }, 'test: vm-parity');
+
+      const writePaths = vi.mocked(fs.writeFileSync).mock.calls.map(c => c[0]);
+      expect(writePaths).toContain('/home/agent/.claude.json');
+      expect(writePaths).not.toContain('/home/.claude.json');
+    } finally {
+      if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
+      if (savedVmId !== undefined) process.env.VM_INSTANCE_ID = savedVmId; else delete process.env.VM_INSTANCE_ID;
+      _resetCredentialStateForTesting();
+    }
+  });
+
   it('fails hard on a malformed secret manifest instead of leaving prior credentials active', async () => {
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'boot-claude-token';
     refreshRuntimeState();
