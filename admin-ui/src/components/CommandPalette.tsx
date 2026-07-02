@@ -135,6 +135,12 @@ export function CommandPalette({
       .filter(({ command }) => !command.disabled);
     const next = boundary === 'first' ? enabledCommands[0] : enabledCommands.at(-1);
     if (!next) return;
+    if (focusCommand && next.index === resolvedActiveIndex) {
+      // Already at boundary — index won't change so the clearing effect won't re-run.
+      // Focus directly without arming the ref flag to avoid stranding it.
+      window.setTimeout(() => activeCommandRef.current?.focus(), 0);
+      return;
+    }
     if (focusCommand) focusActiveCommandRef.current = true;
     setActiveIndex(next.index);
     if (focusCommand && next.index === resolvedActiveIndex) {

@@ -69,12 +69,12 @@ describe('hardcoded branch-literal regression guard (agent)', () => {
     // Mirrors the defensive `expect(found.size).toBeGreaterThan(3)` idiom
     // in prompt-helper-refs.test.ts:53 — if the file walker / regex set
     // ever silently turns into a no-op, this fails immediately.
-    expect(scan!.files_scanned).toBeGreaterThan(5);
+    expect(scan?.files_scanned).toBeGreaterThan(5);
   });
 
   it.skipIf(!DEPS_PRESENT)('contains no un-allowlisted branch-decision literals', () => {
-    if (scan!.offenders.length > 0) {
-      const lines = scan!.offenders
+    if ((scan?.offenders.length ?? 0) > 0) {
+      const lines = (scan?.offenders ?? [])
         .map(o => `  ${o.path}:${o.line} [${o.pattern}]: ${o.snippet}`)
         .join('\n');
       throw new Error(
@@ -95,7 +95,7 @@ describe('hardcoded branch-literal regression guard (agent)', () => {
     // the allowlisted literal moves or disappears, this test surfaces the
     // stale entry so it gets cleaned up — rather than silently exempting
     // a different (potentially real) offender from the scan.
-    const stale = scan!.stale_allowlist.map(
+    const stale = (scan?.stale_allowlist ?? []).map(
       entry =>
         `  ${entry.path}:${entry.line} expected pattern [${entry.pattern}], ` +
         `found: ${entry.found}`,

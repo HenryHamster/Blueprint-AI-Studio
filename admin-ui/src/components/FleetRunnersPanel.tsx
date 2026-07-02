@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { Compass, Cpu, Copy, Check, RefreshCw, Trash2 } from 'lucide-react';
 import { listFleetRunners, registerFleetRunner, revokeFleetRunner } from '../api';
 import type { FleetRunner, FleetRunnerRegistrationResult } from '../api';
@@ -418,31 +418,48 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
     }
   };
 
-  const liveRunners = runners.filter(isRunnerLive);
-  const liveComputeRunners = liveRunners.filter(isComputeCapable);
-  const liveGpuRunners = liveRunners.filter(runner => runner.capabilities.has_gpu);
-  const liveStrategicRunners = liveRunners.filter(isStrategicRunner);
-  const liveRunnerReadiness = liveRunners.map(runner => runnerReadiness(runner, true, availableSlots(runner)));
-  const liveStrategicRunnerReadiness = liveStrategicRunners.map(runner => runnerReadiness(runner, true, availableSlots(runner)));
-  const readyRunners = liveRunnerReadiness.filter(readiness => readiness.ready).length;
-  const eligibleStrategicRunners = liveStrategicRunnerReadiness.filter(readiness => readiness.ready).length;
-  const failingRunners = liveRunners.filter(isRunnerDegraded).length;
-  const agentUnavailable = liveRunners.filter(runner => runner.health?.agent_available === false).length;
-  const strategicAgentUnavailable = liveStrategicRunners.filter(runner => runner.health?.agent_available === false).length;
-  const busyWork = liveRunners.reduce((sum, runner) => sum + activeWorkCount(runner), 0);
-  const maxSlots = liveRunners.reduce((sum, runner) => sum + (maxSlotsForRunner(runner) ?? 0), 0);
-  const slotValues = liveRunners.map(availableSlots);
-  const knownFreeSlots = slotValues.reduce<number>((sum, slots) => sum + (slots ?? 0), 0);
-  const hasUnknownSlots = slotValues.some(slots => slots == null);
-  const freeSlotsLabel = hasUnknownSlots ? `${knownFreeSlots}+ known` : `${knownFreeSlots} free`;
-  const gpuSlotValues = liveGpuRunners.map(availableSlots);
-  const knownGpuSlots = gpuSlotValues.reduce<number>((sum, slots) => sum + (slots ?? 0), 0);
-  const hasUnknownGpuSlots = gpuSlotValues.some(slots => slots == null);
-  const gpuCapacityLabel = liveGpuRunners.length === 0
-    ? 'offline'
-    : hasUnknownGpuSlots
-      ? `${liveGpuRunners.length} connected`
-      : `${knownGpuSlots} slots free`;
+  const { liveRunners, liveComputeRunners, liveGpuRunners, liveStrategicRunners } = useMemo(() => {
+    const live = runners.filter(isRunnerLive);
+    return {
+      liveRunners: live,
+      liveComputeRunners: live.filter(isComputeCapable),
+      liveGpuRunners: live.filter(runner => runner.capabilities.has_gpu),
+      liveStrategicRunners: live.filter(isStrategicRunner),
+    };
+  }, [runners]);
+
+  const { readyRunners, eligibleStrategicRunners } = useMemo(() => {
+    const readiness = liveRunners.map(runner => runnerReadiness(runner, true, availableSlots(runner)));
+    const strategicReadiness = liveStrategicRunners.map(runner => runnerReadiness(runner, true, availableSlots(runner)));
+    return {
+      readyRunners: readiness.filter(r => r.ready).length,
+      eligibleStrategicRunners: strategicReadiness.filter(r => r.ready).length,
+    };
+  }, [liveRunners, liveStrategicRunners]);
+
+  const { failingRunners, agentUnavailable, strategicAgentUnavailable, busyWork, maxSlots, knownFreeSlots, hasUnknownSlots, freeSlotsLabel, gpuCapacityLabel } = useMemo(() => {
+    const slotValues = liveRunners.map(availableSlots);
+    const knownFree = slotValues.reduce<number>((sum, slots) => sum + (slots ?? 0), 0);
+    const unknownSlots = slotValues.some(slots => slots == null);
+    const gpuSlotValues = liveGpuRunners.map(availableSlots);
+    const knownGpuSlots = gpuSlotValues.reduce<number>((sum, slots) => sum + (slots ?? 0), 0);
+    const unknownGpuSlots = gpuSlotValues.some(slots => slots == null);
+    return {
+      failingRunners: liveRunners.filter(isRunnerDegraded).length,
+      agentUnavailable: liveRunners.filter(runner => runner.health?.agent_available === false).length,
+      strategicAgentUnavailable: liveStrategicRunners.filter(runner => runner.health?.agent_available === false).length,
+      busyWork: liveRunners.reduce((sum, runner) => sum + activeWorkCount(runner), 0),
+      maxSlots: liveRunners.reduce((sum, runner) => sum + (maxSlotsForRunner(runner) ?? 0), 0),
+      knownFreeSlots: knownFree,
+      hasUnknownSlots: unknownSlots,
+      freeSlotsLabel: unknownSlots ? `${knownFree}+ known` : `${knownFree} free`,
+      gpuCapacityLabel: liveGpuRunners.length === 0
+        ? 'offline'
+        : unknownGpuSlots
+          ? `${liveGpuRunners.length} connected`
+          : `${knownGpuSlots} slots free`,
+    };
+  }, [liveRunners, liveGpuRunners, liveStrategicRunners]);
   const localOnlyBlocked = requireLocalRunner && !loading && liveComputeRunners.length === 0;
   const nextAction = (() => {
     if (loading) return null;

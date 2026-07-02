@@ -343,6 +343,40 @@ describe('CommandPalette', () => {
     expect(commands[0].run).not.toHaveBeenCalled();
   });
 
+  test('Home/End at boundary do not strand the focus flag on subsequent typing', async () => {
+    const user = userEvent.setup();
+    render(
+      <CommandPalette
+        open
+        commands={makeCommands()}
+        onClose={vi.fn()}
+      />,
+    );
+
+    const input = screen.getByLabelText('Search commands');
+    await waitFor(() => expect(input).toHaveFocus());
+
+    // Tab to first command then press Home — already at first, boundary no-op
+    await user.tab();
+    const firstCommand = screen.getByRole('button', { name: /Open task drawer/i });
+    expect(firstCommand).toHaveFocus();
+    await user.keyboard('{Home}');
+    expect(firstCommand).toHaveFocus();
+
+    // Tab to last command then press End — already at last, boundary no-op
+    await user.keyboard('{End}');
+    const lastCommand = screen.getByRole('button', { name: /Switch Strategic to Workday/i });
+    expect(lastCommand).toHaveFocus();
+    await user.keyboard('{End}');
+    expect(lastCommand).toHaveFocus();
+
+    // After the no-op End, typing in the input must NOT have focus stolen by the stranded flag
+    await user.click(input);
+    expect(input).toHaveFocus();
+    await user.type(input, 'r');
+    expect(input).toHaveFocus();
+  });
+
   test('contains key events so document shortcuts do not run behind the palette', async () => {
     const user = userEvent.setup();
     const onDocumentKeyDown = vi.fn();
