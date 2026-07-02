@@ -12,7 +12,10 @@ export function useAuth() {
 
   // Firebase auth state
   useEffect(() => {
-    const unsub = onAuthChange((u) => { setUser(u); setAuthLoading(false); });
+    const unsub = onAuthChange(
+      (u) => { setUser(u); setAuthLoading(false); },
+      (message) => { setError(message); setAuthLoading(false); },
+    );
     return unsub;
   }, []);
 

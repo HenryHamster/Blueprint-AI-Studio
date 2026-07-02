@@ -8,7 +8,7 @@ The rule for this file: after every major batch, update the status ledger, miles
 
 ## Status Ledger
 
-Overall implementation estimate: 95%.
+Overall implementation estimate: 98%.
 
 Legend:
 - Done: implemented, reviewed, tested, and pushed.
@@ -31,7 +31,7 @@ Legend:
 | M9. Unified event and message contracts | Done | Workbench event v1 envelope, websocket emitter/v1-producer inventory guards, backend-owned operator workbench fixture, frontend fixture consumption, canonical target/refetch vocabulary. | Keep fixtures and emitter inventory updated as read models evolve. |
 | M10. Visual system and UI polish | Done | Workbench theme tokens, shell/header/workspace token migration, compact Chat session control, lower-level token guard expansion, Pipeline duplicate task-open cleanup, mobile sideboard reachability coverage, and focused viewport assertions/capture review. | Keep token coverage current as lower-level panels are touched. |
 | M11. Background operator jobs | Planned | Existing compute jobs, runner jobs, orchestrator loops, command receipts. | Only build a real operator-job table if a concrete async operator command needs it. |
-| M12. Completion audit and hardening | Partial | Backend/frontend audit wave fixed Pipeline board sideboard loss, mobile sideboard context reachability, duplicate context/global task chrome, compact Chat Strategic controls, stale command affordances, browser rerouting, contract shape drift, malformed payload crashes, attention ordering, local continuation privacy, and lower-level visual token drift. Focused backend, frontend, viewport, and typecheck gates are green. | Run final localhost acceptance/capture pass; keep Research/Knowledge header placement until Project/contextual homes replace the visible findings badge. |
+| M12. Completion audit and hardening | Done | Backend/frontend audit wave plus final localhost acceptance fixed Pipeline board monitoring, mobile sideboard context reachability, duplicate controls, compact Chat Strategic controls, stale command affordances, browser rerouting, contract shape drift, malformed payload crashes, attention ordering, local continuation privacy, local auth bootstrap blanking, and viewport coverage drift. Full frontend, full viewport, typecheck, localhost smoke, and subagent re-review are green. | User acceptance on localhost; fix only concrete follow-up issues surfaced by use. |
 
 ## Operating Principles
 
@@ -353,7 +353,7 @@ Acceptance gates:
 
 ## M8. Operator Attention and Work-Session Read Model
 
-Status: Partial.
+Status: Done.
 
 Purpose: Give the operator a reliable "what needs me" and "what is happening now" model without forcing manual task management.
 
@@ -549,6 +549,10 @@ Completed in current audit batch:
 - Hid foreign local Strategic continuation owner identifiers from other operators while preserving durable ownership markers.
 - Aligned runner-alert dismiss command targets with Runtime Devices.
 - Canonicalized sideboard external links and `id`/`url` target fields.
+- Hardened local Firebase bootstrap so missing or placeholder Firebase config no longer blanks localhost; the sign-in shell now surfaces an explicit setup message, while `VITE_DASHBOARD_API_TOKEN` remains the local dashboard access path.
+- Removed duplicate Project Manage card actions now owned by the workspace header, and auto-scrolls the selected workbench tab into view so Runtime Settings stays visible on mobile.
+- Fixed Windows/local test harness drift for branch literal scanning and viewport-diff imports, then added viewport coverage for keyboard shortcuts and project alert-domain controls with documented exemptions for covered internal subcomponents.
+- Ran subagent review on auth bootstrap and UI acceptance; fixed the concrete findings and reran re-review with no issues found.
 
 Required audit checklist:
 - Active work:
@@ -607,6 +611,12 @@ Final verification gates:
   - integration-contract review
 
 Latest frontend audit gates:
+- `npm --prefix admin-ui run typecheck` -> passed.
+- `npm --prefix admin-ui test -- --run src/firebase.test.ts src/api.test.ts src/operatorWorkbenchContracts.test.ts src/App.wiring.test.ts` -> 34 tests passed.
+- `npm --prefix admin-ui test -- --run src/components/OperatorWorkspaces.test.tsx src/components/PipelineWorkspace.test.tsx src/components/StrategicContextWorkspace.test.tsx src/firebase.test.ts` -> 43 tests passed.
+- `npm --prefix admin-ui test -- --run` -> 161 test files, 3169 tests passed, 4 todo.
+- `npm --prefix admin-ui run test:viewport` -> coverage invariants passed; 139 viewport files, 635 viewport tests passed.
+- Playwright localhost smoke at `http://127.0.0.1:3001/` -> HTTP 200, title `Blueprint AI Studio`, no page errors, explicit Firebase setup message when local auth env is missing.
 - `npm --prefix admin-ui test -- --run src/components/MessagesPanel.test.tsx src/components/PipelineWorkspace.test.tsx src/components/StrategicContextRail.test.tsx src/test/workbench-theme-tokens.test.ts` -> 349 tests passed.
 - `..\node_modules\.bin\vitest.cmd run --config vitest.viewport.config.ts src/components/HeaderBar.viewport.test.tsx src/components/PipelineWorkspace.viewport.test.tsx src/components/MessagesPanel.viewport.test.tsx src/components/WorkbenchComposition.viewport.test.tsx src/components/StrategicContextRail.viewport.test.tsx` -> 51 viewport tests passed.
 - `npm --prefix admin-ui test -- --run src/strategicStateApi.test.ts src/operatorWorkbenchContracts.test.ts src/types/workbenchEvents.test.ts src/types/workbenchTargets.test.ts src/hooks/useWorkbenchCommands.test.tsx src/hooks/useStrategicContextNavigation.test.tsx src/components/MessagesPanel.test.tsx src/components/PipelineWorkspace.test.tsx src/components/TaskContextRail.test.tsx src/components/StrategicContextRail.test.tsx src/App.wiring.test.ts src/test/workbench-theme-tokens.test.ts` -> 440 tests passed.
@@ -617,15 +627,15 @@ Latest frontend audit gates:
 
 ## Next Batch Recommendation
 
-Recommended next implementation batch: run a final live localhost acceptance/capture pass, then fix only concrete issues found there.
+Recommended next implementation batch: no broad roadmap batch. Use localhost for operator acceptance and fix only concrete issues found during real use.
 
 Scope:
-1. Start the local workbench and capture/review the real Chat, Pipeline, Project, Runtime, context workspace, Findings journal, and Knowledge library surfaces.
-2. Fix only concrete acceptance findings: hidden composer, broken routing, duplicate controls, excessive header weight, unreadable mobile layouts, or invalid markup.
+1. Review Chat, Pipeline, Project, Runtime, context workspace, Findings journal, and Knowledge library in the running app.
+2. Fix only concrete acceptance findings: hidden composer, broken routing, duplicate controls, excessive header weight, unreadable mobile layouts, invalid markup, or missing operational data.
 3. Keep Findings journal and Knowledge library in HeaderBar until Project/contextual homes replace the visible pending-findings badge.
-4. Keep M7/M10 token and settings-home regression coverage current while lower-level panels change.
+4. Keep full frontend and viewport gates green for any follow-up polish.
 
-Reason: the highest-risk backend reliability gaps are now covered by contract and route regressions; remaining material progress is targeted IA/visual polish and any concrete issues surfaced by localhost usage.
+Reason: the required backend/frontend workbench systems are implemented and hardened. Remaining progress should be evidence-driven from actual operator use, not speculative new UI surface area.
 
 ## Update Log
 
@@ -643,3 +653,4 @@ Reason: the highest-risk backend reliability gaps are now covered by contract an
 | 2026-07-01 | M12 audit hardening | Fixed audit findings across Pipeline board monitoring, HeaderBar command/global-task affordances, context launcher duplication, archive scoping, backend contract drift, malformed payload handling, attention ordering/lifecycle coverage, continuation privacy, and sideboard target canonicalization. Gates: 133 backend tests, 440 frontend tests, 59 viewport tests, and `npm run typecheck`. |
 | 2026-07-01 | M12 visual/mobile polish | Expanded semantic token coverage, removed duplicate mobile shortcut drawer, prioritized Pipeline task context before stream details, added real-column mobile Board reachability coverage, cleaned artifact empty-state copy, and documented remaining medium IA decisions. Gates: 349 focused frontend tests, 51 viewport tests, 440 broader frontend tests, and `npm run typecheck`. |
 | 2026-07-02 | M12 IA polish | Compacted primary Chat Strategic controls, suppressed duplicate context-map artifact rendering in the workspace while preserving descriptor-only maps, flattened context list chrome, kept Findings/Knowledge header placement with command coverage, synced already-open browser route props, and fixed invalid nested Findings-row buttons. Gates: 173 focused tests, 47 viewport tests, 531 broader frontend tests, and `npm run typecheck`. |
+| 2026-07-02 | M12 final acceptance polish | Hardened localhost auth bootstrap, removed duplicate Project Manage actions, fixed mobile Runtime Settings tab visibility, repaired local full-suite harness drift, added missing viewport coverage, and completed subagent re-review. Gates: full frontend suite 3169 tests, full viewport suite 635 tests, `npm run typecheck`, and Playwright localhost smoke. |

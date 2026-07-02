@@ -33,11 +33,12 @@ interface ScanResult {
 }
 
 function runScanner(): ScanResult {
-  const result = spawnSync('python3', [SCANNER, '--surface', 'admin-ui', '--root', SRC_DIR, '--json'], {
+  const pythonCommand = process.platform === 'win32' ? 'python' : 'python3';
+  const result = spawnSync(pythonCommand, [SCANNER, '--surface', 'admin-ui', '--root', SRC_DIR, '--json'], {
     encoding: 'utf-8',
   });
   if (result.status !== 0) {
-    throw new Error(`branch literal scanner failed:\n${result.stderr}\n${result.stdout}`);
+    throw new Error(`branch literal scanner failed:\n${result.error ?? ''}\n${result.stderr}\n${result.stdout}`);
   }
   const parsed = JSON.parse(result.stdout) as unknown;
   if (!Array.isArray(parsed) || parsed.length !== 1) {

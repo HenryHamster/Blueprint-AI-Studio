@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 // @ts-check
 /**
  * viewport-diff.mjs — perceptual PNG differ for before/after viewport pairs.

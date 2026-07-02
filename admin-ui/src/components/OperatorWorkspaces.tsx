@@ -345,26 +345,6 @@ export function ProjectWorkspace({
                       </div>
                       {selectedProjectRepoLabel && <div className="mt-0.5 text-xs text-neutral-500">{selectedProjectRepoLabel}</div>}
                     </div>
-                    <div className="flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        onClick={onOpenProjectManagement}
-                        className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 px-3 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-800 sm:min-h-9"
-                      >
-                        <Wrench className="h-3.5 w-3.5" />
-                        Manage projects
-                      </button>
-                      {selectedProjectId && (
-                        <button
-                          type="button"
-                          onClick={onOpenProjectMembers}
-                          className="inline-flex min-h-11 items-center gap-1.5 rounded-md border border-neutral-700 px-3 text-xs font-medium text-neutral-200 transition-colors hover:bg-neutral-800 sm:min-h-9"
-                        >
-                          <Users className="h-3.5 w-3.5" />
-                          Members
-                        </button>
-                      )}
-                    </div>
                   </div>
                 </WorkbenchPanel>
 

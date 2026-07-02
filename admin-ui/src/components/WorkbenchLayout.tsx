@@ -1,3 +1,4 @@
+import { useEffect, useRef } from 'react';
 import type { ReactNode } from 'react';
 
 export interface WorkbenchTab<T extends string> {
@@ -41,6 +42,15 @@ export function WorkbenchSurface<T extends string>({
   contentClassName?: string;
 }) {
   const hasTabs = Boolean(tabs && tabs.length > 0);
+  const activeTabRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    activeTabRef.current?.scrollIntoView({
+      block: 'nearest',
+      inline: 'center',
+    });
+  }, [activeTab]);
+
   const tabStrip = hasTabs ? (
     <nav
       data-viewport-allow-overflow
@@ -55,6 +65,7 @@ export function WorkbenchSurface<T extends string>({
         return (
           <button
             key={tab.id}
+            ref={selected ? activeTabRef : undefined}
             type="button"
             disabled={tab.disabled}
             onClick={() => onTabChange?.(tab.id)}
