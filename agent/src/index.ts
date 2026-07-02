@@ -454,26 +454,68 @@ function agentHome(): string {
   return process.env.HOME || os.homedir();
 }
 
-// Managed provider credential/config files, under two distinct anchoring
-// regimes:
-//   - $HOME-relative — the provider CLI reads these from $HOME, so the WRITE
-//     path MUST follow HOME: ~/.claude.json (Claude Code onboarding-bypass file,
-//     without which the CLI dies in seconds) and ~/.gemini/settings.json.
-//   - install-dir-anchored — /opt/agent/openai/auth.json (pointed at by
-//     CODEX_HOME) and /opt/agent/gemini/sa.json (pointed at by
-//     GOOGLE_APPLICATION_CREDENTIALS). The backend manifest
-//     (build_agent_secret_manifest → providers/{openai,gemini}.py) sets BOTH the
-//     file path AND its pointing env var to these absolute /opt/agent paths, so
-//     they are NOT HOME-relative; this client-side list must mirror the server
-//     paths verbatim or the boot-credential snapshot would miss them.
+// Managed provider credential/config files fall under two anchoring regimes.
+//
+// (1) $HOME-relative — the provider CLI reads these from $HOME, so the WRITE
+//     path MUST track the live HOME. Held as canonical TAILS so a backend-
+//     supplied absolute path (baked for the cloud-VM image, e.g.
+//     /home/agent/.claude.json) can be re-anchored onto the agent's actual
+//     $HOME (resolveManagedCredentialWritePath) without hardcoding /home/agent:
+//       ~/.claude.json          — Claude Code onboarding-bypass file (the CLI
+//                                 dies in seconds without it)
+//       ~/.gemini/settings.json — Gemini CLI custom-alias settings
+const HOME_ANCHORED_CRED_SUBPATHS = ['.claude.json', '.gemini/settings.json'] as const;
+
+// (2) install-dir-anchored — /opt/agent/openai/auth.json (pointed at by
+//     CODEX_HOME) and /opt/agent/gemini/sa.json (GOOGLE_APPLICATION_CREDENTIALS).
+//     The backend manifest (build_agent_secret_manifest →
+//     providers/{openai,gemini}.py) sets BOTH the file path AND its pointing env
+//     var to these absolute /opt/agent paths, so they are NOT HOME-relative;
+//     this client-side mirror must match the server verbatim or the boot-
+//     credential snapshot would miss them. /opt/agent is bound READ-ONLY inside
+//     the fleet-runner sandbox, so a write here can legitimately fail there —
+//     materializeCredentialState treats it as best-effort.
+const INSTALL_DIR_ANCHORED_CRED_PATHS = [
+  '/opt/agent/openai/auth.json',
+  '/opt/agent/gemini/sa.json',
+] as const;
+
 function knownManagedCredentialFilePaths(): string[] {
   const home = agentHome();
   return [
-    `${home}/.claude.json`,
-    `${home}/.gemini/settings.json`,
-    '/opt/agent/openai/auth.json',
-    '/opt/agent/gemini/sa.json',
+    ...HOME_ANCHORED_CRED_SUBPATHS.map(sub => `${home}/${sub}`),
+    ...INSTALL_DIR_ANCHORED_CRED_PATHS,
   ];
+}
+
+// Map a backend-supplied managed-cred file path onto the agent's ACTUAL $HOME.
+// The backend manifest bakes absolute paths for the cloud-VM image
+// (HOME=/home/agent), but the provider CLI reads HOME-relative creds from the
+// LIVE $HOME — which is /home inside the fleet-runner bwrap sandbox (fresh
+// tmpfs, NO host $HOME bind). A HOME-relative managed cred (matched by canonical
+// tail) is re-anchored under agentHome(); every other path — including the
+// install-dir-anchored /opt/agent creds — is returned unchanged. On the cloud
+// VM this is a no-op (HOME=/home/agent → identical paths); in the sandbox it
+// redirects the write to where the CLI actually reads.
+function resolveManagedCredentialWritePath(manifestPath: string): string {
+  const home = agentHome();
+  for (const sub of HOME_ANCHORED_CRED_SUBPATHS) {
+    if (manifestPath.endsWith(`/${sub}`) || manifestPath === `${home}/${sub}`) {
+      return `${home}/${sub}`;
+    }
+  }
+  return manifestPath;
+}
+
+// /opt/agent is bound READ-ONLY inside the fleet-runner sandbox, so writing the
+// provider creds anchored there can fail. The anthropic/Claude path does NOT
+// depend on them, so materialization treats these writes as best-effort (log +
+// continue) instead of failing the whole role. Enabling openai/gemini on a
+// sandboxed runner needs a COORDINATED backend relocation of the file path AND
+// its pointing env var (CODEX_HOME / GOOGLE_APPLICATION_CREDENTIALS) out of
+// /opt/agent — deliberately NOT done agent-side.
+function isReadOnlyInstallDirCredPath(writePath: string): boolean {
+  return writePath.startsWith('/opt/agent/');
 }
 
 let bootCredentialSnapshot: MaterializedCredentialState | null = null;
@@ -537,14 +579,41 @@ function materializeCredentialState(
   source: 'boot' | 'retarget',
 ): void {
   clearManagedCredentialState();
+  const materializedPaths: string[] = [];
   for (const file of state.files) {
-    ensureParentDirectorySync(file.path);
-    writePrivateFileSync(file.path, file.content, file.mode);
+    // Re-anchor HOME-relative managed creds (~/.claude.json, ~/.gemini/settings.json)
+    // onto the LIVE $HOME so the write lands where the provider CLI reads it:
+    // identical to today on the cloud VM (HOME=/home/agent), redirected under
+    // /home inside the fleet-runner sandbox. Install-dir + non-managed paths are
+    // written at their manifest path unchanged.
+    const writePath = resolveManagedCredentialWritePath(file.path);
+    if (isReadOnlyInstallDirCredPath(writePath)) {
+      // /opt/agent is READ-ONLY inside the sandbox — this write may fail there.
+      // Best-effort: the Claude path works without these, so a failure must not
+      // sink the whole role. On the cloud VM the dir is agent-owned and the
+      // write always succeeds.
+      try {
+        ensureParentDirectorySync(writePath);
+        writePrivateFileSync(writePath, file.content, file.mode);
+        materializedPaths.push(writePath);
+      } catch (e) {
+        log(
+          `[cred] best-effort write of install-dir provider cred ${writePath} failed ` +
+          `(expected under a read-only sandbox bind; openai/gemini need a coordinated ` +
+          `backend relocation to run on a sandboxed runner): ` +
+          (e instanceof Error ? e.message : String(e)),
+        );
+      }
+      continue;
+    }
+    ensureParentDirectorySync(writePath);
+    writePrivateFileSync(writePath, file.content, file.mode);
+    materializedPaths.push(writePath);
   }
   for (const [key, value] of Object.entries(state.env)) {
     process.env[key] = value;
   }
-  lastMaterializedCredentialPaths = new Set(state.files.map(file => file.path));
+  lastMaterializedCredentialPaths = new Set(materializedPaths);
   activeCredentialStateSource = source;
   refreshRuntimeState();
   recordInitialOAuthAuthHash();
@@ -1575,7 +1644,12 @@ function defaultVerifyMaterialized(manifest: SecretManifest, envPath: string): s
 }
 
 function defaultClearStaleCreds(manifest: SecretManifest): Promise<void> {
-  return clearStaleProviderCredentials((manifest.files ?? []).map(f => f.path));
+  // Preserve the SAME resolved locations materializeCredentialState wrote, so
+  // the stale-clear never deletes the file the new account just materialized.
+  // No-op remap on the cloud VM (HOME=/home/agent → identical paths).
+  return clearStaleProviderCredentials(
+    (manifest.files ?? []).map(f => resolveManagedCredentialWritePath(f.path)),
+  );
 }
 
 async function defaultReexec(): Promise<never> {
