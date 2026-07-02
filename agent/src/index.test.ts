@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, _buildHeartbeatStatusForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, type SecretManifest, type FailureCategory } from './index.js';
 import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { jaccardSimilarity } from './utils/diff-detection.js';
 import {
@@ -6888,6 +6888,40 @@ describe('heartbeat 409 task-terminal detection', () => {
     // No curl terminal POST
     const curlCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'curl');
     expect(curlCall).toBeUndefined();
+  });
+});
+
+// ── Live tool-execution diagnostics in heartbeat status ─────────────────────
+describe('_buildHeartbeatStatusForTesting', () => {
+  it('returns plain status when no tool is in flight', () => {
+    const statusRef = { value: 'Codex thinking' };
+    expect(_buildHeartbeatStatusForTesting(statusRef, 1_000_000)).toBe('Codex thinking');
+  });
+
+  it('includes elapsed time in seconds when tool has been running under 60s', () => {
+    const now = 1_000_000;
+    const statusRef = { value: 'Using tool: Bash', toolStartedAt: now - 42_000, lastProgressAt: now - 5_000 };
+    const msg = _buildHeartbeatStatusForTesting(statusRef, now);
+    expect(msg).toBe('Using tool: Bash (42s elapsed, last sub-progress 5s ago)');
+  });
+
+  it('formats elapsed time as Xm Ys when tool has been running over 60s', () => {
+    const now = 1_000_000;
+    const statusRef = { value: 'Using tool: Bash', toolStartedAt: now - 252_000, lastProgressAt: now - 43_000 };
+    const msg = _buildHeartbeatStatusForTesting(statusRef, now);
+    expect(msg).toBe('Using tool: Bash (4m 12s elapsed, last sub-progress 43s ago)');
+  });
+
+  it('omits sub-progress clause when lastProgressAt is not set', () => {
+    const now = 1_000_000;
+    const statusRef = { value: 'Using tool: TodoWrite', toolStartedAt: now - 10_000 };
+    const msg = _buildHeartbeatStatusForTesting(statusRef, now);
+    expect(msg).toBe('Using tool: TodoWrite (10s elapsed)');
+  });
+
+  it('returns plain status once toolStartedAt is cleared (tool complete)', () => {
+    const statusRef = { value: 'Using tool: Bash', toolStartedAt: undefined, lastProgressAt: undefined };
+    expect(_buildHeartbeatStatusForTesting(statusRef, 1_000_000)).toBe('Using tool: Bash');
   });
 });
 

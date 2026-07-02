@@ -812,7 +812,7 @@ echo ""
   }
 }
 
-export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
+export async function runClaudeCode(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
   codexTurnCompleted?: boolean;
   stderrTail?: string;
@@ -823,7 +823,7 @@ export async function runClaudeCode(prompt: string, ws: WebSocket | null, status
   return runProviderAgent(prompt, ws, statusRef, model, effort, disallowedTools, enableCheckWatchdog);
 }
 
-export async function runProviderAgent(prompt: string, ws: WebSocket | null, statusRef: { value: string }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
+export async function runProviderAgent(prompt: string, ws: WebSocket | null, statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number }, model?: string, effort?: string, disallowedTools?: string[], enableCheckWatchdog?: boolean): Promise<{
   exitCode: number; allOutput: string; lastResultText: string;
   codexTurnCompleted?: boolean;
   stderrTail?: string;
@@ -906,7 +906,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
   // for those. Real work — a nested sub-agent event from a workflow/Task fan-out,
   // or a top-level content/tool event — passes isProgress=true.
   const noteToolProgress = (isProgress: boolean) => {
-    if (isProgress && toolInFlight) lastToolProgressAt = Date.now();
+    if (isProgress && toolInFlight) {
+      lastToolProgressAt = Date.now();
+      statusRef.lastProgressAt = Date.now();
+    }
   };
   let lastCheckOutputOffset = -1;
   let codexTurnCompleted = false;
@@ -1244,6 +1247,8 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                       workflowToolInFlight = isWorkflowToolName(strVal(block.name));
                       lastToolUseAt = Date.now();
                       lastToolProgressAt = Date.now();
+                      statusRef.toolStartedAt = Date.now();
+                      statusRef.lastProgressAt = Date.now();
                     }
                     if (enableCheckWatchdog && strVal(block.name) === 'Bash') {
                       const inputPreview = JSON.stringify(block.input ?? {}).slice(0, 200);
@@ -1313,6 +1318,8 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                 toolInFlight = false;
                 workflowToolInFlight = false;
                 lastToolProgressAt = null;
+                statusRef.toolStartedAt = undefined;
+                statusRef.lastProgressAt = undefined;
                 if (enableCheckWatchdog && lastCheckOutputOffset >= 0) {
                   const slice = allOutput.slice(lastCheckOutputOffset);
                   recordCheckOutcome(!/\[check\].*FAILED/.test(slice));
@@ -1480,6 +1487,8 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                   workflowToolInFlight = isWorkflowToolName(toolName);
                   lastToolUseAt = Date.now();
                   lastToolProgressAt = Date.now();
+                  statusRef.toolStartedAt = Date.now();
+                  statusRef.lastProgressAt = Date.now();
                   if (
                     enableCheckWatchdog
                     && toolName === 'Bash'
@@ -1491,6 +1500,8 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                   toolInFlight = false;
                   workflowToolInFlight = false;
                   lastToolProgressAt = null;
+                  statusRef.toolStartedAt = undefined;
+                  statusRef.lastProgressAt = undefined;
                   const status = item && typeof item.status === 'string' ? item.status : '';
                   sendLog(ws, `[tool: ${toolName}] ${status}\n`);
                 }
@@ -1542,7 +1553,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
       // signature. The no-progress watchdog is unaffected (it is suppressed
       // while toolInFlight) and a fresh top-level content event still resets
       // lastStreamEventAt for it in the JSON drain.
-      if (toolInFlight) lastToolProgressAt = Date.now();
+      if (toolInFlight) {
+        lastToolProgressAt = Date.now();
+        statusRef.lastProgressAt = Date.now();
+      }
       const text = data.toString();
       if (allOutput.length < MAX_OUTPUT_BYTES) allOutput += text;
       if (runCommand.outputMode === 'claude-stream-json') {

@@ -2219,6 +2219,36 @@ function stopHeartbeat() {
   heartbeatInFlightSince = 0;
 }
 
+/**
+ * Build the heartbeat status string from a statusRef, appending in-tool elapsed time
+ * and last-progress age when a tool is in flight.
+ */
+function buildHeartbeatStatus(
+  statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number },
+  now: number,
+): string {
+  const base = statusRef.value;
+  if (statusRef.toolStartedAt) {
+    const elapsedSec = Math.floor((now - statusRef.toolStartedAt) / 1000);
+    const elapsedStr = elapsedSec >= 60
+      ? `${Math.floor(elapsedSec / 60)}m ${elapsedSec % 60}s`
+      : `${elapsedSec}s`;
+    const progressPart = statusRef.lastProgressAt
+      ? `, last sub-progress ${Math.floor((now - statusRef.lastProgressAt) / 1000)}s ago`
+      : '';
+    return `${base} (${elapsedStr} elapsed${progressPart})`;
+  }
+  return base;
+}
+
+/** Test-only: build the heartbeat status string for a given statusRef and timestamp. */
+export function _buildHeartbeatStatusForTesting(
+  statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number },
+  now: number,
+): string {
+  return buildHeartbeatStatus(statusRef, now);
+}
+
 /** Test-only: drive the heartbeat loop without running main(). */
 export function _startHeartbeatForTesting(taskId: string, getMessage: () => string): void {
   startHeartbeat(taskId, getMessage);
@@ -3575,12 +3605,12 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
   const baseBranchForReset = resolveBaseBranch(payload, task).trim();
 
   // Start heartbeat & log stream
-  const statusRef = { value: 'Initializing...' };
+  const statusRef: { value: string; toolStartedAt?: number; lastProgressAt?: number } = { value: 'Initializing...' };
   // Pool mode may keep a startup heartbeat alive through completeStartup() and
   // the idempotent claim replay. Replace that timer with the normal per-role
   // heartbeat before the handler begins so only one task heartbeat remains.
   stopHeartbeat();
-  startHeartbeat(taskId, () => statusRef.value);
+  startHeartbeat(taskId, () => buildHeartbeatStatus(statusRef, Date.now()));
   scheduleProactiveTokenRefresh(AGENT_TOKEN);
   const ws = await connectLogStream(taskId);
   if (!ws) {
