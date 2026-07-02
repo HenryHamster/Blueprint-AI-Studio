@@ -3755,6 +3755,7 @@ class TestReclaimOrphanedLaneWorkspaces:
                 status="DEPLOYING",
             )
         )
+        await db_session.flush()
         lane = ImprovementLane(
             project_id=project_id,
             direction_id="d-reclaim-dry-run",

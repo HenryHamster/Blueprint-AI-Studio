@@ -41,4 +41,6 @@ async def agent_fetch_ci_compliance(
     compact = compact_ci_compliance(envelope.get("data"))
     if compact is None:
         return {"status": "success", "data": {"source": "unavailable"}}
+    if envelope.get("computed"):
+        await session.commit()
     return {"status": "success", "data": compact}

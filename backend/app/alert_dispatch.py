@@ -1006,10 +1006,10 @@ async def _maybe_create_pool_payoff_alert(
 
     Closes the loop on a *bounded* warm-pool enable: when the per-project payoff
     verdict transitions to ``COST_REGRESSION`` (idle-inclusive cost per merged PR
-    is materially above the pre-pool baseline) or to ``PROVEN`` with material
-    warm-start volume, the operator is alerted so the keep / widen / disable
-    decision is made without polling the warm-VM panel. DISTINCT from the silent,
-    cost-only, fleet-wide auto-drain guard (``warm_pool_maintainer``): that
+    is materially above the pre-pool baseline), the operator is alerted so the
+    keep / disable decision is made without polling the warm-VM panel. ``PROVEN``
+    remains a reader-facing payoff state, not a durable alert. DISTINCT from the
+    silent, cost-only, fleet-wide auto-drain guard (``warm_pool_maintainer``): that
     protects spend automatically; this informs a per-project strategic decision.
 
     The message carries the supporting numbers (pool hit rate, pool-origin

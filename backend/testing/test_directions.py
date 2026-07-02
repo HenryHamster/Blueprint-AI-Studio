@@ -9686,7 +9686,11 @@ async def test_add_direction_emits_strategic_updated(client: AsyncClient, mocker
     events = [c.args for c in bcast.await_args_list if c.args[1] == "strategic_updated"]
     assert len(events) == 1, "expected one strategic_updated broadcast"
     assert events[0][0] == str(project_id)
-    assert events[0][2] == {"kind": "directions"}
+    payload = events[0][2]
+    assert payload["kind"] == "directions"
+    assert payload["resource"] == "strategic_output"
+    assert payload["strategic"]["output_kind"] == "directions"
+    assert payload["refetch"]["surfaces"] == ["strategic_session", "directions"]
 
 
 @pytest.mark.asyncio
@@ -9701,7 +9705,11 @@ async def test_remove_direction_emits_strategic_updated(client: AsyncClient, moc
     assert resp.status_code == 200, resp.text
     events = [c.args for c in bcast.await_args_list if c.args[1] == "strategic_updated"]
     assert len(events) == 1
-    assert events[0][2] == {"kind": "directions"}
+    payload = events[0][2]
+    assert payload["kind"] == "directions"
+    assert payload["resource"] == "strategic_output"
+    assert payload["strategic"]["output_kind"] == "directions"
+    assert payload["refetch"]["surfaces"] == ["strategic_session", "directions"]
 
 
 @pytest.mark.asyncio

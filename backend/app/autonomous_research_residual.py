@@ -221,6 +221,7 @@ async def _spawn_residual_fingerprint_remediation(
     )
 
     now_dt = _utcnow()
+    recovered_any = False
     for fp, status, _ts, suspended_at, recovery_attempts in case_rows:
         if status != ResidualCaseStatus.SUSPENDED:
             continue
@@ -245,6 +246,7 @@ async def _spawn_residual_fingerprint_remediation(
         case_row.recovery_attempts = new_attempts
         case_row.updated_at = now_dt
         session.add(case_row)
+        recovered_any = True
         blocked_fingerprints.discard(fp)
         logger.info(
             "[AUTO REMEDIATION] Auto-recovering SUSPENDED fingerprint %s "
@@ -259,6 +261,8 @@ async def _spawn_residual_fingerprint_remediation(
             fingerprint=fp,
             recovery_attempts=new_attempts,
         )
+    if recovered_any:
+        await session.commit()
 
     # Project-wide concurrency cap. Count case rows currently in the
     # in-flight REMEDIATING state — independent of the CI auto-fix
@@ -590,6 +594,7 @@ async def _spawn_viewport_regression_remediation(
     )
 
     now_dt = _utcnow()
+    recovered_any = False
     for fp, status, _ts, suspended_at, recovery_attempts in case_rows:
         if status != ResidualCaseStatus.SUSPENDED:
             continue
@@ -613,6 +618,7 @@ async def _spawn_viewport_regression_remediation(
         case_row.recovery_attempts = new_attempts
         case_row.updated_at = now_dt
         session.add(case_row)
+        recovered_any = True
         blocked_fingerprints.discard(fp)
         logger.info(
             "[VIEWPORT REMEDIATION] Auto-recovering SUSPENDED fingerprint %s "
@@ -627,6 +633,8 @@ async def _spawn_viewport_regression_remediation(
             fingerprint=fp,
             recovery_attempts=new_attempts,
         )
+    if recovered_any:
+        await session.commit()
 
     # Project-wide concurrency cap (shared with CODE_ERROR lane; both write to the
     # same ResidualRemediationCase table so REMEDIATING rows from either lane count).

@@ -79,6 +79,10 @@ def _default_green_ci(mocker):
         new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
     )
     mocker.patch(
+        "app.release_qualifier._resolve_migration_identity_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch(
         "app.release_qualifier.run_migration_apply_gate",
         new=AsyncMock(return_value=("ok", None)),
     )

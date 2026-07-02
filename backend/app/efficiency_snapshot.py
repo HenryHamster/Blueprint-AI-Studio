@@ -762,10 +762,10 @@ POOL_PAYOFF_ORIGIN_SHARE_FLOOR = 0.10
 POOL_PAYOFF_MIN_POOL_DISPATCHES = 20
 POOL_PAYOFF_COST_TOLERANCE_PCT = 5.0
 
-# Minimum pool-origin warm starts before a PROVEN verdict is worth an operator
-# alert. PROVEN on only a couple of warm starts is statistically thin — wait for
-# material volume before recommending a wider scope. COST_REGRESSION has no such
-# floor: a cost regression on a bounded enable is actionable immediately.
+# Minimum pool-origin warm starts before a PROVEN verdict is treated as
+# materially supported in reader-facing summaries. PROVEN is useful history, but
+# it is not a durable operator alert; COST_REGRESSION remains the actionable
+# payoff transition.
 POOL_PAYOFF_PROVEN_MIN_WARM_STARTS = 5
 
 
@@ -3313,9 +3313,9 @@ async def maybe_alert_pool_payoff_transition(
     payoff verdict off the warm-VM panel. This per-project check — run every
     hourly snapshot tick, independent of the daily snapshot-write cadence — emits
     a deduplicated Alert when the verdict transitions to ``COST_REGRESSION``
-    (WARNING; recommend reducing the target or disabling) or to ``PROVEN`` with
-    material warm-start volume (INFO; recommend considering a wider scope), so the
-    keep / widen / disable decision is driven without polling.
+    (WARNING; recommend reducing the target or disabling), so the keep / widen /
+    disable decision is driven without polling. ``PROVEN`` remains visible in
+    payoff summaries but does not create a durable alert.
 
     Reuses the verdict synthesized by :func:`read_baseline_with_drift` (which
     folds in :func:`compute_pool_payoff_verdict`) rather than re-deriving
@@ -3346,16 +3346,10 @@ async def maybe_alert_pool_payoff_transition(
     supporting = dict(verdict.get("supporting") or {})
     recommended_action = verdict.get("recommended_action") or ""
 
-    # Decide alert-worthiness + severity. COST_REGRESSION always alerts; PROVEN
-    # only with material warm-start volume; NO_LIFT / INSUFFICIENT_DATA never.
+    # Decide alert-worthiness + severity. COST_REGRESSION alerts; PROVEN,
+    # NO_LIFT, and INSUFFICIENT_DATA remain dashboard/history states.
     if state == POOL_PAYOFF_COST_REGRESSION:
         severity = AlertSeverity.WARNING
-    elif (
-        state == POOL_PAYOFF_PROVEN
-        and int(supporting.get("pool_warm_starts") or 0)
-        >= POOL_PAYOFF_PROVEN_MIN_WARM_STARTS
-    ):
-        severity = AlertSeverity.INFO
     else:
         return None
 

@@ -6171,7 +6171,7 @@ def _ast_count_attr_assignments(app_dir: str, attr_name: str) -> dict[str, int]:
 
     counts: dict[str, int] = {}
     for py_file in globmod.glob(os.path.join(app_dir, "**", "*.py"), recursive=True):
-        with open(py_file) as fh:
+        with open(py_file, encoding="utf-8") as fh:
             source = fh.read()
         try:
             tree = ast.parse(source, filename=py_file)
@@ -6188,7 +6188,7 @@ def _ast_count_attr_assignments(app_dir: str, attr_name: str) -> dict[str, int]:
                         if isinstance(t, ast.Attribute) and t.attr == attr_name:
                             count += 1
         if count > 0:
-            rel = os.path.relpath(py_file, app_dir)
+            rel = os.path.relpath(py_file, app_dir).replace(os.sep, "/")
             counts[rel] = count
     return counts
 
@@ -6200,7 +6200,7 @@ def _file_contains_lock_pattern(file_path: str, patterns: list[str]) -> bool:
     Returns True if any pattern is found, False otherwise.
     """
     try:
-        with open(file_path) as f:
+        with open(file_path, encoding="utf-8") as f:
             source = f.read()
     except (IOError, OSError):
         return False

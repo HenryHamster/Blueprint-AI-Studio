@@ -585,6 +585,13 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     "verified_prs_merged": {
         "consumer": "verified_merged_count (this module), digest_metrics.py, strategic_spawning.py"
     },
+    "stranded_prs_merged": {
+        "consumer": (
+            "credit_gate_merged_count (this module), direction_metrics.py "
+            "(total_stranded_prs_merged), strategic_completion.py, "
+            "research_completion.py, research_direction_state.py"
+        )
+    },
     "reachable_prs_merged": {
         "consumer": "reachable_merged_count (this module), strategic_spawning.py (stat_entry reachable_prs_merged), strategic_payload_compaction.py (_compact_direction_summary_entry)"
     },

@@ -14,6 +14,7 @@ from app.project_message_projection import (
     legacy_direction_message_dict,
     message_preview_dict,
 )
+from testing.factories import make_task
 
 TEST_USER_ID = "test-user-123"
 
@@ -150,11 +151,20 @@ async def test_admin_messages_endpoint_keeps_full_message_contract(
     db_session,
 ):
     project = await _make_project(db_session)
+    task_id = uuid.UUID("44444444-4444-4444-8444-444444444444")
+    db_session.add(
+        make_task(
+            id=task_id,
+            project_id=project.id,
+            title="Message owner task",
+        )
+    )
+    await db_session.flush()
     msg = ProjectMessage(
         project_id=project.id,
         message_type=MessageType.BUG_REPORT,
         from_type="agent",
-        from_task_id=uuid.UUID("44444444-4444-4444-8444-444444444444"),
+        from_task_id=task_id,
         content="Full admin route contract",
         context=None,
         status="linked",

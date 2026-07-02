@@ -257,12 +257,13 @@ def _inventory_record(
 
 
 def build_websocket_event_inventory(app_dir: Path) -> list[dict[str, Any]]:
-    root = app_dir.parent.parent
+    app_dir = app_dir.resolve()
+    backend_root = app_dir.parent
     records: list[dict[str, Any]] = []
     for path in sorted(app_dir.rglob("*.py")):
         if "__pycache__" in path.parts:
             continue
-        source_path = path.relative_to(root).as_posix()
+        source_path = f"backend/{path.relative_to(backend_root).as_posix()}"
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         aliases = _import_aliases(tree)
         stack: list[ast.AST] = []

@@ -1043,6 +1043,116 @@ class TestSuspendedResidualCaseAutoRecovery:
         )
 
     @pytest.mark.asyncio
+    async def test_suspended_viewport_case_auto_recovers_after_cooldown(
+        self, session_factory, monkeypatch
+    ):
+        """Viewport SUSPENDED cases persist auto-recovery before cap return too."""
+        import time
+        from datetime import datetime, timezone, timedelta
+        from unittest.mock import AsyncMock
+
+        import app.autonomous_research as ar_mod
+        import app.database as db_mod
+        import app.notification_dispatch as nd_mod
+        from app.autonomous_research_residual import (
+            _spawn_viewport_regression_remediation,
+        )
+        from app.failure_residual import _viewport_residual_store
+        from app.models import Project, ResidualCaseStatus, ResidualRemediationCase
+        from sqlmodel import select
+
+        monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
+        monkeypatch.setattr(
+            nd_mod,
+            "post_residual_fix_auto_recovered_message",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            ar_mod,
+            "_project_spend_ceiling_spawn_defer_reason",
+            AsyncMock(return_value=None),
+        )
+
+        project_id = uuid.uuid4()
+        fp_suspended = "viewport:TaskCard:overflow"
+        now_epoch = time.time()
+
+        _viewport_residual_store.clear()
+        _viewport_residual_store[fp_suspended] = {
+            "count": 5,
+            "first_seen": now_epoch - 7200,
+            "last_seen": now_epoch,
+            "component": "TaskCard",
+            "assertion_type": "overflow",
+            "sample_message": "expectNoOverflowAt failed",
+            "task_ids": [],
+        }
+
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        suspended_at = now_naive - timedelta(hours=48)
+
+        async with session_factory() as session:
+            project = Project(
+                id=project_id,
+                name="Viewport Auto Recovery Test",
+                user_id="test-user",
+                autonomous_enabled=True,
+                directions=[],
+            )
+            session.add(project)
+            for i in range(2):
+                session.add(
+                    ResidualRemediationCase(
+                        project_id=project_id,
+                        fingerprint=f"viewport:Other:{i}",
+                        status=ResidualCaseStatus.REMEDIATING,
+                        hit_count=3,
+                        first_seen_at=now_naive,
+                        last_seen_at=now_naive,
+                        created_at=now_naive,
+                        updated_at=now_naive,
+                    )
+                )
+            session.add(
+                ResidualRemediationCase(
+                    project_id=project_id,
+                    fingerprint=fp_suspended,
+                    status=ResidualCaseStatus.SUSPENDED,
+                    suspended_at=suspended_at,
+                    recovery_attempts=0,
+                    hit_count=5,
+                    sample_message="expectNoOverflowAt failed",
+                    first_seen_at=suspended_at,
+                    last_seen_at=now_naive,
+                    created_at=suspended_at,
+                    updated_at=suspended_at,
+                )
+            )
+            await session.commit()
+            await session.refresh(project)
+
+            spawned = await _spawn_viewport_regression_remediation(project, session)
+
+        assert spawned == 0, "Concurrency cap should block viewport remediation spawn"
+
+        async with session_factory() as read_session:
+            recovered = (
+                await read_session.execute(
+                    select(ResidualRemediationCase).where(
+                        ResidualRemediationCase.project_id == project_id,
+                        ResidualRemediationCase.fingerprint == fp_suspended,
+                    )
+                )
+            ).scalar_one_or_none()
+
+        _viewport_residual_store.clear()
+
+        assert recovered is not None
+        assert recovered.status == ResidualCaseStatus.ACTIVE
+        assert recovered.suspended_at is None
+        assert recovered.recovery_attempts == 1
+
+    @pytest.mark.asyncio
     async def test_suspended_case_stays_blocked_within_cooldown(
         self, session_factory, monkeypatch
     ):

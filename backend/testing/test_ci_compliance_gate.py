@@ -77,6 +77,11 @@ async def _make_project_with_agent_task(db_session, *, module_line_count: int, m
         "get_file_text_at_ref",
         new=_fake_reader(module_line_count),
     )
+    mocker.patch.object(
+        ci_compliance.github,
+        "list_repo_tree_paths_at_ref",
+        new=mocker.AsyncMock(return_value=[]),
+    )
 
     project = Project(
         name="CI Compliance Gate",

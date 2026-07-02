@@ -288,6 +288,7 @@ async def resolve_selected_ref_descriptors(
                         Task.title,
                         Task.latest_status_message,
                         Task.status,
+                        raiseload=True,
                     )
                 )
                 .where(Task.project_id == project_id, Task.id.in_(task_ids))
@@ -321,6 +322,7 @@ async def resolve_selected_ref_descriptors(
                         ProjectMessage.message_type,
                         ProjectMessage.from_type,
                         ProjectMessage.status,
+                        raiseload=True,
                     )
                 )
                 .where(
@@ -359,6 +361,7 @@ async def resolve_selected_ref_descriptors(
                         Direction.text,
                         Direction.status,
                         Direction.priority,
+                        raiseload=True,
                     )
                 )
                 .where(
@@ -401,6 +404,7 @@ async def resolve_selected_ref_descriptors(
                         KnowledgeDocument.source_kind,
                         KnowledgeDocument.direction_id,
                         KnowledgeDocument.source_task_id,
+                        raiseload=True,
                     )
                 )
                 .where(
@@ -447,6 +451,7 @@ async def resolve_selected_ref_descriptors(
                         Artifact.artifact_type,
                         Artifact.logical_key,
                         Artifact.task_id,
+                        raiseload=True,
                     )
                 )
                 .join(Task, Artifact.task_id == Task.id)
@@ -648,6 +653,7 @@ async def load_strategic_context_evidence(
                     KnowledgeDocument.source_task_id,
                     KnowledgeDocument.created_at,
                     KnowledgeDocument.updated_at,
+                    raiseload=True,
                 )
             )
             .where(KnowledgeDocument.project_id == project_id)
@@ -696,6 +702,7 @@ async def load_strategic_context_evidence(
                     Artifact.storage_uri,
                     Artifact.logical_key,
                     Artifact.created_at,
+                    raiseload=True,
                 )
             )
             .join(Task, Artifact.task_id == Task.id)

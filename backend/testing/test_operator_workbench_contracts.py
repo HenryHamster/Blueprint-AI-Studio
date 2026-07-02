@@ -29,7 +29,6 @@ from app.workbench_state import STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY
 TEST_USER_ID = "test-user-123"
 FIXTURE_DIR = Path(__file__).parent / "__fixtures__"
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
-REPO_ROOT = BACKEND_ROOT.parent
 OPERATOR_WORKBENCH_FIXTURE_PATH = FIXTURE_DIR / "operator_workbench_contracts.json"
 
 
@@ -534,7 +533,7 @@ def test_websocket_emitter_inventory_covers_current_emitters():
     discovered_v1_producers = set()
     for path in (BACKEND_ROOT / "app").rglob("*.py"):
         text = path.read_text(encoding="utf-8")
-        rel_path = path.relative_to(REPO_ROOT).as_posix()
+        rel_path = f"backend/{path.relative_to(BACKEND_ROOT).as_posix()}"
         if "broadcast_to_project" in text or "send_json(" in text:
             discovered_emitters.add(rel_path)
         if rel_path != "backend/app/workbench_events.py" and (
