@@ -12,12 +12,20 @@ interface StrategicContextRefDescriptor {
   status?: string | null;
 }
 
+interface StrategicContextPackageSnapshotDescriptor {
+  id: string;
+  label?: string | null;
+  summary?: string | null;
+  status?: string | null;
+}
+
 export interface StrategicContextDescriptorModel {
   modeLabel: string;
   surfaceLabel: string;
   packageTitle?: string | null;
   contextLabel: string | null;
   contextTone: 'ready' | 'building' | 'stale' | 'neutral';
+  receiptLabel?: string | null;
   itemCount?: number | null;
   canvas?: {
     nodeCount: number;
@@ -34,6 +42,7 @@ type StrategicSessionLike = {
   session_started_at?: string | null;
   last_interaction_at?: string | null;
   context_package_id?: string | null;
+  context_package_descriptor?: StrategicContextPackageSnapshotDescriptor | null;
   selected_refs?: StrategicWorkbenchState['selected_refs'];
   selected_ref_descriptors?: Array<StrategicContextRefDescriptor>;
   captured_at?: string | null;
@@ -61,23 +70,56 @@ function surfaceLabel(surface?: string | null): string {
   return 'Strategic';
 }
 
+function isNonDefaultMode(mode?: string | null): boolean {
+  return Boolean(mode && mode !== 'chat');
+}
+
+function isNonDefaultSurface(surface?: string | null): boolean {
+  return Boolean(surface && surface !== 'strategic');
+}
+
 function fallbackRefLabel(kind: string, id: string, label?: string): string {
   if (label?.trim()) return label.trim();
   return `${kind.replace(/_/g, ' ')} ${id.slice(0, 8)}`;
 }
 
+function normalizedStatus(status?: string | null): string | null {
+  const normalized = status?.trim().toLowerCase();
+  return normalized || null;
+}
+
 function contextTone(status?: string | null): StrategicContextDescriptorModel['contextTone'] {
-  if (status === 'building') return 'building';
-  if (status === 'stale') return 'stale';
-  if (status === 'ready') return 'ready';
+  const normalized = normalizedStatus(status);
+  if (normalized === 'building') return 'building';
+  if (normalized === 'stale') return 'stale';
+  if (normalized === 'ready') return 'ready';
   return 'neutral';
 }
 
 function contextLabel(status?: string | null, hasContextPackage?: boolean): string | null {
-  if (status === 'building') return 'Building context';
-  if (status === 'stale') return 'Stale context';
-  if (status === 'ready') return 'Context ready';
+  const normalized = normalizedStatus(status);
+  if (normalized === 'building') return 'Building context';
+  if (normalized === 'stale') return 'Stale context';
+  if (normalized === 'ready') return 'Context ready';
   return hasContextPackage ? 'Context captured' : null;
+}
+
+function humanStatusLabel(status: string): string {
+  const label = status.replace(/[_-]+/g, ' ').trim();
+  return label ? label.charAt(0).toUpperCase() + label.slice(1) : 'Context';
+}
+
+function capturedContextLabel(status?: string | null): string | null {
+  const normalized = normalizedStatus(status);
+  if (!normalized || normalized === 'ready') return null;
+  if (normalized === 'building') return 'Building context';
+  if (normalized === 'stale') return 'Stale context';
+  if (normalized === 'actionable') return 'Actionable context';
+  return `${humanStatusLabel(normalized)} context`;
+}
+
+function isUsefulContextStatus(status?: string | null): boolean {
+  return capturedContextLabel(status) !== null;
 }
 
 export function isSessionStartedAtStale(session: StrategicSessionLike): boolean {
@@ -144,15 +186,32 @@ function buildDescriptor(
 }
 
 function hasCapturedStrategicSignal(session: StrategicSessionLike): boolean {
-  return Boolean(
-    session.context_package_id ||
-    (session.selected_refs?.length ?? 0) > 0 ||
-    session.interaction_mode && session.interaction_mode !== 'chat' ||
-    session.active_surface && session.active_surface !== 'strategic' ||
-    session.session_started_at ||
-    session.last_interaction_at ||
-    session.captured_at
+  const refs = buildRefs(session, session.selected_ref_descriptors);
+  const contextStatus = session.context_package_descriptor?.status;
+  const hasExplicitAttachment = Boolean(
+    session.context_package_descriptor?.summary ||
+    isUsefulContextStatus(contextStatus),
   );
+  return Boolean(
+    refs.length > 0 ||
+    isNonDefaultMode(session.interaction_mode) ||
+    isNonDefaultSurface(session.active_surface) ||
+    isUsefulContextStatus(contextStatus) ||
+    hasExplicitAttachment
+  );
+}
+
+function capturedReceiptLabel(
+  session: StrategicSessionLike,
+  refs: StrategicContextRefDescriptor[],
+  contextLabelValue: string | null,
+): string | null {
+  if (refs.length > 0) return 'Refs attached';
+  if (isNonDefaultSurface(session.active_surface)) return `${surfaceLabel(session.active_surface)} context`;
+  if (contextLabelValue) return contextLabelValue;
+  if (isNonDefaultMode(session.interaction_mode)) return `${modeLabel(session.interaction_mode)} context`;
+  if (session.context_package_descriptor?.summary) return 'Context attached';
+  return null;
 }
 
 function buildCapturedDescriptor(
@@ -160,12 +219,15 @@ function buildCapturedDescriptor(
 ): StrategicContextDescriptorModel | null {
   if (!hasCapturedStrategicSignal(session)) return null;
   const refs = buildRefs(session, session.selected_ref_descriptors);
+  const packageDescriptor = session.context_package_descriptor ?? null;
+  const label = capturedContextLabel(packageDescriptor?.status);
   return {
     modeLabel: modeLabel(session.interaction_mode),
     surfaceLabel: surfaceLabel(session.active_surface),
-    packageTitle: null,
-    contextLabel: contextLabel(null, Boolean(session.context_package_id)),
-    contextTone: 'neutral',
+    packageTitle: packageDescriptor?.label ?? null,
+    contextLabel: label,
+    contextTone: contextTone(packageDescriptor?.status),
+    receiptLabel: capturedReceiptLabel(session, refs, label),
     itemCount: null,
     canvas: null,
     refCount: refs.length,
@@ -246,6 +308,19 @@ function parseRefDescriptors(value: unknown): StrategicContextRefDescriptor[] {
   });
 }
 
+function parseContextPackageDescriptor(value: unknown): StrategicContextPackageSnapshotDescriptor | null {
+  const record = asRecord(value);
+  if (!record) return null;
+  const id = asString(record.id) ?? asString(record.context_package_id);
+  if (!id) return null;
+  return {
+    id,
+    label: asString(record.label) ?? asString(record.title),
+    summary: asString(record.summary),
+    status: asString(record.status),
+  };
+}
+
 export function buildMessageStrategicContextDescriptor(
   context: ProjectMessageContext,
 ): StrategicContextDescriptorModel | null {
@@ -257,6 +332,9 @@ export function buildMessageStrategicContextDescriptor(
     session_started_at: asString(snapshot.session_started_at),
     last_interaction_at: asString(snapshot.last_interaction_at),
     context_package_id: asString(snapshot.context_package_id),
+    context_package_descriptor: parseContextPackageDescriptor(
+      snapshot.context_package_descriptor ?? snapshot.context_package,
+    ),
     selected_refs: parseSelectedRefs(snapshot.selected_refs),
     selected_ref_descriptors: parseRefDescriptors(snapshot.selected_ref_descriptors),
     captured_at: asString(snapshot.captured_at),

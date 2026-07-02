@@ -779,22 +779,24 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).toContain('Persistent Strategic interaction');
     expect(host.textContent).toContain('Chat reload loses state');
     expect(host.textContent).toContain('Unblock the operator workbench');
-    expect(host.textContent).toContain('Strategic is consolidating operator chat state');
     expect(host.textContent).toContain('$3.50');
+    expect(host.textContent).toContain('Context package');
     expect(host.textContent).toContain('Workbench context package');
     expect(host.textContent).toContain('building');
     expect(host.textContent).toContain('32 items');
     expect(host.textContent).toContain('9 nodes / 8 links');
+    expect(host.textContent).toContain('3 refs');
+    expect(host.textContent).toContain('13 views');
     expect(host.textContent).toContain('Session context');
-    expect(host.textContent).toContain('Context map');
-    expect(host.textContent).toContain('Strategic context map');
     expect(host.textContent).toContain('Operator notes');
-    expect(host.textContent).toContain('operator-context-report');
-    expect(host.textContent).toContain('problem model 9');
+    expect(host.textContent).not.toContain('Strategic is consolidating operator chat state');
+    expect(host.textContent).not.toContain('Context map');
+    expect(host.textContent).not.toContain('operator-context-report');
+    expect(host.textContent).not.toContain('problem model 9');
     expect(host.textContent).toContain('Needs operator');
     expect(host.textContent).toContain('Question waiting');
     expect(host.textContent).toContain('new');
-    expect(host.textContent).toContain('linked messages');
+    expect(host.textContent).not.toContain('linked messages');
     expect(host.textContent).toContain('Task focus');
     expect(host.textContent).toContain('Needs judgment');
     expect(host.textContent).toContain('Review backend focus contract');
@@ -802,7 +804,8 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).not.toContain('Approval requested for the task focus projection.');
     expect(host.textContent).not.toContain('Strategic needs an operator decision before merging.');
     expect(host.textContent).toContain('Wire focus rows into the Strategic rail');
-    expect(host.textContent).toContain('Extract Pipeline workspace');
+    expect(host.textContent).toContain('Blocked runner registration check');
+    expect(host.textContent).not.toContain('Extract Pipeline workspace');
     expect(host.textContent?.match(/Review backend focus contract/g) ?? []).toHaveLength(1);
     expect(host.textContent).toContain('Local Strategic');
     expect(host.textContent).toContain('Running on runner 11111111');
@@ -821,9 +824,7 @@ describe('StrategicContextRail', () => {
     const { host, props } = mount({ onOpenRuntimeCompute, onOpenKnowledge, onOpenTask });
 
     const buttons = Array.from(host.querySelectorAll('button'));
-    buttons.find(button => button.textContent?.includes('Strategic context map'))?.click();
     buttons.find(button => button.textContent?.includes('Operator notes'))?.click();
-    buttons.find(button => button.textContent?.includes('operator-context-report'))?.click();
     buttons.find(button => button.textContent?.includes('Model'))?.click();
     buttons.find(button => button.textContent?.includes('Directions'))?.click();
     buttons.find(button => button.textContent?.trim() === 'Pipeline')?.click();
@@ -834,7 +835,6 @@ describe('StrategicContextRail', () => {
 
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('problem-model');
     expect(onOpenKnowledge).toHaveBeenCalledWith('kdoc-1', 'd-1');
-    expect(onOpenTask).toHaveBeenCalledWith('task-strat');
     expect(onOpenTask).toHaveBeenCalledWith('task-judgment');
     expect(props.onOpenProjectSection).toHaveBeenCalledWith('directions');
     expect(props.onOpenPipeline).toHaveBeenCalled();
@@ -901,7 +901,7 @@ describe('StrategicContextRail', () => {
     expect(onOpenRuntimeCompute).toHaveBeenCalled();
   });
 
-  test('keeps configured account caps as neutral detail in the rail', () => {
+  test('keeps healthy account spend out of the status stack while preserving Accounts navigation', () => {
     const onOpenAccounts = vi.fn();
     const { host } = mount({
       accountSpend: {
@@ -916,49 +916,64 @@ describe('StrategicContextRail', () => {
     });
 
     const accountStatus = host.querySelector('[data-testid="strategic-account-status"]');
-    expect(accountStatus?.textContent).toContain('available');
-    expect(accountStatus?.textContent).toContain('2/2 available');
-    expect(accountStatus?.textContent).toContain('2 with caps');
-    expect(accountStatus?.textContent).not.toContain('needs check');
-    expect(accountStatus?.textContent).not.toContain('$0.00');
-    const accountButton = accountStatus?.querySelector<HTMLButtonElement>('button[aria-label^="Open accounts: available"]');
+    expect(accountStatus).toBeNull();
+    expect(host.textContent).not.toContain('2 with caps');
+    expect(host.textContent).not.toContain('$0.00');
+    const accountButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.includes('Accounts'));
     expect(accountButton).toBeTruthy();
 
     accountButton?.click();
     expect(onOpenAccounts).toHaveBeenCalled();
   });
 
-  test('delegates context package targets to the canonical handler when provided', () => {
+  test('surfaces account problems in the status stack', () => {
+    const onOpenAccounts = vi.fn();
+    const { host } = mount({
+      accountSpend: {
+        totalAccounts: 2,
+        availableAccounts: 1,
+        enabledAccounts: 2,
+        cooldownAccounts: 1,
+        trackedSpendUsd: 12.5,
+        dailyCostCeilingUsd: 20,
+      },
+      onOpenAccounts,
+    });
+
+    const accountStatus = host.querySelector('[data-testid="strategic-account-status"]');
+    expect(accountStatus?.textContent).toContain('needs check');
+    expect(accountStatus?.textContent).toContain('1/2 available');
+    expect(accountStatus?.textContent).toContain('1 cooldown');
+
+    accountStatus?.querySelector<HTMLButtonElement>('button[aria-label^="Open accounts: needs check"]')?.click();
+    expect(onOpenAccounts).toHaveBeenCalled();
+  });
+
+  test('delegates selected session context targets to the canonical handler when provided', () => {
     const onOpenTarget = vi.fn();
     const { host, props } = mount({ onOpenTarget });
 
     const buttons = Array.from(host.querySelectorAll('button'));
-    buttons.find(button => button.textContent?.includes('Strategic context map'))?.click();
     buttons.find(button => button.textContent?.includes('Operator notes'))?.click();
-    buttons.find(button => button.textContent?.includes('operator-context-report'))?.click();
 
-    expect(onOpenTarget).toHaveBeenCalledWith({ surface: 'project', section: 'problem-model' });
     expect(onOpenTarget).toHaveBeenCalledWith({
       surface: 'knowledge',
       document_id: 'kdoc-1',
       direction_id: 'd-1',
       task_id: 'task-strat',
     });
-    expect(onOpenTarget).toHaveBeenCalledWith({
-      surface: 'task',
-      task_id: 'task-strat',
-      artifact_id: 'artifact-1',
-    });
+    expect(onOpenTarget).toHaveBeenCalledTimes(1);
     expect(props.onOpenProjectSection).not.toHaveBeenCalled();
     expect(props.onOpenPipeline).not.toHaveBeenCalled();
   });
 
-  test('renders the v1 strategic canvas and artifact descriptor matrix in the chat rail', () => {
-    const onOpenTarget = vi.fn();
-    const { host } = mount({ onOpenTarget });
+  test('keeps the v1 strategic canvas and artifact descriptor matrix out of the default chat rail', () => {
+    const { host } = mount();
 
-    expect(host.querySelector('[data-testid="strategic-chat-artifact-slot"]')).toBeTruthy();
-    expect(host.querySelector('[data-testid="strategic-chat-canvas-slot"]')).toBeTruthy();
+    expect(host.querySelector('[data-testid="strategic-context-package-summary"]')).toBeTruthy();
+    expect(host.querySelector('[data-testid="strategic-chat-artifact-slot"]')).toBeNull();
+    expect(host.querySelector('[data-testid="strategic-chat-canvas-slot"]')).toBeNull();
     [
       'context_map',
       'metric_cards',
@@ -974,25 +989,19 @@ describe('StrategicContextRail', () => {
       'resource_detail',
       'unsupported',
     ].forEach(kind => {
-      expect(host.querySelector(`[data-testid="strategic-context-descriptor-${kind}"]`)).toBeTruthy();
+      expect(host.querySelector(`[data-testid="strategic-context-descriptor-${kind}"]`)).toBeNull();
     });
-    expect(host.textContent).toContain('Canvas and artifacts');
-    expect(host.textContent).toContain('Context health');
-    expect(host.textContent).toContain('Read-only report');
-    expect(host.textContent).toContain('agent step completed');
-    expect(host.textContent).toContain('running');
-    expect(host.textContent).toContain('phase 2');
-    expect(host.textContent).toContain('Binary artifact preview is not supported in v1.');
-    expect(host.querySelector('img[alt="Operator context diagram"]')).toHaveAttribute(
-      'src',
-      'https://example.com/operator-context.png',
-    );
-
-    host.querySelector<HTMLButtonElement>('button[title="Open Strategic review task"]')?.click();
-    expect(onOpenTarget).toHaveBeenCalledWith({ surface: 'task', task_id: 'task-strat' });
+    expect(host.textContent).toContain('13 views');
+    expect(host.textContent).not.toContain('Canvas and artifacts');
+    expect(host.textContent).not.toContain('Context health');
+    expect(host.textContent).not.toContain('Read-only report');
+    expect(host.textContent).not.toContain('agent step completed');
+    expect(host.textContent).not.toContain('phase 2');
+    expect(host.textContent).not.toContain('Binary artifact preview is not supported in v1.');
+    expect(host.querySelector('img[alt="Operator context diagram"]')).toBeNull();
   });
 
-  test('renders the backend v1 strategic context package fixture shape', () => {
+  test('summarizes the backend v1 strategic context package fixture shape', () => {
     const { host } = mount({
       state: {
         ...STATE,
@@ -1015,18 +1024,19 @@ describe('StrategicContextRail', () => {
       'resource_detail',
       'unsupported',
     ].forEach(kind => {
-      expect(host.querySelector(`[data-testid="strategic-context-descriptor-${kind}"]`)).toBeTruthy();
+      expect(host.querySelector(`[data-testid="strategic-context-descriptor-${kind}"]`)).toBeNull();
     });
     expect(host.textContent).toContain('Operator workbench context');
-    expect(host.textContent).toContain('Binary artifact preview is not supported in v1.');
-    expect(host.querySelector('img[alt="Operator context diagram"]')).toBeTruthy();
+    expect(host.querySelector('[data-testid="strategic-context-package-summary"]')).toBeTruthy();
+    expect(host.textContent).not.toContain('Binary artifact preview is not supported in v1.');
+    expect(host.querySelector('img[alt="Operator context diagram"]')).toBeNull();
   });
 
-  test('fallback context resource routing preserves message target intent', () => {
+  test('hides raw context resources from the default rail even when they have message targets', () => {
     const contextPackage = STATE.context_package;
     if (!contextPackage) throw new Error('Expected fixture context package');
     const onOpenMessages = vi.fn();
-    const { host, props } = mount({
+    const { host } = mount({
       onOpenMessages,
       state: {
         ...STATE,
@@ -1046,15 +1056,12 @@ describe('StrategicContextRail', () => {
       },
     });
 
-    Array.from(host.querySelectorAll('button'))
-      .find(button => button.textContent?.includes('Operator follow-up thread'))
-      ?.click();
-
-    expect(onOpenMessages).toHaveBeenCalledWith({ messageId: 'msg-resource', action: 'highlight' });
-    expect(props.onOpenPipeline).not.toHaveBeenCalled();
+    expect(host.textContent).not.toContain('Operator follow-up thread');
+    expect(host.querySelector('[data-testid="strategic-context-resources"]')).toBeNull();
+    expect(onOpenMessages).not.toHaveBeenCalled();
   });
 
-  test('does not delegate context resources without targets', () => {
+  test('hides unrouted context resources from the default rail', () => {
     const contextPackage = STATE.context_package;
     if (!contextPackage) throw new Error('Expected fixture context package');
     const onOpenTarget = vi.fn();
@@ -1077,55 +1084,27 @@ describe('StrategicContextRail', () => {
       },
     });
 
-    const resourceButton = Array.from(host.querySelectorAll('button'))
-      .find(button => button.textContent?.includes('Unrouted context report'));
-    expect(resourceButton).toBeTruthy();
-    expect(resourceButton?.disabled).toBe(true);
-    expect(resourceButton?.title).toBe('Unrouted context report');
-    resourceButton?.click();
+    expect(host.textContent).not.toContain('Unrouted context report');
+    expect(host.querySelector('[data-testid="strategic-context-resources"]')).toBeNull();
 
     expect(onOpenTarget).not.toHaveBeenCalled();
     expect(props.onOpenPipeline).not.toHaveBeenCalled();
     expect(props.onOpenProjectSection).not.toHaveBeenCalled();
   });
 
-  test('applies Strategic session ref updates against the latest workbench state', () => {
+  test('applies Strategic session ref removals against the latest workbench state', () => {
     const baseWorkbench = STATE.workbench;
     if (!baseWorkbench) throw new Error('Expected fixture workbench state');
-    let currentRefs: SessionRefs = [...baseWorkbench.selected_refs];
+    let currentRefs: SessionRefs = [
+      ...baseWorkbench.selected_refs,
+      { kind: 'canvas', id: 'strategic-canvas:proj-1', label: 'Strategic context map' },
+      { kind: 'artifact', id: 'artifact:artifact-1', label: 'operator-context-report' },
+    ];
     const updates: SessionRefs[] = [];
     const onUpdateSessionRefs = vi.fn((updateRefs: (refs: SessionRefs) => SessionRefs) => {
       currentRefs = updateRefs(currentRefs);
       updates.push(currentRefs);
     });
-    const firstMount = mount({ onUpdateSessionRefs });
-
-    let buttons = Array.from(firstMount.host.querySelectorAll('button'));
-    const keepCanvas = buttons.find(button => button.title === 'Keep Strategic context map in session context');
-    const keepArtifact = buttons.find(button => button.title === 'Keep operator-context-report in session context');
-    if (!keepCanvas || !keepArtifact) throw new Error('Expected keep actions for context refs');
-    expect(keepCanvas.getAttribute('aria-label')).toBe('Keep Strategic context map in session context');
-    keepCanvas.click();
-    keepArtifact.click();
-
-    expect(updates).toEqual([
-      [
-        { kind: 'canvas', id: 'strategic-canvas:proj-1', label: 'Strategic context map' },
-        { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
-      ],
-      [
-        { kind: 'artifact', id: 'artifact:artifact-1', label: 'operator-context-report' },
-        { kind: 'canvas', id: 'strategic-canvas:proj-1', label: 'Strategic context map' },
-        { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
-      ],
-    ]);
-    expect(onUpdateSessionRefs).toHaveBeenCalledTimes(2);
-
-    act(() => { root?.unmount(); });
-    root = null;
-    host?.remove();
-    host = null;
-
     const withSelectedRefs = {
       ...baseWorkbench,
       selected_refs: currentRefs,
@@ -1133,21 +1112,31 @@ describe('StrategicContextRail', () => {
     const mounted = mount({ onUpdateSessionRefs, workbenchState: withSelectedRefs });
 
     expect(mounted.host.textContent).toContain('Strategic context map');
-    buttons = Array.from(mounted.host.querySelectorAll('button'));
-    const removeCanvas = buttons.find(button => button.title === 'Remove Strategic context map from session context');
-    const removeKnowledge = buttons.find(button => button.title === 'Remove Operator notes from session context');
+    expect(mounted.host.textContent).toContain('operator-context-report');
+    const buttons = Array.from(mounted.host.querySelectorAll('button'));
+    const removeCanvas = buttons.find(button => button.title === 'Stop keeping Strategic context map in session context');
+    const removeKnowledge = buttons.find(button => button.title === 'Stop keeping Operator notes in session context');
     if (!removeCanvas || !removeKnowledge) throw new Error('Expected remove actions for selected refs');
-    expect(removeCanvas.getAttribute('aria-label')).toBe('Remove Strategic context map from session context');
+    expect(removeCanvas.getAttribute('aria-label')).toBe('Stop keeping Strategic context map in session context');
     removeCanvas.click();
     removeKnowledge.click();
 
+    expect(updates).toEqual([
+      [
+        { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
+        { kind: 'artifact', id: 'artifact:artifact-1', label: 'operator-context-report' },
+      ],
+      [
+        { kind: 'artifact', id: 'artifact:artifact-1', label: 'operator-context-report' },
+      ],
+    ]);
     expect(updates.at(-1)).toEqual([
       { kind: 'artifact', id: 'artifact:artifact-1', label: 'operator-context-report' },
     ]);
-    expect(onUpdateSessionRefs).toHaveBeenCalledTimes(4);
+    expect(onUpdateSessionRefs).toHaveBeenCalledTimes(2);
   });
 
-  test('shows recent terminal compute results without requiring an active job', () => {
+  test('keeps recent terminal compute results out of the default rail without an active job', () => {
     const terminalOnlyState: StrategicStateResponse = {
       ...STATE,
       runtime: {
@@ -1205,10 +1194,11 @@ describe('StrategicContextRail', () => {
     };
     const { host } = mount({ state: terminalOnlyState });
 
-    expect(host.textContent).toContain('Runtime work');
-    expect(host.textContent).toContain('recent result');
-    expect(host.textContent).toContain('1 recent compute result');
-    expect(host.textContent).toContain('Compare embeddings');
+    expect(host.textContent).not.toContain('Runtime work');
+    expect(host.textContent).not.toContain('recent result');
+    expect(host.textContent).not.toContain('1 recent compute result');
+    expect(host.textContent).not.toContain('Compare embeddings');
+    expect(Array.from(host.querySelectorAll('button')).some(button => button.textContent?.includes('Runtime'))).toBe(true);
   });
 
   test('surfaces local runner holds as runtime work needing attention', () => {
@@ -1318,7 +1308,8 @@ describe('StrategicContextRail', () => {
     const { host } = mount({ state: { ...STATE, context_package: null } });
 
     expect(host.textContent).not.toContain('Workbench context package');
-    expect(host.textContent).toContain('Running update');
+    expect(host.textContent).not.toContain('Context package');
+    expect(host.textContent).toContain('Unblock the operator workbench');
   });
 
   test('attention items drill into existing surfaces', () => {
@@ -1582,7 +1573,7 @@ describe('StrategicContextRail', () => {
     expect(props.onOpenPipeline).not.toHaveBeenCalled();
   });
 
-  test('renders recent work session flow and routes event targets', () => {
+  test('renders warning work session signals and routes event targets', () => {
     const onOpenMessages = vi.fn();
     const { host, props } = mount({
       state: stateWithWorkSessionEvents([
@@ -1618,9 +1609,9 @@ describe('StrategicContextRail', () => {
       onOpenMessages,
     });
 
-    expect(host.textContent).toContain('Recent flow');
+    expect(host.textContent).toContain('Recent signal');
     expect(host.textContent).toContain('Question message');
-    expect(host.textContent).toContain('Task update');
+    expect(host.textContent).not.toContain('Task update');
 
     Array.from(host.querySelectorAll('button'))
       .find(button => button.title === 'Open Question message')
@@ -2075,7 +2066,7 @@ describe('StrategicContextRail', () => {
     expect(host.textContent).not.toContain('Steer queued');
   });
 
-  test('keeps clear attention state quiet while preserving counts', () => {
+  test('keeps clear attention state quiet', () => {
     const clearState: StrategicStateResponse = {
       ...STATE,
       attention: {
@@ -2099,7 +2090,6 @@ describe('StrategicContextRail', () => {
     };
     const { host } = mount({ state: clearState });
 
-    expect(host.textContent).toContain('needs operator');
     expect(host.textContent).not.toContain('Needs operator');
     expect(host.textContent).not.toContain('Question waiting');
   });

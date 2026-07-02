@@ -443,8 +443,9 @@ describe('StrategicContextRail — viewport regression', () => {
     const contextButton = host?.querySelector<HTMLButtonElement>('button[aria-label="Open Strategic context"]');
     expect(host?.querySelector('[data-testid="strategic-chat-primary"]')?.textContent).toContain('Strategic chat');
     expect(host?.querySelector('[data-testid="strategic-context-descriptor"]')?.tagName).toBe('DIV');
-    expect(host?.querySelector('[data-testid="strategic-chat-artifact-slot"]')?.textContent).toContain('Canvas and artifacts');
-    expect(host?.querySelector('[data-testid="strategic-context-descriptor-context_map"]')?.textContent).toContain('Strategic context map');
+    expect(host?.querySelector('[data-testid="strategic-context-package-summary"]')?.textContent).toContain('Strategic context');
+    expect(host?.querySelector('[data-testid="strategic-chat-artifact-slot"]')).toBeNull();
+    expect(host?.querySelector('[data-testid="strategic-context-descriptor-context_map"]')).toBeNull();
     expect(rail).toBeTruthy();
     expect(contextButton).toBeTruthy();
     expect(getComputedStyle(rail!).display).not.toBe('none');
@@ -460,6 +461,7 @@ describe('StrategicContextRail — viewport regression', () => {
     expect(rail).toBeTruthy();
     expect(contextButton).toBeTruthy();
     expect(host?.querySelector('[data-testid="strategic-context-descriptor"]')?.tagName).toBe('DIV');
+    expect(host?.querySelector('[data-testid="strategic-chat-artifact-slot"]')).toBeNull();
     expect(getComputedStyle(rail!).display).toBe('none');
     expect(getComputedStyle(contextButton!).display).not.toBe('none');
 

@@ -8,34 +8,7 @@ import { buildForest, type TreeNode } from './PipelineView.utils';
 import { taskStatusDotColor } from '../utils/taskStatus';
 
 const ACTIVE_STATUSES = ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'];
-const WAITING_STATUSES = ['BLOCKED', 'PARKED'];
 const TERMINAL_STATUSES = ['COMPLETED', 'FAILED', 'CANCELLED'];
-
-type FilterType = 'All' | 'Active' | 'Waiting' | 'Blocked' | 'Failed';
-
-const FILTER_CHIPS: { label: FilterType }[] = [
-  { label: 'All' },
-  { label: 'Active' },
-  { label: 'Waiting' },
-  { label: 'Blocked' },
-  { label: 'Failed' },
-];
-
-function taskIsWaiting(task: Task): boolean {
-  return WAITING_STATUSES.includes(task.status)
-    || (task.status === 'QUEUED' && !!task.depends_on && task.depends_on.length > 0);
-}
-
-function taskMatchesFilter(task: Task, filter: FilterType): boolean {
-  if (filter === 'All') return true;
-  if (filter === 'Active') return ['IN_PROGRESS', 'PROVISIONING', 'EVALUATING'].includes(task.status);
-  if (filter === 'Waiting') return taskIsWaiting(task);
-  // First-class BLOCKED status, with the legacy QUEUED+depends_on inference
-  // kept as a fallback for payloads predating the status.
-  if (filter === 'Blocked') return task.status === 'BLOCKED' || (task.status === 'QUEUED' && !!task.depends_on && task.depends_on.length > 0);
-  if (filter === 'Failed') return task.status === 'FAILED';
-  return true;
-}
 
 interface PipelineViewProps {
   tasks: Task[];
@@ -48,7 +21,7 @@ interface PipelineViewProps {
   onUnarchiveTask?: (taskId: string) => void;
 }
 
-function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveParent, activeFilter, blockingCount, sidecarBadges, isSidecar, isSidecarFallback }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean; onNavigateToParent?: (parentTaskId: string) => void; onUnarchiveParent?: (parentTaskId: string) => void; activeFilter: FilterType; blockingCount?: number; sidecarBadges?: SidecarBadge[]; isSidecar?: boolean; isSidecarFallback?: boolean }) {
+function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveParent, blockingCount, sidecarBadges, isSidecar, isSidecarFallback }: { task: Task; onViewLogs: (task: Task) => void; isOrphan?: boolean; onNavigateToParent?: (parentTaskId: string) => void; onUnarchiveParent?: (parentTaskId: string) => void; blockingCount?: number; sidecarBadges?: SidecarBadge[]; isSidecar?: boolean; isSidecarFallback?: boolean }) {
   const style = task.task_type ? TASK_TYPE_STYLES[task.task_type] : null;
   const Icon = style?.icon;
   const statusColor = taskStatusDotColor(task.status);
@@ -61,8 +34,6 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
     ? task.history[task.history.length - 1].timestamp
     : isTerminal ? task.created_at : undefined;
   const duration = useElapsedTime(task.created_at, isActiveForDuration ? undefined : endTime);
-  const dimmed = !taskMatchesFilter(task, activeFilter);
-
   // Surface the durable blocker metadata (backend models.py) on the pipeline node
   // tooltip — the only board view that renders its own compact card instead of
   // <TaskCard> (which already shows these). All fields are nullable and absent on
@@ -82,7 +53,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
       data-task-id={task.id}
       onClick={() => onViewLogs(task)}
       onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onViewLogs(task); } }}
-      className={`flex min-h-[44px] w-full min-w-0 cursor-pointer items-center gap-2 rounded-md border bg-[#10151c] px-2.5 py-1.5 text-left transition-colors hover:border-neutral-600 hover:bg-neutral-900 md:min-h-0 group ${isOrphan ? 'border-dashed border-neutral-600' : 'border-neutral-800'} ${dimmed ? 'opacity-40 grayscale' : ''}`}
+      className={`flex min-h-[44px] w-full min-w-0 cursor-pointer items-center gap-2 rounded-md border bg-[#10151c] px-2.5 py-1.5 text-left transition-colors hover:border-neutral-600 hover:bg-neutral-900 md:min-h-0 group ${isOrphan ? 'border-dashed border-neutral-600' : 'border-neutral-800'}`}
       title={`${task.title}\n${task.status} • ${task.task_type || 'create'}${blockerTooltip ? `\n${blockerTooltip}` : ''}\nClick to view logs`}
     >
       {/* Status dot */}
@@ -155,7 +126,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
 
       {/* Retry badge */}
       {task.attempt_count != null && task.attempt_count > 0 && (
-        <span className="text-orange-400 bg-orange-500/10 border border-orange-500/20 text-ui-xs px-1.5 py-0.5 rounded font-semibold whitespace-nowrap shrink-0" title={`Attempt ${task.attempt_count + 1}`}>
+        <span className="border border-violet-500/20 bg-violet-500/10 px-1.5 py-0.5 text-ui-xs font-semibold whitespace-nowrap text-violet-300 rounded shrink-0" title={`Attempt ${task.attempt_count + 1}`}>
           ↺{task.attempt_count + 1}
         </span>
       )}
@@ -178,7 +149,7 @@ function TaskNode({ task, onViewLogs, isOrphan, onNavigateToParent, onUnarchiveP
         const prCount = task.artifacts?.filter(a => a.artifact_type === 'PULL_REQUEST').length ?? 0;
         return prCount > 1 ? (
           <span
-            className="bg-orange-500/10 border border-orange-500/20 text-orange-400 text-ui-xs font-mono px-1.5 py-0.5 rounded whitespace-nowrap shrink-0"
+            className="border border-violet-500/20 bg-violet-500/10 px-1.5 py-0.5 font-mono text-ui-xs whitespace-nowrap text-violet-300 rounded shrink-0"
             title={`This task required ${prCount} PR iterations`}
           >
             ×{prCount} iters
@@ -236,7 +207,6 @@ function TreeBranch({
   onUnarchiveParent,
   isLast,
   depth,
-  activeFilter,
   blockingMap,
 }: {
   node: TreeNode;
@@ -248,7 +218,6 @@ function TreeBranch({
   onUnarchiveParent?: (parentTaskId: string) => void;
   isLast: boolean;
   depth: number;
-  activeFilter: FilterType;
   blockingMap: Record<string, number>;
 }) {
   const depIds = node.task.depends_on || [];
@@ -270,8 +239,8 @@ function TreeBranch({
     return createTask;
   }, [node.task, prChainMap]);
 
-  const chainColor = node.task.task_type === 'fix' ? 'border-orange-500/50' : 'border-amber-500/50';
-  const chainBadgeBg = node.task.task_type === 'fix' ? 'bg-orange-500/10 border-orange-500/30 text-orange-400' : 'bg-amber-500/10 border-amber-500/30 text-amber-400';
+  const chainColor = node.task.task_type === 'fix' ? 'border-violet-500/50' : 'border-cyan-500/45';
+  const chainBadgeBg = node.task.task_type === 'fix' ? 'border-violet-500/30 bg-violet-500/10 text-violet-300' : 'border-cyan-500/25 bg-cyan-500/10 text-cyan-300';
   const chainLabel = node.task.task_type === 'fix' ? 'Fix' : 'Review';
 
   const [childrenExpanded, setChildrenExpanded] = useState(true);
@@ -353,7 +322,7 @@ function TreeBranch({
             </button>
           )}
           <div className="flex-1 min-w-0">
-            <TaskNode task={node.task} onViewLogs={onViewLogs} isOrphan={node.isOrphan} onNavigateToParent={onNavigateToParent} onUnarchiveParent={onUnarchiveParent} activeFilter={activeFilter} blockingCount={blockingMap[node.task.id]} sidecarBadges={sidecarBadges.length > 0 ? sidecarBadges : undefined} isSidecar={node.isSidecar} isSidecarFallback={node.isSidecarFallback} />
+            <TaskNode task={node.task} onViewLogs={onViewLogs} isOrphan={node.isOrphan} onNavigateToParent={onNavigateToParent} onUnarchiveParent={onUnarchiveParent} blockingCount={blockingMap[node.task.id]} sidecarBadges={sidecarBadges.length > 0 ? sidecarBadges : undefined} isSidecar={node.isSidecar} isSidecarFallback={node.isSidecarFallback} />
           </div>
         </div>
 
@@ -387,7 +356,6 @@ function TreeBranch({
                     onUnarchiveParent={onUnarchiveParent}
                     isLast={i === node.sidecars.length - 1}
                     depth={depth + 1}
-                    activeFilter={activeFilter}
                     blockingMap={blockingMap}
                   />
                 ))}
@@ -411,7 +379,6 @@ function TreeBranch({
                 onUnarchiveParent={onUnarchiveParent}
                 isLast={i === node.children.length - 1}
                 depth={depth + 1}
-                activeFilter={activeFilter}
                 blockingMap={blockingMap}
               />
             ))}
@@ -458,7 +425,6 @@ function RootGroup({
   onUnarchiveParent,
   expanded,
   onToggle,
-  activeFilter,
   onArchiveGroup,
   blockingMap,
 }: {
@@ -471,7 +437,6 @@ function RootGroup({
   onUnarchiveParent?: (parentTaskId: string) => void;
   expanded: boolean;
   onToggle: () => void;
-  activeFilter: FilterType;
   onArchiveGroup?: (taskIds: string[]) => void;
   blockingMap: Record<string, number>;
 }) {
@@ -625,7 +590,6 @@ function RootGroup({
                 onUnarchiveParent={onUnarchiveParent}
                 isLast={i === root.children.length - 1}
                 depth={0}
-                activeFilter={activeFilter}
                 blockingMap={blockingMap}
               />
             ))
@@ -640,7 +604,6 @@ function RootGroup({
               onUnarchiveParent={onUnarchiveParent}
               isLast={true}
               depth={0}
-              activeFilter={activeFilter}
               blockingMap={blockingMap}
             />
           )}
@@ -667,7 +630,6 @@ export function PipelineView({ tasks, onViewLogs, hasActiveFilters, onNavigateTo
     return map;
   }, [tasks]);
   const [groupExpanded, setGroupExpanded] = useState<Record<string, boolean>>({});
-  const [activeFilter, setActiveFilter] = useState<FilterType>('All');
 
   // Hide synthetic orphan groups whose parent was archived and every child is
   // now terminal — they have no actionable tasks and only add clutter.
@@ -744,24 +706,12 @@ export function PipelineView({ tasks, onViewLogs, hasActiveFilters, onNavigateTo
   }, [visibleForest, taskMap]);
 
   const btnClass = 'px-2 py-1 text-xs text-neutral-500 hover:text-neutral-300 bg-neutral-900 border border-neutral-800 rounded transition-colors';
-  const chipBase = 'px-2.5 py-1 text-xs rounded-full border transition-colors font-medium';
-  const chipActive = 'bg-neutral-700 border-neutral-500 text-neutral-100';
-  const chipInactive = 'bg-neutral-900 border-neutral-800 text-neutral-500 hover:text-neutral-300 hover:border-neutral-600';
 
   return (
     <div className="flex-1 overflow-y-auto overflow-x-auto pb-4 custom-scrollbar">
       <div className="space-y-4">
-        <div className="flex items-center gap-1.5">
-          {FILTER_CHIPS.map(({ label }) => (
-            <button
-              key={label}
-              className={`${chipBase} ${activeFilter === label ? chipActive : chipInactive}`}
-              onClick={() => setActiveFilter(label)}
-            >
-              {label}
-            </button>
-          ))}
-          {onClearWaveDeps && tasks.some(t => t.status === 'QUEUED' && t.depends_on && t.depends_on.length > 0) && (
+        {onClearWaveDeps && tasks.some(t => t.status === 'QUEUED' && t.depends_on && t.depends_on.length > 0) && (
+          <div className="flex items-center gap-1.5">
             <button
               className="px-2.5 py-1 text-xs rounded-full border border-red-500/30 bg-red-500/10 text-red-400 hover:bg-red-500/20 transition-colors font-medium"
               onClick={() => {
@@ -772,8 +722,8 @@ export function PipelineView({ tasks, onViewLogs, hasActiveFilters, onNavigateTo
             >
               Clear Stale Wave Deps
             </button>
-          )}
-        </div>
+          </div>
+        )}
         {visibleForest.length > 1 && (
           <div className="flex items-center gap-2">
             <button className={btnClass} onClick={expandAll}>Expand all</button>
@@ -816,7 +766,6 @@ export function PipelineView({ tasks, onViewLogs, hasActiveFilters, onNavigateTo
             onUnarchiveParent={onUnarchiveTask}
             expanded={getExpanded(root.task.id)}
             onToggle={() => toggleGroup(root.task.id)}
-            activeFilter={activeFilter}
             onArchiveGroup={onArchiveGroup}
             blockingMap={blockingMap}
           />

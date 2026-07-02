@@ -183,7 +183,7 @@ describe('MessageBubble — viewport regression', () => {
         );
       });
     });
-    if (host) expect(host.textContent).toContain('Sent with context');
+    if (host) expect(host.textContent).toContain('Refs attached');
     if (host) expect(host.textContent).toContain('Operator notes');
     await expectNoTextTruncationAt(375, async () => {});
     await expectMinTouchTargetAt(375, async () => {});

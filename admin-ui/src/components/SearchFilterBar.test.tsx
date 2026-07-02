@@ -1,11 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { SearchFilterBar } from './SearchFilterBar';
 
 describe('SearchFilterBar', () => {
-  it('renders the CSV action and invokes the download callback', () => {
-    const onDownloadCsv = vi.fn();
-
+  it('keeps export actions out of the default task filter bar', () => {
     render(
       <SearchFilterBar
         searchQuery=""
@@ -16,11 +14,10 @@ describe('SearchFilterBar', () => {
         onDateRangeChange={vi.fn()}
         blockedFilter={false}
         onBlockedFilterChange={vi.fn()}
-        onDownloadCsv={onDownloadCsv}
       />,
     );
 
-    fireEvent.click(screen.getByTitle('Download CSV'));
-    expect(onDownloadCsv).toHaveBeenCalledTimes(1);
+    expect(screen.getByPlaceholderText('Search by title, ID, or status...')).toBeInTheDocument();
+    expect(screen.queryByTitle('Download CSV')).not.toBeInTheDocument();
   });
 });

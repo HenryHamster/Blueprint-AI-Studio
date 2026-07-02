@@ -1,6 +1,6 @@
 import type { RefObject } from 'react';
 import { useMemo, useState, useRef, useEffect } from 'react';
-import { Activity, Microscope, BookOpen, Command, LogOut, MoreHorizontal, Settings, Bell } from 'lucide-react';
+import { Activity, Microscope, BookOpen, Command, LogOut, MoreHorizontal, Search, Settings, Bell } from 'lucide-react';
 import { AutonomousStatus } from './AutonomousStatus';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
 import type { DetailedHealth, PipelineThrottle } from './OrchestratorHealthBar';
@@ -179,7 +179,7 @@ export function HeaderBar(props: HeaderBarProps) {
     if (props.health.orchestrator_hung) return 'bg-red-500 animate-pulse';
     const cycleAge = props.health.last_cycle_seconds_ago;
     if (cycleAge !== null && cycleAge >= 120) return 'bg-red-500 animate-pulse';
-    if (cycleAge !== null && cycleAge >= 60) return 'bg-amber-400';
+    if (cycleAge !== null && cycleAge >= 60) return 'bg-yellow-400';
     return 'bg-emerald-500';
   }, [apiHealthy, props.health]);
   return (
@@ -200,7 +200,7 @@ export function HeaderBar(props: HeaderBarProps) {
         </div>
       )}
 
-      {/* Unified top bar: compact global shell with fixed utility clusters and a scrolling tab strip. */}
+      {/* Unified top bar: compact global shell with command search and right-aligned workspace controls. */}
       <header className="flex min-h-10 flex-wrap items-center gap-1 border-b border-workbench-border/90 bg-workbench-shell px-1.5 py-0.5 md:min-h-8 md:flex-nowrap md:px-2">
         {/* LEFT: ProjectSwitcher + Manage projects slot */}
         <div className="flex min-w-0 shrink-0 items-center gap-1">
@@ -229,21 +229,31 @@ export function HeaderBar(props: HeaderBarProps) {
           )}
         </div>
 
-        {/* CENTER: Primary tab group — intentional horizontal-scroll strip
-            (overflow-x-auto + min-w-0) so the tabs scroll rather than wrap or
-            push the bar wide on narrow viewports; opt the scroll container out
-            of the overflow/truncation invariants (its descendants legitimately
-            extend past the fold inside the scroll region). */}
-        <PrimaryTabNav
-          activeTab={props.activeTab}
-          onTabChange={props.onTabChange}
-          openMessageCount={openMessageCount}
-          newSinceLastVisitCount={newSinceLastVisitCount}
-          needsAttentionCount={props.needsAttentionCount}
-        />
+        <div className="hidden min-w-0 flex-1 items-center md:flex">
+          <button
+            type="button"
+            onClick={() => props.onOpenCommandPalette?.()}
+            title="Open command palette (Ctrl+K)"
+            aria-label="Open command palette (Ctrl+K)"
+            data-testid="header-command-search"
+            className="workbench-focus inline-flex h-7 items-center gap-1.5 rounded-md border border-workbench-border/80 bg-workbench-control px-2 text-xs text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-workbench-layer hover:text-neutral-200"
+          >
+            <Search className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />
+            <kbd className="shrink-0 rounded border border-workbench-border/80 bg-workbench-shell px-1.5 py-0.5 font-mono text-ui-sm leading-none text-neutral-500">
+              Ctrl K
+            </kbd>
+          </button>
+        </div>
 
-        {/* RIGHT: Icon cluster + mobile controls + Launch Task */}
+        {/* RIGHT: workspace navigation + compact utilities */}
         <div className="ml-auto flex shrink-0 items-center gap-0.5">
+          <PrimaryTabNav
+            activeTab={props.activeTab}
+            onTabChange={props.onTabChange}
+            openMessageCount={openMessageCount}
+            newSinceLastVisitCount={newSinceLastVisitCount}
+            needsAttentionCount={props.needsAttentionCount}
+          />
 
           {/* Desktop icon cluster */}
           <div className="workbench-control hidden items-center gap-0.5 rounded-md border p-0.5 md:flex">
@@ -256,52 +266,17 @@ export function HeaderBar(props: HeaderBarProps) {
                 className={`flex h-7 items-center gap-1 rounded px-1.5 text-xs transition-colors ${
                   props.showAlertsPopover
                     ? (props.alertMaxSeverity === 'ERROR' ? 'text-red-400 bg-red-500/10'
-                      : props.alertMaxSeverity === 'WARNING' ? 'text-amber-400 bg-amber-500/10'
+                      : props.alertMaxSeverity === 'WARNING' ? 'text-yellow-300 bg-yellow-500/10'
                       : 'text-blue-400 bg-blue-500/10')
                     : 'text-neutral-400 hover:bg-workbench-layer hover:text-neutral-200'
                 }`}
               >
                 <span className={`w-2 h-2 rounded-full ${
                   props.alertMaxSeverity === 'ERROR' ? 'bg-red-500' :
-                  props.alertMaxSeverity === 'WARNING' ? 'bg-amber-500' : 'bg-blue-500'
+                  props.alertMaxSeverity === 'WARNING' ? 'bg-yellow-400' : 'bg-blue-500'
                 }`} />
                 <Bell className="w-3.5 h-3.5" />
                 <span>{props.alertCount}</span>
-              </button>
-            )}
-            <button
-              onClick={onToggleResearchBrowser}
-              title="Findings journal"
-              aria-pressed={showResearchBrowser}
-              className={`relative flex h-7 w-7 items-center justify-center rounded text-xs transition-colors ${
-                showResearchBrowser ? 'bg-cyan-500/10 text-cyan-300' : 'text-neutral-400 hover:bg-workbench-layer hover:text-neutral-200'
-              }`}
-            >
-              <Microscope className="h-3.5 w-3.5" />
-              {pendingFindingsCount > 0 && (
-                <span className="absolute -right-0.5 -top-0.5 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-cyan-400 px-0.5 text-ui-2xs font-bold leading-none text-neutral-950">
-                  {pendingFindingsCount > 9 ? '9+' : pendingFindingsCount}
-                </span>
-              )}
-            </button>
-            <button
-              onClick={onToggleKnowledgeBrowser}
-              title="Knowledge library"
-              aria-pressed={showKnowledgeBrowser}
-              className={`flex h-7 w-7 items-center justify-center rounded text-xs transition-colors ${
-                showKnowledgeBrowser ? 'bg-violet-500/10 text-violet-300' : 'text-neutral-400 hover:bg-workbench-layer hover:text-neutral-200'
-              }`}
-            >
-              <BookOpen className="h-3.5 w-3.5" />
-            </button>
-            {/* Activity */}
-            {onOpenActivityFeed && (
-              <button
-                onClick={onOpenActivityFeed}
-                title="Chronological activity stream"
-                className="flex h-7 w-7 items-center justify-center rounded text-xs text-neutral-400 transition-colors hover:bg-workbench-layer hover:text-neutral-200"
-              >
-                <Activity className="h-3.5 w-3.5" />
               </button>
             )}
             {/* Health pill — expands/collapses the full OrchestratorHealthBar */}

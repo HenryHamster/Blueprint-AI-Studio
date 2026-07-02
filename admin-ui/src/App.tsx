@@ -28,7 +28,6 @@ import { defaultComputeExperimentForm } from './hooks/useTaskModal';
 import { BulkActionBar } from './components/BulkActionBar';
 import type { SortBy } from './components/KanbanBoard';
 import { ACTIVE_PIPELINE_STATUSES, CANCELLABLE_STATUSES, COLUMNS, SORT_KEY, TERMINAL_STATUSES } from './appWorkbenchConstants';
-import { downloadTaskCsv, orderTasksForKanbanExport } from './utils/taskCsv';
 import { Pagination } from './components/Pagination';
 import { UserManagement } from './components/UserManagement';
 import { ProjectMembers } from './components/ProjectMembers';
@@ -40,8 +39,6 @@ import { StrategicSessionControl, type StrategicAccountSpendStatus, type Strateg
 import { CommandPaletteHost } from './components/CommandPaletteHost';
 import { KeyboardShortcutsOverlay } from './components/KeyboardShortcutsOverlay';
 import { parseArmingOutcome, workbenchArmingToastCopy } from './components/messageArming';
-import { QuickFilterPresets } from './components/QuickFilterPresets';
-import { BoardSavedViewsBar, type BoardFilterSnapshot } from './components/BoardSavedViewsBar';
 import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 import type { Task } from './components/TaskCard';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
@@ -61,18 +58,26 @@ import { matchesStatusFilter } from './utils/statusFilter';
 import { buildOptimisticStrategicWorkbench, normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSurfaceForTab } from './utils/strategicWorkbenchSession';
 import { pipelineTaskIdForAttentionItem } from './utils/strategicAttention';
 import { buildStrategicContextDescriptor } from './utils/strategicContextDescriptor';
+import { STATUS_OPTIONS } from './constants';
 
 type StrategicSessionRefs = StrategicWorkbenchState['selected_refs'];
 type PipelineDirectionOption = { id: string; text: string };
 const PIPELINE_SECTION_ORDER: readonly PipelineSection[] = ['flow', 'board', 'archive'];
 const PROJECT_SECTION_ORDER: readonly ProjectSection[] = ['running-update', 'directions', 'problem-model', 'design-doc', 'manage'];
 const RUNTIME_SECTION_ORDER: readonly RuntimeSection[] = ['health', 'devices', 'compute', 'accounts', 'settings', 'analytics'];
+const ACTIVE_TASK_STATUS_FILTER = STATUS_OPTIONS.map(option => option.value);
 
 function cycleSection<T extends string>(sections: readonly T[], current: T, direction: -1 | 1): T {
   if (sections.length === 0) return current;
   const currentIndex = Math.max(0, sections.indexOf(current));
   const nextIndex = (currentIndex + direction + sections.length) % sections.length;
   return sections[nextIndex] ?? current;
+}
+
+function sameStringSet(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  const values = new Set(b);
+  return a.every(value => values.has(value));
 }
 export default function App() {
   const refreshStrategicReadModelRef = useRef<() => void>(() => {});
@@ -112,15 +117,7 @@ export default function App() {
       return (stored as SortBy) ?? 'newest';
     } catch { return 'newest'; }
   });
-  // Apply a saved view's snapshot through the live filter/sort setters so the
-  // active-filter persistence layer keeps working exactly as before. Destructure
-  // the (stable) setters so exhaustive-deps can track them without depending on
-  // the whole per-render state object `s`.
-  const {
-    setSearchQuery, setTaskTypeFilter, setStatusFilter, setDateRange,
-    setBlockedFilter, setRequiresApproval, setStuckFilter, setStuckMinSeconds,
-    setFailureClassFilter,
-  } = s;
+  const { setFailureClassFilter, setRequiresApproval, setStatusFilter, setStuckFilter, setStuckMinSeconds } = s;
   useEffect(() => {
     const onFailureClassFilter = (e: Event) => {
       const failureClass = (e as CustomEvent<string>).detail;
@@ -130,6 +127,23 @@ export default function App() {
     return () => window.removeEventListener('blueprint:failure-class-filter', onFailureClassFilter);
   }, [setFailureClassFilter]);
   useEffect(() => {
+    if (!sameStringSet(s.statusFilter, ACTIVE_TASK_STATUS_FILTER)) {
+      setStatusFilter([...ACTIVE_TASK_STATUS_FILTER]);
+    }
+    if (s.requiresApproval) setRequiresApproval(false);
+    if (s.stuckFilter) setStuckFilter(false);
+    if (s.stuckMinSeconds !== 0) setStuckMinSeconds(0);
+  }, [
+    s.requiresApproval,
+    s.statusFilter,
+    s.stuckFilter,
+    s.stuckMinSeconds,
+    setRequiresApproval,
+    setStatusFilter,
+    setStuckFilter,
+    setStuckMinSeconds,
+  ]);
+  useEffect(() => {
     localStorage.setItem(SORT_KEY, sortBy);
   }, [sortBy]);
   const resolvedTaskCapabilities = useMemo(
@@ -137,32 +151,6 @@ export default function App() {
     [s.taskCapabilityContract],
   );
   const filterTaskTypeIds = resolvedTaskCapabilities.filterIds;
-  // Snapshot of the full task-board filter combination + sort, fed to the saved-views
-  // switcher so it can detect "modified" state and capture new views.
-  const boardFilterSnapshot: BoardFilterSnapshot = {
-    query: s.searchQuery,
-    taskTypeFilter: s.taskTypeFilter,
-    statusFilter: s.statusFilter,
-    dateRange: s.dateRange,
-    blocked: s.blockedFilter,
-    requiresApproval: s.requiresApproval,
-    stuck: s.stuckFilter,
-    stuckMinSeconds: s.stuckMinSeconds,
-    failureClassFilter: s.failureClassFilter,
-    sortBy,
-  };
-  const applyBoardView = useCallback((snap: BoardFilterSnapshot) => {
-    setSearchQuery(snap.query);
-    setTaskTypeFilter(snap.taskTypeFilter);
-    setStatusFilter(snap.statusFilter);
-    setDateRange(snap.dateRange);
-    setBlockedFilter(snap.blocked);
-    setRequiresApproval(snap.requiresApproval);
-    setStuckFilter(snap.stuck);
-    setStuckMinSeconds(snap.stuckMinSeconds);
-    setFailureClassFilter(snap.failureClassFilter);
-    setSortBy(snap.sortBy);
-  }, [setSearchQuery, setTaskTypeFilter, setStatusFilter, setDateRange, setBlockedFilter, setRequiresApproval, setStuckFilter, setStuckMinSeconds, setFailureClassFilter]);
   useEffect(() => {
     if (openMessageCount > 0) {
       document.title = `(${openMessageCount}) Blueprint AI Studio`;
@@ -569,11 +557,10 @@ export default function App() {
       .filter(pref => pref.visible)
       .map(pref => COLUMNS.find(c => c.id === pref.id))
       .filter((c): c is typeof COLUMNS[number] => !!c)
-      .filter(col => col.includes.some(status => s.statusFilter.includes(status)));
-  }, [effectiveColumnPrefs, s.statusFilter]);
+      .filter(col => col.includes.some(status => ACTIVE_TASK_STATUS_FILTER.includes(status)));
+  }, [effectiveColumnPrefs]);
 
   const stuckTaskIds = useMemo(() => new Set((s.diagnostics?.stuck_tasks ?? []).filter((st: { task_id: string; stuck_for_seconds: number }) => st.stuck_for_seconds >= s.stuckMinSeconds).map((st: { task_id: string }) => st.task_id)), [s.diagnostics, s.stuckMinSeconds]);
-  const stuckCount1h = useMemo(() => (s.diagnostics?.stuck_tasks ?? []).filter((st: { stuck_for_seconds: number }) => st.stuck_for_seconds >= 3600).length, [s.diagnostics]);
   const dateRangeCutoffs: Record<string, number> = { '1h': 3600000, '6h': 21600000, '24h': 86400000, '7d': 604800000 };
   const filteredTasks = useMemo(() => {
     const now = new Date().getTime();
@@ -581,7 +568,7 @@ export default function App() {
     return s.tasks.filter(t => {
       const taskType = t.task_type || (t.payloads?.[0] as Record<string, unknown>)?.type as string || 'create';
       const typeMatch = matchesTaskTypeFilter(taskType, s.taskTypeFilter, filterTaskTypeIds);
-      const statusMatch = matchesStatusFilter(t.status, s.statusFilter);
+      const statusMatch = matchesStatusFilter(t.status, ACTIVE_TASK_STATUS_FILTER);
       const query = s.searchQuery.toLowerCase();
       const searchMatch = !query || t.id.toLowerCase().includes(query) || (t.title?.toLowerCase().includes(query)) || (t.description?.toLowerCase().includes(query)) || (t.latest_status_message?.toLowerCase().includes(query));
       const projectMatch = s.selectedProjectId === null || t.project_id === s.selectedProjectId;
@@ -589,24 +576,11 @@ export default function App() {
       // Prefer the first-class BLOCKED status; fall back to the legacy
       // QUEUED+depends_on inference for older payloads predating the status.
       const blockedMatch = !s.blockedFilter || t.status === 'BLOCKED' || (t.status === 'QUEUED' && t.depends_on != null && t.depends_on.length > 0);
-      const approvalMatch = !s.requiresApproval || t.requires_approval;
       const failureClassMatch = s.failureClassFilter.length === 0 || (t.status === 'FAILED' && t.failure_class != null && s.failureClassFilter.includes(t.failure_class));
-      const stuckMatch = !s.stuckFilter || stuckTaskIds.has(t.id);
-      return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch && blockedMatch && approvalMatch && failureClassMatch && stuckMatch;
+      return typeMatch && statusMatch && searchMatch && projectMatch && dateMatch && blockedMatch && failureClassMatch;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [s.tasks, s.taskTypeFilter, s.statusFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.requiresApproval, s.stuckFilter, s.stuckMinSeconds, stuckTaskIds, s.failureClassFilter, filterTaskTypeIds]);
-
-  const orderedExportTasks = useMemo(() => {
-    if (s.viewMode !== 'kanban') return filteredTasks;
-    if (visibleColumns.length === 0) return filteredTasks;
-    return orderTasksForKanbanExport(filteredTasks, visibleColumns, sortBy);
-  }, [filteredTasks, visibleColumns, s.viewMode, sortBy]);
-
-  const handleDownloadTasksCsv = useCallback(() => {
-    const projectName = selectedProject?.name ?? selectedProject?.github_repo ?? (s.selectedProjectId ?? 'all-projects');
-    downloadTaskCsv(orderedExportTasks, projectName);
-  }, [orderedExportTasks, selectedProject?.github_repo, selectedProject?.name, s.selectedProjectId]);
+  }, [s.tasks, s.taskTypeFilter, s.searchQuery, s.selectedProjectId, s.dateRange, s.blockedFilter, s.failureClassFilter, filterTaskTypeIds]);
 
   const {
     addToast: addTaskLookupToast,
@@ -1165,8 +1139,6 @@ export default function App() {
           onSearchChange={s.setSearchQuery}
           taskTypeFilter={s.taskTypeFilter}
           onTypeFilterChange={s.setTaskTypeFilter}
-          statusFilter={s.statusFilter}
-          onStatusFilterChange={s.setStatusFilter}
           failureClassFilter={s.failureClassFilter}
           onFailureClassFilterChange={s.setFailureClassFilter}
           dateRange={s.dateRange}
@@ -1176,7 +1148,6 @@ export default function App() {
           directionFilter={s.directionFilter}
           onDirectionFilterChange={s.setDirectionFilter}
           directions={directions}
-          onDownloadCsv={handleDownloadTasksCsv}
           inputRef={searchInputRef}
         />
         {s.viewMode === 'kanban' && (
@@ -1203,7 +1174,7 @@ export default function App() {
             title={s.compactMode ? 'Switch to normal density' : 'Switch to compact density'}
             className={`inline-flex min-h-11 items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
               s.compactMode
-                ? 'border-amber-500/40 bg-amber-500/20 text-amber-400'
+                ? 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300'
                 : 'border-neutral-800/50 bg-neutral-900/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
             }`}
           >
@@ -1218,7 +1189,7 @@ export default function App() {
             title={s.selectionMode ? 'Exit selection mode' : 'Select tasks for bulk actions'}
             className={`inline-flex min-h-11 items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
               s.selectionMode
-                ? 'border-amber-500/40 bg-amber-500/20 text-amber-400'
+                ? 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300'
                 : 'border-neutral-800/50 bg-neutral-900/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
             }`}
           >
@@ -1226,37 +1197,6 @@ export default function App() {
             {s.selectionMode ? 'Selecting' : 'Select'}
           </button>
         )}
-      </div>
-
-      <div className="mt-2 min-w-0">
-        <BoardSavedViewsBar
-          key={`${s.user?.email ?? 'anon'}:${s.selectedProjectId ?? 'none'}`}
-          userId={s.user?.email}
-          projectId={s.selectedProjectId}
-          current={boardFilterSnapshot}
-          onApply={applyBoardView}
-        />
-        <QuickFilterPresets
-          statusFilter={s.statusFilter}
-          dateRange={s.dateRange}
-          requiresApproval={s.requiresApproval}
-          blockedFilter={s.blockedFilter}
-          stuckFilter={s.stuckFilter}
-          stuckCount={stuckTaskIds.size}
-          stuckCount1h={stuckCount1h}
-          stuckMinSeconds={s.stuckMinSeconds}
-          searchQuery={s.searchQuery}
-          failureClassFilter={s.failureClassFilter}
-          setFailureClassFilter={s.setFailureClassFilter}
-          setStatusFilter={s.setStatusFilter}
-          setTaskTypeFilter={s.setTaskTypeFilter}
-          setDateRange={s.setDateRange}
-          setRequiresApproval={s.setRequiresApproval}
-          setBlockedFilter={s.setBlockedFilter}
-          setStuckFilter={s.setStuckFilter}
-          setStuckMinSeconds={s.setStuckMinSeconds}
-          setSearchQuery={s.setSearchQuery}
-        />
       </div>
     </div>
   );

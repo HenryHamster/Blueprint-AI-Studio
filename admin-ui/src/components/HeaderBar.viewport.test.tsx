@@ -136,18 +136,29 @@ describe('HeaderBar — viewport regression', () => {
     });
   });
 
-  test('desktop activity stream launcher calls its opener', async () => {
+  test('desktop top bar keeps journal, library, and activity out of primary chrome', async () => {
     const onOpenActivityFeed = vi.fn();
     host = document.createElement('div');
     host.style.padding = '12px';
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenActivityFeed={onOpenActivityFeed} />); });
-    const activityButton = host.querySelector<HTMLButtonElement>('button[title="Chronological activity stream"]');
-    expect(activityButton).toBeTruthy();
-    await act(async () => { activityButton?.click(); });
-    expect(onOpenActivityFeed).toHaveBeenCalledOnce();
+    await act(async () => {
+      r.render(
+        <HeaderBar
+          {...makeProps()}
+          showResearchBrowser
+          showKnowledgeBrowser
+          onOpenActivityFeed={onOpenActivityFeed}
+        />,
+      );
+    });
+
+    expect(host.querySelector<HTMLButtonElement>('button[title="Findings journal"]')).toBeNull();
+    expect(host.querySelector<HTMLButtonElement>('button[title="Knowledge library"]')).toBeNull();
+    expect(host.querySelector<HTMLButtonElement>('button[title="Chronological activity stream"]')).toBeNull();
+    expect(host.textContent).not.toContain('Activity stream');
+    expect(onOpenActivityFeed).not.toHaveBeenCalled();
   });
 
   test('desktop settings and sign-out actions use header callbacks', async () => {
@@ -174,7 +185,7 @@ describe('HeaderBar — viewport regression', () => {
     expect(onSignOut).toHaveBeenCalledOnce();
   });
 
-  test('desktop command palette launcher is not duplicated in the global header', async () => {
+  test('desktop command search opens the command palette from the global header', async () => {
     const onOpenCommandPalette = vi.fn();
     host = document.createElement('div');
     host.style.padding = '12px';
@@ -184,9 +195,30 @@ describe('HeaderBar — viewport regression', () => {
     await act(async () => {
       r.render(<HeaderBar {...makeProps()} activeTab="runtime" onOpenCommandPalette={onOpenCommandPalette} />);
     });
-    const commandButton = host.querySelector<HTMLButtonElement>('button[title="Open command palette (Ctrl+K)"]');
-    expect(commandButton).toBeNull();
-    expect(onOpenCommandPalette).not.toHaveBeenCalled();
+    const commandButton = host.querySelector<HTMLButtonElement>('[data-testid="header-command-search"]');
+    expect(commandButton).toBeTruthy();
+    expect(commandButton?.textContent).toContain('Ctrl K');
+    expect(commandButton?.textContent).not.toContain('Search commands');
+    expect(commandButton?.textContent).not.toContain('Message Strategic');
+    await act(async () => { commandButton?.click(); });
+    expect(onOpenCommandPalette).toHaveBeenCalledOnce();
+  });
+
+  test('desktop workspace navigation sits to the right of command search', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenCommandPalette={vi.fn()} />); });
+
+    const commandButton = host.querySelector<HTMLButtonElement>('[data-testid="header-command-search"]');
+    const primaryNav = host.querySelector<HTMLElement>('[data-testid="primary-tab-nav"]');
+    const commandSlot = commandButton?.parentElement;
+    expect(commandButton).toBeTruthy();
+    expect(primaryNav).toBeTruthy();
+    expect(commandSlot?.nextElementSibling).toBe(primaryNav?.parentElement);
+    expect(primaryNav?.parentElement?.className).toContain('ml-auto');
   });
 
   test('desktop header keeps the Blueprint brand icon-only and project switcher primary', async () => {

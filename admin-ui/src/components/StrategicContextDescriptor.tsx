@@ -25,8 +25,13 @@ export function StrategicContextDescriptor({
   const visibleRefs = model.refs.slice(0, 2);
   const hiddenRefCount = Math.max(0, model.refCount - visibleRefs.length);
   const compact = variant === 'receipt';
+  const interactive = Boolean(onOpen) && !compact;
+  const primaryLabel = compact ? (model.receiptLabel ?? 'Context attached') : 'Context';
+  const showMode = !compact || (model.modeLabel !== 'Chat' && primaryLabel !== `${model.modeLabel} context`);
+  const showSurface = model.surfaceLabel !== 'Strategic' && (!compact || primaryLabel !== `${model.surfaceLabel} context`);
+  const showContextLabel = Boolean(model.contextLabel) && (!compact || model.contextLabel !== primaryLabel);
   const packageLabel = !compact && model.packageTitle ? model.packageTitle : null;
-  const title = onOpen
+  const title = interactive
     ? 'Open Strategic context'
     : model.capturedAt
       ? `Captured ${model.capturedAt}`
@@ -39,20 +44,24 @@ export function StrategicContextDescriptor({
     <>
       <span className="inline-flex min-w-0 items-center gap-1.5 font-medium text-neutral-400">
         <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${toneClass(model.contextTone)}`} />
-        {compact ? 'Sent with context' : 'Context'}
+        {primaryLabel}
       </span>
       {packageLabel && (
         <span className="min-w-0 max-w-full truncate text-neutral-300">{packageLabel}</span>
       )}
-      <span aria-hidden="true" className="text-neutral-700">·</span>
-      <span>{model.modeLabel}</span>
-      {model.surfaceLabel !== 'Strategic' && (
+      {showMode && (
+        <>
+          <span aria-hidden="true" className="text-neutral-700">·</span>
+          <span>{model.modeLabel}</span>
+        </>
+      )}
+      {showSurface && (
         <>
           <span aria-hidden="true" className="text-neutral-700">·</span>
           <span>{model.surfaceLabel}</span>
         </>
       )}
-      {model.contextLabel && (
+      {showContextLabel && (
         <>
           <span aria-hidden="true" className="text-neutral-700">·</span>
           <span className={model.contextTone === 'stale' ? 'text-amber-300' : model.contextTone === 'building' ? 'text-cyan-300' : 'text-neutral-400'}>
@@ -79,7 +88,7 @@ export function StrategicContextDescriptor({
       )}
     </>
   );
-  if (onOpen) {
+  if (interactive) {
     return (
       <button
         type="button"

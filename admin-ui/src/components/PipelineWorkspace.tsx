@@ -241,13 +241,13 @@ function PipelineStatusStrip({ status }: { status: PipelineWorkspaceStatus }) {
           aria-controls="pipeline-status-details"
           onClick={() => setDetailsOpen(open => !open)}
           className="inline-flex min-h-11 min-w-11 shrink-0 items-center justify-center rounded border border-neutral-800 bg-neutral-950/45 text-neutral-500 transition-colors hover:border-neutral-700 hover:text-neutral-200 sm:min-h-7 sm:min-w-7"
-          title={detailsOpen ? 'Hide monitoring details' : 'Show monitoring details'}
+          title={detailsOpen ? 'Hide data details' : 'Show data details'}
         >
           {detailsOpen ? <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" /> : <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />}
-          <span className="sr-only">{detailsOpen ? 'Hide monitoring details' : 'Show monitoring details'}</span>
+          <span className="sr-only">{detailsOpen ? 'Hide data details' : 'Show data details'}</span>
         </button>
         <div className="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
-          <span className="hidden shrink-0 text-ui-sm font-semibold uppercase text-neutral-600 sm:inline">Task monitor</span>
+          <span className="hidden shrink-0 text-ui-sm font-semibold uppercase text-neutral-600 sm:inline">Data health</span>
           <PipelineStatusPill
             label={scopeLabel}
             tone={scoped ? 'info' : 'neutral'}

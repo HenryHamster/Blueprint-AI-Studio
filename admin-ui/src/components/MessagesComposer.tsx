@@ -107,7 +107,7 @@ export function MessagesComposer({
             onClick={onOpenCommandPalette}
             title="Open command palette (Ctrl+K)"
             aria-label="Open command palette (Ctrl+K)"
-            className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2.5 text-xs font-semibold text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-100 md:min-h-8 md:min-w-10"
+            className="flex min-h-[44px] min-w-[44px] shrink-0 items-center justify-center gap-1 rounded-md border border-neutral-800/80 bg-neutral-950/35 px-2.5 text-xs font-semibold text-neutral-500 transition-colors hover:border-neutral-700 hover:bg-neutral-900/80 hover:text-neutral-100 md:hidden"
           >
             <Command className="h-3.5 w-3.5" />
             <span className="hidden font-mono text-ui-sm text-neutral-500 sm:inline">Ctrl+K</span>

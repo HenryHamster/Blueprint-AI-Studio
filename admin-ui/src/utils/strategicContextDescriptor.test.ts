@@ -233,7 +233,8 @@ describe('buildMessageStrategicContextDescriptor', () => {
     expect(descriptor).not.toBeNull();
     expect(descriptor?.modeLabel).toBe('Workday');
     expect(descriptor?.surfaceLabel).toBe('Pipeline');
-    expect(descriptor?.contextLabel).toBe('Context captured');
+    expect(descriptor?.contextLabel).toBeNull();
+    expect(descriptor?.receiptLabel).toBe('Refs attached');
     expect(descriptor?.refCount).toBe(1);
     expect(descriptor?.refs[0]?.label).toBe('Latest context report');
   });
@@ -286,5 +287,57 @@ describe('buildMessageStrategicContextDescriptor', () => {
 
     expect(descriptor).not.toBeNull();
     expect(descriptor?.modeLabel).toBe('Workday');
+    expect(descriptor?.receiptLabel).toBe('Workday context');
+  });
+
+  test('suppresses routine captured chat context with only default timestamps', () => {
+    const context = {
+      strategic_session: {
+        interaction_mode: 'chat',
+        active_surface: 'strategic',
+        session_started_at: '2026-06-29T12:00:00Z',
+        captured_at: '2026-06-29T12:00:05Z',
+        selected_refs: [],
+        selected_ref_descriptors: [],
+      },
+    } as ProjectMessageContext;
+
+    expect(buildMessageStrategicContextDescriptor(context)).toBeNull();
+  });
+
+  test('suppresses captured package id when it has no non-default context', () => {
+    const context = {
+      strategic_session: {
+        interaction_mode: 'chat',
+        active_surface: 'strategic',
+        context_package_id: 'strategic-context:proj-1',
+        selected_refs: [],
+      },
+    } as ProjectMessageContext;
+
+    expect(buildMessageStrategicContextDescriptor(context)).toBeNull();
+  });
+
+  test('shows stale captured package state without selected refs', () => {
+    const context = {
+      strategic_session: {
+        interaction_mode: 'chat',
+        active_surface: 'strategic',
+        context_package_id: 'strategic-context:proj-1',
+        context_package_descriptor: {
+          id: 'strategic-context:proj-1',
+          label: 'Pipeline context bundle',
+          status: 'stale',
+        },
+        selected_refs: [],
+      },
+    } as ProjectMessageContext;
+
+    const descriptor = buildMessageStrategicContextDescriptor(context);
+
+    expect(descriptor).not.toBeNull();
+    expect(descriptor?.receiptLabel).toBe('Stale context');
+    expect(descriptor?.contextLabel).toBe('Stale context');
+    expect(descriptor?.contextTone).toBe('stale');
   });
 });

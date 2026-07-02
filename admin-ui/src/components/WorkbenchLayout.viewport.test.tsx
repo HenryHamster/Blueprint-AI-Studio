@@ -107,4 +107,38 @@ describe('WorkbenchLayout viewport regression', () => {
     await act(async () => { action?.click(); });
     expect(actionOpened).toBe(true);
   });
+
+  test('document root keeps the dark shell anchored during scroll', async () => {
+    await page.viewport(390, 700);
+    const appRoot = document.createElement('div');
+    appRoot.id = 'root';
+    const appShell = document.createElement('div');
+    appShell.className = 'flex min-h-screen flex-col bg-[#08090b] text-neutral-200';
+    const tallContent = document.createElement('main');
+    tallContent.style.minHeight = '1400px';
+    appShell.appendChild(tallContent);
+    appRoot.appendChild(appShell);
+    document.body.appendChild(appRoot);
+
+    try {
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
+      window.scrollTo(0, document.documentElement.scrollHeight);
+      await new Promise<void>((resolve) => {
+        requestAnimationFrame(() => resolve());
+      });
+
+      const workbenchBase = 'rgb(3, 6, 10)';
+      expect(getComputedStyle(document.documentElement).backgroundColor).toBe(workbenchBase);
+      expect(getComputedStyle(document.body).backgroundColor).toBe(workbenchBase);
+      expect(getComputedStyle(appRoot).backgroundColor).toBe(workbenchBase);
+      expect(getComputedStyle(appShell).backgroundColor).toBe('rgb(8, 9, 11)');
+      expect(appRoot.getBoundingClientRect().height).toBeGreaterThanOrEqual(1400);
+      expect(appShell.getBoundingClientRect().height).toBeGreaterThanOrEqual(1400);
+    } finally {
+      appRoot.remove();
+      window.scrollTo(0, 0);
+    }
+  });
 });

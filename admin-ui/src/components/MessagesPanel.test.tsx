@@ -1024,7 +1024,7 @@ describe('MessagesPanel chrome modes', () => {
     expect(el.textContent).not.toContain('Stale ref');
   });
 
-  test('minimal chat context receipts open Strategic context workspace', async () => {
+  test('minimal chat context receipts are passive when useful context is attached', async () => {
     const onOpenStrategicContextWorkspace = vi.fn();
     const operator = makeMsg({
       id: 'operator-context',
@@ -1059,14 +1059,15 @@ describe('MessagesPanel chrome modes', () => {
       onOpenStrategicContextWorkspace,
     }, [operator]);
 
-    const receipt = el.querySelector('[data-testid="strategic-context-receipt"]') as HTMLButtonElement | null;
+    const receipt = el.querySelector('[data-testid="strategic-context-receipt"]') as HTMLElement | null;
     expect(receipt).not.toBeNull();
-    expect(receipt?.textContent).toContain('Sent with context');
+    expect(receipt?.tagName.toLowerCase()).toBe('div');
+    expect(receipt?.textContent).toContain('Refs attached');
     expect(receipt?.textContent).toContain('Review active wave');
     await act(async () => {
       receipt?.click();
     });
-    expect(onOpenStrategicContextWorkspace).toHaveBeenCalledTimes(1);
+    expect(onOpenStrategicContextWorkspace).not.toHaveBeenCalled();
   });
 
   test('minimal chat chrome shows conversation messages chronologically without routine alerts', async () => {

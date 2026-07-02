@@ -277,12 +277,14 @@ describe('MessageBubble', () => {
     })} />);
 
     const receipt = screen.getByTestId('strategic-context-receipt');
-    expect(receipt.textContent).toContain('Sent with context');
+    expect(receipt.tagName.toLowerCase()).toBe('div');
+    expect(receipt.textContent).toContain('Refs attached');
+    expect(receipt.textContent).not.toContain('Sent with context');
     expect(receipt.textContent).toContain('Workday');
     expect(receipt.textContent).toContain('Pipeline');
     expect(receipt.textContent).toContain('Latest context report');
     fireEvent.click(receipt);
-    expect(onOpenStrategicContext).toHaveBeenCalledTimes(1);
+    expect(onOpenStrategicContext).not.toHaveBeenCalled();
   });
 
   test('triage presentation keeps operator Strategic context receipt hidden', () => {
@@ -304,7 +306,7 @@ describe('MessageBubble', () => {
     expect(screen.queryByTestId('strategic-context-receipt')).toBeNull();
   });
 
-  test('chat receipt appears when the captured Strategic session only has a start time', () => {
+  test('chat receipt stays hidden when the captured Strategic session only has default timestamps', () => {
     render(<MessageBubble {...makeProps({
       presentation: 'chat',
       msg: makeMsg({
@@ -321,9 +323,29 @@ describe('MessageBubble', () => {
       }),
     })} />);
 
+    expect(screen.queryByTestId('strategic-context-receipt')).toBeNull();
+  });
+
+  test('chat receipt labels non-default captured surface as pipeline context', () => {
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      msg: makeMsg({
+        from_type: 'operator',
+        context: {
+          strategic_session: {
+            version: 1,
+            interaction_mode: 'chat',
+            active_surface: 'pipeline',
+            selected_refs: [],
+            captured_at: '2026-06-29T12:00:00Z',
+          },
+        },
+      }),
+    })} />);
+
     const receipt = screen.getByTestId('strategic-context-receipt');
-    expect(receipt.textContent).toContain('Sent with context');
-    expect(receipt.textContent).toContain('Chat');
+    expect(receipt.textContent).toContain('Pipeline context');
+    expect(receipt.textContent).not.toContain('Sent with context');
   });
 
   test('chat presentation omits task metadata when there is no task ref', () => {

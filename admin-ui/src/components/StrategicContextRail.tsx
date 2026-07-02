@@ -1,11 +1,9 @@
 import type { ReactNode } from 'react';
-import { Activity, ArrowUpRight, CircleAlert, Cpu, CreditCard, FileText, GitBranch, Network, Plus, Radio, X } from 'lucide-react';
+import { Activity, ArrowUpRight, CircleAlert, Cpu, CreditCard, GitBranch, Network, Radio, X } from 'lucide-react';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
 import type {
-  StrategicContextCanvasNode,
   StrategicContextPackageDescriptor,
   StrategicContextPackageDrilldown,
-  StrategicContextResourceRef,
   StrategicLocalRunnerState,
   StrategicMessageTarget,
   StrategicStateTaskFocus,
@@ -16,15 +14,14 @@ import type {
   StrategicStateResponse,
   StrategicWorkbenchState,
   StrategicWorkSessionAction,
+  StrategicWorkSessionEvent,
   StrategicWorkSessionRefDescriptor,
 } from '../strategicStateApi';
 import {
   MAX_STRATEGIC_SELECTED_REFS,
   removeStrategicSelectedRef,
-  upsertStrategicSelectedRef,
   type StrategicSelectedRef,
 } from '../utils/strategicWorkbenchSession';
-import { StrategicContextArtifactSlot } from './StrategicContextArtifactSlot';
 import { StrategicSessionEvents } from './StrategicSessionEvents';
 import type { StrategicAccountSpendStatus } from './StrategicSessionControl';
 import { WorkbenchPanel } from './WorkbenchLayout';
@@ -221,6 +218,21 @@ function accountSpendDetail(accountSpend: StrategicAccountSpendStatus): string {
   return parts.length > 0 ? parts.join(' / ') : 'Account and spend status unavailable';
 }
 
+function accountSpendHasProblem(
+  accountSpend: StrategicAccountSpendStatus,
+  status: ReturnType<typeof accountSpendTone>,
+): boolean {
+  if (status.label !== 'available') return true;
+  return (
+    (accountSpend.cooldownAccounts ?? 0) > 0 ||
+    (accountSpend.cappedAccounts ?? 0) > 0 ||
+    (accountSpend.disabledModelCount ?? 0) > 0 ||
+    (accountSpend.availableAccounts != null &&
+      accountSpend.totalAccounts != null &&
+      accountSpend.availableAccounts < accountSpend.totalAccounts)
+  );
+}
+
 function shaFreshnessTone(verdict?: string | null): { dot: string; text: string; label: string } {
   if (verdict === 'fresh') return { dot: 'bg-emerald-400', text: 'text-emerald-300', label: 'fresh' };
   if (verdict === 'stale') return { dot: 'bg-rose-400', text: 'text-rose-300', label: 'stale' };
@@ -280,9 +292,14 @@ function runtimeWorkHasSignal(work?: StrategicRuntimeWorkState | null): work is 
     (work.local_runner_holds?.count ?? 0) > 0 ||
     (work.held_approvals?.count ?? 0) > 0 ||
     (work.parked_wakes?.counts.active ?? 0) > 0 ||
-    (work.parked_wakes?.counts.problem ?? 0) > 0 ||
-    (work.compute_jobs?.counts.terminal_recent ?? 0) > 0
+    (work.parked_wakes?.counts.problem ?? 0) > 0
   );
+}
+
+function workSessionEventHasActionableSignal(event: StrategicWorkSessionEvent): boolean {
+  const tone = event.tone?.toLowerCase();
+  if (tone === 'critical' || tone === 'warning') return true;
+  return event.target?.surface === 'messages' && event.target.action === 'reply';
 }
 
 function RailButton({
@@ -329,22 +346,6 @@ function resourceKindLabel(kind?: string | null): string {
 
 function sessionRefKey(ref: Pick<StrategicSelectedRef, 'kind' | 'id'>): string {
   return `${ref.kind}:${ref.id}`;
-}
-
-function selectedRefFromResource(resource: StrategicContextResourceRef): StrategicSelectedRef {
-  return {
-    kind: resource.kind,
-    id: resource.id,
-    label: resource.label,
-  };
-}
-
-function selectedRefFromNode(node: StrategicContextCanvasNode): StrategicSelectedRef {
-  return {
-    kind: node.kind,
-    id: node.id,
-    label: node.label,
-  };
 }
 
 function fallbackRefDescriptor(ref: StrategicSelectedRef): StrategicWorkSessionRefDescriptor {
@@ -405,153 +406,6 @@ function SessionContextList({
           </div>
         );
       })}
-    </div>
-  );
-}
-
-function SessionRefAction({
-  selected,
-  disabled,
-  label,
-  onUse,
-  onRemove,
-}: {
-  selected: boolean;
-  disabled?: boolean;
-  label: string;
-  onUse?: () => void;
-  onRemove?: () => void;
-}) {
-  if (selected) {
-    return (
-      <button
-        type="button"
-        disabled={disabled}
-        onClick={onRemove}
-        className="inline-flex min-h-11 shrink-0 items-center gap-1 rounded-md border border-neutral-800 px-2 text-ui-sm font-semibold text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 disabled:opacity-40"
-        title={`Remove ${label} from session context`}
-        aria-label={`Remove ${label} from session context`}
-      >
-        <X className="h-3.5 w-3.5" aria-hidden="true" />
-        <span>Remove</span>
-      </button>
-    );
-  }
-  return (
-    <button
-      type="button"
-      disabled={disabled}
-      onClick={onUse}
-      className="inline-flex min-h-11 shrink-0 items-center gap-1 rounded-md border border-neutral-800 px-2 text-ui-sm font-semibold text-neutral-400 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 disabled:opacity-40"
-      title={`Keep ${label} in session context`}
-      aria-label={`Keep ${label} in session context`}
-    >
-      <Plus className="h-3.5 w-3.5" aria-hidden="true" />
-      <span>Keep</span>
-    </button>
-  );
-}
-
-function ContextResourceButton({
-  resource,
-  onOpen,
-  selected,
-  onUse,
-  onRemove,
-  disabled,
-}: {
-  resource: StrategicContextResourceRef;
-  onOpen?: (resource: StrategicContextResourceRef) => void;
-  selected?: boolean;
-  onUse?: () => void;
-  onRemove?: () => void;
-  disabled?: boolean;
-}) {
-  const canOpen = Boolean(onOpen && resource.target);
-  const detail = resource.kind === 'canvas' ? null : resource.summary;
-  return (
-    <div className="flex min-w-0 items-center gap-2 rounded-md border border-neutral-800 bg-neutral-950/60 px-2.5 py-2">
-      <button
-        type="button"
-        disabled={!canOpen}
-        onClick={() => onOpen?.(resource)}
-        className="min-h-11 min-w-0 flex-1 text-left disabled:cursor-default"
-        title={canOpen ? `Open ${resource.label}` : resource.label}
-      >
-        <span className="min-w-0">
-          <span className="block truncate text-xs font-semibold text-neutral-200">
-            {resource.label}
-          </span>
-          <span className="mt-0.5 block truncate text-ui-sm font-medium uppercase text-neutral-500">
-            {resourceKindLabel(resource.kind)}
-            {detail ? ` / ${detail}` : ''}
-          </span>
-        </span>
-      </button>
-      {canOpen && <ArrowUpRight className="h-3.5 w-3.5 shrink-0 text-neutral-600" aria-hidden="true" />}
-      {(onUse || onRemove) && (
-        <SessionRefAction
-          selected={Boolean(selected)}
-          disabled={disabled}
-          label={resource.label}
-          onUse={onUse}
-          onRemove={onRemove}
-        />
-      )}
-    </div>
-  );
-}
-
-function ContextMapNodeRow({
-  node,
-  selected,
-  disabled,
-  onOpenTarget,
-  onUse,
-  onRemove,
-}: {
-  node: StrategicContextCanvasNode;
-  selected?: boolean;
-  disabled?: boolean;
-  onOpenTarget: (target?: StrategicContextPackageDrilldown['target'] | null) => void;
-  onUse?: () => void;
-  onRemove?: () => void;
-}) {
-  const canOpen = Boolean(node.target);
-  return (
-    <div className="flex min-w-0 items-center gap-2 border-t border-neutral-800/70 py-1.5 first:border-t-0">
-      <button
-        type="button"
-        disabled={!canOpen}
-        onClick={() => onOpenTarget(node.target)}
-        className="min-h-11 min-w-0 flex-1 text-left disabled:cursor-default"
-        title={canOpen ? `Open ${node.label}` : node.label}
-      >
-        <span className="flex min-w-0 items-center gap-2">
-          <span className="truncate text-xs font-semibold text-neutral-200">{node.label}</span>
-          {node.count != null && (
-            <span className="shrink-0 rounded border border-neutral-800 px-1 text-ui-sm font-semibold text-neutral-500">
-              {formatCompactNumber(node.count)}
-            </span>
-          )}
-        </span>
-        <span className="mt-0.5 block truncate text-ui-sm font-medium uppercase text-neutral-500">
-          {resourceKindLabel(node.kind)}
-          {node.status ? ` / ${node.status}` : ''}
-        </span>
-        {node.summary && (
-          <span className="mt-0.5 block truncate text-xs text-neutral-600">{node.summary}</span>
-        )}
-      </button>
-      {(onUse || onRemove) && (
-        <SessionRefAction
-          selected={Boolean(selected)}
-          disabled={disabled}
-          label={node.label}
-          onUse={onUse}
-          onRemove={onRemove}
-        />
-      )}
     </div>
   );
 }
@@ -753,38 +607,49 @@ function TaskFocusRow({
 function TaskFocusBlock({
   focus,
   onOpenTask,
-  onOpenPipeline,
 }: {
   focus?: StrategicStateTaskFocus | null;
   onOpenTask?: (taskId: string) => void;
-  onOpenPipeline: () => void;
 }) {
   const renderedIds = new Set<string>();
+  let remainingRows = 4;
+  const takeItems = (bucket: StrategicStateTaskFocusBucket, limit: number): StrategicStateTaskFocusItem[] => {
+    if (remainingRows <= 0) return [];
+    const items = (bucket.items ?? [])
+      .filter(item => !renderedIds.has(item.id))
+      .slice(0, Math.min(limit, remainingRows));
+    items.forEach(item => renderedIds.add(item.id));
+    remainingRows -= items.length;
+    return items;
+  };
   const liveSections = TASK_FOCUS_SECTIONS
-    .filter(section => section.key !== 'recent_completed')
+    .filter(section => section.key !== 'queued' && section.key !== 'recent_completed')
     .map(section => {
       const bucket = taskFocusBucket(focus, section.key);
       if (!bucket) return null;
-      const items = (bucket.items ?? []).filter(item => !renderedIds.has(item.id)).slice(0, section.limit);
-      items.forEach(item => renderedIds.add(item.id));
+      const items = takeItems(bucket, section.limit);
       return { section, bucket, items };
     })
     .filter((entry): entry is { section: (typeof TASK_FOCUS_SECTIONS)[number]; bucket: StrategicStateTaskFocusBucket; items: StrategicStateTaskFocusItem[] } => Boolean(entry && entry.items.length > 0));
+  const queuedBucket = taskFocusBucket(focus, 'queued');
+  const queuedItems = queuedBucket && liveSections.length === 0 ? takeItems(queuedBucket, 1) : [];
   const completedBucket = taskFocusBucket(focus, 'recent_completed');
-  const completedItems = completedBucket
-    ? (completedBucket.items ?? []).filter(item => !renderedIds.has(item.id))
+  const completedItems = completedBucket && liveSections.length === 0 && queuedItems.length === 0
+    ? takeItems(completedBucket, 1)
     : [];
   const sections = liveSections.length > 0
     ? liveSections
+    : queuedBucket && queuedItems.length > 0
+      ? [{ section: TASK_FOCUS_SECTIONS.find(section => section.key === 'queued')!, bucket: queuedBucket, items: queuedItems }]
     : completedBucket && completedItems.length > 0
       ? [{ section: TASK_FOCUS_SECTIONS[TASK_FOCUS_SECTIONS.length - 1], bucket: completedBucket, items: completedItems }]
       : [];
-  const openTotal = liveSections.reduce((sum, entry) => sum + entry.items.length, 0);
+  const visibleTotal = sections.reduce((sum, entry) => sum + entry.items.length, 0);
 
   if (sections.length === 0) return null;
 
   return (
-    <WorkbenchPanel title="Task focus" meta={openTotal > 0 ? `${formatCompactNumber(openTotal)} shown` : 'recent'}>
+    <WorkbenchPanel title="Task focus" meta={visibleTotal > 0 ? `${formatCompactNumber(visibleTotal)} shown` : 'recent'}>
       <div className="space-y-3" data-testid="strategic-task-focus">
         {sections.slice(0, 4).map(({ section, bucket, items }) => (
           <div key={section.key} className="space-y-1.5">
@@ -800,9 +665,6 @@ function TaskFocusBlock({
             ))}
           </div>
         ))}
-        <div className="pt-1">
-          <RailButton onClick={onOpenPipeline}>Pipeline</RailButton>
-        </div>
       </div>
     </WorkbenchPanel>
   );
@@ -811,122 +673,60 @@ function TaskFocusBlock({
 function ContextPackageBlock({
   contextPackage,
   sessionRefs,
-  selectedRefs,
   savingSessionRefs,
-  onOpenResource,
   onOpenTarget,
-  onUseRef,
   onRemoveRef,
 }: {
   contextPackage?: StrategicContextPackageDescriptor | null;
   sessionRefs: StrategicWorkSessionRefDescriptor[];
-  selectedRefs: StrategicSelectedRef[];
   savingSessionRefs?: boolean;
-  onOpenResource?: (resource: StrategicContextResourceRef) => void;
   onOpenTarget: (target?: StrategicContextPackageDrilldown['target'] | null) => void;
-  onUseRef?: (ref: StrategicSelectedRef) => void;
   onRemoveRef?: (ref: Pick<StrategicSelectedRef, 'kind' | 'id'>) => void;
 }) {
   if (!contextPackage) return null;
   const tone = contextPackageTone(contextPackage.status);
-  const sources = (contextPackage.sources ?? []).slice(0, 5);
   const itemCount = Number(contextPackage.item_count ?? 0);
-  const resources = (contextPackage.resources ?? []).slice(0, 4);
-  const mapNodes = (contextPackage.canvas?.nodes ?? [])
-    .filter(node => node.kind !== 'project')
-    .slice(0, 5);
   const nodeCount = contextPackage.canvas?.node_count ?? null;
   const edgeCount = contextPackage.canvas?.edge_count ?? null;
-  const selectedKeys = new Set(selectedRefs.map(sessionRefKey));
+  const descriptorCount = contextPackage.descriptors?.length ?? 0;
+  const resourceCount = contextPackage.resources?.length ?? 0;
+  const summaryItems = [
+    itemCount > 0 ? `${formatCompactNumber(itemCount)} items` : null,
+    nodeCount != null
+      ? `${formatCompactNumber(nodeCount)} nodes${edgeCount != null ? ` / ${formatCompactNumber(edgeCount)} links` : ''}`
+      : null,
+    resourceCount > 0 ? `${formatCompactNumber(resourceCount)} refs` : null,
+    descriptorCount > 0 ? `${formatCompactNumber(descriptorCount)} views` : null,
+  ].filter((item): item is string => Boolean(item));
 
   return (
-    <div className="border-b border-neutral-800 pb-3">
+    <div className="border-b border-neutral-800 pb-3" data-testid="strategic-context-package-summary">
       <div className="flex min-w-0 gap-2">
         <Network className="mt-0.5 h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
         <div className="min-w-0 flex-1">
           <div className="flex min-w-0 items-center gap-2">
-            <span className="truncate text-xs font-semibold text-neutral-100">{contextPackage.title}</span>
+            <span className="truncate text-xs font-semibold text-neutral-100">Context package</span>
             <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${tone.dot}`} aria-hidden="true" />
             <span className={`shrink-0 text-ui-sm font-semibold uppercase ${tone.text}`}>
               {tone.label}
             </span>
           </div>
-          <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500">
-            {itemCount > 0 && <span>{formatCompactNumber(itemCount)} items</span>}
-            {nodeCount != null && (
-              <span>
-                {formatCompactNumber(nodeCount)} nodes
-                {edgeCount != null ? ` / ${formatCompactNumber(edgeCount)} links` : ''}
-              </span>
-            )}
-          </div>
+          <p className="mt-1 line-clamp-1 text-xs leading-relaxed text-neutral-400">
+            {contextPackage.title}
+          </p>
+          {summaryItems.length > 0 && (
+            <div className="mt-1 flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500">
+              {summaryItems.map(item => <span key={item}>{item}</span>)}
+            </div>
+          )}
         </div>
       </div>
-      {sources.length > 0 && (
-        <div className="mt-2 flex flex-wrap gap-1.5">
-          {sources.map(source => (
-            <span
-              key={source.kind}
-              className="rounded border border-neutral-800 bg-neutral-950/70 px-1.5 py-0.5 text-ui-sm font-medium text-neutral-500"
-            >
-              {source.kind.replace(/_/g, ' ')} {formatCompactNumber(source.count)}
-            </span>
-          ))}
-        </div>
-      )}
       <SessionContextList
         refs={sessionRefs}
         onOpenTarget={onOpenTarget}
         onRemove={onRemoveRef}
         disabled={savingSessionRefs}
       />
-      <StrategicContextArtifactSlot
-        contextPackage={contextPackage}
-        onOpenTarget={onOpenTarget}
-      />
-      {mapNodes.length > 0 && (
-        <div className="mt-2" data-testid="strategic-context-map">
-          <div className="mb-1 text-ui-sm font-semibold uppercase text-neutral-500">Context map</div>
-          <div className="rounded-md border border-neutral-800 bg-neutral-950/40 px-2.5">
-            {mapNodes.map(node => {
-              const ref = selectedRefFromNode(node);
-              const key = sessionRefKey(ref);
-              return (
-                <ContextMapNodeRow
-                  key={node.id}
-                  node={node}
-                  selected={selectedKeys.has(key)}
-                  disabled={savingSessionRefs}
-                  onOpenTarget={onOpenTarget}
-                  onUse={onUseRef ? () => onUseRef(ref) : undefined}
-                  onRemove={onRemoveRef ? () => onRemoveRef(ref) : undefined}
-                />
-              );
-            })}
-          </div>
-        </div>
-      )}
-      {resources.length > 0 && (
-        <div className="mt-2 space-y-1.5" data-testid="strategic-context-resources">
-          {resources.map(resource => (
-            (() => {
-              const ref = selectedRefFromResource(resource);
-              const key = sessionRefKey(ref);
-              return (
-                <ContextResourceButton
-                  key={`${resource.kind}:${resource.id}`}
-                  resource={resource}
-                  selected={selectedKeys.has(key)}
-                  disabled={savingSessionRefs}
-                  onOpen={onOpenResource}
-                  onUse={onUseRef ? () => onUseRef(ref) : undefined}
-                  onRemove={onRemoveRef ? () => onRemoveRef(ref) : undefined}
-                />
-              );
-            })()
-          ))}
-        </div>
-      )}
     </div>
   );
 }
@@ -960,11 +760,8 @@ export function StrategicContextRail({
   const runtimeWork = state?.runtime?.work ?? null;
   const pendingSteer = state?.strategic.refresh.pending ?? null;
   const latestCycle = state?.strategic.latest_cycle ?? null;
-  const taskCounts = state?.tasks.counts;
   const attention = state?.attention ?? null;
   const attentionItems = attention?.items.slice(0, 2) ?? [];
-  const attentionNeeds = attention?.counts.needs_operator ?? 0;
-  const attentionWatch = attention?.counts.watch ?? 0;
   const staleCycle = Boolean(activeCycle?.stale);
   const shaFreshness = state?.sha_freshness ?? null;
   const operatorSteerQueued = Boolean(
@@ -1034,14 +831,17 @@ export function StrategicContextRail({
   const hasLocalRunnerHolds = (runtimeWork?.local_runner_holds?.count ?? 0) > 0;
   const accountStatus = accountSpend ? accountSpendTone(accountSpend) : null;
   const accountDetail = accountSpend ? accountSpendDetail(accountSpend) : null;
+  const showAccountStatus = Boolean(accountSpend && accountStatus && accountSpendHasProblem(accountSpend, accountStatus));
   const openAccountSpend = onOpenAccounts ?? onOpenSpend;
   const accountActionText = onOpenAccounts ? 'Accounts' : 'Spend';
   const accountActionLabel = onOpenAccounts ? 'accounts' : 'spend';
   const workSessionActions = state?.work_session?.actions ?? [];
   const workSessionEvents = state?.work_session?.events?.items ?? [];
-  const visibleWorkSessionActions = workSessionActions.slice(0, 4);
-  const visibleWorkSessionActionIds = new Set(visibleWorkSessionActions.filter(action => action.enabled).map(action => action.id));
+  const visibleWorkSessionActions = workSessionActions.filter(action => action.enabled).slice(0, 4);
+  const visibleWorkSessionActionIds = new Set(visibleWorkSessionActions.map(action => action.id));
   const visibleAttentionItems = attentionItems.filter(item => !visibleWorkSessionActionIds.has(`attention.${item.id}`));
+  const actionableWorkSessionEvents = workSessionEvents.filter(workSessionEventHasActionableSignal).slice(0, 2);
+  const showActionableSessionActivity = visibleWorkSessionActions.length === 0 && actionableWorkSessionEvents.length > 0;
   const selectedRefs = workbenchState?.selected_refs ?? state?.work_session?.selected_refs ?? state?.workbench?.selected_refs ?? [];
   const workSessionDescriptors = state?.work_session?.selected_ref_descriptors ?? [];
   const descriptorByRef = new Map(workSessionDescriptors.map(descriptor => [sessionRefKey(descriptor), descriptor]));
@@ -1110,10 +910,6 @@ export function StrategicContextRail({
     (onOpenTarget ?? fallbackOpenContextTarget)(target);
   }
 
-  function openContextResource(resource: StrategicContextResourceRef): void {
-    openContextTarget(resource.target);
-  }
-
   function workSessionActionClick(action: StrategicWorkSessionAction): (() => void) | undefined {
     if (!action.enabled) return undefined;
     const target = action.target ?? null;
@@ -1140,11 +936,6 @@ export function StrategicContextRail({
     return contextTarget ? () => openContextTarget(contextTarget) : undefined;
   }
 
-  function useSessionRef(ref: StrategicSelectedRef): void {
-    if (!onUpdateSessionRefs) return;
-    onUpdateSessionRefs(refs => upsertStrategicSelectedRef(refs, ref));
-  }
-
   function removeSessionRef(ref: Pick<StrategicSelectedRef, 'kind' | 'id'>): void {
     if (!onUpdateSessionRefs) return;
     onUpdateSessionRefs(refs => removeStrategicSelectedRef(refs, ref));
@@ -1160,19 +951,11 @@ export function StrategicContextRail({
             <p className="mt-1 line-clamp-3 text-xs leading-relaxed text-neutral-400">{statusDetail}</p>
           </div>
         </div>
-        {(pendingSteer?.operator_count || latestCycle) && (
+        {pendingSteer?.operator_count ? (
           <div className="mt-3 border-t border-neutral-800 pt-2">
-            {pendingSteer?.operator_count ? (
-              <StatRow label="queued steers" value={pendingSteer.operator_count} />
-            ) : null}
-            {latestCycle ? (
-              <StatRow
-                label="last cycle"
-                value={`${latestCycle.directions_created} opened / ${latestCycle.tasks_spawned} tasks`}
-              />
-            ) : null}
+            <StatRow label="queued steers" value={pendingSteer.operator_count} />
           </div>
-        )}
+        ) : null}
         <div className="mt-3 flex flex-wrap gap-2 border-t border-neutral-800 pt-3">
           {onOpenContextWorkspace && <RailButton onClick={onOpenContextWorkspace}>Open context</RailButton>}
           <RailButton onClick={onOpenPipeline}>Pipeline</RailButton>
@@ -1197,7 +980,7 @@ export function StrategicContextRail({
             </div>
           </div>
         )}
-        {accountSpend && accountStatus && (
+        {accountSpend && accountStatus && showAccountStatus && (
           <div className="mt-3 border-t border-neutral-800 pt-3" data-testid="strategic-account-status">
             <div className="flex min-w-0 items-center gap-2">
               <CreditCard className="h-4 w-4 shrink-0 text-neutral-500" aria-hidden="true" />
@@ -1303,17 +1086,17 @@ export function StrategicContextRail({
             </div>
           </div>
         )}
-        {workSessionEvents.length > 0 && (
+        {showActionableSessionActivity && (
           <div className="mt-3 border-t border-neutral-800 pt-3" data-testid="strategic-session-activity">
             <div className="mb-1 flex min-w-0 items-center justify-between gap-2">
-              <span className="truncate text-xs font-semibold text-neutral-100">Recent flow</span>
+              <span className="truncate text-xs font-semibold text-neutral-100">Recent signal</span>
               <span className="shrink-0 font-mono text-ui-sm text-neutral-600">
-                {formatCompactNumber(workSessionEvents.length)}
+                {formatCompactNumber(actionableWorkSessionEvents.length)}
               </span>
             </div>
             <StrategicSessionEvents
-              events={workSessionEvents}
-              limit={3}
+              events={actionableWorkSessionEvents}
+              limit={2}
               density="compact"
               onOpenTarget={openContextTarget}
             />
@@ -1325,7 +1108,6 @@ export function StrategicContextRail({
       <TaskFocusBlock
         focus={state?.tasks.focus ?? null}
         onOpenTask={onOpenTask}
-        onOpenPipeline={onOpenPipeline}
       />
 
       <WorkbenchPanel title="Context" meta={formatCost(state?.tasks.cumulative_estimated_cost_usd)}>
@@ -1380,34 +1162,20 @@ export function StrategicContextRail({
           <ContextPackageBlock
             contextPackage={state?.context_package}
             sessionRefs={selectedRefDescriptors}
-            selectedRefs={selectedRefs}
             savingSessionRefs={savingSessionRefs}
-            onOpenResource={openContextResource}
             onOpenTarget={openContextTarget}
-            onUseRef={onUpdateSessionRefs ? useSessionRef : undefined}
             onRemoveRef={onUpdateSessionRefs ? removeSessionRef : undefined}
           />
-          <div>
-            <div className="mb-1 flex items-center gap-2 text-xs font-semibold text-neutral-100">
-              <FileText className="h-4 w-4 text-neutral-500" aria-hidden="true" />
-              Running update
-            </div>
-            <p className="line-clamp-3 text-xs leading-relaxed text-neutral-400">
-              {state?.running_update.excerpt || 'No running update yet.'}
-            </p>
-          </div>
-          <div className="border-t border-neutral-800 pt-2">
-            <StatRow label="running" value={taskCounts?.running ?? 0} />
-            <StatRow label="queued" value={taskCounts?.queued ?? 0} />
-            <StatRow label="blocked" value={taskCounts?.blocked ?? 0} />
-            <StatRow label="parked" value={taskCounts?.parked ?? 0} />
-            <StatRow label="needs operator" value={attentionNeeds} />
-            <StatRow label="watch" value={attentionWatch} />
-            <StatRow label="linked messages" value={state?.messages.counts.linked ?? 0} />
-          </div>
           <div className="flex flex-wrap gap-2">
-            <RailButton onClick={onOpenPipeline}>Pipeline</RailButton>
             <RailButton onClick={onOpenRuntimeHealth}>Runtime</RailButton>
+            {openAccountSpend && !showAccountStatus && (
+              <RailButton
+                onClick={openAccountSpend}
+                ariaLabel={`Open ${accountActionLabel}`}
+              >
+                {accountActionText}
+              </RailButton>
+            )}
             {state?.design.has_design_doc && (
               <RailButton onClick={() => onOpenProjectSection('design-doc')}>Design</RailButton>
             )}

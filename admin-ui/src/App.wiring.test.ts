@@ -43,6 +43,19 @@ describe('App workbench wiring', () => {
     expect(appSource).toContain('Open tracked task streams in Pipeline');
   });
 
+  test('keeps removed task status presets from leaving invisible persisted filters active', () => {
+    expect(appSource).toContain('const ACTIVE_TASK_STATUS_FILTER = STATUS_OPTIONS.map(option => option.value);');
+    expect(appSource).toMatch(/if \(!sameStringSet\(s\.statusFilter, ACTIVE_TASK_STATUS_FILTER\)\) \{[\s\S]*setStatusFilter\(\[\.\.\.ACTIVE_TASK_STATUS_FILTER\]\);/);
+    expect(appSource).toContain('if (s.requiresApproval) setRequiresApproval(false);');
+    expect(appSource).toContain('if (s.stuckFilter) setStuckFilter(false);');
+    expect(appSource).toContain('if (s.stuckMinSeconds !== 0) setStuckMinSeconds(0);');
+    expect(appSource).toContain('const statusMatch = matchesStatusFilter(t.status, ACTIVE_TASK_STATUS_FILTER);');
+    expect(appSource).not.toContain('statusFilter={s.statusFilter}');
+    expect(appSource).not.toContain('onStatusFilterChange={s.setStatusFilter}');
+    expect(appSource).not.toContain('const approvalMatch = !s.requiresApproval');
+    expect(appSource).not.toContain('const stuckMatch = !s.stuckFilter');
+  });
+
   test('keeps bracket section cycling wired through the real Pipeline view state', () => {
     expect(appSource).toContain("const PIPELINE_SECTION_ORDER: readonly PipelineSection[] = ['flow', 'board', 'archive'];");
     expect(appSource).toMatch(/const applyPipelineSection = useCallback\(\(section: PipelineSection\) => \{[\s\S]*setPipelineSection\(section\);[\s\S]*setArchiveVisible\(section === 'archive'\);[\s\S]*if \(section === 'flow'\) setTaskViewMode\('pipeline'\);[\s\S]*if \(section === 'board'\) setTaskViewMode\('kanban'\);/);

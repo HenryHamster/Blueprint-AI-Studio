@@ -162,14 +162,14 @@ describe('PipelineWorkspace status strip', () => {
     expect(screen.getByRole('button', { name: 'Tasks' })).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('button', { name: 'Board' })).toBeInTheDocument();
     expect(screen.queryByTestId('pipeline-status-details')).not.toBeInTheDocument();
-    expect(screen.getByText('Task monitor')).toBeInTheDocument();
+    expect(screen.getByText('Data health')).toBeInTheDocument();
     expect(screen.getByText('acme/widgets')).toHaveAttribute('title', 'Project-scoped task view: acme/widgets');
     expect(screen.getByText('2/7 shown')).toHaveAttribute('title', 'Rows currently displayed compared with the loaded page');
     expect(screen.getByText('fetched 30s ago')).toBeInTheDocument();
     expect(screen.getByText('API healthy')).toBeInTheDocument();
     expect(screen.getByText('Stream on')).toBeInTheDocument();
 
-    fireEvent.click(screen.getByTitle('Show monitoring details'));
+    fireEvent.click(screen.getByTitle('Show data details'));
     const details = screen.getByTestId('pipeline-status-details');
     expect(within(details).getByText('Scope')).toBeInTheDocument();
     expect(within(details).getByText('Displayed')).toBeInTheDocument();
@@ -200,7 +200,7 @@ describe('PipelineWorkspace status strip', () => {
     expect(screen.getByText('API healthy')).toHaveAttribute('title', 'Task API health from the existing poller state');
     expect(screen.queryByText(/Stream (on|off)/)).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByTitle('Show monitoring details'));
+    fireEvent.click(screen.getByTitle('Show data details'));
     expect(screen.getByText('Event stream')).toBeInTheDocument();
     expect(screen.getByText('not reported')).toBeInTheDocument();
   });
@@ -225,7 +225,7 @@ describe('PipelineWorkspace status strip', () => {
     expect(screen.getByText('data stale 5m ago')).toBeInTheDocument();
     expect(screen.getByText('Stream off')).toBeInTheDocument();
 
-    fireEvent.click(screen.getByTitle('Show monitoring details'));
+    fireEvent.click(screen.getByTitle('Show data details'));
     expect(screen.getByText('disconnected')).toBeInTheDocument();
   });
 

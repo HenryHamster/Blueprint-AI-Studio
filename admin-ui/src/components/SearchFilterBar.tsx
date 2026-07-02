@@ -10,8 +10,6 @@ interface SearchFilterBarProps {
   onSearchChange: (query: string) => void;
   taskTypeFilter: string[];
   onTypeFilterChange: (filter: string[]) => void;
-  statusFilter?: string[];
-  onStatusFilterChange?: (filter: string[]) => void;
   failureClassFilter?: string[];
   onFailureClassFilterChange?: (filter: string[]) => void;
   dateRange: DateRange;
@@ -21,7 +19,6 @@ interface SearchFilterBarProps {
   directionFilter?: string;
   onDirectionFilterChange?: (v: string) => void;
   directions?: { id: string; text: string }[];
-  onDownloadCsv: () => void;
   inputRef?: RefObject<HTMLInputElement | null>;
 }
 
@@ -181,7 +178,7 @@ const DATE_RANGE_OPTIONS: { label: string; value: DateRange }[] = [
 const DATE_RANGE_SELECT_OPTIONS: { label: string; value: string }[] = DATE_RANGE_OPTIONS.map(o => ({ label: o.label, value: o.value }));
 const FAILURE_CLASS_OPTIONS = Object.entries(FAILURE_CLASS_CONFIG).map(([value, config]) => ({ value, label: config.label }));
 
-export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, failureClassFilter = [], onFailureClassFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, directionFilter = '', onDirectionFilterChange, directions, onDownloadCsv, inputRef }: SearchFilterBarProps) {
+export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, onTypeFilterChange, failureClassFilter = [], onFailureClassFilterChange, dateRange, onDateRangeChange, blockedFilter, onBlockedFilterChange, directionFilter = '', onDirectionFilterChange, directions, inputRef }: SearchFilterBarProps) {
   const [inputValue, setInputValue] = useState(searchQuery);
   const { filterOptions: typeOptions } = useTaskCapabilities();
   useEffect(() => {
@@ -256,7 +253,7 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
         onClick={() => onBlockedFilterChange(!blockedFilter)}
         className={`flex items-center gap-1.5 px-2.5 py-1.5 min-h-11 rounded-md text-xs font-medium transition-all border md:min-h-8 md:py-1 ${
           blockedFilter
-            ? 'bg-amber-950/30 border-amber-700/60 text-amber-400'
+            ? 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300'
             : 'bg-neutral-900/50 border-neutral-800/50 text-neutral-400 hover:border-neutral-700 hover:text-neutral-300'
         }`}
       >
@@ -278,14 +275,6 @@ export function SearchFilterBar({ searchQuery, onSearchChange, taskTypeFilter, o
           isActive={opt => opt === directionFilter && directionFilter !== ''}
         />
       )}
-
-      <button
-        onClick={onDownloadCsv}
-        title="Download CSV"
-        className="min-h-11 rounded-md border border-neutral-800/50 bg-neutral-900/50 px-3 py-1.5 text-xs font-medium text-neutral-400 transition-colors hover:border-neutral-700 hover:text-neutral-300 md:min-h-8 md:py-1"
-      >
-        CSV
-      </button>
 
       {hasActiveFilters && (
         <button

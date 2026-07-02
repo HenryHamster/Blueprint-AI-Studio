@@ -25,6 +25,30 @@ vi.mock('./AutonomousStatus', () => ({
   AutonomousStatus: () => <div data-testid="autonomous-status" />,
 }));
 
+vi.mock('./StrategicContextRail', () => ({
+  StrategicContextRail: ({
+    onOpenRuntimeDevices,
+    onOpenRuntimeCompute,
+    onOpenAccounts,
+    onOpenContextWorkspace,
+    onOpenPipeline,
+  }: {
+    onOpenRuntimeDevices?: () => void;
+    onOpenRuntimeCompute?: () => void;
+    onOpenAccounts?: () => void;
+    onOpenContextWorkspace?: () => void;
+    onOpenPipeline?: () => void;
+  }) => (
+    <div data-testid="strategic-context-rail" className="grid gap-1">
+      <button type="button" onClick={onOpenRuntimeDevices}>Devices</button>
+      <button type="button" onClick={onOpenAccounts}>Accounts</button>
+      <button type="button" onClick={onOpenRuntimeCompute}>Compute</button>
+      <button type="button" onClick={onOpenContextWorkspace}>Open context</button>
+      <button type="button" onClick={onOpenPipeline}>Pipeline</button>
+    </div>
+  ),
+}));
+
 const noop = () => {};
 
 const STATE = {
@@ -424,24 +448,27 @@ describe('WorkbenchComposition viewport regression', () => {
     await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 75)); });
   }
 
-  test('desktop shell keeps global header clean and preserves chat, composer, and rail', async () => {
+  test('desktop shell shows header command search and preserves chat, composer, and rail', async () => {
     await expectNoOverflowAt(1280, renderWorkbenchShell, { height: 800, waitMs: 50 });
 
     const globalHeader = host?.querySelector('header');
+    const headerCommandSearch = globalHeader?.querySelector<HTMLButtonElement>('[data-testid="header-command-search"]');
     const composer = host?.querySelector('[data-testid="strategic-composer-box"]');
     const conversationColumn = host?.querySelector('[data-testid="strategic-conversation-column"]');
     const rail = host?.querySelector('[data-testid="strategic-context-rail"]');
 
     expect(globalHeader).toBeTruthy();
-    expect(globalHeader?.querySelector('button[title="Open command palette (Ctrl+K)"]')).toBeNull();
-    expect(globalHeader?.querySelector('input[placeholder*="Command" i]')).toBeNull();
+    expect(headerCommandSearch).toBeTruthy();
+    expect(headerCommandSearch?.textContent).toContain('Ctrl K');
+    expect(headerCommandSearch?.textContent).not.toContain('Search commands');
+    expect(headerCommandSearch?.textContent).not.toContain('Message Strategic');
     expect(composer).toBeTruthy();
     expect(conversationColumn).toBeTruthy();
     expect(rail).toBeTruthy();
     expect(getComputedStyle(rail!.closest('aside')!).display).not.toBe('none');
   });
 
-  test('breakpoint shell keeps monitoring visible with one composer command launcher', async () => {
+  test('breakpoint shell keeps monitoring visible with header command launcher', async () => {
     const onOpenCommandPalette = vi.fn();
     const onOpenDevices = vi.fn();
     const onOpenAccounts = vi.fn();
@@ -465,11 +492,13 @@ describe('WorkbenchComposition viewport regression', () => {
     const sessionControl = host?.querySelector('[data-testid="strategic-session-control"]');
     const rail = host?.querySelector('[data-testid="strategic-context-rail"]');
     const railButtons = Array.from(rail?.querySelectorAll<HTMLButtonElement>('button') ?? []);
+    const headerCommandSearch = host?.querySelector<HTMLButtonElement>('[data-testid="header-command-search"]');
     const commandButtons = Array.from(host?.querySelectorAll<HTMLButtonElement>('button[title="Open command palette (Ctrl+K)"]') ?? [])
       .filter(button => {
         const rect = button.getBoundingClientRect();
         return rect.width > 0 && rect.height > 0 && getComputedStyle(button).display !== 'none';
       });
+    const composerCommandButtons = commandButtons.filter(button => button.closest('[data-testid="strategic-composer-box"]'));
 
     expect(sessionControl).toBeTruthy();
     expect(getComputedStyle(sessionControl as Element).display).not.toBe('none');
@@ -491,9 +520,10 @@ describe('WorkbenchComposition viewport regression', () => {
     expect(rail).toBeTruthy();
     expect(getComputedStyle(rail!.closest('aside')!).display).not.toBe('none');
     expect(host?.querySelector<HTMLButtonElement>('button[aria-label="Open Strategic context"]')).toBeNull();
-    expect(commandButtons).toHaveLength(1);
-    expect(commandButtons[0].closest('[data-testid="strategic-composer-box"]')).toBeTruthy();
-    await act(async () => { commandButtons[0].click(); });
+    expect(headerCommandSearch).toBeTruthy();
+    expect(commandButtons).toContain(headerCommandSearch);
+    expect(composerCommandButtons).toHaveLength(0);
+    await act(async () => { headerCommandSearch!.click(); });
     expect(onOpenCommandPalette).toHaveBeenCalledOnce();
     expect(onOpenDevices).not.toHaveBeenCalled();
     await act(async () => { devicesButton!.click(); });
