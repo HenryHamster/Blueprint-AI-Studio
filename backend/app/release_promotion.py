@@ -877,6 +877,36 @@ async def promote(
 
     release_branch = f"release-v{version.version_number}"
 
+    # --- Promotion CLAIM: fence the in-flight promotion BEFORE the lock frees -
+    # promote() must release the row lock (the intermediate commit below) before
+    # its 30-120s of GitHub I/O, but the real ``promotion_pending`` record is
+    # only written AFTER that I/O.  Without a marker, a concurrent
+    # ``run_qualification`` on a newer HEAD acquires the freed lock DURING the
+    # I/O window, sees no ``promotion_pending``, sails past Guard 2b
+    # (``_promotion_in_flight_result``), re-cuts, and CLOBBERS the in-flight
+    # promotion's provenance (the PR #12492 incident).  So stamp a lightweight
+    # CLAIM here, carried on the SAME transaction the intermediate commit makes
+    # durable: ``summarize_qualification_state`` already classifies ANY
+    # ``promotion_pending`` dict as ``promotion_in_flight`` (a
+    # PROMOTION_BLOCKING_STATE), so from the instant this commits both Guard 2b
+    # and the version-cut lever refuse concurrent re-qualification.  promote()'s
+    # normal pending/success writers overwrite this claim with the real
+    # pr_number/url after the I/O; every failure path
+    # (``_record_promotion_failure``) drops ``promotion_pending`` and so clears
+    # it; and ``_reconcile_if_promotion_pending_timed_out`` GCs a claim orphaned
+    # by a crash between here and the PR opening on a SHORT bound (it carries
+    # ``claiming`` and has no ``pr_number``).
+    _claim_record = dict(version.last_qualification or {})
+    _claim_record.update(base_record or {})
+    _claim_record["status"] = "pending"
+    _claim_record["promotion_pending"] = {
+        "claiming": True,
+        "candidate_sha": candidate_sha,
+        "enabled_at": _utcnow().isoformat(),
+    }
+    version.last_qualification = _claim_record
+    session.add(version)
+
     # --- Release the ReleaseVersion row lock BEFORE any GitHub I/O ----------
     # Audit R4-H3 + concern 2: the caller-supplied dedicated session holds a
     # FOR UPDATE lock on this version row (taken by _finalize_in_dedicated_session).

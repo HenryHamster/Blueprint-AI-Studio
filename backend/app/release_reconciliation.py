@@ -91,6 +91,17 @@ logger = logging.getLogger(__name__)
 # the 4h stall alert and any realistic CI duration so it only fires on a
 # genuinely wedged promotion, never on a slow-but-progressing one.
 _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT = 24 * 3600
+# A bare promotion CLAIM (``promotion_pending`` carrying ``claiming`` with no
+# ``pr_number`` yet) is written under-lock by promote() immediately before it
+# releases the row lock for its 30-120s of GitHub I/O, so a concurrent
+# re-qualify cannot clobber the in-flight promotion.  Its entire legitimate
+# lifetime is that I/O window; a claim older than this bound means promote()
+# crashed between claiming and opening the PR, so the reaper GCs it far sooner
+# than the 24h cap a real open-PR promotion inherits.  This is strict-dominance
+# behavior (an orphaned pre-PR claim is always garbage), not a tunable — but the
+# 24h resolver still governs a real stranded PR.  10 min is comfortably beyond
+# any real promote() I/O and well under the 24h cap.
+_PROMOTION_CLAIM_TIMEOUT_SECONDS = 10 * 60
 _MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT = 10
 _MANAGED_CHECK_WAIT_DETAIL_TEXT_LIMIT = 160
 # Number of consecutive sweeps where CI is red due to only transient conclusions
@@ -2813,6 +2824,16 @@ async def _reconcile_if_promotion_pending_timed_out(
 
             age_seconds = (_utcnow() - enabled_at).total_seconds()
             cap_seconds = _promotion_pending_timeout_seconds()
+            # A bare promotion CLAIM (``claiming`` + no ``pr_number``) is only
+            # ever alive for promote()'s 30-120s I/O window; if it has aged past
+            # the short claim bound, promote() crashed between claiming and
+            # opening the PR, so GC it now instead of letting it inherit the 24h
+            # cap and wedge the version out of re-qualification.
+            _is_bare_claim = bool(pending.get("claiming")) and not pending.get(
+                "pr_number"
+            )
+            if _is_bare_claim:
+                cap_seconds = min(cap_seconds, _PROMOTION_CLAIM_TIMEOUT_SECONDS)
             if age_seconds < cap_seconds:
                 return False
 
@@ -2836,27 +2857,48 @@ async def _reconcile_if_promotion_pending_timed_out(
             # CLEARS the sub-state and re-arms the qualification-timeout backstop.
             base_record = {k: v for k, v in qual.items() if k != "promotion_pending"}
 
-            logger.warning(
-                "[RELEASE_QUALIFIER] reconcile promotion_pending_timeout: v%d "
-                "promotion PR #%s has been pending %.1fh (> %.1fh cap) — "
-                "force-failing as promotion_pending_timeout so the version "
-                "returns to stabilize and the normal backstop re-arms",
-                version.version_number,
-                pr_number,
-                age_hours,
-                cap_seconds / 3600.0,
-            )
-            await _record_promotion_failure(
-                session,
-                version,
-                base_record,
-                "promotion_pending_timeout",
-                detail=(
+            if _is_bare_claim:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile promotion_claim_abandoned: v%d "
+                    "held a bare promotion claim %.0fs (> %.0fs cap) with no PR — "
+                    "promote() crashed between claiming the promotion and opening "
+                    "the PR; clearing the claim so the version returns to "
+                    "stabilize and re-qualifies",
+                    version.version_number,
+                    age_seconds,
+                    cap_seconds,
+                )
+                _timeout_error = "promotion_claim_abandoned"
+                _timeout_detail = (
+                    f"bare promotion claim stranded {age_seconds:.0f}s "
+                    f"(> {cap_seconds:.0f}s cap) with no PR opened — promote() "
+                    f"crashed mid-claim; cleared so the version retries "
+                    f"qualification"
+                )
+            else:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile promotion_pending_timeout: v%d "
+                    "promotion PR #%s has been pending %.1fh (> %.1fh cap) — "
+                    "force-failing as promotion_pending_timeout so the version "
+                    "returns to stabilize and the normal backstop re-arms",
+                    version.version_number,
+                    pr_number,
+                    age_hours,
+                    cap_seconds / 3600.0,
+                )
+                _timeout_error = "promotion_pending_timeout"
+                _timeout_detail = (
                     f"promotion PR #{pr_number} stranded in promotion_pending "
                     f"for {age_hours:.0f}h (> {cap_seconds / 3600.0:.0f}h cap) "
                     f"without a terminal merge/close/CI signal — force-failed so "
                     f"the version retries qualification"
-                ),
+                )
+            await _record_promotion_failure(
+                session,
+                version,
+                base_record,
+                _timeout_error,
+                detail=_timeout_detail,
                 pr_url=pr_url,
                 lock_released=False,
             )

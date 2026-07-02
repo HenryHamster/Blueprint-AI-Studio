@@ -1681,6 +1681,35 @@ def test_qual_state_pending_no_audit_signal_stays_qualifying():
     assert state["state"] == "qualifying"
 
 
+def test_summarize_qualification_state_bare_promotion_claim_blocks():
+    """A bare promotion CLAIM must be recognized as a promotion-blocking state.
+
+    promote() writes ``promotion_pending = {claiming: True, candidate_sha, ...}``
+    under the row lock BEFORE releasing it for its 30-120s of GitHub I/O, so a
+    concurrent re-qualify can't clobber the in-flight promotion. The claim has no
+    ``pr_number`` yet (the PR isn't open), so summarize must still classify it as
+    ``promotion_in_flight`` ∈ ``PROMOTION_BLOCKING_STATES`` — that is what makes
+    Guard 2b (``_promotion_in_flight_result``) and the version-cut lever refuse a
+    concurrent qualify from the instant the claim commits. If this regressed to
+    ``qualifying`` the clobber race (PR #12492) would reopen."""
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "candidate_sha": "abcd" * 10,
+            "promotion_pending": {
+                "claiming": True,
+                "candidate_sha": "abcd" * 10,
+                "enabled_at": _utcnow().isoformat(),
+            },
+        }
+    )
+    assert state is not None
+    assert state["state"] == "promotion_in_flight"
+    assert state["state"] in rv.PROMOTION_BLOCKING_STATES
+    # No PR exists yet — the claim precedes the promotion PR being opened.
+    assert state.get("promotion_pr_number") is None
+
+
 def test_qual_state_pending_running_audit_child_stays_qualifying():
     """A non-terminal audit child (still running) must keep ``qualifying``."""
     for running in ("QUEUED", "PROVISIONING", "IN_PROGRESS", "EVALUATING"):

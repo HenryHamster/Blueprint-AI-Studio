@@ -25,6 +25,7 @@ import pytest
 from app import release_version as rv
 from app.models import Project
 from app.release_reconciliation import (
+    _PROMOTION_CLAIM_TIMEOUT_SECONDS,
     _promotion_pending_timeout_seconds,
     _reconcile_if_ci_unresolved_now_green,
     _reconcile_if_managed_check_wait,
@@ -1180,6 +1181,87 @@ async def test_reconcile_promotion_pending_timeout_never_touches_main(db_session
     assert version.last_qualification["status"] == "promotion_failed"
     assert version.last_qualification["error"] == "promotion_pending_timeout"
     assert "promotion_pending" not in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_reconcile_promotion_claim_abandoned_short_timeout(db_session):
+    """A bare promotion CLAIM orphaned by a promote() crash is GC'd on the SHORT
+    claim bound, not the 24h open-PR cap.
+
+    promote() stamps ``promotion_pending = {claiming: True, ...}`` under the row
+    lock before its GitHub I/O so a concurrent re-qualify can't clobber the
+    in-flight promotion. If promote() then crashes before opening the PR, the
+    claim (which has NO pr_number) would otherwise inherit the 24h pending cap
+    and wedge the version out of re-qualification for a day. The reaper must age
+    a bare claim against ``_PROMOTION_CLAIM_TIMEOUT_SECONDS`` instead — clearing
+    it back to stabilize so the version re-qualifies promptly. main is untouched.
+    """
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    # Older than the SHORT claim bound, but FAR younger than the 24h pending cap,
+    # so only the claim-specific short bound can be what clears it.
+    stranded_enabled = (
+        _utcnow() - timedelta(seconds=_PROMOTION_CLAIM_TIMEOUT_SECONDS + 60)
+    ).isoformat()
+    assert _PROMOTION_CLAIM_TIMEOUT_SECONDS + 60 < _promotion_pending_timeout_seconds()
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "promotion_pending": {
+            "claiming": True,
+            "candidate_sha": "abcd" * 10,
+            "enabled_at": stranded_enabled,
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    timed_out = await _reconcile_if_promotion_pending_timed_out(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert timed_out is True
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "promotion_claim_abandoned"
+    assert "promotion_pending" not in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_reconcile_fresh_promotion_claim_is_left_alone(db_session):
+    """A FRESH claim (younger than the short bound) must NOT be cleared — the
+    reaper cannot race a promote() whose GitHub I/O is legitimately still in
+    flight, or it would tear down a live promotion mid-flight."""
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    fresh_enabled = (_utcnow() - timedelta(seconds=5)).isoformat()
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "promotion_pending": {
+            "claiming": True,
+            "candidate_sha": "abcd" * 10,
+            "enabled_at": fresh_enabled,
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    timed_out = await _reconcile_if_promotion_pending_timed_out(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert timed_out is False
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["promotion_pending"]["claiming"] is True
 
 
 # ===========================================================================

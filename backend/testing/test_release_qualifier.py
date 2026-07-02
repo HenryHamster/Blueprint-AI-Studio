@@ -11727,6 +11727,78 @@ async def test_promote_success_opens_next_version(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_promote_writes_claim_before_pr_io(db_session, mocker):
+    """promote() must persist a promotion CLAIM under the row lock BEFORE it
+    releases the lock for its GitHub I/O.
+
+    Without the claim, a concurrent ``run_qualification`` on a newer HEAD
+    acquires the freed lock during the 30-120s I/O window, sees no
+    ``promotion_pending``, sails past Guard 2b, re-cuts, and clobbers the
+    in-flight promotion's record (the PR #12492 incident). This asserts the fix
+    by observing the COMMITTED DB row at the moment ``create_pull_request`` runs:
+    the claim (``promotion_pending.claiming``) must already be durable then, so a
+    concurrent qualifier in that window would see it and refuse."""
+    _project, version = await _make_project_and_version(db_session)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(main="mainnew" * 5 + "00000"),
+    )
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+
+    captured: dict = {}
+
+    async def _capture_claim_then_open_pr(*args, **kwargs):
+        # Re-read the version row from the DB (populate_existing bypasses the
+        # identity-map cache) to observe the COMMITTED state at PR-open time —
+        # this is exactly what a concurrent qualifier's FOR UPDATE read sees.
+        obj = (
+            (
+                await db_session.execute(
+                    select(rv.ReleaseVersion)
+                    .where(rv.ReleaseVersion.id == version.id)
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        captured["promotion_pending"] = (obj.last_qualification or {}).get(
+            "promotion_pending"
+        )
+        return {"number": 5, "html_url": "http://pr/5"}
+
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(side_effect=_capture_claim_then_open_pr),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+
+    result = await rq.promote(
+        db_session, version, "1234" * 10, composite={"confidence": 0.88}
+    )
+    await db_session.commit()
+
+    assert result["status"] == "promoted"
+    # The claim was durable in the committed DB row when the PR I/O ran, so a
+    # concurrent re-qualify in that window would have seen it and refused.
+    assert captured["promotion_pending"] is not None, (
+        "no promotion_pending was committed before create_pull_request ran — "
+        "the claim must be written under-lock before the I/O"
+    )
+    assert captured["promotion_pending"]["claiming"] is True
+    assert captured["promotion_pending"]["candidate_sha"] == "1234" * 10
+
+
+@pytest.mark.asyncio
 async def test_promote_blocks_on_dual_alembic_head(db_session, mocker):
     """The pre-merge Alembic dual-head guard HOLDS a promotion whose added
     migration reuses a revision id already on the promotion target.
