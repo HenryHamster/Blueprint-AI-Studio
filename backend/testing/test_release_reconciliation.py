@@ -1275,6 +1275,72 @@ async def test_reconcile_not_promoted_hard_blocker_is_inert(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_reconcile_not_promoted_ci_unresolved_armed_merge_grade_propagates(
+    db_session, mocker
+):
+    """_reconcile_if_not_promoted_but_pr_merged: a not_promoted/ci_unresolved
+    record carrying merge_grade_misses=True reconciles to promoted AND the
+    armed merge-grade signal propagates through _recover_confidence_from_ci_unresolved
+    into the final promotion record.
+
+    Regression guard: _recover_confidence_from_ci_unresolved calls
+    _merge_grade_misses_armed which checks base_record["merge_grade_misses"]
+    first (before the policy threshold).  A stored True must survive the
+    recovery path so the promoted record reflects the actual merge-grade
+    verdict, not a silently-laundered clean bill of health.
+    """
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="release0" * 5),
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
+    )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_unresolved",
+        "candidate_sha": candidate_sha,
+        "confidence": 0.0,
+        "merge_grade_misses": True,
+        "pr_url": "https://github.com/acme/widget/pull/9",
+        "sub_scores": {"audit": 0.91, "test_erosion": 0.85, "smoketest": 0.0},
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_not_promoted_but_pr_merged(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    qual = version.last_qualification
+    assert qual["status"] == "promoted"
+    # _recover_confidence_from_ci_unresolved re-runs compute_composite with
+    # merge_grade_misses=True (because base_record["merge_grade_misses"] is
+    # True, _merge_grade_misses_armed short-circuits to True).  compute_composite
+    # with merge_grade_misses=True returns blocker="merge_grade_misses" —
+    # the signal is NOT laundered away during reconciliation.
+    assert qual.get("blocker") == "merge_grade_misses"
+    assert qual.get("confidence") == pytest.approx(0.0)
+    assert qual.get("confidence_recovered_from_ci_unresolved") is True
+
+
+@pytest.mark.asyncio
 async def test_reconcile_not_promoted_skips_single_branch(db_session, mocker):
     """_reconcile_if_not_promoted_but_pr_merged: on a single-branch repo (LTS
     inactive) the reconciler is inert — no GitHub I/O, version untouched."""
