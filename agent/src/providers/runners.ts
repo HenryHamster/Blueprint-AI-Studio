@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import { spawn } from 'child_process';
 import type WebSocket from 'ws';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
@@ -302,7 +303,10 @@ export function matchesVmConfigMissing(text: string): boolean {
 // requirements are confirmed.
 export function requiredProviderConfigFiles(provider: ProviderName = PROVIDER): string[] {
   if (provider === 'anthropic') {
-    const home = process.env.HOME || '/home/agent';
+    // HOME-anchored: the Claude CLI reads ~/.claude.json from $HOME. Fall back to
+    // os.homedir() (never a fixed /home/agent) so the check tracks the actual
+    // home — /home/agent on the cloud VM, /home inside the fleet-runner sandbox.
+    const home = process.env.HOME || os.homedir();
     return [`${home}/.claude.json`];
   }
   return [];
@@ -486,7 +490,7 @@ export interface ProviderRunner {
 
 function buildBaseCliEnv(provider: ProviderName = PROVIDER): Record<string, string> {
   const env: Record<string, string> = {
-    HOME: process.env.HOME || '/home/agent',
+    HOME: process.env.HOME || os.homedir(),
     PATH: process.env.PATH || '/usr/local/bin:/usr/bin:/bin',
     LANG: process.env.LANG || 'en_US.UTF-8',
     TERM: process.env.TERM || 'xterm-256color',
