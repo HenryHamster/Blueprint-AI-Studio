@@ -3496,6 +3496,131 @@ async def test_agent_fetch_qualification_current_identity_uses_version_phase_whe
     assert body["findings"][0]["summary"] == "Old finding"
 
 
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_prefers_verdict_terminal_status_over_stale_promotion_pending(
+    client: AsyncClient, db_session
+):
+    """When last_qualification.status=pending with promotion_pending AND
+    QualificationVerdict.terminal_status=promoted, the endpoint returns
+    status=promoted and populates source_disagreement."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qual-verdict-override"
+    )
+
+    sha = "c" * 40
+    finding = {"severity": "LOW", "summary": "Minor style issue", "file": "app/foo.py"}
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=sha,
+        confidence=0.91,
+        sub_scores={"audit": 0.95},
+        terminal_status="promoted",
+        finalized_at=datetime(2026, 6, 20, 14, 0, 0),
+        audit_findings=[finding],
+    )
+    db_session.add(verdict)
+
+    # last_qualification is still in transient pending state with promotion_pending
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": sha,
+        "confidence": 0.91,
+        "promotion_pending": {
+            "pr_number": 42,
+            "pr_url": "https://github.com/example/repo/pull/42",
+        },
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "qualification_verdict"
+    # Verdict terminal_status wins over the stale pending
+    assert body["status"] == "promoted", (
+        "verdict terminal_status should override stale pending status"
+    )
+    assert body["finalized_at"] == "2026-06-20T14:00:00"
+    assert body["candidate_sha"] == sha
+    # source_disagreement must be populated
+    assert body["source_disagreement"] is not None
+    assert body["source_disagreement"]["last_qualification_status"] == "pending"
+    assert body["source_disagreement"]["verdict_terminal_status"] == "promoted"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_qualification_state_not_in_flight_when_verdict_finalized(
+    client: AsyncClient, db_session
+):
+    """When open version last_qualification.status=pending with promotion_pending
+    AND QualificationVerdict.terminal_status=promoted, version-phase returns
+    qualification_state_disagreement and qualification_state.state reflects the
+    resolved outcome (not promotion_in_flight)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-vp-verdict-override"
+    )
+
+    sha = "d" * 40
+    finding = {"severity": "LOW", "summary": "Style nit", "file": "app/bar.py"}
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=sha,
+        confidence=0.88,
+        sub_scores={"audit": 0.9},
+        terminal_status="promoted",
+        finalized_at=datetime(2026, 6, 21, 10, 0, 0),
+        audit_findings=[finding],
+    )
+    db_session.add(verdict)
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": sha,
+        "confidence": 0.88,
+        "promotion_pending": {
+            "pr_number": 99,
+            "pr_url": "https://github.com/example/repo/pull/99",
+        },
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+
+    current = body["data"]["current_version"]
+    # qualification_state.state must not be promotion_in_flight when verdict is finalized
+    assert current["qualification_state"]["state"] != "promotion_in_flight", (
+        "qualification_state should not show promotion_in_flight when verdict is finalized"
+    )
+    # The disagreement field must be present
+    assert "qualification_state_disagreement" in current
+    assert current["qualification_state_disagreement"]["last_qualification_status"] == "pending"
+    assert current["qualification_state_disagreement"]["verdict_terminal_status"] == "promoted"
+
+
 # ---------------------------------------------------------------------------
 # compute-sweeps recovery endpoints + sweep_id filter on knowledge-documents
 # ---------------------------------------------------------------------------

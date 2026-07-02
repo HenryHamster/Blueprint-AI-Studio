@@ -154,9 +154,16 @@ def _compose_serving_block(
     }
 
 
+_FINALIZED_TERMINAL_STATUSES = frozenset(
+    {"promoted", "not_promoted", "dry_run", "promotion_failed"}
+)
+
+
 def _compact_version_lifecycle(
     version: ReleaseVersion,
     project: Project,
+    *,
+    latest_verdict: "QualificationVerdict | None" = None,
 ) -> dict[str, Any]:
     from app import release_version as _release_version
     from app.release_artifacts import version_serving_summary
@@ -167,7 +174,27 @@ def _compact_version_lifecycle(
         if isinstance(version.last_qualification, dict)
         else {}
     )
-    return {
+
+    # Detect pending/verdict disagreement: last_qualification is in a transient
+    # promotion_pending state but the verdict row already has a finalized outcome.
+    verdict_disagreement: dict[str, Any] | None = None
+    effective_qual = qual
+    if (
+        latest_verdict is not None
+        and qual.get("status") == "pending"
+        and isinstance(qual.get("promotion_pending"), dict)
+        and latest_verdict.terminal_status in _FINALIZED_TERMINAL_STATUSES
+    ):
+        verdict_disagreement = {
+            "last_qualification_status": "pending",
+            "verdict_terminal_status": latest_verdict.terminal_status,
+        }
+        # Use the finalized verdict status so summarize_qualification_state sees
+        # the resolved outcome instead of the transient promotion_in_flight state.
+        effective_qual = {**qual, "status": latest_verdict.terminal_status}
+        effective_qual.pop("promotion_pending", None)
+
+    out = {
         "id": str(version.id),
         "version_number": version.version_number,
         "status": version.status,
@@ -183,7 +210,7 @@ def _compact_version_lifecycle(
         "active_candidate_sha": qual.get("candidate_sha"),
         "last_qualification": _compact_last_qualification(qual),
         "qualification_state": _release_version.summarize_qualification_state(
-            qual,
+            effective_qual,
             version.serving_status,
             version.deploy_failure_reason,
             aggregate_serving_status=aggregate_serving["serving_status"],
@@ -200,6 +227,9 @@ def _compact_version_lifecycle(
         "artifacts": artifacts,
         "serving": _compose_serving_block(aggregate_serving, artifacts, version),
     }
+    if verdict_disagreement is not None:
+        out["qualification_state_disagreement"] = verdict_disagreement
+    return out
 
 
 async def _resolve_agent_project(
@@ -513,13 +543,36 @@ async def agent_fetch_qualification(
         # without producing a new verdict. Findings still come from the verdict
         # row because its audit_findings column is immutable and survives
         # re-qualification overwrites.
+        #
+        # Exception: when last_qualification is in a transient "pending" state
+        # with a promotion_pending sub-key AND the verdict row already carries a
+        # finalized terminal_status, the verdict is canonical — use it so the
+        # agent sees the resolved disposition instead of the stale pending.
         lq = open_row.last_qualification or {}
+        lq_status = lq.get("status")
+        lq_has_promotion_pending = isinstance(lq.get("promotion_pending"), dict)
+        verdict_is_finalized = verdict.terminal_status in _FINALIZED_TERMINAL_STATUSES
+
+        source_disagreement: dict[str, Any] | None = None
+        if lq_status == "pending" and lq_has_promotion_pending and verdict_is_finalized:
+            resolved_status = verdict.terminal_status
+            resolved_finalized_at = (
+                verdict.finalized_at.isoformat() if verdict.finalized_at else None
+            )
+            source_disagreement = {
+                "last_qualification_status": lq_status,
+                "verdict_terminal_status": verdict.terminal_status,
+            }
+        else:
+            resolved_status = lq_status or verdict.terminal_status
+            resolved_finalized_at = lq.get("finalized_at") or (
+                verdict.finalized_at.isoformat() if verdict.finalized_at else None
+            )
+
         return {
             "candidate_sha": lq.get("candidate_sha") or verdict.candidate_sha,
-            "finalized_at": lq.get("finalized_at") or (
-                verdict.finalized_at.isoformat() if verdict.finalized_at else None
-            ),
-            "status": lq.get("status") or verdict.terminal_status,
+            "finalized_at": resolved_finalized_at,
+            "status": resolved_status,
             "confidence": verdict.confidence,
             "sub_scores": verdict.sub_scores,
             "findings": get_latest_qualification_audit_findings(open_row, verdict),
@@ -528,6 +581,7 @@ async def agent_fetch_qualification(
             or [],
             "goal_alignment": verdict.goal_alignment,
             "source": "qualification_verdict",
+            "source_disagreement": source_disagreement,
             "goal_coverage_drift": goal_coverage_drift,
             **requalification_extra,
         }
@@ -639,8 +693,28 @@ async def agent_fetch_version_phase(
                 project_id,
             )
 
+    open_version_verdict: QualificationVerdict | None = None
+    if open_row is not None:
+        open_version_verdict = (
+            (
+                await session.execute(
+                    select(QualificationVerdict)
+                    .where(
+                        QualificationVerdict.release_version_id == open_row.id,
+                        QualificationVerdict.audit_findings.is_not(None),
+                    )
+                    .order_by(QualificationVerdict.created_at.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+
     _current_version_data = (
-        _compact_version_lifecycle(open_row, project) if open_row is not None else None
+        _compact_version_lifecycle(open_row, project, latest_verdict=open_version_verdict)
+        if open_row is not None
+        else None
     )
     if _current_version_data is not None and version_phase_criterion_coverage is not None:
         _current_version_data["criterion_coverage"] = version_phase_criterion_coverage
