@@ -58,7 +58,8 @@ export async function apiFetch(
   options?: RequestInit,
   retries = 2,
   timeout = 30000,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  dedup = true
 ): Promise<Response> {
   const headers = await authHeaders();
   const fullUrl = url.startsWith('http') ? url : `${API_BASE_URL}${url}`;
@@ -72,7 +73,7 @@ export async function apiFetch(
   // Only dedup idempotent reads. POST/PUT/DELETE are intentionally separate
   // requests even when fired in parallel — the body's identity is too
   // expensive to hash reliably and the semantics rarely overlap.
-  const dedupKey = safeToRetry ? `${method} ${fullUrl}` : null;
+  const dedupKey = safeToRetry && dedup ? `${method} ${fullUrl}` : null;
   if (dedupKey) {
     const existing = inFlightRequests.get(dedupKey);
     if (existing) {

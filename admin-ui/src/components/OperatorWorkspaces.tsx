@@ -512,7 +512,11 @@ export function RuntimeWorkspace({
       {userRole === 'admin' && (
         <button
           type="button"
-          onClick={() => { void onRestartOrchestrator(); }}
+          onClick={() => {
+            // The handler toasts on failure and re-throws; swallow the rejection
+            // here so a failed restart doesn't surface as an unhandledrejection.
+            void onRestartOrchestrator().catch(() => {});
+          }}
           className={actionButtonClass}
           title="Restart orchestrator"
           aria-label="Restart orchestrator"

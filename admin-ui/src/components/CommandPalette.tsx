@@ -138,6 +138,10 @@ export function CommandPalette({
     if (focusCommand) focusActiveCommandRef.current = true;
     setActiveIndex(next.index);
     if (focusCommand && next.index === resolvedActiveIndex) {
+      // No-op boundary: resolvedActiveIndex won't change, so the effect that
+      // clears the flag never re-runs. Clear it here and focus directly, or the
+      // stale flag would later yank focus out of the search input mid-typing.
+      focusActiveCommandRef.current = false;
       window.setTimeout(() => activeCommandRef.current?.focus(), 0);
     }
   }

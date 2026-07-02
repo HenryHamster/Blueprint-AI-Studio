@@ -8,11 +8,18 @@ export function useStrategicReadModel(projectId: string | null) {
   const [error, setError] = useState<string | null>(null);
   const currentProjectIdRef = useRef(projectId);
   currentProjectIdRef.current = projectId;
+  // Monotonic request generation for sequencing. Every refresh claims the
+  // latest generation when it starts; an applied mutation (applySessionResponse)
+  // also advances it. A refresh only commits its response if the generation is
+  // still the one it claimed — so a stale, in-flight pre-mutation GET can never
+  // clobber freshly merged session state (or a newer refresh's result).
+  const requestGenerationRef = useRef(0);
 
   useEffect(() => {
     setData(null);
     setError(null);
     setLoading(Boolean(projectId));
+    requestGenerationRef.current += 1;
   }, [projectId]);
 
   const refresh = useCallback(
@@ -20,12 +27,14 @@ export function useStrategicReadModel(projectId: string | null) {
       if (!projectId) return;
       if (signal?.aborted) return;
       const requestedProjectId = projectId;
+      const requestGeneration = (requestGenerationRef.current += 1);
       setLoading(prev => prev || data == null);
       try {
         const next = await fetchStrategicState(requestedProjectId, signal);
         if (
           currentProjectIdRef.current !== requestedProjectId ||
-          next.project_id !== requestedProjectId
+          next.project_id !== requestedProjectId ||
+          requestGenerationRef.current !== requestGeneration
         ) {
           return;
         }
@@ -64,6 +73,9 @@ export function useStrategicReadModel(projectId: string | null) {
           work_session: sessionResponse.session ?? prev.work_session,
         };
       });
+      // Advance the generation so any refresh already in flight (which fetched a
+      // pre-mutation snapshot) is dropped instead of overwriting this merge.
+      requestGenerationRef.current += 1;
       setError(null);
       setLoading(false);
     },

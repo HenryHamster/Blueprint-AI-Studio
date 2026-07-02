@@ -711,6 +711,11 @@ async def resolve_message(
             "resolution": resolution or None,
             "resolved_at": resolved_at.isoformat(),
         }
+        # Persist the resolution FIRST (together with any staged workbench
+        # update) so a secondary failure while posting the answer/ack reply can
+        # never roll back the primary resolution — the message stays resolved
+        # even if the reply cannot be posted (restores main's resilient order).
+        await session.commit()
         reply_msg: ProjectMessage | None = None
         reply_message_event: dict[str, Any] | None = None
         reply_message_id: str | None = None
@@ -720,57 +725,73 @@ async def resolve_message(
             MessageType.QUESTION,
             MessageType.FEEDBACK,
         ):
-            from app.notification_dispatch import (
-                post_feedback_acknowledgment as _post_feedback_ack,
-                post_question_answer as _post_qa,
-            )
+            try:
+                from app.notification_dispatch import (
+                    post_feedback_acknowledgment as _post_feedback_ack,
+                    post_question_answer as _post_qa,
+                )
 
-            strategic_session = await build_message_strategic_session_snapshot(
-                session,
-                current_user["user_id"],
-                message_project_uuid,
-                workbench_context_for_snapshot,
-            )
-            if message_type == MessageType.QUESTION:
-                reply_msg = await _post_qa(
+                strategic_session = await build_message_strategic_session_snapshot(
                     session,
+                    current_user["user_id"],
                     message_project_uuid,
-                    message_id,
-                    resolution,
-                    from_type="user",
+                    workbench_context_for_snapshot,
                 )
-            else:
-                reply_msg = await _post_feedback_ack(
-                    session,
-                    message_project_uuid,
-                    message_id,
-                    resolution,
-                )
-            if strategic_session:
-                reply_msg.context = {
-                    **(reply_msg.context or {}),
-                    "strategic_session": strategic_session,
-                }
-        await session.commit()
-        if reply_msg is not None:
-            await session.refresh(reply_msg)
-            reply_message_id = str(reply_msg.id)
-            reply_message_event = message_event_payload(reply_msg)
-            reply_message_response = admin_message_dict(reply_msg)
-            event_type = (
-                reply_msg.context.get("event_type")
-                if isinstance(reply_msg.context, dict)
-                else None
-            )
-            arming = await maybe_arm_operator_refresh(
-                session,
-                message_project_uuid,
-                MessageType(reply_msg.message_type),
-                event_type=str(event_type) if event_type else None,
-                message_content=resolution,
-            )
-            if arming == ARMING_STEERING:
+                if message_type == MessageType.QUESTION:
+                    reply_msg = await _post_qa(
+                        session,
+                        message_project_uuid,
+                        message_id,
+                        resolution,
+                        from_type="user",
+                    )
+                else:
+                    reply_msg = await _post_feedback_ack(
+                        session,
+                        message_project_uuid,
+                        message_id,
+                        resolution,
+                    )
+                if strategic_session:
+                    reply_msg.context = {
+                        **(reply_msg.context or {}),
+                        "strategic_session": strategic_session,
+                    }
                 await session.commit()
+                await session.refresh(reply_msg)
+                reply_message_id = str(reply_msg.id)
+                reply_message_event = message_event_payload(reply_msg)
+                reply_message_response = admin_message_dict(reply_msg)
+                event_type = (
+                    reply_msg.context.get("event_type")
+                    if isinstance(reply_msg.context, dict)
+                    else None
+                )
+                arming = await maybe_arm_operator_refresh(
+                    session,
+                    message_project_uuid,
+                    MessageType(reply_msg.message_type),
+                    event_type=str(event_type) if event_type else None,
+                    message_content=resolution,
+                )
+                if arming == ARMING_STEERING:
+                    await session.commit()
+            except Exception:
+                # A reply-post/arming failure is non-fatal: the resolution is
+                # already committed above and must stand. Log, discard the
+                # failed secondary work, and return the resolved message alone.
+                logger.warning(
+                    "resolve_message reply post failed for message %s; "
+                    "resolution stands",
+                    message_id_str,
+                    exc_info=True,
+                )
+                await session.rollback()
+                reply_msg = None
+                reply_message_event = None
+                reply_message_id = None
+                reply_message_response = None
+                arming = None
         await broadcast_to_project(str(message_project_uuid), "message_updated", message_event)
         if reply_message_event is not None:
             await broadcast_to_project(

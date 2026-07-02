@@ -469,9 +469,13 @@ function messageTargetFromContextTarget(
   target?: StrategicContextPackageDrilldown['target'] | null,
   fallbackAction?: StrategicMessageTarget['action'],
 ): StrategicMessageTarget | undefined {
-  const messageId = target?.message_id ?? null;
+  // Mirror StrategicContextWorkspace: only route to the messages surface when
+  // the target actually declares it. A 'task' target that happens to carry a
+  // message_id must not be misrouted to messages.
+  if (target?.surface !== 'messages') return undefined;
+  const messageId = target.message_id?.trim() || null;
   if (!messageId) return undefined;
-  const action = target?.action === 'reply' || target?.action === 'highlight'
+  const action = target.action === 'reply' || target.action === 'highlight'
     ? target.action
     : fallbackAction;
   return action ? { messageId, action } : { messageId };

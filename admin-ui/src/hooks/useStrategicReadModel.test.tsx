@@ -229,6 +229,66 @@ describe('useStrategicReadModel', () => {
     expect(mockFetch).toHaveBeenCalledTimes(1);
   });
 
+  it('drops an in-flight refresh that resolves after a session mutation was applied', async () => {
+    // Prime the read model.
+    mockFetch.mockResolvedValueOnce(makeState());
+    const { result } = renderHook(() => useStrategicReadModel('proj-1'));
+    await act(async () => { await result.current.refresh(); });
+
+    // A poll GET starts and is still in flight — it captured a pre-mutation snapshot.
+    const inflightPoll = deferred<StrategicStateResponse>();
+    mockFetch.mockReturnValueOnce(inflightPoll.promise);
+    let pollPromise: Promise<void> = Promise.resolve();
+    await act(async () => {
+      pollPromise = result.current.refresh();
+      await Promise.resolve();
+    });
+
+    // A mutation merges fresh session state while that poll is still in flight.
+    const sessionResponse: StrategicSessionResponse = {
+      project_id: 'proj-1',
+      status: 'idle',
+      location: 'locally',
+      session: {
+        version: 1,
+        id: 'strategic-session:proj-1',
+        mode: 'chat',
+        active_surface: 'strategic',
+        selected_refs: [],
+        selected_ref_descriptors: [],
+        curated_metrics: [],
+        last_check_in: { message_id: 'msg-fresh', created_at: '2026-06-30T12:00:00Z', kind: 'manual' },
+        since_last_check_in: {
+          version: 1,
+          available: true,
+          since: '2026-06-30T12:00:00Z',
+          until: '2026-06-30T12:00:01Z',
+          messages: { total: 0 },
+          tasks: { created: 0, updated: 0 },
+          alerts: { raised: 0 },
+          strategic: { cycles_completed: 0 },
+        },
+      },
+      workbench: null,
+      strategic: makeState().strategic,
+      runtime: { local_runner: null, work: null },
+      context_package: null,
+      conversation: { limit: 20, items: [] },
+      recent_outputs: [],
+    };
+    act(() => { result.current.applySessionResponse(sessionResponse); });
+    expect(result.current.data?.work_session?.last_check_in?.message_id).toBe('msg-fresh');
+
+    // The stale poll now resolves with a pre-mutation snapshot (no work_session).
+    await act(async () => {
+      inflightPoll.resolve(makeState('proj-1'));
+      await pollPromise;
+    });
+
+    // The freshly merged session state must survive — the stale response is dropped.
+    expect(result.current.data?.work_session?.last_check_in?.message_id).toBe('msg-fresh');
+  });
+
   it('skips fetch when signal is already aborted before the call starts', async () => {
     const { result } = renderHook(() => useStrategicReadModel('proj-1'));
     const controller = new AbortController();

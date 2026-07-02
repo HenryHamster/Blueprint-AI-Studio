@@ -31,6 +31,7 @@ from app.models import (
     TaskStatus,
     Project,
     _utcnow,
+    _TASK_BANKED_VM_RUNTIME_COST_KEY,
     get_task_total_vm_cost_usd_or_none,
 )
 from app.auth import get_current_user
@@ -976,12 +977,26 @@ async def get_project_strategic_state(
         elif status == TaskStatus.CANCELLED:
             task_counts["cancelled"] += n
 
+    # Only tasks with actual VM-cost evidence can contribute to the total —
+    # get_task_total_vm_cost_usd_or_none returns None (skipped below) for any
+    # task with no banked amount and no provisioning window. Filtering to that
+    # set in SQL keeps the materialized rows bounded to cost-bearing tasks
+    # instead of every non-archived task, with identical cost semantics. A pure
+    # func.sum() cannot replace this because the per-task current-attempt cost
+    # depends on machine-type/spot pricing resolved in Python.
     cost_tasks = (
         await session.execute(
             select(Task)
             .where(
                 Task.project_id == project.id,
                 Task.archived.is_(False),
+                or_(
+                    Task.vm_provisioned_at.is_not(None),
+                    Task.vm_runtime_cost_banked_db.is_not(None),
+                    Task.context[_TASK_BANKED_VM_RUNTIME_COST_KEY]
+                    .as_string()
+                    .is_not(None),
+                ),
             )
             .options(
                 load_only(

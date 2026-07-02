@@ -358,6 +358,11 @@ def _runner_health_with_compute_assignments(
             status=runner.status,
             last_seen_at=runner.last_seen_at,
             capabilities=capabilities,
+            # Pass through trust-telemetry fields _runner_health reads; the
+            # compute-assignment view must carry the same failure/success
+            # signal as the direct view (else AttributeError on this shim).
+            consecutive_job_failures=runner.consecutive_job_failures,
+            last_successful_job_at=runner.last_successful_job_at,
         )
     )
 

@@ -899,6 +899,10 @@ export async function fetchStrategicState(
     2,
     30000,
     signal,
+    // Bypass apiFetch's in-flight GET dedup: a post-mutation refresh must never
+    // coalesce onto an older, in-flight pre-mutation request (which would
+    // resolve with stale data). useStrategicReadModel sequences the results.
+    false,
   );
   if (!res.ok) throw new Error(`Failed to fetch strategic state: ${res.status}`);
   return res.json() as Promise<StrategicStateResponse>;

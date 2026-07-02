@@ -445,6 +445,21 @@ export default function App() {
   useEffect(() => {
     strategicWorkbenchStateRef.current = strategicWorkbenchState;
   }, [strategicWorkbenchState]);
+  // The optimistic workbench shadow is only meant to cover the in-flight save
+  // window. Once no save is pending, let the polled server read model reclaim
+  // the display as soon as it is at least as fresh as the optimistic value.
+  // Without this the shadow would outlive its mutation forever (cleared only on
+  // project switch), so workbench/session changes arriving via the 30s poll —
+  // e.g. from another device or session — never surfaced.
+  useEffect(() => {
+    if (savingStrategicWorkbench) return;
+    if (!optimisticStrategicWorkbench || !strategicReadModelWorkbench) return;
+    const optimisticTs = parseTimestamp(optimisticStrategicWorkbench.last_interaction_at).getTime();
+    const serverTs = parseTimestamp(strategicReadModelWorkbench.last_interaction_at).getTime();
+    if (serverTs >= optimisticTs) {
+      setOptimisticStrategicWorkbench(null);
+    }
+  }, [savingStrategicWorkbench, optimisticStrategicWorkbench, strategicReadModelWorkbench]);
   const persistStrategicWorkbench = useCallback((patch: Partial<StrategicWorkbenchState>) => {
     const projectId = s.selectedProjectId;
     if (!projectId) return;

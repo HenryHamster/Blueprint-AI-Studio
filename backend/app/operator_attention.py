@@ -10,8 +10,9 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, case, func
+from sqlalchemy import and_, case, func, not_
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.message_convergence import OPEN_STATUS
@@ -37,8 +38,6 @@ from app.strategic_runtime_work import (
     strategic_local_runner_hold_task_filters,
     task_awaiting_local_runner_since,
     task_awaiting_strategic_local_runner_since,
-    task_is_local_runner_hold,
-    task_is_strategic_local_runner_hold,
 )
 from app.task_movement import build_task_movement_explanation
 from app.time_utils import _utcnow
@@ -64,6 +63,12 @@ _MAX_ATTENTION_ITEMS = 8
 _ACTIONABLE_ALERT_SEVERITIES = (AlertSeverity.ERROR, AlertSeverity.WARNING)
 _STALE_DEPENDENCY_QUEUE_AFTER = timedelta(minutes=10)
 _STALE_TASK_PREVIEW_LIMIT = 4
+# Upper bound on the stale-queued-dependency candidate scan. The scan loads slim
+# task rows (no heavy JSONB) and a second slim lookup of their dependencies; this
+# cap keeps both bounded on a poll-frequent endpoint. The reported count is
+# therefore capped at this many candidates (an anomalous overflow, not a normal
+# operating state).
+_STALE_QUEUED_SCAN_LIMIT = 200
 _MESSAGE_BLOCKER_PREVIEW_LIMIT = 8
 _MESSAGE_QUESTION_PREVIEW_LIMIT = 8
 _MESSAGE_WATCH_PREVIEW_LIMIT = 24
@@ -830,6 +835,12 @@ async def _load_stale_queued_dependency_tasks(
     project_id: uuid.UUID,
 ) -> tuple[int, list[Task]]:
     cutoff = _utcnow() - _STALE_DEPENDENCY_QUEUE_AFTER
+    # Slim, bounded scan: only the columns the stale-queued attention items and
+    # the dependency-status check read (no context/payloads/plan_output JSONB),
+    # capped so a poll-frequent endpoint never materializes an unbounded row set.
+    # Local-runner holds are excluded in SQL via their authoritative predicates
+    # (already surfaced as their own attention items), which also removes the
+    # last reason to load payloads/context for candidates.
     candidates = list(
         (
             await session.execute(
@@ -840,20 +851,36 @@ async def _load_stale_queued_dependency_tasks(
                     Task.status == TaskStatus.QUEUED,
                     Task.requires_approval.is_not(True),
                     Task.created_at < cutoff,
+                    func.jsonb_array_length(Task.depends_on) > 0,
+                    not_(and_(*local_runner_hold_task_filters(project_id))),
+                    not_(and_(*strategic_local_runner_hold_task_filters(project_id))),
+                )
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.project_id,
+                        Task.status,
+                        Task.priority,
+                        Task.created_at,
+                        Task.updated_at,
+                        Task.depends_on,
+                        Task.title,
+                        Task.description,
+                        Task.latest_status_message,
+                        Task.blocked_reason,
+                        Task.park_reason,
+                        Task.requires_approval,
+                        Task.blocker_kind,
+                        raiseload=True,
+                    )
                 )
                 .order_by(Task.priority.asc(), Task.created_at.asc())
+                .limit(_STALE_QUEUED_SCAN_LIMIT)
             )
         )
         .scalars()
         .all()
     )
-    candidates = [
-        task
-        for task in candidates
-        if (task.depends_on or [])
-        and not task_is_local_runner_hold(task)
-        and not task_is_strategic_local_runner_hold(task)
-    ]
     if not candidates:
         return 0, []
 
@@ -874,10 +901,23 @@ async def _load_stale_queued_dependency_tasks(
 
     dep_tasks_by_id: dict[uuid.UUID, Task] = {}
     if all_dep_ids:
+        # Only id/status/context are read from dependency rows below; keep the
+        # heavy JSONB columns (payloads, plan_output, ...) off this lookup.
         dep_tasks_by_id = {
             task.id: task
             for task in (
-                await session.execute(select(Task).where(Task.id.in_(all_dep_ids)))
+                await session.execute(
+                    select(Task)
+                    .where(Task.id.in_(all_dep_ids))
+                    .options(
+                        load_only(
+                            Task.id,
+                            Task.status,
+                            Task.context,
+                            raiseload=True,
+                        )
+                    )
+                )
             )
             .scalars()
             .all()

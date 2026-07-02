@@ -1650,6 +1650,34 @@ describe('StrategicContextRail', () => {
     expect(props.onOpenPipeline).not.toHaveBeenCalled();
   });
 
+  test('routes a task-surface action carrying a message_id to task navigation, not messages', () => {
+    const onOpenTask = vi.fn();
+    const onOpenMessages = vi.fn();
+    const { host } = mount({
+      state: stateWithWorkSessionActions([
+        {
+          id: 'action-task-with-message',
+          kind: 'review',
+          label: 'Review task with an embedded message ref',
+          reason: 'Task-surface action that also carries a message_id.',
+          priority: 'high',
+          source: 'task',
+          target: { surface: 'task', task_id: 'task-action', message_id: 'msg-embedded' },
+          enabled: true,
+        },
+      ]),
+      onOpenTask,
+      onOpenMessages,
+    });
+
+    Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Review task with an embedded message ref'))
+      ?.click();
+
+    expect(onOpenTask).toHaveBeenCalledWith('task-action');
+    expect(onOpenMessages).not.toHaveBeenCalled();
+  });
+
   test('keeps attention rows when matching work session action is outside the visible action cap', () => {
     const { host } = mount({
       state: stateWithWorkSessionActions([
