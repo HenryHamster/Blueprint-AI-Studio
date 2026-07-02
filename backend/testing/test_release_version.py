@@ -2018,6 +2018,123 @@ def test_qual_state_unknown_status_passes_through():
 
 
 # ===========================================================================
+# TestQualificationStateVocab — pin QUALIFICATION_STATE_VOCAB contract
+# ===========================================================================
+
+
+class TestQualificationStateVocab:
+    """Pin the QUALIFICATION_STATE_VOCAB constant and its relationship to
+    summarize_qualification_state return values."""
+
+    def test_is_frozenset_of_strings(self):
+        vocab = rv.QUALIFICATION_STATE_VOCAB
+        assert isinstance(vocab, frozenset)
+        assert vocab, "vocab must not be empty"
+        assert all(isinstance(s, str) for s in vocab)
+
+    def test_contains_all_14_states(self):
+        expected = frozenset(
+            {
+                "qualifying",
+                "audit_crashed",
+                "promotion_check_wait",
+                "promotion_in_flight",
+                "promotion_failed",
+                "required_check_failed",
+                "protection_blocked_review",
+                "not_promoted",
+                "dry_run",
+                "promoted",
+                "promoted_unconfirmed",
+                "promotion_deploy_failed",
+                "promotion_confirmation_timed_out",
+                "deferred_unsynced",
+            }
+        )
+        assert rv.QUALIFICATION_STATE_VOCAB == expected
+
+    def test_promotion_blocking_states_subset_of_vocab(self):
+        assert rv.PROMOTION_BLOCKING_STATES <= rv.QUALIFICATION_STATE_VOCAB
+
+    @pytest.mark.parametrize(
+        "verdict,kwargs",
+        [
+            # qualifying — pending with no promotion_pending
+            ({"status": "pending"}, {}),
+            # audit_crashed — pending with a crashed audit child
+            (
+                {"status": "pending"},
+                {"audit_child": {"task_status": "FAILED", "report": None}},
+            ),
+            # promotion_check_wait — pending with managed_check_wait promo
+            (
+                {
+                    "status": "pending",
+                    "promotion_pending": {"managed_check_wait": True},
+                },
+                {},
+            ),
+            # promotion_in_flight — pending with non-managed promo
+            (
+                {
+                    "status": "pending",
+                    "promotion_pending": {"auto_merge_enabled": True},
+                },
+                {},
+            ),
+            # required_check_failed
+            (
+                {"status": "promotion_failed", "error": "required_check_failed"},
+                {},
+            ),
+            # protection_blocked_review
+            (
+                {"status": "promotion_failed", "error": "protection_blocked_review"},
+                {},
+            ),
+            # promotion_failed (generic)
+            ({"status": "promotion_failed", "error": "merge_conflict"}, {}),
+            # not_promoted
+            ({"status": "not_promoted", "confidence": 0.5, "threshold": 0.9}, {}),
+            # dry_run
+            ({"status": "dry_run"}, {}),
+            # promoted (no serving info)
+            ({"status": "promoted"}, {}),
+            # promoted_unconfirmed
+            ({"status": "promoted"}, {"serving_status": "unconfirmed"}),
+            # promotion_deploy_failed
+            ({"status": "promoted"}, {"serving_status": "deploy_failed"}),
+            # promotion_confirmation_timed_out
+            (
+                {"status": "promoted"},
+                {"serving_status": "confirmation_timed_out"},
+            ),
+            # deferred_unsynced
+            ({"status": "deferred_unsynced"}, {}),
+        ],
+    )
+    def test_returned_state_is_in_vocab(self, verdict, kwargs):
+        """Every distinct code path returns a state that is in QUALIFICATION_STATE_VOCAB."""
+        result = rv.summarize_qualification_state(verdict, **kwargs)
+        assert result is not None, "expected a non-None result for this verdict"
+        state = result.get("state")
+        assert state in rv.QUALIFICATION_STATE_VOCAB, (
+            f"state={state!r} is not in QUALIFICATION_STATE_VOCAB"
+        )
+
+    def test_prompt_suffix_hint_states_subset_of_vocab(self):
+        """The 5-state prompt-suffix set in strategic_spawning stays inside vocab."""
+        hint_states = {
+            "promotion_in_flight",
+            "promotion_check_wait",
+            "promotion_failed",
+            "required_check_failed",
+            "protection_blocked_review",
+        }
+        assert hint_states <= rv.QUALIFICATION_STATE_VOCAB
+
+
+# ===========================================================================
 # recent_closed_versions
 # ===========================================================================
 

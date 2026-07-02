@@ -1428,6 +1428,9 @@ _CAPABILITY_DOMAIN_KEYWORD_BUCKETS: dict[str, list[str]] = {
 # timeout caps the worst case of a single hung GitHub request.
 _ANCESTRY_CONCURRENCY = 6
 _ANCESTRY_CALL_TIMEOUT_S = 15.0
+# Matches an 8-hex-char short SHA in prose, but not the hex suffix of a direction
+# ID (e.g. 'd-f0224ab4') — the negative lookbehind suppresses matches preceded by '-'.
+_QUAL_SHA_PAT = re.compile(r"(?<!-)\b([0-9a-f]{8})\b")
 
 
 def _build_cycle_start_reconciliation(
@@ -1437,6 +1440,7 @@ def _build_cycle_start_reconciliation(
     held_by_direction: dict[str, int] | None = None,
     per_direction_delta: list[dict] | None = None,
     running_update: str | None = None,
+    last_qual: dict | None = None,
 ) -> dict | None:
     """Compute one authoritative cycle-start reconciliation of the strategic surfaces.
 
@@ -1804,6 +1808,35 @@ def _build_cycle_start_reconciliation(
                     {"direction_id": ref_id, "cited_in": field_name}
                 )
 
+    # 7. Qualification prose-drift: prose cites a short SHA that does not match
+    # the current active qualification candidate.  When the strategist embeds a
+    # specific candidate commit in current_focus or running_update, that SHA
+    # becomes stale the moment the qualification advances.  Scans the same prose
+    # fields as the phantom-direction-ref check; only fires when last_qual carries
+    # a candidate_sha so cold-start projects are never flagged.
+    qualification_prose_drift: list[dict] = []
+    _active_candidate_short: str | None = None
+    if isinstance(last_qual, dict):
+        _cand = last_qual.get("candidate_sha")
+        if isinstance(_cand, str) and len(_cand) >= 8:
+            _active_candidate_short = _cand[:8]
+            _seen_stale: set[str] = set()
+            for field_name, prose in _prose_to_check:
+                for m in _QUAL_SHA_PAT.finditer(prose):
+                    found_sha = m.group(1)
+                    if found_sha == _active_candidate_short:
+                        continue
+                    if found_sha in _seen_stale:
+                        continue
+                    _seen_stale.add(found_sha)
+                    qualification_prose_drift.append(
+                        {
+                            "stale_sha": found_sha,
+                            "active_candidate_sha": _active_candidate_short,
+                            "cited_in": field_name,
+                        }
+                    )
+
     # Nothing to reconcile (e.g. a cold-start project): let the caller omit it.
     if (
         not active_dirs
@@ -1814,6 +1847,7 @@ def _build_cycle_start_reconciliation(
         and not stale_active_moves
         and not merge_accounting
         and not phantom_direction_refs
+        and not qualification_prose_drift
     ):
         return None
 
@@ -1830,6 +1864,7 @@ def _build_cycle_start_reconciliation(
     capped_pipeline, pipeline_dropped = _cap(direction_pipeline)
     capped_merge, merge_dropped = _cap(merge_accounting)
     capped_phantoms, phantoms_total = _cap(phantom_direction_refs)
+    capped_qual_drift, qual_drift_total = _cap(qualification_prose_drift)
     # Cap each surfaced direction's not-landed title list too, preserving the
     # true count (``not_landed``) so the renderer can show "+N more".
     for m in capped_merge:
@@ -1850,6 +1885,7 @@ def _build_cycle_start_reconciliation(
         "direction_pipeline": capped_pipeline,
         "merge_accounting": capped_merge,
         "phantom_direction_refs": capped_phantoms,
+        "qualification_prose_drift": capped_qual_drift,
         "counts": {
             # True totals (shown + overflow) so the renderer can say "+N more".
             "capability_contradictions": len(capped_caps) + caps_total,
@@ -1873,6 +1909,7 @@ def _build_cycle_start_reconciliation(
             "merge_not_landed": merge_not_landed_total,
             "merge_unverifiable": merge_unverifiable_total,
             "phantom_direction_refs": len(capped_phantoms) + phantoms_total,
+            "qualification_prose_drift": len(capped_qual_drift) + qual_drift_total,
         },
     }
 
@@ -6125,17 +6162,22 @@ async def _spawn_strategic_review(
     # to integration-branch refactors of release_version on back-merge.
     if _open_version is not None:
         from app.release_version import (
+            QUALIFICATION_STATE_VOCAB as _QUAL_STATE_VOCAB,
             summarize_qualification_state as _summarize_qual_state,
         )
 
-        _qual_state = _summarize_qual_state(_open_version.last_qualification)
-        if _qual_state and _qual_state.get("state") in {
+        _QUAL_HINT_STATES = {
             "promotion_in_flight",
             "promotion_check_wait",
             "promotion_failed",
             "required_check_failed",
             "protection_blocked_review",
-        }:
+        }
+        assert (
+            _QUAL_HINT_STATES <= _QUAL_STATE_VOCAB
+        ), "prompt-suffix states not in vocab"
+        _qual_state = _summarize_qual_state(_open_version.last_qualification)
+        if _qual_state and _qual_state.get("state") in _QUAL_HINT_STATES:
             _qual_hint = (
                 f"Qualification sub-state: {_qual_state['state'].upper()} — "
                 f"{_qual_state['summary']} Do NOT read "
@@ -6645,6 +6687,7 @@ async def _spawn_strategic_review(
         (recent_interventions or {}).get("held_by_direction"),
         (recent_interventions or {}).get("per_direction_delta"),
         running_update=project.running_update or "",
+        last_qual=_open_version.last_qualification if _open_version is not None else None,
     )
     # Soft size/health signal from the DURABLE pre-trim model so counts are honest
     # (the agent view above is trimmed). Fail-open: None when the durable model

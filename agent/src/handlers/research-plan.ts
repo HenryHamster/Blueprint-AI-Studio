@@ -492,6 +492,14 @@ export function buildUserPausedSection(
 }
 
 const QUALIFICATION_SCORE_KEYS = ['audit', 'test_erosion', 'smoketest'] as const;
+// Derived qualification states that mean an audit / promotion run is actively
+// in flight for the current candidate. When the effective status is any of
+// these, the agent must NOT emit `qualify_request` — a run is already going.
+// `'pending'` is the raw stamp; `'qualifying'` is the derived state the backend
+// surfaces while the audit is actually executing. Missing `'qualifying'` here
+// was the wait-guard regression: the pending warning was silently dropped once
+// the raw status was superseded by the derived `'qualifying'` state.
+const AUDIT_IN_PROGRESS_STATES = new Set(['pending', 'qualifying']);
 const QUALIFICATION_SEVERITY_ORDER: Record<string, number> = {
   blocker: 0,
   critical: 1,
@@ -799,7 +807,8 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   const effectiveQualStatus = qualStatus === 'pending' && typeof qualificationState?.state === 'string'
     ? qualificationState.state
     : qualStatus;
-  const qualificationPending = effectiveQualStatus === 'pending';
+  const qualificationPending = typeof effectiveQualStatus === 'string'
+    && AUDIT_IN_PROGRESS_STATES.has(effectiveQualStatus);
   // A finalized conclusive verdict (dry_run, not_promoted, or promoted) means
   // the candidate has been fully evaluated and the outcome is settled. In the
   // shipped-dark default (promotion_enabled=False) a passing candidate records

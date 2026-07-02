@@ -11757,6 +11757,64 @@ class TestBuildCycleStartReconciliation:
         # Clean gap is not surfaced.
         assert not any(s["gap_id"] == "g-clean" for s in stale)
 
+    def test_qualification_prose_drift_flags_stale_sha_in_current_focus(self):
+        # A stale candidate SHA embedded in current_focus is surfaced as
+        # qualification_prose_drift when last_qual carries a different candidate.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "intent": {
+                "current_focus": "Audit findings on candidate f0224ab4 are blocking.",
+            }
+        }
+        last_qual = {"candidate_sha": "e587a4d0aabbccdd"}
+        direction_stats = [{"id": "d-aaaa1111", "status": "active", "gap_id": None}]
+        out = _build_cycle_start_reconciliation(
+            direction_stats, pm, {}, running_update="", last_qual=last_qual
+        )
+        assert out is not None
+        drift = out["qualification_prose_drift"]
+        assert len(drift) == 1
+        assert drift[0]["stale_sha"] == "f0224ab4"
+        assert drift[0]["active_candidate_sha"] == "e587a4d0"
+        assert drift[0]["cited_in"] == "intent.current_focus"
+        assert out["counts"]["qualification_prose_drift"] == 1
+
+    def test_qualification_prose_drift_no_flag_when_sha_matches_active(self):
+        # When prose cites the CURRENT candidate SHA, no drift is flagged.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "intent": {
+                "current_focus": "Candidate e587a4d0 is the active qualification target.",
+            }
+        }
+        last_qual = {"candidate_sha": "e587a4d0aabbccdd"}
+        direction_stats = [{"id": "d-aaaa1111", "status": "active", "gap_id": None}]
+        out = _build_cycle_start_reconciliation(
+            direction_stats, pm, {}, running_update="", last_qual=last_qual
+        )
+        assert out is not None
+        assert out["qualification_prose_drift"] == []
+        assert out["counts"]["qualification_prose_drift"] == 0
+
+    def test_qualification_prose_drift_absent_without_last_qual(self):
+        # Without last_qual, no SHA detection runs — the field is empty but present.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "intent": {
+                "current_focus": "Working on f0224ab4 and other things.",
+            }
+        }
+        direction_stats = [{"id": "d-aaaa1111", "status": "active", "gap_id": None}]
+        out = _build_cycle_start_reconciliation(
+            direction_stats, pm, {}, running_update="", last_qual=None
+        )
+        assert out is not None
+        assert out["qualification_prose_drift"] == []
+        assert out["counts"]["qualification_prose_drift"] == 0
+
 
 # ── _build_prune_candidates: concrete cleanup list when the model is heavy ─────
 

@@ -258,6 +258,16 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     }
   }
 
+  const qualProseDrift = Array.isArray(recon.qualification_prose_drift)
+    ? recon.qualification_prose_drift as Array<Record<string, unknown>> : [];
+  if (qualProseDrift.length > 0) {
+    lines.push(`\n### Qualification prose-drift — stale candidate SHA in prose (${fmtScalar(counts.qualification_prose_drift, String(qualProseDrift.length))})`);
+    lines.push(`Active candidate: \`${strVal(qualProseDrift[0]?.active_candidate_sha, '?')}\`. The prose fields below reference a different SHA. Rewrite the stale narrative to reflect the current candidate or remove the specific SHA reference.`);
+    for (const q of qualProseDrift) {
+      lines.push(`- \`${strVal(q.stale_sha, '?')}\` cited in ${strVal(q.cited_in, '?')} (active: \`${strVal(q.active_candidate_sha, '?')}\`)`);
+    }
+  }
+
   // Per-direction research pipeline: where is each active direction stuck/moving.
   const waiting = pipeline.filter(p => strVal(p.state as string) === 'research_waiting_on_action');
   const inProgress = pipeline.filter(p => strVal(p.state as string) === 'tasks_in_progress');

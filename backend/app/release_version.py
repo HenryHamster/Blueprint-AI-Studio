@@ -92,6 +92,28 @@ _PROMOTION_NEARING_TIMEOUT_FRACTION = 0.8
 # frozenset keeps all guards in agreement by construction.
 PROMOTION_BLOCKING_STATES = frozenset({"promotion_in_flight", "promotion_check_wait"})
 
+# Exhaustive vocabulary of ``state`` values returned by
+# ``summarize_qualification_state``.  Pin this against the function body so
+# callers can assert membership rather than re-declaring their own subsets.
+QUALIFICATION_STATE_VOCAB: frozenset[str] = frozenset(
+    {
+        "qualifying",
+        "audit_crashed",
+        "promotion_check_wait",
+        "promotion_in_flight",
+        "promotion_failed",
+        "required_check_failed",
+        "protection_blocked_review",
+        "not_promoted",
+        "dry_run",
+        "promoted",
+        "promoted_unconfirmed",
+        "promotion_deploy_failed",
+        "promotion_confirmation_timed_out",
+        "deferred_unsynced",
+    }
+)
+
 # Cap on the persisted version ``goal`` — a snapshot of intent.current_focus,
 # which is meant to be a concise statement.  Mirrors _PHASE_REASONING_MAX.
 _GOAL_MAX = 500
@@ -682,11 +704,13 @@ def summarize_qualification_state(
     and burn whole cycles waiting (incident 2026-06-02). This derives a single
     explicit sub-state from the raw verdict — pure data, no I/O.
 
-    Returns ``{"state", "summary", ...}`` (``state`` ∈ ``qualifying`` |
-    ``audit_crashed`` | ``promotion_in_flight`` | ``promotion_failed`` |
-    ``not_promoted`` | ``dry_run`` | ``promoted`` | ``promoted_unconfirmed`` |
-    ``promotion_confirmation_timed_out`` | ``promotion_deploy_failed``), or
-    ``None`` when unqualified (no verdict yet).
+    Returns ``{"state", "summary", ...}`` where ``state`` ∈
+    ``QUALIFICATION_STATE_VOCAB`` (``qualifying`` | ``audit_crashed`` |
+    ``promotion_check_wait`` | ``promotion_in_flight`` | ``promotion_failed`` |
+    ``required_check_failed`` | ``protection_blocked_review`` | ``not_promoted`` |
+    ``dry_run`` | ``promoted`` | ``promoted_unconfirmed`` |
+    ``promotion_deploy_failed`` | ``promotion_confirmation_timed_out`` |
+    ``deferred_unsynced``), or ``None`` when unqualified (no verdict yet).
 
     Audit-crash reconciliation: when ``status == "pending"`` with no
     ``promotion_pending`` sub-key, the bare result was always ``qualifying``

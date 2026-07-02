@@ -1861,6 +1861,22 @@ describe('buildVersionPhaseSection', () => {
     expect(result).not.toContain('currently **PENDING**');
   });
 
+  it('renders qualifying state as pending wait-guard', () => {
+    // Wait-guard regression: when the raw last_qualification.status is 'pending'
+    // but the derived qualification_state.state is 'qualifying' (the audit is
+    // actively running), the agent must still see the PENDING wait-guard so it
+    // does NOT re-emit qualify_request while a run is in flight.
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      last_qualification: { status: 'pending', candidate_sha: 'deadbeefcafe0000' },
+      qualification_state: { state: 'qualifying' },
+    });
+    expect(result).toContain('status=qualifying');
+    expect(result).toContain('currently **PENDING**');
+    expect(result).toMatch(/do NOT emit `?qualify_request`?/i);
+  });
+
   it('omits the pending warning when last_qualification is finalized (not pending)', () => {
     const result = buildVersionPhaseSection({
       version_number: 4,

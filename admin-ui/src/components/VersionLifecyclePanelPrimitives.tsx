@@ -24,6 +24,7 @@ import type {
   PromotionPolicySource,
   PromotionReadiness,
   QualificationState,
+  QualificationStateValue,
   ChallengedVsUnchallengedTelemetry,
 } from '../api';
 import { timeAgo, formatDurationSec, deployWindowStatus } from '../utils/time';
@@ -287,7 +288,10 @@ function classifyAuditNoReport(taskStatus: string | null | undefined): AuditNoRe
   }
 }
 
-export const QUAL_STATE_STYLE: Record<string, string> = {
+// Keyed by the authoritative QualificationStateValue union: a new backend
+// qualification state without a style entry here is now a compile-time error
+// (missing key), and a typo'd key fails the same way — the type is the pin.
+export const QUAL_STATE_STYLE: Record<QualificationStateValue, string> = {
   qualifying: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
   // The audit child crashed (terminal-failed, no report) while the verdict is
   // still pending — loud red, NOT the amber 'qualifying' look. Keeps the top

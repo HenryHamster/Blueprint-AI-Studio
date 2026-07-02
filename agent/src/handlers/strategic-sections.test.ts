@@ -386,6 +386,26 @@ describe('buildCycleStartReconciliationSection', () => {
     expect(result).toContain('**blocked orphan** [low] (gap g-b) — BLOCKED');
   });
 
+  it('renders qualification_prose_drift entries with header and per-entry bullets', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      qualification_prose_drift: [
+        { stale_sha: 'aabbccdd', active_candidate_sha: '11223344', cited_in: 'intent.current_focus' },
+        { stale_sha: 'deadbeef', active_candidate_sha: '11223344', cited_in: 'running_update' },
+      ],
+      counts: { qualification_prose_drift: 2 },
+    });
+
+    expect(result).toContain('Qualification prose-drift — stale candidate SHA in prose (2)');
+    expect(result).toContain('Active candidate: `11223344`');
+    expect(result).toContain('Rewrite the stale narrative to reflect the current candidate');
+    expect(result).toContain('`aabbccdd` cited in intent.current_focus (active: `11223344`)');
+    expect(result).toContain('`deadbeef` cited in running_update (active: `11223344`)');
+  });
+
   it('buildCycleStartReconciliationSection renders stale active moves staffed deferrals and phantom refs', () => {
     const result = buildCycleStartReconciliationSection({
       capability_contradictions: [],

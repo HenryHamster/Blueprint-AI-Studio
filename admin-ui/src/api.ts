@@ -2187,8 +2187,31 @@ export interface ManagedCheckWaitSnapshot {
   detail?: string | null;
 }
 
+// The authoritative closed vocabulary of qualification states. This mirrors
+// the backend's summarize_qualification_state (backend/app/release_version.py):
+// every branch there returns exactly one of these state strings. Keeping this
+// union in sync with that producer is what lets TypeScript catch a new backend
+// state that lacks a QUAL_STATE_STYLE entry or a stale literal comparison in
+// the lifecycle panels — the drift that let the 'qualifying' wait-guard
+// regression ship silently.
+export type QualificationStateValue =
+  | 'qualifying'
+  | 'audit_crashed'
+  | 'promotion_check_wait'
+  | 'promotion_in_flight'
+  | 'promotion_failed'
+  | 'required_check_failed'
+  | 'protection_blocked_review'
+  | 'not_promoted'
+  | 'dry_run'
+  | 'promoted'
+  | 'promoted_unconfirmed'
+  | 'promotion_deploy_failed'
+  | 'promotion_confirmation_timed_out'
+  | 'deferred_unsynced';
+
 export interface QualificationState {
-  state: string;
+  state: QualificationStateValue;
   summary: string;
   promotion_pr_number?: number | null;
   promotion_pr_url?: string | null;

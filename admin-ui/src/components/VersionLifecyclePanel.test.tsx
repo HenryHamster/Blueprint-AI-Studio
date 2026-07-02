@@ -3438,7 +3438,11 @@ describe('VersionLifecyclePanel', () => {
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               qualification_state: {
-                state: 'promoted_serving',
+                // 'promoted' is the real backend state once a candidate merges;
+                // serving confirmation is carried by serving_status, not the
+                // qualification state string. ('promoted_serving' was never a
+                // value summarize_qualification_state emits.)
+                state: 'promoted',
                 summary: 'All artifacts confirmed.',
                 serving_status: 'serving_confirmed',
               },
