@@ -6379,7 +6379,6 @@ async def test_version_phase_includes_promotion_readiness(
     """When is_self_repo=True and QualificationVerdict rows exist, the strategic
     payload's version_phase block carries promotion_readiness with ready,
     would_promote_rate, and recurring_blockers keys."""
-    from datetime import datetime
     from app.models import ReleaseVersion, QualificationVerdict
 
     await _ensure_releaseversion_table(db_session)
@@ -6453,7 +6452,7 @@ async def test_version_phase_includes_recent_versions(
 ):
     """When is_self_repo=True and closed ReleaseVersion rows exist, version_phase
     carries a recent_versions list."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from app.models import ReleaseVersion
 
     await _ensure_releaseversion_table(db_session)
@@ -6524,7 +6523,6 @@ async def test_version_phase_block_carries_goal_coverage_drift(
     """The always-on version_phase block carries goal_coverage_drift when the
     helper returns a non-None dict, and the key survives _compact_version_phase
     at both normal and floor levels."""
-    from datetime import datetime
     from app.models import ReleaseVersion, QualificationVerdict
 
     await _ensure_releaseversion_table(db_session)
@@ -6612,7 +6610,6 @@ async def test_version_phase_block_carries_criterion_coverage(
 ):
     """The initial strategic payload carries criterion_coverage for the open
     version and the signal survives version_phase compaction/floor trimming."""
-    from datetime import datetime
 
     from app import acceptance_criteria as ac
     from app.models import ReleaseVersion
@@ -7497,6 +7494,73 @@ async def test_spawn_strategic_review_payload_freshness_unknown_when_currency_in
 
 
 @pytest.mark.asyncio
+async def test_payload_staleness_resolves_true_verdict_without_carried_findings(
+    db_session, mocker, _lts_split_active
+):
+    """payload_staleness must carry a real stale/fresh verdict even when the
+    version has no carried audit findings (i.e. the stabilize+findings fast-path
+    is skipped).  Without the fallback resolution, _currency stays None and the
+    payload emits verdict='unknown' on every non-findings cycle."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "a" * 40
+    head = "b" * 40
+    now = _utcnow_naive()
+    # Stabilize phase with a candidate SHA but NO audit_findings — the
+    # stabilize+carried-findings guard is skipped, so only the fallback path runs.
+    version = ReleaseVersion(
+        version_number=2,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "not_promoted",
+            "confidence": 0.90,
+            "blocker": None,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0},
+            "candidate_sha": candidate,
+            "audit_findings": [],
+        },
+    )
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(mocker, resolved=("tok", "owner", "repo"), head_sha=head)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    staleness = payload.get("payload_staleness")
+    assert staleness is not None, "payload_staleness must be present"
+    assert staleness.get("verdict") == "stale", (
+        "verdict must be 'stale' (not 'unknown') when candidate SHA is behind HEAD "
+        "even without carried audit findings — the fallback path must resolve currency"
+    )
+    assert staleness.get("stale") is True
+    assert staleness.get("active_candidate_sha") == candidate
+    assert staleness.get("integration_head_sha") == head
+    _assert_generated_at_iso_utc(staleness)
+
+
+@pytest.mark.asyncio
 async def test_stabilize_hint_names_hard_blocker_as_binding_constraint(
     db_session, mocker, _lts_split_active
 ):
@@ -7878,7 +7942,7 @@ async def test_post_promote_handoff_hint_grounds_in_prior_promoted_record(
     states the concrete promotion — its date and final confidence — so the agent
     gets a positive 'it shipped' signal rather than only a 'stale text' warning,
     and is explicitly forbidden from re-qualifying the already-shipped version."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from app.models import ReleaseVersion
 
     await _ensure_releaseversion_table(db_session)
@@ -7944,7 +8008,7 @@ async def test_post_promote_handoff_respects_existing_fresh_goal(
     """A fresh post-promotion version can already have its goal authored
     by the time the strategic review spawns. The handoff suffix must not carry
     stale null-goal instructions that contradict version_phase."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from app.models import ReleaseVersion
 
     await _ensure_releaseversion_table(db_session)
@@ -9182,7 +9246,7 @@ async def test_deployment_state_block_in_payload_when_split(db_session, mocker):
     """The strategic payload carries a deployment_state block under an LTS split:
     deployed SHA/status from DeploymentState, the promoted vs open version, and
     automain_ahead_of_main derived from un-promoted merged work."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from app.models import ReleaseVersion, DeploymentState
 
     await _ensure_releaseversion_table(db_session)
@@ -9422,7 +9486,7 @@ async def _spawn_self_repo_with_deployment_state(
 ):
     """Spawn a self-repo strategic review under an LTS split with a seeded
     DeploymentState row. Returns (deployment_state block, prompt_suffix)."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from app.models import ReleaseVersion, DeploymentState
 
     await _ensure_releaseversion_table(db_session)
@@ -15583,7 +15647,7 @@ def test_one_time_spawnable_registry_set_is_implementation_types():
         STRATEGIST_SPAWNABLE_TASK_TYPES,
     )
 
-    assert STRATEGIST_ONE_TIME_SPAWNABLE_TYPES == {"create", "refactor", "qa"}
+    assert {"create", "refactor", "qa"} == STRATEGIST_ONE_TIME_SPAWNABLE_TYPES
     # The two lanes are mutually exclusive: a one-time fix is direction-free and
     # PR-producing; a spawn_task spawn is a read-only investigation.
     assert STRATEGIST_ONE_TIME_SPAWNABLE_TYPES.isdisjoint(

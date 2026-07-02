@@ -6489,6 +6489,22 @@ async def _spawn_strategic_review(
                     }
         except Exception:
             logger.exception("[STRATEGIC] build-stall hint build failed; continuing")
+    # Fallback currency resolution: the stabilize+carried-findings path above
+    # already set _currency when applicable.  For every other cycle (build phase,
+    # or stabilize with no carried findings), resolve it here so the freshness
+    # verdict is accurate on all paths, not just the stabilize+findings one.
+    if _currency is None and _open_version is not None:
+        try:
+            _currency = await _resolve_candidate_currency(
+                session,
+                project,
+                _open_version.last_qualification or {},
+                _integration_branch,
+            )
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] fallback candidate-currency resolution failed; continuing"
+            )
     # Derive structured payload-staleness signal from the already-resolved
     # _currency dict.  Exposes payload_compiled_sha, active_candidate_sha,
     # integration_head_sha, and an explicit stale/current verdict at cycle start
