@@ -36,6 +36,7 @@ const {
     '__resetTaskCapabilityContractLoadedForTesting',
     '__setRunClaudeCodeOverrideForSmoke',
     '__setWarmRetargetDepsForTesting',
+    '_buildHeartbeatStatusForTesting',
     '_captureBootCredentialSnapshotForTesting',
     '_captureBootProviderConfigPresenceForTesting',
     '_consumePendingParkDirectiveForTesting',

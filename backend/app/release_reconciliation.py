@@ -1072,15 +1072,32 @@ async def _reconcile_if_ci_unresolved_now_green(
                 candidate_sha,
                 project_id=str(version.project_id),
             )
-            if ci_resolution.get("state") != _CI_GREEN or not ci_resolution.get(
+            if ci_resolution.get("state") == _CI_NO_CHECKS:
+                # Integration-branch candidates structurally carry no check-runs
+                # when the CI workflow's automain trigger has been removed.
+                # Annotate with topology and proceed if CI is not required
+                # (topology-relaxed no_checks), mirroring _ci_required_for_finalize.
+                ci_resolution = (
+                    await _rq_mod._annotate_absent_ci_integration_topology(
+                        token=token,
+                        owner=owner,
+                        repo=repo,
+                        project=project,
+                        candidate_sha=candidate_sha,
+                        ci_resolution=ci_resolution,
+                    )
+                )
+                if _rq_mod._ci_required_for_finalize(project, ci_resolution):
+                    return False
+            elif ci_resolution.get("state") != _CI_GREEN or not ci_resolution.get(
                 "ci_green"
             ):
                 return False
 
             logger.info(
                 "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
-                "candidate %s for v%d now has green CI on unchanged automain — "
-                "spawning fresh qualification",
+                "candidate %s for v%d now has green CI or topology-relaxed "
+                "no_checks on unchanged automain — spawning fresh qualification",
                 candidate_sha[:8],
                 version.version_number,
             )
