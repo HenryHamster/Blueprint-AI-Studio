@@ -8,7 +8,7 @@ The rule for this file: after every major batch, update the status ledger, miles
 
 ## Status Ledger
 
-Overall implementation estimate: 98%.
+Overall implementation estimate: 100%.
 
 Legend:
 - Done: implemented, reviewed, tested, and pushed.
@@ -20,7 +20,7 @@ Legend:
 | Milestone | Status | Current evidence | Next action |
 | --- | --- | --- | --- |
 | M0. Workbench IA foundation | Done | Four-mode shell, Chat/Pipeline/Project/Runtime homes, task archive moved under Pipeline, runtime settings/devices/accounts rehosted. | Keep regression coverage while later cleanup lands. |
-| M1. Roadmap and tracking discipline | In progress | This document. | Keep this file updated after every pushed batch. |
+| M1. Roadmap and tracking discipline | Done | Roadmap exists and is updated through the final acceptance audit. | Update only for concrete follow-up batches. |
 | M2. Persistent local Strategic workday mode | Done | Workbench state, 12-hour continuation markers, explicit marker ownership/lease diagnostics, duplicate-session protection, Strategic local runner requirement, local runner selection, attention for holds, stale Strategic hold timeout, and clearer Devices UI. | Only revisit explicit takeover or heartbeat fallback renewal if real multi-operator contention appears. |
 | M3. Messages as the active-work interface | Done | Shared `ProjectMessage` creation/projection, bounded workbench message context, minimal Strategic-session Chat, backend/frontend arming fixtures. | Keep regression coverage while M4/M5 add richer command and context surfaces. |
 | M4. Ctrl+K and hotkey operating layer | Done | Canonical command/target contracts, executable descriptors, allowlisted validation, command palette routing, current-section `[`, `]`, `/`, `?` shortcuts, and keyboard shortcuts overlay. | Keep command palette/shortcut regression coverage while later UI polish lands. |
@@ -30,7 +30,7 @@ Legend:
 | M8. Operator attention and work-session read model | Done | Derived attention state, lifecycle metadata across common and rare reasons, prioritized bounded attention candidates with newest tie-breaks, registry-backed curated metric metadata, actions, events, jobs, command receipts, and command receipts excluded from check-in deltas. | Keep lifecycle/count regressions current as new attention reasons are added. |
 | M9. Unified event and message contracts | Done | Workbench event v1 envelope, websocket emitter/v1-producer inventory guards, backend-owned operator workbench fixture, frontend fixture consumption, canonical target/refetch vocabulary. | Keep fixtures and emitter inventory updated as read models evolve. |
 | M10. Visual system and UI polish | Done | Workbench theme tokens, shell/header/workspace token migration, compact Chat session control, lower-level token guard expansion, Pipeline duplicate task-open cleanup, mobile sideboard reachability coverage, and focused viewport assertions/capture review. | Keep token coverage current as lower-level panels are touched. |
-| M11. Background operator jobs | Planned | Existing compute jobs, runner jobs, orchestrator loops, command receipts. | Only build a real operator-job table if a concrete async operator command needs it. |
+| M11. Background operator jobs | Defer | Existing compute jobs, runner jobs, orchestrator loops, and command receipts cover current justified async operator work; no separate OperatorJob system is required yet. | Reopen only if a concrete async operator command needs progress, cancellation, retry, and history beyond existing job models. |
 | M12. Completion audit and hardening | Done | Backend/frontend audit wave plus final localhost acceptance fixed Pipeline board monitoring, mobile sideboard context reachability, duplicate controls, compact Chat Strategic controls, stale command affordances, browser rerouting, contract shape drift, malformed payload crashes, attention ordering, local continuation privacy, local auth bootstrap blanking, and viewport coverage drift. Full frontend, full viewport, typecheck, localhost smoke, and subagent re-review are green. | User acceptance on localhost; fix only concrete follow-up issues surfaced by use. |
 
 ## Operating Principles
@@ -73,7 +73,7 @@ Regression gates:
 
 ## M1. Roadmap and Tracking Discipline
 
-Status: In progress.
+Status: Done.
 
 Purpose: Prevent open-ended work from turning into invisible drift.
 
@@ -492,7 +492,7 @@ Acceptance gates:
 
 ## M11. Background Operator Jobs
 
-Status: Planned.
+Status: Defer.
 
 Purpose: Support operator-triggered async work only where synchronous command receipts are not enough.
 
@@ -525,7 +525,7 @@ Acceptance gates:
 
 ## M12. Completion Audit and Hardening
 
-Status: Partial.
+Status: Done.
 
 Purpose: Prove the full operator workbench is usable, not just locally green.
 
@@ -553,6 +553,7 @@ Completed in current audit batch:
 - Removed duplicate Project Manage card actions now owned by the workspace header, and auto-scrolls the selected workbench tab into view so Runtime Settings stays visible on mobile.
 - Fixed Windows/local test harness drift for branch literal scanning and viewport-diff imports, then added viewport coverage for keyboard shortcuts and project alert-domain controls with documented exemptions for covered internal subcomponents.
 - Ran subagent review on auth bootstrap and UI acceptance; fixed the concrete findings and reran re-review with no issues found.
+- Fixed Python 3.12 backend test harness drift in `test_strategic_spawning.py` by replacing deprecated `datetime.utcnow()` calls while preserving naive-UTC test semantics.
 
 Required audit checklist:
 - Active work:
@@ -610,6 +611,10 @@ Final verification gates:
   - visual/UX review
   - integration-contract review
 
+Latest backend audit gates:
+- `python -m pytest backend/testing/test_strategic_spawning.py -q` -> 387 tests passed.
+- `python -m pytest backend/testing/test_strategic_state.py backend/testing/test_workbench_events.py backend/testing/test_work_session_commands.py backend/testing/test_work_session_actions.py backend/testing/test_work_session_command_execution.py backend/testing/test_operator_workbench_contracts.py backend/testing/test_message_convergence.py backend/testing/test_project_message_projection.py backend/testing/test_local_runner.py backend/testing/test_local_runner_holds.py backend/testing/test_strategic_spawning.py backend/testing/test_event_type_invariants.py backend/testing/test_websocket_emitter_inventory.py backend/testing/test_viewport_coverage.py backend/testing/test_work_session_metrics.py -q` -> 654 tests passed, 1 existing Pydantic serialization warning.
+
 Latest frontend audit gates:
 - `npm --prefix admin-ui run typecheck` -> passed.
 - `npm --prefix admin-ui test -- --run src/firebase.test.ts src/api.test.ts src/operatorWorkbenchContracts.test.ts src/App.wiring.test.ts` -> 34 tests passed.
@@ -654,3 +659,4 @@ Reason: the required backend/frontend workbench systems are implemented and hard
 | 2026-07-01 | M12 visual/mobile polish | Expanded semantic token coverage, removed duplicate mobile shortcut drawer, prioritized Pipeline task context before stream details, added real-column mobile Board reachability coverage, cleaned artifact empty-state copy, and documented remaining medium IA decisions. Gates: 349 focused frontend tests, 51 viewport tests, 440 broader frontend tests, and `npm run typecheck`. |
 | 2026-07-02 | M12 IA polish | Compacted primary Chat Strategic controls, suppressed duplicate context-map artifact rendering in the workspace while preserving descriptor-only maps, flattened context list chrome, kept Findings/Knowledge header placement with command coverage, synced already-open browser route props, and fixed invalid nested Findings-row buttons. Gates: 173 focused tests, 47 viewport tests, 531 broader frontend tests, and `npm run typecheck`. |
 | 2026-07-02 | M12 final acceptance polish | Hardened localhost auth bootstrap, removed duplicate Project Manage actions, fixed mobile Runtime Settings tab visibility, repaired local full-suite harness drift, added missing viewport coverage, and completed subagent re-review. Gates: full frontend suite 3169 tests, full viewport suite 635 tests, `npm run typecheck`, and Playwright localhost smoke. |
+| 2026-07-02 | M12 backend final audit | Fixed Python 3.12 `datetime.utcnow()` test harness drift in strategic spawning coverage and reran final backend-focused gates. Gates: `test_strategic_spawning.py` 387 tests and backend operator-workbench focused suite 654 tests. |

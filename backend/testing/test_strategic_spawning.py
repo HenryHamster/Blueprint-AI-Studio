@@ -78,6 +78,10 @@ def _assert_generated_at_iso_utc(payload: dict) -> None:
     assert parsed.utcoffset().total_seconds() == 0
 
 
+def _utcnow_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
 # ── Account pool fixture (required by _spawn_research_task) ───────────────────
 
 
@@ -6390,7 +6394,7 @@ async def test_version_phase_includes_promotion_readiness(
     await db_session.refresh(project)
 
     # Open version in stabilize phase
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=2,
@@ -6462,7 +6466,7 @@ async def test_version_phase_includes_recent_versions(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
 
     # One closed (promoted) version
     closed = ReleaseVersion(
@@ -6534,7 +6538,7 @@ async def test_version_phase_block_carries_goal_coverage_drift(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=3,
@@ -6625,7 +6629,7 @@ async def test_version_phase_block_carries_criterion_coverage(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=4,
@@ -6748,7 +6752,7 @@ async def test_version_phase_recent_versions_use_aggregate_pending_truth(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     closed = ReleaseVersion(
         project_id=project.id,
         version_number=1,
@@ -6920,7 +6924,7 @@ async def test_stabilize_stall_hint_fires_for_old_stabilize_version(
     await db_session.refresh(project)
 
     # Version stuck in stabilize well past the age threshold
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=3,
@@ -6978,7 +6982,7 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=4,
@@ -7064,7 +7068,7 @@ async def test_stabilize_hint_names_lower_dimension_when_audit_not_binding(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=4,
@@ -7113,7 +7117,7 @@ def _make_stabilize_version_with_candidate(candidate_sha):
     from app.models import ReleaseVersion
     from app.release_scoring import _audit_finding_key
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     # Carried findings stamped with the deterministic content key the resolution
     # ledger joins against (release_scoring._audit_finding_key) so readiness can be
     # computed exactly as it is for real carried findings.
@@ -7506,7 +7510,7 @@ async def test_stabilize_hint_names_hard_blocker_as_binding_constraint(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=4,
@@ -7547,7 +7551,7 @@ async def test_stabilize_hint_excludes_disabled_smoketest_from_binding(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=4,
@@ -7594,7 +7598,7 @@ async def test_qualification_substate_hint_promotion_in_flight(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=3,
@@ -7657,7 +7661,7 @@ async def test_qualification_substate_hint_promotion_failed(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=3,
@@ -7710,7 +7714,7 @@ async def test_qualification_substate_hint_absent_while_auditing(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=3,
@@ -7768,7 +7772,7 @@ async def test_stabilize_findings_hint_softens_when_remediation_direction_exists
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=4,
@@ -7825,7 +7829,7 @@ async def test_post_promote_handoff_hint_fires_on_fresh_version(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=2,
@@ -7884,7 +7888,7 @@ async def test_post_promote_handoff_hint_grounds_in_prior_promoted_record(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     promoted_at = now - timedelta(hours=3)
     prior = ReleaseVersion(
         project_id=project.id,
@@ -7950,7 +7954,7 @@ async def test_post_promote_handoff_respects_existing_fresh_goal(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     promoted_at = now - timedelta(hours=2)
     prior = ReleaseVersion(
         project_id=project.id,
@@ -8018,7 +8022,7 @@ async def test_post_promote_handoff_hint_self_clears_after_first_qualification(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=2,
@@ -8066,7 +8070,7 @@ async def test_post_promote_handoff_hint_skipped_for_bootstrap_version(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=1,
@@ -8114,7 +8118,7 @@ async def test_post_promote_handoff_unknown_serving_status_is_not_live(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     db_session.add(
         ReleaseVersion(
             project_id=project.id,
@@ -8175,7 +8179,7 @@ async def test_failed_deploy_directive_renders_after_next_version_qualification_
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     # v1: promoted but deployment failed
     prior_version = ReleaseVersion(
         project_id=project.id,
@@ -8250,7 +8254,7 @@ async def test_failed_deploy_directive_clears_when_newer_version_serving_confirm
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     # v1: promoted but deployment failed
     failed_version = ReleaseVersion(
         project_id=project.id,
@@ -8331,7 +8335,7 @@ async def test_failed_deploy_directive_text_states_same_sha_recovery_clears(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     failed_version = ReleaseVersion(
         project_id=project.id,
         version_number=1,
@@ -8403,7 +8407,7 @@ async def test_failed_deploy_directive_clears_on_same_sha_recovery(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     recovered_version = ReleaseVersion(
         project_id=project.id,
         version_number=1,
@@ -8470,7 +8474,7 @@ async def test_stabilize_stall_hint_suppressed_for_dry_run(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=4,
@@ -8534,7 +8538,7 @@ async def test_build_stall_nudge_counts_build_phase_merges_not_version_lifetime(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     # Version just re-entered build phase (age = 0 days)
     version = ReleaseVersion(
         project_id=project.id,
@@ -8608,7 +8612,7 @@ async def test_build_stall_nudge_tasks_merged_field_is_phase_scoped(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     # Version re-entered build phase past the age threshold
     phase_entry = now - timedelta(days=_BUILD_STALL_AGE_DAYS + 2)
     version = ReleaseVersion(
@@ -9200,7 +9204,7 @@ async def test_deployment_state_block_in_payload_when_split(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     db_session.add(
         ReleaseVersion(
             project_id=project.id,
@@ -9313,7 +9317,7 @@ async def test_deployment_state_and_failed_directive_use_aggregate_failed_truth(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     failed_version = ReleaseVersion(
         project_id=project.id,
         version_number=1,
@@ -9440,7 +9444,7 @@ async def _spawn_self_repo_with_deployment_state(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     db_session.add(
         ReleaseVersion(
             project_id=project.id,
@@ -9605,7 +9609,7 @@ async def test_active_counts_include_old_inflight_tasks_outside_lookback(db_sess
     await db_session.commit()
     await db_session.refresh(project)
 
-    old_started = datetime.utcnow().replace(tzinfo=None) - timedelta(days=35)
+    old_started = _utcnow_naive() - timedelta(days=35)
     db_session.add(
         Task(
             project_id=project.id,
@@ -10515,7 +10519,7 @@ async def test_recent_merged_titles_cap_preserves_full_merge_accounting_counts(
     await db_session.commit()
     await db_session.refresh(project)
 
-    base_time = datetime.utcnow()
+    base_time = _utcnow_naive()
     tasks = []
     for i in range(_RECENT_MERGED_TITLES_CAP + 3):
         tasks.append(
@@ -13847,7 +13851,7 @@ def _recent_strategic_task(project_id, minutes_ago: int) -> Task:
         payloads=[{"type": "design_doc_update", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        created_at=datetime.utcnow() - timedelta(minutes=minutes_ago),
+        created_at=_utcnow_naive() - timedelta(minutes=minutes_ago),
     )
 
 
@@ -13876,7 +13880,7 @@ async def test_steering_acted_confirmation_skipped_when_marker_has_no_excerpt(
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow_naive().isoformat(),
                 "reason": "operator_message",
                 "count": 1,
                 "origin": ORIGIN_OPERATOR,
@@ -13924,7 +13928,7 @@ async def test_steering_acted_confirmation_posted_when_marker_has_excerpt(
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow_naive().isoformat(),
                 "reason": "operator_message",
                 "count": 1,
                 "origin": ORIGIN_OPERATOR,
