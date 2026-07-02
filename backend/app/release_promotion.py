@@ -296,6 +296,7 @@ def _recover_confidence_from_ci_unresolved(
         policy=_policy,
         smoketest_enabled=smoketest_enabled,
         criterion_coverage=base_record.get("criterion_coverage"),
+        merge_grade_misses=_merge_grade_misses_from_record(base_record),
     )
 
     return {
@@ -304,6 +305,20 @@ def _recover_confidence_from_ci_unresolved(
         "blocker": recovered.get("blocker"),
         "confidence_recovered_from_ci_unresolved": True,
     }
+
+
+def _merge_grade_misses_from_record(base_record: dict[str, Any]) -> bool:
+    """Return whether a durable qualification record carries a failing merge grade."""
+    if base_record.get("merge_grade_status") == "fail":
+        return True
+    merge_grade = base_record.get("merge_grade")
+    if not isinstance(merge_grade, dict):
+        return False
+    if merge_grade.get("status") == "fail":
+        return True
+    if base_record.get("merge_grade_status") in {"pass", "not_applicable", "superseded_exempt"}:
+        return False
+    return merge_grade.get("blocked") is True
 
 
 async def _record_qualification_verdict(

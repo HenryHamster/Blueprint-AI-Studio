@@ -9944,15 +9944,12 @@ async def test_finalize_blocks_on_migration_apply_drift(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mocker):
-    """The blind merge-grade artifact is validated but no longer gates coverage.
+    """The blind merge-grade artifact is both required and load-bearing.
 
-    Three scenarios prove the artifact is still unskippable, while canonical
-    criterion coverage now owns the hard goal-coverage decision:
-    otherwise-clean candidate (audit 1.0 / smoke green / no migration drift)
-    that would promote is not decided by the merge-grade covers_goal verdict:
-      (a) a FAILING merge-grade -> promote proceeds when criteria are absent.
-      (b) the required merge-grade artifact MISSING -> held (infra_failure),
-          NOT promoted (the gate cannot be skipped).
+    Three scenarios prove the artifact cannot be skipped and cannot be masked by
+    an empty acceptance-criteria coverage set:
+      (a) a FAILING merge-grade -> hard block with merge_grade_misses.
+      (b) the required merge-grade artifact MISSING -> held (infra_failure).
       (c) a PASSING merge-grade with everything else green -> promote proceeds.
     """
     from app import shared_state
@@ -9974,7 +9971,7 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
     }
     goal = "Deliver the blind merge-grade qualification gate on stabilize->qualify"
 
-    # --- (a) FAILING merge-grade -> diagnostic only; promote proceeds --------
+    # --- (a) FAILING merge-grade -> hard blocker, no promotion ---------------
     project_a, version_a = await _make_project_and_version(db_session)
     await _seed_qualification_children(
         db_session,
@@ -9998,8 +9995,12 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
     result_a = await rq._finalize_qualification(db_session, version_a)
     await db_session.commit()
 
-    promote_a.assert_called_once()
-    assert result_a == {"status": "promoted"}
+    promote_a.assert_not_called()
+    assert result_a["status"] == "not_promoted"
+    assert result_a["blocker"] == "merge_grade_misses"
+    await db_session.refresh(version_a)
+    assert version_a.last_qualification["blocker"] == "merge_grade_misses"
+    assert version_a.last_qualification["merge_grade_status"] == "fail"
 
     # --- (b) MISSING merge-grade artifact -> infra hold, cannot be skipped --
     project_b, version_b = await _make_project_and_version(db_session)
@@ -10125,7 +10126,7 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
         f"Expected promotion for superseded version but got: {result_a}"
     )
 
-    # --- (b) prior_superseded absent -> still diagnostic only; promote proceeds ---
+    # --- (b) prior_superseded absent -> fresh versions still block -----------
     project_b, version_b = await _make_project_and_version(db_session)
     await _seed_qualification_children(
         db_session,
@@ -10145,8 +10146,12 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
     result_b = await rq._finalize_qualification(db_session, version_b)
     await db_session.commit()
 
-    promote_b.assert_called_once()
-    assert result_b == {"status": "promoted"}
+    promote_b.assert_not_called()
+    assert result_b["status"] == "not_promoted"
+    assert result_b["blocker"] == "merge_grade_misses"
+    await db_session.refresh(version_b)
+    assert version_b.last_qualification["blocker"] == "merge_grade_misses"
+    assert version_b.last_qualification["merge_grade_status"] == "fail"
 
 
 @pytest.mark.asyncio
@@ -27164,6 +27169,31 @@ class TestRecoverConfidenceFromCiUnresolved:
         }
         out = self._fn(record)
         assert out["blocker"] == "criterion_coverage_incomplete"
+        assert out["confidence"] == 0.0
+
+    def test_ci_unresolved_preserves_merge_grade_misses_blocker(self):
+        """Recovery keeps a failing blind merge-grade load-bearing."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
+            "smoketest_enabled": True,
+            "criterion_coverage": {
+                "total": 0,
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 0,
+            },
+            "merge_grade_status": "fail",
+            "merge_grade": {
+                "status": "fail",
+                "blocked": True,
+                "coverage": 0.2,
+                "biggest_gap": "The grade says the goal was missed.",
+            },
+        }
+        out = self._fn(record)
+        assert out["blocker"] == "merge_grade_misses"
         assert out["confidence"] == 0.0
 
 

@@ -3377,6 +3377,12 @@ async def _finalize_qualification(
                 version.version_number,
             )
         merge_grade_cert = evaluate_merge_grade(version.goal, merge_grade_artifact)
+        if qual.get("prior_superseded") and merge_grade_cert["status"] == "fail":
+            merge_grade_cert = {
+                **merge_grade_cert,
+                "status": "superseded_exempt",
+                "blocked": False,
+            }
         # A spawned merge-grade child MUST produce a usable goal-coverage verdict
         # to finalize.  A COMPLETED child with an absent artifact, or a present
         # but malformed artifact, is an infrastructure failure (the agent ran but
@@ -3410,6 +3416,7 @@ async def _finalize_qualification(
         migration_collision=migration_collision,
         migration_apply_blocked=migration_apply_blocked,
         criterion_coverage=criterion_coverage,
+        merge_grade_misses=bool(merge_grade_cert.get("blocked")),
     )
 
     # --- Acceptance-window counts (additive evidence, no score impact) -----
