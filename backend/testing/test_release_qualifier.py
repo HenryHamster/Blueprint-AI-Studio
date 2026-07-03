@@ -651,6 +651,61 @@ def _point_policy_at(mocker, tmp_path, content: str | None):
     return target
 
 
+class TestPolicyFromBuildConfig:
+    """Per-project promotion rubric via ``Project.build_config`` (Fix 5): a repo
+    that legitimately promotes at a different bar rides the existing build_config
+    seam — no new setting, no migration — and cannot set a gate-disabling bar."""
+
+    @staticmethod
+    def _proj(build_config):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(id="proj-1", build_config=build_config)
+
+    def test_build_config_override_wins(self):
+        proj = self._proj(
+            {
+                "promotion_threshold": 0.75,
+                "promotion_weights": {
+                    "audit": 0.5,
+                    "test_erosion": 0.3,
+                    "smoketest": 0.2,
+                },
+            }
+        )
+        policy, source, _ = rq._resolve_policy_with_provenance(proj)
+        assert source == "build_config"
+        assert policy["threshold"] == pytest.approx(0.75)
+        assert policy["weights"]["audit"] == pytest.approx(0.5)
+        # _load_policy threads the project through too.
+        assert rq._load_policy(proj)["threshold"] == pytest.approx(0.75)
+
+    def test_threshold_clamped_to_floor(self):
+        # A project cannot set a near-zero bar that silently disables its gate.
+        proj = self._proj({"promotion_threshold": 0.2})
+        policy = rq._load_policy(proj)
+        assert policy["threshold"] == pytest.approx(rq._SAFE_PROMOTION_THRESHOLD_FLOOR)
+
+    def test_threshold_only_uses_default_weights(self):
+        proj = self._proj({"promotion_threshold": 0.85})
+        policy, source, _ = rq._resolve_policy_with_provenance(proj)
+        assert source == "build_config"
+        assert policy["threshold"] == pytest.approx(0.85)
+        assert policy["weights"] == rq._DEFAULT_POLICY["weights"]
+
+    def test_invalid_weights_fall_through(self):
+        # Weights that don't sum to ~1.0 would break the gate math — ignored.
+        proj = self._proj(
+            {"promotion_weights": {"audit": 0.9, "test_erosion": 0.9, "smoketest": 0.9}}
+        )
+        assert rq._policy_from_build_config(proj) is None
+
+    def test_no_override_falls_through(self):
+        assert rq._policy_from_build_config(self._proj({})) is None
+        assert rq._policy_from_build_config(self._proj(None)) is None
+        assert rq._policy_from_build_config(None) is None
+
+
 class TestLoadPolicy:
     def test_parses_real_policy_file(self, mocker):
         """The shipped promotion_policy.yaml parses to the documented values.

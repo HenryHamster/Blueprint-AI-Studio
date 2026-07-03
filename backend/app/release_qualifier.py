@@ -326,14 +326,76 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
         return None
 
 
-def _resolve_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
+# A project's per-project promotion threshold is clamped to this floor so a
+# project can never set a near-zero bar that silently disables its own gate.
+_SAFE_PROMOTION_THRESHOLD_FLOOR = 0.5
+
+
+def _policy_from_build_config(project: "Project | None") -> dict[str, Any] | None:
+    """Resolve a per-project promotion rubric from ``Project.build_config``.
+
+    A project may LEGITIMATELY promote at a different bar than the fleet default
+    (an external research/witness repo vs Blueprint's trusted self-improvement
+    core), so ``build_config`` carries an optional per-project override on the
+    SAME schemaless JSONB seam that already holds ``requires_ci_checks`` /
+    ``has_ci`` — no new settings surface, no migration.  Returns
+    ``{"weights", "threshold"}`` or ``None`` when the project sets no override
+    (fall through to the fleet rubric).  Never raises.
+
+    Safety: the threshold is clamped to ``_SAFE_PROMOTION_THRESHOLD_FLOOR`` so a
+    project cannot set a near-zero bar; weights must sum ~1.0 (mirrors the YAML
+    validation) or the override is ignored and the fleet rubric applies.
+    """
+    bc = (project.build_config or {}) if project is not None else {}
+    threshold_raw = bc.get("promotion_threshold")
+    weights_raw = bc.get("promotion_weights")
+    if threshold_raw is None and weights_raw is None:
+        return None
+    try:
+        if weights_raw is not None:
+            weights = {
+                "audit": float(weights_raw["audit"]),
+                "test_erosion": float(weights_raw["test_erosion"]),
+                "smoketest": float(weights_raw["smoketest"]),
+            }
+            wsum = weights["audit"] + weights["test_erosion"] + weights["smoketest"]
+            if abs(wsum - 1.0) > 0.01:
+                raise ValueError(
+                    f"build_config promotion_weights sum to {wsum:.4f}, expected ~1.0"
+                )
+        else:
+            weights = dict(_DEFAULT_POLICY["weights"])
+        threshold = (
+            float(threshold_raw)
+            if threshold_raw is not None
+            else float(_DEFAULT_POLICY["threshold"])
+        )
+        threshold = max(threshold, _SAFE_PROMOTION_THRESHOLD_FLOOR)
+        return {"weights": weights, "threshold": threshold}
+    except Exception as exc:  # noqa: BLE001 — a bad per-project override falls through
+        logger.warning(
+            "[RELEASE_QUALIFIER] project %s build_config promotion rubric invalid "
+            "(%s) — falling back to the fleet rubric",
+            getattr(project, "id", "?"),
+            exc,
+        )
+        return None
+
+
+def _resolve_policy_with_provenance(
+    project: "Project | None" = None,
+) -> tuple[dict[str, Any], str, str | None]:
     """Resolve the promotion rubric and return its active source + fallback reason.
 
     The policy payload itself keeps the legacy ``{"weights": ..., "threshold": ...}``
     shape. This helper layers operator-visible provenance on top so callers can tell
-    whether the active rubric came from runtime config, the YAML file, or the
-    hardcoded defaults after a YAML failure.
+    whether the active rubric came from the project's build_config, runtime config,
+    the YAML file, or the hardcoded defaults after a YAML failure.
     """
+    from_build_config = _policy_from_build_config(project)
+    if from_build_config is not None:
+        return from_build_config, "build_config", None
+
     from_config = _policy_from_runtime_config()
     if from_config is not None:
         return from_config, "runtime_config", None
@@ -397,10 +459,13 @@ def _resolve_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
         )
 
 
-def _load_policy() -> dict[str, Any]:
-    """Resolve the promotion rubric: live runtime_config → YAML file → defaults.
+def _load_policy(project: "Project | None" = None) -> dict[str, Any]:
+    """Resolve the promotion rubric: project build_config → runtime_config → YAML → defaults.
 
     Resolution order:
+      0. ``project.build_config['promotion_threshold'/'promotion_weights']`` — an
+         optional per-project override (clamped to a safety floor), for a repo
+         that legitimately promotes at a different bar than the fleet default.
       1. ``runtime_config['promotion_threshold'/'promotion_weights']`` — the
          live, admin-tunable rubric (seeded from the YAML at startup, then
          operator-overridable via PATCH /api/admin/settings with no redeploy).
@@ -419,7 +484,7 @@ def _load_policy() -> dict[str, Any]:
     ``{"weights": {"audit": float, "test_erosion": float, "smoketest": float},
        "threshold": float}`` with every value coerced to float.
     """
-    policy, _, _ = _resolve_policy_with_provenance()
+    policy, _, _ = _resolve_policy_with_provenance(project)
     return policy
 
 
@@ -1621,7 +1686,13 @@ async def run_qualification(
     # spawned and compute_composite drops the smoketest dimension entirely —
     # see _finalize_qualification / compute_composite.  When True, behave as
     # the design doc specifies (audit + test-erosion + smoketest).
-    smoketest_enabled = bool(_runtime_config.get("smoketest_enabled"))
+    # Per-project override on the build_config seam (a project may or may not
+    # have a smoke suite), falling back to the fleet-global runtime_config flag.
+    smoketest_enabled = bool(
+        (project.build_config or {}).get(
+            "smoketest_enabled", _runtime_config.get("smoketest_enabled")
+        )
+    )
     audit_task_id: str | None = None
     challenge_task_id: str | None = None
     audit_challenge_task_id: str | None = None
@@ -2458,7 +2529,8 @@ async def _finalize_qualification(
             session, version, candidate_sha
         )
 
-    policy = _load_policy()
+    _policy_project = await session.get(Project, version.project_id)
+    policy = _load_policy(_policy_project)
 
     # --- Infra-failure detection: check required child terminal statuses ------
     # A FAILED, CANCELLED, or BLOCKED required child means the qualifier pipeline
