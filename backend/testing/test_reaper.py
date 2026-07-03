@@ -66,6 +66,11 @@ from app.reaper import (
     _normalize_reaper_retry_failure_class,
     _build_active_scan_stmt,
 )
+from app.reaper_orphan_classify import (
+    _RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS,
+    _is_resident_session,
+    _resident_session_heartbeat_stale_cutoff,
+)
 from app.retry_prompt import _build_retry_prompt_suffix
 from app.shared_state import runtime_config as _runtime_config
 import app.reaper_sweeps as _rs
@@ -7143,6 +7148,203 @@ def test_classify_orphan_degenerate_in_progress_catch_all():
         last_heartbeat=None,
         started_at=None,
         created_at=now - timedelta(minutes=11),
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+
+
+# ── resident strategic session carve-out ────────────────────────────────────
+
+
+def test_is_resident_session_predicate():
+    assert _is_resident_session(
+        _FakeClassifyTask(status=TaskStatus.IN_PROGRESS, context={"_resident_session": True})
+    ) is True
+    # Only the strict boolean True opts in — truthy-but-not-True does not.
+    assert _is_resident_session(
+        _FakeClassifyTask(status=TaskStatus.IN_PROGRESS, context={"_resident_session": "yes"})
+    ) is False
+    assert _is_resident_session(
+        _FakeClassifyTask(status=TaskStatus.IN_PROGRESS, context={})
+    ) is False
+
+
+def test_resident_session_heartbeat_stale_cutoff_default_and_override():
+    now = datetime(2026, 7, 2, 12, 0, 0)
+    t = _FakeClassifyTask(status=TaskStatus.IN_PROGRESS)
+    assert _resident_session_heartbeat_stale_cutoff(t, now) == now - timedelta(
+        seconds=_RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS
+    )
+    original = _runtime_config.get("resident_session_heartbeat_stale_seconds")
+    try:
+        _runtime_config["resident_session_heartbeat_stale_seconds"] = 60
+        assert _resident_session_heartbeat_stale_cutoff(t, now) == now - timedelta(
+            seconds=60
+        )
+    finally:
+        if original is None:
+            _runtime_config.pop("resident_session_heartbeat_stale_seconds", None)
+        else:
+            _runtime_config["resident_session_heartbeat_stale_seconds"] = original
+
+
+def test_classify_orphan_resident_session_exempt_from_progress_staleness():
+    """A resident strategic session that would be reaped as agent_stalled under
+    the thinking-heavy 1500s progress budget is EXEMPT while its runner stays
+    live (fresh heartbeat). This is the core carve-out."""
+    now = _utcnow()
+    base = {
+        "status": TaskStatus.IN_PROGRESS,
+        "last_heartbeat": now - timedelta(seconds=30),  # runner alive
+        "last_tool_use_at": None,  # no tool calls: pure warm-idle reasoning/waiting
+        "started_at": now - timedelta(minutes=30),  # well past the 1500s budget
+        "first_payload": {"type": "strategic_review"},
+        "context": {"llm_provider": "anthropic"},
+    }
+    # Baseline: without the resident flag this is a stalled anthropic orphan.
+    non_resident = _FakeClassifyTask(**base)
+    assert _classify_orphan(non_resident, now, has_open_pr=False) is True
+    # With the resident-session flag it is exempt from progress-staleness.
+    resident = _FakeClassifyTask(
+        **{**base, "context": {"llm_provider": "anthropic", "_resident_session": True}}
+    )
+    assert _classify_orphan(resident, now, has_open_pr=False) is False
+
+
+def test_classify_orphan_resident_session_fresh_heartbeat_stale_tool_not_reaped():
+    """Exempt even with an ancient last_tool_use_at, as long as heartbeat is fresh."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=45),
+        last_tool_use_at=now - timedelta(minutes=40),
+        started_at=now - timedelta(minutes=45),
+        first_payload={"type": "strategic_review"},
+        context={"_resident_session": True, "llm_provider": "anthropic"},
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is False
+
+
+def test_classify_orphan_resident_session_reaped_when_heartbeat_stale_beyond_window():
+    """A resident session whose runner has gone silent past the resident window IS
+    reaped — the carve-out never makes it immortal."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=_RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS + 120),
+        started_at=now - timedelta(hours=1),
+        first_payload={"type": "strategic_review"},
+        context={"_resident_session": True},
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+    # Just inside the window → not reaped.
+    t.last_heartbeat = now - timedelta(
+        seconds=_RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS - 120
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is False
+
+
+def test_classify_orphan_resident_session_null_heartbeat_uses_started_at_window():
+    """No heartbeat ever: reap only when started_at is older than the resident
+    window (runner never called in), not before."""
+    now = _utcnow()
+    stale = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=None,
+        started_at=now - timedelta(seconds=_RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS + 60),
+        first_payload={"type": "strategic_review"},
+        context={"_resident_session": True},
+    )
+    assert _classify_orphan(stale, now, has_open_pr=False) is True
+    fresh = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=None,
+        started_at=now - timedelta(minutes=5),
+        first_payload={"type": "strategic_review"},
+        context={"_resident_session": True},
+    )
+    assert _classify_orphan(fresh, now, has_open_pr=False) is False
+
+
+def test_classify_orphan_resident_session_degenerate_row_reaped_by_created_at():
+    """A degenerate resident row (no last_heartbeat AND no started_at) is no
+    longer immortal: it is reaped once created_at is older than the resident
+    window, and left alone while still inside it."""
+    now = _utcnow()
+    stale = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=None,
+        started_at=None,
+        created_at=now
+        - timedelta(seconds=_RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS + 120),
+        first_payload={"type": "strategic_review"},
+        context={"_resident_session": True},
+    )
+    assert _classify_orphan(stale, now, has_open_pr=False) is True
+    fresh = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=None,
+        started_at=None,
+        created_at=now - timedelta(minutes=2),
+        first_payload={"type": "strategic_review"},
+        context={"_resident_session": True},
+    )
+    assert _classify_orphan(fresh, now, has_open_pr=False) is False
+
+
+def test_classify_orphan_resident_session_degenerate_vm_contact_override():
+    """The degenerate created_at reap still honors the off-row VM-contact
+    liveness override, like every other resident heartbeat-stale branch."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=None,
+        started_at=None,
+        created_at=now
+        - timedelta(seconds=_RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS + 300),
+        first_payload={"type": "strategic_review"},
+        context={"_resident_session": True},
+        vm_instance_id="runner:degenerate",
+    )
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+    lookup = {"runner:degenerate": now - timedelta(seconds=60)}
+    assert (
+        _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup=lookup) is False
+    )
+
+
+def test_classify_orphan_resident_session_vm_contact_override_suppresses_reap():
+    """A stale-heartbeat resident session whose VM was heard from within the
+    resident window is NOT reaped (lock-starved heartbeat write) — same liveness
+    override the other heartbeat-stale branches honor."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=_RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS + 300),
+        started_at=now - timedelta(hours=1),
+        first_payload={"type": "strategic_review"},
+        context={"_resident_session": True},
+        vm_instance_id="runner:aaaa",
+    )
+    # No lookup → reaps.
+    assert _classify_orphan(t, now, has_open_pr=False) is True
+    # Fresh off-row contact within the resident window → suppressed.
+    lookup = {"runner:aaaa": now - timedelta(seconds=60)}
+    assert (
+        _classify_orphan(t, now, has_open_pr=False, vm_contact_lookup=lookup) is False
+    )
+
+
+def test_classify_orphan_non_resident_strategic_review_still_reaped():
+    """The carve-out is opt-in: a normal (non-resident) strategic_review that
+    blows the 1500s thinking-heavy budget is still reaped as before."""
+    now = _utcnow()
+    t = _FakeClassifyTask(
+        status=TaskStatus.IN_PROGRESS,
+        last_heartbeat=now - timedelta(seconds=30),
+        last_tool_use_at=None,
+        started_at=now - timedelta(minutes=30),
+        first_payload={"type": "strategic_review"},
+        context={"llm_provider": "anthropic"},
     )
     assert _classify_orphan(t, now, has_open_pr=False) is True
 

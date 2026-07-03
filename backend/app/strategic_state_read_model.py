@@ -19,6 +19,11 @@ from app.models import (
     TaskStatus,
 )
 from app import strategic_cycle
+from app.shared_state import runtime_config
+from app.strategic_resident_session import (
+    STRATEGIC_SESSION_ENABLED_SETTING,
+    resident_session_snapshot,
+)
 from app.task_movement import build_task_movement_explanation
 
 TASK_FOCUS_BUCKET_LIMIT = 8
@@ -493,3 +498,25 @@ def _strategic_refresh_summary(vision: Dict[str, Any] | None) -> Dict[str, Any]:
             vision.get("_strategic_refresh_last_fired_origin"), max_chars=40
         ),
     }
+
+
+def _resident_session_summary(project: Project) -> Dict[str, Any] | None:
+    """Bounded projection of the resident strategic-session state blob.
+
+    Reads the session record stored under ``Project.vision`` (no queries) via the
+    authoritative ``resident_session_snapshot`` helper so the operator UI polling
+    the strategic-state read model can tell whether a resident session is active
+    and its status. Returns ``None`` when no session record exists.
+    """
+    return resident_session_snapshot(project.vision)
+
+
+def _resident_session_available() -> bool:
+    """Whether resident strategic sessions are currently enabled.
+
+    Mirrors the ``strategic_session_enabled`` runtime-config gate enforced by the
+    resident-session start endpoint. Surfaced on the read model so the operator
+    UI can hide the Start affordance when the feature is off, instead of letting
+    a click 403 at the start endpoint.
+    """
+    return bool(runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False))

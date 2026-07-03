@@ -7780,6 +7780,85 @@ class TestNotificationConfigSettings:
         assert bad2.status_code == 400
 
     @pytest.mark.asyncio
+    async def test_resident_strategic_session_settings(self, client: AsyncClient):
+        """The seven resident-strategic-session settings expose their contract
+        defaults on GET, round-trip through PATCH, and reject bad values.
+
+        Other builders reference these by name, so the names + defaults are
+        pinned here: strategic_session_enabled (false),
+        strategic_continuation_ttl_seconds (1500),
+        strategic_local_hold_timeout_seconds (900),
+        strategic_session_idle_tick_seconds (5),
+        strategic_session_turn_timeout_seconds (120),
+        strategic_session_max_unattended_seconds (14400),
+        resident_session_heartbeat_stale_seconds (1500)."""
+        get_resp = await client.get("/api/admin/settings")
+        assert get_resp.status_code == 200
+        data = get_resp.json()
+        assert data["strategic_session_enabled"] is False
+        assert data["strategic_continuation_ttl_seconds"] == 1500
+        assert data["strategic_local_hold_timeout_seconds"] == 900
+        assert data["strategic_session_idle_tick_seconds"] == 5
+        assert data["strategic_session_turn_timeout_seconds"] == 120
+        assert data["strategic_session_max_unattended_seconds"] == 14400
+        assert data["resident_session_heartbeat_stale_seconds"] == 1500
+
+        # Feature flag round-trips; only a real boolean is accepted.
+        resp = await client.patch(
+            "/api/admin/settings", json={"strategic_session_enabled": True}
+        )
+        assert resp.status_code == 200, resp.text
+        assert (
+            (await client.get("/api/admin/settings")).json()[
+                "strategic_session_enabled"
+            ]
+            is True
+        )
+        bad_flag = await client.patch(
+            "/api/admin/settings", json={"strategic_session_enabled": "yes"}
+        )
+        assert bad_flag.status_code == 400
+
+        # Integer knobs round-trip and clamp to their documented ranges.
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "strategic_continuation_ttl_seconds": 1800,
+                "strategic_local_hold_timeout_seconds": 600,
+                "strategic_session_idle_tick_seconds": 3,
+                "strategic_session_turn_timeout_seconds": 300,
+                "strategic_session_max_unattended_seconds": 7200,
+                "resident_session_heartbeat_stale_seconds": 1200,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = (await client.get("/api/admin/settings")).json()
+        assert data["strategic_continuation_ttl_seconds"] == 1800
+        assert data["strategic_local_hold_timeout_seconds"] == 600
+        assert data["strategic_session_idle_tick_seconds"] == 3
+        assert data["strategic_session_turn_timeout_seconds"] == 300
+        assert data["strategic_session_max_unattended_seconds"] == 7200
+        assert data["resident_session_heartbeat_stale_seconds"] == 1200
+
+        # Out-of-range / non-numeric are rejected. The continuation TTL and
+        # local-hold timeout ceilings are lowered to 7200s (2h) so an operator
+        # can never reintroduce a >12h local-pin wall.
+        for key, bad_val in (
+            ("strategic_continuation_ttl_seconds", 10),  # < 60
+            ("strategic_continuation_ttl_seconds", 86_400),  # > 7200 ceiling
+            ("strategic_local_hold_timeout_seconds", "x"),
+            ("strategic_local_hold_timeout_seconds", 43_200),  # > 7200 ceiling
+            ("strategic_session_idle_tick_seconds", 0),  # < 1
+            ("strategic_session_turn_timeout_seconds", 99999),  # > 3600
+            ("strategic_session_max_unattended_seconds", 30),  # < 60
+            ("strategic_session_max_unattended_seconds", 99999),  # > 28800
+            ("resident_session_heartbeat_stale_seconds", 10),  # < 60
+            ("resident_session_heartbeat_stale_seconds", 99999),  # > 7200
+        ):
+            bad = await client.patch("/api/admin/settings", json={key: bad_val})
+            assert bad.status_code == 400, f"{key}={bad_val!r} should be rejected"
+
+    @pytest.mark.asyncio
     async def test_patch_deploy_repo_identity(self, client: AsyncClient):
         """deploy_repo_identity accepts a normalized 'owner/repo', clears on null,
         rejects malformed values, and round-trips on GET."""
@@ -8887,6 +8966,83 @@ class TestEvergreenFillSettingsPersist:
         assert _shared_state.runtime_config["structural_health_audit_mode"] == "enforce"
         assert _shared_state.runtime_config["structural_health_audit_interval_minutes"] == 120
         assert _shared_state.runtime_config["structural_health_audit_fat_row_bytes"] == 2097152
+
+    @pytest.mark.asyncio
+    async def test_strategic_session_settings_persist_across_sync(
+        self, client: AsyncClient, db_session
+    ):
+        """The resident-strategic-session settings persist into
+        DeploymentState.runtime_config_json AND are restored by
+        sync_runtime_config_from_state, so an enable/tune survives a Cloud Run
+        restart and reaches the leader across instances (regression: they were
+        omitted from both the persist dict and the sync-back reader, so enabling
+        reverted on restart and a multi-instance PATCH never propagated)."""
+        from app.models import DeploymentState
+        from app.runtime_config_state import sync_runtime_config_from_state
+        import app.shared_state as _shared_state
+
+        db_session.add(DeploymentState())
+        await db_session.commit()
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "strategic_session_enabled": True,
+                "strategic_continuation_ttl_seconds": 1800,
+                "strategic_local_hold_timeout_seconds": 600,
+                "strategic_session_idle_tick_seconds": 3,
+                "strategic_session_turn_timeout_seconds": 300,
+                "strategic_session_max_unattended_seconds": 7200,
+                "resident_session_heartbeat_stale_seconds": 1200,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        # Values are persisted to DeploymentState.runtime_config_json.
+        row = await db_session.get(DeploymentState, 1)
+        assert row is not None
+        assert row.runtime_config_json is not None
+        assert row.runtime_config_json["strategic_session_enabled"] is True
+        assert row.runtime_config_json["strategic_continuation_ttl_seconds"] == 1800
+        assert row.runtime_config_json["strategic_local_hold_timeout_seconds"] == 600
+        assert row.runtime_config_json["strategic_session_idle_tick_seconds"] == 3
+        assert row.runtime_config_json["strategic_session_turn_timeout_seconds"] == 300
+        assert (
+            row.runtime_config_json["strategic_session_max_unattended_seconds"] == 7200
+        )
+        assert (
+            row.runtime_config_json["resident_session_heartbeat_stale_seconds"] == 1200
+        )
+
+        # Config-sync restore applies persisted values to a fresh in-memory config
+        # (mirrors what a cold Cloud Run instance / the leader does on boot).
+        _shared_state.runtime_config["strategic_session_enabled"] = False
+        _shared_state.runtime_config["strategic_continuation_ttl_seconds"] = 1500
+        _shared_state.runtime_config["strategic_local_hold_timeout_seconds"] = 900
+        _shared_state.runtime_config["strategic_session_idle_tick_seconds"] = 5
+        _shared_state.runtime_config["strategic_session_turn_timeout_seconds"] = 120
+        _shared_state.runtime_config["strategic_session_max_unattended_seconds"] = 14400
+        _shared_state.runtime_config["resident_session_heartbeat_stale_seconds"] = 1500
+
+        await sync_runtime_config_from_state(row)
+
+        assert _shared_state.runtime_config["strategic_session_enabled"] is True
+        assert _shared_state.runtime_config["strategic_continuation_ttl_seconds"] == 1800
+        assert (
+            _shared_state.runtime_config["strategic_local_hold_timeout_seconds"] == 600
+        )
+        assert _shared_state.runtime_config["strategic_session_idle_tick_seconds"] == 3
+        assert (
+            _shared_state.runtime_config["strategic_session_turn_timeout_seconds"] == 300
+        )
+        assert (
+            _shared_state.runtime_config["strategic_session_max_unattended_seconds"]
+            == 7200
+        )
+        assert (
+            _shared_state.runtime_config["resident_session_heartbeat_stale_seconds"]
+            == 1200
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

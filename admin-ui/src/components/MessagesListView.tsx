@@ -1,4 +1,4 @@
-import { type Dispatch, type SetStateAction, type RefObject } from 'react';
+import { type Dispatch, type SetStateAction, type RefObject, type ReactNode } from 'react';
 import { MessageSquare, AlertTriangle, HelpCircle, ChevronDown, ArrowDown, ChevronUp, Check, MoreVertical } from 'lucide-react';
 import { ROUTINE_EVENT_LABELS } from './eventPrefs';
 import { type RoutineRow, type MessageWithDivider, routineSummary, formatDailyDigestSummary, outcomeBreakdown, insertTimeDividers, formatTimestamp, formatSinceTimestamp } from './messageGrouping';
@@ -22,6 +22,13 @@ function TimeDividerRow({ label, className }: { label: string; className?: strin
 
 export interface MessagesListViewProps {
   presentation?: 'triage' | 'conversation';
+  /**
+   * Live resident-session streaming preview, rendered at the tail of the
+   * conversation transcript (conversation presentation only). Reconciled away by
+   * the caller once the durable strategic ProjectMessage lands, so it never
+   * duplicates a persisted message.
+   */
+  streamingBubble?: ReactNode;
   // Refs
   scrollRef: RefObject<HTMLDivElement | null>;
   blockersRefEl: RefObject<HTMLDivElement | null>;
@@ -87,6 +94,7 @@ export interface MessagesListViewProps {
  */
 export function MessagesListView({
   presentation = 'triage',
+  streamingBubble,
   scrollRef,
   blockersRefEl,
   questionsRefEl,
@@ -140,27 +148,31 @@ export function MessagesListView({
         <div data-testid="strategic-conversation-column" className="mx-auto flex w-full max-w-[940px] flex-col gap-3">
           {loading ? (
             <p className="py-8 text-center text-xs text-neutral-500">Loading...</p>
-          ) : messages.length === 0 ? (
+          ) : messages.length === 0 && !streamingBubble ? (
             <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
               <MessageSquare className="mb-3 h-8 w-8 opacity-40" />
               <p className="text-sm">No messages yet</p>
             </div>
           ) : (
-            insertTimeDividers(messages).map((item, idx) =>
-              item.kind === 'divider' ? (
-                <TimeDividerRow key={`divider-conversation-${idx}`} label={item.label} className="my-1" />
-              ) : (
-                <MessageBubble
-                  key={item.msg.id}
-                  msg={item.msg}
-                  faded={item.msg.status === 'resolved'}
-                  allMessages={messages}
-                  presentation="chat"
-                  highlighted={item.msg.id === highlightedMessageId}
-                  {...bubbleProps}
-                />
-              ),
-            )
+            <>
+              {insertTimeDividers(messages).map((item, idx) =>
+                item.kind === 'divider' ? (
+                  <TimeDividerRow key={`divider-conversation-${idx}`} label={item.label} className="my-1" />
+                ) : (
+                  <MessageBubble
+                    key={item.msg.id}
+                    msg={item.msg}
+                    faded={item.msg.status === 'resolved'}
+                    allMessages={messages}
+                    presentation="chat"
+                    highlighted={item.msg.id === highlightedMessageId}
+                    {...bubbleProps}
+                  />
+                ),
+              )}
+              {/* Live streaming preview — always at the tail, below all durable messages. */}
+              {streamingBubble}
+            </>
           )}
         </div>
         {showScrollDown && (

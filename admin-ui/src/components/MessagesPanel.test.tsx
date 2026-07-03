@@ -8,6 +8,7 @@ import type { ProjectMessage } from './MessageBubble';
 import type { SavedView } from './MessagesPanel.utils';
 import { armingToastCopy, armingHintCopy, parseArmingOutcome, type ArmingOutcome } from './messageArming';
 import type { StrategicStateResponse } from '../strategicStateApi';
+import type { StrategicSessionDelta } from '../hooks/useLogViewer';
 
 // Full replacement (NOT a partial mock): the real `../firebase` calls
 // initializeApp()/getAuth() at module load, which we must not run in jsdom.
@@ -1417,6 +1418,69 @@ describe('MessagesPanel chrome modes', () => {
       expect(el.textContent).not.toContain('Replying to Strategic');
       expect(el.textContent).not.toContain('cycle summary should stay out of chat');
       expect(el.querySelector('textarea')?.value).toBe('');
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
+
+  test('streams the live resident turn then reconciles into the durable message', async () => {
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = vi.fn();
+    try {
+      const transcript: StrategicSessionDelta[] = [
+        { id: 1, session_id: 'ss-abc', task_id: 't-1', seq: 1, kind: 'reasoning', text: 'Comparing the two plans', ts: '2026-06-01T10:00:00Z' },
+        { id: 2, session_id: 'ss-abc', task_id: 't-1', seq: 2, kind: 'message', text: 'The smaller plan is cheaper.', ts: '2026-06-01T10:00:02Z' },
+      ];
+
+      // Phase 1: turn is streaming, no durable strategic message persisted yet.
+      const el = await renderPanel({
+        filterChrome: 'minimal',
+        strategicSessionTranscript: transcript,
+      }, []);
+
+      await waitFor(() => {
+        expect(el.querySelector('[data-testid="strategic-streaming-bubble"]')).toBeTruthy();
+      });
+      expect(el.querySelector('[data-testid="strategic-streaming-bubble"]')?.textContent)
+        .toContain('The smaller plan is cheaper.');
+      // Only the live preview exists — no durable bubble has arrived.
+      expect(el.querySelectorAll('[data-testid="message-bubble"]')).toHaveLength(0);
+
+      // Phase 2: the durable strategic ProjectMessage lands (created_at newer than
+      // the streamed deltas). Refresh the mock + bump realtimeRefreshSignal to refetch.
+      const durable = makeMsg({
+        id: 'strategic-reply-1',
+        from_type: 'strategic',
+        message_type: 'NOTE',
+        content: 'The smaller plan is cheaper.',
+        status: 'open',
+        created_at: '2026-06-01T10:00:05Z',
+      });
+      _mockMessagesFetch([durable]);
+      const mountedRoot = root;
+      if (!mountedRoot) throw new Error('panel root not mounted');
+      await act(async () => {
+        mountedRoot.render(
+          <MessagesPanel
+            selectedProjectId="proj-1"
+            addToast={() => {}}
+            onMessageCountChange={() => {}}
+            filterChrome="minimal"
+            strategicSessionTranscript={transcript}
+            realtimeRefreshSignal={2}
+          />,
+        );
+      });
+
+      await waitFor(() => {
+        expect(el.querySelector('[data-message-id="strategic-reply-1"]')).toBeTruthy();
+      });
+      // The streaming preview reconciled away (no duplicate) and the durable reply
+      // renders exactly once.
+      expect(el.querySelector('[data-testid="strategic-streaming-bubble"]')).toBeNull();
+      const durableBubbles = [...el.querySelectorAll('[data-testid="message-bubble"]')]
+        .filter(node => node.textContent?.includes('The smaller plan is cheaper.'));
+      expect(durableBubbles).toHaveLength(1);
     } finally {
       Element.prototype.scrollIntoView = originalScrollIntoView;
     }

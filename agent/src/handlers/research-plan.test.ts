@@ -137,6 +137,7 @@ const {
     'sanitizeError',
     'sendHeartbeatSync',
     'sendLog',
+    'sendWsFrame',
     'setCurrentPromptFingerprint',
     'setupWorkspace',
     'shouldAbandonStaleResult',

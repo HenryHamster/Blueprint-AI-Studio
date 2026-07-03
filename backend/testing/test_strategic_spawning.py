@@ -583,6 +583,80 @@ async def test_spawn_review_includes_operator_overrides_when_present(db_session)
     assert payload["operator_overrides"][0]["document"] == "running_update"
 
 
+# ── extra_context born-context seeding (resident-session SPAWN-path race fix) ──
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_seeds_extra_context_at_birth(db_session):
+    """``extra_context`` is merged into the created task's ``context`` in the SAME
+    INSERT that creates it, so the committed task is BORN already carrying those
+    keys (it never exists in a committed state without them). This is the atomic
+    seam the resident-session start uses to make its spawned strategic_review
+    claimable ONLY with ``_resident_session`` already set — closing the window in
+    which a warm runner could claim it flag-less and dispatch the one-shot."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    extra = {
+        "_resident_session": True,
+        "strategic_session_id": "ss-born-1234",
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "resident_session",
+        "preferred_runner_target_id": "runner-abc",
+    }
+    spawned = await _spawn_strategic_review(project, db_session, extra_context=extra)
+    assert spawned is True
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()[0]
+    )
+    # The task's FIRST (and only) committed context carries the born flags — proof
+    # the seed rode the creating INSERT, not a follow-up transaction.
+    ctx = task.context or {}
+    assert ctx.get("_resident_session") is True
+    assert ctx.get("strategic_session_id") == "ss-born-1234"
+    assert ctx.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+    assert ctx.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY) == "resident_session"
+    assert ctx.get("preferred_runner_target_id") == "runner-abc"
+    # The function's own derived context (the cycle id) is preserved alongside.
+    assert ctx.get("strategic_cycle_id") == task.strategic_cycle_id
+    assert task.strategic_cycle_id
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_default_extra_context_unchanged(db_session):
+    """Regression: a normal cadence spawn (``extra_context`` defaulting to None)
+    is unaffected — the created task carries NO resident flags, exactly as before
+    the parameter was added."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()[0]
+    )
+    ctx = task.context or {}
+    # No born-context leaked into a plain cadence spawn.
+    assert "_resident_session" not in ctx
+    assert "strategic_session_id" not in ctx
+    assert STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in ctx
+    # The cadence cycle id is still set as before.
+    assert ctx.get("strategic_cycle_id") == task.strategic_cycle_id
+    assert task.strategic_cycle_id
+
+
 @pytest.mark.asyncio
 async def test_drift_snapshot_failure_does_not_expire_caller_instances(
     db_session, mocker
@@ -2992,26 +3066,34 @@ async def test_local_continuation_requires_local_even_without_live_runner(
 
 
 @pytest.mark.asyncio
-async def test_local_continuation_workday_ttl_outlives_idle_workbench_ttl(
+async def test_local_continuation_ttl_bounded_to_lease_window(
     db_session, mocker
 ):
-    """Workday local intent remains hard local after the UI idle TTL."""
-    assert STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS > SESSION_IDLE_TTL_SECONDS
+    """Continuation TTL is the short lease window, not a 12h wall clock.
+
+    SAFETY (dead-man's switch): the local-Strategic continuation TTL must no
+    longer OUTLIVE the idle workbench TTL. The retired 12h-vs-4h relationship let
+    an opened-and-abandoned session pin the project locally for 12h; the TTL is
+    now bounded to the short lease window so abandonment self-heals fast. A marker
+    still WITHIN the (short) TTL keeps its hard-local intent — verified here — while
+    a marker aged past it drops to cloud (test_local_continuation_affinity_
+    omitted_when_stale_or_incapable covers the stale case).
+    """
+    assert STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS <= SESSION_IDLE_TTL_SECONDS
     _patch_spawning_deps(mocker)
     mocker.patch(
         "app.task_lifecycle._has_active_strategic_task",
         new=AsyncMock(return_value=False),
     )
-    workday_at = (
-        datetime.now(timezone.utc)
-        - timedelta(seconds=SESSION_IDLE_TTL_SECONDS + 60)
+    fresh_at = (
+        datetime.now(timezone.utc) - timedelta(seconds=60)
     ).isoformat()
     project = _make_project(
         vision={
             "purpose": "test purpose",
             STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(
-                updated_at=workday_at,
-                last_seen_at=workday_at,
+                updated_at=fresh_at,
+                last_seen_at=fresh_at,
             ),
         }
     )

@@ -978,9 +978,14 @@ class TestRunnerEndpoints:
         assert runner.consecutive_job_failures == 0
 
     @pytest.mark.asyncio
-    async def test_heartbeat_renews_pinned_strategic_continuation(
+    async def test_heartbeat_does_not_renew_pinned_strategic_continuation(
         self, client: AsyncClient, db_session
     ):
+        """SAFETY (dead-man's switch): bare runner liveness must NOT renew the
+        continuation marker — even when the marker is fresh, active, and pinned to
+        the heartbeating Strategic-capable runner. Renewal is gated on operator
+        interaction OR an applied strategic op (progress); an alive-but-idle local
+        session must be reclaimable by the cloud cadence once its lease lapses."""
         project = await _make_project(db_session)
         runner, token = await _make_runner(
             db_session,
@@ -1017,12 +1022,13 @@ class TestRunnerEndpoints:
             )
         ).scalar_one()
         workbench = prefs_row.prefs[WORKBENCH_STATE_KEY]
-        assert _parse_iso(workbench["last_interaction_at"]) > _parse_iso(old_at)
+        # Freshness is UNCHANGED by the heartbeat — no liveness-driven renewal.
+        assert workbench["last_interaction_at"] == old_at
         assert workbench["preferred_runner_id"] == preferred_runner_id
         await db_session.refresh(project)
         marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
-        assert _parse_iso(marker["last_seen_at"]) > _parse_iso(old_at)
-        assert _parse_iso(marker["updated_at"]) > _parse_iso(old_at)
+        assert marker["last_seen_at"] == old_at
+        assert marker["updated_at"] == old_at
         assert marker["preferred_runner_id"] == preferred_runner_id
 
     @pytest.mark.asyncio

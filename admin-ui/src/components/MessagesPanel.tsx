@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
 import { auth } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker } from '../api';
-import type { StrategicCycleProgress, StrategicCycleCompletion } from '../hooks/useLogViewer';
+import type { StrategicCycleProgress, StrategicCycleCompletion, StrategicSessionDelta } from '../hooks/useLogViewer';
 import { parseTimestamp, timeAgo } from '../utils/time';
 import { type EventPref, loadEventPrefs, saveEventPrefs, effectiveSignal, getToastSeverity, countHighSignalMessages } from './eventPrefs';
 import { type MuteWindow, loadMuteWindow, saveMuteWindow, clearMuteWindow } from './muteWindow';
@@ -300,6 +300,13 @@ export interface MessagesPanelProps {
   onOpenStrategicContextCommands?: () => void;
   /** Legacy refresh callback kept for callers that still wire the old prop name. */
   onStrategicRefresh?: () => void;
+  /**
+   * Live resident-session transcript deltas (from `useLogViewer`, one per
+   * `strategic_session` WS frame). Rendered as a streaming/"typing" bubble in the
+   * conversation transcript while a turn streams; reconciled into the durable
+   * `from_type=strategic` ProjectMessage once it lands via the conversation refresh.
+   */
+  strategicSessionTranscript?: StrategicSessionDelta[];
 }
 
 type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean; criticalOnly: boolean };
@@ -391,7 +398,88 @@ function messageListsEqual(a: ProjectMessage[], b: ProjectMessage[]): boolean {
   return a.length === b.length && a.every((message, i) => messagesEqual(message, b[i]));
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh }: MessagesPanelProps) {
+interface StrategicStreamingTurn {
+  /** Stable React key for the streaming bubble: session id + first visible seq. */
+  key: string;
+  sessionId: string;
+  text: string;
+}
+
+/**
+ * Derive the live streaming turn from the resident-session transcript deltas.
+ *
+ * Dedup / reconciliation key: the newest DURABLE strategic message's `created_at`
+ * acts as a high-water mark. Only transcript deltas from the most recent session
+ * whose `ts` is strictly newer than that water mark are shown — so the streaming
+ * bubble only ever previews content that has NOT yet been persisted. When the
+ * durable `from_type=strategic` ProjectMessage for the turn arrives via the
+ * conversation refresh, the water mark advances past the turn's deltas, the
+ * preview empties, and the durable bubble takes its place — no duplicate. A
+ * cadence / non-resident turn streams nothing, so this returns null and only the
+ * persisted message renders.
+ */
+function computeStrategicStreamingTurn(
+  transcript: StrategicSessionDelta[] | undefined,
+  conversationMessages: ProjectMessage[],
+): StrategicStreamingTurn | null {
+  const deltas = transcript ?? [];
+  if (deltas.length === 0) return null;
+  const latestSessionId = deltas[deltas.length - 1]?.session_id;
+
+  // High-water mark = newest durable strategic reply already in the transcript.
+  let watermark = Number.NEGATIVE_INFINITY;
+  for (const msg of conversationMessages) {
+    const ft = (msg.from_type || '').toLowerCase();
+    if ((ft === 'strategic' || ft === 'strategist') && msg.created_at) {
+      const t = parseTimestamp(msg.created_at).getTime();
+      if (!Number.isNaN(t) && t > watermark) watermark = t;
+    }
+  }
+
+  const visible = deltas.filter(d => {
+    // Restrict to the current (latest) session so a prior session's un-persisted
+    // trailing status lines never linger.
+    if (latestSessionId && d.session_id && d.session_id !== latestSessionId) return false;
+    if (watermark === Number.NEGATIVE_INFINITY) return true;
+    if (!d.ts) return true; // no timestamp → treat as a fresh, unpersisted delta
+    const t = parseTimestamp(d.ts).getTime();
+    return Number.isNaN(t) ? true : t > watermark;
+  });
+  if (visible.length === 0) return null;
+
+  const text = visible.map(d => d.text).filter(Boolean).join('\n').trim();
+  if (!text) return null;
+
+  const firstSeq = visible[0].seq ?? visible[0].id;
+  const sessionId = latestSessionId ?? 'session';
+  return { key: `${sessionId}:${firstSeq}`, sessionId, text };
+}
+
+/** Live "typing"/streaming preview bubble for the resident strategist's in-flight turn. */
+function StrategicStreamingBubble({ text }: { text: string }) {
+  return (
+    <div
+      data-testid="strategic-streaming-bubble"
+      className="group flex scroll-mt-24 justify-start rounded-md"
+    >
+      <div className="flex w-full max-w-[92%] flex-col items-start md:max-w-[76%]">
+        <div className="mb-0.5 flex items-center gap-1.5 px-0.5 text-ui-md text-neutral-500">
+          <span className="font-medium text-neutral-400">Strategic</span>
+          <span aria-hidden="true">·</span>
+          <span className="inline-flex items-center gap-1">
+            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" aria-hidden="true" />
+            responding…
+          </span>
+        </div>
+        <div className="rounded-md border border-transparent bg-transparent px-0.5 py-0.5">
+          <div className="whitespace-pre-wrap text-sm leading-relaxed text-neutral-100">{text}</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
   const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
   const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
@@ -804,6 +892,14 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         return aTime - bTime;
       });
   }, [messages, eventPrefs, tempMutes]);
+  // Live streaming turn: the resident strategist's in-flight reply, previewed as a
+  // "typing" bubble at the tail of the chat and reconciled into the durable
+  // ProjectMessage once it lands (see computeStrategicStreamingTurn). Only relevant
+  // in conversation mode; the persisted-message path renders regardless.
+  const streamingTurn = useMemo(
+    () => (conversationMode ? computeStrategicStreamingTurn(strategicSessionTranscript, conversationMessages) : null),
+    [conversationMode, strategicSessionTranscript, conversationMessages],
+  );
   const showStrategicStatusStrip = conversationMode && Boolean(
     strategistActive
       || strategicRefresh
@@ -1250,6 +1346,20 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     // Don't scroll at all on polling refresh with same count — preserves position
     prevMessageCountRef.current = currentCount;
   }, [conversationMode, conversationMessages.length, highSignalOpen, routineOpen, targetMessageId, visibleResolved]);
+
+  // Keep the chat pinned to the live streaming preview as it grows — but only
+  // when the operator is already near the bottom, so a deliberate scroll-up to
+  // read history is never yanked back down mid-turn.
+  const streamingText = streamingTurn?.text ?? '';
+  useEffect(() => {
+    if (!conversationMode || !streamingText) return;
+    const el = scrollRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 160;
+    if (nearBottom) {
+      requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }));
+    }
+  }, [conversationMode, streamingText]);
 
   // Update parent with the high-signal count for the tab-title badge. highSignalCount is
   // countHighSignalMessages(messages), identical to the fetch callback and the closed-panel
@@ -1928,6 +2038,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       {/* Messages list — chat-style scroll area */}
       <MessagesListView
         presentation={conversationMode ? 'conversation' : 'triage'}
+        streamingBubble={streamingTurn ? <StrategicStreamingBubble key={streamingTurn.key} text={streamingTurn.text} /> : null}
         scrollRef={scrollRef}
         blockersRefEl={blockersRefEl}
         questionsRefEl={questionsRefEl}

@@ -88,6 +88,8 @@ from app.strategic_state_read_model import (
     _direction_summary,
     _is_live_strategic_task,
     _problem_model_summary,
+    _resident_session_available,
+    _resident_session_summary,
     _running_update_summary,
     _strategic_refresh_summary,
     _task_summary,
@@ -98,6 +100,12 @@ from app.work_session_check_in import (
     _build_work_session_check_in_projection,
     _message_is_operator_check_in,
     _persist_strategic_check_in_marker,
+)
+from app.shared_state import runtime_config
+from app.strategic_resident_session import (
+    STRATEGIC_SESSION_ENABLED_SETTING,
+    start_resident_session,
+    stop_resident_session,
 )
 
 router = APIRouter(
@@ -388,6 +396,10 @@ class StrategicSessionCheckInCreate(BaseModel):
 class StrategicSessionCommandExecute(BaseModel):
     idempotency_key: str
     observed_at: int | None = None
+
+
+class StrategicResidentSessionStart(BaseModel):
+    runner_id: str | None = None
 
 
 def _work_session_command_by_id(
@@ -723,6 +735,7 @@ async def _build_strategic_session_response(
         "session": work_session,
         "workbench": state.get("workbench"),
         "strategic": state.get("strategic"),
+        "resident_session": state.get("resident_session"),
         "runtime": runtime,
         "context_package": context_package,
         "conversation": work_session["conversation"],
@@ -1190,6 +1203,8 @@ async def get_project_strategic_state(
             "latest_cycle": latest_cycle_summary,
             "refresh": _strategic_refresh_summary(project.vision or {}),
         },
+        "resident_session": _resident_session_summary(project),
+        "resident_session_available": _resident_session_available(),
         "running_update": running_update_summary,
         "problem_model": problem_model_summary,
         "directions": directions_summary,
@@ -1667,3 +1682,59 @@ async def create_project_strategic_session_message(
             result.message_event,
         )
     return response
+
+
+@router.post("/projects/{project_id}/strategic-session/start")
+@limiter.limit("30/minute")
+async def start_project_strategic_resident_session(
+    request: Request,
+    project_id: uuid.UUID,
+    payload: StrategicResidentSessionStart | None = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Start (or adopt) a resident Strategic session on the operator's runner.
+
+    Gated on the ``strategic_session_enabled`` runtime setting (default off);
+    the resident session subsumes the legacy cadence for its project while live.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    if not runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False):
+        raise HTTPException(
+            status_code=403,
+            detail="Strategic resident sessions are disabled",
+        )
+    data = payload or StrategicResidentSessionStart()
+    snapshot = await start_resident_session(
+        session,
+        project,
+        operator_user_id=current_user["user_id"],
+        runner_id=data.runner_id,
+    )
+    return {"project_id": str(project_id), "enabled": True, "session": snapshot}
+
+
+@router.post("/projects/{project_id}/strategic-session/stop")
+@limiter.limit("30/minute")
+async def stop_project_strategic_resident_session(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Stop the resident Strategic session and hand authority back to the cadence.
+
+    Not gated on the feature flag: an operator can always reclaim/stop a session
+    (instant manual reclaim), even after the flag is turned off.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    snapshot = await stop_resident_session(
+        session,
+        project,
+        operator_user_id=current_user["user_id"],
+    )
+    return {"project_id": str(project_id), "session": snapshot}

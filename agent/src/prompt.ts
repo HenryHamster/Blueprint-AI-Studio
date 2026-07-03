@@ -694,7 +694,9 @@ elif [ "$OP" = "resolve" ]; then
 else
   echo "Unknown op: $OP. Use send or resolve." >&2; exit 1
 fi
+rc=$?
 echo ""
+exit $rc
 `;
   fs.writeFileSync(`${workspace}/messages`, helperScript, { mode: 0o755 });
   excludeAgentHelpers();
