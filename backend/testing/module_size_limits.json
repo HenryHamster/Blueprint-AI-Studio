@@ -118,7 +118,8 @@
     "compute_backends.py": 2350,
     "direction_lifecycle.py": 1750,
     "routers/admin_notifications.py": 1850,
-    "strategic_state_read_model.py": 600,
+    "strategic_state_read_model.py": 850,
+    "strategic_resident_session.py": 1750,
     "work_session_check_in.py": 400,
     "release_qualifier_sweep.py": 1750
   },
@@ -170,7 +171,7 @@
     "components/TaskDetailDrawer.tsx": 2500,
     "components/KanbanBoard.tsx": 1500,
     "components/KanbanColumn.tsx": 1500,
-    "App.tsx": 2000,
+    "App.tsx": 2350,
     "components/TaskCard.tsx": 1500,
     "components/DirectionCard.tsx": 1650,
     "components/PipelineView.tsx": 1200,

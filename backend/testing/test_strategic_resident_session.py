@@ -16,6 +16,7 @@ from datetime import timedelta
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import async_sessionmaker
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
@@ -35,17 +36,23 @@ from app.shared_state import runtime_config
 import app.strategic_resident_session as srs
 from app.strategic_resident_session import (
     RESIDENT_SESSION_KEY,
+    RESIDENT_SESSION_REASON_KEY,
+    RESIDENT_SESSION_REASON_NO_RUNNER,
+    RESIDENT_SESSION_REASON_START_FAILED_PREFIX,
     STRATEGIC_SESSION_ENABLED_SETTING,
     STRATEGIC_SESSION_MAX_UNATTENDED_SETTING,
     new_session_id,
     read_resident_session,
+    read_resident_session_blocked_reason,
     renew_resident_session_lease,
     resident_session_is_active,
     resident_session_snapshot,
     router as resident_router,
     start_resident_session,
     stop_resident_session,
+    sync_resident_session_for_interaction_mode,
 )
+from app.strategic_state_read_model import _resident_session_availability
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
     strategic_local_continuation_status_from_vision,
@@ -136,6 +143,44 @@ async def _make_live_local_runner(
     await db_session.commit()
     await db_session.refresh(runner)
     return runner
+
+
+def _dedicated_session_factory(db_session):
+    """A dedicated-session factory bound to the SAME test engine as ``db_session``.
+
+    ``sync_resident_session_for_interaction_mode`` runs its auto-start/stop +
+    reason-recording on a FRESH session (production: ``AsyncSessionLocal``) so a
+    poisoned start cannot break the caller's request session (Fix 2). Under the
+    SQLite test harness a bare ``AsyncSessionLocal()`` opens a SEPARATE in-memory
+    DB whose writes ``db_session`` can't see — the exact reason the sibling
+    dedicated-session compensation tests are Postgres-only. Injecting a factory
+    bound to ``db_session``'s own engine keeps the fresh session on the SAME test
+    DB, so the committed session blob / blocked-reason is visible to the
+    assertions below while the production isolation semantics are unchanged.
+    """
+    return async_sessionmaker(db_session.bind, expire_on_commit=False)
+
+
+async def _fresh_vision(factory, project_id) -> dict:
+    """Read a project's ``vision`` via a FRESH session on the same test engine.
+
+    The sync hook commits its auto-start/stop + reason writes on its own dedicated
+    session; the long-lived ``db_session`` fixture holds a connection snapshot that
+    does NOT observe another session's UPDATE to an existing row under the SQLite
+    in-memory harness (the same isolation artifact that makes the sibling
+    dedicated-session compensation tests Postgres-only). A fresh read session
+    observes the committed state reliably, so assertions read through here.
+    """
+    async with factory() as s:
+        proj = await s.get(Project, project_id)
+        return dict(proj.vision) if proj is not None and proj.vision else {}
+
+
+async def _fresh_task_status(factory, task_id):
+    """Read a task's committed status via a FRESH session (see ``_fresh_vision``)."""
+    async with factory() as s:
+        task = await s.get(Task, task_id)
+        return task.status if task is not None else None
 
 
 # ---------------------------------------------------------------------------
@@ -326,20 +371,33 @@ async def test_start_does_not_adopt_in_progress_one_shot(db_session):
         db_session, project, status=TaskStatus.IN_PROGRESS
     )
 
+    # The refusal path spawns a provisional claim then compensates it on a FRESH,
+    # dedicated session (production: ``AsyncSessionLocal``); inject a factory bound
+    # to this test's engine so that cleanup lands on the SAME DB the assertions
+    # read (see ``_dedicated_session_factory`` / ``_release_start_claim``).
+    factory = _dedicated_session_factory(db_session)
     with pytest.raises(HTTPException) as exc:
         await start_resident_session(
-            db_session, project, operator_user_id=TEST_USER_ID
+            db_session,
+            project,
+            operator_user_id=TEST_USER_ID,
+            session_factory=factory,
         )
     assert exc.value.status_code == 409
 
-    # The in-flight one-shot was NOT hijacked into a (non-streaming) session.
-    refreshed = await db_session.get(Task, one_shot.id)
-    assert refreshed.context is None or refreshed.context.get("_resident_session") is not True
-    assert refreshed.status == TaskStatus.IN_PROGRESS
+    # The in-flight one-shot was NOT hijacked into a (non-streaming) session
+    # (read committed state via a fresh session — see ``_fresh_vision``).
+    async with factory() as s:
+        refreshed = await s.get(Task, one_shot.id)
+        assert (
+            refreshed.context is None
+            or refreshed.context.get("_resident_session") is not True
+        )
+        assert refreshed.status == TaskStatus.IN_PROGRESS
 
     # No provisional claim left behind to wedge future starts.
-    fresh = await db_session.get(Project, project.id)
-    assert read_resident_session(fresh.vision) is None
+    vision = await _fresh_vision(factory, project.id)
+    assert read_resident_session(vision) is None
 
 
 @pytest.mark.asyncio
@@ -657,6 +715,26 @@ async def test_stop_endpoint(client: AsyncClient, db_session, enable_strategic_s
     assert blob is not None and blob.get("status") == "ended"
 
 
+@pytest.mark.asyncio
+async def test_stop_noop_when_no_session_blob(db_session):
+    """Fix 4: stopping a project with NO live session blob is a no-op — it must
+    NOT synthesize a phantom ``{session_id: null, status: "ended"}`` record into
+    ``Project.vision`` (a spurious write + a non-null null-id "ended" session in
+    API responses, even when the feature is dark and nothing ever started)."""
+    project = await _make_project_with_member(db_session)
+    # Never started a session — vision has no resident-session key.
+    assert read_resident_session(project.vision) is None
+
+    snapshot = await stop_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    # No live session -> empty snapshot, and crucially no phantom blob written.
+    assert snapshot == {}
+    fresh = await db_session.get(Project, project.id)
+    assert RESIDENT_SESSION_KEY not in (fresh.vision or {})
+    assert read_resident_session(fresh.vision) is None
+
+
 # ---------------------------------------------------------------------------
 # Finding 1 — stop <-> heartbeat race must not re-arm the lease
 # ---------------------------------------------------------------------------
@@ -827,17 +905,468 @@ async def test_start_spawn_then_finalize_failure_compensates(db_session, monkeyp
     monkeypatch.setattr(srs, "_spawn_resident_strategic_task", fake_spawn)
     monkeypatch.setattr(srs, "persist_strategic_workbench_update", boom)
 
+    # Compensation runs on a FRESH, dedicated session (production:
+    # ``AsyncSessionLocal``); inject a factory bound to this test's engine so the
+    # cleanup lands on the SAME DB the assertions read back through.
+    factory = _dedicated_session_factory(db_session)
     with pytest.raises(RuntimeError):
         await start_resident_session(
-            db_session, project, operator_user_id=TEST_USER_ID
+            db_session,
+            project,
+            operator_user_id=TEST_USER_ID,
+            session_factory=factory,
         )
 
-    # Orphaned spawned task cancelled.
-    t = await db_session.get(Task, created["id"])
-    assert t.status == TaskStatus.CANCELLED
+    # Orphaned spawned task cancelled (read committed state via a fresh session).
+    assert await _fresh_task_status(factory, created["id"]) == TaskStatus.CANCELLED
     # Provisional claim cleared — no active session left to wedge future starts.
+    vision = await _fresh_vision(factory, project.id)
+    assert read_resident_session(vision) is None
+
+
+# ---------------------------------------------------------------------------
+# Workday is the on-switch: auto start/stop the resident session on an
+# interaction_mode change (sync_resident_session_for_interaction_mode).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sync_auto_starts_on_enter_continuous(
+    db_session, enable_strategic_session_flag
+):
+    """Entering Workday (chat -> continuous) with the flag on + a live local
+    runner auto-starts the resident session (pinned to that runner) and clears
+    any blocked-reason."""
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    runner = await _make_live_local_runner(db_session, project)
+
+    factory = _dedicated_session_factory(db_session)
+    snapshot = await sync_resident_session_for_interaction_mode(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        previous_mode="chat",
+        new_mode="continuous",
+        session_factory=factory,
+    )
+    assert snapshot is not None
+    assert snapshot["status"] == "active"
+    assert snapshot["task_id"] == str(task.id)
+    assert snapshot["runner_id"] == str(runner.id)
+
+    vision = await _fresh_vision(factory, project.id)
+    assert resident_session_is_active(read_resident_session(vision))
+    # No blocked-reason recorded when the auto-start succeeds.
+    assert read_resident_session_blocked_reason(vision) is None
+
+
+@pytest.mark.asyncio
+async def test_sync_auto_stops_on_leave_continuous(
+    db_session, enable_strategic_session_flag
+):
+    """Leaving Workday (continuous -> chat) auto-stops the live resident
+    session and hands authority back to the cadence."""
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    await start_resident_session(db_session, project, operator_user_id=TEST_USER_ID)
+
+    project = await db_session.get(Project, project.id)
+    factory = _dedicated_session_factory(db_session)
+    result = await sync_resident_session_for_interaction_mode(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        previous_mode="continuous",
+        new_mode="chat",
+        session_factory=factory,
+    )
+    assert result is None
+
+    vision = await _fresh_vision(factory, project.id)
+    blob = read_resident_session(vision)
+    assert blob is not None and blob["status"] == "ended"
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in vision
+    assert await _fresh_task_status(factory, task.id) == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_sync_records_no_runner_when_no_live_runner(
+    db_session, enable_strategic_session_flag
+):
+    """Flag on but NO live eligible local runner: entering Workday records the
+    ``no_runner`` reason and does NOT start a session (Workday runs on the
+    operator's box, not a cloud VM)."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    # No runner registered.
+
+    factory = _dedicated_session_factory(db_session)
+    snapshot = await sync_resident_session_for_interaction_mode(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        previous_mode="chat",
+        new_mode="continuous",
+        session_factory=factory,
+    )
+    assert snapshot is None
+
+    vision = await _fresh_vision(factory, project.id)
+    assert read_resident_session(vision) is None
+    assert (
+        read_resident_session_blocked_reason(vision)
+        == RESIDENT_SESSION_REASON_NO_RUNNER
+    )
+    assert RESIDENT_SESSION_REASON_KEY in vision
+
+
+@pytest.mark.asyncio
+async def test_sync_records_start_failed_reason(
+    db_session, enable_strategic_session_flag, monkeypatch
+):
+    """When the auto-start path errors (Track-1 makes it fail fast + clean), the
+    sync records a ``start_failed: <msg>`` reason and never propagates the error
+    (the mode switch must stand)."""
+    from fastapi import HTTPException
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+
+    async def boom(*args, **kwargs):
+        raise HTTPException(status_code=409, detail="no task to host session")
+
+    monkeypatch.setattr(srs, "start_resident_session", boom)
+
+    # Must NOT raise — the mode switch is already committed by the caller.
+    factory = _dedicated_session_factory(db_session)
+    snapshot = await sync_resident_session_for_interaction_mode(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        previous_mode="chat",
+        new_mode="continuous",
+        session_factory=factory,
+    )
+    assert snapshot is None
+
+    vision = await _fresh_vision(factory, project.id)
+    reason = read_resident_session_blocked_reason(vision)
+    assert reason is not None
+    assert reason.startswith(RESIDENT_SESSION_REASON_START_FAILED_PREFIX)
+    assert "no task to host session" in reason
+
+
+@pytest.mark.asyncio
+async def test_sync_noop_when_flag_disabled(db_session):
+    """Flag off: entering Workday records nothing (the read model derives
+    ``sessions_disabled`` from the flag) and starts no session."""
+    runtime_config.pop(STRATEGIC_SESSION_ENABLED_SETTING, None)
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+
+    snapshot = await sync_resident_session_for_interaction_mode(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        previous_mode="chat",
+        new_mode="continuous",
+    )
+    assert snapshot is None
     fresh = await db_session.get(Project, project.id)
     assert read_resident_session(fresh.vision) is None
+    assert read_resident_session_blocked_reason(fresh.vision) is None
+
+
+@pytest.mark.asyncio
+async def test_sync_ignores_non_transition(
+    db_session, enable_strategic_session_flag
+):
+    """A workbench save that does NOT cross the continuous boundary (e.g. a
+    selected_refs edit that keeps the same mode) is a no-op — no start, no stop,
+    no reason churn."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+
+    # chat -> chat (no transition).
+    assert (
+        await sync_resident_session_for_interaction_mode(
+            db_session,
+            project,
+            operator_user_id=TEST_USER_ID,
+            previous_mode="chat",
+            new_mode="chat",
+        )
+        is None
+    )
+    fresh = await db_session.get(Project, project.id)
+    assert read_resident_session(fresh.vision) is None
+    assert RESIDENT_SESSION_REASON_KEY not in (fresh.vision or {})
+
+
+@pytest.mark.asyncio
+async def test_sync_runs_start_on_dedicated_session(
+    db_session, enable_strategic_session_flag
+):
+    """Fix 2: the auto-start (and reason recording) run on a FRESH, dedicated
+    session — NEVER the caller's request ``session`` — so a poisoned start can
+    neither poison the request session nor 5xx the endpoint's trailing
+    ``get_project_strategic_state`` read. Asserts a dedicated session distinct
+    from ``db_session`` hosted the work, and the caller session stays usable."""
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+
+    opened: list = []
+    base_factory = _dedicated_session_factory(db_session)
+
+    def tracking_factory():
+        s = base_factory()
+        opened.append(s)
+        return s
+
+    snapshot = await sync_resident_session_for_interaction_mode(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        previous_mode="chat",
+        new_mode="continuous",
+        session_factory=tracking_factory,
+    )
+    assert snapshot is not None
+    assert snapshot["status"] == "active"
+    assert snapshot["task_id"] == str(task.id)
+
+    # The start ran on a dedicated session, never the caller's request session.
+    assert len(opened) >= 1
+    assert all(s is not db_session for s in opened)
+
+    # The caller's request session stays clean/usable, and the committed session
+    # blob is observable (read via a fresh session — see ``_fresh_vision``).
+    vision = await _fresh_vision(base_factory, project.id)
+    assert resident_session_is_active(read_resident_session(vision))
+
+
+# NOTE: an end-to-end HTTP test of the mode-change endpoint auto-starting the
+# session (POST /strategic-session with interaction_mode=continuous) requires
+# Postgres — the endpoint's arming/refresh + strategic-state read paths use
+# Postgres-only SQL (``jsonb_array_length``), the same reason the sibling
+# compensation/dedicated-session tests here run only under the Postgres harness.
+# CI (Postgres) covers that HTTP path; the wiring is unit-tested directly above
+# via ``sync_resident_session_for_interaction_mode``.
+
+
+# ---------------------------------------------------------------------------
+# Read-model availability projection (_resident_session_availability): the
+# legible state + reason the operator UI renders.
+# ---------------------------------------------------------------------------
+
+
+def _project_with_vision(vision: dict) -> Project:
+    return Project(name="avail", user_id=TEST_USER_ID, vision=vision)
+
+
+def test_resident_session_availability_dark_when_flag_off():
+    runtime_config.pop(STRATEGIC_SESSION_ENABLED_SETTING, None)
+    result = _resident_session_availability(_project_with_vision({}))
+    assert result == {"available": False, "state": "dark", "reason": "sessions_disabled"}
+
+
+def test_resident_session_availability_reasons(enable_strategic_session_flag):
+    # no_runner recorded -> blocked + reason.
+    blocked = _resident_session_availability(
+        _project_with_vision(
+            {RESIDENT_SESSION_REASON_KEY: {"reason": RESIDENT_SESSION_REASON_NO_RUNNER}}
+        )
+    )
+    assert blocked["state"] == "blocked"
+    assert blocked["reason"] == RESIDENT_SESSION_REASON_NO_RUNNER
+
+    # start_failed recorded -> error + full reason.
+    failed = _resident_session_availability(
+        _project_with_vision(
+            {RESIDENT_SESSION_REASON_KEY: {"reason": "start_failed: boom"}}
+        )
+    )
+    assert failed["state"] == "error"
+    assert failed["reason"] == "start_failed: boom"
+
+    # Active session -> active (reason cleared).
+    active = _resident_session_availability(
+        _project_with_vision(
+            {RESIDENT_SESSION_KEY: {"status": "active", "stop_requested": False}}
+        )
+    )
+    assert active["state"] == "active"
+    assert active["reason"] is None
+
+    # Enabled, no reason, zero eligible runners -> inferred no_runner.
+    inferred = _resident_session_availability(
+        _project_with_vision({}), eligible_live_runner_count=0
+    )
+    assert inferred["state"] == "blocked"
+    assert inferred["reason"] == RESIDENT_SESSION_REASON_NO_RUNNER
+
+    # Enabled, no reason, a live runner attached -> ready.
+    ready = _resident_session_availability(
+        _project_with_vision({}), eligible_live_runner_count=1
+    )
+    assert ready["state"] == "ready"
+    assert ready["reason"] is None
+
+
+def test_resident_session_availability_live_runner_overrides_stale_no_runner(
+    enable_strategic_session_flag,
+):
+    """Fix 1: a stale ``no_runner`` reason (recorded on a runner-less Workday entry
+    and never re-run when a runner later attaches) is OVERRIDDEN by a positive live
+    runner count — the read model reports ``ready``, not a phantom "blocked: no
+    runner" with a runner plainly attached. A recorded ``start_failed`` still wins
+    over a live count (a real failure is never masked)."""
+    # Stale no_runner recorded, but a live runner is now attached -> ready.
+    overridden = _resident_session_availability(
+        _project_with_vision(
+            {RESIDENT_SESSION_REASON_KEY: {"reason": RESIDENT_SESSION_REASON_NO_RUNNER}}
+        ),
+        eligible_live_runner_count=1,
+    )
+    assert overridden["state"] == "ready"
+    assert overridden["reason"] is None
+
+    # A recorded no_runner is still authoritative while the live count is 0.
+    still_blocked = _resident_session_availability(
+        _project_with_vision(
+            {RESIDENT_SESSION_REASON_KEY: {"reason": RESIDENT_SESSION_REASON_NO_RUNNER}}
+        ),
+        eligible_live_runner_count=0,
+    )
+    assert still_blocked["state"] == "blocked"
+    assert still_blocked["reason"] == RESIDENT_SESSION_REASON_NO_RUNNER
+
+    # start_failed is NEVER masked by a live runner count.
+    start_failed_wins = _resident_session_availability(
+        _project_with_vision(
+            {RESIDENT_SESSION_REASON_KEY: {"reason": "start_failed: boom"}}
+        ),
+        eligible_live_runner_count=1,
+    )
+    assert start_failed_wins["state"] == "error"
+    assert start_failed_wins["reason"] == "start_failed: boom"
+
+
+@pytest.mark.asyncio
+async def test_release_start_claim_runs_on_dedicated_session(db_session):
+    """Compensation must run on a DEDICATED session opened via the injected
+    factory — never the caller's (possibly poisoned) session — and must both
+    clear OUR provisional claim and cancel the orphaned spawned task.
+
+    This locks the fix for the live crash: running compensation on the caller
+    session (poisoned by the original spawn/finalize failure) raised
+    ``MissingGreenlet`` on a pool pre-ping and masked the real error, leaving a
+    half-initialized (``task_id: null``) session behind. A fresh connection can
+    always clean up.
+    """
+    project = await _make_project_with_member(db_session)
+
+    # Commit a provisional claim (task_id=None) + an orphaned spawned task, the
+    # exact mid-flight state a failed start leaves between claim and finalize.
+    session_id = "ss-comp-dedicated"
+    now_iso = _utcnow().isoformat()
+    orphan = Task(
+        project_id=project.id,
+        title="orphan resident",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-orphan",
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(orphan)
+    vision = dict(project.vision or {})
+    vision[RESIDENT_SESSION_KEY] = {
+        "version": 1,
+        "session_id": session_id,
+        "task_id": None,
+        "runner_id": None,
+        "operator_user_id": TEST_USER_ID,
+        "status": "active",
+        "stop_requested": False,
+        "started_at": now_iso,
+        "updated_at": now_iso,
+        "ended_at": None,
+        "last_progress_at": None,
+        "last_operator_interaction_at": now_iso,
+    }
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+    orphan_id = orphan.id
+
+    # A dedicated-session factory bound to this test's engine so compensation's
+    # FRESH session (production: ``AsyncSessionLocal``) lands on the SAME DB the
+    # assertions read — see ``_dedicated_session_factory``.
+    base_factory = _dedicated_session_factory(db_session)
+    used_sessions: list = []
+
+    def tracking_factory():
+        s = base_factory()
+        used_sessions.append(s)
+        return s
+
+    await srs._release_start_claim(
+        project.id, session_id, orphan_id, session_factory=tracking_factory
+    )
+
+    # Compensation opened its OWN dedicated session (not the caller's db_session).
+    assert len(used_sessions) == 1
+    assert used_sessions[0] is not db_session
+
+    # Claim cleared + orphan cancelled (visible on a fresh read of committed state).
+    vision = await _fresh_vision(base_factory, project.id)
+    assert read_resident_session(vision) is None
+    assert await _fresh_task_status(base_factory, orphan_id) == TaskStatus.CANCELLED
+
+
+@pytest.mark.asyncio
+async def test_release_start_claim_only_clears_own_claim(db_session):
+    """Guarded on ``session_id``: compensation for a stale/foreign session_id must
+    NOT clear a claim a concurrent starter legitimately owns."""
+    project = await _make_project_with_member(db_session)
+
+    now_iso = _utcnow().isoformat()
+    owner_blob = {
+        "version": 1,
+        "session_id": "ss-owned-by-peer",
+        "task_id": "t-peer",
+        "runner_id": None,
+        "operator_user_id": TEST_USER_ID,
+        "status": "active",
+        "stop_requested": False,
+        "started_at": now_iso,
+        "updated_at": now_iso,
+        "ended_at": None,
+        "last_progress_at": None,
+        "last_operator_interaction_at": now_iso,
+    }
+    vision = dict(project.vision or {})
+    vision[RESIDENT_SESSION_KEY] = owner_blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    # We failed a DIFFERENT session; compensation must leave the peer's claim intact.
+    await srs._release_start_claim(project.id, "ss-ours-that-failed", None)
+
+    await db_session.rollback()
+    fresh = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh.vision)
+    assert blob is not None
+    assert blob["session_id"] == "ss-owned-by-peer"
 
 
 # ---------------------------------------------------------------------------

@@ -253,22 +253,70 @@ _project_id_cache: str | None = None
 
 
 def get_project_id(project_id: str | None = None) -> str:
-    """Return a project ID. Uses explicit arg, config, or fetches the first project."""
+    """Return a project ID.
+
+    Precedence (first non-empty wins):
+      1. explicit ``project_id`` arg — from the ``--project-id`` / ``--project``
+         CLI flags, already resolved to an id by the caller;
+      2. the ``BLUEPRINT_PROJECT_ID`` env var;
+      3. ``project_id`` configured in the config file;
+      4. the first project returned by the API.
+
+    Previously (1) was honored but (2) was silently dropped and it fell straight
+    to (4), so an explicit env selection was ignored and the CLI targeted an
+    unrelated first project.
+    """
     global _project_id_cache
     if project_id:
         return project_id
+    env_pid = os.environ.get("BLUEPRINT_PROJECT_ID")
+    if env_pid:
+        return env_pid
     cfg = load_config()
     if cfg.get("project_id"):
         return cfg["project_id"]
     if _project_id_cache:
         return _project_id_cache
-    resp = api("GET", "/api/admin/projects")
-    projects = resp.get("items", []) if isinstance(resp, dict) else resp
+    projects = list_projects()
     if not projects:
         print("ERROR: No projects found.")
         sys.exit(1)
     _project_id_cache = projects[0]["id"]
     return _project_id_cache
+
+
+def list_projects() -> list[dict]:
+    """Return all projects (each dict carries at least ``id`` and ``name``)."""
+    resp = api("GET", "/api/admin/projects")
+    return resp.get("items", []) if isinstance(resp, dict) else (resp or [])
+
+
+def resolve_project_id_by_name(name: str) -> str:
+    """Resolve a project id from a case-insensitive substring match on its name.
+
+    An exact (case-insensitive) name match wins outright so that a name which is
+    also a substring of another (e.g. "Blueprint" vs "Blueprint Staging") is not
+    reported as ambiguous. Otherwise exactly one substring match must remain;
+    zero or more than one exits with a clear message rather than silently
+    targeting the wrong project.
+    """
+    needle = name.strip().lower()
+    projects = list_projects()
+    exact = [p for p in projects if (p.get("name") or "").lower() == needle]
+    if len(exact) == 1:
+        return exact[0]["id"]
+    matches = [p for p in projects if needle in (p.get("name") or "").lower()]
+    if not matches:
+        available = ", ".join(sorted((p.get("name") or "?") for p in projects)) or "(none)"
+        print(f"ERROR: no project matches --project '{name}'. Available: {available}",
+              file=sys.stderr)
+        sys.exit(1)
+    if len(matches) > 1:
+        names = ", ".join((p.get("name") or "?") for p in matches)
+        print(f"ERROR: --project '{name}' is ambiguous; matches: {names}. "
+              "Narrow the name or use --project-id.", file=sys.stderr)
+        sys.exit(1)
+    return matches[0]["id"]
 
 
 def get_version_summary(version_id: str) -> dict:

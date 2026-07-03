@@ -473,4 +473,92 @@ describe('StrategicSessionControl', () => {
     expect(screen.queryByRole('button', { name: /open compute/i })).toBeNull();
     expect(screen.getByLabelText(/runtime work idle/i)).toBeInTheDocument();
   });
+
+  it('shows a dark resident-session chip when the feature is off', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionState="dark"
+        sessionReason="sessions_disabled"
+        onModeChange={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole('status', { name: /resident strategic session: sessions off/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /start resident strategic session/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /stop resident strategic session/i })).toBeNull();
+  });
+
+  it('surfaces a no-runner reason with a Start fallback in Workday mode', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionState="blocked"
+        sessionReason="no_runner"
+        onModeChange={vi.fn()}
+        onStartSession={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText('No live local runner')).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /start resident strategic session/i }),
+    ).toBeInTheDocument();
+  });
+
+  it('surfaces a start_failed reason as an error state', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionState="error"
+        sessionReason="start_failed: no task to host session"
+        onModeChange={vi.fn()}
+        onStartSession={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole('status', { name: /resident strategic session: start failed/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/start failed: no task to host session/i)).toBeInTheDocument();
+  });
+
+  it('shows an active resident session with Stop and no Start', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive
+        sessionStatus="active"
+        sessionState="active"
+        onModeChange={vi.fn()}
+        onStartSession={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole('status', { name: /resident strategic session: active/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /stop resident strategic session/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /start resident strategic session/i })).toBeNull();
+  });
+
+  it('shows a ready resident session that auto-starts on Workday entry', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionState="ready"
+        onModeChange={vi.fn()}
+        onStartSession={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole('status', { name: /resident strategic session: ready/i }),
+    ).toBeInTheDocument();
+  });
 });

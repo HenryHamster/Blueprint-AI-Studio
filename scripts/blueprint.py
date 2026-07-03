@@ -45,7 +45,14 @@ import tempfile
 import time
 from datetime import datetime, timedelta, timezone
 
-from blueprint_api import APIError, api, get_project_id, load_config
+from blueprint_api import (
+    APIError,
+    api,
+    get_project_id,
+    list_projects,
+    load_config,
+    resolve_project_id_by_name,
+)
 
 SERVICE_NAME = os.environ.get("BLUEPRINT_GCP_SERVICE", "blueprint-orchestrator")
 GCP_PROJECT = os.environ.get("GCP_PROJECT", "blueprint-orchestrator")
@@ -88,6 +95,27 @@ def first_payload(task: dict) -> dict:
     """
     payloads = task.get("payloads") or [{}]
     return payloads[0] if payloads else {}
+
+
+# ── projects ─────────────────────────────────────────────────────────────────
+
+def cmd_projects(args: argparse.Namespace) -> None:
+    """List every project as ``id · name · status``. Respects ``--json``."""
+    projects = list_projects()
+    _emit(args, {"projects": projects, "total": len(projects)}, _render_projects)
+
+
+def _render_projects(data: dict) -> None:
+    projects = data.get("projects") or []
+    print(f"=== PROJECTS ({len(projects)}) ===")
+    if not projects:
+        print("  (none)")
+        return
+    for p in projects:
+        pid = p.get("id") or "?"
+        name = p.get("name") or "?"
+        status = p.get("status") or p.get("state") or "-"
+        print(f"  {pid} · {name} · {status}")
 
 
 # ── status ───────────────────────────────────────────────────────────────────
@@ -4879,8 +4907,16 @@ def build_parser() -> argparse.ArgumentParser:
     common.add_argument("--json", dest="json_out", action="store_true",
                         default=argparse.SUPPRESS,
                         help="Emit machine-readable JSON instead of human text.")
-    common.add_argument("--project-id", dest="project_id", default=None,
-                        help="Project id (defaults to the first/configured project).")
+    # default=SUPPRESS (like --json) so an absent flag on a subparser never
+    # clobbers a value set on the top-level parser — the classic argparse
+    # parent/subparser override gotcha. With default=None this flag was silently
+    # dropped when placed *before* the subcommand.
+    common.add_argument("--project-id", dest="project_id", default=argparse.SUPPRESS,
+                        help="Target project by id (overrides --project, "
+                             "BLUEPRINT_PROJECT_ID, and config).")
+    common.add_argument("--project", dest="project_name", default=argparse.SUPPRESS,
+                        help="Target project by case-insensitive name match "
+                             "(resolved via GET /api/admin/projects).")
 
     parser = argparse.ArgumentParser(
         prog="blueprint",
@@ -4892,6 +4928,10 @@ def build_parser() -> argparse.ArgumentParser:
         parents=[common],
     )
     sub = parser.add_subparsers(dest="command")
+
+    # projects
+    sub.add_parser("projects", parents=[common],
+                   help="List all projects (id, name, status).")
 
     # status
     sub.add_parser("status", parents=[common],
@@ -5665,6 +5705,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 _DISPATCH = {
+    "projects": cmd_projects,
     "status": cmd_status,
     "diagnostics": cmd_diagnostics,
     "ops": cmd_ops,
@@ -5709,6 +5750,12 @@ def main(argv: list | None = None) -> int:
         return 1
     handler = _DISPATCH[args.command]
     try:
+        # Resolve --project <name> to an id once, up front, so every
+        # get_project_id(args.project_id) call site targets it. An explicit
+        # --project-id wins if both are supplied.
+        proj_name = getattr(args, "project_name", None)
+        if proj_name and not getattr(args, "project_id", None):
+            args.project_id = resolve_project_id_by_name(proj_name)
         handler(args)
     except APIError:
         return 1
