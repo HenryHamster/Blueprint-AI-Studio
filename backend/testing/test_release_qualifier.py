@@ -7039,6 +7039,140 @@ async def test_run_qualification_dry_run_but_automain_moved_runs_fresh(
 
 
 @pytest.mark.asyncio
+class TestComputeAuditedSurfaceHash:
+    """The audited-surface content hash excludes mechanically-regenerated
+    artifacts (CI workflows, __fixtures__ snapshots, size-limit config, docs) so
+    a candidate that differs from a prior audited candidate ONLY in those files
+    reuses its verdict — while any real app-code OR test-logic change re-audits."""
+
+    def test_excluded_files_do_not_change_hash(self):
+        base = [
+            {"path": "backend/app/x.py", "size": 1, "sha": "a"},
+            {"path": ".github/workflows/ci.yml", "size": 1, "sha": "w1"},
+            {"path": "backend/testing/__fixtures__/snap.json", "size": 1, "sha": "f1"},
+            {"path": "docs/readme.md", "size": 1, "sha": "d1"},
+            {"path": "backend/testing/module_size_limits.json", "size": 1, "sha": "m1"},
+        ]
+        changed_excluded_only = [
+            {"path": "backend/app/x.py", "size": 1, "sha": "a"},
+            {"path": ".github/workflows/ci.yml", "size": 1, "sha": "w2"},
+            {"path": "backend/testing/__fixtures__/snap.json", "size": 1, "sha": "f2"},
+            {"path": "docs/readme.md", "size": 1, "sha": "d2"},
+            {"path": "backend/testing/module_size_limits.json", "size": 1, "sha": "m2"},
+        ]
+        assert rq.compute_audited_surface_hash(base) == rq.compute_audited_surface_hash(
+            changed_excluded_only
+        )
+
+    def test_app_code_change_changes_hash(self):
+        base = [{"path": "backend/app/x.py", "size": 1, "sha": "a"}]
+        changed = [{"path": "backend/app/x.py", "size": 1, "sha": "b"}]
+        assert rq.compute_audited_surface_hash(base) != rq.compute_audited_surface_hash(
+            changed
+        )
+
+    def test_test_logic_is_in_the_surface(self):
+        # Test files (NOT fixtures) are audited surface — a test change re-audits.
+        base = [{"path": "backend/testing/test_foo.py", "size": 1, "sha": "a"}]
+        changed = [{"path": "backend/testing/test_foo.py", "size": 1, "sha": "b"}]
+        assert rq.compute_audited_surface_hash(base) != rq.compute_audited_surface_hash(
+            changed
+        )
+
+    def test_none_or_all_excluded_returns_none(self):
+        assert rq.compute_audited_surface_hash(None) is None
+        assert rq.compute_audited_surface_hash([]) is None
+        assert (
+            rq.compute_audited_surface_hash(
+                [{"path": ".github/x.yml", "size": 1, "sha": "z"}]
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_content_hash_reuse_across_sha(db_session, mocker):
+    """Content-hash reuse: when automain HEAD advances to a NEW commit whose
+    audited surface is byte-identical to a prior conclusive candidate (differs
+    only in an excluded fixture), run_qualification reuses that verdict instead
+    of re-auditing — fixing CI / regenerating a snapshot must not re-run the
+    whole qualification."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    surface_hash = rq.compute_audited_surface_hash(
+        [
+            {"path": "backend/app/main.py", "size": 100, "sha": "blobmain"},
+            {"path": "backend/app/foo.py", "size": 50, "sha": "blobfoo"},
+            {
+                "path": "backend/testing/__fixtures__/websocket_event_inventory_v1.json",
+                "size": 10,
+                "sha": "blobfixtureOLD",
+            },
+        ]
+    )
+    assert surface_hash is not None
+
+    old_sha = "oldshaaa" * 5
+    new_sha = "newshaaa" * 5  # HEAD advanced to a different commit
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "candidate_diff_hash": surface_hash,
+        "ci_green": True,
+        "confidence": 0.82,
+        "threshold": 0.90,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    attempts_before = version.qualification_attempts
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=new_sha))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+    # The NEW commit's tree hashes to the SAME audited surface (only the EXCLUDED
+    # fixture blob changed), so reuse must fire despite the different SHA.
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[
+                {"path": "backend/app/main.py", "size": 100, "sha": "blobmain"},
+                {"path": "backend/app/foo.py", "size": 50, "sha": "blobfoo"},
+                {
+                    "path": "backend/testing/__fixtures__/websocket_event_inventory_v1.json",
+                    "size": 11,
+                    "sha": "blobfixtureNEW",
+                },
+            ]
+        ),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "cached_verdict"
+    assert result["cached_verdict_status"] == "not_promoted"
+    await db_session.refresh(version)
+    # No re-audit: attempts unchanged and no child tasks spawned.
+    assert version.qualification_attempts == attempts_before
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(list(tasks)) == 0
+
+
 async def test_run_qualification_cached_not_promoted_same_sha_is_noop(
     db_session, mocker
 ):

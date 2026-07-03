@@ -63,6 +63,7 @@ Public API: ``run_qualification``, ``maybe_finalize_qualification``,
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import uuid
 from datetime import datetime
@@ -268,6 +269,67 @@ logger = logging.getLogger(__name__)
 _CONCLUSIVE_VERDICT_STATUSES: frozenset[str] = frozenset(
     {"promoted", "not_promoted", "dry_run"}
 )
+
+
+def _is_audited_surface_path(path: str) -> bool:
+    """True when a file is part of the code surface a release audit judges.
+
+    Excludes the mechanically-regenerated artifacts an audit does NOT judge —
+    emitter-inventory snapshots and other ``__fixtures__``/``__snapshots__``,
+    the module-size limits config, CI workflow files, generated test-timing
+    data, and docs.  A candidate that differs from a prior audited candidate
+    ONLY in these excluded files has the SAME audited surface, so its audit
+    verdict can be reused (Guard 3) instead of re-rolling the ~15min LLM audit.
+    Everything else — app code AND test logic — is IN the surface, so a real
+    change always re-audits.
+    """
+    p = path.lower()
+    if p.startswith(".github/"):
+        return False
+    if "/__fixtures__/" in p or "/__snapshots__/" in p:
+        return False
+    if p.endswith("module_size_limits.json"):
+        return False
+    if p.endswith(".test_durations"):
+        return False
+    if p.endswith(".md"):
+        return False
+    return True
+
+
+def compute_audited_surface_hash(tree_entries: list[dict] | None) -> str | None:
+    """Content hash of the audited code surface at a candidate ref.
+
+    Built from the git blob SHAs of every tracked file EXCEPT the mechanically-
+    regenerated artifacts a code audit does not judge (see
+    ``_is_audited_surface_path``).  Two candidates whose audited surface is
+    byte-identical hash identically, so the qualifier can REUSE a prior audit
+    verdict for the newer commit (Guard 3) instead of re-rolling the audit — the
+    "fixing CI / regenerating a snapshot must not re-run the whole qualification"
+    lever (Henry, 2026-07-02).  Cheap: the whole tree (path + blob SHA) comes
+    from ONE ``list_repo_tree_paths_at_ref`` call, no per-file reads.  Returns
+    None when the tree is unavailable — fail-open: no reuse, the normal
+    SHA-keyed cache path applies.
+    """
+    if not tree_entries:
+        return None
+    relevant = sorted(
+        (str(e["path"]), str(e["sha"]))
+        for e in tree_entries
+        if isinstance(e, dict)
+        and e.get("sha")
+        and e.get("path")
+        and _is_audited_surface_path(str(e["path"]))
+    )
+    if not relevant:
+        return None
+    h = hashlib.sha256()
+    for path, sha in relevant:
+        h.update(path.encode("utf-8"))
+        h.update(b"\0")
+        h.update(sha.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
 
 # ---------------------------------------------------------------------------
 # Policy — the trusted core.  weights + threshold come from a human-owned file.
@@ -1483,6 +1545,19 @@ async def run_qualification(
     ci_green = ci_resolution["ci_green"]
     ci_state = ci_resolution["state"]
 
+    # 3a. Content hash of the audited surface at the candidate (cheap — ONE tree
+    #     call, no per-file reads).  Lets Guard 3 reuse a prior conclusive verdict
+    #     when a newer commit differs ONLY in CI/fixture/config files: fixing CI
+    #     or regenerating a snapshot must NOT re-run the whole ~15min audit
+    #     (Henry, 2026-07-02).  Fail-open: list_repo_tree_paths_at_ref returns
+    #     None on any error, so candidate_diff_hash is None → no reuse, the
+    #     SHA-keyed cache path applies unchanged.
+    candidate_diff_hash = compute_audited_surface_hash(
+        await github.list_repo_tree_paths_at_ref(
+            token, owner, repo, candidate_sha, project_id=str(project_id)
+        )
+    )
+
     # 3b. Qualify-on-synced gate (LTS split only).  Don't score a candidate that
     #     is behind the promotion target — it would fail the promotion merge and
     #     bounce the version back to stabilize, burning a full re-audit.  Bounded,
@@ -1614,18 +1689,39 @@ async def run_qualification(
         and prior_qual.get("candidate_sha") == candidate_sha
         and ci_green
     )
+    # Content-hash reuse: a newer commit whose AUDITED SURFACE is byte-identical
+    # to the prior conclusive candidate (differs only in excluded CI/fixture/
+    # config files) carries the same verdict — reuse it instead of re-rolling the
+    # audit.  This is the "fixing CI / regenerating a snapshot must not re-run the
+    # whole qualification" lever; it never wedges a not_promoted (real findings
+    # are app-code, so fixing them changes the hash and re-audits).
+    _prior_diff_hash = prior_qual.get("candidate_diff_hash")
+    _same_audited_surface = bool(
+        candidate_diff_hash
+        and _prior_diff_hash
+        and candidate_diff_hash == _prior_diff_hash
+    )
     if (
         prior_status in _CONCLUSIVE_VERDICT_STATUSES
-        and prior_qual.get("candidate_sha") == candidate_sha
+        and (
+            prior_qual.get("candidate_sha") == candidate_sha
+            or _same_audited_surface
+        )
         and not ci_unresolved_recovered_same_sha
     ):
+        _reuse_reason = (
+            "automain unchanged"
+            if prior_qual.get("candidate_sha") == candidate_sha
+            else "audited surface unchanged (CI/fixture-only diff)"
+        )
         logger.info(
             "[RELEASE_QUALIFIER] run_qualification: version v%d already has a "
-            "conclusive %s verdict for candidate %s (automain unchanged) — "
-            "skipping (cached verdict)",
+            "conclusive %s verdict for candidate %s (%s) — skipping (cached "
+            "verdict)",
             version.version_number,
             prior_status,
             candidate_sha[:8],
+            _reuse_reason,
         )
         return {
             "status": "cached_verdict",
@@ -1776,6 +1872,7 @@ async def run_qualification(
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": candidate_sha,
+        "candidate_diff_hash": candidate_diff_hash,
         "ci_green": ci_green,
         "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
@@ -3587,6 +3684,10 @@ async def _finalize_qualification(
     finalized_at = _utcnow().isoformat()
     base_record: dict[str, Any] = {
         "candidate_sha": candidate_sha,
+        # Carry the audited-surface hash from the pending record into the verdict
+        # so the NEXT qualify's Guard 3 can reuse this verdict for a commit that
+        # differs only in CI/fixture/config files (content-hash reuse).
+        "candidate_diff_hash": qual.get("candidate_diff_hash"),
         "ci_green": ci_green,
         "ci_resolution": ci_resolution,
         "smoketest_enabled": smoketest_enabled,

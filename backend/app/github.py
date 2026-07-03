@@ -652,10 +652,12 @@ async def list_repo_tree_paths_at_ref(
 ) -> list[dict] | None:
     """List all file paths in the repo at ``ref`` via GitHub's recursive tree API.
 
-    Returns a list of dicts ``{"path": str, "size": int}`` for every blob in the
-    tree. Returns ``None`` on any error (network, 404, truncated tree — the caller
-    decides how to fail-safe). A single API call retrieves the full tree so this
-    is much more efficient than walking directories file-by-file.
+    Returns a list of dicts ``{"path": str, "size": int, "sha": str}`` for every
+    blob in the tree (``sha`` is the git blob SHA — a stable content identity of
+    the file, used by the qualifier's audited-surface content hash). Returns
+    ``None`` on any error (network, 404, truncated tree — the caller decides how
+    to fail-safe). A single API call retrieves the full tree so this is much more
+    efficient than walking directories file-by-file.
 
     GitHub truncates trees with > 100,000 entries; the caller receives ``None``
     in that case so it can degrade gracefully rather than silently missing files.
@@ -698,7 +700,11 @@ async def list_repo_tree_paths_at_ref(
         if not isinstance(tree, list):
             return None
         return [
-            {"path": entry["path"], "size": entry.get("size", 0)}
+            {
+                "path": entry["path"],
+                "size": entry.get("size", 0),
+                "sha": entry.get("sha"),
+            }
             for entry in tree
             if isinstance(entry, dict) and entry.get("type") == "blob"
         ]
