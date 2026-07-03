@@ -4691,6 +4691,201 @@ async def _reattempt_promotion_failed_in_dedicated_session(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Operator FORCE-PROMOTE — skip the audit gate, still open the PR + wait for CI.
+# ---------------------------------------------------------------------------
+# Statuses returned by force_promote_current_version / _force_promote_locked that
+# mean promote() never ran (a pre-promote no-op guard) — the post-commit hooks
+# and any "promotion attempted" messaging must skip these.
+_FORCE_PROMOTE_NOOP_STATUSES: frozenset[str] = frozenset(
+    {
+        "no_open_version",
+        "project_not_found",
+        "no_credentials",
+        "sha_error",
+        "version_not_found",
+        "not_open",
+        "promotion_in_flight",
+    }
+)
+
+
+async def _force_promote_locked(
+    session: AsyncSession,
+    version_id: uuid.UUID,
+    candidate_sha: str,
+    candidate_diff_hash: str | None,
+    actor: str | None,
+) -> dict[str, Any]:
+    """Lock + FORCE-promote an open version on a dedicated session (no audit).
+
+    Body of ``_force_promote_in_dedicated_session``.  Takes ``SELECT..FOR UPDATE``
+    on the version row, refuses when the version is not open or a promotion is
+    already in flight (Guard 2b / the Fix-3 claim), builds a FORCED
+    composite/base_record (no audit score — marked ``forced_promote``), and
+    re-enters ``promote()`` on the current candidate, mirroring
+    ``_finalize_locked_version``'s commit discipline.
+    """
+    version = (
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if version is None:
+        return {"status": "version_not_found"}
+    if version.status != "open":
+        return {"status": "not_open", "version_status": version.status}
+    # Refuse when a promotion is already in flight (an audit-passed PR open + the
+    # Fix-3 claim, or a concurrent force-promote) — mirrors the /qualify + the
+    # version-cut levers so every lever over an in-flight promotion agrees.
+    _promo = _promotion_in_flight_result(version)
+    if _promo is not None:
+        return _promo
+    now = _utcnow()
+    # Forced composite: NO audit score.  promote() only reads ``confidence`` for
+    # the PR body (renders 'n/a' when absent), so omit it.
+    composite: dict[str, Any] = {"promote": True, "forced_promote": True}
+    base_record: dict[str, Any] = {
+        "candidate_sha": candidate_sha,
+        "candidate_diff_hash": candidate_diff_hash,
+        "confidence": None,
+        "forced_promote": True,
+        "forced_promote_by": actor,
+        "forced_promote_at": now.isoformat(),
+        "started_at": now.isoformat(),
+        "finalized_at": now.isoformat(),
+    }
+    logger.warning(
+        "[RELEASE_QUALIFIER] FORCE-PROMOTE: v%d cutting release branch + opening "
+        "promotion PR at candidate %s (audit gate SKIPPED; CI still gates the "
+        "merge) — actor=%s",
+        version.version_number,
+        candidate_sha[:8],
+        actor,
+    )
+    result = await promote(
+        session,
+        version,
+        candidate_sha,
+        composite=composite,
+        base_record=base_record,
+    )
+    await session.commit()
+    return result
+
+
+async def _force_promote_in_dedicated_session(
+    version_id: uuid.UUID,
+    candidate_sha: str,
+    candidate_diff_hash: str | None,
+    actor: str | None,
+    *,
+    session_factory=None,
+) -> dict[str, Any]:
+    """Run FORCE-promote on a DEDICATED session (mirrors the reuse-promote path).
+
+    A dedicated ``AsyncSessionLocal`` is required because ``promote()`` issues an
+    intermediate lock-releasing commit — running it on the request session would
+    prematurely commit unrelated work.  Runs the same post-commit hooks the
+    finalize/reuse paths run, but only when a promotion actually attempted.
+    """
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            result = await _force_promote_locked(
+                session, version_id, candidate_sha, candidate_diff_hash, actor
+            )
+        except Exception:
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] force-promote: rollback failed for "
+                    "version %s",
+                    version_id,
+                )
+            raise
+
+    if result.get("status") not in _FORCE_PROMOTE_NOOP_STATUSES:
+        await _maybe_reconcile_after_promotion_conflict(
+            version_id, result, session_factory=session_factory
+        )
+        await _maybe_trigger_strategic_after_qualification(
+            version_id, result, session_factory=session_factory
+        )
+    return result
+
+
+async def force_promote_current_version(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    candidate_sha: str | None = None,
+    actor: str | None = None,
+    session_factory=None,
+) -> dict[str, Any]:
+    """Operator FORCE-PROMOTE the project's open version.
+
+    SKIPS the audit / qualification gate, but still cuts the release branch,
+    opens the ``release-vN → promotion-target`` PR, and lets the NORMAL CI-wait /
+    managed-check-wait machinery merge it once the promotion target's required
+    checks (branch-protection CI) pass — 'force' skips the AUDIT, not CI.
+
+    Resolves the candidate (an explicit SHA, else the current integration-branch
+    HEAD) + credentials on the request session (pre-lock GitHub I/O), then
+    re-enters ``promote()`` in a DEDICATED session (``promote()`` releases the row
+    lock mid-flight).  Refuses when a promotion is already in flight.  Returns the
+    ``promote()`` result, or a no-op guard status.
+    """
+    version = await release_version.current_open_version(session, project_id)
+    if version is None:
+        return {"status": "no_open_version"}
+    project = await session.get(Project, project_id)
+    if project is None:
+        return {"status": "project_not_found"}
+    resolved = await _resolve_github_with_session(session, project)
+    if resolved is None:
+        return {"status": "no_credentials"}
+    token, owner, repo = resolved
+    integration_branch, _promotion_target = _lts_branch_names(project)
+    if not candidate_sha:
+        try:
+            candidate_sha = await github.get_branch_sha(
+                token, owner, repo, integration_branch
+            )
+        except Exception as exc:  # noqa: BLE001 — a missing branch / API error is recoverable
+            return {"status": "sha_error", "detail": str(exc)[:300]}
+    if not candidate_sha:
+        return {"status": "sha_error", "detail": "empty candidate sha"}
+    candidate_diff_hash = compute_audited_surface_hash(
+        await github.list_repo_tree_paths_at_ref(
+            token, owner, repo, candidate_sha, project_id=str(project_id)
+        )
+    )
+    logger.warning(
+        "[RELEASE_QUALIFIER] FORCE-PROMOTE requested: project %s v%d candidate %s "
+        "actor=%s — SKIPPING the audit/qualify gate (CI still gates the merge)",
+        project_id,
+        version.version_number,
+        candidate_sha[:8],
+        actor,
+    )
+    return await _force_promote_in_dedicated_session(
+        version.id,
+        candidate_sha,
+        candidate_diff_hash,
+        actor,
+        session_factory=session_factory,
+    )
+
+
 def _qualification_timeout_age_seconds(
     version: release_version.ReleaseVersion,
     qual: dict[str, Any],

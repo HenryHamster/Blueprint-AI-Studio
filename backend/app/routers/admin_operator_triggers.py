@@ -308,6 +308,61 @@ async def trigger_qualify(
     return result
 
 
+class _ForcePromoteRequest(BaseModel):
+    candidate_sha: str | None = None
+    reason: str | None = None
+
+
+@router.post("/projects/{project_id}/promote/force")
+async def trigger_force_promote(
+    project_id: uuid.UUID,
+    body: _ForcePromoteRequest | None = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """FORCE-PROMOTE the project's open version — SKIP the audit/qualify gate.
+
+    Still cuts the release branch, opens the ``release-vN → promotion-target`` PR,
+    and lets the normal CI-wait / managed-check-wait machinery merge it once the
+    promotion target's required checks (branch-protection CI) pass — 'force' skips
+    the AUDIT, not CI.
+
+    OWNER-only: this bypasses the quality gate and merges toward production
+    ``main``, so it is the most privileged operator lever.  Optionally pins an
+    explicit ``candidate_sha`` (default: current integration-branch HEAD).
+    Refuses (409) when a promotion is already in flight; 404 when there is no open
+    version.  Reuses ``promote()`` + the Fix-3 under-lock claim, so it is
+    idempotent and cannot double-promote.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    _body = body or _ForcePromoteRequest()
+    result = await release_qualifier.force_promote_current_version(
+        session,
+        project_id,
+        candidate_sha=_body.candidate_sha,
+        actor=str(current_user["user_id"]),
+    )
+    await session.commit()
+    status = result.get("status")
+    if status == "no_open_version":
+        raise HTTPException(
+            status_code=404,
+            detail="No open release version found for this project.",
+        )
+    if status == "promotion_in_flight":
+        detail = (
+            "a promotion PR is open and auto-merging — wait for it to land or "
+            "cancel it before force-promoting"
+        )
+        pr_number = result.get("promotion_pr_number")
+        if pr_number is not None:
+            detail += f" (PR #{pr_number})"
+        raise HTTPException(status_code=409, detail=detail)
+    return result
+
+
 # Blocker provenance sources that mark a depends_on edge as a real, structural
 # prerequisite rather than legacy queue-wave serialization.
 _PREREQUISITE_BLOCKER_SOURCES = {"research_prerequisite", "parent"}

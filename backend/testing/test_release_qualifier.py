@@ -12406,6 +12406,113 @@ async def test_promote_success_opens_next_version(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_force_promote_current_version_skips_audit_and_promotes(
+    db_session, mocker
+):
+    """Operator FORCE-promote SKIPS the audit gate but still cuts the release
+    branch, opens the PR, and (CI mocked green) merges — NO audit/qualify children
+    are spawned. 'force' skips the AUDIT, not CI. The verdict records the forced
+    provenance."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate = "facec0de" * 5  # 40-char candidate sha
+    merge_sha = "mainnew" * 5 + "00000"
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate, main=merge_sha),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
+        ),
+    )
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    create_mock = mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 7, "html_url": "http://pr/7"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task", new=AsyncMock()
+    )
+
+    result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promoted"
+    # The AUDIT gate was skipped — no audit child spawned.
+    spawn_mock.assert_not_called()
+    # But the promotion PR was still opened release-vN → main (CI still gates it).
+    assert create_mock.call_args.kwargs["base"] == "main"
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.last_qualification.get("forced_promote") is True
+    assert version.last_qualification.get("forced_promote_by") == "operator-1"
+
+
+@pytest.mark.asyncio
+async def test_force_promote_refuses_when_promotion_in_flight(db_session, mocker):
+    """Force-promote refuses when a promotion is already in flight (an audit-passed
+    PR open, or the Fix-3 claim) — mirrors /qualify + the version-cut lever, so all
+    levers over an in-flight promotion agree. No second PR is opened."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "promotion_pending": {
+            "pr_number": 42,
+            "pr_url": "http://pr/42",
+            "enabled_at": "2026-07-02T00:00:00",
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain="facec0de" * 5),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
+        ),
+    )
+    create_mock = mocker.patch("app.github.create_pull_request", new=AsyncMock())
+
+    result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        actor="op",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promotion_in_flight"
+    create_mock.assert_not_called()  # no second promotion PR opened
+    await db_session.refresh(version)
+    # The in-flight promotion record is untouched.
+    assert version.last_qualification["promotion_pending"]["pr_number"] == 42
+
+
+@pytest.mark.asyncio
 async def test_promote_writes_claim_before_pr_io(db_session, mocker):
     """promote() must persist a promotion CLAIM under the row lock BEFORE it
     releases the lock for its GitHub I/O.
