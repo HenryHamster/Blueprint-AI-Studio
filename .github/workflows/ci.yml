@@ -532,22 +532,39 @@ jobs:
           # Disable -e so pytest's non-zero exit doesn't short-circuit the
           # failure-extraction below; we propagate the code via $pytest_status.
           set +e
-          docker run --rm --network host -v "$PWD/backend:/app" \
-            -e DATABASE_URL=${{ env.TEST_DB_URL }} \
-            -e USE_TEST_POSTGRES=true \
-            -e AGENT_JWT_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \
-            -e WS_TICKET_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \
-            ${{ steps.deps.outputs.image }} \
-            python -m pytest testing/ --splits 8 --group ${{ matrix.shard }} \
-              -v --tb=short --timeout=30 --timeout-method=signal --log-cli-level=WARNING 2>&1 | tee test-output.txt
-          pytest_status=${PIPESTATUS[0]}
+          run_shard() {
+            docker run --rm --network host -v "$PWD/backend:/app" \
+              -e DATABASE_URL=${{ env.TEST_DB_URL }} \
+              -e USE_TEST_POSTGRES=true \
+              -e AGENT_JWT_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \
+              -e WS_TICKET_SECRET=ci-test-secret-padding-to-meet-32-byte-minimum \
+              ${{ steps.deps.outputs.image }} \
+              python -m pytest testing/ --splits 8 --group ${{ matrix.shard }} \
+                -v --tb=short --timeout=30 --timeout-method=signal --log-cli-level=WARNING 2>&1 | tee test-output.txt
+            return ${PIPESTATUS[0]}
+          }
+          # Extract failed test IDs from pytest's "short test summary info" section.
+          extract_failures() {
+            grep -E "^FAILED " test-output.txt | sed 's/^FAILED //' | sed 's/ -.*//' | sort -u > pr-test-failures.txt || true
+          }
+          run_shard; pytest_status=$?
+          extract_failures
+
+          # A non-zero exit with NO FAILED summary is a CRASH/HANG (timeout, OOM,
+          # collection error, or a Docker/DB blip) — NOT real test failures. Retry
+          # the shard ONCE so a transient crash self-heals instead of writing the
+          # sentinel, which always counts as net-new and blocks the promotion gate
+          # (the crash-sentinel wedge). Real FAILED lines are NOT retried — a
+          # genuine regression fails fast on the first run.
+          if [ "$pytest_status" -ne 0 ] && [ ! -s pr-test-failures.txt ]; then
+            echo "::warning::shard ${{ matrix.shard }} exited $pytest_status with no FAILED summary (crash/hang) — retrying once"
+            run_shard; pytest_status=$?
+            extract_failures
+          fi
           set -e
 
-          # Extract failed test IDs from pytest's "short test summary info" section.
-          grep -E "^FAILED " test-output.txt | sed 's/^FAILED //' | sed 's/ -.*//' | sort -u > pr-test-failures.txt || true
-
-          # Fallback: pytest exited non-zero but printed no FAILED summary (timeout / crash /
-          # collection error). Surface a sentinel + the tail so the Evaluate step is useful.
+          # Fallback: STILL a non-zero exit with no FAILED summary after the retry.
+          # Surface a sentinel + the tail so the Evaluate step is useful.
           if [ "$pytest_status" -ne 0 ] && [ ! -s pr-test-failures.txt ]; then
             echo "<pytest crashed or hung; no FAILED summary captured>" > pr-test-failures.txt
             echo ""
