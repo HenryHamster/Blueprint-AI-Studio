@@ -256,41 +256,46 @@ def _inventory_record(
     return record
 
 
-def build_websocket_event_inventory(app_dir: Path) -> list[dict[str, Any]]:
-    app_dir = app_dir.resolve()
-    backend_root = app_dir.parent
+def _records_for_source(source_path: str, text: str) -> list[dict[str, Any]]:
+    """Parse one backend source file's text and return its emitter records.
+
+    ``source_path`` is the repo-relative ``backend/app/...`` path used as the
+    ``source_path`` field (and for classification). Records are returned WITHOUT
+    the ``occurrence`` field, which is assigned globally across the whole tree by
+    :func:`_assign_occurrences`.
+    """
+    tree = ast.parse(text, filename=source_path)
+    aliases = _import_aliases(tree)
+    stack: list[ast.AST] = []
     records: list[dict[str, Any]] = []
-    for path in sorted(app_dir.rglob("*.py")):
-        if "__pycache__" in path.parts:
-            continue
-        source_path = f"backend/{path.relative_to(backend_root).as_posix()}"
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        aliases = _import_aliases(tree)
-        stack: list[ast.AST] = []
 
-        class Visitor(ast.NodeVisitor):
-            def generic_visit(self, node: ast.AST) -> None:
-                stack.append(node)
-                super().generic_visit(node)
-                stack.pop()
+    class Visitor(ast.NodeVisitor):
+        def generic_visit(self, node: ast.AST) -> None:
+            stack.append(node)
+            super().generic_visit(node)
+            stack.pop()
 
-            def visit_Call(self, node: ast.Call) -> None:
-                callee = _call_name(node)
-                canonical_callee = _canonical_callee(callee, aliases)
-                if canonical_callee is not None:
-                    records.append(
-                        _inventory_record(
-                            source_path=source_path,
-                            stack=stack,
-                            node=node,
-                            callee=callee,
-                            canonical_callee=canonical_callee,
-                        )
+        def visit_Call(self, node: ast.Call) -> None:
+            callee = _call_name(node)
+            canonical_callee = _canonical_callee(callee, aliases)
+            if canonical_callee is not None:
+                records.append(
+                    _inventory_record(
+                        source_path=source_path,
+                        stack=stack,
+                        node=node,
+                        callee=callee,
+                        canonical_callee=canonical_callee,
                     )
-                self.generic_visit(node)
+                )
+            self.generic_visit(node)
 
-        Visitor().visit(tree)
+    Visitor().visit(tree)
+    return records
 
+
+def _assign_occurrences(records: list[dict[str, Any]]) -> None:
+    """Number repeated identical call sites in list order (in place)."""
     occurrences: defaultdict[tuple[str, ...], int] = defaultdict(int)
     for record in records:
         occurrence_key = (
@@ -303,7 +308,55 @@ def build_websocket_event_inventory(app_dir: Path) -> list[dict[str, Any]]:
         )
         occurrences[occurrence_key] += 1
         record["occurrence"] = occurrences[occurrence_key]
+
+
+def build_from_sources(sources: dict[str, str]) -> list[dict[str, Any]]:
+    """Build the emitter inventory from in-memory source texts.
+
+    ``sources`` maps repo-relative ``backend/app/...`` paths to their file text.
+    Files are processed in sorted-key order so the result is deterministic and
+    independent of the caller's insertion order; because backend source paths are
+    all lowercase, this is byte-identical to the disk walk's sorted-``Path`` order
+    used by :func:`build_websocket_event_inventory`.
+
+    This is the pure, filesystem-free core: the disk-walking function is a thin
+    wrapper that reads the tree into ``sources`` and delegates here, so an at-ref
+    evaluator can build the identical inventory from git-tree blobs without a
+    checkout.
+    """
+    records: list[dict[str, Any]] = []
+    for source_path in sorted(sources):
+        records.extend(_records_for_source(source_path, sources[source_path]))
+    _assign_occurrences(records)
     return records
+
+
+def read_app_sources(app_dir: Path) -> dict[str, str]:
+    """Read every ``backend/app/**/*.py`` file into a ``{source_path: text}`` map.
+
+    Keys are the same repo-relative ``backend/app/...`` paths used as the
+    ``source_path`` field, so the result feeds :func:`build_from_sources`
+    directly.
+    """
+    app_dir = app_dir.resolve()
+    backend_root = app_dir.parent
+    sources: dict[str, str] = {}
+    for path in sorted(app_dir.rglob("*.py")):
+        if "__pycache__" in path.parts:
+            continue
+        source_path = f"backend/{path.relative_to(backend_root).as_posix()}"
+        sources[source_path] = path.read_text(encoding="utf-8")
+    return sources
+
+
+def build_websocket_event_inventory(app_dir: Path) -> list[dict[str, Any]]:
+    """Build the emitter inventory by walking ``app_dir`` on disk.
+
+    Thin wrapper over :func:`build_from_sources`: reads the tree via
+    :func:`read_app_sources` then delegates. The two paths produce byte-identical
+    results on the same tree (guarded by the inventory parity test).
+    """
+    return build_from_sources(read_app_sources(app_dir))
 
 
 def inventory_signature(record: dict[str, Any]) -> dict[str, Any]:

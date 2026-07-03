@@ -11,9 +11,13 @@ import json
 from pathlib import Path
 from typing import Any
 
+from regen_emitter_inventory import build_fixture
+from regen_emitter_inventory import main as regen_main
 from websocket_event_inventory import (
+    build_from_sources,
     build_websocket_event_inventory,
     inventory_signature,
+    read_app_sources,
 )
 
 
@@ -34,6 +38,10 @@ VALID_CLASSIFICATIONS = {
 }
 
 
+def _app_dir() -> Path:
+    return Path(__file__).parent.parent / "app"
+
+
 def _load_snapshot() -> dict[str, Any]:
     assert SNAPSHOT_PATH.exists(), (
         "Missing websocket emitter inventory snapshot. Generate it from "
@@ -44,8 +52,7 @@ def _load_snapshot() -> dict[str, Any]:
 
 
 def _current_inventory() -> list[dict[str, Any]]:
-    app_dir = Path(__file__).parent.parent / "app"
-    return build_websocket_event_inventory(app_dir)
+    return build_websocket_event_inventory(_app_dir())
 
 
 def _snapshot_inventory(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
@@ -105,3 +112,71 @@ def test_websocket_emitter_inventory_entries_are_classified():
     assert "message_v1_payload" in classifications
     assert "legacy_project_event" in classifications
     assert "legacy_review_required" in classifications
+
+
+def test_build_from_sources_matches_disk_walk():
+    """The content-injectable builder must never diverge from the disk walk.
+
+    This is the safety property that lets an at-ref evaluator trust
+    ``build_from_sources`` (fed git-tree blobs) to produce the same inventory the
+    disk-walking guard test produces from a checkout. Read the sources
+    independently (in arbitrary dict order) to prove the injectable path is
+    byte-identical AND order-independent, not merely reusing the same read.
+    """
+    disk = build_websocket_event_inventory(_app_dir())
+
+    # Independent read; reversed insertion order to exercise the internal sort.
+    sources = read_app_sources(_app_dir())
+    shuffled = dict(reversed(list(sources.items())))
+    injectable = build_from_sources(shuffled)
+
+    assert injectable == disk
+
+
+def test_regen_round_trip_snapshot_matches_source(tmp_path):
+    """Regenerating the fixture yields a snapshot that passes the gate test.
+
+    Drives the actual CLI entry point (``--fix``) to a temp fixture, then reuses
+    the snapshot-match comparison against it. Also asserts a second ``--fix`` is a
+    byte-for-byte no-op (idempotent).
+    """
+    fixture_path = tmp_path / "websocket_event_inventory_v1.json"
+
+    assert regen_main(["--fix", "--fixture", str(fixture_path)]) == 0
+    assert fixture_path.exists()
+
+    first = fixture_path.read_text(encoding="utf-8")
+    assert regen_main(["--fix", "--fixture", str(fixture_path)]) == 0
+    assert fixture_path.read_text(encoding="utf-8") == first, (
+        "Second --fix changed the fixture; regeneration is not idempotent."
+    )
+
+    snapshot = json.loads(first)
+    expected = [inventory_signature(r) for r in _snapshot_inventory(snapshot)]
+    current = [inventory_signature(r) for r in _current_inventory()]
+    assert [r for r in expected if r not in current] == []
+    assert [r for r in current if r not in expected] == []
+
+    # The plain (no-flag) check mode reports the freshly written fixture as clean.
+    assert regen_main(["--fixture", str(fixture_path)]) == 0
+
+
+def test_regen_preserves_lineno_for_unchanged_signature():
+    """An unrelated edit that only shifts line numbers must not churn the fixture.
+
+    ``build_fixture`` carries prior line numbers forward for any emitter whose
+    stable signature is unchanged, so regeneration touches only genuinely
+    new/changed call sites.
+    """
+    app_dir = str(_app_dir())
+    baseline = build_fixture(app_dir, existing=None)
+    assert baseline["emitters"], "Expected at least one emitter."
+
+    # Pretend the prior fixture recorded a different line number for one emitter.
+    stale = json.loads(json.dumps(baseline))
+    stale["emitters"][0]["lineno"] = 987654
+
+    rebuilt = build_fixture(app_dir, existing=stale)
+    assert rebuilt["emitters"][0]["lineno"] == 987654, (
+        "Line number was rewritten despite an unchanged signature (churn)."
+    )
